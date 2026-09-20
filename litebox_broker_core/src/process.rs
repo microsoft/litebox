@@ -273,15 +273,22 @@ impl BrokerProcess {
         }
     }
 
-    /// Fails pending startup and requests runner termination.
-    pub fn fail_start(&self, error: BrokerError, abnormal: bool, expected_shutdown: bool) {
+    /// Fails pending startup and returns the authoritative startup outcome.
+    pub fn fail_start(
+        &self,
+        error: BrokerError,
+        abnormal: bool,
+        expected_shutdown: bool,
+    ) -> Result<()> {
         let shutdown = {
             let mut state = self.state.lock();
+            match state.startup {
+                ProcessStartupState::Starting => {}
+                ProcessStartupState::Running => return Ok(()),
+                ProcessStartupState::Failed(error) => return Err(error),
+            }
             if abnormal {
                 state.retirement.mark_abnormal();
-            }
-            if !matches!(state.startup, ProcessStartupState::Starting) {
-                return;
             }
             state.startup = ProcessStartupState::Failed(error);
             if state.shutdown_request == ProcessShutdownRequest::None {
@@ -297,6 +304,7 @@ impl BrokerProcess {
         if let Some(shutdown) = shutdown {
             shutdown();
         }
+        Err(error)
     }
 
     /// Returns whether the first runner shutdown request was expected.
@@ -321,16 +329,17 @@ impl BrokerProcess {
 
     /// Fails every child process that is still awaiting association activation.
     pub fn fail_starting_children(&self) {
-        let children = self
-            .core
-            .processes
-            .read()
-            .values()
-            .filter_map(Weak::upgrade)
-            .filter(|process| process.parent_id == Some(self.id))
-            .collect::<Vec<_>>();
-        for child in children {
-            child.fail_start(BrokerError::PeerClosed, false, true);
+        let processes = {
+            let processes = self.core.processes.read();
+            processes
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
+        for child in processes {
+            if child.parent_id == Some(self.id) {
+                let _ = child.fail_start(BrokerError::PeerClosed, false, true);
+            }
         }
     }
 
@@ -1101,6 +1110,11 @@ mod tests {
             .unwrap();
         let retained = Arc::clone(&process);
         process.complete_start().unwrap();
+        assert_eq!(
+            process.fail_start(BrokerError::PeerClosed, true, true),
+            Ok(())
+        );
+        assert!(!process.shutdown_was_expected());
         process.retire(true);
         assert_eq!(process.complete_start(), Err(BrokerError::PeerClosed));
         drop(process);

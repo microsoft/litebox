@@ -16,8 +16,7 @@ use litebox_broker_transport_windows_userland::named_pipe::{
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
 use super::{
-    PendingRunnerAssociation, SETUP_TIMEOUT, UserlandProcessLauncher, accept_runner_channel,
-    runner_has_exited,
+    PendingRunnerAssociation, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -43,7 +42,8 @@ impl PlatformRunnerEndpoint {
     pub(super) fn serve(
         &mut self,
         runner: &Arc<Mutex<Child>>,
-        startup: Option<PendingRunnerAssociation>,
+        startup: PendingRunnerAssociation,
+        setup_deadline: Instant,
         broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> AssociationOutcome {
@@ -53,6 +53,7 @@ impl PlatformRunnerEndpoint {
                 .expect("a live runner instance must own its control listener"),
             runner,
             startup,
+            setup_deadline,
             broker,
             launcher,
         )
@@ -66,20 +67,19 @@ impl PlatformRunnerEndpoint {
 fn serve_association(
     control_listener: &mut WindowsNamedPipeListener,
     runner: &Arc<Mutex<Child>>,
-    startup: Option<PendingRunnerAssociation>,
+    startup: PendingRunnerAssociation,
+    setup_deadline: Instant,
     broker: BrokerCore,
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
-    let has_parent_startup = startup.is_some();
-    let (control_channel, _setup_deadline) = match accept_control_channel(control_listener, runner)
-    {
+    let shutdown_was_expected = startup.process.shutdown_was_expected();
+    let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
         Ok(connection) => connection,
         Err(error) => {
             let abnormal = !(runner_has_exited(runner).unwrap_or(false)
-                || has_parent_startup && is_peer_closed_error(&error));
+                || shutdown_was_expected && is_peer_closed_error(&error));
             return AssociationOutcome {
                 result: Err(error),
-                process: None,
                 abnormal,
             };
         }
@@ -106,8 +106,8 @@ fn serve_association(
 fn accept_control_channel(
     control_listener: &mut WindowsNamedPipeListener,
     runner: &Arc<Mutex<Child>>,
-) -> IoResult<(WindowsNamedPipeHostSetupChannel, Instant)> {
-    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
+    setup_deadline: Instant,
+) -> IoResult<WindowsNamedPipeHostSetupChannel> {
     let control_stream = accept_runner_channel(
         setup_deadline,
         "control",
@@ -116,8 +116,8 @@ fn accept_control_channel(
     )?;
     let runner_id = runner.lock().expect("runner process mutex poisoned").id();
     validate_client_process(&control_stream, runner_id)?;
-    Ok((
-        WindowsNamedPipeHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline),
+    Ok(WindowsNamedPipeHostSetupChannel::from_host_guaranteed(
+        control_stream,
         setup_deadline,
     ))
 }

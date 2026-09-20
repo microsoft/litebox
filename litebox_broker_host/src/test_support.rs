@@ -30,7 +30,7 @@ pub struct InProcessBrokerSetup {
     broker: BrokerCore,
     memory: Arc<InProcessSharedMemory>,
     readiness: Arc<InProcessReadinessSink>,
-    association: Option<BrokerHostAssociation<'static, Arc<InProcessSharedMemory>>>,
+    association: Option<BrokerHostAssociation<Arc<InProcessSharedMemory>>>,
 }
 
 impl InProcessBrokerSetup {
@@ -93,10 +93,10 @@ impl LocalSetupChannel for InProcessBrokerSetup {
             self.association.is_none(),
             "the in-process broker association must be negotiated only once"
         );
-        let shared_buffers = Box::leak(Box::new(
+        let shared_buffers = Arc::new(
             SharedBufferPool::new(Arc::clone(&self.memory), SHARED_BUFFER_LAYOUT)
                 .expect("the in-process shared-buffer layout must be valid"),
-        ));
+        );
         let mut host_setup = InProcessHostSetup { response: None };
         let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
         let association = crate::setup_connection(
@@ -120,7 +120,7 @@ impl LocalSetupChannel for InProcessBrokerSetup {
 
 /// Active request channel for an in-process broker association.
 pub struct InProcessBrokerChannel {
-    association: Option<BrokerHostAssociation<'static, Arc<InProcessSharedMemory>>>,
+    association: Option<BrokerHostAssociation<Arc<InProcessSharedMemory>>>,
     panicked: AtomicBool,
 }
 

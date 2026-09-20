@@ -1,19 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Child runner launch support backed by broker-owned process lifecycle state.
+//! Runner launch support backed by broker-owned process lifecycle state.
 
+use std::io::{Error as IoError, Result as IoResult};
+use std::process::ExitStatus;
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, ProcessLifecycleSink};
+use litebox_broker_core::{
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ProcessLifecycleSink,
+};
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::process::ProcessStartupData;
 
 use crate::runner::{RunnerCompletion, RunnerConfig, RunnerInstance};
-
-const PROCESS_START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Userland implementation that starts one out-of-process runner per process.
 pub(crate) struct UserlandProcessLauncher {
@@ -22,17 +25,29 @@ pub(crate) struct UserlandProcessLauncher {
     lifecycle: Arc<ProcessLifecycleNotifier>,
 }
 
-/// Pending association for a runner whose broker process was created by its parent.
+/// Pending association for a broker-created runner process.
 pub(crate) struct PendingRunnerAssociation {
     pub(super) process: Arc<BrokerProcess>,
     initial_thread_id: ThreadId,
-    data: ProcessStartupData,
+    data: Option<ProcessStartupData>,
 }
 
 impl PendingRunnerAssociation {
+    fn new(
+        process: Arc<BrokerProcess>,
+        initial_thread_id: ThreadId,
+        data: Option<ProcessStartupData>,
+    ) -> Self {
+        Self {
+            process,
+            initial_thread_id,
+            data,
+        }
+    }
+
     pub(crate) fn into_process_and_startup(
         self,
-    ) -> ((Arc<BrokerProcess>, ThreadId), ProcessStartupData) {
+    ) -> ((Arc<BrokerProcess>, ThreadId), Option<ProcessStartupData>) {
         ((self.process, self.initial_thread_id), self.data)
     }
 }
@@ -58,9 +73,8 @@ impl ProcessLifecycleNotifier {
     fn wait_for_start(
         &self,
         process: &BrokerProcess,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<(), BrokerError> {
-        let deadline = Instant::now() + timeout;
         let mut state = self.state.lock().expect("process lifecycle mutex poisoned");
         loop {
             if let Some(result) = process.startup_result() {
@@ -69,18 +83,16 @@ impl ProcessLifecycleNotifier {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 drop(state);
-                process.fail_start(BrokerError::Internal, true, true);
-                return Err(BrokerError::Internal);
+                return process.fail_start(BrokerError::PeerClosed, true, true);
             }
             let (next_state, wait_result) = self
                 .changed
                 .wait_timeout(state, remaining)
                 .expect("process lifecycle mutex poisoned");
             state = next_state;
-            if wait_result.timed_out() && process.startup_result().is_none() {
+            if wait_result.timed_out() {
                 drop(state);
-                process.fail_start(BrokerError::Internal, true, true);
-                return Err(BrokerError::Internal);
+                return process.fail_start(BrokerError::PeerClosed, true, true);
             }
         }
     }
@@ -97,7 +109,7 @@ impl ProcessLifecycleNotifier {
 }
 
 impl UserlandProcessLauncher {
-    pub(super) fn new(started_runner_config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
+    fn new(started_runner_config: RunnerConfig, broker: BrokerCore) -> Arc<Self> {
         let lifecycle = Arc::new(ProcessLifecycleNotifier::default());
         let broker = broker.with_process_lifecycle_sink(lifecycle.clone());
         Arc::new(Self {
@@ -107,17 +119,86 @@ impl UserlandProcessLauncher {
         })
     }
 
-    pub(super) fn broker(&self) -> BrokerCore {
-        self.broker.clone()
-    }
-
-    pub(super) fn wait_for_drain(&self) {
+    fn wait_for_drain(&self) {
         self.lifecycle.wait_for_drain(&self.broker);
     }
 
-    fn runner_finished(process: &BrokerProcess, result: RunnerCompletion, thread_panicked: bool) {
-        let abnormal = result.is_abnormal(thread_panicked);
-        process.fail_start(BrokerError::PeerClosed, abnormal, false);
+    pub(crate) fn run_root(config: RunnerConfig, broker: &BrokerCore) -> IoResult<ExitStatus> {
+        let launcher = Self::new(config.without_initial_arguments(), broker.clone());
+        let process = launcher
+            .broker
+            .create_process(CallerCredential::HostGuaranteed, None)
+            .map_err(broker_io_error)?;
+        let initial_thread_id = match process.create_thread() {
+            Ok(initial_thread_id) => initial_thread_id,
+            Err(error) => {
+                process.retire(true);
+                return Err(broker_io_error(error));
+            }
+        };
+        let association =
+            PendingRunnerAssociation::new(Arc::clone(&process), initial_thread_id, None);
+        let (completion_sender, completion_receiver) = sync_channel(1);
+        let startup =
+            Arc::clone(&launcher).launch_runner(association, config, Some(completion_sender));
+        if let Err(error) = startup {
+            drop(process);
+            launcher.wait_for_drain();
+            return Err(broker_io_error(error));
+        }
+        let result = completion_receiver
+            .recv()
+            .unwrap_or_else(|_| Err(IoError::other("root runner completion channel closed")));
+        drop(process);
+        launcher.wait_for_drain();
+        result
+    }
+
+    fn launch_runner(
+        self: Arc<Self>,
+        association: PendingRunnerAssociation,
+        config: RunnerConfig,
+        completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
+    ) -> Result<(), BrokerError> {
+        let process = Arc::clone(&association.process);
+        let process_id = process.id();
+        let Ok(instance) = RunnerInstance::start(config) else {
+            let _ = process.fail_start(BrokerError::PeerClosed, false, false);
+            process.retire(true);
+            return Err(BrokerError::PeerClosed);
+        };
+        let setup_deadline = instance.setup_deadline();
+        let broker = self.broker.clone();
+        let launcher = Arc::clone(&self);
+        let completion_process = Arc::clone(&process);
+        let thread = std::thread::Builder::new()
+            .name(format!("litebox-runner-{}", process_id.0))
+            .spawn(move || {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    instance.run_process_to_completion(association, broker, launcher)
+                }));
+                let (completion, thread_panicked) = match outcome {
+                    Ok(completion) => (completion, false),
+                    Err(_) => (RunnerCompletion::panicked(), true),
+                };
+                let abnormal = completion.is_abnormal(thread_panicked);
+                Self::runner_finished(&completion_process, abnormal);
+                if let Some(completion_sender) = completion_sender {
+                    let _ = completion_sender.send(completion.into_result());
+                }
+            });
+        if thread.is_err() {
+            let _ = process.fail_start(BrokerError::OutOfMemory, false, true);
+            process.retire(true);
+            return Err(BrokerError::OutOfMemory);
+        }
+        drop(thread);
+
+        self.lifecycle.wait_for_start(&process, setup_deadline)
+    }
+
+    fn runner_finished(process: &BrokerProcess, abnormal: bool) {
+        let _ = process.fail_start(BrokerError::PeerClosed, abnormal, false);
         process.retire(!abnormal);
     }
 }
@@ -129,42 +210,15 @@ impl ProcessLauncher for UserlandProcessLauncher {
         initial_thread_id: ThreadId,
         data: ProcessStartupData,
     ) -> Result<(), BrokerError> {
-        let process_id = process.id();
-        let broker = self.broker.clone();
-        let launcher = Arc::clone(&self);
         let config = self.started_runner_config.clone();
-        let runner_process = Arc::clone(&process);
-        let thread = std::thread::Builder::new()
-            .name(format!("litebox-runner-{}", process_id.0))
-            .spawn(move || {
-                let completion_process = Arc::clone(&runner_process);
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    RunnerInstance::start(config).map(|instance| {
-                        instance.run_started_process_to_completion(
-                            PendingRunnerAssociation {
-                                process: runner_process,
-                                initial_thread_id,
-                                data,
-                            },
-                            broker,
-                            Arc::clone(&launcher),
-                        )
-                    })
-                }));
-                let (result, thread_panicked) = match outcome {
-                    Ok(Ok(result)) => (result, false),
-                    Ok(Err(_error)) => (RunnerCompletion::default(), false),
-                    Err(_) => (RunnerCompletion::default(), true),
-                };
-                Self::runner_finished(&completion_process, result, thread_panicked);
-            });
-        if thread.is_err() {
-            process.retire(true);
-            return Err(BrokerError::OutOfMemory);
-        }
-        drop(thread);
-
-        self.lifecycle
-            .wait_for_start(&process, PROCESS_START_TIMEOUT)
+        self.launch_runner(
+            PendingRunnerAssociation::new(process, initial_thread_id, Some(data)),
+            config,
+            None,
+        )
     }
+}
+
+fn broker_io_error(error: BrokerError) -> IoError {
+    IoError::other(error)
 }

@@ -75,17 +75,17 @@ pub mod test_support;
 pub use error::{BrokerHostError, Result};
 
 /// Negotiated active association, or a terminal outcome reached during setup.
-pub type ConnectionSetup<'a, Memory> =
-    core::result::Result<BrokerHostAssociation<'a, Memory>, ConnectionTermination>;
+pub type ConnectionSetup<Memory> =
+    core::result::Result<BrokerHostAssociation<Memory>, ConnectionTermination>;
 
 /// Active portable broker association.
 ///
 /// Deployments may share this value across bounded workers. Each request is
 /// executed independently, while shared-buffer usage is synchronized and
 /// released immediately before publishing the response.
-pub struct BrokerHostAssociation<'a, Memory: SharedMemory> {
+pub struct BrokerHostAssociation<Memory: SharedMemory> {
     process: Arc<BrokerProcess>,
-    shared_buffers: &'a SharedBufferPool<Memory>,
+    shared_buffers: Arc<SharedBufferPool<Memory>>,
     readiness_sink: Arc<dyn ReadinessSink>,
     state: SpinMutex<AssociationState>,
 }
@@ -95,10 +95,10 @@ struct AssociationState {
     shared_buffer_usage: SharedBufferUsage,
 }
 
-impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
+impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
     fn new(
         process: Arc<BrokerProcess>,
-        shared_buffers: &'a SharedBufferPool<Memory>,
+        shared_buffers: Arc<SharedBufferPool<Memory>>,
         readiness_sink: Arc<dyn ReadinessSink>,
     ) -> Self {
         Self {
@@ -186,12 +186,12 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
             }
         }
 
-        let request_result = match extension(&self.process, &operation, self.shared_buffers) {
+        let request_result = match extension(&self.process, &operation, &self.shared_buffers) {
             Some(result) => result,
             None => handle_request(
                 &self.process,
                 operation,
-                self.shared_buffers,
+                &self.shared_buffers,
                 &self.readiness_sink,
             ),
         };
@@ -220,16 +220,16 @@ impl<'a, Memory: SharedMemory> BrokerHostAssociation<'a, Memory> {
 /// Authenticates and negotiates one broker control connection while allowing
 /// a deployment owner to retain the negotiated process before setup completes.
 #[allow(clippy::too_many_arguments)]
-pub fn setup_connection<'a, SetupChannel, Memory, ChannelError>(
+pub fn setup_connection<SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
     process: Option<(Arc<BrokerProcess>, ThreadId)>,
     startup: Option<ProcessStartupData>,
     setup_channel: &mut SetupChannel,
-    shared_buffers: &'a SharedBufferPool<Memory>,
+    shared_buffers: Arc<SharedBufferPool<Memory>>,
     readiness_sink: Arc<dyn ReadinessSink>,
     retain_process: impl FnOnce(&Arc<BrokerProcess>) -> bool,
     send_shared_memory: impl FnOnce(&mut SetupChannel) -> core::result::Result<(), ChannelError>,
-) -> Result<ConnectionSetup<'a, Memory>, ChannelError>
+) -> Result<ConnectionSetup<Memory>, ChannelError>
 where
     SetupChannel: HostSetupChannel<Error = ChannelError>,
     Memory: SharedMemory,
@@ -237,7 +237,7 @@ where
     if shared_buffers.layout() != SHARED_BUFFER_LAYOUT {
         return Err(BrokerHostError::SharedBufferLayoutMismatch);
     }
-    if process.is_some() != startup.is_some() {
+    if process.is_none() && startup.is_some() {
         return Err(BrokerHostError::Broker(ErrorCode::Internal));
     }
     let startup = match startup {
@@ -254,8 +254,13 @@ where
                 .map_err(|_| BrokerHostError::Broker(ErrorCode::ResourceExhausted))?;
             let buffer = SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], bootstrap_length)
                 .map_err(|_| BrokerHostError::Broker(ErrorCode::Internal))?;
-            write_shared_buffer(shared_buffers, buffer, &payload, MAX_PROCESS_BOOTSTRAP_SIZE)
-                .map_err(|error| BrokerHostError::Broker(error.into()))?;
+            write_shared_buffer(
+                &shared_buffers,
+                buffer,
+                &payload,
+                MAX_PROCESS_BOOTSTRAP_SIZE,
+            )
+            .map_err(|error| BrokerHostError::Broker(error.into()))?;
             Some(ProcessStartupDescriptor {
                 format,
                 version,
@@ -1630,6 +1635,7 @@ mod tests {
         test_channel_aborts_on_stale_shared_buffer_request(&broker);
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
         setup_failure_transfers_process_to_the_deployment_owner(&broker);
+        precreated_root_negotiates_without_startup_data(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
@@ -1652,7 +1658,7 @@ mod tests {
             }))]),
             std::vec::Vec::new(),
         );
-        let shared_buffers = test_shared_buffers();
+        let shared_buffers = Arc::new(test_shared_buffers());
         let retained = Mutex::new(None);
 
         assert!(matches!(
@@ -1661,7 +1667,7 @@ mod tests {
                 None,
                 None,
                 &mut channel,
-                &shared_buffers,
+                shared_buffers,
                 test_readiness_sink(),
                 |process| {
                     *retained.lock().unwrap() = Some(Arc::clone(process));
@@ -1678,6 +1684,36 @@ mod tests {
             .expect("deployment owner must retain the negotiated process");
         assert!(!process.is_running());
         process.retire(true);
+    }
+
+    fn precreated_root_negotiates_without_startup_data(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let initial_thread_id = process.create_thread().unwrap();
+        let mut channel = FakeHostControlChannel::new(
+            std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
+                protocol_version: BROKER_PROTOCOL_VERSION,
+            }))]),
+            std::vec::Vec::new(),
+        );
+
+        let association = setup_connection(
+            broker,
+            Some((Arc::clone(&process), initial_thread_id)),
+            None,
+            &mut channel,
+            Arc::new(test_shared_buffers()),
+            test_readiness_sink(),
+            |_| false,
+            |_| Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(association.process.id(), process.id());
+        association.activate_process().unwrap();
+        association.finish();
     }
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
@@ -1981,7 +2017,7 @@ mod tests {
         );
         channel.next_request_id = 41;
         assert_eq!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())).unwrap(),
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -2014,7 +2050,7 @@ mod tests {
             std::vec::Vec::from([Ok(HostReceive::PeerClosed)]),
         );
         assert_eq!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())).unwrap(),
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -2046,7 +2082,7 @@ mod tests {
         let setup_called = Cell::new(false);
 
         assert_eq!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| {
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| {
                 setup_called.set(true);
                 Ok(())
             })
@@ -2075,7 +2111,7 @@ mod tests {
             std::vec::Vec::new(),
         );
         assert_eq!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())).unwrap(),
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -2093,7 +2129,7 @@ mod tests {
             std::vec::Vec::from([Ok(HostReceive::ProtocolViolation)]),
         );
         assert_eq!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())).unwrap(),
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())).unwrap(),
             ConnectionTermination::ProtocolViolation
         );
         assert_eq!(
@@ -2118,7 +2154,7 @@ mod tests {
             )))]),
         );
         channel.response_send_error = true;
-        match serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())) {
+        match serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())) {
             Err(BrokerHostError::Channel(())) => {}
             result => panic!("unexpected serve result: {result:?}"),
         }
@@ -2137,7 +2173,7 @@ mod tests {
         );
         channel.enqueue_readiness_requests_after_create = true;
         assert_eq!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())).unwrap(),
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -2176,7 +2212,7 @@ mod tests {
             ]),
         );
         assert_eq!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())).unwrap(),
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())).unwrap(),
             ConnectionTermination::PeerClosed
         );
         assert_eq!(
@@ -2206,7 +2242,7 @@ mod tests {
         );
         channel.request_id_step = 0;
         assert!(matches!(
-            serve_test_channel(broker, &mut channel, &test_shared_buffers(), |_| Ok(())),
+            serve_test_channel(broker, &mut channel, test_shared_buffers(), |_| Ok(())),
             Err(BrokerHostError::Broker(ErrorCode::MalformedRequest))
         ));
         assert_eq!(
@@ -2233,7 +2269,7 @@ mod tests {
             serve_test_channel(
                 broker,
                 &mut channel,
-                &SharedBufferPool::new(FailingSharedMemory, SHARED_BUFFER_LAYOUT).unwrap(),
+                SharedBufferPool::new(FailingSharedMemory, SHARED_BUFFER_LAYOUT).unwrap(),
                 |_| Ok(()),
             ),
             Err(BrokerHostError::Broker(ErrorCode::Internal))
@@ -2265,7 +2301,7 @@ mod tests {
         let setup_called = Cell::new(false);
 
         assert!(matches!(
-            serve_test_channel(broker, &mut channel, &shared_buffers, |_| {
+            serve_test_channel(broker, &mut channel, shared_buffers, |_| {
                 setup_called.set(true);
                 Ok(())
             }),
@@ -2677,8 +2713,8 @@ mod tests {
             entered_sender,
             release: Arc::clone(&release),
         };
-        let shared_buffers = SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap();
-        let association = test_association(broker, &shared_buffers);
+        let shared_buffers = Arc::new(SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap());
+        let association = test_association(broker, Arc::clone(&shared_buffers));
         let (_, first_write_handle) =
             litebox_broker_core::pipe::create(&association.process, 64, 16).unwrap();
         let (_, second_write_handle) =
@@ -2712,8 +2748,8 @@ mod tests {
     }
 
     fn association_allows_slot_reuse_during_response_emission(broker: &BrokerCore) {
-        let shared_buffers = test_shared_buffers();
-        let association = test_association(broker, &shared_buffers);
+        let shared_buffers = Arc::new(test_shared_buffers());
+        let association = test_association(broker, Arc::clone(&shared_buffers));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
 
@@ -2742,8 +2778,8 @@ mod tests {
     }
 
     fn association_allows_out_of_order_responses(broker: &BrokerCore) {
-        let shared_buffers = test_shared_buffers();
-        let association = test_association(broker, &shared_buffers);
+        let shared_buffers = Arc::new(test_shared_buffers());
+        let association = test_association(broker, Arc::clone(&shared_buffers));
         let release = Arc::new((Mutex::new(false), Condvar::new()));
         let (first_started_sender, first_started_receiver) = mpsc::sync_channel(1);
         let (response_sender, response_receiver) = mpsc::sync_channel(2);
@@ -2792,8 +2828,8 @@ mod tests {
     }
 
     fn association_preserves_the_initiating_failure(broker: &BrokerCore) {
-        let shared_buffers = test_shared_buffers();
-        let association = test_association(broker, &shared_buffers);
+        let shared_buffers = Arc::new(test_shared_buffers());
+        let association = test_association(broker, Arc::clone(&shared_buffers));
 
         assert!(matches!(
             association.execute_request(event_create_request(1), |_| Err::<(), _>(())),
@@ -2805,10 +2841,10 @@ mod tests {
         ));
     }
 
-    fn test_association<'a, Memory: SharedMemory>(
+    fn test_association<Memory: SharedMemory>(
         broker: &BrokerCore,
-        shared_buffers: &'a SharedBufferPool<Memory>,
-    ) -> BrokerHostAssociation<'a, Memory> {
+        shared_buffers: Arc<SharedBufferPool<Memory>>,
+    ) -> BrokerHostAssociation<Memory> {
         BrokerHostAssociation {
             process: broker
                 .create_process(CallerCredential::Unauthenticated, None)
@@ -2897,7 +2933,7 @@ mod tests {
     fn serve_test_channel<Memory: SharedMemory>(
         broker: &BrokerCore,
         control_channel: &mut FakeHostControlChannel,
-        shared_buffers: &SharedBufferPool<Memory>,
+        shared_buffers: SharedBufferPool<Memory>,
         send_shared_memory: impl FnOnce(&mut FakeHostControlChannel) -> core::result::Result<(), ()>,
     ) -> Result<ConnectionTermination, ()> {
         let association = match setup_connection(
@@ -2905,7 +2941,7 @@ mod tests {
             None,
             None,
             control_channel,
-            shared_buffers,
+            Arc::new(shared_buffers),
             test_readiness_sink(),
             |_| false,
             send_shared_memory,

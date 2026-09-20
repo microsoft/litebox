@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use std::ffi::OsStr;
-use std::io::Result as IoResult;
+use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Child;
@@ -17,8 +17,7 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 };
 
 use super::{
-    PendingRunnerAssociation, SETUP_TIMEOUT, UserlandProcessLauncher, accept_runner_channel,
-    runner_has_exited,
+    PendingRunnerAssociation, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -50,7 +49,8 @@ impl PlatformRunnerEndpoint {
     pub(super) fn serve(
         &mut self,
         runner: &Arc<Mutex<Child>>,
-        startup: Option<PendingRunnerAssociation>,
+        startup: PendingRunnerAssociation,
+        setup_deadline: Instant,
         broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> AssociationOutcome {
@@ -60,6 +60,7 @@ impl PlatformRunnerEndpoint {
                 .expect("a live runner instance must own its control listener"),
             runner,
             startup,
+            setup_deadline,
             broker,
             launcher,
         )
@@ -74,19 +75,19 @@ impl PlatformRunnerEndpoint {
 fn serve_association(
     control_listener: &UnixListener,
     runner: &Arc<Mutex<Child>>,
-    startup: Option<PendingRunnerAssociation>,
+    startup: PendingRunnerAssociation,
+    setup_deadline: Instant,
     broker: BrokerCore,
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
-    let has_parent_startup = startup.is_some();
-    let (control_channel, setup_deadline) = match accept_control_channel(control_listener, runner) {
+    let shutdown_was_expected = startup.process.shutdown_was_expected();
+    let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
         Ok(connection) => connection,
         Err(error) => {
             let abnormal = !(runner_has_exited(runner).unwrap_or(false)
-                || has_parent_startup && is_peer_closed_error(&error));
+                || shutdown_was_expected && is_peer_closed_error(&error));
             return AssociationOutcome {
                 result: Err(error),
-                process: None,
                 abnormal,
             };
         }
@@ -110,18 +111,26 @@ fn serve_association(
 fn accept_control_channel(
     control_listener: &UnixListener,
     runner: &Arc<Mutex<Child>>,
-) -> IoResult<(UnixStreamHostSetupChannel, Instant)> {
-    let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let runner_id = runner.lock().expect("runner process mutex poisoned").id();
+    setup_deadline: Instant,
+) -> IoResult<UnixStreamHostSetupChannel> {
     let control_stream = accept_runner_channel(
         setup_deadline,
         "control",
         || runner_has_exited(runner).map(|exited| exited.then(|| "exited".to_owned())),
         || control_listener.accept().map(|(stream, _)| stream),
     )?;
-    validate_peer_process(&control_stream, runner_id)?;
-    Ok((
-        UnixStreamHostSetupChannel::from_host_guaranteed(control_stream, setup_deadline),
+    {
+        let mut runner = runner.lock().expect("runner process mutex poisoned");
+        if runner.try_wait()?.is_some() {
+            return Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                "runner exited before peer authentication",
+            ));
+        }
+        validate_peer_process(&control_stream, runner.id())?;
+    }
+    Ok(UnixStreamHostSetupChannel::from_host_guaranteed(
+        control_stream,
         setup_deadline,
     ))
 }

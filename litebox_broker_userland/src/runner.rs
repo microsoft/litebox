@@ -74,7 +74,7 @@ impl RunnerConfig {
         arguments
     }
 
-    fn without_initial_arguments(&self) -> Self {
+    pub(crate) fn without_initial_arguments(&self) -> Self {
         Self {
             executable: self.executable.clone(),
             arguments: Vec::new(),
@@ -85,13 +85,13 @@ impl RunnerConfig {
 
 /// One out-of-process runner and its dedicated broker control endpoint.
 ///
-/// Dropping an instance before [`Self::run_to_completion`] completes
+/// Dropping an instance before [`Self::run_process_to_completion`] completes
 /// terminates and reaps the runner.
-pub struct RunnerInstance {
+pub(crate) struct RunnerInstance {
     runner: Arc<Mutex<Child>>,
     shutdown: Arc<RunnerShutdown>,
     endpoint: PlatformRunnerEndpoint,
-    started_runner_config: RunnerConfig,
+    setup_deadline: Instant,
 }
 
 struct RunnerShutdown {
@@ -108,18 +108,34 @@ enum RunnerShutdownState {
     Retired,
 }
 
-#[derive(Default)]
 pub(crate) struct RunnerCompletion {
+    result: IoResult<ExitStatus>,
+    abnormal: bool,
     runner_signal: Option<i32>,
     runner_exit_code: Option<i32>,
     broker_termination: bool,
 }
 
 impl RunnerCompletion {
-    pub(crate) const fn is_abnormal(&self, thread_panicked: bool) -> bool {
+    pub(crate) fn panicked() -> Self {
+        Self {
+            result: Err(IoError::other("runner supervision thread panicked")),
+            abnormal: true,
+            runner_signal: None,
+            runner_exit_code: None,
+            broker_termination: false,
+        }
+    }
+
+    pub(crate) fn is_abnormal(&self, thread_panicked: bool) -> bool {
         thread_panicked
+            || self.abnormal
             || runner_signal_is_abnormal(self.runner_signal, self.broker_termination)
             || runner_exit_code_is_crash(self.runner_exit_code)
+    }
+
+    pub(crate) fn into_result(self) -> IoResult<ExitStatus> {
+        self.result
     }
 }
 
@@ -202,7 +218,8 @@ impl RunnerShutdown {
 
 impl RunnerInstance {
     /// Creates the runner's dedicated control endpoint and starts the runner.
-    pub fn start(config: RunnerConfig) -> IoResult<Self> {
+    pub(crate) fn start(config: RunnerConfig) -> IoResult<Self> {
+        let setup_deadline = Instant::now() + SETUP_TIMEOUT;
         let endpoint = PlatformRunnerEndpoint::create()?;
         let runner = Arc::new(Mutex::new(
             Command::new(&config.executable)
@@ -215,82 +232,37 @@ impl RunnerInstance {
             changed: Condvar::new(),
             termination_dispatched: AtomicBool::new(false),
         });
-        let started_runner_config = config.without_initial_arguments();
         Ok(Self {
             runner,
             shutdown,
             endpoint,
-            started_runner_config,
+            setup_deadline,
         })
     }
 
-    /// Serves the runner's broker association and waits for its host process.
-    ///
-    /// Association failure terminates the runner before it is reaped. A
-    /// non-successful runner exit is returned as ordinary instance data for the
-    /// caller to interpret.
-    ///
-    /// # Panics
-    ///
-    /// Panics if another runner owner poisoned the process mutex.
-    pub fn run_to_completion(mut self, broker: &BrokerCore) -> IoResult<ExitStatus> {
-        let launcher =
-            UserlandProcessLauncher::new(self.started_runner_config.clone(), broker.clone());
-        let mut association_result =
-            self.endpoint
-                .serve(&self.runner, None, launcher.broker(), launcher.clone());
-        self.endpoint.close();
-        let runner_exited = if association_result.result.is_ok() {
-            self.shutdown
-                .wait_for_exit(PROCESS_EXIT_OBSERVATION_TIMEOUT)
-        } else {
-            self.shutdown.has_exited()
-        };
-        if !matches!(runner_exited, Ok(true)) {
-            self.shutdown.shutdown();
-        }
-        self.shutdown.retire();
-        let runner_status = wait_for_runner_exit(&self.runner);
-        let root_abnormal = association_result.abnormal
-            || runner_exited.is_err()
-            || runner_status.is_err()
-            || runner_status.as_ref().is_ok_and(|status| {
-                runner_signal_is_abnormal(
-                    runner_exit_signal(*status),
-                    self.shutdown.termination_was_dispatched(),
-                ) || runner_exit_code_is_crash(status.code())
-            });
-        if let Some(process) = association_result.process.take() {
-            if root_abnormal {
-                process.mark_abnormal();
-            }
-            process.retire(!root_abnormal);
-            drop(process);
-            launcher.wait_for_drain();
-        }
-        let runner_status = runner_status?;
-        runner_exited?;
-        association_result.result?;
-        Ok(runner_status)
+    pub(crate) const fn setup_deadline(&self) -> Instant {
+        self.setup_deadline
     }
 
-    pub(crate) fn run_started_process_to_completion(
+    pub(crate) fn run_process_to_completion(
         mut self,
-        startup: PendingRunnerAssociation,
+        association: PendingRunnerAssociation,
         broker: BrokerCore,
         launcher: Arc<UserlandProcessLauncher>,
     ) -> RunnerCompletion {
-        let process = Arc::clone(&startup.process);
+        let process = Arc::clone(&association.process);
         let shutdown = Arc::clone(&self.shutdown);
         process.install_shutdown(Arc::new(move || shutdown.shutdown()));
-        let association_result = self
-            .endpoint
-            .serve(&self.runner, Some(startup), broker, launcher);
+        let association_result = self.endpoint.serve(
+            &self.runner,
+            association,
+            self.setup_deadline,
+            broker,
+            launcher,
+        );
         self.endpoint.close();
         let shutdown_was_expected = process.shutdown_was_expected();
-        if association_result.abnormal {
-            process.mark_abnormal();
-        }
+        let mut abnormal = association_result.abnormal;
         let runner_exited = if !shutdown_was_expected && !association_result.abnormal {
             self.shutdown
                 .wait_for_exit(PROCESS_EXIT_OBSERVATION_TIMEOUT)
@@ -301,19 +273,19 @@ impl RunnerInstance {
             Ok(true) => {}
             Ok(false) => {
                 if !shutdown_was_expected {
-                    process.mark_abnormal();
+                    abnormal = true;
                 }
                 self.shutdown.shutdown();
             }
             Err(_) => {
-                process.mark_abnormal();
+                abnormal = true;
                 self.shutdown.shutdown();
             }
         }
         self.shutdown.retire();
         let runner_status = wait_for_runner_exit(&self.runner);
         if runner_status.is_err() {
-            process.mark_abnormal();
+            abnormal = true;
         }
         let runner_signal = runner_status
             .as_ref()
@@ -321,12 +293,24 @@ impl RunnerInstance {
             .copied()
             .and_then(runner_exit_signal);
         let runner_exit_code = runner_status.as_ref().ok().and_then(ExitStatus::code);
+        let result = runner_status.and_then(|runner_status| {
+            runner_exited.map(|_| ())?;
+            association_result.result?;
+            Ok(runner_status)
+        });
         RunnerCompletion {
+            result,
+            abnormal,
             runner_signal,
             runner_exit_code,
             broker_termination: self.shutdown.termination_was_dispatched(),
         }
     }
+}
+
+/// Launches and supervises the initial runner process.
+pub fn run_to_completion(config: RunnerConfig, broker: &BrokerCore) -> IoResult<ExitStatus> {
+    UserlandProcessLauncher::run_root(config, broker)
 }
 
 impl Drop for RunnerInstance {
