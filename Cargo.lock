@@ -1877,6 +1877,7 @@ dependencies = [
  "litebox_platform_macos_userland",
  "litebox_shim_macos",
  "litebox_syscall_rewriter",
+ "object",
  "tempfile",
 ]
 
