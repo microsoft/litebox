@@ -4,7 +4,7 @@
 //! Guest descriptor namespace and LiteBox file operations.
 
 use crate::{ShimPlatform, Task};
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{collections::BTreeMap, string::String, sync::Arc, vec::Vec};
 use litebox::{
     LiteBox,
     fd::RawDescriptorStorage,
@@ -21,9 +21,26 @@ use litebox_common_macos::{
 
 const MAX_FDS: usize = 1024;
 
+fn canonical_root_path(path: &str) -> String {
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component),
+        }
+    }
+    let mut result = String::from("/");
+    result.push_str(&components.join("/"));
+    result
+}
+
 pub(crate) struct FilesState<P: ShimPlatform> {
     litebox: Arc<LiteBox<P>>,
     raw: RwLock<P, RawDescriptorStorage>,
+    paths: RwLock<P, BTreeMap<usize, String>>,
 }
 
 impl<P: ShimPlatform> FilesState<P> {
@@ -31,6 +48,7 @@ impl<P: ShimPlatform> FilesState<P> {
         Self {
             litebox,
             raw: RwLock::new(RawDescriptorStorage::new()),
+            paths: RwLock::new(BTreeMap::new()),
         }
     }
 
@@ -61,18 +79,69 @@ impl<P: ShimPlatform> FilesState<P> {
     }
 
     pub(crate) fn close(&self, fd: i32) -> Result<(), Errno> {
-        let fd = self.consume(usize::try_from(fd).map_err(|_| Errno::EBADF)?)?;
+        let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let fd = self.consume(raw)?;
+        self.paths.write().remove(&raw);
         self.litebox.close_file(&fd).map_err(|_| Errno::EIO)
     }
 
+    pub(crate) fn path(&self, fd: i32) -> Result<String, Errno> {
+        let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        self.typed_fd(fd)?;
+        self.paths.read().get(&raw).cloned().ok_or(Errno::ENOENT)
+    }
+
     pub(crate) fn dup(&self, fd: i32) -> Result<u32, Errno> {
+        let path = self.path(fd).ok();
         let fd = self.typed_fd(fd)?;
         let duplicate = self
             .litebox
             .descriptor_table_mut()
             .duplicate(&fd)
             .ok_or(Errno::EBADF)?;
-        self.insert_file(duplicate)
+        let raw = self.insert_file(duplicate)?;
+        if let Some(path) = path {
+            self.paths.write().insert(raw as usize, path);
+        }
+        Ok(raw)
+    }
+
+    pub(crate) fn dup2(&self, oldfd: i32, newfd: i32) -> Result<u32, Errno> {
+        let target = usize::try_from(newfd).map_err(|_| Errno::EBADF)?;
+        if target >= MAX_FDS {
+            return Err(Errno::EBADF);
+        }
+        if oldfd == newfd {
+            self.typed_fd(oldfd)?;
+            return u32::try_from(target).map_err(|_| Errno::EBADF);
+        }
+        let path = self.path(oldfd).ok();
+        let source = self.typed_fd(oldfd)?;
+        let duplicate = self
+            .litebox
+            .descriptor_table_mut()
+            .duplicate(&source)
+            .ok_or(Errno::EBADF)?;
+
+        let mut raw = self.raw.write();
+        let replaced = raw.fd_consume_raw_integer::<BrokerFile>(target).ok();
+        assert!(
+            raw.fd_into_specific_raw_integer(duplicate, target),
+            "the target slot is vacant while the descriptor lock is held"
+        );
+        drop(raw);
+        let mut paths = self.paths.write();
+        paths.remove(&target);
+        if let Some(path) = path {
+            paths.insert(target, path);
+        }
+        drop(paths);
+        if let Some(replaced) = replaced
+            && let Err(error) = self.litebox.close_file(&replaced)
+        {
+            litebox_util_log::warn!(error:? = error; "failed to close replaced descriptor");
+        }
+        u32::try_from(target).map_err(|_| Errno::EBADF)
     }
 }
 
@@ -106,12 +175,25 @@ impl<P: ShimPlatform> Task<P> {
         if path.as_bytes().contains(&0) {
             return Err(Errno::EINVAL);
         }
+        let path = canonical_root_path(path);
+        let unsupported_flags = flags.bits() & !OpenFlags::all().bits();
+        if unsupported_flags != 0 {
+            litebox_util_log::warn!(unsupported_flags; "ignoring unsupported Darwin open flags");
+        }
         let access = match flags.bits() & 3 {
             0 => FileAccessMode::ReadOnly,
             1 => FileAccessMode::WriteOnly,
             2 => FileAccessMode::ReadWrite,
             _ => return Err(Errno::EINVAL),
         };
+        // Bootstrap-only alias: the runner exposes its writable stderr as the console.
+        if path == "/dev/console" {
+            return if access == FileAccessMode::WriteOnly {
+                self.sys_dup(2)
+            } else {
+                Err(Errno::EACCES)
+            };
+        }
         let mut open_flags = FileOpenFlags::NONE;
         for (guest, broker) in [
             (OpenFlags::CREAT, FileOpenFlags::CREATE),
@@ -143,7 +225,7 @@ impl<P: ShimPlatform> Task<P> {
         let file = self
             .global
             .litebox
-            .open_file(&context, path, access, open_flags, mode)
+            .open_file(&context, &path, access, open_flags, mode)
             .map_err(open_error)?;
         if flags.contains(OpenFlags::CLOEXEC) {
             // TODO: honor FD_CLOEXEC when macOS exec is implemented.
@@ -154,7 +236,9 @@ impl<P: ShimPlatform> Task<P> {
                 .set_fd_metadata(&file, FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        Ok(u32::try_from(raw.fd_into_raw_integer(file)).expect("fd bounded by MAX_FDS"))
+        let raw = u32::try_from(raw.fd_into_raw_integer(file)).expect("fd bounded by MAX_FDS");
+        self.files.paths.write().insert(raw as usize, path);
+        Ok(raw)
     }
 
     pub(crate) fn read_path(&self, path: UserPtr<core::ffi::c_char>) -> Result<String, Errno> {
@@ -218,6 +302,9 @@ impl<P: ShimPlatform> Task<P> {
     }
     pub(crate) fn sys_dup(&self, fd: i32) -> Result<u32, Errno> {
         self.files.dup(fd)
+    }
+    pub(crate) fn sys_dup2(&self, oldfd: i32, newfd: i32) -> Result<u32, Errno> {
+        self.files.dup2(oldfd, newfd)
     }
 }
 
@@ -367,6 +454,10 @@ mod tests {
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
+            thread: crate::ThreadState {
+                blocked_signals: core::sync::atomic::AtomicU32::new(0),
+                id: 1u64 << 32,
+            },
         };
         // SAFETY: a fresh, non-fixed mapping owned by this task.
         let buf = unsafe {
@@ -430,6 +521,11 @@ mod tests {
         assert_eq!(&*buf.to_owned_slice(6).unwrap(), b"abcdXY");
         // INT_MAX itself is permitted; at EOF it returns zero bytes.
         assert_eq!(invoke(nr::READ, 1, max_count), Ok(0));
+        assert_eq!(task.sys_dup2(1, 1), Ok(1));
+        assert_eq!(
+            task.sys_dup2(1, i32::try_from(MAX_FDS).unwrap()),
+            Err(Errno::EBADF)
+        );
         assert_eq!(invoke(nr::CLOSE, 2, 0), Ok(0));
         assert_eq!(invoke(nr::CLOSE, 2, 0), Err(Errno::EBADF));
 

@@ -3,9 +3,10 @@
 
 //! Typed BSD syscall decoding.
 
-use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _};
+use core::mem::size_of;
+use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt};
 use litebox_broker_protocol::fs::FileMode;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::{
     MmapFlags, OpenFlags, VmProtection,
@@ -23,17 +24,38 @@ pub mod nr {
     pub const GETPID: usize = 20;
     pub const GETUID: usize = 24;
     pub const GETEUID: usize = 25;
+    pub const CROSSARCH_TRAP: usize = 38;
     pub const GETPPID: usize = 39;
     pub const DUP: usize = 41;
     pub const GETEGID: usize = 43;
     pub const GETGID: usize = 47;
+    pub const SIGPROCMASK: usize = 48;
     pub const MUNMAP: usize = 73;
     pub const MPROTECT: usize = 74;
+    pub const CSOPS: usize = 169;
+    pub const DUP2: usize = 90;
+    pub const FCNTL: usize = 92;
+    pub const SYSCTL: usize = 202;
     pub const MMAP: usize = 197;
+    pub const SHARED_REGION_CHECK_NP: usize = 294;
     pub const READ_NOCANCEL: usize = 396;
     pub const WRITE_NOCANCEL: usize = 397;
     pub const OPEN_NOCANCEL: usize = 398;
     pub const CLOSE_NOCANCEL: usize = 399;
+    pub const THREAD_SELFID: usize = 372;
+    pub const CSRCTL: usize = 483;
+    pub const MAC_SYSCALL: usize = 381;
+    pub const FSCTL: usize = 242;
+    pub const STAT64: usize = 338;
+    pub const FSTAT64: usize = 339;
+    pub const STATFS64: usize = 345;
+    pub const BSDTHREAD_CREATE: usize = 360;
+    pub const PROC_RLIMIT_CONTROL: usize = 446;
+    pub const FSGETPATH: usize = 427;
+    pub const GETENTROPY: usize = 500;
+    pub const ABORT_WITH_PAYLOAD: usize = 521;
+    pub const MAP_WITH_LINKING_NP: usize = 550;
+    pub const SHARED_REGION_MAP_AND_SLIDE_2_NP: usize = 536;
 }
 
 /// Whether the low 32 bits of an AArch64 syscall selector encode a Mach trap.
@@ -47,10 +69,143 @@ pub fn is_mach_trap_selector(number: usize) -> bool {
 pub mod mach_trap {
     /// `mach_absolute_time()`.
     pub const MACH_ABSOLUTE_TIME: u32 = 3;
+    pub const MACH_VM_ALLOCATE: u32 = 10;
+    pub const MACH_VM_DEALLOCATE: u32 = 12;
+    pub const MACH_VM_PROTECT: u32 = 14;
+    pub const MACH_VM_MAP: u32 = 15;
+    pub const MACH_REPLY_PORT: u32 = 26;
+    pub const THREAD_SELF: u32 = 27;
+    pub const TASK_SELF: u32 = 28;
+    pub const HOST_SELF: u32 = 29;
+    pub const MACH_MSG2: u32 = 47;
     /// `mach_timebase_info(mach_timebase_info_t)`.
     pub const MACH_TIMEBASE_INFO: u32 = 89;
     /// `mach_wait_until(deadline)`.
     pub const MACH_WAIT_UNTIL: u32 = 90;
+}
+
+/// Synthetic Mach port name returned by the minimal single-task shim.
+///
+/// These names are ABI-visible handles, not host Mach rights. They only let
+/// dyld identify the shim's one task, one thread, and one host endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct MachPortName(pub u32);
+
+impl From<MachPortName> for usize {
+    fn from(value: MachPortName) -> Self {
+        value.0 as Self
+    }
+}
+
+/// Stable synthetic names. Keep them distinct from `MACH_PORT_NULL` and from
+/// descriptors allocated later by a future Mach IPC implementation.
+pub mod synthetic_port {
+    use super::MachPortName;
+
+    pub const HOST_SELF: MachPortName = MachPortName(0x102);
+    pub const TASK_SELF: MachPortName = MachPortName(0x103);
+    pub const THREAD_SELF: MachPortName = MachPortName(0x104);
+    pub const REPLY: MachPortName = MachPortName(0x105);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalMaskOperation {
+    Block,
+    Unblock,
+    SetMask,
+}
+
+impl TryFrom<i32> for SignalMaskOperation {
+    type Error = Errno;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Block),
+            2 => Ok(Self::Unblock),
+            3 => Ok(Self::SetMask),
+            _ => Err(Errno::EINVAL),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FcntlCommand {
+    /// Darwin `F_GETPATH`; writes a NUL-terminated path to the argument buffer.
+    GetPath,
+    Unsupported(i32),
+}
+
+impl From<i32> for FcntlCommand {
+    fn from(value: i32) -> Self {
+        if value == 50 {
+            Self::GetPath
+        } else {
+            Self::Unsupported(value)
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Raw Mach VM flags. XNU combines behavioral bits with a VM allocation tag,
+    /// so callers retain unknown bits even though the shim only honors `ANYWHERE`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MachVmFlags: i32 {
+        const ANYWHERE = 0x0000_0001;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct MachVmAddressMask(pub usize);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MachVmProtection {
+    permissions: VmProtection,
+    copy: bool,
+}
+
+impl MachVmProtection {
+    const COPY: i32 = 0x10;
+
+    pub const fn new(permissions: VmProtection, copy: bool) -> Self {
+        Self { permissions, copy }
+    }
+
+    fn from_raw(raw: i32) -> Option<Self> {
+        let permissions = VmProtection::from_bits(raw & !Self::COPY)?;
+        (raw & !(Self::COPY | VmProtection::all().bits()) == 0).then_some(Self {
+            permissions,
+            copy: raw & Self::COPY != 0,
+        })
+    }
+
+    pub const fn permissions(self) -> VmProtection {
+        self.permissions
+    }
+
+    pub const fn requests_copy(self) -> bool {
+        self.copy
+    }
+}
+
+impl MachVmAddressMask {
+    pub const fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+}
+
+bitflags::bitflags! {
+    /// Options used by `mach_msg2_trap`. Only receive-only probes are currently
+    /// accepted; Mach message sending is not emulated.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct MachMessageOptions: u64 {
+        const SEND = 0x0000_0001;
+        const RECEIVE = 0x0000_0002;
+        const RECEIVE_LARGE = 0x0000_0004;
+        const SEND_TIMEOUT = 0x0000_0010;
+        const RECEIVE_TIMEOUT = 0x0000_0100;
+    }
 }
 
 /// Darwin's `mach_timebase_info_data_t` output structure.
@@ -60,6 +215,96 @@ pub struct MachTimebaseInfo {
     pub numer: u32,
     pub denom: u32,
 }
+
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct DarwinTimespec {
+    pub seconds: i64,
+    pub nanoseconds: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct DarwinFsid {
+    pub values: [i32; 2],
+}
+
+/// Darwin arm64 `struct stat` layout used by the `*stat64` compatibility calls.
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct DarwinStat64 {
+    pub device: i32,
+    pub mode: u16,
+    pub link_count: u16,
+    pub inode: u64,
+    pub user_id: u32,
+    pub group_id: u32,
+    pub raw_device: i32,
+    pub padding: i32,
+    pub access_time: DarwinTimespec,
+    pub modification_time: DarwinTimespec,
+    pub change_time: DarwinTimespec,
+    pub birth_time: DarwinTimespec,
+    pub size: i64,
+    pub blocks: i64,
+    pub block_size: i32,
+    pub flags: u32,
+    pub generation: u32,
+    pub spare: i32,
+    pub qspare: [i64; 2],
+}
+
+const _: () = assert!(size_of::<DarwinStat64>() == 144);
+
+/// Darwin arm64 `struct statfs` layout. The shim reports one synthetic APFS
+/// mount because its filesystem is broker-backed rather than a host mount.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct DarwinStatFs64 {
+    pub block_size: u32,
+    pub io_size: i32,
+    pub blocks: u64,
+    pub blocks_free: u64,
+    pub blocks_available: u64,
+    pub files: u64,
+    pub files_free: u64,
+    pub filesystem_id: [i32; 2],
+    pub owner: u32,
+    pub filesystem_type: u32,
+    pub flags: u32,
+    pub subtype: u32,
+    pub type_name: [u8; 16],
+    pub mount_point: [u8; 1024],
+    pub mounted_from: [u8; 1024],
+    pub extended_flags: u32,
+    pub reserved: [u32; 7],
+}
+
+impl Default for DarwinStatFs64 {
+    fn default() -> Self {
+        Self {
+            block_size: 16 * 1024,
+            io_size: 16 * 1024,
+            blocks: 0,
+            blocks_free: 0,
+            blocks_available: 0,
+            files: 0,
+            files_free: 0,
+            filesystem_id: [0; 2],
+            owner: 0,
+            filesystem_type: 0,
+            flags: 0,
+            subtype: 0,
+            type_name: [0; 16],
+            mount_point: [0; 1024],
+            mounted_from: [0; 1024],
+            extended_flags: 0,
+            reserved: [0; 7],
+        }
+    }
+}
+
+const _: () = assert!(size_of::<DarwinStatFs64>() == 0x878);
 
 #[derive(Clone, Copy, Debug)]
 pub enum SyscallRequest {
@@ -87,6 +332,23 @@ pub enum SyscallRequest {
     Dup {
         fd: i32,
     },
+    Dup2 {
+        oldfd: i32,
+        newfd: i32,
+    },
+    Fcntl {
+        fd: i32,
+        command: FcntlCommand,
+        argument: UserPtrMut<u8>,
+    },
+    Sysctl {
+        name: UserPtr<i32>,
+        name_length: u32,
+        old_value: UserPtrMut<u8>,
+        old_length: UserPtrMut<usize>,
+        new_value: UserPtr<u8>,
+        new_length: usize,
+    },
     Mmap {
         address: usize,
         length: usize,
@@ -110,6 +372,134 @@ pub enum SyscallRequest {
     Geteuid,
     Getgid,
     Getegid,
+    Sigprocmask {
+        how: i32,
+        set: UserPtr<u32>,
+        oldset: UserPtrMut<u32>,
+    },
+    ThreadSelfid,
+    CrossarchTrap {
+        name: u32,
+    },
+    Csrctl {
+        operation: u32,
+        user_address: UserPtrMut<u8>,
+        user_size: usize,
+    },
+    Csops {
+        pid: i32,
+        operation: u32,
+        user_address: UserPtrMut<u8>,
+        user_size: usize,
+    },
+    ProcRlimitControl {
+        pid: i32,
+        flavor: i32,
+        argument: UserPtrMut<u8>,
+    },
+    BsdthreadCreate {
+        function: usize,
+        function_argument: usize,
+        stack: usize,
+        pthread: usize,
+        flags: u32,
+    },
+    Fsctl {
+        path: UserPtr<core::ffi::c_char>,
+        command: usize,
+        data: UserPtrMut<u8>,
+        options: u32,
+    },
+    Stat64 {
+        path: UserPtr<core::ffi::c_char>,
+        buffer: UserPtrMut<DarwinStat64>,
+    },
+    Fstat64 {
+        fd: i32,
+        buffer: UserPtrMut<DarwinStat64>,
+    },
+    Statfs64 {
+        path: UserPtr<core::ffi::c_char>,
+        buffer: UserPtrMut<DarwinStatFs64>,
+    },
+    Fsgetpath {
+        buffer: UserPtrMut<u8>,
+        size: usize,
+        filesystem_id: UserPtr<DarwinFsid>,
+        object_id: u64,
+    },
+    MacSyscall {
+        policy: UserPtr<core::ffi::c_char>,
+        operation: i32,
+        argument: UserPtrMut<u8>,
+    },
+    Getentropy {
+        buffer: UserPtrMut<u8>,
+        count: usize,
+    },
+    MapWithLinkingNp {
+        regions: UserPtr<u8>,
+        region_count: u32,
+        link_info: UserPtr<u8>,
+        link_info_size: u32,
+    },
+    AbortWithPayload {
+        namespace: u32,
+        code: u64,
+        payload: UserPtr<u8>,
+        payload_size: u32,
+        reason: UserPtr<core::ffi::c_char>,
+        reason_flags: u64,
+    },
+    MachVmAllocate {
+        target: MachPortName,
+        address: UserPtrMut<usize>,
+        size: usize,
+        flags: MachVmFlags,
+    },
+    MachVmDeallocate {
+        target: MachPortName,
+        address: usize,
+        size: usize,
+    },
+    MachVmProtect {
+        target: MachPortName,
+        address: usize,
+        size: usize,
+        set_maximum: bool,
+        protection: MachVmProtection,
+    },
+    MachVmMap {
+        target: MachPortName,
+        address: UserPtrMut<usize>,
+        size: usize,
+        mask: MachVmAddressMask,
+        flags: MachVmFlags,
+        current_protection: MachVmProtection,
+    },
+    MachReplyPort,
+    MachThreadSelf,
+    MachTaskSelf,
+    MachHostSelf,
+    MachMsg2Trap {
+        data: usize,
+        options: MachMessageOptions,
+        msgh_bits_and_send_size: u64,
+        msgh_remote_and_local_port: u64,
+        msgh_voucher_and_id: u64,
+        descriptor_count_and_receive_name: u64,
+        receive_size_and_priority: u64,
+        timeout: u64,
+    },
+    SharedRegionCheckNp {
+        start_address: UserPtrMut<usize>,
+    },
+    SharedRegionMapAndSlide2Np {
+        files_count: u32,
+        files: UserPtr<u8>,
+        mappings_count: u32,
+        mappings: UserPtr<u8>,
+    },
     MachAbsoluteTime,
     MachTimebaseInfo {
         info: UserPtrMut<MachTimebaseInfo>,
@@ -124,11 +514,53 @@ impl SyscallRequest {
     pub fn from_args(number: usize, args: [usize; 8]) -> Result<Self, Errno> {
         let int_arg = |i: usize| -> i32 { args[i].reinterpret_as_signed().trunc() };
         let u64_arg = |i: usize| -> u64 { args[i] as u64 };
+        let port_arg = |i: usize| MachPortName(TruncateExt::<u32>::trunc(args[i]));
         if is_mach_trap_selector(number) {
             let selector: i32 = number.reinterpret_as_signed().trunc();
             let trap = selector.wrapping_neg().reinterpret_as_unsigned();
             return match trap {
                 mach_trap::MACH_ABSOLUTE_TIME => Ok(Self::MachAbsoluteTime),
+                mach_trap::MACH_VM_ALLOCATE => Ok(Self::MachVmAllocate {
+                    target: port_arg(0),
+                    address: UserPtrMut::from_usize(args[1]),
+                    size: args[2],
+                    flags: MachVmFlags::from_bits_retain(int_arg(3)),
+                }),
+                mach_trap::MACH_VM_DEALLOCATE => Ok(Self::MachVmDeallocate {
+                    target: port_arg(0),
+                    address: args[1],
+                    size: args[2],
+                }),
+                mach_trap::MACH_VM_PROTECT => Ok(Self::MachVmProtect {
+                    target: port_arg(0),
+                    address: args[1],
+                    size: args[2],
+                    set_maximum: args[3] != 0,
+                    protection: MachVmProtection::from_raw(int_arg(4)).ok_or(Errno::EINVAL)?,
+                }),
+                mach_trap::MACH_VM_MAP => Ok(Self::MachVmMap {
+                    target: port_arg(0),
+                    address: UserPtrMut::from_usize(args[1]),
+                    size: args[2],
+                    mask: MachVmAddressMask(args[3]),
+                    flags: MachVmFlags::from_bits_retain(int_arg(4)),
+                    current_protection: MachVmProtection::from_raw(int_arg(5))
+                        .ok_or(Errno::EINVAL)?,
+                }),
+                mach_trap::MACH_REPLY_PORT => Ok(Self::MachReplyPort),
+                mach_trap::THREAD_SELF => Ok(Self::MachThreadSelf),
+                mach_trap::TASK_SELF => Ok(Self::MachTaskSelf),
+                mach_trap::HOST_SELF => Ok(Self::MachHostSelf),
+                mach_trap::MACH_MSG2 => Ok(Self::MachMsg2Trap {
+                    data: args[0],
+                    options: MachMessageOptions::from_bits_retain(u64_arg(1)),
+                    msgh_bits_and_send_size: u64_arg(2),
+                    msgh_remote_and_local_port: u64_arg(3),
+                    msgh_voucher_and_id: u64_arg(4),
+                    descriptor_count_and_receive_name: u64_arg(5),
+                    receive_size_and_priority: u64_arg(6),
+                    timeout: u64_arg(7),
+                }),
                 mach_trap::MACH_TIMEBASE_INFO => Ok(Self::MachTimebaseInfo {
                     info: UserPtrMut::from_usize(args[0]),
                 }),
@@ -152,11 +584,28 @@ impl SyscallRequest {
             },
             nr::OPEN | nr::OPEN_NOCANCEL => Self::Open {
                 path: UserPtr::from_usize(args[0]),
-                flags: OpenFlags::from_bits(int_arg(1)).ok_or(Errno::EINVAL)?,
+                flags: OpenFlags::from_bits_retain(int_arg(1)),
                 mode: FileMode::from_u32_bits_truncate(int_arg(2).reinterpret_as_unsigned()),
             },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
+            nr::DUP2 => Self::Dup2 {
+                oldfd: int_arg(0),
+                newfd: int_arg(1),
+            },
+            nr::SYSCTL => Self::Sysctl {
+                name: UserPtr::from_usize(args[0]),
+                name_length: TruncateExt::<u32>::trunc(args[1]),
+                old_value: UserPtrMut::from_usize(args[2]),
+                old_length: UserPtrMut::from_usize(args[3]),
+                new_value: UserPtr::from_usize(args[4]),
+                new_length: args[5],
+            },
+            nr::FCNTL => Self::Fcntl {
+                fd: int_arg(0),
+                command: FcntlCommand::from(int_arg(1)),
+                argument: UserPtrMut::from_usize(args[2]),
+            },
             nr::MMAP => Self::Mmap {
                 address: args[0],
                 length: args[1],
@@ -175,11 +624,99 @@ impl SyscallRequest {
                 protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
             },
             nr::GETPID => Self::Getpid,
+            nr::CROSSARCH_TRAP => Self::CrossarchTrap {
+                name: TruncateExt::<u32>::trunc(args[0]),
+            },
+            nr::CSRCTL => Self::Csrctl {
+                operation: TruncateExt::<u32>::trunc(args[0]),
+                user_address: UserPtrMut::from_usize(args[1]),
+                user_size: args[2],
+            },
+            nr::CSOPS => Self::Csops {
+                pid: int_arg(0),
+                operation: TruncateExt::<u32>::trunc(args[1]),
+                user_address: UserPtrMut::from_usize(args[2]),
+                user_size: args[3],
+            },
+            nr::PROC_RLIMIT_CONTROL => Self::ProcRlimitControl {
+                pid: int_arg(0),
+                flavor: int_arg(1),
+                argument: UserPtrMut::from_usize(args[2]),
+            },
+            nr::BSDTHREAD_CREATE => Self::BsdthreadCreate {
+                function: args[0],
+                function_argument: args[1],
+                stack: args[2],
+                pthread: args[3],
+                flags: TruncateExt::<u32>::trunc(args[4]),
+            },
+            nr::FSCTL => Self::Fsctl {
+                path: UserPtr::from_usize(args[0]),
+                command: args[1],
+                data: UserPtrMut::from_usize(args[2]),
+                options: TruncateExt::<u32>::trunc(args[3]),
+            },
+            nr::FSTAT64 => Self::Fstat64 {
+                fd: int_arg(0),
+                buffer: UserPtrMut::from_usize(args[1]),
+            },
+            nr::STAT64 => Self::Stat64 {
+                path: UserPtr::from_usize(args[0]),
+                buffer: UserPtrMut::from_usize(args[1]),
+            },
+            nr::STATFS64 => Self::Statfs64 {
+                path: UserPtr::from_usize(args[0]),
+                buffer: UserPtrMut::from_usize(args[1]),
+            },
+            nr::FSGETPATH => Self::Fsgetpath {
+                buffer: UserPtrMut::from_usize(args[0]),
+                size: args[1],
+                filesystem_id: UserPtr::from_usize(args[2]),
+                object_id: u64_arg(3),
+            },
+            nr::MAC_SYSCALL => Self::MacSyscall {
+                policy: UserPtr::from_usize(args[0]),
+                operation: int_arg(1),
+                argument: UserPtrMut::from_usize(args[2]),
+            },
+            nr::GETENTROPY => Self::Getentropy {
+                buffer: UserPtrMut::from_usize(args[0]),
+                count: args[1],
+            },
+            nr::MAP_WITH_LINKING_NP => Self::MapWithLinkingNp {
+                regions: UserPtr::from_usize(args[0]),
+                region_count: TruncateExt::<u32>::trunc(args[1]),
+                link_info: UserPtr::from_usize(args[2]),
+                link_info_size: TruncateExt::<u32>::trunc(args[3]),
+            },
+            nr::ABORT_WITH_PAYLOAD => Self::AbortWithPayload {
+                namespace: TruncateExt::<u32>::trunc(args[0]),
+                code: u64_arg(1),
+                payload: UserPtr::from_usize(args[2]),
+                payload_size: TruncateExt::<u32>::trunc(args[3]),
+                reason: UserPtr::from_usize(args[4]),
+                reason_flags: u64_arg(5),
+            },
             nr::GETPPID => Self::Getppid,
             nr::GETUID => Self::Getuid,
             nr::GETEUID => Self::Geteuid,
             nr::GETGID => Self::Getgid,
+            nr::SIGPROCMASK => Self::Sigprocmask {
+                how: int_arg(0),
+                set: UserPtr::from_usize(args[1]),
+                oldset: UserPtrMut::from_usize(args[2]),
+            },
             nr::GETEGID => Self::Getegid,
+            nr::THREAD_SELFID => Self::ThreadSelfid,
+            nr::SHARED_REGION_CHECK_NP => Self::SharedRegionCheckNp {
+                start_address: UserPtrMut::from_usize(args[0]),
+            },
+            nr::SHARED_REGION_MAP_AND_SLIDE_2_NP => Self::SharedRegionMapAndSlide2Np {
+                files_count: TruncateExt::<u32>::trunc(args[0]),
+                files: UserPtr::from_usize(args[1]),
+                mappings_count: TruncateExt::<u32>::trunc(args[2]),
+                mappings: UserPtr::from_usize(args[3]),
+            },
             _ => return Err(Errno::ENOSYS),
         })
     }
@@ -219,7 +756,7 @@ mod tests {
             panic!()
         };
         assert_eq!(status, -1);
-        for number in [0, 0x0200_0004, 0x8000_0000] {
+        for number in [0, 0x0200_0004] {
             assert!(matches!(
                 SyscallRequest::from_args(number, [0; 8]),
                 Err(Errno::ENOSYS)
@@ -230,6 +767,52 @@ mod tests {
             SyscallRequest::from_args(u32::MAX as usize - 2, [0; 8]),
             Ok(SyscallRequest::MachAbsoluteTime)
         ));
+        for number in [
+            0u32.wrapping_sub(mach_trap::MACH_MSG2) as usize,
+            (-47isize).reinterpret_as_unsigned(),
+        ] {
+            let request = SyscallRequest::from_args(
+                number,
+                [
+                    0x1234,
+                    usize::try_from(MachMessageOptions::RECEIVE_TIMEOUT.bits() | (1 << 40))
+                        .unwrap(),
+                    0x2222,
+                    0x3333,
+                    0x4444,
+                    0x5555,
+                    0x6666,
+                    0x7777,
+                ],
+            )
+            .unwrap();
+            let SyscallRequest::MachMsg2Trap {
+                data,
+                options,
+                msgh_bits_and_send_size,
+                msgh_remote_and_local_port,
+                msgh_voucher_and_id,
+                descriptor_count_and_receive_name,
+                receive_size_and_priority,
+                timeout,
+            } = request
+            else {
+                panic!("unexpected request: {request:?}")
+            };
+            assert_eq!(data, 0x1234);
+            assert_eq!(options.bits(), 0x100_0000_0100);
+            assert_eq!(
+                [
+                    msgh_bits_and_send_size,
+                    msgh_remote_and_local_port,
+                    msgh_voucher_and_id,
+                    descriptor_count_and_receive_name,
+                    receive_size_and_priority,
+                    timeout,
+                ],
+                [0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777]
+            );
+        }
         let request = SyscallRequest::from_args(
             nr::MMAP,
             [0x4000, 0x8000, 5, 0x12, usize::MAX, 0x1234, 0, 0],
@@ -257,6 +840,88 @@ mod tests {
                 Errno::EINVAL
             );
         }
+    }
+
+    #[test]
+    fn bootstrap_requests_preserve_their_abi_arguments() {
+        let request = SyscallRequest::from_args(
+            nr::PROC_RLIMIT_CONTROL,
+            [usize::MAX, 7, 0x1234, 0, 0, 0, 0, 0],
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            SyscallRequest::ProcRlimitControl {
+                pid: -1,
+                flavor: 7,
+                argument,
+            } if argument.as_usize() == 0x1234
+        ));
+        assert_eq!(
+            SyscallRequest::from_args(336, [0; 8]).unwrap_err(),
+            Errno::ENOSYS
+        );
+
+        let request = SyscallRequest::from_args(
+            nr::ABORT_WITH_PAYLOAD,
+            [usize::MAX, 0x2222, 0x3333, usize::MAX, 0x5555, 0x6666, 0, 0],
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
+            SyscallRequest::AbortWithPayload {
+                namespace: u32::MAX,
+                code: 0x2222,
+                payload,
+                payload_size: u32::MAX,
+                reason,
+                reason_flags: 0x6666,
+            } if payload.as_usize() == 0x3333 && reason.as_usize() == 0x5555
+        ));
+
+        assert!(matches!(
+            SyscallRequest::from_args(nr::SIGPROCMASK, [0, 0, 0x7777, 0, 0, 0, 0, 0]),
+            Ok(SyscallRequest::Sigprocmask {
+                how: 0,
+                set,
+                oldset,
+            }) if set.as_usize() == 0 && oldset.as_usize() == 0x7777
+        ));
+
+        assert!(matches!(
+            SyscallRequest::from_args(nr::MAC_SYSCALL, [0x1000, usize::MAX, 0x2000, 0, 0, 0, 0, 0]),
+            Ok(SyscallRequest::MacSyscall {
+                policy,
+                operation: -1,
+                argument,
+            }) if policy.as_usize() == 0x1000 && argument.as_usize() == 0x2000
+        ));
+        let mach_protect = SyscallRequest::from_args(
+            0u32.wrapping_sub(mach_trap::MACH_VM_PROTECT) as usize,
+            [0x103, 0x2001, 1, 0, 0x13, 0, 0, 0],
+        )
+        .unwrap();
+        assert!(matches!(
+            mach_protect,
+            SyscallRequest::MachVmProtect { protection, .. }
+                if protection.permissions() == (VmProtection::READ | VmProtection::WRITE)
+                    && protection.requests_copy()
+        ));
+
+        assert!(matches!(
+            SyscallRequest::from_args(
+                nr::SHARED_REGION_MAP_AND_SLIDE_2_NP,
+                [usize::MAX, 0x2000, usize::MAX - 1, 0x4000, 0, 0, 0, 0],
+            ),
+            Ok(SyscallRequest::SharedRegionMapAndSlide2Np {
+                files_count: u32::MAX,
+                files,
+                mappings_count,
+                mappings,
+            }) if files.as_usize() == 0x2000
+                && mappings_count == u32::MAX - 1
+                && mappings.as_usize() == 0x4000
+        ));
     }
 
     #[cfg(target_arch = "aarch64")]
