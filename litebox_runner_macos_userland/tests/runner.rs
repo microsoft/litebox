@@ -380,6 +380,104 @@ fn runner_executes_mmap_mprotect_rewritten_macho_code() {
 }
 
 #[test]
+fn dynamic_loader_enters_host_dyld_and_exposes_main_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hello.c");
+    let binary = dir.path().join("hello");
+    std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+    let output = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .expect("Xcode command line tools are required to compile the dynamic fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let executable = std::fs::read(&binary).expect("reading the dynamic fixture");
+    let dyld = std::fs::read("/usr/lib/dyld")
+        .expect("the current boot's standalone /usr/lib/dyld is required");
+    let main_image =
+        MachoParsedFile::parse(litebox_common_macos::loader::arm64_slice(&executable).unwrap())
+            .unwrap();
+    let dyld_image =
+        MachoParsedFile::parse(litebox_common_macos::loader::arm64_slice(&dyld).unwrap()).unwrap();
+    assert!(dyld_image.is_dyld);
+    litebox_platform_macos_userland::set_guest_abi(
+        litebox_platform_macos_userland::GuestAbi::Darwin,
+    );
+    let shim = litebox_shim_macos::MacosShimBuilder::new(
+        litebox_platform_macos_userland::MacosUserland::new(),
+    )
+    .build();
+    let program = shim
+        .load_program_with_dyld(
+            TaskParams::default(),
+            "/hello",
+            &executable,
+            &dyld,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    let dyld_header = program.initial_ctx.pc - (dyld_image.entry - dyld_image.virtual_range.start);
+    let main_header =
+        litebox_common_macos::user_pointers::UserPtr::<usize>::from_usize(program.initial_ctx.sp)
+            .read_at_offset::<litebox_platform_macos_userland::MacosUserland>(0)
+            .unwrap();
+    let read_u32 = |address| {
+        litebox_common_macos::user_pointers::UserPtr::<u32>::from_usize(address)
+            .read_at_offset::<litebox_platform_macos_userland::MacosUserland>(0)
+            .unwrap()
+    };
+    assert_eq!(read_u32(main_header), object::macho::MH_MAGIC_64);
+    assert_eq!(read_u32(dyld_header), object::macho::MH_MAGIC_64);
+    assert_eq!(read_u32(dyld_header + 12), object::macho::MH_DYLINKER);
+    let relocated_main_entry = main_header + (main_image.entry - main_image.virtual_range.start);
+    assert_ne!(program.initial_ctx.pc, relocated_main_entry);
+}
+
+/// Verifies dyld/libSystem startup, private guest errno across a shim
+/// transition, main-thread identity, and clean process exit.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_libsystem_tls_and_main_thread_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("libsystem_state.c");
+    let binary = dir.path().join("libsystem_state");
+    std::fs::write(
+        &source,
+        "#include <errno.h>\n#include <pthread.h>\n#include <unistd.h>\n\
+         int main(void) { errno = E2BIG; (void)getpid(); \
+         return errno == E2BIG && pthread_main_np() ? 0 : 42; }\n",
+    )
+    .unwrap();
+    let compiled = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .expect("Xcode command line tools are required to compile the libSystem fixture");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn syscall_free_image_delivers_guest_faults() {
     let dir = tempfile::tempdir().unwrap();
     let binary = assemble(
