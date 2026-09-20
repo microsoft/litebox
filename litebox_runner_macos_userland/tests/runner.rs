@@ -11,6 +11,25 @@ use std::{
     process::{Command, Stdio},
 };
 
+#[cfg(feature = "test-broker")]
+fn dynamic_guest_stderr(output: &std::process::Output) -> &[u8] {
+    let end = output
+        .stderr
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("dynamic runner must report its bounded-cache limitation");
+    let (warning, rest) = output.stderr.split_at(end);
+    assert!(
+        warning.starts_with(b"warning: bounded shared-cache rewrite skips "),
+        "{output:?}"
+    );
+    assert!(
+        warning.ends_with(b"Swift/Foundation are unsupported and may crash"),
+        "{output:?}"
+    );
+    &rest[1..]
+}
+
 fn assemble(dir: &Path, source: &str) -> PathBuf {
     let asm = dir.join("guest.s");
     let obj = dir.join("guest.o");
@@ -377,6 +396,262 @@ fn runner_executes_mmap_mprotect_rewritten_macho_code() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn live_cache_dynamic_guest_e2e() {
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("dynamic.c");
+    let binary = dir.path().join("dynamic");
+    std::fs::write(&source, include_str!("fixtures/live_cache.c")).unwrap();
+    let compiled = Command::new("xcrun")
+        .args([
+            "clang", "-arch", "arm64", "-O2", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .current_dir(dir.path())
+        .args(["./dynamic", "two words"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            // SAFETY: this test owns the process group, including the disposable fork child.
+            unsafe { libc::kill(-i32::try_from(child.id()).unwrap(), libc::SIGKILL) };
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "dynamic fixture timed out: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    #[cfg(feature = "test-broker")]
+    {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"argv0=./dynamic\narg=two words\nprotect=0");
+        assert_eq!(dynamic_guest_stderr(&output), b"guest stderr\n");
+    }
+    #[cfg(not(feature = "test-broker"))]
+    {
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(output.stdout, b"");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("dynamic executables require broker support")
+        );
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("guest stderr"));
+    }
+}
+
+#[cfg(feature = "test-broker")]
+#[test]
+fn termination_signals_reach_the_dynamic_child() {
+    use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("dynamic.c");
+    let binary = dir.path().join("dynamic");
+    std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+    let compiled = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{compiled:?}");
+    for (signal, auto_reap) in [
+        (libc::SIGTERM, false),
+        (libc::SIGINT, false),
+        (libc::SIGHUP, false),
+        (libc::SIGTERM, true),
+        (libc::SIGKILL, false),
+        (libc::SIGQUIT, false),
+        (libc::SIGUSR1, false),
+        (libc::SIGALRM, false),
+    ] {
+        let runner = env!("CARGO_BIN_EXE_litebox_runner_macos_userland");
+        // Keep the fork child in broker startup's stdin read, so it cannot
+        // finish before we signal it.
+        let mut command = Command::new(runner);
+        if auto_reap {
+            // SAFETY: pre_exec only builds a zero-valid sigaction and calls the
+            // async-signal-safe sigaction API. No allocation or locking occurs.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut action = core::mem::zeroed::<libc::sigaction>();
+                    action.sa_sigaction = libc::SIG_IGN;
+                    action.sa_flags = libc::SA_NOCLDWAIT;
+                    if libc::sigaction(libc::SIGCHLD, &raw const action, core::ptr::null_mut()) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut parent = command
+            .arg(&binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _input = parent.stdin.take().unwrap();
+        let pid = i32::try_from(parent.id()).unwrap();
+        let finished = std::cell::Cell::new(false);
+        let _cleanup = litebox::utils::defer(|| {
+            if !finished.get() {
+                // SAFETY: this test owns the process group. Group killing is
+                // only failure cleanup, never the signal delivery under test.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+                loop {
+                    // SAFETY: reap our runner if try_wait has not already done so.
+                    if unsafe { libc::waitpid(pid, core::ptr::null_mut(), 0) } >= 0
+                        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let child_pid = loop {
+            let mut children = [0; 1];
+            // SAFETY: children is writable PID storage with the supplied byte size.
+            let count = unsafe {
+                libc::proc_listchildpids(
+                    pid,
+                    children.as_mut_ptr().cast(),
+                    i32::try_from(size_of_val(&children)).unwrap(),
+                )
+            };
+            if count > 0 && children[0] > 0 {
+                break children[0];
+            }
+            assert!(
+                parent.try_wait().unwrap().is_none(),
+                "runner exited before forking"
+            );
+            assert!(Instant::now() < deadline, "runner did not fork");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // SAFETY: pid is the still-live runner owned by this test, not its group.
+        assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
+        let status = loop {
+            if let Some(status) = parent.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "runner failed to forward signal {signal}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if [libc::SIGTERM, libc::SIGINT, libc::SIGHUP].contains(&signal) {
+            assert_eq!(status.code(), Some(128 + signal), "{status:?}");
+        } else {
+            assert_eq!(status.signal(), Some(signal), "{status:?}");
+        }
+        loop {
+            // SAFETY: signal zero only queries the recorded child's existence.
+            if unsafe { libc::kill(child_pid, 0) } == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ESRCH)
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "guest child survived signal {signal}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        finished.set(true);
+        let output = parent.wait_with_output().unwrap();
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
+
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_thread_local_and_rethrow_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("thread_local.cpp");
+    let binary = dir.path().join("thread_local");
+    std::fs::write(&source, include_str!("fixtures/thread_local.cpp")).unwrap();
+    for executable_tlv in [false, true] {
+        let compiled = Command::new("xcrun")
+            .args([
+                "clang++", "-arch", "arm64", "-O0", "-Wall", "-Wextra", "-Werror",
+            ])
+            .arg(if executable_tlv {
+                "-DEXECUTABLE_TLV"
+            } else {
+                "-UEXECUTABLE_TLV"
+            })
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(compiled.status.success(), "{compiled:?}");
+        let native = Command::new(&binary).output().unwrap();
+        assert_eq!(native.status.code(), Some(0), "{native:?}");
+        let mut data = std::fs::read(&binary).unwrap();
+        assert_eq!(
+            MachoParsedFile::parse(&data).unwrap().has_tlv_descriptors,
+            executable_tlv
+        );
+        let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .arg(&binary)
+            .output()
+            .unwrap();
+        if executable_tlv {
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("unsupported TLV initialization")
+            );
+            assert_eq!(output.stdout, []);
+            // Section metadata must still identify TLVs if the header flag is absent.
+            let flags = u32::from_le_bytes(data[24..28].try_into().unwrap());
+            data[24..28]
+                .copy_from_slice(&(flags & !object::macho::MH_HAS_TLV_DESCRIPTORS).to_le_bytes());
+            assert!(MachoParsedFile::parse(&data).unwrap().has_tlv_descriptors);
+        } else {
+            assert_eq!(output.status.code(), Some(0), "{output:?}");
+            assert_eq!(output.stdout, b"thread local and rethrow ok\n");
+            assert_eq!(output.stdout, native.stdout);
+            assert_eq!(dynamic_guest_stderr(&output), native.stderr);
+        }
+    }
 }
 
 #[test]

@@ -93,6 +93,8 @@ pub struct MachoParsedFile {
     pub entry: usize,
     /// The image requests the system dynamic linker.
     pub uses_dyld: bool,
+    /// The image contains thread-local variable descriptors requiring runtime setup.
+    pub has_tlv_descriptors: bool,
     /// The image itself is dyld (`MH_DYLINKER`).
     pub is_dyld: bool,
 }
@@ -235,6 +237,7 @@ impl MachoParsedFile {
         }
         let is_dyld = header.filetype(LE) == macho::MH_DYLINKER;
         let mut uses_dyld = false;
+        let mut has_tlv_descriptors = header.flags(LE) & macho::MH_HAS_TLV_DESCRIPTORS != 0;
         let metadata_len = MACH_HEADER_SIZE
             .checked_add(
                 usize::try_from(header.sizeofcmds(LE)).map_err(|_| Invalid("load commands"))?,
@@ -310,6 +313,8 @@ impl MachoParsedFile {
                         if section.nreloc.get(LE) != 0 {
                             return Err(Unsupported("section relocations"));
                         }
+                        has_tlv_descriptors |= section.flags.get(LE) & macho::SECTION_TYPE
+                            == macho::S_THREAD_LOCAL_VARIABLES;
                     }
                     let start =
                         usize::try_from(seg.vmaddr.get(LE)).map_err(|_| Invalid("vmaddr"))?;
@@ -413,6 +418,7 @@ impl MachoParsedFile {
             virtual_range: start..end,
             entry,
             uses_dyld,
+            has_tlv_descriptors,
             is_dyld,
         })
     }

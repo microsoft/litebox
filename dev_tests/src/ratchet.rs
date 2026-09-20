@@ -82,6 +82,8 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_vm_userland/", 1),
             ("litebox_platform_windows_userland/", 12),
             ("litebox_runner_lvbs/", 8),
+            // Foreign libc __stdoutp binding; no Rust-owned global storage.
+            ("litebox_runner_macos_userland/", 1),
             ("litebox_runner_optee_on_qemu/", 1),
             ("litebox_runner_optee_on_vm_userland/", 1),
             ("litebox_runner_snp/", 2),

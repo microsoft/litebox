@@ -13,8 +13,9 @@ use litebox_broker_core::{
         in_mem::{InMem, InitialNode},
         resolver::Resolver,
     },
+    random::{RandomProvider, RandomProviderError},
     stdio::StdioOutputStream,
-    test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
+    test_support::{TestBrokerCoreBuilder, TestStdioProvider},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -25,6 +26,20 @@ use std::{
     io::{Read as _, Write as _},
     sync::Arc,
 };
+
+struct HostRandom;
+
+impl RandomProvider for HostRandom {
+    fn fill(&self, output: &mut [u8]) -> std::result::Result<(), RandomProviderError> {
+        for chunk in output.chunks_mut(256) {
+            // SAFETY: chunk is writable and no larger than Darwin's 256-byte limit.
+            if unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) } != 0 {
+                return Err(RandomProviderError);
+            }
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn setup(
     platform: &'static MacosUserland,
@@ -68,13 +83,14 @@ pub(crate) fn setup(
     let fs = Composer::builder()
         .mount("/", |_| fs)
         .mount("/dev", |allocator| {
-            Devices::new(allocator, stdio.clone(), Arc::new(FailingRandomProvider))
+            Devices::new(allocator, stdio.clone(), Arc::new(HostRandom))
         })
         .build()
         .map_err(|error| anyhow!("test filesystem: {error:?}"))?;
     let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
+    .with_random_provider(Arc::new(HostRandom))
     .with_file_service(Arc::new(Resolver::<MacosUserland, _>::new(fs)))
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;
@@ -119,5 +135,9 @@ pub(crate) fn flush_output(stdio: &TestStdioProvider) -> Result<()> {
             StdioOutputStream::Stderr => std::io::stderr().write_all(&bytes)?,
         }
     }
+    // The one-shot dynamic runner uses raw SYS_exit, so Rust will not flush
+    // its line-buffered stdout for us. Preserve trailing non-newline output.
+    std::io::stdout().flush()?;
+    std::io::stderr().flush()?;
     Ok(())
 }
