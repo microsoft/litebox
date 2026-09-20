@@ -432,6 +432,32 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn root_startup_preserves_runner_connection_error() {
+        use litebox_broker_core::test_support::TestBrokerCoreBuilder;
+        use litebox_broker_core::{ObjectRights, PolicyEngine};
+
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_host_guaranteed_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let error = super::run_to_completion(
+            super::RunnerConfig::new("/bin/false".into(), Vec::new()),
+            &broker,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(
+            error
+                .to_string()
+                .contains("runner exited before connecting its control channel"),
+            "unexpected root startup error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn shutdown_can_terminate_while_runner_waits_for_exit() {
         use super::{RunnerShutdown, RunnerShutdownState, wait_for_runner_exit};
         use std::process::Command;

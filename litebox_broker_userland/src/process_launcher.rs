@@ -144,7 +144,11 @@ impl UserlandProcessLauncher {
         if let Err(error) = startup {
             drop(process);
             launcher.wait_for_drain();
-            return Err(broker_io_error(error));
+            let fallback = broker_io_error(error);
+            return match completion_receiver.recv() {
+                Ok(Err(error)) => Err(error),
+                Ok(Ok(_)) | Err(_) => Err(fallback),
+            };
         }
         let result = completion_receiver
             .recv()
