@@ -11,6 +11,33 @@ use std::{
     process::{Command, Stdio},
 };
 
+fn run_guest(command: &mut Command) -> std::process::Output {
+    use std::os::unix::process::CommandExt as _;
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            // SAFETY: this test owns the process group, including the disposable fork child.
+            unsafe { libc::kill(-i32::try_from(child.id()).unwrap(), libc::SIGKILL) };
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "guest fixture timed out: {command:?}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
 fn assemble(dir: &Path, source: &str) -> PathBuf {
     let asm = dir.join("guest.s");
     let obj = dir.join("guest.o");
@@ -381,8 +408,6 @@ fn runner_executes_mmap_mprotect_rewritten_macho_code() {
 
 #[test]
 fn live_cache_dynamic_guest_e2e() {
-    use std::os::unix::process::CommandExt as _;
-    use std::time::{Duration, Instant};
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("dynamic.c");
     let binary = dir.path().join("dynamic");
@@ -401,29 +426,11 @@ fn live_cache_dynamic_guest_e2e() {
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
-        .current_dir(dir.path())
-        .args(["./dynamic", "two words"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            // SAFETY: this test owns the process group, including the disposable fork child.
-            unsafe { libc::kill(-i32::try_from(child.id()).unwrap(), libc::SIGKILL) };
-            let output = child.wait_with_output().unwrap();
-            panic!(
-                "dynamic fixture timed out: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let output = child.wait_with_output().unwrap();
+    let output = run_guest(
+        Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .current_dir(dir.path())
+            .args(["./dynamic", "two words"]),
+    );
     #[cfg(feature = "test-broker")]
     {
         assert_eq!(
@@ -620,6 +627,112 @@ fn dynamic_thread_local_and_rethrow_e2e() {
             assert_eq!(output.stderr, native.stderr);
         }
     }
+}
+
+#[test]
+fn dynamic_loader_enters_host_dyld_and_exposes_main_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hello.c");
+    let binary = dir.path().join("hello");
+    std::fs::write(&source, "int main(void) { return 0; }\n").unwrap();
+    let output = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .expect("Xcode command line tools are required to compile the dynamic fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let executable = std::fs::read(&binary).expect("reading the dynamic fixture");
+    let mut dyld = std::fs::read("/usr/lib/dyld").expect("the host /usr/lib/dyld is required");
+    litebox_common_macos::dyld::patch_for_initialized_shared_cache(&mut dyld).unwrap();
+    let main_image =
+        MachoParsedFile::parse(litebox_common_macos::loader::arm64_slice(&executable).unwrap())
+            .unwrap();
+    let dyld_image =
+        MachoParsedFile::parse(litebox_common_macos::loader::arm64_slice(&dyld).unwrap()).unwrap();
+    assert!(dyld_image.is_dyld);
+    litebox_platform_macos_userland::set_guest_abi(
+        litebox_platform_macos_userland::GuestAbi::Darwin,
+    );
+    let shim = litebox_shim_macos::MacosShimBuilder::new(
+        litebox_platform_macos_userland::MacosUserland::new(),
+    )
+    .build();
+    let program = shim
+        .load_program_with_dyld(
+            TaskParams::default(),
+            "/hello",
+            &executable,
+            litebox_shim_macos::DyldImage {
+                data: &dyld,
+                thread_pointer: litebox_shim_macos::DyldThreadPointerMode::Native,
+            },
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    let dyld_header = program.initial_ctx.pc - (dyld_image.entry - dyld_image.virtual_range.start);
+    let main_header =
+        litebox_common_macos::user_pointers::UserPtr::<usize>::from_usize(program.initial_ctx.sp)
+            .read_at_offset::<litebox_platform_macos_userland::MacosUserland>(0)
+            .unwrap();
+    let read_u32 = |address| {
+        litebox_common_macos::user_pointers::UserPtr::<u32>::from_usize(address)
+            .read_at_offset::<litebox_platform_macos_userland::MacosUserland>(0)
+            .unwrap()
+    };
+    assert_eq!(read_u32(main_header), object::macho::MH_MAGIC_64);
+    assert_eq!(read_u32(dyld_header), object::macho::MH_MAGIC_64);
+    assert_eq!(read_u32(dyld_header + 12), object::macho::MH_DYLINKER);
+    let relocated_main_entry = main_header + (main_image.entry - main_image.virtual_range.start);
+    assert_ne!(program.initial_ctx.pc, relocated_main_entry);
+}
+
+/// Verifies dyld/libSystem startup, errno across successful and failing shim
+/// syscalls, synthetic parent PID, main-thread identity, and clean process exit.
+#[cfg(feature = "test-broker")]
+#[test]
+fn dynamic_libsystem_tls_and_main_thread_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("libsystem_state.c");
+    let binary = dir.path().join("libsystem_state");
+    std::fs::write(
+        &source,
+        "#include <errno.h>\n#include <pthread.h>\n#include <unistd.h>\n\
+         int main(void) { errno = E2BIG; \
+         if (getppid() != 1) return 43; \
+         if (errno != E2BIG) return 42; \
+         if (close(-1) != -1 || errno != EBADF) return 46; \
+         if (getppid() != 1 || errno != EBADF) return 47; \
+         if (!pthread_main_np()) return 44; \
+         return write(1, \"state ok\", 8) == 8 ? 0 : 45; }\n",
+    )
+    .unwrap();
+    let compiled = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .expect("Xcode command line tools are required to compile the libSystem fixture");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output =
+        run_guest(Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland")).arg(&binary));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The dynamic runner terminates without Rust's usual stdout teardown.
+    assert_eq!(output.stdout, b"state ok");
 }
 
 #[test]
