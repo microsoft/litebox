@@ -21,6 +21,7 @@ object = { version = "0.36.7", default-features = false, features = ["macho", "r
 tempfile = "3"
 litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
 litebox = { path = "../litebox", version = "0.1.0" }
+object = { version = "0.36.7", default-features = false, features = ["macho"] }
 
 [features]
 default = ["test-broker"]
