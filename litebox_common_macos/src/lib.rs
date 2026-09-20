@@ -25,6 +25,7 @@ impl KernReturn {
     pub const SUCCESS: Self = Self(0);
     pub const INVALID_ADDRESS: Self = Self(1);
     pub const PROTECTION_FAILURE: Self = Self(2);
+    pub const INVALID_ARGUMENT: Self = Self(4);
     pub const RESOURCE_SHORTAGE: Self = Self(6);
 
     pub const fn from_raw(value: i32) -> Self {

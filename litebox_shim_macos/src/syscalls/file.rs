@@ -74,6 +74,32 @@ impl<P: ShimPlatform> FilesState<P> {
             .ok_or(Errno::EBADF)?;
         self.insert_file(duplicate)
     }
+
+    pub(crate) fn dup2(&self, oldfd: i32, newfd: i32) -> Result<u32, Errno> {
+        let target = usize::try_from(newfd).map_err(|_| Errno::EBADF)?;
+        if oldfd == newfd {
+            self.typed_fd(oldfd)?;
+            return u32::try_from(target).map_err(|_| Errno::EBADF);
+        }
+        let source = self.typed_fd(oldfd)?;
+        let duplicate = self
+            .litebox
+            .descriptor_table_mut()
+            .duplicate(&source)
+            .ok_or(Errno::EBADF)?;
+        if let Ok(replaced) = self.consume(target) {
+            self.litebox.close_file(&replaced).map_err(|_| Errno::EIO)?;
+        }
+        let inserted = self
+            .raw
+            .write()
+            .fd_into_specific_raw_integer(duplicate, target);
+        if inserted {
+            u32::try_from(target).map_err(|_| Errno::EBADF)
+        } else {
+            Err(Errno::EBADF)
+        }
+    }
 }
 
 impl<P: ShimPlatform> Drop for FilesState<P> {
@@ -218,6 +244,9 @@ impl<P: ShimPlatform> Task<P> {
     }
     pub(crate) fn sys_dup(&self, fd: i32) -> Result<u32, Errno> {
         self.files.dup(fd)
+    }
+    pub(crate) fn sys_dup2(&self, oldfd: i32, newfd: i32) -> Result<u32, Errno> {
+        self.files.dup2(oldfd, newfd)
     }
 }
 
