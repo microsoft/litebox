@@ -394,7 +394,7 @@ fn syscall_free_image_delivers_guest_faults() {
 }
 
 #[test]
-fn invalid_and_dynamic_images_are_rejected() {
+fn invalid_images_are_rejected_and_dynamic_images_require_dyld() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("invalid");
     std::fs::write(&path, b"not a Mach-O").unwrap();
@@ -405,14 +405,11 @@ fn invalid_and_dynamic_images_are_rejected() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("loading Mach-O"));
 
-    // The runner itself is a dynamically linked AArch64 Mach-O.
+    // The runner itself is a dynamically linked AArch64 Mach-O. Parsing is
+    // supported, but loading without a dyld input is not.
     let data = std::fs::read(env!("CARGO_BIN_EXE_litebox_runner_macos_userland")).unwrap();
-    assert!(matches!(
-        MachoParsedFile::parse(&data),
-        Err(litebox_common_macos::loader::MachoLoaderError::Unsupported(
-            _
-        ))
-    ));
+    let parsed = MachoParsedFile::parse(&data).unwrap();
+    assert!(parsed.uses_dyld);
     let result = litebox_shim_macos::MacosShimBuilder::new(
         litebox_platform_macos_userland::MacosUserland::new(),
     )
@@ -421,7 +418,7 @@ fn invalid_and_dynamic_images_are_rejected() {
     assert!(matches!(
         result,
         Err(litebox_common_macos::loader::MachoLoaderError::Unsupported(
-            _
+            "dynamic executable requires privately mapped dyld"
         ))
     ));
 }

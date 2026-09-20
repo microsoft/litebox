@@ -215,6 +215,16 @@ fn filesystem_loader_runs_linked_static_macho() {
 }
 
 #[test]
+fn pre_rewritten_dyld_is_rejected() {
+    let dyld = std::fs::read("/usr/lib/dyld").unwrap();
+    let rewritten = Image::prepare(&dyld).unwrap();
+    assert!(matches!(
+        Image::prepare(rewritten.data.as_ref()),
+        Err(MachoLoaderError::Unsupported("pre-rewritten dyld"))
+    ));
+}
+
+#[test]
 fn byte_snapshot_path_is_independent_of_argv() {
     set_guest_abi(GuestAbi::Darwin);
     let platform = Platform::new();

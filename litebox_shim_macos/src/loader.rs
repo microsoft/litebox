@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Static Mach-O loading through the shim's file and virtual-memory subsystems.
+//! Mach-O loading through the shim's file and virtual-memory subsystems.
 //!
 //! Parsing and rewriting use the same in-memory snapshot, isolating the load plan
-//! from later file changes. Guest mappings live until the last global-state owner
-//! is dropped. Dynamic linking and shared-cache loading are unsupported.
+//! from later file changes. Dynamically linked executables enter a privately
+//! mapped host dyld and use the inherited live shared cache.
 
 use crate::{ShimPlatform, Task};
 use alloc::{borrow::Cow, ffi::CString, format, vec, vec::Vec};
@@ -18,12 +18,13 @@ use litebox_common_macos::{
     loader::{MAX_IMAGE_SIZE, MachoParsedFile, TrampolineInfo, arm64_slice},
 };
 use litebox_syscall_rewriter::{
-    TargetHost,
-    macho::{CodeMetadata, Rewriter, hook_syscalls_in_macho},
+    RewriteOptions, TargetHost,
+    macho::{CodeMetadata, Rewriter, hook_syscalls_in_macho, hook_syscalls_in_macho_with_options},
 };
 
 use crate::MachoLoaderError;
 
+mod dyld;
 mod stack;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
@@ -107,11 +108,39 @@ impl<'a> Image<'a> {
         let data = arm64_slice(data)?;
         let mut plan = MachoParsedFile::parse(data)?;
         let (data, trampoline) = match plan.parse_trampoline(data) {
+            Ok(_) if plan.is_dyld => {
+                return Err(MachoLoaderError::Unsupported("pre-rewritten dyld"));
+            }
             Ok(trampoline) => (Cow::Borrowed(data), trampoline),
             Err(MachoLoaderError::Unrewritten) => {
                 // Only absent rewrite metadata permits rewriting; invalid metadata is an error.
-                let rewritten =
-                    hook_syscalls_in_macho(data, None).map_err(|_| MachoLoaderError::Rewrite)?;
+                let patched_dyld;
+                let rewrite_input = if plan.is_dyld {
+                    patched_dyld = {
+                        let executable_ranges: Vec<_> = plan
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.protection.contains(VmProtection::EXECUTE))
+                            .map(|segment| segment.file_range.clone())
+                            .collect();
+                        let mut bytes = data.to_vec();
+                        dyld::patch(&mut bytes, &executable_ranges)?;
+                        bytes
+                    };
+                    patched_dyld.as_slice()
+                } else {
+                    data
+                };
+                let rewritten = if plan.is_dyld {
+                    hook_syscalls_in_macho_with_options(
+                        rewrite_input,
+                        None,
+                        RewriteOptions::macos_native_guest_tpidrro(),
+                    )
+                } else {
+                    hook_syscalls_in_macho(rewrite_input, None)
+                }
+                .map_err(|_| MachoLoaderError::Rewrite)?;
                 plan = MachoParsedFile::parse(&rewritten)?;
                 let trampoline = plan.parse_trampoline(&rewritten)?;
                 (Cow::Owned(rewritten), trampoline)
@@ -126,7 +155,7 @@ impl<'a> Image<'a> {
         })
     }
 
-    fn map<P: ShimPlatform>(&self, task: &Task<P>) -> Result<usize, MachoLoaderError> {
+    fn map<P: ShimPlatform>(&self, task: &Task<P>) -> Result<MappedImage, MachoLoaderError> {
         let platform = task.global.platform;
         let rewriter = Rewriter::new(TargetHost::MacOs).map_err(|_| MachoLoaderError::Rewrite)?;
         // Callback and TLS-offset placeholders must be resolved before gates become executable.
@@ -165,7 +194,17 @@ impl<'a> Image<'a> {
                 .ok_or(MachoLoaderError::Memory)?;
             // Anonymous pages supply zero-filled BSS/padding; holes remain
             // inaccessible. macOS synchronizes instruction caches on RW -> RX.
-            protect(task, range, segment.protection)?;
+            // Privately mapped dyld mutates its DATA_CONST/authenticated bookkeeping
+            // during bootstrap and normally asks the kernel mapping machinery
+            // to toggle those pages. Keep non-executable dyld data writable in
+            // this minimal loader; executable segments still remain W^X.
+            let final_protection =
+                if self.plan.is_dyld && !segment.protection.contains(VmProtection::EXECUTE) {
+                    segment.protection | VmProtection::WRITE
+                } else {
+                    segment.protection
+                };
+            protect(task, range, final_protection)?;
         }
         if let Some(trampoline) = &self.trampoline {
             let start = relocate(trampoline.virtual_range.start);
@@ -180,14 +219,25 @@ impl<'a> Image<'a> {
                 .ok_or(MachoLoaderError::Memory)?;
             protect(task, range, VmProtection::READ | VmProtection::EXECUTE)?;
         }
-        Ok(relocate(self.plan.entry))
+        Ok(MappedImage {
+            entry: relocate(self.plan.entry),
+            header: relocate(self.plan.virtual_range.start),
+            end: base + self.plan.virtual_range.len(),
+        })
     }
+}
+
+struct MappedImage {
+    entry: usize,
+    header: usize,
+    end: usize,
 }
 
 pub(super) fn load<P: ShimPlatform>(
     task: &Task<P>,
     path: &str,
     image: Option<&[u8]>,
+    dyld: Option<&[u8]>,
     argv: &[CString],
     envp: &[CString],
 ) -> Result<PtRegs, MachoLoaderError> {
@@ -198,9 +248,49 @@ pub(super) fn load<P: ShimPlatform>(
         owned_image = read_image(task, path)?;
         &owned_image
     };
-    let entry = Image::prepare(data)?.map(task)?;
-    let apple = [CString::new(format!("executable_path={path}"))
-        .map_err(|_| MachoLoaderError::Invalid("executable path"))?];
+    let image = Image::prepare(data)?;
+    let uses_dyld = image.plan.uses_dyld;
+    if image.plan.is_dyld {
+        return Err(MachoLoaderError::Unsupported(
+            "dyld cannot be the main executable",
+        ));
+    }
+    let main = image.map(task)?;
+    let dyld = match (uses_dyld, dyld) {
+        (false, None) => None,
+        (false, Some(_)) => {
+            return Err(MachoLoaderError::Unsupported(
+                "dyld supplied for static executable",
+            ));
+        }
+        (true, None) => {
+            return Err(MachoLoaderError::Unsupported(
+                "dynamic executable requires privately mapped dyld",
+            ));
+        }
+        (true, Some(bytes)) => {
+            let image = Image::prepare(bytes)?;
+            if !image.plan.is_dyld {
+                return Err(MachoLoaderError::Invalid(
+                    "supplied dyld is not MH_DYLINKER",
+                ));
+            }
+            Some(image.map(task)?)
+        }
+    };
+    if let Some(dyld) = &dyld {
+        *task.global.privately_mapped_dyld_range.lock() = Some(dyld.header..dyld.end);
+    }
+    let mut apple = vec![
+        CString::new(format!("executable_path={path}"))
+            .map_err(|_| MachoLoaderError::Invalid("executable path"))?,
+    ];
+    if uses_dyld {
+        apple.push(
+            CString::new(format!("executable_mh=0x{:x}", main.header))
+                .map_err(|_| MachoLoaderError::Invalid("executable header"))?,
+        );
+    }
     let stack_base = reserve(task, STACK_SIZE + PAGE_SIZE)? + PAGE_SIZE;
     // Keep the guard page inaccessible; this fixed-size stack must not use IS_STACK grow-down.
     protect(
@@ -208,9 +298,15 @@ pub(super) fn load<P: ShimPlatform>(
         stack_base..stack_base + STACK_SIZE,
         VmProtection::READ | VmProtection::WRITE,
     )?;
-    let sp = stack::initialize::<P>(stack_base, argv, envp, &apple)?;
+    let sp = stack::initialize::<P>(
+        stack_base,
+        argv,
+        envp,
+        &apple,
+        dyld.as_ref().map(|_| main.header),
+    )?;
     Ok(PtRegs {
-        pc: entry,
+        pc: dyld.as_ref().map_or(main.entry, |dyld| dyld.entry),
         sp,
         ..PtRegs::default()
     })

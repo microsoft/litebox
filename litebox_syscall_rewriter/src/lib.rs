@@ -199,7 +199,7 @@ impl RewriteOptions {
 
     /// Rewrite Darwin syscalls while leaving TPIDRRO reads native.
     ///
-    /// Standalone dyld's protected-stack machinery must remain associated with
+    /// Privately mapped dyld's protected-stack machinery must remain associated with
     /// the host thread that is actually executing it.
     pub const fn macos_native_guest_tpidrro() -> Self {
         Self {

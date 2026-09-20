@@ -1,0 +1,225 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Patches for the privately mapped dyld used with the host shared cache.
+//!
+//! These signatures are intentionally fail-closed. A macOS update that changes
+//! the relevant code produces `MachoLoaderError::Rewrite` instead of silently
+//! executing a partially compatible dyld.
+
+use crate::MachoLoaderError;
+use core::ops::Range;
+use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _};
+
+const AARCH64_NOP: u32 = 0xd503_201f;
+const AARCH64_RET: u32 = 0xd65f_03c0;
+const AARCH64_BL_OPCODE: u32 = 0b100101;
+const AARCH64_BRANCH_IMMEDIATE_MASK: u32 = 0x03ff_ffff;
+
+pub(super) fn patch(
+    data: &mut [u8],
+    executable_ranges: &[Range<usize>],
+) -> Result<(), MachoLoaderError> {
+    disable_restart_into_cached_dyld(data, executable_ranges)?;
+    suppress_shared_cache_initializers(data, executable_ranges)?;
+    redirect_process_exit(data, executable_ranges)?;
+    Ok(())
+}
+
+/// `restartWithDyldInCache` normally switches SP and branches into cached dyld.
+/// The cache belongs to this process's host runtime, so the guest must continue
+/// in its private dyld mapping instead.
+fn disable_restart_into_cached_dyld(
+    data: &mut [u8],
+    executable_ranges: &[Range<usize>],
+) -> Result<(), MachoLoaderError> {
+    const MOV_SP_X0: u32 = 0x9100_001f;
+    const BR_X3: u32 = 0xd61f_0060;
+    const BR_X4: u32 = 0xd61f_0080;
+
+    let offset = unique_instruction_match(data, executable_ranges, 2, |offset| {
+        word(data, offset) == MOV_SP_X0 && matches!(word(data, offset + 4), BR_X3 | BR_X4)
+    })?;
+    write_word(data, offset, AARCH64_RET);
+    write_word(data, offset + 4, AARCH64_NOP);
+    Ok(())
+}
+
+/// Host cache initializers have already run and are not safe to run again in
+/// the forked guest runner. Keep dyld's state bookkeeping but skip the call to
+/// `findAndRunAllInitializers`.
+fn suppress_shared_cache_initializers(
+    data: &mut [u8],
+    executable_ranges: &[Range<usize>],
+) -> Result<(), MachoLoaderError> {
+    const PREFIX: [u32; 4] = [0x7940_5808, 0x3600_0088, 0xaa14_03e0, 0xaa13_03e1];
+
+    let offset = unique_instruction_match(data, executable_ranges, 5, |offset| {
+        PREFIX
+            .iter()
+            .enumerate()
+            .all(|(index, expected)| word(data, offset + index * 4) == *expected)
+            && is_bl(word(data, offset + 16))
+    })?;
+    write_word(data, offset + 16, AARCH64_NOP);
+    Ok(())
+}
+
+/// Redirect dyld's non-simulator `LibSystemHelpers::exit` call to dyld's own
+/// rewritten `___exit` stub. This terminates the guest task through the shim
+/// instead of terminating the host runner from an unrewritten cache function.
+fn redirect_process_exit(
+    data: &mut [u8],
+    executable_ranges: &[Range<usize>],
+) -> Result<(), MachoLoaderError> {
+    const CBZ_W0_PLUS_12: u32 = 0x3400_0060;
+    const MOV_X0_X19: u32 = 0xaa13_03e0;
+    const LDR_X8_SP_464: u32 = 0xf940_ebe8;
+    const ADD_X0_X8_160: u32 = 0x9102_8100;
+    const LDR_X8_SP_488: u32 = 0xf940_f7e8;
+    const ADD_X0_X8_176: u32 = 0x9102_c100;
+    const MOV_X1_X19: u32 = 0xaa13_03e1;
+
+    let offset = unique_instruction_match(data, executable_ranges, 7, |offset| {
+        let simulator_exit = word(data, offset + 8);
+        let helper_exit = word(data, offset + 24);
+        let helper_address = (word(data, offset + 12), word(data, offset + 16));
+        word(data, offset) == CBZ_W0_PLUS_12
+            && word(data, offset + 4) == MOV_X0_X19
+            && is_bl(simulator_exit)
+            && matches!(
+                helper_address,
+                (LDR_X8_SP_464, ADD_X0_X8_160) | (LDR_X8_SP_488, ADD_X0_X8_176)
+            )
+            && word(data, offset + 20) == MOV_X1_X19
+            && is_bl(helper_exit)
+    })?;
+    let simulator_exit = word(data, offset + 8);
+    let immediate = sign_extend_branch(simulator_exit & AARCH64_BRANCH_IMMEDIATE_MASK);
+    let redirected = (AARCH64_BL_OPCODE << 26)
+        | ((immediate - 4).reinterpret_as_unsigned() & AARCH64_BRANCH_IMMEDIATE_MASK);
+    write_word(data, offset + 12, MOV_X0_X19);
+    write_word(data, offset + 16, AARCH64_NOP);
+    write_word(data, offset + 20, AARCH64_NOP);
+    write_word(data, offset + 24, redirected);
+    Ok(())
+}
+
+fn unique_instruction_match(
+    data: &[u8],
+    executable_ranges: &[Range<usize>],
+    words: usize,
+    mut matches: impl FnMut(usize) -> bool,
+) -> Result<usize, MachoLoaderError> {
+    let width = words
+        .checked_mul(size_of::<u32>())
+        .ok_or(MachoLoaderError::Rewrite)?;
+    let mut found = None;
+    for range in executable_ranges {
+        let start = range
+            .start
+            .checked_next_multiple_of(size_of::<u32>())
+            .ok_or(MachoLoaderError::Rewrite)?;
+        let end = range.end.min(data.len());
+        let Some(last) = end.checked_sub(width).filter(|&last| last >= start) else {
+            continue;
+        };
+        for offset in (start..=last).step_by(size_of::<u32>()) {
+            if matches(offset) && found.replace(offset).is_some() {
+                return Err(MachoLoaderError::Rewrite);
+            }
+        }
+    }
+    found.ok_or(MachoLoaderError::Rewrite)
+}
+
+fn word(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        data[offset..offset + 4]
+            .try_into()
+            .expect("bounded signature"),
+    )
+}
+
+fn write_word(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn is_bl(instruction: u32) -> bool {
+    instruction >> 26 == AARCH64_BL_OPCODE
+}
+
+fn sign_extend_branch(immediate: u32) -> i32 {
+    let immediate = immediate.reinterpret_as_signed();
+    if immediate & (1 << 25) != 0 {
+        immediate | !AARCH64_BRANCH_IMMEDIATE_MASK.reinterpret_as_signed()
+    } else {
+        immediate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    fn code(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn cached_dyld_restart_accepts_x3_and_x4() {
+        for branch in [0xd61f_0060, 0xd61f_0080] {
+            let mut data = code(&[0x9100_001f, branch]);
+            let executable_range = 0..data.len();
+            disable_restart_into_cached_dyld(&mut data, core::slice::from_ref(&executable_range))
+                .unwrap();
+            assert_eq!(word(&data, 0), AARCH64_RET);
+            assert_eq!(word(&data, 4), AARCH64_NOP);
+        }
+    }
+
+    #[test]
+    fn restart_patch_is_unique_and_executable() {
+        let signature = [0x9100_001f, 0xd61f_0060];
+        let mut data = code(&[signature[0], signature[1], signature[0], signature[1]]);
+        disable_restart_into_cached_dyld(&mut data, core::slice::from_ref(&(0..8))).unwrap();
+        assert_eq!(word(&data, 0), AARCH64_RET);
+        assert_eq!(word(&data, 8), signature[0]);
+
+        let mut duplicate = code(&[signature[0], signature[1], signature[0], signature[1]]);
+        let executable_range = 0..duplicate.len();
+        assert!(matches!(
+            disable_restart_into_cached_dyld(
+                &mut duplicate,
+                core::slice::from_ref(&executable_range)
+            ),
+            Err(MachoLoaderError::Rewrite)
+        ));
+        assert_eq!(
+            duplicate,
+            code(&[signature[0], signature[1], signature[0], signature[1]])
+        );
+    }
+
+    #[test]
+    fn process_exit_accepts_known_helper_layouts() {
+        for (load, add) in [(0xf940_ebe8, 0x9102_8100), (0xf940_f7e8, 0x9102_c100)] {
+            let mut data = code(&[
+                0x3400_0060,
+                0xaa13_03e0,
+                0x9400_0008,
+                load,
+                add,
+                0xaa13_03e1,
+                0x9400_0008,
+            ]);
+            let executable_range = 0..data.len();
+            redirect_process_exit(&mut data, core::slice::from_ref(&executable_range)).unwrap();
+            assert_eq!(word(&data, 12), 0xaa13_03e0);
+            assert_eq!(word(&data, 16), AARCH64_NOP);
+            assert_eq!(word(&data, 20), AARCH64_NOP);
+            assert_eq!(word(&data, 24), 0x9400_0004);
+        }
+    }
+}

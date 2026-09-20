@@ -61,7 +61,8 @@ impl<P: ShimPlatform> FilesState<P> {
     }
 
     pub(crate) fn close(&self, fd: i32) -> Result<(), Errno> {
-        let fd = self.consume(usize::try_from(fd).map_err(|_| Errno::EBADF)?)?;
+        let raw = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let fd = self.consume(raw)?;
         self.litebox.close_file(&fd).map_err(|_| Errno::EIO)
     }
 
@@ -106,12 +107,23 @@ impl<P: ShimPlatform> Task<P> {
         if path.as_bytes().contains(&0) {
             return Err(Errno::EINVAL);
         }
+        if flags.bits() & !OpenFlags::all().bits() != 0 {
+            return Err(Errno::EINVAL);
+        }
         let access = match flags.bits() & 3 {
             0 => FileAccessMode::ReadOnly,
             1 => FileAccessMode::WriteOnly,
             2 => FileAccessMode::ReadWrite,
             _ => return Err(Errno::EINVAL),
         };
+        // Bootstrap-only alias: the runner exposes its writable stderr as the console.
+        if path == "/dev/console" {
+            return if access == FileAccessMode::WriteOnly {
+                self.sys_dup(2)
+            } else {
+                Err(Errno::EACCES)
+            };
+        }
         let mut open_flags = FileOpenFlags::NONE;
         for (guest, broker) in [
             (OpenFlags::CREAT, FileOpenFlags::CREATE),
@@ -120,12 +132,18 @@ impl<P: ShimPlatform> Task<P> {
             (OpenFlags::APPEND, FileOpenFlags::APPEND),
             (OpenFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
             (OpenFlags::NOFOLLOW, FileOpenFlags::NO_FOLLOW),
+            // TODO: Enforce NOFOLLOW_ANY for every component in the broker.
+            // Dyld startup currently requires the strongest available no-follow rule.
+            (OpenFlags::NOFOLLOW_ANY, FileOpenFlags::NO_FOLLOW),
             (OpenFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
             (OpenFlags::DIRECTORY, FileOpenFlags::DIRECTORY),
         ] {
             if flags.contains(guest) {
                 open_flags = open_flags.union(broker);
             }
+        }
+        if path.ends_with('/') {
+            open_flags = open_flags.union(FileOpenFlags::DIRECTORY);
         }
         let mut context = litebox::fs::Context::new();
         context.set_acting_user(FileUser {
@@ -295,6 +313,9 @@ mod tests {
     };
     use litebox_platform_macos_userland::MacosUserland as Platform;
 
+    const O_SHLOCK: i32 = 0x10;
+    const O_EXLOCK: i32 = 0x20;
+
     #[test]
     fn inherited_litebox_files_use_the_syscall_dispatcher() {
         let platform = Platform::new();
@@ -361,6 +382,7 @@ mod tests {
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
+            thread: crate::ThreadState { id: 1u64 << 32 },
         };
         // SAFETY: a fresh, non-fixed mapping owned by this task.
         let buf = unsafe {
@@ -491,6 +513,12 @@ mod tests {
         assert_eq!(invoke(nr::READ, reopened, 3), Ok(3));
         assert_eq!(&*buf.to_owned_slice(3).unwrap(), b"new");
         assert_eq!(invoke(nr::CLOSE_NOCANCEL, reopened, 0), Ok(0));
+        for unsupported in [O_SHLOCK, O_EXLOCK] {
+            assert_eq!(
+                open(nr::OPEN, path, OpenFlags::from_bits_retain(unsupported), 0,),
+                Err(Errno::EINVAL)
+            );
+        }
         assert_eq!(open(nr::OPEN, 0, OpenFlags::RDONLY, 0), Err(Errno::EFAULT));
         buf.copy_from_slice(0, &[b'x'; PATH_MAX]).unwrap();
         assert_eq!(
@@ -502,6 +530,14 @@ mod tests {
             open(nr::OPEN, buf.as_usize(), OpenFlags::RDONLY, 0),
             Err(Errno::ENOENT)
         );
+        assert_eq!(
+            task.sys_open("/data/", OpenFlags::RDONLY, FileMode::empty()),
+            Err(Errno::ENOTDIR)
+        );
+        let relative = task
+            .sys_open("data", OpenFlags::RDONLY, FileMode::empty())
+            .unwrap();
+        task.sys_close(i32::try_from(relative).unwrap()).unwrap();
 
         let directory = task
             .sys_open("/", OpenFlags::RDONLY, FileMode::empty())
