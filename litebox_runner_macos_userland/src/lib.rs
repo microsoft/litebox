@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Run static, position-independent AArch64 Mach-O programs on Apple Silicon.
+//! Run AArch64 Mach-O programs on Apple Silicon.
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use anyhow::{Context as _, Result, bail};
@@ -15,11 +15,9 @@ use std::path::PathBuf;
 use std::{ffi::CString, io::Read as _};
 
 #[derive(Parser, Debug)]
-#[command(about = "Run self-contained static AArch64 Mach-O programs (no dyld)")]
+#[command(about = "Run AArch64 Mach-O programs with a private boot-local dyld cache")]
 pub struct CliArgs {
     /// Host path of a thin or universal Mach-O, followed by guest arguments.
-    /// Accepts raw or AOT-rewritten static images. No host filesystem passthrough,
-    /// dynamic linking, or shared-cache support.
     #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
@@ -31,6 +29,7 @@ pub struct CliArgs {
     pub test_mmap_image: Option<PathBuf>,
 }
 
+mod live_cache;
 #[cfg(feature = "test-broker")]
 mod test_broker;
 
@@ -49,7 +48,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     if data.len() > litebox_common_macos::loader::MAX_IMAGE_SIZE {
         bail!("Mach-O file larger than 256 MiB: {path}");
     }
-    let argv = cli_args
+    let mut argv = cli_args
         .program_and_arguments
         .iter()
         .map(|s| CString::new(s.as_bytes()))
@@ -61,6 +60,35 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         .map(|s| CString::new(s.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
         .context("NUL in environment entry")?;
+    let dynamic = litebox_common_macos::loader::arm64_slice(&data)
+        .ok()
+        .and_then(|image| litebox_common_macos::loader::MachoParsedFile::parse(image).ok())
+        .is_some_and(|image| image.uses_dyld);
+    #[cfg(feature = "test-broker")]
+    if dynamic {
+        argv[0] = CString::new("/executable").context("invalid guest executable path")?;
+    }
+    litebox_platform_macos_userland::set_darwin_private_thread_state(dynamic);
+    if dynamic {
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Err(std::io::Error::last_os_error()).context("forking macOS guest runner");
+        }
+        if pid > 0 {
+            let mut status = 0;
+            if unsafe { libc::waitpid(pid, &raw mut status, 0) } != pid {
+                return Err(std::io::Error::last_os_error())
+                    .context("waiting for macOS guest runner");
+            }
+            if libc::WIFEXITED(status) {
+                return Ok(libc::WEXITSTATUS(status));
+            }
+            if libc::WIFSIGNALED(status) {
+                return Ok(128 + libc::WTERMSIG(status));
+            }
+            bail!("unexpected macOS guest child status {status:#x}");
+        }
+    }
     let platform = MacosUserland::new();
     #[cfg(not(feature = "test-broker"))]
     let builder = MacosShimBuilder::new(platform);
@@ -72,18 +100,79 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             .map(std::fs::read)
             .transpose()
             .context("reading mmap test image")?;
-        test_broker::setup(platform, data, mmap_image.as_deref())?
+        test_broker::setup(platform, data.clone(), mmap_image.as_deref())?
     };
+    let shim = builder.build();
+    let shared_cache_instance = dynamic
+        .then(live_cache::PrivateSharedCacheInstance::instantiate)
+        .transpose()
+        .context("instantiating private dyld cache")?;
     #[cfg(feature = "test-broker")]
-    let program = builder
-        .build()
-        .load_program(TaskParams::default(), "/executable", argv, envp);
+    let program = if let Some(cache) = &shared_cache_instance {
+        shim.load_program_with_dyld(
+            TaskParams::default(),
+            "/executable",
+            &data,
+            &cache.dyld,
+            argv,
+            envp,
+        )
+    } else {
+        shim.load_program(TaskParams::default(), "/executable", argv, envp)
+    };
     #[cfg(not(feature = "test-broker"))]
-    let program =
-        builder
-            .build()
-            .load_program_from_bytes(TaskParams::default(), path, &data, argv, envp);
+    let program = if let Some(cache) = &shared_cache_instance {
+        shim.load_program_with_dyld(TaskParams::default(), path, &data, &cache.dyld, argv, envp)
+    } else {
+        shim.load_program_from_bytes(TaskParams::default(), path, &data, argv, envp)
+    };
     let program = program.context("loading Mach-O")?;
+    if let Some(cache) = &shared_cache_instance {
+        let regions: Vec<_> = cache
+            .regions
+            .iter()
+            .map(|region| litebox_shim_macos::LiveSharedCacheRegion {
+                range: region.address..region.address + region.length,
+                writable_alias: region.alias.address(),
+                code_ranges: &region.code_ranges,
+                native_tpidrro_ranges: &region.native_tpidrro_ranges,
+            })
+            .collect();
+        let layout = litebox_shim_macos::LiveSharedCache {
+            range: cache.range.clone(),
+            mappings: &cache.mappings,
+            executable_regions: &regions,
+            trampoline: litebox_shim_macos::LiveSharedCacheTrampoline {
+                range: cache.trampoline_address..cache.trampoline_address + cache.trampoline_length,
+                writable_alias: cache.trampoline.address(),
+            },
+        };
+        program
+            .adopt_live_shared_cache(&layout)
+            .context("rewriting private dyld cache")?;
+    }
+    if dynamic {
+        litebox_platform_macos_userland::suspend_exception_handlers_for_cache_rewrite()
+            .context("suspending exception handlers for cache rewrite")?;
+    }
+    let tpro_ranges = shared_cache_instance
+        .as_ref()
+        .map(|cache| cache.tpro_ranges.clone())
+        .unwrap_or_default();
+    shared_cache_instance
+        .map(|cache| {
+            // SAFETY: this is the isolated fork child, exception handlers are
+            // suspended, and no other thread may enter the cache during publication.
+            unsafe { cache.commit() }
+        })
+        .transpose()
+        .context("publishing private dyld cache")?;
+    for range in tpro_ranges {
+        // SAFETY: the isolated child exclusively controls these cache ranges
+        // while handlers and guest execution remain stopped.
+        unsafe { litebox_platform_macos_userland::make_shared_cache_range_writable(range) }
+            .map_err(|error| anyhow::anyhow!("making dyld TPRO writable: {error:?}"))?;
+    }
     let litebox_shim_macos::LoadedProgram {
         entrypoints,
         process,
@@ -96,7 +185,18 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     }
     #[cfg(feature = "test-broker")]
     test_broker::flush_output(&stdio)?;
-    process
+    let status = process
         .exit_status()
-        .context("guest stopped without an exit status")
+        .context("guest stopped without an exit status")?;
+    if dynamic {
+        unsafe {
+            core::arch::asm!(
+                "svc #0x80",
+                in("x0") status,
+                in("x16") 1usize,
+                options(noreturn),
+            );
+        }
+    }
+    Ok(status)
 }

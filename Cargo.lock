@@ -1867,6 +1867,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "litebox",
  "litebox_broker_core",
  "litebox_broker_host",
@@ -1876,6 +1877,7 @@ dependencies = [
  "litebox_platform_macos_userland",
  "litebox_shim_macos",
  "litebox_syscall_rewriter",
+ "object",
  "tempfile",
 ]
 
