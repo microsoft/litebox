@@ -108,6 +108,19 @@ fn footer(bytes: &[u8]) -> (usize, u64, usize) {
 }
 
 #[test]
+fn arm64e_images_and_capability_bits_are_supported() {
+    for subtype in [
+        macho::CPU_SUBTYPE_ARM64E,
+        macho::CPU_SUBTYPE_ARM64E | macho::CPU_SUBTYPE_PTRAUTH_ABI,
+    ] {
+        let mut input = image(&[SVC]);
+        put32(&mut input, 8, subtype);
+        CodeMetadata::parse(&input).unwrap();
+        hook_syscalls_in_macho(&input, None).unwrap();
+    }
+}
+
+#[test]
 fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let mut input = image(&[SVC, MRS, SVC, NOP]);

@@ -114,8 +114,8 @@ pub fn is_thin_arm64_macho_header(data: &[u8]) -> bool {
     header.is_little_endian()
         && header.cputype(LE) == macho::CPU_TYPE_ARM64
         && matches!(
-            header.cpusubtype(LE),
-            macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8
+            header.cpusubtype(LE) & !macho::CPU_SUBTYPE_MASK,
+            macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8 | macho::CPU_SUBTYPE_ARM64E
         )
 }
 
@@ -215,13 +215,15 @@ impl MachoParsedFile {
         if !header.is_little_endian()
             || header.cputype(LE) != macho::CPU_TYPE_ARM64
             || !matches!(
-                header.cpusubtype(LE),
-                macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8
+                header.cpusubtype(LE) & !macho::CPU_SUBTYPE_MASK,
+                macho::CPU_SUBTYPE_ARM64_ALL
+                    | macho::CPU_SUBTYPE_ARM64_V8
+                    | macho::CPU_SUBTYPE_ARM64E
             )
             || header.filetype(LE) != macho::MH_EXECUTE
         {
             return Err(Unsupported(
-                "unexpected file type or architecture (requires arm64, not arm64e)",
+                "unexpected file type or architecture (requires arm64/arm64e, executable only)",
             ));
         }
         if header.flags(LE) & (macho::MH_DYLDLINK | macho::MH_DYLIB_IN_CACHE) != 0 {
@@ -376,17 +378,14 @@ impl MachoParsedFile {
     }
 }
 
-/// Return the container-relative range of the unique arm64 (not arm64e) slice.
+/// Return the container-relative range of the selected arm64 or arm64e slice.
 pub fn arm64_slice_range(data: &[u8]) -> Result<Range<usize>, MachoLoaderError> {
     let slice = arm64_slice(data)?;
     let offset = slice.as_ptr().addr() - data.as_ptr().addr();
     Ok(offset..offset + slice.len())
 }
 
-/// Select the unique arm64 (not arm64e) slice, or return thin input unchanged.
-///
-/// Pass the returned slice to the parser and rewriter: their file offsets are
-/// slice-relative. Malformed universal headers are rejected, not treated as thin.
+/// Select an arm64 or arm64e slice, or return thin input unchanged.
 pub fn arm64_slice(data: &[u8]) -> Result<&[u8], MachoLoaderError> {
     use MachoLoaderError::{Invalid, Unsupported};
     const HEADER_SIZE: usize = size_of::<macho::FatHeader>();
@@ -442,7 +441,10 @@ fn select_arm64<'a, A: object::read::macho::FatArch>(
     table_end: usize,
 ) -> Result<&'a [u8], MachoLoaderError> {
     use MachoLoaderError::{Invalid, Unsupported};
-    let mut selected = None;
+    let mut arm64 = None;
+    let mut arm64e = None;
+    let mut ambiguous_arm64 = false;
+    let mut ambiguous_arm64e = false;
     for arch in arches {
         let offset = usize::try_from(arch.offset().into()).map_err(|_| Invalid("fat offset"))?;
         let size = usize::try_from(arch.size().into()).map_err(|_| Invalid("fat size"))?;
@@ -453,19 +455,26 @@ fn select_arm64<'a, A: object::read::macho::FatArch>(
         if offset < table_end || size == 0 || !offset.is_multiple_of(align) || end > data.len() {
             return Err(Invalid("fat slice bounds/alignment"));
         }
-        if arch.cputype() == macho::CPU_TYPE_ARM64
-            && matches!(
-                arch.cpusubtype(),
-                macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8
-            )
-        {
-            if selected.is_some() {
-                return Err(Invalid("ambiguous arm64 slices"));
+        if arch.cputype() != macho::CPU_TYPE_ARM64 {
+            continue;
+        }
+        let slice = &data[offset..end];
+        match arch.cpusubtype() & !macho::CPU_SUBTYPE_MASK {
+            macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8 => {
+                ambiguous_arm64 |= arm64.replace(slice).is_some();
             }
-            selected = Some(&data[offset..end]);
+            macho::CPU_SUBTYPE_ARM64E => {
+                ambiguous_arm64e |= arm64e.replace(slice).is_some();
+            }
+            _ => {}
         }
     }
-    selected.ok_or(Unsupported("universal binary has no supported arm64 slice"))
+    if ambiguous_arm64 || (arm64.is_none() && ambiguous_arm64e) {
+        return Err(Invalid("ambiguous arm64 slices"));
+    }
+    arm64
+        .or(arm64e)
+        .ok_or(Unsupported("universal binary has no supported arm64 slice"))
 }
 
 #[cfg(test)]
@@ -549,6 +558,69 @@ mod tests {
         data
     }
 
+    fn image_with_subtype(subtype: u32) -> Vec<u8> {
+        let mut data = image();
+        put32(&mut data, offset_of!(Header, cpusubtype), subtype);
+        data
+    }
+
+    fn fat32(subtypes: &[u32]) -> Vec<u8> {
+        use object::{endian::U32, pod::bytes_of};
+
+        let header = macho::FatHeader {
+            magic: U32::new(BE, macho::FAT_MAGIC),
+            nfat_arch: U32::new(BE, u32::try_from(subtypes.len()).unwrap()),
+        };
+        let mut fat = bytes_of(&header).to_vec();
+        for (index, subtype) in subtypes.iter().copied().enumerate() {
+            let offset = (index + 1) * PAGE_SIZE;
+            let arch = macho::FatArch32 {
+                cputype: U32::new(BE, macho::CPU_TYPE_ARM64),
+                cpusubtype: U32::new(BE, subtype),
+                offset: U32::new(BE, u32::try_from(offset).unwrap()),
+                size: U32::new(BE, u32::try_from(PAGE_SIZE).unwrap()),
+                align: U32::new(BE, PAGE_SIZE.ilog2()),
+            };
+            fat.extend_from_slice(bytes_of(&arch));
+        }
+        for subtype in subtypes {
+            fat.resize(fat.len().next_multiple_of(PAGE_SIZE), 0);
+            fat.extend_from_slice(&image_with_subtype(*subtype));
+        }
+        fat
+    }
+
+    #[test]
+    fn mixed_arm64_fat_binaries_prefer_plain_arm64() {
+        for subtypes in [
+            [macho::CPU_SUBTYPE_ARM64E, macho::CPU_SUBTYPE_ARM64_ALL],
+            [macho::CPU_SUBTYPE_ARM64_V8, macho::CPU_SUBTYPE_ARM64E],
+        ] {
+            let fat = fat32(&subtypes);
+            let plain_index = subtypes
+                .iter()
+                .position(|subtype| *subtype != macho::CPU_SUBTYPE_ARM64E)
+                .unwrap();
+            let start = (plain_index + 1) * PAGE_SIZE;
+            assert_eq!(arm64_slice_range(&fat).unwrap(), start..start + PAGE_SIZE);
+        }
+
+        assert!(matches!(
+            arm64_slice(&fat32(&[
+                macho::CPU_SUBTYPE_ARM64_ALL,
+                macho::CPU_SUBTYPE_ARM64_V8,
+            ])),
+            Err(MachoLoaderError::Invalid("ambiguous arm64 slices"))
+        ));
+        assert!(matches!(
+            arm64_slice(&fat32(&[
+                macho::CPU_SUBTYPE_ARM64E,
+                macho::CPU_SUBTYPE_ARM64E,
+            ])),
+            Err(MachoLoaderError::Invalid("ambiguous arm64 slices"))
+        ));
+    }
+
     #[test]
     fn universal_slices_are_bounded_and_architecture_specific() {
         use object::{
@@ -623,7 +695,7 @@ mod tests {
             }
             for (offset, value) in [
                 (COUNT, u32::MAX), // table multiplication / bounds
-                (HEADER_SIZE + subtype, macho::CPU_SUBTYPE_ARM64E),
+                (HEADER_SIZE + subtype, u32::MAX),
                 (HEADER_SIZE + offset_field, u32::MAX), // slice past EOF
                 (HEADER_SIZE + alignment, usize::BITS), // alignment shift overflow
             ] {
