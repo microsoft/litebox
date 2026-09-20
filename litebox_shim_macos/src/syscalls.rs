@@ -4,12 +4,15 @@
 //! Typed BSD syscall implementations.
 
 use crate::{ShimPlatform, Task};
+use core::sync::atomic::Ordering;
 use litebox::{
     platform::page_mgmt::MemoryRegionPermissions as Permissions, utils::TruncateExt as _,
 };
 use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers::UserPtrMut};
 
+pub(crate) mod compat;
 pub(crate) mod file;
+pub(crate) mod mach;
 pub(crate) mod mm;
 
 impl<P: ShimPlatform> Task<P> {
@@ -34,6 +37,33 @@ impl<P: ShimPlatform> Task<P> {
     }
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.params.egid
+    }
+
+    pub(crate) fn sys_shared_region_check_np(
+        &self,
+        start_address: UserPtrMut<usize>,
+    ) -> Result<(), litebox_common_macos::errno::Errno> {
+        use litebox_common_macos::errno::Errno;
+
+        let base = self.global.shared_cache_base.load(Ordering::Acquire);
+        if base == 0 {
+            return Err(Errno::EINVAL);
+        }
+        if self
+            .check_user_buffer(
+                start_address.as_usize(),
+                size_of::<usize>(),
+                Permissions::WRITE,
+            )
+            .is_err()
+        {
+            // Current dyld probes with an all-ones sentinel after the cache is
+            // established. XNU reports success without copying out in this path.
+            return Ok(());
+        }
+        start_address
+            .write_at_offset::<P>(0, base)
+            .ok_or(Errno::EFAULT)
     }
 
     pub(crate) fn sys_mach_absolute_time(&self) -> usize {

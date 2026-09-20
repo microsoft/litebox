@@ -4,7 +4,7 @@
 extern crate std;
 
 use super::*;
-use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
+use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
 use litebox::platform::RawConstPointer as _;
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
@@ -34,6 +34,50 @@ fn syscall_return_registers_and_carry() {
     assert_eq!(ctx.regs[0], 1);
     assert_eq!(ctx.pstate, 0x9000_0000);
     assert_eq!(ctx.regs[1], 0x1234);
+}
+
+#[test]
+fn mach_vm_map_honors_current_protection() {
+    use litebox_common_macos::{
+        KernReturn, VmProtection,
+        syscall::{MachVmFlags, synthetic_port},
+        user_pointers::UserPtrMut,
+    };
+
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    // SAFETY: allocate fresh address-output storage in this idle guest task.
+    let slot = unsafe {
+        task.global.pm.create_writable_pages(
+            NonZeroAddress::new(Platform::TASK_ADDR_MIN),
+            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+            |_| Ok(0),
+        )
+    }
+    .unwrap();
+    let address = UserPtrMut::from_usize(slot.as_usize());
+    address.write_at_offset::<Platform>(0, 0usize).unwrap();
+
+    assert_eq!(
+        task.sys_mach_vm_map_compat(
+            synthetic_port::TASK_SELF,
+            address,
+            PAGE_SIZE,
+            MachVmFlags(MachVmFlags::ANYWHERE),
+            VmProtection::READ,
+        ),
+        usize::from(KernReturn::SUCCESS)
+    );
+    let mapped = address.read_at_offset::<Platform>(0).unwrap();
+    let flags = task
+        .global
+        .pm
+        .mappings()
+        .into_iter()
+        .find_map(|(range, flags)| range.contains(&mapped).then_some(flags))
+        .unwrap();
+    assert!(flags.contains(VmFlags::VM_READ));
+    assert!(!flags.contains(VmFlags::VM_WRITE));
 }
 
 #[test]

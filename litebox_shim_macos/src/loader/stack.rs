@@ -1,8 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Darwin static startup stack: `argc, argv[], NULL, envp[], NULL, apple[], NULL`,
-//! then strings. `LC_UNIXTHREAD` entry points receive `argc` at SP.
+//! Darwin startup stack.
+//!
+//! Static `LC_UNIXTHREAD` entry points receive `argc` at SP. For dyld, the
+//! kernel's `mainExecutable` Mach header pointer precedes `argc`.
 
 use super::{MachoLoaderError, STACK_SIZE};
 use crate::ShimPlatform;
@@ -17,8 +19,9 @@ pub(super) fn initialize<P: ShimPlatform>(
     argv: &[CString],
     envp: &[CString],
     apple: &[CString],
+    main_executable: Option<usize>,
 ) -> Result<usize, MachoLoaderError> {
-    let (bytes, offset) = stack_image(base, STACK_SIZE, argv, envp, apple)?;
+    let (bytes, offset) = stack_image(base, STACK_SIZE, argv, envp, apple, main_executable)?;
     UserPtrMut::from_usize(base + offset)
         .copy_from_slice::<P>(0, &bytes)
         .ok_or(MachoLoaderError::Memory)?;
@@ -31,6 +34,7 @@ fn stack_image(
     argv: &[CString],
     envp: &[CString],
     apple: &[CString],
+    main_executable: Option<usize>,
 ) -> Result<(Vec<u8>, usize), MachoLoaderError> {
     use MachoLoaderError::ArgumentsTooLarge;
     debug_assert!(base.is_multiple_of(STACK_ALIGNMENT));
@@ -40,6 +44,7 @@ fn stack_image(
         .checked_add(envp.len())
         .and_then(|n| n.checked_add(apple.len()))
         .and_then(|n| n.checked_add(FIXED_STACK_WORDS))
+        .and_then(|n| n.checked_add(usize::from(main_executable.is_some())))
         .and_then(|n| n.checked_mul(size_of::<usize>()))
         .ok_or(ArgumentsTooLarge)?;
     let string_bytes = argv
@@ -58,7 +63,11 @@ fn stack_image(
     // Unused stack bytes are already zero-filled by the anonymous mapping.
     let mut bytes = vec![0u8; size - sp];
     let mut position = bytes.len();
-    let mut pointers = vec![argv.len()];
+    let mut pointers = Vec::with_capacity(pointer_bytes / size_of::<usize>());
+    if let Some(main_executable) = main_executable {
+        pointers.push(main_executable);
+    }
+    pointers.push(argv.len());
     for strings in [argv, envp, apple] {
         for string in strings {
             let data = string.as_bytes_with_nul();
@@ -93,7 +102,7 @@ mod tests {
         ];
         let env = [CString::new("KEY=VALUE").unwrap()];
         let apple = [CString::new("executable_path=/program").unwrap()];
-        let (bytes, sp) = stack_image(BASE, SMALL_STACK_SIZE, &argv, &env, &apple).unwrap();
+        let (bytes, sp) = stack_image(BASE, SMALL_STACK_SIZE, &argv, &env, &apple, None).unwrap();
         assert_eq!(sp % STACK_ALIGNMENT, 0);
         let word_count = FIXED_STACK_WORDS + argv.len() + env.len() + apple.len();
         let words: Vec<_> = bytes[..word_count * size_of::<usize>()]
@@ -117,7 +126,7 @@ mod tests {
             index += 1;
         }
         assert_eq!(index, words.len());
-        let (large, large_sp) = stack_image(BASE, STACK_SIZE, &argv, &env, &apple).unwrap();
+        let (large, large_sp) = stack_image(BASE, STACK_SIZE, &argv, &env, &apple, None).unwrap();
         assert_eq!(large.len(), bytes.len());
         assert_eq!(large_sp + large.len(), STACK_SIZE);
         for (base, size) in [
@@ -125,11 +134,11 @@ mod tests {
             (usize::MAX & !(STACK_ALIGNMENT - 1), SMALL_STACK_SIZE),
         ] {
             assert!(matches!(
-                stack_image(base, size, &argv, &env, &apple),
+                stack_image(base, size, &argv, &env, &apple, None),
                 Err(MachoLoaderError::ArgumentsTooLarge)
             ));
         }
-        let (empty, sp) = stack_image(BASE, STACK_SIZE, &[], &[], &[]).unwrap();
+        let (empty, sp) = stack_image(BASE, STACK_SIZE, &[], &[], &[], None).unwrap();
         assert_eq!(empty, [0; FIXED_STACK_WORDS * size_of::<usize>()]);
         assert_eq!(sp, STACK_SIZE - empty.len());
     }

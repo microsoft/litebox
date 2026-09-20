@@ -91,6 +91,10 @@ pub struct MachoParsedFile {
     pub segments: Vec<Segment>,
     pub virtual_range: Range<usize>,
     pub entry: usize,
+    /// The image requests the system dynamic linker.
+    pub uses_dyld: bool,
+    /// The image itself is dyld (`MH_DYLINKER`).
+    pub is_dyld: bool,
 }
 
 /// AOT trampoline payload described by the rewriter's 64-bit footer.
@@ -223,15 +227,17 @@ impl MachoParsedFile {
                     | macho::CPU_SUBTYPE_ARM64_V8
                     | macho::CPU_SUBTYPE_ARM64E
             )
-            || header.filetype(LE) != macho::MH_EXECUTE
+            || !matches!(header.filetype(LE), macho::MH_EXECUTE | macho::MH_DYLINKER)
         {
             return Err(Unsupported(
-                "unexpected file type or architecture (requires arm64/arm64e, executable only)",
+                "unexpected file type or architecture (requires arm64/arm64e executable or dyld)",
             ));
         }
-        if header.flags(LE) & (macho::MH_DYLDLINK | macho::MH_DYLIB_IN_CACHE) != 0 {
-            return Err(Unsupported("dynamically linked/shared-cache image"));
+        if header.flags(LE) & macho::MH_DYLIB_IN_CACHE != 0 {
+            return Err(Unsupported("shared-cache image"));
         }
+        let is_dyld = header.filetype(LE) == macho::MH_DYLINKER;
+        let mut uses_dyld = false;
         let metadata_len = MACH_HEADER_SIZE
             .checked_add(
                 usize::try_from(header.sizeofcmds(LE)).map_err(|_| Invalid("load commands"))?,
@@ -245,6 +251,7 @@ impl MachoParsedFile {
             .map_err(|_| Invalid("load commands"))?;
         let mut segments = Vec::new();
         let mut entry = None;
+        let mut main_entry_file_offset = None;
         let mut command_bytes = 0usize;
         while let Some(command) = commands.next().map_err(|_| Invalid("load command"))? {
             let raw = command.raw_data();
@@ -257,15 +264,21 @@ impl MachoParsedFile {
                 .checked_add(raw.len())
                 .ok_or(Invalid("load commands"))?;
             match command.cmd() {
-                macho::LC_LOAD_DYLINKER
-                | macho::LC_LOAD_DYLIB
-                | macho::LC_LOAD_WEAK_DYLIB
-                | macho::LC_REEXPORT_DYLIB
-                | macho::LC_DYLD_INFO
-                | macho::LC_DYLD_INFO_ONLY
-                | macho::LC_DYLD_CHAINED_FIXUPS
-                | macho::LC_MAIN => {
-                    return Err(Unsupported("dynamic linking/LC_MAIN/fixups"));
+                macho::LC_LOAD_DYLINKER => uses_dyld = true,
+                macho::LC_MAIN => {
+                    let command = command
+                        .entry_point()
+                        .map_err(|_| Invalid("LC_MAIN"))?
+                        .ok_or(Invalid("LC_MAIN"))?;
+                    if main_entry_file_offset
+                        .replace(
+                            usize::try_from(command.entryoff.get(LE))
+                                .map_err(|_| Invalid("LC_MAIN entry offset"))?,
+                        )
+                        .is_some()
+                    {
+                        return Err(Invalid("multiple entry points"));
+                    }
                 }
                 macho::LC_UNIXTHREAD => {
                     let thread = UnixThreadCommand64::read_from_bytes(command.raw_data())
@@ -363,7 +376,26 @@ impl MachoParsedFile {
         if end - start > MAX_IMAGE_SIZE {
             return Err(Unsupported("image larger than 256 MiB"));
         }
-        let entry = entry.ok_or(Unsupported("missing or invalid entry point"))?;
+        if entry.is_some() && main_entry_file_offset.is_some() {
+            return Err(Invalid("multiple entry point forms"));
+        }
+        let entry = if let Some(file_offset) = main_entry_file_offset {
+            segments
+                .iter()
+                .find(|segment| {
+                    segment.protection.contains(VmProtection::EXECUTE)
+                        && segment.file_range.contains(&file_offset)
+                })
+                .and_then(|segment| {
+                    segment
+                        .virtual_range
+                        .start
+                        .checked_add(file_offset - segment.file_range.start)
+                })
+                .ok_or(Invalid("LC_MAIN entry outside executable segment"))?
+        } else {
+            entry.ok_or(Unsupported("missing or invalid entry point"))?
+        };
         if !entry.is_multiple_of(size_of::<u32>())
             || !segments.iter().any(|s| {
                 s.protection.contains(VmProtection::EXECUTE)
@@ -373,10 +405,17 @@ impl MachoParsedFile {
         {
             return Err(Invalid("entry outside file-backed executable segment"));
         }
+        if (is_dyld && uses_dyld)
+            || (!is_dyld && header.flags(LE) & macho::MH_DYLDLINK != 0 && !uses_dyld)
+        {
+            return Err(Invalid("inconsistent dynamic-linker commands"));
+        }
         Ok(Self {
             segments,
             virtual_range: start..end,
             entry,
+            uses_dyld,
+            is_dyld,
         })
     }
 }
