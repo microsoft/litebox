@@ -46,7 +46,12 @@ pub enum GuestAbi {
     Darwin = litebox_syscall_rewriter::aarch64::DARWIN_SVC_FRAME_BYTES as usize,
 }
 
-static GUEST_ABI: OnceLock<GuestAbi> = OnceLock::new();
+struct GuestConfiguration {
+    abi: GuestAbi,
+    darwin_private_thread_state: AtomicBool,
+}
+
+static GUEST_CONFIGURATION: OnceLock<GuestConfiguration> = OnceLock::new();
 
 /// Set the process-wide guest ABI before running or spawning guest threads.
 ///
@@ -54,16 +59,48 @@ static GUEST_ABI: OnceLock<GuestAbi> = OnceLock::new();
 /// Panics if a different ABI has already been configured.
 pub fn set_guest_abi(abi: GuestAbi) {
     assert_eq!(
-        *GUEST_ABI.get_or_init(|| abi),
+        GUEST_CONFIGURATION
+            .get_or_init(|| GuestConfiguration {
+                abi,
+                darwin_private_thread_state: AtomicBool::new(false),
+            })
+            .abi,
         abi,
         "guest ABI is already configured"
     );
 }
 
-fn guest_abi() -> GuestAbi {
-    *GUEST_ABI
+/// Give a Darwin guest private, natively initialized libSystem thread state.
+///
+/// Dynamic guests execute code from the dual-use host shared cache. A parked
+/// donor pthread supplies a valid pthread/TSD object that guest TPIDRRO gates
+/// can expose without allowing guest libc to mutate the runner thread's state.
+///
+/// # Panics
+///
+/// Panics if the guest ABI has not been configured yet.
+pub fn set_darwin_private_thread_state(enabled: bool) {
+    GUEST_CONFIGURATION
+        .get()
+        .expect("guest ABI must be configured before selecting Darwin thread state")
+        .darwin_private_thread_state
+        .store(enabled, Ordering::Release);
+}
+
+fn guest_configuration() -> &'static GuestConfiguration {
+    GUEST_CONFIGURATION
         .get()
         .expect("guest ABI must be configured before guest execution")
+}
+
+fn guest_abi() -> GuestAbi {
+    guest_configuration().abi
+}
+
+fn darwin_private_thread_state_enabled() -> bool {
+    guest_configuration()
+        .darwin_private_thread_state
+        .load(Ordering::Acquire)
 }
 
 /// Native page size on AArch64 macOS.
@@ -671,14 +708,17 @@ impl<const PAGE_SIZE: usize> litebox::mm::linux::VmemPageFaultHandler
 bitflags::bitflags! {
     #[repr(transparent)]
     struct MachVmFlags: i32 {
+        /// Mach uses zero to request the supplied fixed address.
         const FIXED = 0;
         const ANYWHERE = 0x0000_0001;
-        const RANDOM_ADDRESS = 0x0000_0008;
-        const OVERWRITE = 0x0000_4000;
     }
 }
 
 const MACH_PORT_NULL: u32 = 0;
+const VM_PROT_COPY: i32 = 0x10;
+const VM_INHERIT_NONE: u32 = 2;
+const BSD_SYS_MMAP: usize = 197;
+const BSD_SYS_MPROTECT: usize = 74;
 const VM_REGION_BASIC_INFO_64: i32 = 9;
 // sizeof(vm_region_basic_info_data_64_t) / sizeof(integer_t) on macOS. The
 // SDK declares this structure with 4-byte packing, making it 36 bytes.
@@ -691,6 +731,27 @@ unsafe extern "C" {
     fn mach_task_self() -> u32;
     fn mach_port_deallocate(task: u32, name: u32) -> KernReturn;
     fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: MachVmFlags) -> KernReturn;
+    fn mach_vm_deallocate(task: u32, address: u64, size: u64) -> KernReturn;
+    fn mach_vm_protect(
+        task: u32,
+        address: u64,
+        size: u64,
+        set_max: i32,
+        protection: i32,
+    ) -> KernReturn;
+    fn mach_vm_remap(
+        task: u32,
+        target: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: MachVmFlags,
+        source_task: u32,
+        source: u64,
+        copy: i32,
+        current_protection: *mut i32,
+        max_protection: *mut i32,
+        inheritance: u32,
+    ) -> KernReturn;
     fn mach_vm_region(
         task: u32,
         address: *mut u64,
@@ -709,6 +770,363 @@ unsafe extern "C" {
     ) -> KernReturn;
     fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
 }
+/// Failure while staging or publishing private dyld shared-cache mappings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedCacheMappingError {
+    /// A requested range is empty or not aligned to the native host page size.
+    Unaligned,
+    /// A Mach VM operation returned this kernel status.
+    Mach(KernReturn),
+    /// A raw BSD VM syscall returned this errno.
+    Errno(i32),
+    /// A fixed-address operation did not produce the requested address.
+    UnexpectedAddress,
+}
+
+impl core::fmt::Display for SharedCacheMappingError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unaligned => formatter.write_str("shared-cache range is not host-page aligned"),
+            Self::Mach(value) => write!(formatter, "Mach VM operation failed: {value:?}"),
+            Self::Errno(value) => write!(formatter, "Darwin VM syscall failed with errno {value}"),
+            Self::UnexpectedAddress => {
+                formatter.write_str("Darwin VM syscall returned the wrong address")
+            }
+        }
+    }
+}
+
+impl core::error::Error for SharedCacheMappingError {}
+
+/// Replace a host mapping with an anonymous private copy at the same address.
+///
+/// This is used by the macOS runner child to privatize shared-cache code before
+/// rewriting it. Keeping the virtual address unchanged preserves the cache's
+/// boot-local ASLR slide and arm64e pointer signatures.
+///
+/// # Safety
+///
+/// No thread may execute from `range` while it is replaced. The caller must
+/// ensure the range belongs to the current process's dyld shared cache.
+pub unsafe fn prepare_shared_cache_copy(
+    range: Range<usize>,
+) -> Result<SharedCacheWriteAlias, SharedCacheMappingError> {
+    if !is_page_aligned::<HOST_PAGE_SIZE>(&range) {
+        return Err(SharedCacheMappingError::Unaligned);
+    }
+    let mut alias = 0u64;
+    let mut current = 0;
+    let mut maximum = 0;
+    // SAFETY: output fields are writable, the source range is caller-validated,
+    // and Mach validates both task-relative address ranges.
+    let remapped = unsafe {
+        mach_vm_remap(
+            mach_task_self(),
+            &raw mut alias,
+            range.len() as u64,
+            0,
+            MachVmFlags::ANYWHERE,
+            mach_task_self(),
+            range.start as u64,
+            1, // private COW copy
+            &raw mut current,
+            &raw mut maximum,
+            VM_INHERIT_NONE,
+        )
+    };
+    if remapped != KernReturn::SUCCESS {
+        return Err(SharedCacheMappingError::Mach(remapped));
+    }
+    // VM_PROT_COPY permits a writable COW view of code-signed shared-cache
+    // pages while retaining executable provenance for publication.
+    // SAFETY: alias is the live mapping returned by mach_vm_remap above.
+    let writable = unsafe {
+        mach_vm_protect(
+            mach_task_self(),
+            alias,
+            range.len() as u64,
+            0,
+            libc::PROT_READ | libc::PROT_WRITE | VM_PROT_COPY,
+        )
+    };
+    if writable != KernReturn::SUCCESS {
+        // SAFETY: alias is still exclusively owned after the failed protection change.
+        unsafe { mach_vm_deallocate(mach_task_self(), alias, range.len() as u64) };
+        return Err(SharedCacheMappingError::Mach(writable));
+    }
+    let mut original = vec![0u8; range.len()];
+    // SAFETY: the caller guarantees range is a readable shared-cache mapping;
+    // original has exactly range.len() initialized writable bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            range.start as *const u8,
+            original.as_mut_ptr(),
+            range.len(),
+        );
+    }
+    Ok(SharedCacheWriteAlias {
+        address: usize::try_from(alias).map_err(|_| SharedCacheMappingError::UnexpectedAddress)?,
+        target: range.start,
+        len: range.len(),
+        original: Some(original),
+    })
+}
+
+/// Make shared-cache data privately writable in the forked runner.
+///
+/// # Safety
+///
+/// The caller must exclusively control `range`, ensure that it belongs to the
+/// current process's shared cache, and prevent concurrent access while its
+/// mapping protections are changed.
+pub unsafe fn make_shared_cache_range_writable(
+    range: Range<usize>,
+) -> Result<(), SharedCacheMappingError> {
+    if !is_page_aligned::<HOST_PAGE_SIZE>(&range) {
+        return Err(SharedCacheMappingError::Unaligned);
+    }
+    // SAFETY: the caller guarantees exclusive control and validity of range;
+    // Mach validates the task-relative mapping and requested protections.
+    let result = unsafe {
+        mach_vm_protect(
+            mach_task_self(),
+            range.start as u64,
+            range.len() as u64,
+            0,
+            libc::PROT_READ | libc::PROT_WRITE | VM_PROT_COPY,
+        )
+    };
+    if result == KernReturn::SUCCESS {
+        Ok(())
+    } else {
+        Err(SharedCacheMappingError::Mach(result))
+    }
+}
+
+/// Prepare a zero-filled private mapping that will replace `range` on commit.
+pub fn prepare_private_cache_mapping(
+    range: Range<usize>,
+) -> Result<SharedCacheWriteAlias, SharedCacheMappingError> {
+    if !is_page_aligned::<HOST_PAGE_SIZE>(&range) {
+        return Err(SharedCacheMappingError::Unaligned);
+    }
+    let len = range.len();
+    // mach_vm_allocate gives the anonymous object an RWX maximum protection.
+    // Keep its alias RW while the replacement is RX, avoiding a window where
+    // host code cannot execute its own libSystem stubs.
+    let mut temporary = 0u64;
+    // SAFETY: temporary is writable and ANYWHERE requests a fresh mapping.
+    let allocated = unsafe {
+        mach_vm_allocate(
+            mach_task_self(),
+            &raw mut temporary,
+            len as u64,
+            MachVmFlags::ANYWHERE,
+        )
+    };
+    if allocated != KernReturn::SUCCESS {
+        return Err(SharedCacheMappingError::Mach(allocated));
+    }
+    let address =
+        usize::try_from(temporary).map_err(|_| SharedCacheMappingError::UnexpectedAddress)?;
+    Ok(SharedCacheWriteAlias {
+        address,
+        target: range.start,
+        len,
+        original: None,
+    })
+}
+
+/// Invoke `mmap(MAP_FIXED)` without entering potentially replaced libSystem code.
+///
+/// # Safety
+///
+/// The caller must own the target range and permit its existing mapping to be
+/// destroyed. `address..address + length` must not overflow.
+unsafe fn raw_fixed_anonymous(address: usize, length: usize) -> Result<usize, i32> {
+    let result: usize;
+    let failed: usize;
+    // SAFETY: registers follow the Darwin mmap syscall ABI; the caller supplies
+    // the ownership and range validity required by MAP_FIXED.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            "cset {failed}, cs",
+            in("x0") address,
+            inlateout("x1") length => _,
+            in("x2") (libc::PROT_READ | libc::PROT_WRITE) as usize,
+            in("x3") (libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED) as usize,
+            in("x4") usize::MAX,
+            in("x5") 0usize,
+            in("x16") BSD_SYS_MMAP,
+            lateout("x0") result,
+            failed = lateout(reg) failed,
+            options(nostack),
+        );
+    }
+    if failed == 0 {
+        Ok(result)
+    } else {
+        Err(i32::try_from(result).unwrap_or(i32::MAX))
+    }
+}
+
+/// Invoke `mprotect` without entering potentially replaced libSystem code.
+///
+/// # Safety
+///
+/// The range must be a live mapping controlled by the caller, and changing its
+/// protections must not race any access from another thread.
+unsafe fn raw_protect(address: usize, length: usize, protection: i32) -> Result<(), i32> {
+    let result: usize;
+    let failed: usize;
+    // SAFETY: registers follow the Darwin mprotect syscall ABI and the caller
+    // guarantees exclusive control of the live mapping.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            "cset {failed}, cs",
+            in("x0") address,
+            inlateout("x1") length => _,
+            in("x2") protection.cast_unsigned() as usize,
+            in("x16") BSD_SYS_MPROTECT,
+            lateout("x0") result,
+            failed = lateout(reg) failed,
+            options(nostack),
+        );
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(i32::try_from(result).unwrap_or(i32::MAX))
+    }
+}
+
+/// Copy bytes without allowing LLVM to introduce a libSystem call.
+///
+/// # Safety
+///
+/// Both ranges must be valid for `length` bytes and must not overlap.
+unsafe fn raw_copy(destination: *mut u8, source: *const u8, length: usize) {
+    // SAFETY: the caller guarantees both ranges; the loop accesses exactly
+    // length bytes and uses no stack or external code.
+    unsafe {
+        core::arch::asm!(
+            "cbz {length}, 2f",
+            "1:",
+            "ldrb {byte:w}, [{source}], #1",
+            "strb {byte:w}, [{destination}], #1",
+            "subs {length}, {length}, #1",
+            "b.ne 1b",
+            "2:",
+            destination = inlateout(reg) destination => _,
+            source = inlateout(reg) source => _,
+            length = inlateout(reg) length => _,
+            byte = lateout(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+/// Report an unrecoverable post-publication errno and terminate via raw `_exit`.
+///
+/// # Safety
+///
+/// This unconditionally terminates the process and therefore may only be used
+/// after shared-cache publication has made ordinary unwinding unsafe.
+unsafe fn raw_fatal_exit(error: i32) -> ! {
+    let mut message = *b"fatal shared-cache publication errno=0x00000000\n";
+    let value = error.cast_unsigned();
+    for (index, byte) in message[39..47].iter_mut().enumerate() {
+        let nibble = ((value >> ((7 - index) * 4)) & 0xf) as usize;
+        *byte = b"0123456789abcdef"[nibble];
+    }
+    raw_signal_write(&message);
+    // SAFETY: SYS_exit accepts the status in x0 and never returns.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            in("x0") (128 + libc::SIGABRT) as usize,
+            in("x16") 1usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// Writable staging alias for a private shared-cache mapping.
+///
+/// Dropping an unpublished alias releases its staging Mach VM allocation.
+pub struct SharedCacheWriteAlias {
+    address: usize,
+    target: usize,
+    len: usize,
+    original: Option<Vec<u8>>,
+}
+
+impl SharedCacheWriteAlias {
+    /// Return the writable staging mapping's base address.
+    pub fn address(&self) -> usize {
+        self.address
+    }
+
+    /// Publish the fully rewritten staging copy at its original cache address.
+    /// # Safety
+    ///
+    /// The caller must exclusively own the target address range and ensure no
+    /// thread can execute from or otherwise access it until publication ends.
+    pub unsafe fn commit(self) -> Result<(), SharedCacheMappingError> {
+        // Move into its final storage before replacement. No Rust move, Drop,
+        // allocation, or libc call is permitted after the target may disappear.
+        let this = core::mem::ManuallyDrop::new(self);
+        let target = this.target;
+        let len = this.len;
+        let address = this.address;
+        let original = this.original.as_deref();
+        // Use raw syscalls: the mapping being replaced contains the libc
+        // wrappers for mmap/mprotect themselves. Returning through those
+        // wrappers while the page is RW or empty is not safe. A failure before
+        // replacement deliberately leaks staging storage in the short-lived child.
+        // SAFETY: commit's contract grants exclusive ownership of target.
+        let mapped =
+            unsafe { raw_fixed_anonymous(target, len) }.map_err(SharedCacheMappingError::Errno)?;
+        if mapped != target {
+            // SAFETY: MAP_FIXED already destroyed the old mapping, so unwinding is unsafe.
+            unsafe { raw_fatal_exit(libc::EFAULT) }
+        }
+        // SAFETY: commit's contract covers the source and destination ranges;
+        // post-replacement failures terminate without unwinding through the cache.
+        unsafe {
+            let destination = target as *mut u8;
+            if let Some(original) = original {
+                raw_copy(destination, original.as_ptr(), len);
+                if let Err(error) = raw_protect(target, len, libc::PROT_READ | libc::PROT_EXEC) {
+                    raw_fatal_exit(error);
+                }
+                if let Err(error) = raw_protect(target, len, libc::PROT_READ | libc::PROT_WRITE) {
+                    raw_fatal_exit(error);
+                }
+            }
+            let source = address as *const u8;
+            raw_copy(destination, source, len);
+            if let Err(error) = raw_protect(target, len, libc::PROT_READ | libc::PROT_EXEC) {
+                raw_fatal_exit(error);
+            }
+            sys_icache_invalidate(target as *mut libc::c_void, len);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SharedCacheWriteAlias {
+    fn drop(&mut self) {
+        // Best effort during setup failure. The runner child is short-lived and
+        // the kernel reclaims any surviving staging mapping on exit.
+        // SAFETY: an unpublished alias exclusively owns this live Mach allocation.
+        let _ =
+            unsafe { mach_vm_deallocate(mach_task_self(), self.address as u64, self.len as u64) };
+    }
+}
+
 fn is_page_aligned<const PAGE_SIZE: usize>(range: &Range<usize>) -> bool {
     range.start < range.end
         && range.start.is_multiple_of(PAGE_SIZE)
@@ -1038,6 +1456,73 @@ fn create_tls_key() -> Result<TlsKey, i32> {
     Ok(TlsKey(key))
 }
 
+struct PrivateDarwinThreadOwner {
+    stop: std::sync::mpsc::SyncSender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for PrivateDarwinThreadOwner {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("private Darwin TLS owner panicked");
+        }
+    }
+}
+
+struct PrivateDarwinThreadState {
+    tpidrro: usize,
+    x18: usize,
+    // Retained for an invariant test; guest code reaches this through its
+    // private TSD rather than through a runner-owned address.
+    #[cfg_attr(not(test), allow(dead_code))]
+    errno: usize,
+    _owner: PrivateDarwinThreadOwner,
+}
+
+fn create_private_darwin_thread_state() -> PrivateDarwinThreadState {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (stop, stopped) = std::sync::mpsc::sync_channel(0);
+    let thread = std::thread::Builder::new()
+        .name("litebox-darwin-tls".into())
+        .spawn(move || {
+            let tpidrro: usize;
+            let x18: usize;
+            // SAFETY: TPIDRRO_EL0 is readable at EL0 and x18 is a readable
+            // Darwin-reserved register; neither operation changes machine state.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {tpidrro}, tpidrro_el0",
+                    "mov {x18}, x18",
+                    tpidrro = out(reg) tpidrro,
+                    x18 = out(reg) x18,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            // SAFETY: __error returns this live pthread's errno slot.
+            let errno = unsafe { libc::__error() } as usize;
+            sender
+                .send((tpidrro & !0b111, x18, errno))
+                .expect("Darwin TLS owner disappeared during initialization");
+            // Keep the native pthread, and therefore its authenticated
+            // pthread/TSD object, alive until guest execution has ended.
+            let _ = stopped.recv();
+        })
+        .expect("failed to create private Darwin TLS owner");
+    let (tpidrro, x18, errno) = receiver
+        .recv()
+        .expect("private Darwin TLS owner terminated during initialization");
+    PrivateDarwinThreadState {
+        tpidrro,
+        x18,
+        errno,
+        _owner: PrivateDarwinThreadOwner {
+            stop,
+            thread: Some(thread),
+        },
+    }
+}
+
 fn anchor() -> usize {
     let value: usize;
     // SAFETY: TPIDRRO_EL0 is readable at EL0 on macOS; this changes no memory or flags.
@@ -1224,6 +1709,7 @@ struct ThreadContext<'a> {
     outbound_x16: usize,
     outbound_pc: usize,
     outbound_stub: usize,
+    initial_entry: bool,
     interrupted: *const AtomicBool,
     thread: ThreadHandle,
     exit: GuestExit,
@@ -1239,7 +1725,7 @@ fn thread_start(
     set_guest_vector_state(&vector_state);
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
-    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process);
+    run_thread_inner_with_process(shim.as_ref(), &mut ctx, process, false);
 }
 
 #[derive(Default)]
@@ -1337,7 +1823,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         ctx: &Self::ExecutionContext,
         init_thread: Box<dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>>,
     ) -> Result<(), Self::ThreadSpawnError> {
-        if GUEST_ABI.get().is_none() {
+        if GUEST_CONFIGURATION.get().is_none() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "guest ABI must be configured before spawning guest threads",
@@ -1497,6 +1983,8 @@ unsafe extern "C" {
     fn litebox_macos_syscall_callback_in_guest_cleared();
     fn switch_to_guest_via_sigreturn_start();
     fn switch_to_guest_via_sigreturn_end();
+    fn switch_to_guest_direct_start();
+    fn switch_to_guest_direct_end();
     fn switch_to_guest_via_outbound_stub_start();
     fn switch_to_guest_via_outbound_stub_end();
 }
@@ -1533,7 +2021,10 @@ unsafe extern "C" fn syscall_callback() {
         "adrp x17, {tls_key_offset}@PAGE",
         "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
         "add x16, x16, x17",
-        "ldr x16, [x16]", // LiteBox TlsBlock pointer
+        "ldr x16, [x16]", // LiteBox TlsBlock pointer, or zero for host-only threads
+        "cbz x16, 90f",
+        "ldr x17, [x16, #{in_guest}]",
+        "cbz x17, 90f",
         "ldr x17, [x16, #{active}]", // ThreadContext
         "ldr x17, [x17, #{context}]", // PtRegs
         "stp x0, x1, [x17, #0]",
@@ -1643,6 +2134,17 @@ unsafe extern "C" fn syscall_callback() {
         "add x29, sp, #16",
         "bl {syscall_handler}",
         "b {finish_thread_arch}",
+        // A rewritten shared-cache stub may also be called by the runner.
+        // Host execution has no active guest (or no LiteBox TLS entry). Restore
+        // the gate-clobbered registers, issue the original syscall, and resume
+        // after the patched SVC without entering Rust or the shim.
+        "90:",
+        "ldr x16, [sp, #{frame_x16}]",
+        "ldr x17, [sp, #{frame_scratch}]",
+        "svc #0x80",
+        "ldr x16, [sp, #{frame_retaddr}]",
+        "add sp, sp, #{darwin_frame_bytes}",
+        "br x16",
         ".cfi_endproc",
         tls_key_offset = sym TLS_KEY_OFFSET,
         active = const tls_offset::ACTIVE,
@@ -1668,6 +2170,7 @@ unsafe extern "C" fn syscall_callback() {
         frame_retaddr = const SVC_FRAME_OFF_RETADDR,
         frame_stub = const SVC_FRAME_OFF_STUB,
         frame_scratch = const MACOS_SVC_FRAME_OFF_SCRATCH,
+        darwin_frame_bytes = const litebox_syscall_rewriter::aarch64::DARWIN_SVC_FRAME_BYTES,
         syscall_handler = sym syscall_handler,
         finish_thread_arch = sym finish_thread_arch,
     );
@@ -1703,6 +2206,99 @@ unsafe extern "C" fn switch_to_guest_via_sigreturn() -> ! {
         tls_key_offset = sym TLS_KEY_OFFSET,
         in_guest = const tls_offset::IN_GUEST,
         host_fp_state = const tls_offset::HOST_FP_STATE,
+    );
+}
+
+/// Initial process entry. Unlike the generic sigreturn path, direct register
+/// restoration preserves XNU's physical TPIDRRO_EL0 value. Host-cache gates use
+/// it to locate LiteBox state, then expose either native host TLS or the private
+/// guest pthread according to `in_guest`. Darwin does not define an initial x16
+/// value, so x16 is used as the final branch register.
+#[unsafe(naked)]
+unsafe extern "C" fn switch_to_guest_direct(_: &mut ThreadContext) -> ! {
+    core::arch::naked_asm!(
+        "ldr x16, [x0, #{context}]",
+        "mrs x17, tpidrro_el0",
+        "and x17, x17, #0xfffffffffffffff8",
+        "adrp x1, {tls_key_offset}@PAGE",
+        "ldr x1, [x1, {tls_key_offset}@PAGEOFF]",
+        "add x17, x17, x1",
+        "ldr x17, [x17]",
+        "mrs x1, fpsr",
+        "mrs x2, fpcr",
+        "stp w1, w2, [x17, #{host_fp_state}]",
+        ".globl _switch_to_guest_direct_start",
+        ".alt_entry _switch_to_guest_direct_start",
+        "_switch_to_guest_direct_start:",
+        "mov x1, #1",
+        "str x1, [x17, #{in_guest}]",
+        "ldr x1, [x16, #{regs_x18}]",
+        "str x1, [x17, #{guest_x18}]",
+        "ldr x1, [x17, #{vector_state}]",
+        "ldp q0, q1, [x1, #0]",
+        "ldp q2, q3, [x1, #32]",
+        "ldp q4, q5, [x1, #64]",
+        "ldp q6, q7, [x1, #96]",
+        "ldp q8, q9, [x1, #128]",
+        "ldp q10, q11, [x1, #160]",
+        "ldp q12, q13, [x1, #192]",
+        "ldp q14, q15, [x1, #224]",
+        "ldp q16, q17, [x1, #256]",
+        "ldp q18, q19, [x1, #288]",
+        "ldp q20, q21, [x1, #320]",
+        "ldp q22, q23, [x1, #352]",
+        "ldp q24, q25, [x1, #384]",
+        "ldp q26, q27, [x1, #416]",
+        "ldp q28, q29, [x1, #448]",
+        "ldp q30, q31, [x1, #480]",
+        "ldr w2, [x1, #{vector_fpsr}]",
+        "msr fpsr, x2",
+        "ldr w2, [x1, #{vector_fpcr}]",
+        "msr fpcr, x2",
+        "ldr x1, [x16, #{regs_pstate}]",
+        "msr nzcv, x1",
+        "ldr x9, [x16, #{regs_sp}]",
+        "mov sp, x9",
+        "ldp x0, x1, [x16, #0]",
+        "ldp x2, x3, [x16, #16]",
+        "ldp x4, x5, [x16, #32]",
+        "ldp x6, x7, [x16, #48]",
+        "ldp x8, x9, [x16, #64]",
+        "ldp x10, x11, [x16, #80]",
+        "ldp x12, x13, [x16, #96]",
+        "ldp x14, x15, [x16, #112]",
+        "ldr x17, [x16, #{regs_x17}]",
+        "ldp x19, x20, [x16, #{regs_x19}]",
+        "ldp x21, x22, [x16, #{regs_x21}]",
+        "ldp x23, x24, [x16, #{regs_x23}]",
+        "ldp x25, x26, [x16, #{regs_x25}]",
+        "ldp x27, x28, [x16, #{regs_x27}]",
+        "ldp x29, x30, [x16, #{regs_x29}]",
+        "ldr x16, [x16, #{regs_pc}]",
+        "br x16",
+        ".globl _switch_to_guest_direct_end",
+        ".alt_entry _switch_to_guest_direct_end",
+        "_switch_to_guest_direct_end:",
+        "brk #0",
+        tls_key_offset = sym TLS_KEY_OFFSET,
+        context = const core::mem::offset_of!(ThreadContext, ctx),
+        in_guest = const tls_offset::IN_GUEST,
+        guest_x18 = const tls_offset::GUEST_X18,
+        vector_state = const tls_offset::VECTOR_STATE,
+        host_fp_state = const tls_offset::HOST_FP_STATE,
+        regs_sp = const core::mem::offset_of!(PtRegs, sp),
+        regs_pc = const core::mem::offset_of!(PtRegs, pc),
+        regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
+        regs_x17 = const core::mem::offset_of!(PtRegs, regs) + 17 * size_of::<usize>(),
+        regs_x18 = const core::mem::offset_of!(PtRegs, regs) + 18 * size_of::<usize>(),
+        regs_x19 = const core::mem::offset_of!(PtRegs, regs) + 19 * size_of::<usize>(),
+        regs_x21 = const core::mem::offset_of!(PtRegs, regs) + 21 * size_of::<usize>(),
+        regs_x23 = const core::mem::offset_of!(PtRegs, regs) + 23 * size_of::<usize>(),
+        regs_x25 = const core::mem::offset_of!(PtRegs, regs) + 25 * size_of::<usize>(),
+        regs_x27 = const core::mem::offset_of!(PtRegs, regs) + 27 * size_of::<usize>(),
+        regs_x29 = const core::mem::offset_of!(PtRegs, regs) + 29 * size_of::<usize>(),
+        vector_fpsr = const core::mem::offset_of!(GuestVectorState, fpsr),
+        vector_fpcr = const core::mem::offset_of!(GuestVectorState, fpcr),
     );
 }
 
@@ -1816,15 +2412,17 @@ where
 }
 
 fn run_thread_inner(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut PtRegs) {
-    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()));
+    run_thread_inner_with_process(shim, ctx, Arc::new(ProcessState::default()), true);
 }
 
 fn run_thread_inner_with_process(
     shim: &dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: &mut PtRegs,
     process: Arc<ProcessState>,
+    initial_darwin_process_entry: bool,
 ) {
     initialize_thread_tls();
+    register_exception_handlers().expect("re-registering macOS exception handlers");
     assert!(
         read_tls(tls_offset::ACTIVE) == 0,
         "nested guest entry is not supported"
@@ -1834,8 +2432,22 @@ fn run_thread_inner_with_process(
         pending.store(0, Ordering::Relaxed);
     })
     .expect("initialized thread TLS");
-    set_guest_thread_pointer(0);
-    set_guest_x18(0);
+    let initial_guest_thread_state =
+        if guest_abi() == GuestAbi::Darwin && darwin_private_thread_state_enabled() {
+            Some(create_private_darwin_thread_state())
+        } else {
+            None
+        };
+    set_guest_thread_pointer(
+        initial_guest_thread_state
+            .as_ref()
+            .map_or(0, |state| state.tpidrro),
+    );
+    set_guest_x18(
+        initial_guest_thread_state
+            .as_ref()
+            .map_or(0, |state| state.x18),
+    );
     let thread = ThreadHandle(Arc::new(ThreadState {
         // SAFETY: pthread_self has no preconditions; unregister before thread exit.
         identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
@@ -1852,6 +2464,7 @@ fn run_thread_inner_with_process(
         outbound_x16: 0,
         outbound_pc: 0,
         outbound_stub: 0,
+        initial_entry: initial_darwin_process_entry,
         interrupted: &raw const thread.0.interrupted,
         thread,
         exit: GuestExit::Interrupt,
@@ -1941,17 +2554,24 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     };
     // SAFETY: stack_t consists of a nullable pointer and integers, all zero-valid.
     let mut previous = unsafe { std::mem::zeroed::<libc::stack_t>() };
+    // SAFETY: the writable mapping stays live until the previous altstack is restored.
+    let install_result = unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) };
     assert_eq!(
-        // SAFETY: the writable mapping stays live until the previous altstack is restored.
-        unsafe { libc::sigaltstack(&raw const alternate, &raw mut previous) },
+        install_result,
         0,
+        "sigaltstack failed: {}",
+        std::io::Error::last_os_error()
     );
+    let tolerate_guest_altstack_change =
+        guest_abi() == GuestAbi::Darwin && darwin_private_thread_state_enabled();
     let _restore_guard = litebox::utils::defer(|| {
-        assert_eq!(
-            // SAFETY: f and its handlers have returned; the saved descriptor remains live.
-            unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) },
-            0,
-        );
+        // SAFETY: previous was returned by sigaltstack for this thread and stays live.
+        let result = unsafe { libc::sigaltstack(&raw const previous, core::ptr::null_mut()) };
+        if !tolerate_guest_altstack_change {
+            assert_eq!(result, 0, "failed to restore the host signal stack");
+        }
+        // A dynamic Darwin guest may replace the altstack through libSystem.
+        // Its isolated runner child exits immediately, so restoration is best effort.
     });
     f()
 }
@@ -1975,6 +2595,9 @@ impl ThreadContext<'_> {
 }
 
 unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
+    // Consume this before selecting a path: every later callback is an
+    // arbitrary resume and must restore all registers, including x16.
+    let initial_entry = core::mem::replace(&mut thread_ctx.initial_entry, false);
     if thread_ctx.outbound_stub != 0
         && thread_ctx.ctx.sp == thread_ctx.svc_frame + thread_ctx.guest_abi as usize
         && thread_ctx.ctx.pc == thread_ctx.outbound_pc
@@ -2003,7 +2626,11 @@ unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
             unsafe { switch_to_guest_via_outbound_stub(thread_ctx) }
         }
     }
-    // SAFETY: generic resume obtains an XNU-created signal context to restore every register.
+    if initial_entry && thread_ctx.guest_abi == GuestAbi::Darwin {
+        // Initial Darwin process entry leaves x16 unspecified. Direct
+        // restoration preserves the physical TPIDRRO_EL0 used by cache gates.
+        unsafe { switch_to_guest_direct(thread_ctx) }
+    }
     unsafe { switch_to_guest_via_sigreturn() }
 }
 
@@ -2134,6 +2761,24 @@ fn restore_signal_context(regs: &PtRegs, mc: &mut libc::__darwin_mcontext64) {
     mc.__ns.__fpcr = state.fpcr;
 }
 
+fn raw_signal_write(bytes: &[u8]) {
+    let result: usize;
+    // SAFETY: bytes is readable for x2 bytes; registers follow Darwin SYS_write,
+    // and x1 is declared inlateout because XNU may overwrite it on return.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            in("x0") libc::STDERR_FILENO as usize,
+            inlateout("x1") bytes.as_ptr() => _,
+            in("x2") bytes.len(),
+            in("x16") 4usize,
+            lateout("x0") result,
+            options(nostack),
+        );
+    }
+    let _ = result;
+}
+
 fn fatal_signal(message: &[u8], pc: usize) -> ! {
     const DIGITS: usize = size_of::<usize>() * 2;
     let mut address = [b'0'; DIGITS + 1];
@@ -2141,12 +2786,17 @@ fn fatal_signal(message: &[u8], pc: usize) -> ! {
         *byte = b"0123456789abcdef"[(pc >> ((DIGITS - index - 1) * 4)) & 15];
     }
     address[DIGITS] = b'\n';
-    // SAFETY: all buffers are live for their lengths; write and _exit are async-signal-safe.
+    raw_signal_write(message);
+    raw_signal_write(b" pc=0x");
+    raw_signal_write(&address);
+    // SAFETY: SYS_exit accepts the status in x0 and never returns.
     unsafe {
-        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
-        libc::write(libc::STDERR_FILENO, b" pc=0x".as_ptr().cast(), 6);
-        libc::write(libc::STDERR_FILENO, address.as_ptr().cast(), address.len());
-        libc::_exit(128 + libc::SIGABRT);
+        core::arch::asm!(
+            "svc #0x80",
+            in("x0") (128 + libc::SIGABRT) as usize,
+            in("x16") 1usize,
+            options(noreturn),
+        );
     }
 }
 
@@ -2160,9 +2810,29 @@ fn resume_or_interrupt(mc: &mut libc::__darwin_mcontext64, thread_ctx: &mut Thre
     }
 }
 
+static EXCEPTION_HANDLERS_INSTALLED: Mutex<bool> = Mutex::new(false);
+
+/// Disable platform handlers while libsystem_kernel is replaced in a forked child.
+///
+/// # Panics
+/// Panics if the process-wide handler-state mutex is poisoned.
+pub fn suspend_exception_handlers_for_cache_rewrite() -> std::io::Result<()> {
+    let mut installed = EXCEPTION_HANDLERS_INSTALLED.lock().unwrap();
+    *installed = false;
+    // SAFETY: zero initializes SIG_DFL, an empty mask, and no flags.
+    let action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+    for signal in host_signals() {
+        // SAFETY: action is a fully initialized SIG_DFL disposition; no old action is requested.
+        if unsafe { libc::sigaction(signal, &raw const action, core::ptr::null_mut()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    drop(installed);
+    Ok(())
+}
+
 pub(crate) fn register_exception_handlers() -> std::io::Result<()> {
-    static INSTALLED: Mutex<bool> = Mutex::new(false);
-    let mut installed = INSTALLED.lock().unwrap();
+    let mut installed = EXCEPTION_HANDLERS_INSTALLED.lock().unwrap();
     if *installed {
         return Ok(());
     }
@@ -2316,6 +2986,9 @@ unsafe extern "C" fn exception_signal_handler(
     let in_syscall_callback_prologue = (syscall_callback as *const () as usize
         ..litebox_macos_syscall_callback_in_guest_cleared as *const () as usize)
         .contains(&pc);
+    let in_direct_transition = (switch_to_guest_direct_start as *const () as usize
+        ..switch_to_guest_direct_end as *const () as usize)
+        .contains(&pc);
     let in_outbound_transition = (switch_to_guest_via_outbound_stub_start as *const () as usize
         ..switch_to_guest_via_outbound_stub_end as *const () as usize)
         .contains(&pc);
@@ -2343,6 +3016,7 @@ unsafe extern "C" fn exception_signal_handler(
         if !ptr.is_null()
             && (in_guest
                 || in_syscall_callback_prologue
+                || in_direct_transition
                 || in_outbound_transition
                 || in_sigreturn_transition)
         {
@@ -2362,7 +3036,8 @@ unsafe extern "C" fn exception_signal_handler(
         // finish saving a coherent guest context before dispatching it.
         return;
     }
-    if !ptr.is_null() && (in_outbound_transition || in_sigreturn_transition) {
+    if !ptr.is_null() && (in_direct_transition || in_outbound_transition || in_sigreturn_transition)
+    {
         if resuming {
             restore_host_fp_state();
             write_tls(tls_offset::IN_GUEST, 0);
@@ -2791,6 +3466,7 @@ mod tests {
             &InitOnly(std::cell::RefCell::new(Some(f))),
             &mut PtRegs::default(),
             process,
+            false,
         );
     }
 
@@ -3240,10 +3916,13 @@ mod tests {
             ..litebox_macos_syscall_callback_in_guest_cleared as *const () as usize;
         let sigreturn = switch_to_guest_via_sigreturn_start as *const () as usize
             ..switch_to_guest_via_sigreturn_end as *const () as usize;
+        let direct = switch_to_guest_direct_start as *const () as usize
+            ..switch_to_guest_direct_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert_eq!(syscall_prologue.len(), 72 * size_of::<u32>());
+        assert_eq!(syscall_prologue.len(), 75 * size_of::<u32>());
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
+        assert_eq!(direct.len(), 46 * size_of::<u32>());
         assert_eq!(outbound.len(), 52 * size_of::<u32>());
     }
 
@@ -3512,6 +4191,16 @@ mod tests {
             assert_eq!(mc.__ns.__v, restored_vector.registers);
             assert_eq!((mc.__ns.__fpsr, mc.__ns.__fpcr), (0xd000, 0xe000));
         }
+    }
+
+    #[test]
+    fn private_darwin_thread_state_does_not_alias_the_runner() {
+        let runner_tpidrro = anchor();
+        // SAFETY: __error returns the current host pthread's live errno slot.
+        let runner_errno = unsafe { libc::__error() } as usize;
+        let private = create_private_darwin_thread_state();
+        assert_ne!(private.tpidrro, runner_tpidrro);
+        assert_ne!(private.errno, runner_errno);
     }
 
     #[test]
