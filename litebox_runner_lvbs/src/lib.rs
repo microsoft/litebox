@@ -794,6 +794,10 @@ fn open_session_new_instance(
         write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
         return Ok(());
     }
+    let ta_source = shim
+        .get_ta_source(&ta_uuid)
+        .expect("successfully loaded TA must have a source");
+    debug_serial_println!("Loading TA: uuid={:?}, source={:?}", ta_uuid, ta_source);
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
     // Marker only releases once CR3 is back to base. See
@@ -1399,7 +1403,11 @@ fn register_embedded_ta(
     let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
         return false;
     };
-    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+    shim.store_ta_bin(
+        &ta_head.uuid,
+        ta_binary,
+        litebox_shim_optee::TaSource::BuiltIn,
+    )
 }
 
 /// Register all TA binaries embedded in the runner image.
