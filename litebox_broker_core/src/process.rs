@@ -160,6 +160,22 @@ pub(crate) enum ProcessStartKind {
     ImageReplacement,
 }
 
+/// Origin of a request concerning one process record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "later request dispatch PRs consume the origin classification"
+    )
+)]
+pub(crate) enum ProcessRequestOrigin {
+    /// Transport or host notification that must be handled in every state.
+    Lifecycle,
+    /// Operation initiated by guest execution.
+    Guest,
+}
+
 /// Authoritative lifecycle state of one broker process record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
@@ -191,6 +207,26 @@ pub(crate) enum ProcessRecordState {
 }
 
 impl ProcessRecordState {
+    /// Returns whether requests from this origin can be considered in this state.
+    ///
+    /// Guest operations still require operation-specific authorization.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "later request dispatch PRs apply the operation-specific checks"
+        )
+    )]
+    fn admits_request_origin(self, origin: ProcessRequestOrigin) -> bool {
+        match origin {
+            ProcessRequestOrigin::Lifecycle => true,
+            ProcessRequestOrigin::Guest => matches!(
+                self,
+                Self::Starting(_) | Self::VirtualRunning | Self::Running
+            ),
+        }
+    }
+
     fn transition(&mut self, next: Self) -> Result<()> {
         let allowed = matches!(
             (*self, next),
@@ -1093,8 +1129,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        ProcessLifecycleSink, ProcessRecordState, ProcessReferences, ProcessStartKind,
-        release_pending_reference,
+        ProcessLifecycleSink, ProcessRecordState, ProcessReferences, ProcessRequestOrigin,
+        ProcessStartKind, release_pending_reference,
     };
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
@@ -1128,25 +1164,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn process_record_state_transition_matrix() {
+    fn process_record_states() -> [ProcessRecordState; 11] {
         use ProcessRecordState as State;
         use ProcessStartKind as Start;
 
-        let failed = State::Failed(BrokerError::PeerClosed);
-        let states = [
+        [
             State::Reserved,
             State::Starting(Start::Association),
             State::Starting(Start::Duplication),
             State::Starting(Start::ImageReplacement),
             State::VirtualRunning,
             State::Running,
-            failed,
+            State::Failed(BrokerError::PeerClosed),
             State::Zombie,
             State::Collected,
             State::Reaped,
             State::Expired,
-        ];
+        ]
+    }
+
+    #[test]
+    fn process_record_state_transition_matrix() {
+        use ProcessRecordState as State;
+        use ProcessStartKind as Start;
+
+        let failed = State::Failed(BrokerError::PeerClosed);
+        let states = process_record_states();
         let allowed = [
             (State::Reserved, State::VirtualRunning),
             (State::Reserved, State::Starting(Start::Duplication)),
@@ -1179,6 +1222,24 @@ mod tests {
                 );
                 assert_eq!(current, if expected { next } else { initial });
             }
+        }
+    }
+
+    #[test]
+    fn request_origin_classification_preserves_lifecycle_notifications() {
+        use ProcessRecordState as State;
+        use ProcessRequestOrigin as Origin;
+
+        for state in process_record_states() {
+            assert!(state.admits_request_origin(Origin::Lifecycle), "{state:?}");
+            assert_eq!(
+                state.admits_request_origin(Origin::Guest),
+                matches!(
+                    state,
+                    State::Starting(_) | State::VirtualRunning | State::Running
+                ),
+                "{state:?}"
+            );
         }
     }
 
