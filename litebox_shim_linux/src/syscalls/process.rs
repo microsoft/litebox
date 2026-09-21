@@ -1833,13 +1833,12 @@ mod tests {
     extern crate std;
 
     #[test]
-    fn fork_policy_defaults_off_and_non_thread_clone_returns_einval() {
-        use litebox_broker_core::{ForkPlatform, PolicyEngine};
+    fn process_duplication_defaults_off_and_non_thread_clone_returns_einval() {
+        use litebox_broker_core::PolicyEngine;
         use litebox_common_linux::{CloneArgs, CloneFlags, PtRegs, errno::Errno, signal::Signal};
 
         let policy = PolicyEngine::default_deny();
-        assert!(!policy.fork_enabled(ForkPlatform::Linux));
-        assert!(!policy.fork_enabled(ForkPlatform::Windows));
+        assert!(!policy.process_duplication_enabled());
 
         let task = crate::syscalls::tests::init_platform();
         let args = CloneArgs {
