@@ -220,8 +220,8 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
-    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
+    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], source: TaSource) -> bool {
+        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into(), source)
     }
 
     /// Get the TA binary associated with the given TA UUID.
@@ -230,7 +230,7 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
             Some(ta_bin)
         } else {
             let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
-            if !self.store_ta_bin(ta_uuid, &ta_bin) {
+            if !self.store_ta_bin(ta_uuid, &ta_bin, TaSource::Dynamic) {
                 return None;
             }
             Some(ta_bin)
@@ -240,6 +240,11 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     /// Get the TA flags associated with the given TA UUID.
     pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
         self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
+    }
+
+    /// Get how the cached TA binary was loaded.
+    pub(crate) fn get_ta_source(&self, ta_uuid: &TeeUuid) -> Option<TaSource> {
+        self.ta_uuid_map.get_source(ta_uuid)
     }
 
     /// Monotonic time elapsed since this instance was created, used as GP
@@ -360,13 +365,18 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
-    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        self.0.store_ta_bin(ta_uuid, ta_bin)
+    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], source: TaSource) -> bool {
+        self.0.store_ta_bin(ta_uuid, ta_bin, source)
     }
 
     /// Get the TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
+    }
+
+    /// Get how the cached TA binary was loaded.
+    pub fn get_ta_source(&self, ta_uuid: &TeeUuid) -> Option<TaSource> {
+        self.0.get_ta_source(ta_uuid)
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -1401,12 +1411,21 @@ impl TaHandleMap {
     }
 }
 
+/// Whether the TA binary was built into the runner or dynamically loaded at runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaSource {
+    BuiltIn,
+    Dynamic,
+}
+
 /// Entry in the TA UUID map containing binary data and parsed flags.
 struct TaInfo {
     /// The raw TA binary
     binary: Arc<[u8]>,
     /// Parsed TA flags from .ta_head section
     flags: TaFlags,
+    /// How the TA binary was loaded
+    source: TaSource,
 }
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
@@ -1421,7 +1440,7 @@ impl TaUuidMap {
         }
     }
 
-    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: Arc<[u8]>) -> bool {
+    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: Arc<[u8]>, source: TaSource) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
             return false;
@@ -1437,6 +1456,7 @@ impl TaUuidMap {
             TaInfo {
                 binary: ta_bin,
                 flags: ta_head.flags,
+                source,
             },
         );
         true
@@ -1449,6 +1469,11 @@ impl TaUuidMap {
     /// Get the TA flags for a given UUID.
     pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
         self.inner.read().get(uuid).map(|info| info.flags)
+    }
+
+    /// Get how the TA binary for a given UUID entered the cache.
+    pub(crate) fn get_source(&self, uuid: &TeeUuid) -> Option<TaSource> {
+        self.inner.read().get(uuid).map(|info| info.source)
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
