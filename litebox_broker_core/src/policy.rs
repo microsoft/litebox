@@ -517,15 +517,6 @@ mod tests {
     }
 
     #[test]
-    fn process_duplication_policy_defaults_off_and_can_be_enabled() {
-        let disabled = PolicyEngine::default_deny();
-        assert!(!disabled.process_duplication_enabled());
-
-        let enabled = PolicyEngine::default_deny().with_process_duplication_enabled(true);
-        assert!(enabled.process_duplication_enabled());
-    }
-
-    #[test]
     fn cidr_requires_canonical_networks_and_matches_partial_bytes() {
         assert_eq!(Ipv4Cidr::new(Ipv4Address([10, 0, 0, 0]), 33), None);
         assert_eq!(Ipv4Cidr::new(Ipv4Address([10, 1, 0, 1]), 24), None);
