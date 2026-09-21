@@ -329,6 +329,7 @@ pub enum PolicyProfile {
 pub struct PolicyEngine {
     profile: PolicyProfile,
     socket_policy: SocketPolicy,
+    process_duplication_enabled: bool,
 }
 
 impl PolicyEngine {
@@ -337,6 +338,7 @@ impl PolicyEngine {
         Self {
             profile,
             socket_policy: SocketPolicy::deny(),
+            process_duplication_enabled: false,
         }
     }
 
@@ -360,6 +362,19 @@ impl PolicyEngine {
     pub const fn with_socket_policy(mut self, socket_policy: SocketPolicy) -> Self {
         self.socket_policy = socket_policy;
         self
+    }
+
+    /// Configures whether a process may duplicate itself into a child process.
+    #[must_use]
+    pub const fn with_process_duplication_enabled(mut self, enabled: bool) -> Self {
+        self.process_duplication_enabled = enabled;
+        self
+    }
+
+    /// Returns whether a process may duplicate itself into a child process.
+    #[must_use]
+    pub const fn process_duplication_enabled(&self) -> bool {
+        self.process_duplication_enabled
     }
 
     pub(crate) fn principal_object_rights(

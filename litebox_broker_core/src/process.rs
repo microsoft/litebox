@@ -136,17 +136,131 @@ pub struct BrokerProcess {
 }
 
 struct BrokerProcessState {
-    startup: ProcessStartupState,
+    record: ProcessRecordState,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
     shutdown: Option<ProcessShutdown>,
 }
 
+/// Origin of a process entering the starting state.
+///
+/// Design section 5.2 calls [`Self::Duplication`] `Fork` and
+/// [`Self::ImageReplacement`] `Exec`; broker core uses host-neutral names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProcessStartupState {
-    Starting,
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "later process lifecycle PRs construct these kinds"
+    )
+)]
+pub(crate) enum ProcessStartKind {
+    /// Existing runner association startup.
+    Association,
+    /// Child creation by duplicating an existing process image.
+    Duplication,
+    /// Child creation by replacing a virtual child's process image.
+    ImageReplacement,
+}
+
+/// Origin of a request concerning one process record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "later request dispatch PRs consume the origin classification"
+    )
+)]
+pub(crate) enum ProcessRequestOrigin {
+    /// Transport or host notification that must be handled in every state.
+    Lifecycle,
+    /// Operation initiated by guest execution.
+    Guest,
+}
+
+/// Authoritative lifecycle state of one broker process record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "later process lifecycle PRs construct these states"
+    )
+)]
+pub(crate) enum ProcessRecordState {
+    /// Identity reserved, with no host process selected yet.
+    Reserved,
+    /// Host process setup is in progress.
+    Starting(ProcessStartKind),
+    /// A virtual child is executing in its owner's address space.
+    VirtualRunning,
+    /// The process is published and may issue guest-originated operations.
     Running,
+    /// Startup failed and host cleanup is still pending.
     Failed(BrokerError),
+    /// The process exited and has a waitable status.
+    Zombie,
+    /// A failed host process has been confirmed dead.
+    Collected,
+    /// A zombie's waitable status was consumed.
+    Reaped,
+    /// An unused reservation expired.
+    Expired,
+}
+
+impl ProcessRecordState {
+    /// Returns whether requests from this origin can be considered in this state.
+    ///
+    /// Guest operations still require operation-specific authorization. This
+    /// filter does not model the setup channel's `AcknowledgeInstall`
+    /// restriction or the parked-versus-released component of a running child.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "later request dispatch PRs apply the operation-specific checks"
+        )
+    )]
+    fn admits_request_origin(self, origin: ProcessRequestOrigin) -> bool {
+        match origin {
+            ProcessRequestOrigin::Lifecycle => true,
+            ProcessRequestOrigin::Guest => matches!(
+                self,
+                Self::Starting(_) | Self::VirtualRunning | Self::Running
+            ),
+        }
+    }
+
+    fn transition(&mut self, next: Self) -> Result<()> {
+        let allowed = matches!(
+            (*self, next),
+            (
+                Self::Reserved,
+                Self::VirtualRunning
+                    | Self::Starting(
+                        ProcessStartKind::Duplication | ProcessStartKind::ImageReplacement
+                    )
+                    | Self::Expired,
+            ) | (
+                Self::Starting(ProcessStartKind::Association | ProcessStartKind::Duplication),
+                Self::Running | Self::Failed(_),
+            ) | (
+                Self::Starting(ProcessStartKind::ImageReplacement),
+                Self::Running | Self::VirtualRunning | Self::Zombie,
+            ) | (
+                Self::VirtualRunning,
+                Self::Starting(ProcessStartKind::ImageReplacement) | Self::Zombie,
+            ) | (Self::Running, Self::Zombie)
+                | (Self::Zombie, Self::Reaped)
+                | (Self::Failed(_), Self::Collected)
+        );
+        if !allowed {
+            return Err(BrokerError::Internal);
+        }
+        *self = next;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,7 +311,7 @@ impl BrokerProcess {
             id,
             parent_id,
             state: Mutex::new(BrokerProcessState {
-                startup: ProcessStartupState::Starting,
+                record: ProcessRecordState::Starting(ProcessStartKind::Association),
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
@@ -230,16 +344,20 @@ impl BrokerProcess {
     #[must_use]
     pub fn is_running(&self) -> bool {
         let state = self.state.lock();
-        matches!(state.startup, ProcessStartupState::Running)
+        matches!(state.record, ProcessRecordState::Running)
             && matches!(state.retirement, ProcessRetirement::Active { .. })
     }
 
     /// Returns the completed startup outcome, or `None` while startup is pending.
     pub fn startup_result(&self) -> Option<Result<()>> {
-        match self.state.lock().startup {
-            ProcessStartupState::Starting => None,
-            ProcessStartupState::Running => Some(Ok(())),
-            ProcessStartupState::Failed(error) => Some(Err(error)),
+        match self.state.lock().record {
+            ProcessRecordState::Reserved | ProcessRecordState::Starting(_) => None,
+            ProcessRecordState::Running | ProcessRecordState::VirtualRunning => Some(Ok(())),
+            ProcessRecordState::Failed(error) => Some(Err(error)),
+            ProcessRecordState::Zombie
+            | ProcessRecordState::Collected
+            | ProcessRecordState::Reaped
+            | ProcessRecordState::Expired => Some(Err(BrokerError::PeerClosed)),
         }
     }
 
@@ -250,12 +368,13 @@ impl BrokerProcess {
             if !matches!(state.retirement, ProcessRetirement::Active { .. }) {
                 return Err(BrokerError::PeerClosed);
             }
-            match state.startup {
-                ProcessStartupState::Starting => {}
-                ProcessStartupState::Running => return Err(BrokerError::Internal),
-                ProcessStartupState::Failed(error) => return Err(error),
+            match state.record {
+                ProcessRecordState::Starting(_) => {}
+                ProcessRecordState::Running => return Err(BrokerError::Internal),
+                ProcessRecordState::Failed(error) => return Err(error),
+                _ => return Err(BrokerError::PeerClosed),
             }
-            state.startup = ProcessStartupState::Running;
+            state.record.transition(ProcessRecordState::Running)?;
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -282,15 +401,21 @@ impl BrokerProcess {
     ) -> Result<()> {
         let shutdown = {
             let mut state = self.state.lock();
-            match state.startup {
-                ProcessStartupState::Starting => {}
-                ProcessStartupState::Running => return Ok(()),
-                ProcessStartupState::Failed(error) => return Err(error),
+            match state.record {
+                ProcessRecordState::Starting(
+                    ProcessStartKind::Association | ProcessStartKind::Duplication,
+                ) => {}
+                ProcessRecordState::Starting(ProcessStartKind::ImageReplacement) => {
+                    return Err(BrokerError::Internal);
+                }
+                ProcessRecordState::Running => return Ok(()),
+                ProcessRecordState::Failed(error) => return Err(error),
+                _ => return Err(BrokerError::PeerClosed),
             }
             if abnormal {
                 state.retirement.mark_abnormal();
             }
-            state.startup = ProcessStartupState::Failed(error);
+            state.record.transition(ProcessRecordState::Failed(error))?;
             if state.shutdown_request == ProcessShutdownRequest::None {
                 state.shutdown_request = if expected_shutdown {
                     ProcessShutdownRequest::Expected
@@ -1014,7 +1139,10 @@ impl Drop for BrokerProcess {
 mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{ProcessLifecycleSink, ProcessReferences, release_pending_reference};
+    use super::{
+        ProcessLifecycleSink, ProcessRecordState, ProcessReferences, ProcessRequestOrigin,
+        ProcessStartKind, release_pending_reference,
+    };
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
@@ -1045,6 +1173,112 @@ mod tests {
         fn changed(&self) {
             self.changes.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn process_record_states() -> [ProcessRecordState; 11] {
+        use ProcessRecordState as State;
+        use ProcessStartKind as Start;
+
+        [
+            State::Reserved,
+            State::Starting(Start::Association),
+            State::Starting(Start::Duplication),
+            State::Starting(Start::ImageReplacement),
+            State::VirtualRunning,
+            State::Running,
+            State::Failed(BrokerError::PeerClosed),
+            State::Zombie,
+            State::Collected,
+            State::Reaped,
+            State::Expired,
+        ]
+    }
+
+    #[test]
+    fn process_record_state_transition_matrix() {
+        use ProcessRecordState as State;
+        use ProcessStartKind as Start;
+
+        let failed = State::Failed(BrokerError::PeerClosed);
+        let states = process_record_states();
+        let allowed = [
+            (State::Reserved, State::VirtualRunning),
+            (State::Reserved, State::Starting(Start::Duplication)),
+            (State::Reserved, State::Starting(Start::ImageReplacement)),
+            (State::Reserved, State::Expired),
+            (State::Starting(Start::Association), State::Running),
+            (State::Starting(Start::Association), failed),
+            (State::Starting(Start::Duplication), State::Running),
+            (State::Starting(Start::Duplication), failed),
+            (State::Starting(Start::ImageReplacement), State::Running),
+            (
+                State::Starting(Start::ImageReplacement),
+                State::VirtualRunning,
+            ),
+            (State::Starting(Start::ImageReplacement), State::Zombie),
+            (
+                State::VirtualRunning,
+                State::Starting(Start::ImageReplacement),
+            ),
+            (State::VirtualRunning, State::Zombie),
+            (State::Running, State::Zombie),
+            (State::Zombie, State::Reaped),
+            (failed, State::Collected),
+        ];
+
+        for initial in states {
+            for next in states {
+                let expected = allowed.contains(&(initial, next));
+                let mut current = initial;
+                assert_eq!(
+                    current.transition(next).is_ok(),
+                    expected,
+                    "{initial:?} -> {next:?}"
+                );
+                assert_eq!(current, if expected { next } else { initial });
+            }
+        }
+    }
+
+    #[test]
+    fn request_origin_classification_preserves_lifecycle_notifications() {
+        use ProcessRecordState as State;
+        use ProcessRequestOrigin as Origin;
+
+        for state in process_record_states() {
+            assert!(state.admits_request_origin(Origin::Lifecycle), "{state:?}");
+            assert_eq!(
+                state.admits_request_origin(Origin::Guest),
+                matches!(
+                    state,
+                    State::Starting(_) | State::VirtualRunning | State::Running
+                ),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_startup_failure_rejects_image_replacement() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        process.state.lock().record =
+            ProcessRecordState::Starting(ProcessStartKind::ImageReplacement);
+
+        assert_eq!(
+            process.fail_start(BrokerError::PeerClosed, false, true),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            process.state.lock().record,
+            ProcessRecordState::Starting(ProcessStartKind::ImageReplacement)
+        );
     }
 
     #[test]
