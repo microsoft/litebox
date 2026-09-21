@@ -2670,15 +2670,15 @@ const SHDR_MAGIC: u32 = 0x4f54_5348;
 
 /// From `optee_os/core/include/signed_hdr.h`
 /// struct shdr_bootstrap_ta {
-/// 	uint8_t uuid[sizeof(TEE_UUID)];
-/// 	uint32_t ta_version;
+///     uint8_t uuid[sizeof(TEE_UUID)];
+///     uint32_t ta_version;
 /// };
 /// and from `optee_os/core/include/tee_api_types.h`
 /// typedef struct {
-/// 	uint32_t timeLow;
-/// 	uint16_t timeMid;
-/// 	uint16_t timeHiAndVersion;
-/// 	uint8_t clockSeqAndNode[8];
+///     uint32_t timeLow;
+///     uint16_t timeMid;
+///     uint16_t timeHiAndVersion;
+///     uint8_t clockSeqAndNode[8];
 /// } TEE_UUID;
 #[cfg(feature = "signed-ta-rsa")]
 const SHDR_UUID_LEN: usize = 16;
