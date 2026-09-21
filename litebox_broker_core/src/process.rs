@@ -143,6 +143,9 @@ struct BrokerProcessState {
 }
 
 /// Origin of a process entering the starting state.
+///
+/// Design section 5.2 calls [`Self::Duplication`] `Fork` and
+/// [`Self::ImageReplacement`] `Exec`; broker core uses host-neutral names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     not(test),
@@ -209,7 +212,9 @@ pub(crate) enum ProcessRecordState {
 impl ProcessRecordState {
     /// Returns whether requests from this origin can be considered in this state.
     ///
-    /// Guest operations still require operation-specific authorization.
+    /// Guest operations still require operation-specific authorization. This
+    /// filter does not model the setup channel's `AcknowledgeInstall`
+    /// restriction or the parked-versus-released component of a running child.
     #[cfg_attr(
         not(test),
         expect(
@@ -243,7 +248,10 @@ impl ProcessRecordState {
             ) | (
                 Self::Starting(ProcessStartKind::ImageReplacement),
                 Self::Running | Self::VirtualRunning | Self::Zombie,
-            ) | (Self::VirtualRunning | Self::Running, Self::Zombie)
+            ) | (
+                Self::VirtualRunning,
+                Self::Starting(ProcessStartKind::ImageReplacement) | Self::Zombie,
+            ) | (Self::Running, Self::Zombie)
                 | (Self::Zombie, Self::Reaped)
                 | (Self::Failed(_), Self::Collected)
         );
@@ -397,6 +405,9 @@ impl BrokerProcess {
                 ProcessRecordState::Starting(
                     ProcessStartKind::Association | ProcessStartKind::Duplication,
                 ) => {}
+                ProcessRecordState::Starting(ProcessStartKind::ImageReplacement) => {
+                    return Err(BrokerError::Internal);
+                }
                 ProcessRecordState::Running => return Ok(()),
                 ProcessRecordState::Failed(error) => return Err(error),
                 _ => return Err(BrokerError::PeerClosed),
@@ -1205,6 +1216,10 @@ mod tests {
                 State::VirtualRunning,
             ),
             (State::Starting(Start::ImageReplacement), State::Zombie),
+            (
+                State::VirtualRunning,
+                State::Starting(Start::ImageReplacement),
+            ),
             (State::VirtualRunning, State::Zombie),
             (State::Running, State::Zombie),
             (State::Zombie, State::Reaped),
@@ -1241,6 +1256,29 @@ mod tests {
                 "{state:?}"
             );
         }
+    }
+
+    #[test]
+    fn generic_startup_failure_rejects_image_replacement() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        process.state.lock().record =
+            ProcessRecordState::Starting(ProcessStartKind::ImageReplacement);
+
+        assert_eq!(
+            process.fail_start(BrokerError::PeerClosed, false, true),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            process.state.lock().record,
+            ProcessRecordState::Starting(ProcessStartKind::ImageReplacement)
+        );
     }
 
     #[test]
