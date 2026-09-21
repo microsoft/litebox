@@ -114,7 +114,7 @@ fn run_ta_with_default_commands(
     let ta_uuid = litebox_common_optee::parse_ta_head(ta_bin)
         .expect("Failed to parse TA header from ta_bin")
         .uuid;
-    assert!(shim.store_ta_bin(&ta_uuid, ta_bin));
+    assert!(shim.store_ta_bin(&ta_uuid, ta_bin, litebox_shim_optee::TaSource::BuiltIn,));
     for func_id in [UteeEntryFunc::OpenSession, UteeEntryFunc::CloseSession] {
         let params = [const { UteeParamOwned::None }; UteeParamOwned::TEE_NUM_PARAMS];
 

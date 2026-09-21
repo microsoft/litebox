@@ -291,6 +291,17 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         self.dynamic_ta_uuid_map.contains(ta_uuid) || self.embedded_ta_uuid_map.contains(ta_uuid)
     }
 
+    /// Get how the cached TA binary was loaded.
+    pub(crate) fn get_ta_source(&self, ta_uuid: &TeeUuid) -> Option<TaSource> {
+        if self.dynamic_ta_uuid_map.contains(ta_uuid) {
+            Some(TaSource::Dynamic)
+        } else if self.embedded_ta_uuid_map.contains(ta_uuid) {
+            Some(TaSource::BuiltIn)
+        } else {
+            None
+        }
+    }
+
     /// Monotonic time elapsed since this instance was created, used as GP
     /// "system time" (`TEE_GetSystemTime`).
     ///
@@ -423,8 +434,11 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
-    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        self.0.store_ta_bin(ta_uuid, ta_bin)
+    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], source: TaSource) -> bool {
+        match source {
+            TaSource::BuiltIn => self.0.embedded_ta_uuid_map.insert(*ta_uuid, ta_bin.into()),
+            TaSource::Dynamic => self.0.store_ta_bin(ta_uuid, ta_bin),
+        }
     }
 
     /// Store a TA binary embedded in the runner image.
@@ -435,6 +449,11 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Get the cached TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
+    }
+
+    /// Get how the cached TA binary was loaded.
+    pub fn get_ta_source(&self, ta_uuid: &TeeUuid) -> Option<TaSource> {
+        self.0.get_ta_source(ta_uuid)
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -1474,6 +1493,13 @@ impl TaHandleMap {
     pub(crate) fn remove(&self, handle: u32) -> Option<TeeUuid> {
         self.inner.lock().remove(&handle)
     }
+}
+
+/// Whether the TA binary was built into the runner or dynamically loaded at runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaSource {
+    BuiltIn,
+    Dynamic,
 }
 
 /// Entry in the TA UUID map containing binary data and parsed flags.

@@ -29,7 +29,7 @@ pub fn run_ta_with_test_commands(
     };
     let ta_head =
         litebox_common_optee::parse_ta_head(ta_bin).expect("Failed to parse TA header from ta_bin");
-    assert!(shim.store_ta_bin(&ta_head.uuid, ta_bin));
+    assert!(shim.store_ta_bin(&ta_head.uuid, ta_bin, litebox_shim_optee::TaSource::BuiltIn,));
     let mut ta_info: Option<LoadedProgram<Platform>> = None;
     // The active session id for the TA. Set at OpenSession and reused for the
     // subsequent InvokeCommand entries on the same persistent session.

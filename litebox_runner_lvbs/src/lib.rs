@@ -1207,6 +1207,10 @@ fn open_session_new_instance(
         rpc.prepare_load_ta_rpc(ta_uuid, None)?;
         return Err(OpteeSmcReturnCode::RpcCmd);
     }
+    let ta_source = shim
+        .get_ta_source(&ta_uuid)
+        .expect("successfully loaded TA must have a source");
+    debug_serial_println!("Loading TA: uuid={:?}, source={:?}", ta_uuid, ta_source);
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
     // Marker only releases once CR3 is back to base. See
@@ -1239,7 +1243,7 @@ fn open_session_new_instance(
     })?;
 
     if let Some(ta_binary) = ta_binary
-        && !shim.store_ta_bin(&ta_uuid, &ta_binary)
+        && !shim.store_ta_bin(&ta_uuid, &ta_binary, litebox_shim_optee::TaSource::Dynamic)
     {
         teardown_ta_page_table(platform, task_pt_id);
         return Err(OpteeSmcReturnCode::EBadCmd);
@@ -1783,7 +1787,9 @@ fn register_embedded_ta(
     };
 
     match parse_and_verify_ta(ta_binary, &verify_key) {
-        Ok((ta_head, ta_elf)) => shim.store_ta_bin(&ta_head.uuid, ta_elf),
+        Ok((ta_head, ta_elf)) => {
+            shim.store_ta_bin(&ta_head.uuid, ta_elf, litebox_shim_optee::TaSource::BuiltIn)
+        }
         Err(err) => {
             debug_serial_println!("parse_and_verify_ta failed: {}", err);
             false
@@ -1800,7 +1806,11 @@ fn register_embedded_ta(
     let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
         return false;
     };
-    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+    shim.store_ta_bin(
+        &ta_head.uuid,
+        ta_binary,
+        litebox_shim_optee::TaSource::BuiltIn,
+    )
 }
 
 /// Register all TA binaries embedded in the runner image.
