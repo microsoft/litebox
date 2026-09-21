@@ -46,8 +46,8 @@ pub use error::BrokerError;
 use fs::FileService;
 use id::{IdAllocator, MAX_ALLOCATED_ID};
 pub use policy::{
-    DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
-    PolicyProfile, SocketPolicy, SocketPolicyError,
+    DestinationPortRange, DestinationRule, ForkPlatform, Ipv4Cidr, MAX_DESTINATION_RULES,
+    PolicyEngine, PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 use process::ObjectReference;
 pub use process::{

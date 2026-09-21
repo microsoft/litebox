@@ -1833,6 +1833,36 @@ mod tests {
     extern crate std;
 
     #[test]
+    fn fork_policy_defaults_off_and_non_thread_clone_returns_einval() {
+        use litebox_broker_core::{ForkPlatform, PolicyEngine};
+        use litebox_common_linux::{CloneArgs, CloneFlags, PtRegs, errno::Errno, signal::Signal};
+
+        let policy = PolicyEngine::default_deny();
+        assert!(!policy.fork_enabled(ForkPlatform::Linux));
+        assert!(!policy.fork_enabled(ForkPlatform::Windows));
+
+        let task = crate::syscalls::tests::init_platform();
+        let args = CloneArgs {
+            flags: CloneFlags::empty(),
+            pidfd: 0,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal: u64::try_from(Signal::SIGCHLD.as_i32()).unwrap(),
+            stack: 0,
+            stack_size: 0,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: 0,
+        };
+
+        assert_eq!(
+            task.sys_clone(&PtRegs::default(), &args),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
     fn nonleader_exec_rebinds_identity_and_retains_broker_thread() {
         use litebox::thread::CreateError;
         use litebox_broker_core::BrokerCoreLimits;

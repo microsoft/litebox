@@ -324,11 +324,23 @@ pub enum PolicyProfile {
     },
 }
 
+/// Host platform whose fork implementation is controlled by broker policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForkPlatform {
+    /// Linux userland host.
+    Linux,
+    /// Windows userland host.
+    Windows,
+}
+
 /// Broker policy decision and audit component.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolicyEngine {
     profile: PolicyProfile,
     socket_policy: SocketPolicy,
+    linux_fork_enabled: bool,
+    windows_fork_enabled: bool,
 }
 
 impl PolicyEngine {
@@ -337,6 +349,8 @@ impl PolicyEngine {
         Self {
             profile,
             socket_policy: SocketPolicy::deny(),
+            linux_fork_enabled: false,
+            windows_fork_enabled: false,
         }
     }
 
@@ -360,6 +374,25 @@ impl PolicyEngine {
     pub const fn with_socket_policy(mut self, socket_policy: SocketPolicy) -> Self {
         self.socket_policy = socket_policy;
         self
+    }
+
+    /// Enables fork on one host platform.
+    #[must_use]
+    pub const fn with_fork_enabled(mut self, platform: ForkPlatform) -> Self {
+        match platform {
+            ForkPlatform::Linux => self.linux_fork_enabled = true,
+            ForkPlatform::Windows => self.windows_fork_enabled = true,
+        }
+        self
+    }
+
+    /// Returns whether fork is enabled on the given host platform.
+    #[must_use]
+    pub const fn fork_enabled(&self, platform: ForkPlatform) -> bool {
+        match platform {
+            ForkPlatform::Linux => self.linux_fork_enabled,
+            ForkPlatform::Windows => self.windows_fork_enabled,
+        }
     }
 
     pub(crate) fn principal_object_rights(
@@ -499,6 +532,21 @@ mod tests {
             policy.authorize_socket_create(CallerCredential::Unauthenticated, IPV4_TCP),
             Err(BrokerError::PolicyDenied)
         );
+    }
+
+    #[test]
+    fn fork_policy_defaults_off_and_enables_platforms_independently() {
+        let disabled = PolicyEngine::default_deny();
+        assert!(!disabled.fork_enabled(ForkPlatform::Linux));
+        assert!(!disabled.fork_enabled(ForkPlatform::Windows));
+
+        let linux = PolicyEngine::default_deny().with_fork_enabled(ForkPlatform::Linux);
+        assert!(linux.fork_enabled(ForkPlatform::Linux));
+        assert!(!linux.fork_enabled(ForkPlatform::Windows));
+
+        let windows = PolicyEngine::default_deny().with_fork_enabled(ForkPlatform::Windows);
+        assert!(!windows.fork_enabled(ForkPlatform::Linux));
+        assert!(windows.fork_enabled(ForkPlatform::Windows));
     }
 
     #[test]
