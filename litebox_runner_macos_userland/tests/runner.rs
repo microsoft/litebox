@@ -449,8 +449,8 @@ fn dynamic_libsystem_tls_and_main_thread_e2e() {
     std::fs::write(
         &source,
         "#include <errno.h>\n#include <pthread.h>\n#include <unistd.h>\n\
-         int main(void) { errno = E2BIG; (void)getpid(); \
-         return errno == E2BIG && pthread_main_np() ? 0 : 42; }\n",
+         int main(void) { errno = E2BIG; pid_t pid = getpid(); \
+         return errno == E2BIG && pid != 1 && pthread_main_np() ? 0 : 42; }\n",
     )
     .unwrap();
     let compiled = Command::new("xcrun")

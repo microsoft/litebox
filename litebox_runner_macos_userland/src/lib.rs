@@ -103,28 +103,33 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         test_broker::setup(platform, data.clone(), mmap_image.as_deref())?
     };
     let shim = builder.build();
+    // PID 1 is launchd on Darwin. Dyld gives it process-global responsibilities,
+    // including computing shared-cache root policy and publishing commpage flags.
+    // A normally launched LiteBox guest must not enter that launchd-only path.
+    let task_params = if dynamic {
+        TaskParams {
+            pid: 2,
+            ppid: 1,
+            ..TaskParams::default()
+        }
+    } else {
+        TaskParams::default()
+    };
     let shared_cache_instance = dynamic
         .then(live_cache::PrivateSharedCacheInstance::instantiate)
         .transpose()
         .context("instantiating private dyld cache")?;
     #[cfg(feature = "test-broker")]
     let program = if let Some(cache) = &shared_cache_instance {
-        shim.load_program_with_dyld(
-            TaskParams::default(),
-            "/executable",
-            &data,
-            &cache.dyld,
-            argv,
-            envp,
-        )
+        shim.load_program_with_dyld(task_params, "/executable", &data, &cache.dyld, argv, envp)
     } else {
-        shim.load_program(TaskParams::default(), "/executable", argv, envp)
+        shim.load_program(task_params, "/executable", argv, envp)
     };
     #[cfg(not(feature = "test-broker"))]
     let program = if let Some(cache) = &shared_cache_instance {
-        shim.load_program_with_dyld(TaskParams::default(), path, &data, &cache.dyld, argv, envp)
+        shim.load_program_with_dyld(task_params, path, &data, &cache.dyld, argv, envp)
     } else {
-        shim.load_program_from_bytes(TaskParams::default(), path, &data, argv, envp)
+        shim.load_program_from_bytes(task_params, path, &data, argv, envp)
     };
     let program = program.context("loading Mach-O")?;
     if let Some(cache) = &shared_cache_instance {
