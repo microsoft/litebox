@@ -8,7 +8,7 @@
 //! be position independent.
 
 use crate::{PAGE_SIZE, VmProtection};
-use alloc::{vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use core::ops::Range;
 use litebox::utils::ReinterpretSignedExt as _;
 use object::{
@@ -75,6 +75,8 @@ pub enum MachoLoaderError {
     ArgumentsTooLarge,
     #[error("invalid or incompatible Mach-O trampoline")]
     Rewrite,
+    #[error("Mach-O rewrite diagnostic: {0}")]
+    RewriteDiagnostic(String),
     #[error("Mach-O is not rewritten; run litebox_syscall_rewriter first")]
     Unrewritten,
 }

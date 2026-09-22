@@ -131,14 +131,30 @@ impl<'a> Image<'a> {
                 } else {
                     hook_syscalls_in_macho(rewrite_input, None)
                 }
-                .map_err(|_| MachoLoaderError::Rewrite)?;
-                plan = MachoParsedFile::parse(&rewritten)?;
-                let trampoline = plan.parse_trampoline(&rewritten)?;
+                .map_err(|error| {
+                    MachoLoaderError::RewriteDiagnostic(format!(
+                        "Mach-O rewriting failed: {error:?}"
+                    ))
+                })?;
+                plan = MachoParsedFile::parse(&rewritten).map_err(|error| {
+                    MachoLoaderError::RewriteDiagnostic(format!(
+                        "rewritten Mach-O parsing failed: {error:?}"
+                    ))
+                })?;
+                let trampoline = plan.parse_trampoline(&rewritten).map_err(|error| {
+                    MachoLoaderError::RewriteDiagnostic(format!(
+                        "rewritten trampoline parsing failed: {error:?}"
+                    ))
+                })?;
                 (Cow::Owned(rewritten), trampoline)
             }
             Err(error) => return Err(error),
         };
-        CodeMetadata::parse(&data).map_err(|_| MachoLoaderError::Rewrite)?;
+        CodeMetadata::parse(&data).map_err(|error| {
+            MachoLoaderError::RewriteDiagnostic(format!(
+                "rewritten code metadata parsing failed: {error:?}"
+            ))
+        })?;
         Ok(Self {
             data,
             plan,
@@ -163,7 +179,13 @@ impl<'a> Image<'a> {
             gates[..size_of::<usize>()].copy_from_slice(&callback.to_le_bytes());
             rewriter
                 .finalize_trampoline_gates(&mut gates, tls_offset)
-                .map_err(|_| MachoLoaderError::Rewrite)?;
+                .map_err(|error| {
+                    MachoLoaderError::RewriteDiagnostic(format!(
+                        "trampoline finalization failed: {error:?}; gate_bytes={}, \
+                         tls_offset={tls_offset}",
+                        gates.len()
+                    ))
+                })?;
             gates
         } else {
             Vec::new()

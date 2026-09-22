@@ -8,6 +8,7 @@
 //! executing a partially compatible dyld.
 
 use crate::MachoLoaderError;
+use alloc::{format, vec::Vec};
 use litebox::utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _};
 
 const AARCH64_NOP: u32 = 0xd503_201f;
@@ -36,7 +37,11 @@ fn disable_restart_into_cached_dyld(data: &mut [u8]) -> Result<(), MachoLoaderEr
             return Ok(());
         }
     }
-    Err(MachoLoaderError::Rewrite)
+    Err(signature_failure(
+        data,
+        "disable_restart_into_cached_dyld",
+        &[Some(MOV_SP_X0), Some(BR_X3)],
+    ))
 }
 
 /// Host cache initializers have already run and are not safe to run again in
@@ -55,7 +60,17 @@ fn suppress_shared_cache_initializers(data: &mut [u8]) -> Result<(), MachoLoader
             return Ok(());
         }
     }
-    Err(MachoLoaderError::Rewrite)
+    Err(signature_failure(
+        data,
+        "suppress_shared_cache_initializers",
+        &[
+            Some(PREFIX[0]),
+            Some(PREFIX[1]),
+            Some(PREFIX[2]),
+            Some(PREFIX[3]),
+            None,
+        ],
+    ))
 }
 
 /// Redirect dyld's non-simulator `LibSystemHelpers::exit` call to dyld's own
@@ -89,7 +104,60 @@ fn redirect_process_exit(data: &mut [u8]) -> Result<(), MachoLoaderError> {
             return Ok(());
         }
     }
-    Err(MachoLoaderError::Rewrite)
+    Err(signature_failure(
+        data,
+        "redirect_process_exit",
+        &[
+            Some(CBZ_W0_PLUS_12),
+            Some(MOV_X0_X19),
+            None,
+            Some(LDR_X8_SP_464),
+            Some(ADD_X0_X8_160),
+            Some(MOV_X1_X19),
+            None,
+        ],
+    ))
+}
+
+fn signature_failure(data: &[u8], name: &str, signature: &[Option<u32>]) -> MachoLoaderError {
+    let mut candidates: Vec<_> = instruction_offsets(data.len(), signature.len())
+        .map(|offset| {
+            let score = signature
+                .iter()
+                .enumerate()
+                .filter(|(index, expected)| {
+                    expected.is_some_and(|expected| word(data, offset + index * 4) == expected)
+                })
+                .count();
+            (score, offset)
+        })
+        .collect();
+    candidates.sort_unstable_by_key(|&(score, offset)| (core::cmp::Reverse(score), offset));
+    candidates.truncate(8);
+
+    let candidates = candidates
+        .into_iter()
+        .map(|(score, offset)| {
+            let words = (0..signature.len())
+                .map(|index| {
+                    let instruction = word(data, offset + index * 4);
+                    if is_bl(instruction) {
+                        format!("{instruction:08x}(bl)")
+                    } else {
+                        format!("{instruction:08x}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("offset=0x{offset:x} score={score}: {words}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    MachoLoaderError::RewriteDiagnostic(format!(
+        "{name} signature not found (image_bytes={}, exact_words={}): {candidates}",
+        data.len(),
+        signature.iter().flatten().count()
+    ))
 }
 
 fn instruction_offsets(data_len: usize, words: usize) -> impl Iterator<Item = usize> {
