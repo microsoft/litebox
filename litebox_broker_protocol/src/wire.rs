@@ -23,8 +23,8 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
+    DuplicateProcess, DuplicationOutcome, InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS,
+    ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -34,6 +34,7 @@ mod event;
 mod fs;
 mod pipe;
 mod primitive;
+mod process;
 mod socket;
 mod stdio;
 
@@ -77,6 +78,13 @@ pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 85;
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
 
+/// Maximum byte length of an encoded [`DuplicateProcess`] payload.
+pub const MAX_ENCODED_DUPLICATE_PROCESS_SIZE: usize = process::MAX_ENCODED_DUPLICATE_PROCESS_SIZE;
+
+/// Maximum byte length of an encoded [`DuplicationOutcome`] payload.
+pub const MAX_ENCODED_DUPLICATION_OUTCOME_SIZE: usize =
+    process::MAX_ENCODED_DUPLICATION_OUTCOME_SIZE;
+
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
@@ -91,6 +99,26 @@ pub enum WireError {
     WrongMessagePhase,
     #[error("broker wire offset overflow")]
     OffsetOverflow,
+}
+
+/// Encodes a [`DuplicateProcess`] payload without its transport envelope.
+pub fn encode_duplicate_process(request: DuplicateProcess) -> Vec<u8> {
+    process::encode_duplicate_process(request)
+}
+
+/// Decodes a [`DuplicateProcess`] payload.
+pub fn decode_duplicate_process(frame: &[u8]) -> Result<DuplicateProcess, WireError> {
+    process::decode_duplicate_process(frame)
+}
+
+/// Encodes a [`DuplicationOutcome`] payload without its transport envelope.
+pub fn encode_duplication_outcome(outcome: DuplicationOutcome) -> Vec<u8> {
+    process::encode_duplication_outcome(outcome)
+}
+
+/// Decodes a [`DuplicationOutcome`] payload.
+pub fn decode_duplication_outcome(frame: &[u8]) -> Result<DuplicationOutcome, WireError> {
+    process::decode_duplication_outcome(frame)
 }
 
 /// Encodes a broker handshake request body.

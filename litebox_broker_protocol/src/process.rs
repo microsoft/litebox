@@ -93,3 +93,26 @@ pub struct ProcessIdentity {
     /// Broker-assigned initial thread ID.
     pub initial_thread_id: ThreadId,
 }
+
+/// Requests broker-planned process duplication using image and dirty payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DuplicateProcess {
+    /// Serialized parent-image payload.
+    pub image: SharedBufferSequence,
+    /// Serialized dirty-range payload.
+    pub dirty: SharedBufferSequence,
+}
+
+/// Result of broker-planned process duplication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DuplicationOutcome {
+    /// No child was published and the parent image is unchanged.
+    Refused,
+    /// The child was published and the parent must apply the returned patch.
+    ParentUpdate {
+        /// Operation-scoped shared-memory sequence containing the parent patch.
+        patch: SharedBufferSequence,
+        /// Published child identity.
+        child: ProcessIdentity,
+    },
+}
