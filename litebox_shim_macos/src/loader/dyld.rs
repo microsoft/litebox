@@ -82,16 +82,21 @@ fn redirect_process_exit(data: &mut [u8]) -> Result<(), MachoLoaderError> {
     const MOV_X0_X19: u32 = 0xaa13_03e0;
     const LDR_X8_SP_464: u32 = 0xf940_ebe8;
     const ADD_X0_X8_160: u32 = 0x9102_8100;
+    const LDR_X8_SP_488: u32 = 0xf940_f7e8;
+    const ADD_X0_X8_176: u32 = 0x9102_c100;
     const MOV_X1_X19: u32 = 0xaa13_03e1;
 
     for offset in instruction_offsets(data.len(), 7) {
         let simulator_exit = word(data, offset + 8);
         let helper_exit = word(data, offset + 24);
+        let helper_address = (word(data, offset + 12), word(data, offset + 16));
         if word(data, offset) == CBZ_W0_PLUS_12
             && word(data, offset + 4) == MOV_X0_X19
             && is_bl(simulator_exit)
-            && word(data, offset + 12) == LDR_X8_SP_464
-            && word(data, offset + 16) == ADD_X0_X8_160
+            && matches!(
+                helper_address,
+                (LDR_X8_SP_464, ADD_X0_X8_160) | (LDR_X8_SP_488, ADD_X0_X8_176)
+            )
             && word(data, offset + 20) == MOV_X1_X19
             && is_bl(helper_exit)
         {
