@@ -75,7 +75,7 @@ pub enum MachoLoaderError {
     ArgumentsTooLarge,
     #[error("invalid or incompatible Mach-O trampoline")]
     Rewrite,
-    #[error("Mach-O rewrite diagnostic: {0}")]
+    #[error("invalid or incompatible Mach-O trampoline: {0}")]
     RewriteDiagnostic(String),
     #[error("Mach-O is not rewritten; run litebox_syscall_rewriter first")]
     Unrewritten,

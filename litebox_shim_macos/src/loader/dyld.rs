@@ -29,9 +29,10 @@ pub(super) fn patch(data: &mut [u8]) -> Result<(), MachoLoaderError> {
 fn disable_restart_into_cached_dyld(data: &mut [u8]) -> Result<(), MachoLoaderError> {
     const MOV_SP_X0: u32 = 0x9100_001f;
     const BR_X3: u32 = 0xd61f_0060;
+    const BR_X4: u32 = 0xd61f_0080;
 
     for offset in instruction_offsets(data.len(), 2) {
-        if word(data, offset) == MOV_SP_X0 && word(data, offset + 4) == BR_X3 {
+        if word(data, offset) == MOV_SP_X0 && matches!(word(data, offset + 4), BR_X3 | BR_X4) {
             write_word(data, offset, AARCH64_RET);
             write_word(data, offset + 4, AARCH64_NOP);
             return Ok(());
