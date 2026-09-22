@@ -215,12 +215,12 @@ fn parse_image(input: &[u8]) -> Result<Option<CodeMetadata>> {
     let header = macho::MachHeader64::<LE>::parse(&*bytes, 0).map_err(parse_error)?;
     if header.cputype(LE) != macho::CPU_TYPE_ARM64
         || !matches!(
-            header.cpusubtype(LE),
-            macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8
+            header.cpusubtype(LE) & !macho::CPU_SUBTYPE_MASK,
+            macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8 | macho::CPU_SUBTYPE_ARM64E
         )
     {
         return Err(Error::UnsupportedExecutable(
-            "Mach-O requires AArch64, not arm64e".into(),
+            "Mach-O requires AArch64 or arm64e".into(),
         ));
     }
     if header.filetype(LE) == macho::MH_OBJECT {
