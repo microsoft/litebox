@@ -99,13 +99,7 @@ pub struct ProcessIdentity {
 pub enum StartChildProcessRequest {
     /// Starts a child from an opaque platform bootstrap.
     Bootstrap(ProcessStartupDescriptor),
-    /// Starts a child by duplicating the calling process.
-    Duplicate {
-        /// Operation-scoped buffer containing the duplication input and later the parent patch.
-        buffer: SharedBufferSequence,
-        /// Number of leading buffer bytes occupied by the duplication input.
-        ///
-        /// Must not exceed `buffer.length()`.
-        input_length: u32,
-    },
+    /// Starts a child by duplicating the calling process from an encoded,
+    /// input-only image whose exact length is the buffer sequence length.
+    Duplicate(SharedBufferSequence),
 }

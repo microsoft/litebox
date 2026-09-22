@@ -825,10 +825,7 @@ where
                         request.inherited_objects,
                     )
                 })
-                .map(|child| BrokerResult::ProcessStarted {
-                    child,
-                    parent_patch_length: None,
-                }),
+                .map(BrokerResult::ProcessStarted),
         ),
         _ => None,
     }

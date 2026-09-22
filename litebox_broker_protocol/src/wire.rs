@@ -67,9 +67,6 @@ const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
 
-const PROCESS_STARTED_PARENT_PATCH_LENGTH_NONE: u8 = 0;
-const PROCESS_STARTED_PARENT_PATCH_LENGTH_SOME: u8 = 1;
-
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
 const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 254;
@@ -213,13 +210,9 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
                     encoder.shared_buffer_sequence(buffer);
                     encode_inherited_objects(&mut encoder, inherited_objects);
                 }
-                StartChildProcessRequest::Duplicate {
-                    buffer,
-                    input_length,
-                } => {
+                StartChildProcessRequest::Duplicate(buffer) => {
                     encoder.u8(START_CHILD_PROCESS_TAG_DUPLICATE);
                     encoder.shared_buffer_sequence(buffer);
-                    encoder.u32(input_length);
                 }
             }
         }
@@ -268,10 +261,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                         inherited_objects: decode_inherited_objects(&mut decoder)?,
                     })
                 }
-                START_CHILD_PROCESS_TAG_DUPLICATE => StartChildProcessRequest::Duplicate {
-                    buffer: decoder.shared_buffer_sequence()?,
-                    input_length: decoder.u32()?,
-                },
+                START_CHILD_PROCESS_TAG_DUPLICATE => {
+                    StartChildProcessRequest::Duplicate(decoder.shared_buffer_sequence()?)
+                }
                 _ => return Err(WireError::InvalidTag),
             };
             BrokerOperation::StartChildProcess(request)
@@ -433,21 +425,14 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_response(&mut encoder, response);
         }
-        BrokerResult::ProcessStarted {
-            child,
-            parent_patch_length,
-        } => {
+        BrokerResult::ProcessStarted(ProcessIdentity {
+            process_id,
+            initial_thread_id,
+        }) => {
             encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
             encoder.request_id(request_id);
-            encoder.process_id(child.process_id);
-            encoder.thread_id(child.initial_thread_id);
-            match parent_patch_length {
-                None => encoder.u8(PROCESS_STARTED_PARENT_PATCH_LENGTH_NONE),
-                Some(length) => {
-                    encoder.u8(PROCESS_STARTED_PARENT_PATCH_LENGTH_SOME);
-                    encoder.u32(length);
-                }
-            }
+            encoder.process_id(process_id);
+            encoder.thread_id(initial_thread_id);
         }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -493,21 +478,10 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
-        RESPONSE_TAG_PROCESS_STARTED => {
-            let child = ProcessIdentity {
-                process_id: decoder.process_id()?,
-                initial_thread_id: decoder.thread_id()?,
-            };
-            let parent_patch_length = match decoder.u8()? {
-                PROCESS_STARTED_PARENT_PATCH_LENGTH_NONE => None,
-                PROCESS_STARTED_PARENT_PATCH_LENGTH_SOME => Some(decoder.u32()?),
-                _ => return Err(WireError::InvalidTag),
-            };
-            BrokerResult::ProcessStarted {
-                child,
-                parent_patch_length,
-            }
-        }
+        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(ProcessIdentity {
+            process_id: decoder.process_id()?,
+            initial_thread_id: decoder.thread_id()?,
+        }),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -983,10 +957,7 @@ mod tests {
                     .unwrap(),
                 },
             )),
-            BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate {
-                buffer: sequence(0, 2),
-                input_length: 1,
-            }),
+            BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate(sequence(0, 2))),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1332,20 +1303,14 @@ mod tests {
             BrokerResult::File(FileResponse::Mkdir),
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
-            BrokerResult::ProcessStarted {
-                child: ProcessIdentity {
-                    process_id: process_id(u32::MAX),
-                    initial_thread_id: thread_id(u32::MAX - 1),
-                },
-                parent_patch_length: None,
-            },
-            BrokerResult::ProcessStarted {
-                child: ProcessIdentity {
-                    process_id: process_id(9),
-                    initial_thread_id: thread_id(11),
-                },
-                parent_patch_length: Some(u32::MAX),
-            },
+            BrokerResult::ProcessStarted(ProcessIdentity {
+                process_id: process_id(u32::MAX),
+                initial_thread_id: thread_id(u32::MAX - 1),
+            }),
+            BrokerResult::ProcessStarted(ProcessIdentity {
+                process_id: process_id(9),
+                initial_thread_id: thread_id(11),
+            }),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1476,10 +1441,9 @@ mod tests {
         );
         let mut unknown_child_start = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate {
-                buffer: sequence(0, 2),
-                input_length: 1,
-            }),
+            operation: BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate(
+                sequence(0, 2),
+            )),
         });
         unknown_child_start[9] = 0xff;
         assert_eq!(
@@ -1926,22 +1890,6 @@ mod tests {
 
         let truncated = [RESPONSE_TAG_EVENT, 2, 2, 0];
         assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
-
-        let mut invalid_parent_patch = encode_response(BrokerResponse {
-            request_id: TEST_REQUEST_ID,
-            result: BrokerResult::ProcessStarted {
-                child: ProcessIdentity {
-                    process_id: process_id(1),
-                    initial_thread_id: thread_id(2),
-                },
-                parent_patch_length: None,
-            },
-        });
-        *invalid_parent_patch.last_mut().unwrap() = 0xff;
-        assert_eq!(
-            decode_response(&invalid_parent_patch),
-            Err(WireError::InvalidTag)
-        );
 
         let mut frame = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

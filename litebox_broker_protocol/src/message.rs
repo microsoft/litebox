@@ -103,7 +103,7 @@ impl BrokerOperation {
             )
             | Self::StartChildProcess(
                 StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor { buffer, .. })
-                | StartChildProcessRequest::Duplicate { buffer, .. },
+                | StartChildProcessRequest::Duplicate(buffer),
             ) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
@@ -246,14 +246,7 @@ pub enum BrokerResult {
     /// File response family.
     File(FileResponse),
     /// A child established its broker association.
-    ProcessStarted {
-        /// Broker-assigned child identity.
-        child: ProcessIdentity,
-        /// Parent-patch byte length returned only for process duplication.
-        ///
-        /// Must not exceed the duplication request buffer length.
-        parent_patch_length: Option<u32>,
-    },
+    ProcessStarted(ProcessIdentity),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
