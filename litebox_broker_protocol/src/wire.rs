@@ -23,8 +23,8 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    DuplicateProcess, DuplicationOutcome, InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS,
-    ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
+    InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessStartupDescriptor,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -73,17 +73,10 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 85;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 86;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
-
-/// Maximum byte length of an encoded [`DuplicateProcess`] payload.
-pub const MAX_ENCODED_DUPLICATE_PROCESS_SIZE: usize = process::MAX_ENCODED_DUPLICATE_PROCESS_SIZE;
-
-/// Maximum byte length of an encoded [`DuplicationOutcome`] payload.
-pub const MAX_ENCODED_DUPLICATION_OUTCOME_SIZE: usize =
-    process::MAX_ENCODED_DUPLICATION_OUTCOME_SIZE;
 
 /// Error produced while encoding or decoding a broker wire message.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -99,26 +92,6 @@ pub enum WireError {
     WrongMessagePhase,
     #[error("broker wire offset overflow")]
     OffsetOverflow,
-}
-
-/// Encodes a [`DuplicateProcess`] payload without its transport envelope.
-pub fn encode_duplicate_process(request: DuplicateProcess) -> Vec<u8> {
-    process::encode_duplicate_process(request)
-}
-
-/// Decodes a [`DuplicateProcess`] payload.
-pub fn decode_duplicate_process(frame: &[u8]) -> Result<DuplicateProcess, WireError> {
-    process::decode_duplicate_process(frame)
-}
-
-/// Encodes a [`DuplicationOutcome`] payload without its transport envelope.
-pub fn encode_duplication_outcome(outcome: DuplicationOutcome) -> Vec<u8> {
-    process::encode_duplication_outcome(outcome)
-}
-
-/// Decodes a [`DuplicationOutcome`] payload.
-pub fn decode_duplication_outcome(frame: &[u8]) -> Result<DuplicationOutcome, WireError> {
-    process::decode_duplication_outcome(frame)
 }
 
 /// Encodes a broker handshake request body.
@@ -219,18 +192,10 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_request(&mut encoder, request);
         }
-        BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
-            format,
-            version,
-            buffer,
-            inherited_objects,
-        }) => {
+        BrokerOperation::StartChildProcess(request) => {
             encoder.u8(REQUEST_TAG_START_CHILD_PROCESS);
             encoder.request_id(request_id);
-            encoder.u32(format.0);
-            encoder.u16(version.0);
-            encoder.shared_buffer_sequence(buffer);
-            encode_inherited_objects(&mut encoder, inherited_objects);
+            process::encode_start_child_process_request(&mut encoder, request);
         }
     }
     encoder.finish()
@@ -267,14 +232,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_sequence()?),
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
-        REQUEST_TAG_START_CHILD_PROCESS => {
-            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
-                format: ProcessBootstrapFormat(decoder.u32()?),
-                version: ProcessBootstrapVersion(decoder.u16()?),
-                buffer: decoder.shared_buffer_sequence()?,
-                inherited_objects: decode_inherited_objects(&mut decoder)?,
-            })
-        }
+        REQUEST_TAG_START_CHILD_PROCESS => BrokerOperation::StartChildProcess(
+            process::decode_start_child_process_request(&mut decoder)?,
+        ),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -432,14 +392,15 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_response(&mut encoder, response);
         }
-        BrokerResult::ProcessStarted(ProcessIdentity {
-            process_id,
-            initial_thread_id,
-        }) => {
+        BrokerResult::ProcessStarted(identity) => {
             encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
             encoder.request_id(request_id);
-            encoder.process_id(process_id);
-            encoder.thread_id(initial_thread_id);
+            process::encode_process_started(&mut encoder, identity);
+        }
+        BrokerResult::ProcessDuplication(outcome) => {
+            encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
+            encoder.request_id(request_id);
+            process::encode_process_duplication(&mut encoder, outcome);
         }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
@@ -485,10 +446,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
-        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(ProcessIdentity {
-            process_id: decoder.process_id()?,
-            initial_thread_id: decoder.thread_id()?,
-        }),
+        RESPONSE_TAG_PROCESS_STARTED => process::decode_start_child_process_result(&mut decoder)?,
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -607,8 +565,9 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
-        ProcessStartupDescriptor,
+        DuplicationOutcome, InheritedProcessObjects, ProcessBootstrapFormat,
+        ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
+        StartChildProcessRequest,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -950,17 +909,23 @@ mod tests {
                 name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
-            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
-                format: ProcessBootstrapFormat(u32::MAX),
-                version: ProcessBootstrapVersion(u16::MAX),
-                buffer: largest_sequence,
-                inherited_objects: InheritedProcessObjects::new(&[
-                    ObjectHandle(1),
-                    ObjectHandle(2),
-                    ObjectHandle(3),
-                    ObjectHandle(4),
-                ])
-                .unwrap(),
+            BrokerOperation::StartChildProcess(StartChildProcessRequest::Bootstrap(
+                ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(u32::MAX),
+                    version: ProcessBootstrapVersion(u16::MAX),
+                    buffer: largest_sequence,
+                    inherited_objects: InheritedProcessObjects::new(&[
+                        ObjectHandle(1),
+                        ObjectHandle(2),
+                        ObjectHandle(3),
+                        ObjectHandle(4),
+                    ])
+                    .unwrap(),
+                },
+            )),
+            BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate {
+                image: sequence(0, 1),
+                dirty: sequence(1, 1),
             }),
         ];
         let mut maximum_encoded_size = 0;
@@ -1314,6 +1279,14 @@ mod tests {
             BrokerResult::ProcessStarted(ProcessIdentity {
                 process_id: process_id(9),
                 initial_thread_id: thread_id(11),
+            }),
+            BrokerResult::ProcessDuplication(DuplicationOutcome::Refused),
+            BrokerResult::ProcessDuplication(DuplicationOutcome::ParentUpdate {
+                patch: sequence(7, u32::MAX),
+                child: ProcessIdentity {
+                    process_id: process_id(u32::MAX),
+                    initial_thread_id: thread_id(u32::MAX),
+                },
             }),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),

@@ -46,6 +46,7 @@ use litebox_broker_protocol::pipe::{
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
     ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -167,22 +168,22 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
             request_id,
             operation,
         } = request;
-        let buffer_sequence = operation.shared_buffer();
+        let buffer_sequences = operation.shared_buffers();
 
         {
             let mut state = self.state.lock();
             if state.failed {
                 return Err(BrokerHostError::AssociationFailed);
             }
-            if let Some(sequence) = buffer_sequence
-                && let Err(error) = state.shared_buffer_usage.begin(
+            for sequence in buffer_sequences.iter().flatten().copied() {
+                if let Err(error) = state.shared_buffer_usage.begin(
                     request_id,
                     sequence,
                     self.shared_buffers.layout(),
-                )
-            {
-                state.failed = true;
-                return Err(BrokerHostError::Broker(error));
+                ) {
+                    state.failed = true;
+                    return Err(BrokerHostError::Broker(error));
+                }
             }
         }
 
@@ -202,7 +203,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
                 return Err(BrokerHostError::Broker(error));
             }
         };
-        if let Some(sequence) = buffer_sequence {
+        for sequence in buffer_sequences.iter().flatten().copied() {
             self.state
                 .lock()
                 .shared_buffer_usage
@@ -811,7 +812,7 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
-        BrokerOperation::StartChildProcess(request) => Some(
+        BrokerOperation::StartChildProcess(StartChildProcessRequest::Bootstrap(request)) => Some(
             read_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
                 .and_then(|payload| {
                     start_child_process(

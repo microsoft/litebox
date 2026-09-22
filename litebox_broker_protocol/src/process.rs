@@ -94,13 +94,18 @@ pub struct ProcessIdentity {
     pub initial_thread_id: ThreadId,
 }
 
-/// Requests broker-planned process duplication using image and dirty payloads.
+/// Selects how the broker starts one child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DuplicateProcess {
-    /// Serialized parent-image payload.
-    pub image: SharedBufferSequence,
-    /// Serialized dirty-range payload.
-    pub dirty: SharedBufferSequence,
+pub enum StartChildProcessRequest {
+    /// Starts a child from an opaque platform bootstrap.
+    Bootstrap(ProcessStartupDescriptor),
+    /// Starts a child by duplicating the calling process.
+    Duplicate {
+        /// Serialized parent-image payload.
+        image: SharedBufferSequence,
+        /// Serialized dirty-range payload.
+        dirty: SharedBufferSequence,
+    },
 }
 
 /// Result of broker-planned process duplication.
