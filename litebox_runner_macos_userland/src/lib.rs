@@ -10,6 +10,8 @@ use litebox_common_macos::TaskParams;
 use litebox_platform_macos_userland::{GuestAbi, MacosUserland, set_guest_abi};
 #[cfg(not(feature = "test-broker"))]
 use litebox_shim_macos::MacosShimBuilder;
+#[cfg(feature = "test-broker")]
+use std::path::PathBuf;
 use std::{ffi::CString, io::Read as _};
 
 #[derive(Parser, Debug)]
@@ -23,6 +25,10 @@ pub struct CliArgs {
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
     #[arg(long = "env")]
     pub environment_variables: Vec<String>,
+    /// Host Mach-O exposed at /mmap-image for mmap rewriting tests.
+    #[cfg(feature = "test-broker")]
+    #[arg(long, hide = true, value_hint = clap::ValueHint::FilePath)]
+    pub test_mmap_image: Option<PathBuf>,
 }
 
 #[cfg(feature = "test-broker")]
@@ -59,7 +65,15 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     #[cfg(not(feature = "test-broker"))]
     let builder = MacosShimBuilder::new(platform);
     #[cfg(feature = "test-broker")]
-    let (builder, stdio) = test_broker::setup(platform, data)?;
+    let (builder, stdio) = {
+        let mmap_image = cli_args
+            .test_mmap_image
+            .as_deref()
+            .map(std::fs::read)
+            .transpose()
+            .context("reading mmap test image")?;
+        test_broker::setup(platform, data, mmap_image.as_deref())?
+    };
     #[cfg(feature = "test-broker")]
     let program = builder
         .build()

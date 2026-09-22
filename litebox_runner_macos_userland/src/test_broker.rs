@@ -31,6 +31,7 @@ use std::{
 pub(crate) fn setup(
     platform: &'static MacosUserland,
     executable: Vec<u8>,
+    mmap_image: Option<&[u8]>,
 ) -> Result<(MacosShimBuilder<MacosUserland>, Arc<TestStdioProvider>)> {
     let stdio = Arc::new(TestStdioProvider::default());
     let mut input = Vec::new();
@@ -38,7 +39,7 @@ pub(crate) fn setup(
         .read_to_end(&mut input)
         .context("reading test input")?;
     stdio.push_input(&input);
-    let fs = InMem::<MacosUserland>::new_initialized(vec![
+    let mut initial_nodes = vec![
         (
             "/",
             InitialNode::Directory {
@@ -54,7 +55,18 @@ pub(crate) fn setup(
                 data: executable.into(),
             },
         ),
-    ]);
+    ];
+    if let Some(image) = mmap_image {
+        initial_nodes.push((
+            "/mmap-image",
+            InitialNode::File {
+                mode: FileMode::from_u32_bits_truncate(0o555),
+                owner: FileUser::ROOT,
+                data: image.to_vec().into(),
+            },
+        ));
+    }
+    let fs = InMem::<MacosUserland>::new_initialized(initial_nodes);
     let fs = Composer::builder()
         .mount("/", |_| fs)
         .mount("/dev", Devices::new)

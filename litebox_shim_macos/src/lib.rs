@@ -11,12 +11,15 @@
 
 extern crate alloc;
 
-use alloc::{ffi::CString, sync::Arc, vec, vec::Vec};
+use alloc::{collections::BTreeMap, ffi::CString, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicI32, Ordering};
 use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{
-    LiteBox, mm::PageManager, platform::PageManagementProvider, sync::RawSyncPrimitivesProvider,
+    LiteBox,
+    mm::PageManager,
+    platform::PageManagementProvider,
+    sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_macos::{
     PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams, errno::Errno,
@@ -85,6 +88,8 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 platform: self.platform,
                 pm: PageManager::new(&self.litebox),
                 litebox: self.litebox,
+                macho_mappings: Mutex::new(BTreeMap::new()),
+                macho_trampolines: Mutex::new(BTreeMap::new()),
             }),
             files: self.files,
         }
@@ -184,6 +189,8 @@ struct GlobalState<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
     pm: PageManager<P, PAGE_SIZE>,
+    macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
+    macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {

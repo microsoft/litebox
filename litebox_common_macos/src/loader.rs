@@ -21,7 +21,7 @@ use zerocopy::{
 };
 
 const TRAMPOLINE_FILE_ALIGNMENT: usize = 4096;
-const MACH_HEADER_SIZE: usize = size_of::<macho::MachHeader64<LE>>();
+pub const MACH_HEADER_SIZE: usize = size_of::<macho::MachHeader64<LE>>();
 const ARM_THREAD_STATE64: u32 = 6;
 const LOAD_COMMAND_ALIGNMENT: usize = size_of::<u64>();
 
@@ -98,6 +98,34 @@ pub struct MachoParsedFile {
 pub struct TrampolineInfo {
     pub file_range: Range<usize>,
     pub virtual_range: Range<usize>,
+}
+
+/// Returns whether `data` starts with a thin, little-endian AArch64 Mach-O header.
+pub fn is_thin_arm64_macho_header(data: &[u8]) -> bool {
+    let Some(header_bytes) = data.get(..MACH_HEADER_SIZE) else {
+        return false;
+    };
+    let mut storage = [0u64; MACH_HEADER_SIZE.div_ceil(size_of::<u64>())];
+    storage.as_mut_bytes()[..MACH_HEADER_SIZE].copy_from_slice(header_bytes);
+    let Ok(header) = macho::MachHeader64::<LE>::parse(&storage.as_bytes()[..MACH_HEADER_SIZE], 0)
+    else {
+        return false;
+    };
+    header.is_little_endian()
+        && header.cputype(LE) == macho::CPU_TYPE_ARM64
+        && matches!(
+            header.cpusubtype(LE),
+            macho::CPU_SUBTYPE_ARM64_ALL | macho::CPU_SUBTYPE_ARM64_V8
+        )
+}
+
+/// Cheaply classify a header that may contain a supported Mach-O image.
+/// Universal-container architecture selection still requires the complete file.
+pub fn may_contain_arm64_macho(data: &[u8]) -> bool {
+    is_thin_arm64_macho_header(data)
+        || data.get(..size_of::<u32>()).is_some_and(|magic| {
+            magic == macho::FAT_MAGIC.to_be_bytes() || magic == macho::FAT_MAGIC_64.to_be_bytes()
+        })
 }
 
 impl MachoParsedFile {
@@ -346,6 +374,13 @@ impl MachoParsedFile {
             entry,
         })
     }
+}
+
+/// Return the container-relative range of the unique arm64 (not arm64e) slice.
+pub fn arm64_slice_range(data: &[u8]) -> Result<Range<usize>, MachoLoaderError> {
+    let slice = arm64_slice(data)?;
+    let offset = slice.as_ptr().addr() - data.as_ptr().addr();
+    Ok(offset..offset + slice.len())
 }
 
 /// Select the unique arm64 (not arm64e) slice, or return thin input unchanged.
