@@ -50,8 +50,8 @@ pub use policy::{
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 pub use process::{
-    AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
-    ProcessLifecycleSink, ProcessShutdown,
+    AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, DuplicationTransaction,
+    ObjectRights, ProcessLifecycleSink, ProcessShutdown,
 };
 use process::{ObjectReference, ProcessParent, ProcessRoot};
 use random::RandomProvider;

@@ -167,6 +167,7 @@ struct BrokerProcessState {
     /// Immediate wait parent; `None` on a non-root means future zombies auto-reap.
     parent: Option<ProcessParent>,
     owner_alive: bool,
+    duplication_active: bool,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
     shutdown: Option<ProcessShutdown>,
@@ -207,6 +208,93 @@ pub(crate) enum ProcessRequestOrigin {
     Lifecycle,
     /// Operation initiated by guest execution.
     Guest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "later duplication PRs advance through the remaining phases"
+    )
+)]
+enum DuplicationPhase {
+    Admitted,
+    Captured,
+    ChildImageReady,
+    Published,
+    Aborted,
+}
+
+impl DuplicationPhase {
+    fn transition(&mut self, next: Self) -> Result<()> {
+        let allowed = matches!(
+            (*self, next),
+            (Self::Admitted, Self::Captured | Self::Aborted)
+                | (Self::Captured, Self::ChildImageReady | Self::Aborted)
+                | (Self::ChildImageReady, Self::Published | Self::Aborted)
+        );
+        if !allowed {
+            return Err(BrokerError::Internal);
+        }
+        *self = next;
+        Ok(())
+    }
+}
+
+/// Broker-owned state for one admitted process-duplication attempt.
+///
+/// At most one transaction may be active for a process. Transactions track
+/// admission, capture, child-image construction, publication, and abortion.
+/// Initial admission does not allocate a child.
+pub struct DuplicationTransaction {
+    owner: Arc<BrokerProcess>,
+    child_id: Option<ProcessId>,
+    phase: DuplicationPhase,
+    active: bool,
+}
+
+impl DuplicationTransaction {
+    /// Returns the allocated child ID, if child allocation has completed.
+    #[must_use]
+    pub const fn child_id(&self) -> Option<ProcessId> {
+        self.child_id
+    }
+
+    /// Refuses this attempt before child allocation or publication.
+    pub fn refuse(mut self) -> Result<()> {
+        self.phase.transition(DuplicationPhase::Aborted)?;
+        self.release()?;
+        Err(BrokerError::WouldBlock)
+    }
+
+    fn release(&mut self) -> Result<()> {
+        if !self.active {
+            return Err(BrokerError::Internal);
+        }
+        let mut state = self.owner.state.lock();
+        if !state.duplication_active {
+            self.active = false;
+            return Err(BrokerError::Internal);
+        }
+        state.duplication_active = false;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for DuplicationTransaction {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.owner.state.lock();
+            assert!(
+                state.duplication_active,
+                "active duplication transaction is missing from its owner"
+            );
+            state.duplication_active = false;
+            self.active = false;
+        }
+    }
 }
 
 /// Authoritative lifecycle state of one broker process record.
@@ -342,6 +430,7 @@ impl BrokerProcess {
                 record: ProcessRecordState::Starting(ProcessStartKind::Association),
                 parent,
                 owner_alive: true,
+                duplication_active: false,
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
@@ -368,6 +457,37 @@ impl BrokerProcess {
     #[must_use]
     pub const fn caller_credential(&self) -> CallerCredential {
         self.caller_credential
+    }
+
+    /// Opens one process-duplication transaction for this running process.
+    ///
+    /// Duplication must be enabled by policy, and only one transaction may be
+    /// active for the process. Dropping the returned transaction releases that
+    /// active slot.
+    pub fn begin_duplication(self: &Arc<Self>) -> Result<DuplicationTransaction> {
+        if !self.core.policy.process_duplication_enabled() {
+            return Err(BrokerError::PolicyDenied);
+        }
+
+        let mut state = self.state.lock();
+        if !state.owner_alive
+            || !matches!(state.record, ProcessRecordState::Running)
+            || !matches!(state.retirement, ProcessRetirement::Active { .. })
+        {
+            return Err(BrokerError::PeerClosed);
+        }
+        if state.duplication_active {
+            return Err(BrokerError::WouldBlock);
+        }
+        state.duplication_active = true;
+        drop(state);
+
+        Ok(DuplicationTransaction {
+            owner: Arc::clone(self),
+            child_id: None,
+            phase: DuplicationPhase::Admitted,
+            active: true,
+        })
     }
 
     /// Returns whether this process completed broker startup.
@@ -1298,8 +1418,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        BrokerProcess, ProcessLifecycleSink, ProcessRecordState, ProcessReferences,
-        ProcessRequestOrigin, ProcessStartKind, release_pending_reference,
+        BrokerProcess, DuplicationPhase, ProcessLifecycleSink, ProcessRecordState,
+        ProcessReferences, ProcessRequestOrigin, ProcessStartKind, release_pending_reference,
     };
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
@@ -1421,6 +1541,93 @@ mod tests {
                 "{state:?}"
             );
         }
+    }
+
+    #[test]
+    fn duplication_phase_transition_matrix() {
+        use DuplicationPhase as Phase;
+
+        let phases = [
+            Phase::Admitted,
+            Phase::Captured,
+            Phase::ChildImageReady,
+            Phase::Published,
+            Phase::Aborted,
+        ];
+        let allowed = [
+            (Phase::Admitted, Phase::Captured),
+            (Phase::Admitted, Phase::Aborted),
+            (Phase::Captured, Phase::ChildImageReady),
+            (Phase::Captured, Phase::Aborted),
+            (Phase::ChildImageReady, Phase::Published),
+            (Phase::ChildImageReady, Phase::Aborted),
+        ];
+
+        for initial in phases {
+            for next in phases {
+                let expected = allowed.contains(&(initial, next));
+                let mut current = initial;
+                assert_eq!(
+                    current.transition(next).is_ok(),
+                    expected,
+                    "{initial:?} -> {next:?}"
+                );
+                assert_eq!(current, if expected { next } else { initial });
+            }
+        }
+    }
+
+    #[test]
+    fn duplication_refusal_does_not_allocate_a_child() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let process_count = broker.processes.read().len();
+
+        let transaction = parent.begin_duplication().unwrap();
+        assert_eq!(transaction.owner.id(), parent.id());
+        assert_eq!(transaction.child_id(), None);
+        assert_eq!(transaction.phase, DuplicationPhase::Admitted);
+        assert!(matches!(
+            parent.begin_duplication(),
+            Err(BrokerError::WouldBlock)
+        ));
+        assert_eq!(transaction.refuse(), Err(BrokerError::WouldBlock));
+
+        let transaction = parent.begin_duplication().unwrap();
+        drop(transaction);
+        assert!(parent.begin_duplication().is_ok());
+        assert_eq!(broker.processes.read().len(), process_count);
+
+        let next = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        assert_eq!(next.id().0, parent.id().0 + 1);
+    }
+
+    #[test]
+    fn process_duplication_policy_is_enforced_at_admission() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+
+        assert!(matches!(
+            parent.begin_duplication(),
+            Err(BrokerError::PolicyDenied)
+        ));
     }
 
     #[test]
