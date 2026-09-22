@@ -117,9 +117,9 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
         self.process.complete_start()
     }
 
-    /// Records association teardown and fails children still awaiting activation.
+    /// Treats association loss as owner death; cleanup waits for confirmed runner teardown.
     pub fn association_ending(&self) {
-        self.process.fail_starting_children();
+        self.process.handle_owner_death();
     }
 
     /// Requests cancellation of provider operations after the peer disconnects.

@@ -49,11 +49,11 @@ pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
-use process::ObjectReference;
 pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
     ProcessLifecycleSink, ProcessShutdown,
 };
+use process::{ObjectReference, ProcessParent, ProcessRoot};
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
@@ -336,6 +336,30 @@ impl BrokerCore {
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
+        if let Some(parent_id) = parent_id {
+            let parent = self
+                .processes
+                .read()
+                .get(&parent_id)
+                .and_then(Weak::upgrade)
+                .ok_or(BrokerError::UnknownObject)?;
+            return parent.with_live_owner(|root| {
+                self.register_process(
+                    caller_credential,
+                    Some(ProcessParent::new(&parent)),
+                    Some(root),
+                )
+            })?;
+        }
+        self.register_process(caller_credential, None, None)
+    }
+
+    fn register_process(
+        &self,
+        caller_credential: CallerCredential,
+        parent: Option<ProcessParent>,
+        root: Option<Arc<ProcessRoot>>,
+    ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
             return Err(BrokerError::ResourceExhausted);
@@ -345,12 +369,26 @@ impl BrokerCore {
             .map_err(|_| BrokerError::OutOfMemory)?;
         let raw_id = self.ids.lock().allocate()?;
         let id = ProcessId(raw_id);
-        let process = Arc::new(BrokerProcess::new(
-            self.clone(),
-            id,
-            parent_id,
-            caller_credential,
-        ));
+        let process = if let Some(root) = root {
+            Arc::new(BrokerProcess::new(
+                self.clone(),
+                id,
+                root,
+                parent,
+                caller_credential,
+            ))
+        } else {
+            assert!(parent.is_none(), "a root process cannot have a parent");
+            Arc::new_cyclic(|root_process| {
+                BrokerProcess::new(
+                    self.clone(),
+                    id,
+                    Arc::new(ProcessRoot::new(root_process.clone())),
+                    None,
+                    caller_credential,
+                )
+            })
+        };
         assert!(
             processes.insert(id, Arc::downgrade(&process)).is_none(),
             "the ID allocator returned an occupied process ID"

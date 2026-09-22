@@ -26,6 +26,21 @@ pub trait ProcessLifecycleSink: Send + Sync {
 /// Host runner shutdown action installed into a broker process.
 pub type ProcessShutdown = Arc<dyn Fn() + Send + Sync>;
 
+/// Stable handle to the initial process in one process tree.
+pub(crate) struct ProcessRoot {
+    process: Weak<BrokerProcess>,
+}
+
+impl ProcessRoot {
+    pub(crate) const fn new(process: Weak<BrokerProcess>) -> Self {
+        Self { process }
+    }
+
+    fn process(&self) -> Option<Arc<BrokerProcess>> {
+        self.process.upgrade()
+    }
+}
+
 /// Caller identity information supplied by the broker entry layer.
 ///
 /// The first userland proof of concept does not authenticate Unix-socket peers,
@@ -89,6 +104,18 @@ struct ProcessReferences {
     pending_handles: usize,
 }
 
+pub(crate) struct ProcessParent {
+    process: Weak<BrokerProcess>,
+}
+
+impl ProcessParent {
+    pub(crate) fn new(process: &Arc<BrokerProcess>) -> Self {
+        Self {
+            process: Arc::downgrade(process),
+        }
+    }
+}
+
 /// Broker-owned state for one guest thread.
 ///
 /// Execution remains platform-local. This object owns the authoritative
@@ -119,7 +146,7 @@ pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
     /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
-    parent_id: Option<ProcessId>,
+    root: Arc<ProcessRoot>,
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
@@ -137,6 +164,9 @@ pub struct BrokerProcess {
 
 struct BrokerProcessState {
     record: ProcessRecordState,
+    /// Immediate wait parent; `None` on a non-root means future zombies auto-reap.
+    parent: Option<ProcessParent>,
+    owner_alive: bool,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
     shutdown: Option<ProcessShutdown>,
@@ -303,15 +333,18 @@ impl BrokerProcess {
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
-        parent_id: Option<ProcessId>,
+        root: Arc<ProcessRoot>,
+        parent: Option<ProcessParent>,
         caller_credential: CallerCredential,
     ) -> Self {
         Self {
             core,
             id,
-            parent_id,
+            root,
             state: Mutex::new(BrokerProcessState {
                 record: ProcessRecordState::Starting(ProcessStartKind::Association),
+                parent,
+                owner_alive: true,
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
@@ -452,8 +485,19 @@ impl BrokerProcess {
         }
     }
 
-    /// Fails every child process that is still awaiting association activation.
-    pub fn fail_starting_children(&self) {
+    /// Applies owner-death handling to every direct child process.
+    ///
+    /// Reserved children expire, starting children take their rejecting branch,
+    /// virtual children become zombies, and live or zombie children reparent to
+    /// the tree root. Zombies are reaped immediately when the root owner is gone.
+    pub fn handle_owner_death(self: &Arc<Self>) {
+        {
+            let mut state = self.state.lock();
+            if !state.owner_alive {
+                return;
+            }
+            state.owner_alive = false;
+        }
         let processes = {
             let processes = self.core.processes.read();
             processes
@@ -461,11 +505,128 @@ impl BrokerProcess {
                 .filter_map(Weak::upgrade)
                 .collect::<Vec<_>>()
         };
-        for child in processes {
-            if child.parent_id == Some(self.id) {
-                let _ = child.fail_start(BrokerError::PeerClosed, false, true);
+
+        let root = self.root.process();
+        // Serializing reparenting with the root's owner-death mark prevents a
+        // child from being attached to the root after the root's scan passed it.
+        let root_state = root.as_ref().map(|root| root.state.lock());
+        let live_root = root
+            .as_ref()
+            .zip(root_state.as_ref())
+            .and_then(|(root, state)| {
+                (state.owner_alive && matches!(state.retirement, ProcessRetirement::Active { .. }))
+                    .then(|| Arc::clone(root))
+            });
+        let owner = Arc::downgrade(self);
+        let mut changed = false;
+        let mut shutdowns = Vec::new();
+        for child in &processes {
+            if !Arc::ptr_eq(&child.root, &self.root)
+                || child.id == self.id
+                || root.as_ref().is_some_and(|root| Arc::ptr_eq(child, root))
+            {
+                continue;
+            }
+            let (child_changed, shutdown) = child.handle_parent_death(&owner, live_root.as_ref());
+            changed |= child_changed;
+            if let Some(shutdown) = shutdown {
+                shutdowns.push(shutdown);
             }
         }
+        drop(root_state);
+        drop(live_root);
+        drop(root);
+        drop(processes);
+        if changed {
+            self.core.process_lifecycle_sink.changed();
+        }
+        for shutdown in shutdowns {
+            shutdown();
+        }
+    }
+
+    pub(crate) fn with_live_owner<T>(
+        &self,
+        operation: impl FnOnce(Arc<ProcessRoot>) -> T,
+    ) -> Result<T> {
+        let state = self.state.lock();
+        if !state.owner_alive || !matches!(state.retirement, ProcessRetirement::Active { .. }) {
+            return Err(BrokerError::PeerClosed);
+        }
+        Ok(operation(Arc::clone(&self.root)))
+    }
+
+    fn handle_parent_death(
+        &self,
+        owner: &Weak<BrokerProcess>,
+        live_root: Option<&Arc<BrokerProcess>>,
+    ) -> (bool, Option<ProcessShutdown>) {
+        let mut state = self.state.lock();
+        if !state
+            .parent
+            .as_ref()
+            .is_some_and(|parent| Weak::ptr_eq(&parent.process, owner))
+        {
+            return (false, None);
+        }
+
+        let mut shutdown = None;
+        let reparent = match state.record {
+            ProcessRecordState::Reserved => {
+                state
+                    .record
+                    .transition(ProcessRecordState::Expired)
+                    .expect("reserved child expiration must be a valid transition");
+                false
+            }
+            ProcessRecordState::Starting(
+                ProcessStartKind::Association | ProcessStartKind::Duplication,
+            ) => {
+                state
+                    .record
+                    .transition(ProcessRecordState::Failed(BrokerError::PeerClosed))
+                    .expect("starting child rejection must be a valid transition");
+                if state.shutdown_request == ProcessShutdownRequest::None {
+                    state.shutdown_request = ProcessShutdownRequest::Expected;
+                }
+                shutdown.clone_from(&state.shutdown);
+                false
+            }
+            ProcessRecordState::Starting(ProcessStartKind::ImageReplacement) => {
+                state
+                    .record
+                    .transition(ProcessRecordState::Zombie)
+                    .expect("image replacement rejection must create a zombie");
+                if state.shutdown_request == ProcessShutdownRequest::None {
+                    state.shutdown_request = ProcessShutdownRequest::Expected;
+                }
+                shutdown.clone_from(&state.shutdown);
+                true
+            }
+            ProcessRecordState::VirtualRunning => {
+                state
+                    .record
+                    .transition(ProcessRecordState::Zombie)
+                    .expect("virtual child owner death must create a zombie");
+                true
+            }
+            ProcessRecordState::Running | ProcessRecordState::Zombie => true,
+            ProcessRecordState::Failed(_)
+            | ProcessRecordState::Collected
+            | ProcessRecordState::Reaped
+            | ProcessRecordState::Expired => return (false, None),
+        };
+
+        if reparent {
+            state.parent = live_root.map(ProcessParent::new);
+            if live_root.is_none() && state.record == ProcessRecordState::Zombie {
+                state
+                    .record
+                    .transition(ProcessRecordState::Reaped)
+                    .expect("orphaned zombie reaping must be a valid transition");
+            }
+        }
+        (true, shutdown)
     }
 
     /// Duplicates object references into another process.
@@ -1140,8 +1301,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        ProcessLifecycleSink, ProcessRecordState, ProcessReferences, ProcessRequestOrigin,
-        ProcessStartKind, release_pending_reference,
+        BrokerProcess, ProcessLifecycleSink, ProcessRecordState, ProcessReferences,
+        ProcessRequestOrigin, ProcessStartKind, release_pending_reference,
     };
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
@@ -1149,13 +1310,13 @@ mod tests {
         BrokerCore, BrokerCoreLimits, BrokerError, CallerCredential, ObjectRights, PolicyEngine,
         SocketPolicy,
     };
-    use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::stdio::StdioOutputStream;
+    use litebox_broker_protocol::{ObjectHandle, ProcessId};
     use std::{sync::Arc, vec, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
@@ -1173,6 +1334,16 @@ mod tests {
         fn changed(&self) {
             self.changes.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn parent_id(process: &BrokerProcess) -> Option<ProcessId> {
+        process
+            .state
+            .lock()
+            .parent
+            .as_ref()
+            .and_then(|parent| parent.process.upgrade())
+            .map(|parent| parent.id())
     }
 
     fn process_record_states() -> [ProcessRecordState; 11] {
@@ -1321,12 +1492,258 @@ mod tests {
             shutdown_count.fetch_add(1, Ordering::Relaxed);
         }));
 
-        parent.fail_starting_children();
+        parent.handle_owner_death();
 
-        assert_eq!(child.parent_id, Some(parent.id()));
+        assert_eq!(parent_id(&child), Some(parent.id()));
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert_eq!(child.complete_start(), Err(BrokerError::PeerClosed));
         assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn owner_death_reparents_live_and_zombie_children_to_the_tree_root() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        parent.complete_start().unwrap();
+
+        let running = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        running.complete_start().unwrap();
+        let zombie = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        zombie.complete_start().unwrap();
+        zombie
+            .state
+            .lock()
+            .record
+            .transition(ProcessRecordState::Zombie)
+            .unwrap();
+        let virtual_child = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        virtual_child.state.lock().record = ProcessRecordState::VirtualRunning;
+        let reserved = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        reserved.state.lock().record = ProcessRecordState::Reserved;
+
+        parent.handle_owner_death();
+
+        assert!(!parent.state.lock().owner_alive);
+        assert_eq!(parent_id(&running), Some(root.id()));
+        assert_eq!(running.state.lock().record, ProcessRecordState::Running);
+        assert_eq!(parent_id(&zombie), Some(root.id()));
+        assert_eq!(zombie.state.lock().record, ProcessRecordState::Zombie);
+        assert_eq!(parent_id(&virtual_child), Some(root.id()));
+        assert_eq!(
+            virtual_child.state.lock().record,
+            ProcessRecordState::Zombie
+        );
+        assert_eq!(reserved.state.lock().record, ProcessRecordState::Expired);
+        assert!(matches!(
+            broker.create_process(CallerCredential::Unauthenticated, Some(parent.id())),
+            Err(BrokerError::PeerClosed)
+        ));
+    }
+
+    #[test]
+    fn root_owner_death_auto_reaps_orphaned_zombies() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+
+        let running = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        running.complete_start().unwrap();
+        let zombie = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        zombie.complete_start().unwrap();
+        zombie
+            .state
+            .lock()
+            .record
+            .transition(ProcessRecordState::Zombie)
+            .unwrap();
+        let virtual_child = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        virtual_child.state.lock().record = ProcessRecordState::VirtualRunning;
+        let replacing = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        replacing.state.lock().record =
+            ProcessRecordState::Starting(ProcessStartKind::ImageReplacement);
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdown_count = Arc::clone(&shutdowns);
+        replacing.install_shutdown(Arc::new(move || {
+            shutdown_count.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        root.handle_owner_death();
+
+        assert_eq!(parent_id(&running), None);
+        assert_eq!(running.state.lock().record, ProcessRecordState::Running);
+        assert_eq!(parent_id(&zombie), None);
+        assert_eq!(zombie.state.lock().record, ProcessRecordState::Reaped);
+        assert_eq!(parent_id(&virtual_child), None);
+        assert_eq!(
+            virtual_child.state.lock().record,
+            ProcessRecordState::Reaped
+        );
+        assert_eq!(parent_id(&replacing), None);
+        assert_eq!(replacing.state.lock().record, ProcessRecordState::Reaped);
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn later_owner_death_observes_that_the_tree_root_is_gone() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        child.complete_start().unwrap();
+        child
+            .state
+            .lock()
+            .record
+            .transition(ProcessRecordState::Zombie)
+            .unwrap();
+
+        root.handle_owner_death();
+        parent.handle_owner_death();
+
+        assert_eq!(parent_id(&parent), None);
+        assert_eq!(parent_id(&child), None);
+        assert_eq!(child.state.lock().record, ProcessRecordState::Reaped);
+    }
+
+    #[test]
+    fn recycled_root_process_id_does_not_resurrect_the_root_within_its_tree() {
+        let mut broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        broker.ids =
+            alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(3).unwrap()));
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        parent.complete_start().unwrap();
+        let zombie = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        zombie.complete_start().unwrap();
+        zombie
+            .state
+            .lock()
+            .record
+            .transition(ProcessRecordState::Zombie)
+            .unwrap();
+
+        root.handle_owner_death();
+        root.cleanup(true);
+        let replacement = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        assert_eq!(replacement.id(), root.id());
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdown_count = Arc::clone(&shutdowns);
+        replacement.install_shutdown(Arc::new(move || {
+            shutdown_count.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        parent.handle_owner_death();
+
+        assert_eq!(
+            replacement.startup_result(),
+            Some(Err(BrokerError::PeerClosed))
+        );
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
+        assert_eq!(parent_id(&zombie), None);
+        assert_eq!(zombie.state.lock().record, ProcessRecordState::Reaped);
+    }
+
+    #[test]
+    fn owner_death_does_not_lock_processes_from_other_trees() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        parent.complete_start().unwrap();
+        let other_root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        other_root.complete_start().unwrap();
+
+        let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let locked_root = Arc::clone(&other_root);
+        let lock_thread = std::thread::spawn(move || {
+            let _state = locked_root.state.lock();
+            locked_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        locked_receiver.recv().unwrap();
+
+        let (done_sender, done_receiver) = std::sync::mpsc::sync_channel(1);
+        let dying_parent = Arc::clone(&parent);
+        let owner_death_thread = std::thread::spawn(move || {
+            dying_parent.handle_owner_death();
+            done_sender.send(()).unwrap();
+        });
+        let completed_without_other_tree = done_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+
+        release_sender.send(()).unwrap();
+        lock_thread.join().unwrap();
+        owner_death_thread.join().unwrap();
+        assert!(completed_without_other_tree);
     }
 
     #[test]
