@@ -168,22 +168,22 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
             request_id,
             operation,
         } = request;
-        let buffer_sequences = operation.shared_buffers();
+        let buffer_sequence = operation.shared_buffer();
 
         {
             let mut state = self.state.lock();
             if state.failed {
                 return Err(BrokerHostError::AssociationFailed);
             }
-            for sequence in buffer_sequences.iter().flatten().copied() {
-                if let Err(error) = state.shared_buffer_usage.begin(
+            if let Some(sequence) = buffer_sequence
+                && let Err(error) = state.shared_buffer_usage.begin(
                     request_id,
                     sequence,
                     self.shared_buffers.layout(),
-                ) {
-                    state.failed = true;
-                    return Err(BrokerHostError::Broker(error));
-                }
+                )
+            {
+                state.failed = true;
+                return Err(BrokerHostError::Broker(error));
             }
         }
 
@@ -203,7 +203,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
                 return Err(BrokerHostError::Broker(error));
             }
         };
-        for sequence in buffer_sequences.iter().flatten().copied() {
+        if let Some(sequence) = buffer_sequence {
             self.state
                 .lock()
                 .shared_buffer_usage
@@ -825,7 +825,10 @@ where
                         request.inherited_objects,
                     )
                 })
-                .map(BrokerResult::ProcessStarted),
+                .map(|child| BrokerResult::ProcessStarted {
+                    child,
+                    parent_patch_length: None,
+                }),
         ),
         _ => None,
     }

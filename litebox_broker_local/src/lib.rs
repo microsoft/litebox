@@ -219,7 +219,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 inherited_objects,
             }),
         ))? {
-            BrokerResult::ProcessStarted(started) => Ok(started),
+            BrokerResult::ProcessStarted {
+                child,
+                parent_patch_length: None,
+            } => Ok(child),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
         }

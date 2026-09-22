@@ -17,9 +17,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::process::{
-    DuplicationOutcome, ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
-};
+use crate::process::{ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -72,9 +70,9 @@ pub enum BrokerOperation {
 }
 
 impl BrokerOperation {
-    /// Returns the operation-scoped shared-buffer sequences.
+    /// Returns the operation-scoped shared-buffer sequence, if this operation uses one.
     #[must_use]
-    pub const fn shared_buffers(&self) -> [Option<SharedBufferSequence>; 2] {
+    pub const fn shared_buffer(&self) -> Option<SharedBufferSequence> {
         match self {
             Self::Pipe(
                 PipeRequest::Read(ReadPipeRequest { buffer, .. })
@@ -103,12 +101,10 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
-            | Self::StartChildProcess(StartChildProcessRequest::Bootstrap(
-                ProcessStartupDescriptor { buffer, .. },
-            )) => [Some(*buffer), None],
-            Self::StartChildProcess(StartChildProcessRequest::Duplicate { image, dirty }) => {
-                [Some(*image), Some(*dirty)]
-            }
+            | Self::StartChildProcess(
+                StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor { buffer, .. })
+                | StartChildProcessRequest::Duplicate { buffer, .. },
+            ) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
             | Self::CloseObject(_)
@@ -129,7 +125,7 @@ impl BrokerOperation {
             | Self::Stdio(StdioRequest::IsTerminal(_))
             | Self::File(
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
-            ) => [None, None],
+            ) => None,
         }
     }
 }
@@ -250,9 +246,14 @@ pub enum BrokerResult {
     /// File response family.
     File(FileResponse),
     /// A child established its broker association.
-    ProcessStarted(ProcessIdentity),
-    /// Result of attempting to duplicate the calling process.
-    ProcessDuplication(DuplicationOutcome),
+    ProcessStarted {
+        /// Broker-assigned child identity.
+        child: ProcessIdentity,
+        /// Parent-patch byte length returned only for process duplication.
+        ///
+        /// Must not exceed the duplication request buffer length.
+        parent_patch_length: Option<u32>,
+    },
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

@@ -101,23 +101,11 @@ pub enum StartChildProcessRequest {
     Bootstrap(ProcessStartupDescriptor),
     /// Starts a child by duplicating the calling process.
     Duplicate {
-        /// Serialized parent-image payload.
-        image: SharedBufferSequence,
-        /// Serialized dirty-range payload.
-        dirty: SharedBufferSequence,
-    },
-}
-
-/// Result of broker-planned process duplication.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DuplicationOutcome {
-    /// No child was published and the parent image is unchanged.
-    Refused,
-    /// The child was published and the parent must apply the returned patch.
-    ParentUpdate {
-        /// Operation-scoped shared-memory sequence containing the parent patch.
-        patch: SharedBufferSequence,
-        /// Published child identity.
-        child: ProcessIdentity,
+        /// Operation-scoped buffer containing the duplication input and later the parent patch.
+        buffer: SharedBufferSequence,
+        /// Number of leading buffer bytes occupied by the duplication input.
+        ///
+        /// Must not exceed `buffer.length()`.
+        input_length: u32,
     },
 }
