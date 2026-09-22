@@ -153,6 +153,8 @@ pub enum TargetHost {
 pub struct RewriteOptions {
     target_host: TargetHost,
     virtualize_x18: bool,
+    preserve_host_thread_state: bool,
+    native_guest_thread_pointer: bool,
 }
 
 impl RewriteOptions {
@@ -177,6 +179,34 @@ impl RewriteOptions {
         Self {
             target_host,
             virtualize_x18: virtualize_x18 || !matches!(target_host, TargetHost::Linux),
+            preserve_host_thread_state: false,
+            native_guest_thread_pointer: false,
+        }
+    }
+
+    /// Rewrites Darwin syscalls and thread-pointer reads in live host shared-cache code.
+    ///
+    /// TPIDRRO gates preserve the physical host value outside guest execution
+    /// and select LiteBox's private guest thread state while `in_guest` is set.
+    pub const fn macos_host_shared_cache() -> Self {
+        Self {
+            target_host: TargetHost::MacOs,
+            virtualize_x18: false,
+            preserve_host_thread_state: true,
+            native_guest_thread_pointer: false,
+        }
+    }
+
+    /// Rewrite Darwin syscalls while leaving TPIDRRO reads native.
+    ///
+    /// Standalone dyld's protected-stack machinery must remain associated with
+    /// the host thread that is actually executing it.
+    pub const fn macos_native_guest_tpidrro() -> Self {
+        Self {
+            target_host: TargetHost::MacOs,
+            virtualize_x18: false,
+            preserve_host_thread_state: false,
+            native_guest_thread_pointer: true,
         }
     }
 
@@ -188,6 +218,14 @@ impl RewriteOptions {
     /// Returns whether AArch64 guest `x18` accesses must be virtualized.
     pub const fn virtualizes_x18(self) -> bool {
         self.virtualize_x18
+    }
+
+    pub(crate) const fn preserves_host_thread_state(self) -> bool {
+        self.preserve_host_thread_state
+    }
+
+    pub(crate) const fn uses_native_guest_thread_pointer(self) -> bool {
+        self.native_guest_thread_pointer
     }
 }
 
