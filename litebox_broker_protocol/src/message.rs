@@ -17,7 +17,7 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::process::{ProcessIdentity, ProcessStartupDescriptor};
+use crate::process::{ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -65,8 +65,8 @@ pub enum BrokerOperation {
     Stdio(StdioRequest),
     /// File request family.
     File(FileRequest),
-    /// Start one child process from an opaque platform bootstrap.
-    StartChildProcess(ProcessStartupDescriptor),
+    /// Start one child process.
+    StartChildProcess(StartChildProcessRequest),
 }
 
 impl BrokerOperation {
@@ -101,7 +101,10 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
-            | Self::StartChildProcess(ProcessStartupDescriptor { buffer, .. }) => Some(*buffer),
+            | Self::StartChildProcess(
+                StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor { buffer, .. })
+                | StartChildProcessRequest::Duplicate(buffer),
+            ) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
             | Self::CloseObject(_)

@@ -46,6 +46,7 @@ use litebox_broker_protocol::pipe::{
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
     ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -811,7 +812,7 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
-        BrokerOperation::StartChildProcess(request) => Some(
+        BrokerOperation::StartChildProcess(StartChildProcessRequest::Bootstrap(request)) => Some(
             read_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
                 .and_then(|payload| {
                     start_child_process(

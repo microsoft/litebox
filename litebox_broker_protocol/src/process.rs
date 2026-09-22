@@ -93,3 +93,13 @@ pub struct ProcessIdentity {
     /// Broker-assigned initial thread ID.
     pub initial_thread_id: ThreadId,
 }
+
+/// Selects how the broker starts one child process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartChildProcessRequest {
+    /// Starts a child from an opaque platform bootstrap.
+    Bootstrap(ProcessStartupDescriptor),
+    /// Starts a child by duplicating the calling process from an encoded,
+    /// input-only image whose exact length is the buffer sequence length.
+    Duplicate(SharedBufferSequence),
+}

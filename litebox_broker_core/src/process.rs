@@ -242,9 +242,9 @@ pub(crate) enum ProcessRecordState {
 impl ProcessRecordState {
     /// Returns whether requests from this origin can be considered in this state.
     ///
-    /// Guest operations still require operation-specific authorization. This
-    /// filter does not model the setup channel's `AcknowledgeInstall`
-    /// restriction or the parked-versus-released component of a running child.
+    /// Guest operations still require operation-specific authorization.
+    /// Startup negotiation is lifecycle traffic, so guest operations begin
+    /// only after the process reaches a running state.
     #[cfg_attr(
         not(test),
         expect(
@@ -255,10 +255,7 @@ impl ProcessRecordState {
     fn admits_request_origin(self, origin: ProcessRequestOrigin) -> bool {
         match origin {
             ProcessRequestOrigin::Lifecycle => true,
-            ProcessRequestOrigin::Guest => matches!(
-                self,
-                Self::Starting(_) | Self::VirtualRunning | Self::Running
-            ),
+            ProcessRequestOrigin::Guest => matches!(self, Self::VirtualRunning | Self::Running),
         }
     }
 
@@ -1420,10 +1417,7 @@ mod tests {
             assert!(state.admits_request_origin(Origin::Lifecycle), "{state:?}");
             assert_eq!(
                 state.admits_request_origin(Origin::Guest),
-                matches!(
-                    state,
-                    State::Starting(_) | State::VirtualRunning | State::Running
-                ),
+                matches!(state, State::VirtualRunning | State::Running),
                 "{state:?}"
             );
         }

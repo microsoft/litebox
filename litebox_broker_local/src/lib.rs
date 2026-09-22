@@ -42,6 +42,7 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
     ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -211,12 +212,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
         self.write_shared_buffer(buffer, bootstrap);
         match self.request(BrokerOperation::StartChildProcess(
-            ProcessStartupDescriptor {
+            StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
                 format,
                 version,
                 buffer,
                 inherited_objects,
-            },
+            }),
         ))? {
             BrokerResult::ProcessStarted(started) => Ok(started),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),

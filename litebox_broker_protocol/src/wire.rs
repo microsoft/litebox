@@ -24,7 +24,7 @@ use crate::message::{
 };
 use crate::process::{
     InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
+    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -50,6 +50,9 @@ const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
 
+const START_CHILD_PROCESS_TAG_BOOTSTRAP: u8 = 0;
+const START_CHILD_PROCESS_TAG_DUPLICATE: u8 = 1;
+
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
 const RESPONSE_TAG_EVENT: u8 = 1;
@@ -72,7 +75,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 85;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 86;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -191,18 +194,27 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_request(&mut encoder, request);
         }
-        BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
-            format,
-            version,
-            buffer,
-            inherited_objects,
-        }) => {
+        BrokerOperation::StartChildProcess(request) => {
             encoder.u8(REQUEST_TAG_START_CHILD_PROCESS);
             encoder.request_id(request_id);
-            encoder.u32(format.0);
-            encoder.u16(version.0);
-            encoder.shared_buffer_sequence(buffer);
-            encode_inherited_objects(&mut encoder, inherited_objects);
+            match request {
+                StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
+                    format,
+                    version,
+                    buffer,
+                    inherited_objects,
+                }) => {
+                    encoder.u8(START_CHILD_PROCESS_TAG_BOOTSTRAP);
+                    encoder.u32(format.0);
+                    encoder.u16(version.0);
+                    encoder.shared_buffer_sequence(buffer);
+                    encode_inherited_objects(&mut encoder, inherited_objects);
+                }
+                StartChildProcessRequest::Duplicate(buffer) => {
+                    encoder.u8(START_CHILD_PROCESS_TAG_DUPLICATE);
+                    encoder.shared_buffer_sequence(buffer);
+                }
+            }
         }
     }
     encoder.finish()
@@ -240,12 +252,21 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
         REQUEST_TAG_START_CHILD_PROCESS => {
-            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
-                format: ProcessBootstrapFormat(decoder.u32()?),
-                version: ProcessBootstrapVersion(decoder.u16()?),
-                buffer: decoder.shared_buffer_sequence()?,
-                inherited_objects: decode_inherited_objects(&mut decoder)?,
-            })
+            let request = match decoder.u8()? {
+                START_CHILD_PROCESS_TAG_BOOTSTRAP => {
+                    StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
+                        format: ProcessBootstrapFormat(decoder.u32()?),
+                        version: ProcessBootstrapVersion(decoder.u16()?),
+                        buffer: decoder.shared_buffer_sequence()?,
+                        inherited_objects: decode_inherited_objects(&mut decoder)?,
+                    })
+                }
+                START_CHILD_PROCESS_TAG_DUPLICATE => {
+                    StartChildProcessRequest::Duplicate(decoder.shared_buffer_sequence()?)
+                }
+                _ => return Err(WireError::InvalidTag),
+            };
+            BrokerOperation::StartChildProcess(request)
         }
         _ => unreachable!("active request tag was validated"),
     };
@@ -580,7 +601,7 @@ mod tests {
     };
     use crate::process::{
         InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
-        ProcessStartupDescriptor,
+        ProcessStartupDescriptor, StartChildProcessRequest,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -922,18 +943,21 @@ mod tests {
                 name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
-            BrokerOperation::StartChildProcess(ProcessStartupDescriptor {
-                format: ProcessBootstrapFormat(u32::MAX),
-                version: ProcessBootstrapVersion(u16::MAX),
-                buffer: largest_sequence,
-                inherited_objects: InheritedProcessObjects::new(&[
-                    ObjectHandle(1),
-                    ObjectHandle(2),
-                    ObjectHandle(3),
-                    ObjectHandle(4),
-                ])
-                .unwrap(),
-            }),
+            BrokerOperation::StartChildProcess(StartChildProcessRequest::Bootstrap(
+                ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(u32::MAX),
+                    version: ProcessBootstrapVersion(u16::MAX),
+                    buffer: largest_sequence,
+                    inherited_objects: InheritedProcessObjects::new(&[
+                        ObjectHandle(1),
+                        ObjectHandle(2),
+                        ObjectHandle(3),
+                        ObjectHandle(4),
+                    ])
+                    .unwrap(),
+                },
+            )),
+            BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate(sequence(0, 2))),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1413,6 +1437,17 @@ mod tests {
         *unknown_consume_mode.last_mut().unwrap() = 0xff;
         assert_eq!(
             decode_request(&unknown_consume_mode),
+            Err(WireError::InvalidTag)
+        );
+        let mut unknown_child_start = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate(
+                sequence(0, 2),
+            )),
+        });
+        unknown_child_start[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_child_start),
             Err(WireError::InvalidTag)
         );
         let mut frame = encode_request(BrokerRequest {
