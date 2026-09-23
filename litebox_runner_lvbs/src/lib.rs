@@ -824,13 +824,14 @@ fn open_session_new_instance(
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager()).build();
-    if shim.get_ta_bin(&ta_uuid).is_none() {
+    let Some(ta_source) = shim.get_ta_source(&ta_uuid) else {
         msg_args.session = 0;
         msg_args.ret = TeeResult::ItemNotFound;
         msg_args.ret_origin = TeeOrigin::Tee;
         write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
         return Ok(());
-    }
+    };
+    debug_serial_println!("Loading TA: uuid={:?}, source={:?}", ta_uuid, ta_source);
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
     // Marker only releases once CR3 is back to base. See
@@ -1414,15 +1415,12 @@ const LDELF_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 
-/// Register a TA binary embedded in the runner image.
+/// Register a raw or signed TA binary embedded in the runner image.
 fn register_embedded_ta(
     shim: &litebox_shim_optee::OpteeShim<Platform>,
     ta_binary: &'static [u8],
 ) -> bool {
-    let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
-        return false;
-    };
-    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+    shim.store_embedded_ta(ta_binary)
 }
 
 /// Register all TA binaries embedded in the runner image.
