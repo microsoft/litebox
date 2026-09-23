@@ -275,7 +275,7 @@ fn choose_trampoline_reservation<T>(
 
 impl<Platform: ShimPlatform> Task<Platform> {
     #[inline]
-    fn do_mmap(
+    pub(crate) fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
