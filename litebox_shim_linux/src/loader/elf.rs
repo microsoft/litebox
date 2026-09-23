@@ -5,7 +5,8 @@
 
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
-    mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE},
+    mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE, VmFlags},
+    platform::PageManagementProvider,
     utils::ReinterpretSignedExt,
 };
 use litebox_broker_protocol::fs::FileMode as Mode;
@@ -20,6 +21,67 @@ use crate::{
 use super::stack::UserStack;
 use crate::{ShimPlatform, Task};
 
+// Match the guard gap used by LiteBox's private Vmem allocator.
+const STACK_GUARD_GAP: usize = 256 << 12;
+
+fn find_bottom_up_gap<Platform: ShimPlatform>(
+    task: &Task<Platform>,
+    low_limit: usize,
+    len: usize,
+) -> Option<usize> {
+    debug_assert!(low_limit.is_multiple_of(PAGE_SIZE));
+    debug_assert!(len.is_multiple_of(PAGE_SIZE));
+    let high_limit = <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX;
+    let mut candidate = low_limit..low_limit.checked_add(len)?;
+    if candidate.end > high_limit {
+        return None;
+    }
+
+    // PageManager::mappings() is ordered by ascending start address.
+    for (range, flags) in task.global.pm.mappings() {
+        let protected_start = if flags.contains(VmFlags::VM_GROWSDOWN) {
+            range.start.saturating_sub(STACK_GUARD_GAP << 1)
+        } else {
+            range.start
+        };
+        if candidate.end <= protected_start {
+            return Some(candidate.start);
+        }
+        if candidate.start < range.end {
+            candidate = range.end..range.end.checked_add(len)?;
+            if candidate.end > high_limit {
+                return None;
+            }
+        }
+    }
+    Some(candidate.start)
+}
+
+fn claim_bottom_up<Platform: ShimPlatform>(
+    task: &Task<Platform>,
+    mut low_limit: usize,
+    len: usize,
+    mut claim: impl FnMut(usize) -> Result<usize, MappingError>,
+) -> Result<usize, MappingError> {
+    loop {
+        let address = find_bottom_up_gap(task, low_limit, len).ok_or(MappingError::OutOfMemory)?;
+        match claim(address) {
+            Ok(address) => return Ok(address),
+            // Retry if another Vmem thread claimed the selected gap, or if
+            // the platform owns a mapping that is absent from Vmem's snapshot.
+            Err(MappingError::MapError(
+                litebox::platform::page_mgmt::AllocationError::AddressInUse
+                | litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform,
+            )) => {
+                low_limit = address
+                    .checked_add(PAGE_SIZE)
+                    .ok_or(MappingError::OutOfMemory)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 // An opened elf file
 struct ElfFile<'a, Platform: ShimPlatform> {
     task: &'a Task<Platform>,
@@ -27,6 +89,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
     #[cfg(target_arch = "aarch64")]
     file_fd: alloc::sync::Arc<crate::FileFd>,
     load_high: bool,
+    reserve_runtime_trampoline: bool,
 }
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
@@ -45,6 +108,7 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
             #[cfg(target_arch = "aarch64")]
             file_fd,
             load_high: false,
+            reserve_runtime_trampoline: false,
         })
     }
 }
@@ -92,33 +156,54 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
     const POPULATES_TRAMPOLINE: bool = cfg!(target_arch = "aarch64");
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
-        // Allocate a mapping large enough that even if it's maximally misaligned we can
-        // still fit `len` bytes.
-        let mapping_len = len + (align.max(PAGE_SIZE) - PAGE_SIZE);
-        let hint = if self.load_high {
-            // Reserve the interpreter top-down by passing no hint: LiteBox's
-            // `get_unmmaped_area` then runs its top-down search and returns
-            // the highest free slot (see `litebox/src/mm/linux.rs`), which is
-            // where we want `ld.so` so the low ET_EXEC brk heap below stays
-            // uncapped. This needs no explicit `TASK_ADDR_MAX` arithmetic and
-            // no reserve-once bookkeeping, and it does not rely on any
-            // platform honoring an out-of-range hint.
-            0
-        } else {
-            super::DEFAULT_LOW_ADDR
+        // Allocate a mapping which should be large enough to fit `len` bytes.
+        // For an unpatched ELF, also include the runtime trampoline.
+        let mapping_len = len
+            .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
+            .and_then(|len| {
+                len.checked_add(if self.reserve_runtime_trampoline {
+                    litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE
+                } else {
+                    0
+                })
+            })
+            .ok_or(Errno::ENOMEM)?;
+        let aligned_len = mapping_len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
+        // Must report `MappingError`: `claim_bottom_up` distinguishes an address
+        // conflict from a real out-of-memory failure, which `Errno` cannot express.
+        let reserve = |address: Option<usize>| {
+            let mut flags = litebox_common_linux::MapFlags::MAP_ANONYMOUS
+                | litebox_common_linux::MapFlags::MAP_PRIVATE;
+            if address.is_some() {
+                flags |= litebox_common_linux::MapFlags::MAP_FIXED_NOREPLACE;
+            }
+            self.task
+                .do_mmap(
+                    address,
+                    aligned_len,
+                    litebox_common_linux::ProtFlags::PROT_NONE,
+                    flags,
+                    false,
+                    |_| Ok(0),
+                )
+                .map(|address| address.as_usize())
         };
-        let mapping_ptr = self
-            .task
-            .sys_mmap(
-                hint,
-                mapping_len,
-                litebox_common_linux::ProtFlags::PROT_NONE,
-                litebox_common_linux::MapFlags::MAP_ANONYMOUS
-                    | litebox_common_linux::MapFlags::MAP_PRIVATE,
-                -1,
-                0,
-            )?
-            .as_usize();
+        let mapping_ptr = if self.load_high {
+            // Reserve the interpreter top-down by passing no hint. LiteBox's
+            // get_unmmaped_area() then returns the highest free slot, which is
+            // where we want ld.so so it does not cap the low main executable's
+            // upward-growing brk heap.
+            reserve(None).map_err(Errno::from)?
+        } else {
+            // Place the main PIE in the first gap at or above DEFAULT_LOW_ADDR,
+            // preserving the low executable and upward-growing brk layout.
+            claim_bottom_up(self.task, super::DEFAULT_LOW_ADDR, aligned_len, |address| {
+                reserve(Some(address))
+            })
+            .map_err(Errno::from)?
+        };
 
         // See `compute_reserved_regions` for why the trim regions must be
         // computed in page units: `len` (an ELF's `max_vaddr - min_vaddr`
@@ -255,6 +340,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         } else {
             None
         };
+        self.file.reserve_runtime_trampoline = reserve.is_some();
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
         #[cfg(target_arch = "aarch64")]
         if self.parsed.has_trampoline() {
@@ -522,8 +608,97 @@ mod tests {
 
     #[test]
     #[cfg_attr(target_os = "macos", ignore = "macOS runner supports PIE guests only")]
-    fn et_exec_interpreter_loads_top_down_above_low_heap() {
+    fn elf_placement_keeps_main_low_and_interpreter_high() {
         let task = crate::syscalls::tests::init_platform();
+
+        // Occupy exactly one page at the preferred address. The first
+        // bottom-up gap must be the immediately following page.
+        let hint = crate::loader::DEFAULT_LOW_ADDR;
+        let occupied = task
+            .sys_mmap(
+                hint,
+                PAGE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_NONE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .expect("the low ELF hint must be available for this test");
+        crate::syscalls::tests::create_file(&task, "/pie", &minimal_elf(ET_DYN, None));
+        let mut pie = ElfFile::new(&task, "/pie").expect("test PIE should open");
+        let reserved =
+            litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
+                .expect("PIE reservation should retry at the next low gap");
+        assert_eq!(reserved, hint + PAGE_SIZE);
+        task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
+            .expect("failed to release test PIE reservation");
+        task.sys_munmap(occupied, PAGE_SIZE)
+            .expect("failed to release occupied hint");
+
+        // Runtime-trampoline space participates in the gap search.
+        let trampoline_blocker = task
+            .sys_mmap(
+                hint + PAGE_SIZE,
+                PAGE_SIZE,
+                litebox_common_linux::ProtFlags::PROT_NONE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .expect("failed to block the runtime-trampoline region");
+        pie.reserve_runtime_trampoline = true;
+        let reserved =
+            litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
+                .expect("PIE reservation should include runtime-trampoline space");
+        assert_eq!(reserved, hint + 2 * PAGE_SIZE);
+        task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
+            .expect("failed to release trampoline-aware reservation");
+        task.sys_munmap(trampoline_blocker, PAGE_SIZE)
+            .expect("failed to release trampoline blocker");
+
+        // Exercise both retryable collision sources deterministically.
+        let mut attempts = Vec::new();
+        let retried = claim_bottom_up(&task, hint, PAGE_SIZE, |address| {
+            use litebox::platform::page_mgmt::AllocationError;
+
+            attempts.push(address);
+            match attempts.len() {
+                1 => Err(MappingError::MapError(AllocationError::AddressInUse)),
+                2 => Err(MappingError::MapError(
+                    AllocationError::AddressInUseByPlatform,
+                )),
+                _ => Ok(address),
+            }
+        })
+        .expect("address collisions should retry");
+        assert_eq!(attempts, [hint, hint + PAGE_SIZE, hint + 2 * PAGE_SIZE]);
+        assert_eq!(retried, hint + 2 * PAGE_SIZE);
+
+        // A grow-down mapping protects its guard gap below the mapped pages.
+        // Bottom-up placement must skip the guard and the stack itself.
+        let stack_start = hint + (STACK_GUARD_GAP << 1);
+        let stack_address = litebox::mm::linux::NonZeroAddress::new(stack_start).unwrap();
+        let stack_len = litebox::mm::linux::NonZeroPageSize::new(PAGE_SIZE).unwrap();
+        // SAFETY: FIXED_ADDR is paired with NOREPLACE, so this cannot replace
+        // an existing mapping. The test does not retain or access the returned
+        // pointer and unmaps the exact range before continuing.
+        unsafe {
+            task.global
+                .pm
+                .create_stack_pages(
+                    Some(stack_address),
+                    stack_len,
+                    CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                )
+                .expect("failed to create test stack mapping");
+        }
+        assert_eq!(
+            find_bottom_up_gap(&task, hint, PAGE_SIZE),
+            Some(stack_start + PAGE_SIZE)
+        );
+        task.sys_munmap(UserPtrMut::from_usize(stack_start), PAGE_SIZE)
+            .expect("failed to release test stack mapping");
+
         crate::syscalls::tests::create_file(
             &task,
             "/main",
