@@ -140,7 +140,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     #[inline]
-    pub(crate) fn do_mmap_anonymous(
+    fn do_mmap_anonymous(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
