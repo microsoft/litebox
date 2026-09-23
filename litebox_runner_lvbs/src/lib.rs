@@ -642,15 +642,12 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
                                 return *smc_args;
                             }
                         };
-                    let ta_uuid = match decode_ta_request(platform, &msg_args)
+                    let Some(ta_uuid) = decode_ta_request(platform, &msg_args)
                         .ok()
                         .and_then(|request| request.uuid)
-                    {
-                        Some(ta_uuid) => ta_uuid,
-                        None => {
-                            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
-                            return *smc_args;
-                        }
+                    else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
                     };
                     let context_id = match rpc_context_map().allocate(
                         ta_uuid,
@@ -1033,7 +1030,6 @@ fn handle_return_from_shm_alloc_rpc(
             tmem.shm_ref,
             RpcCompletion::ReturnError(OpteeSmcReturnCode::EBadAddr),
         );
-        return;
     }
 }
 
