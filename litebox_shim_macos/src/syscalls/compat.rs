@@ -23,6 +23,7 @@ const DARWIN_REGULAR_FILE_TYPE: u16 = 0o100_000;
 const AMFI_CHECK_DYLD_POLICY_SELF: i32 = 0x5a;
 const AMFI_CHECK_DYLD_POLICY_SELF_64: i32 = 0x66;
 const CS_OPS_STATUS: u32 = 0;
+const OPTIONAL_DYLD_TUNABLES: [&[u8]; 2] = [b"kern.bootargs", b"security.mac.lockdown_mode_state"];
 
 /// Fully permissive guest dyld policy: @paths, path variables, custom cache,
 /// fallback paths, print variables, and failed insertion are allowed. These
@@ -39,6 +40,20 @@ fn darwin_file_type(file_type: FileType) -> Result<u16, Errno> {
 }
 
 impl<P: ShimPlatform> Task<P> {
+    pub(crate) fn sys_sysctl_compat(
+        new_value: UserPtr<u8>,
+        new_length: usize,
+    ) -> Result<usize, Errno> {
+        if new_value.as_usize() != 0
+            && let Some(name) = new_value.to_owned_slice::<P>(new_length)
+            && OPTIONAL_DYLD_TUNABLES.contains(&name.as_ref())
+        {
+            Err(Errno::ENOENT)
+        } else {
+            Err(Errno::ENOSYS)
+        }
+    }
+
     pub(crate) fn sys_fcntl_compat(
         &self,
         fd: i32,

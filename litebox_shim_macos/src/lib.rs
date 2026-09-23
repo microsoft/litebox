@@ -466,11 +466,11 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::Dup2 { oldfd, newfd } => {
                 self.sys_dup2(oldfd, newfd).to_syscall_result()
             }
-            SyscallRequest::Sysctl { .. } => {
-                // No host sysctl namespace is exposed. ENOENT tells dyld that
-                // optional policy tunables are absent.
-                Err(Errno::ENOENT)
-            }
+            SyscallRequest::Sysctl {
+                new_value,
+                new_length,
+                ..
+            } => Self::sys_sysctl_compat(new_value, new_length),
             SyscallRequest::Fcntl {
                 fd,
                 command,
