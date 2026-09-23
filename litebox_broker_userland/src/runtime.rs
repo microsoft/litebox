@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 use litebox_broker_host::{
-    BrokerHostAssociation, BrokerHostError, ConnectionTermination, handle_process_operation,
-    setup_connection,
+    BrokerHostAssociation, BrokerHostError, ConnectionTermination, ProcessStartupCompletion,
+    handle_process_operation, setup_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::message::BrokerRequest;
@@ -201,12 +201,12 @@ where
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
-    let (process, startup) = match startup {
+    let (process, startup, completion) = match startup {
         Some(startup) => {
-            let (process, data) = startup.into_process_and_startup();
-            (Some(process), data)
+            let (process, data, completion) = startup.into_process_and_startup();
+            (Some(process), data, completion)
         }
-        None => (None, None),
+        None => (None, None, ProcessStartupCompletion::Association),
     };
     let finish_process = process.is_none();
     let shared_memory = create_shared_memory()?;
@@ -270,6 +270,7 @@ where
         shutdown,
         launcher,
         finish_process,
+        completion,
     ))
 }
 
@@ -454,6 +455,7 @@ fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, S
     shutdown: Shutdown,
     launcher: Option<Arc<UserlandProcessLauncher>>,
     finish_process: bool,
+    completion: ProcessStartupCompletion,
 ) -> AssociationOutcome
 where
     Memory: SharedMemory,
@@ -464,10 +466,10 @@ where
 {
     let association = Arc::new(association);
     let failure_coordinator = Arc::new(HostAssociationFailureCoordinator::new(shutdown));
-    if let Err(error) = association.activate_process() {
+    if let Err(error) = association.complete_startup(completion) {
         return AssociationOutcome {
             result: Err(IoError::other(format!(
-                "failed to activate broker process association: {error}"
+                "failed to complete broker process startup: {error}"
             ))),
             abnormal: true,
         };
@@ -941,6 +943,7 @@ mod tests {
                         shutdown,
                         None,
                         true,
+                        ProcessStartupCompletion::Association,
                     )
                     .result,
                 )

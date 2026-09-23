@@ -53,7 +53,7 @@ pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, DuplicationTransaction,
     ObjectRights, ProcessLifecycleSink, ProcessShutdown,
 };
-use process::{ObjectReference, ProcessParent, ProcessRoot};
+use process::{ObjectReference, ProcessParent, ProcessRoot, ProcessStartKind};
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
@@ -348,17 +348,19 @@ impl BrokerCore {
                     caller_credential,
                     Some(ProcessParent::new(&parent)),
                     Some(root),
+                    ProcessStartKind::Association,
                 )
             })?;
         }
-        self.register_process(caller_credential, None, None)
+        self.register_process(caller_credential, None, None, ProcessStartKind::Association)
     }
 
-    fn register_process(
+    pub(crate) fn register_process(
         &self,
         caller_credential: CallerCredential,
         parent: Option<ProcessParent>,
         root: Option<Arc<ProcessRoot>>,
+        start_kind: ProcessStartKind,
     ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
@@ -375,6 +377,7 @@ impl BrokerCore {
                 id,
                 root,
                 parent,
+                start_kind,
                 caller_credential,
             ))
         } else {
@@ -385,6 +388,7 @@ impl BrokerCore {
                     id,
                     Arc::new(ProcessRoot::new(root_process.clone())),
                     None,
+                    start_kind,
                     caller_credential,
                 )
             })

@@ -24,7 +24,9 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, CallerCredential};
+use litebox_broker_core::{
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, DuplicationTransaction,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -96,6 +98,14 @@ struct AssociationState {
     shared_buffer_usage: SharedBufferUsage,
 }
 
+/// Broker-core action that commits one validated runner association.
+pub enum ProcessStartupCompletion {
+    /// Completes ordinary association startup.
+    Association,
+    /// Publishes the exact staged child owned by a duplication transaction.
+    Duplication(DuplicationTransaction),
+}
+
 impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
     fn new(
         process: Arc<BrokerProcess>,
@@ -113,9 +123,20 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
         }
     }
 
-    /// Marks the process running after deployment-specific association activation.
-    pub fn activate_process(&self) -> litebox_broker_core::Result<()> {
-        self.process.complete_start()
+    /// Commits process startup after deployment-specific installation and validation.
+    ///
+    /// A duplication completion must remain paired with the exact process
+    /// association supplied by its transaction.
+    pub fn complete_startup(
+        &self,
+        completion: ProcessStartupCompletion,
+    ) -> litebox_broker_core::Result<()> {
+        match completion {
+            ProcessStartupCompletion::Association => self.process.complete_start(),
+            ProcessStartupCompletion::Duplication(transaction) => {
+                transaction.publish(&self.process).map(|_| ())
+            }
+        }
     }
 
     /// Treats association loss as owner death; cleanup waits for confirmed runner teardown.
@@ -791,11 +812,15 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
 /// fails. Success means process startup reached `Running`.
 pub trait ProcessLauncher: Send + Sync {
     /// Starts one process and waits for startup to commit or fail.
+    ///
+    /// The launcher transfers `completion` to the runner association and
+    /// consumes it only after deployment-specific installation and validation.
     fn launch(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
         initial_thread_id: ThreadId,
         startup: ProcessStartupData,
+        completion: ProcessStartupCompletion,
     ) -> core::result::Result<(), BrokerError>;
 }
 
@@ -879,6 +904,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
                 payload,
                 inherited_objects,
             },
+            ProcessStartupCompletion::Association,
         )
         .map_err(RequestFailure::from)?;
     Ok(ProcessIdentity {
@@ -1613,7 +1639,8 @@ mod tests {
         );
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::guest_network()),
+                .with_socket_policy(SocketPolicy::guest_network())
+                .with_process_duplication_enabled(true),
         )
         .with_socket_provider(Arc::new(TestSocketProvider))
         .with_random_provider(Arc::new(TestRandomProvider))
@@ -1637,6 +1664,7 @@ mod tests {
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
         setup_failure_transfers_process_to_the_deployment_owner(&broker);
         precreated_root_negotiates_without_startup_data(&broker);
+        duplication_startup_completion_publishes_after_activation(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
@@ -1713,8 +1741,34 @@ mod tests {
         .unwrap();
 
         assert_eq!(association.process.id(), process.id());
-        association.activate_process().unwrap();
+        association
+            .complete_startup(ProcessStartupCompletion::Association)
+            .unwrap();
         association.finish();
+    }
+
+    fn duplication_startup_completion_publishes_after_activation(broker: &BrokerCore) {
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let mut transaction = parent.begin_duplication().unwrap();
+        let (child, _) = transaction.create_child().unwrap();
+        let association = BrokerHostAssociation::new(
+            Arc::clone(&child),
+            Arc::new(test_shared_buffers()),
+            test_readiness_sink(),
+        );
+
+        assert!(!child.is_running());
+        association
+            .complete_startup(ProcessStartupCompletion::Duplication(transaction))
+            .unwrap();
+        assert!(child.is_running());
+
+        association.finish();
+        drop(child);
+        parent.retire(true);
     }
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
@@ -2951,7 +3005,7 @@ mod tests {
             Err(termination) => return Ok(termination),
         };
         association
-            .activate_process()
+            .complete_startup(ProcessStartupCompletion::Association)
             .expect("test broker process must activate once");
         let result = (|| {
             loop {
