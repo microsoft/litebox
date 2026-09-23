@@ -522,20 +522,7 @@ impl SyscallRequest {
                     current_protection: MachVmProtection::from_raw(int_arg(5))
                         .ok_or(Errno::EINVAL)?,
                 }),
-                mach_trap::MACH_REPLY_PORT => Ok(Self::MachReplyPort),
-                mach_trap::THREAD_SELF => Ok(Self::MachThreadSelf),
                 mach_trap::TASK_SELF => Ok(Self::MachTaskSelf),
-                mach_trap::HOST_SELF => Ok(Self::MachHostSelf),
-                mach_trap::MACH_MSG2 => Ok(Self::MachMsg2Trap {
-                    data: args[0],
-                    options: MachMessageOptions::from_bits_retain(u64_arg(1)),
-                    msgh_bits_and_send_size: u64_arg(2),
-                    msgh_remote_and_local_port: u64_arg(3),
-                    msgh_voucher_and_id: u64_arg(4),
-                    descriptor_count_and_receive_name: u64_arg(5),
-                    receive_size_and_priority: u64_arg(6),
-                    timeout: u64_arg(7),
-                }),
                 mach_trap::MACH_TIMEBASE_INFO => Ok(Self::MachTimebaseInfo {
                     info: UserPtrMut::from_usize(args[0]),
                 }),
@@ -564,10 +551,6 @@ impl SyscallRequest {
             },
             nr::CLOSE | nr::CLOSE_NOCANCEL => Self::Close { fd: int_arg(0) },
             nr::DUP => Self::Dup { fd: int_arg(0) },
-            nr::DUP2 => Self::Dup2 {
-                oldfd: int_arg(0),
-                newfd: int_arg(1),
-            },
             nr::SYSCTL => Self::Sysctl {
                 name: UserPtr::from_usize(args[0]),
                 name_length: TruncateExt::<u32>::trunc(args[1]),
@@ -575,11 +558,6 @@ impl SyscallRequest {
                 old_length: UserPtrMut::from_usize(args[3]),
                 new_value: UserPtr::from_usize(args[4]),
                 new_length: args[5],
-            },
-            nr::FCNTL => Self::Fcntl {
-                fd: int_arg(0),
-                command: FcntlCommand::from(int_arg(1)),
-                argument: UserPtrMut::from_usize(args[2]),
             },
             nr::MMAP => Self::Mmap {
                 address: args[0],
@@ -599,81 +577,18 @@ impl SyscallRequest {
                 protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
             },
             nr::GETPID => Self::Getpid,
-            nr::CROSSARCH_TRAP => Self::CrossarchTrap {
-                name: TruncateExt::<u32>::trunc(args[0]),
-            },
-            nr::CSRCTL => Self::Csrctl {
-                operation: TruncateExt::<u32>::trunc(args[0]),
-                user_address: UserPtrMut::from_usize(args[1]),
-                user_size: args[2],
-            },
-            nr::CSOPS => Self::Csops {
-                pid: int_arg(0),
-                operation: TruncateExt::<u32>::trunc(args[1]),
-                user_address: UserPtrMut::from_usize(args[2]),
-                user_size: args[3],
-            },
-            nr::BSDTHREAD_CREATE => Self::BsdthreadCreate {
-                function: args[0],
-                function_argument: args[1],
-                stack: args[2],
-                pthread: args[3],
-                flags: TruncateExt::<u32>::trunc(args[4]),
-            },
-            nr::FSCTL => Self::Fsctl {
-                path: UserPtr::from_usize(args[0]),
-                command: args[1],
-                data: UserPtrMut::from_usize(args[2]),
-                options: TruncateExt::<u32>::trunc(args[3]),
-            },
-            nr::FSTAT64 => Self::Fstat64 {
-                fd: int_arg(0),
-                buffer: UserPtrMut::from_usize(args[1]),
-            },
-            nr::STAT64 => Self::Stat64 {
-                path: UserPtr::from_usize(args[0]),
-                buffer: UserPtrMut::from_usize(args[1]),
-            },
-            nr::STATFS64 => Self::Statfs64 {
-                path: UserPtr::from_usize(args[0]),
-                buffer: UserPtrMut::from_usize(args[1]),
-            },
-            nr::MAC_SYSCALL => Self::MacSyscall {
-                policy: UserPtr::from_usize(args[0]),
-                operation: int_arg(1),
-                argument: UserPtrMut::from_usize(args[2]),
-            },
             nr::GETENTROPY => Self::Getentropy {
                 buffer: UserPtrMut::from_usize(args[0]),
                 count: args[1],
-            },
-            nr::ABORT_WITH_PAYLOAD => Self::AbortWithPayload {
-                namespace: TruncateExt::<u32>::trunc(args[0]),
-                code: u64_arg(1),
-                payload: UserPtr::from_usize(args[2]),
-                payload_size: TruncateExt::<u32>::trunc(args[3]),
-                reason: UserPtr::from_usize(args[4]),
-                reason_flags: u64_arg(5),
             },
             nr::GETPPID => Self::Getppid,
             nr::GETUID => Self::Getuid,
             nr::GETEUID => Self::Geteuid,
             nr::GETGID => Self::Getgid,
-            nr::SIGPROCMASK => Self::Sigprocmask {
-                how: int_arg(0),
-                set: UserPtr::from_usize(args[1]),
-                oldset: UserPtrMut::from_usize(args[2]),
-            },
             nr::GETEGID => Self::Getegid,
             nr::THREAD_SELFID => Self::ThreadSelfid,
             nr::SHARED_REGION_CHECK_NP => Self::SharedRegionCheckNp {
                 start_address: UserPtrMut::from_usize(args[0]),
-            },
-            nr::SHARED_REGION_MAP_AND_SLIDE_2_NP => Self::SharedRegionMapAndSlide2Np {
-                files_count: TruncateExt::<u32>::trunc(args[0]),
-                files: UserPtr::from_usize(args[1]),
-                mappings_count: TruncateExt::<u32>::trunc(args[2]),
-                mappings: UserPtr::from_usize(args[3]),
             },
             _ => return Err(Errno::ENOSYS),
         })
@@ -729,46 +644,9 @@ mod tests {
             0u32.wrapping_sub(mach_trap::MACH_MSG2) as usize,
             (-47isize).reinterpret_as_unsigned(),
         ] {
-            let request = SyscallRequest::from_args(
-                number,
-                [
-                    0x1234,
-                    usize::try_from(MachMessageOptions::RECEIVE_TIMEOUT.bits() | (1 << 40))
-                        .unwrap(),
-                    0x2222,
-                    0x3333,
-                    0x4444,
-                    0x5555,
-                    0x6666,
-                    0x7777,
-                ],
-            )
-            .unwrap();
-            let SyscallRequest::MachMsg2Trap {
-                data,
-                options,
-                msgh_bits_and_send_size,
-                msgh_remote_and_local_port,
-                msgh_voucher_and_id,
-                descriptor_count_and_receive_name,
-                receive_size_and_priority,
-                timeout,
-            } = request
-            else {
-                panic!("unexpected request: {request:?}")
-            };
-            assert_eq!(data, 0x1234);
-            assert_eq!(options.bits(), 0x100_0000_0100);
             assert_eq!(
-                [
-                    msgh_bits_and_send_size,
-                    msgh_remote_and_local_port,
-                    msgh_voucher_and_id,
-                    descriptor_count_and_receive_name,
-                    receive_size_and_priority,
-                    timeout,
-                ],
-                [0x2222, 0x3333, 0x4444, 0x5555, 0x6666, 0x7777]
+                SyscallRequest::from_args(number, [0; 8]).unwrap_err(),
+                Errno::ENOSYS
             );
         }
         let request = SyscallRequest::from_args(
@@ -801,41 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_requests_preserve_their_abi_arguments() {
-        let request = SyscallRequest::from_args(
-            nr::ABORT_WITH_PAYLOAD,
-            [usize::MAX, 0x2222, 0x3333, usize::MAX, 0x5555, 0x6666, 0, 0],
-        )
-        .unwrap();
-        assert!(matches!(
-            request,
-            SyscallRequest::AbortWithPayload {
-                namespace: u32::MAX,
-                code: 0x2222,
-                payload,
-                payload_size: u32::MAX,
-                reason,
-                reason_flags: 0x6666,
-            } if payload.as_usize() == 0x3333 && reason.as_usize() == 0x5555
-        ));
-
-        assert!(matches!(
-            SyscallRequest::from_args(nr::SIGPROCMASK, [0, 0, 0x7777, 0, 0, 0, 0, 0]),
-            Ok(SyscallRequest::Sigprocmask {
-                how: 0,
-                set,
-                oldset,
-            }) if set.as_usize() == 0 && oldset.as_usize() == 0x7777
-        ));
-
-        assert!(matches!(
-            SyscallRequest::from_args(nr::MAC_SYSCALL, [0x1000, usize::MAX, 0x2000, 0, 0, 0, 0, 0]),
-            Ok(SyscallRequest::MacSyscall {
-                policy,
-                operation: -1,
-                argument,
-            }) if policy.as_usize() == 0x1000 && argument.as_usize() == 0x2000
-        ));
+    fn mach_vm_protection_preserves_copy_semantics() {
         let mach_protect = SyscallRequest::from_args(
             0u32.wrapping_sub(mach_trap::MACH_VM_PROTECT) as usize,
             [0x103, 0x2001, 1, 0, 0x13, 0, 0, 0],
@@ -846,21 +690,6 @@ mod tests {
             SyscallRequest::MachVmProtect { protection, .. }
                 if protection.permissions() == (VmProtection::READ | VmProtection::WRITE)
                     && protection.requests_copy()
-        ));
-
-        assert!(matches!(
-            SyscallRequest::from_args(
-                nr::SHARED_REGION_MAP_AND_SLIDE_2_NP,
-                [usize::MAX, 0x2000, usize::MAX - 1, 0x4000, 0, 0, 0, 0],
-            ),
-            Ok(SyscallRequest::SharedRegionMapAndSlide2Np {
-                files_count: u32::MAX,
-                files,
-                mappings_count,
-                mappings,
-            }) if files.as_usize() == 0x2000
-                && mappings_count == u32::MAX - 1
-                && mappings.as_usize() == 0x4000
         ));
     }
 
