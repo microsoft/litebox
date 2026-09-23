@@ -13,6 +13,7 @@ use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::HashMap;
+use litebox_broker_protocol::process::ProcessIdentity;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, rwlock::RwLock};
@@ -147,6 +148,8 @@ pub struct BrokerProcess {
     /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
     root: Arc<ProcessRoot>,
+    /// Parent that created this record; unlike the wait parent, never changes.
+    creation_parent: Option<Weak<BrokerProcess>>,
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
@@ -167,6 +170,7 @@ struct BrokerProcessState {
     /// Immediate wait parent; `None` on a non-root means future zombies auto-reap.
     parent: Option<ProcessParent>,
     owner_alive: bool,
+    /// Whether one admitted duplication transaction owns the publication slot.
     duplication_active: bool,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
@@ -210,87 +214,162 @@ pub(crate) enum ProcessRequestOrigin {
     Guest,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "later duplication PRs advance through the remaining phases"
-    )
-)]
-enum DuplicationPhase {
-    Admitted,
-    Captured,
-    ChildImageReady,
-    Published,
-    Aborted,
-}
-
-impl DuplicationPhase {
-    fn transition(&mut self, next: Self) -> Result<()> {
-        let allowed = matches!(
-            (*self, next),
-            (Self::Admitted, Self::Captured | Self::Aborted)
-                | (Self::Captured, Self::ChildImageReady | Self::Aborted)
-                | (Self::ChildImageReady, Self::Published | Self::Aborted)
-        );
-        if !allowed {
-            return Err(BrokerError::Internal);
-        }
-        *self = next;
-        Ok(())
-    }
-}
-
 /// Broker-owned state for one admitted process-duplication attempt.
 ///
-/// At most one transaction may be active for a process. Transactions track
-/// admission, capture, child-image construction, publication, and abortion.
-/// Initial admission does not allocate a child.
+/// At most one transaction may be active for a process. Initial admission does
+/// not allocate a child; [`Self::publish`] accepts the fully prepared staged
+/// child and owns its rollback while arbitrating publication.
 pub struct DuplicationTransaction {
     owner: Arc<BrokerProcess>,
-    child_id: Option<ProcessId>,
-    phase: DuplicationPhase,
+    /// Child retained during publication so transaction drop can roll it back.
+    child: Option<Arc<BrokerProcess>>,
     active: bool,
 }
 
 impl DuplicationTransaction {
-    /// Returns the allocated child ID, if child allocation has completed.
-    #[must_use]
-    pub const fn child_id(&self) -> Option<ProcessId> {
-        self.child_id
-    }
+    /// Publishes a staged child after successful installation and validation.
+    ///
+    /// Publication transitions the child to running and releases the owner's
+    /// transaction slot under the same lock. Parent cancellation or death does
+    /// not veto a child that completed setup successfully.
+    pub fn publish(mut self, child: Arc<BrokerProcess>) -> Result<ProcessIdentity> {
+        if !self.active
+            || Arc::ptr_eq(&self.owner, &child)
+            || !Arc::ptr_eq(&self.owner.core.processes, &child.core.processes)
+            || !child
+                .creation_parent
+                .as_ref()
+                .is_some_and(|parent| Weak::ptr_eq(parent, &Arc::downgrade(&self.owner)))
+        {
+            return Err(BrokerError::Internal);
+        }
 
-    /// Refuses this attempt before child allocation or publication.
-    pub fn refuse(mut self) -> Result<()> {
-        self.phase.transition(DuplicationPhase::Aborted)?;
-        self.release()?;
+        let mut owner_state = self.owner.state.lock();
+        if !owner_state.duplication_active {
+            self.active = false;
+            return Err(BrokerError::Internal);
+        }
+        self.child = Some(Arc::clone(&child));
+
+        let mut child_state = child.state.lock();
+        let child_threads = child.threads.lock();
+        let child_starting = matches!(
+            child_state.record,
+            ProcessRecordState::Starting(ProcessStartKind::Duplication)
+        );
+        let initial_thread_id = (child_threads.len() == 1)
+            .then(|| child_threads.keys().next().copied())
+            .flatten();
+        let child_failed = matches!(
+            child_state.record,
+            ProcessRecordState::Failed(_)
+                | ProcessRecordState::Zombie
+                | ProcessRecordState::Collected
+                | ProcessRecordState::Reaped
+                | ProcessRecordState::Expired
+        ) || !child_state.owner_alive
+            || !matches!(child_state.retirement, ProcessRetirement::Active { .. })
+            || initial_thread_id.is_none();
+        if !child_starting && !child_failed {
+            owner_state.duplication_active = false;
+            self.active = false;
+            return Err(BrokerError::Internal);
+        }
+
+        if child_starting
+            && !child_failed
+            && let Some(initial_thread_id) = initial_thread_id
+        {
+            let identity = ProcessIdentity {
+                process_id: child.id(),
+                initial_thread_id,
+            };
+            child_state.record.transition(ProcessRecordState::Running)?;
+            owner_state.duplication_active = false;
+            self.active = false;
+            drop(child_threads);
+            drop(child_state);
+            drop(owner_state);
+            self.owner.core.process_lifecycle_sink.changed();
+            return Ok(identity);
+        }
+
+        drop(child_threads);
+        drop(child_state);
+        drop(owner_state);
+        self.abort_prepublication(BrokerError::PeerClosed)?;
         Err(BrokerError::WouldBlock)
     }
 
-    fn release(&mut self) -> Result<()> {
+    /// Refuses this attempt before publication.
+    pub fn refuse(mut self) -> Result<()> {
+        self.abort_prepublication(BrokerError::PeerClosed)?;
+        Err(BrokerError::WouldBlock)
+    }
+
+    fn abort_prepublication(&mut self, error: BrokerError) -> Result<()> {
         if !self.active {
             return Err(BrokerError::Internal);
         }
+
         let mut state = self.owner.state.lock();
         if !state.duplication_active {
             self.active = false;
             return Err(BrokerError::Internal);
         }
+        let mut shutdown = None;
+        let mut child_changed = false;
+        if let Some(child) = &self.child {
+            let mut child_state = child.state.lock();
+            match child_state.record {
+                ProcessRecordState::Starting(ProcessStartKind::Duplication)
+                    if matches!(child_state.retirement, ProcessRetirement::Active { .. }) =>
+                {
+                    child_state
+                        .record
+                        .transition(ProcessRecordState::Failed(error))?;
+                    if child_state.shutdown_request == ProcessShutdownRequest::None {
+                        child_state.shutdown_request = ProcessShutdownRequest::Expected;
+                    }
+                    shutdown.clone_from(&child_state.shutdown);
+                    child_changed = true;
+                }
+                ProcessRecordState::Failed(_)
+                | ProcessRecordState::Zombie
+                | ProcessRecordState::Collected
+                | ProcessRecordState::Reaped
+                | ProcessRecordState::Expired
+                | ProcessRecordState::Starting(ProcessStartKind::Duplication) => {}
+                ProcessRecordState::Reserved
+                | ProcessRecordState::Starting(
+                    ProcessStartKind::Association | ProcessStartKind::ImageReplacement,
+                )
+                | ProcessRecordState::VirtualRunning
+                | ProcessRecordState::Running => {
+                    state.duplication_active = false;
+                    self.active = false;
+                    return Err(BrokerError::Internal);
+                }
+            }
+        }
         state.duplication_active = false;
         self.active = false;
+        drop(state);
+        if child_changed {
+            self.owner.core.process_lifecycle_sink.changed();
+        }
+        if let Some(shutdown) = shutdown {
+            shutdown();
+        }
         Ok(())
     }
 }
 
 impl Drop for DuplicationTransaction {
     fn drop(&mut self) {
-        if self.active {
+        if self.active && self.abort_prepublication(BrokerError::PeerClosed).is_err() {
+            debug_assert!(false, "failed to abort an active duplication transaction");
             let mut state = self.owner.state.lock();
-            assert!(
-                state.duplication_active,
-                "active duplication transaction is missing from its owner"
-            );
             state.duplication_active = false;
             self.active = false;
         }
@@ -422,10 +501,12 @@ impl BrokerProcess {
         parent: Option<ProcessParent>,
         caller_credential: CallerCredential,
     ) -> Self {
+        let creation_parent = parent.as_ref().map(|parent| Weak::clone(&parent.process));
         Self {
             core,
             id,
             root,
+            creation_parent,
             state: Mutex::new(BrokerProcessState {
                 record: ProcessRecordState::Starting(ProcessStartKind::Association),
                 parent,
@@ -468,6 +549,9 @@ impl BrokerProcess {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
+        if self.cancellation.is_cancelled() {
+            return Err(BrokerError::PeerClosed);
+        }
 
         let mut state = self.state.lock();
         if !state.owner_alive
@@ -484,8 +568,7 @@ impl BrokerProcess {
 
         Ok(DuplicationTransaction {
             owner: Arc::clone(self),
-            child_id: None,
-            phase: DuplicationPhase::Admitted,
+            child: None,
             active: true,
         })
     }
@@ -519,8 +602,11 @@ impl BrokerProcess {
                 return Err(BrokerError::PeerClosed);
             }
             match state.record {
-                ProcessRecordState::Starting(_) => {}
-                ProcessRecordState::Running => return Err(BrokerError::Internal),
+                ProcessRecordState::Starting(ProcessStartKind::Association) => {}
+                ProcessRecordState::Starting(
+                    ProcessStartKind::Duplication | ProcessStartKind::ImageReplacement,
+                )
+                | ProcessRecordState::Running => return Err(BrokerError::Internal),
                 ProcessRecordState::Failed(error) => return Err(error),
                 _ => return Err(BrokerError::PeerClosed),
             }
@@ -604,9 +690,10 @@ impl BrokerProcess {
 
     /// Applies owner-death handling to every direct child process.
     ///
-    /// Reserved children expire, starting children take their rejecting branch,
-    /// virtual children become zombies, and live or zombie children reparent to
-    /// the tree root. Zombies are reaped immediately when the root owner is gone.
+    /// Reserved children expire, association startup fails, duplication startup
+    /// continues after reparenting, virtual children become zombies, and live or
+    /// zombie children reparent to the tree root. Zombies are reaped immediately
+    /// when the root owner is gone.
     pub fn handle_owner_death(self: &Arc<Self>) {
         {
             let mut state = self.state.lock();
@@ -696,9 +783,7 @@ impl BrokerProcess {
                     .expect("reserved child expiration must be a valid transition");
                 false
             }
-            ProcessRecordState::Starting(
-                ProcessStartKind::Association | ProcessStartKind::Duplication,
-            ) => {
+            ProcessRecordState::Starting(ProcessStartKind::Association) => {
                 state
                     .record
                     .transition(ProcessRecordState::Failed(BrokerError::PeerClosed))
@@ -727,7 +812,9 @@ impl BrokerProcess {
                     .expect("virtual child owner death must create a zombie");
                 true
             }
-            ProcessRecordState::Running | ProcessRecordState::Zombie => true,
+            ProcessRecordState::Starting(ProcessStartKind::Duplication)
+            | ProcessRecordState::Running
+            | ProcessRecordState::Zombie => true,
             ProcessRecordState::Failed(_)
             | ProcessRecordState::Collected
             | ProcessRecordState::Reaped
@@ -1418,8 +1505,8 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        BrokerProcess, DuplicationPhase, ProcessLifecycleSink, ProcessRecordState,
-        ProcessReferences, ProcessRequestOrigin, ProcessStartKind, release_pending_reference,
+        BrokerProcess, ProcessLifecycleSink, ProcessRecordState, ProcessReferences,
+        ProcessRequestOrigin, ProcessStartKind, release_pending_reference,
     };
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
@@ -1431,6 +1518,7 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
+    use litebox_broker_protocol::process::ProcessIdentity;
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
@@ -1461,6 +1549,27 @@ mod tests {
             .as_ref()
             .and_then(|parent| parent.process.upgrade())
             .map(|parent| parent.id())
+    }
+
+    fn staged_duplication(
+        broker: &BrokerCore,
+        parent: &Arc<BrokerProcess>,
+    ) -> (
+        super::DuplicationTransaction,
+        Arc<BrokerProcess>,
+        ProcessIdentity,
+    ) {
+        let transaction = parent.begin_duplication().unwrap();
+        let child = broker
+            .create_process(parent.caller_credential(), Some(parent.id()))
+            .unwrap();
+        child.state.lock().record = ProcessRecordState::Starting(ProcessStartKind::Duplication);
+        let initial_thread_id = child.create_thread().unwrap();
+        let identity = ProcessIdentity {
+            process_id: child.id(),
+            initial_thread_id,
+        };
+        (transaction, child, identity)
     }
 
     fn process_record_states() -> [ProcessRecordState; 11] {
@@ -1544,40 +1653,6 @@ mod tests {
     }
 
     #[test]
-    fn duplication_phase_transition_matrix() {
-        use DuplicationPhase as Phase;
-
-        let phases = [
-            Phase::Admitted,
-            Phase::Captured,
-            Phase::ChildImageReady,
-            Phase::Published,
-            Phase::Aborted,
-        ];
-        let allowed = [
-            (Phase::Admitted, Phase::Captured),
-            (Phase::Admitted, Phase::Aborted),
-            (Phase::Captured, Phase::ChildImageReady),
-            (Phase::Captured, Phase::Aborted),
-            (Phase::ChildImageReady, Phase::Published),
-            (Phase::ChildImageReady, Phase::Aborted),
-        ];
-
-        for initial in phases {
-            for next in phases {
-                let expected = allowed.contains(&(initial, next));
-                let mut current = initial;
-                assert_eq!(
-                    current.transition(next).is_ok(),
-                    expected,
-                    "{initial:?} -> {next:?}"
-                );
-                assert_eq!(current, if expected { next } else { initial });
-            }
-        }
-    }
-
-    #[test]
     fn duplication_refusal_does_not_allocate_a_child() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -1593,8 +1668,6 @@ mod tests {
 
         let transaction = parent.begin_duplication().unwrap();
         assert_eq!(transaction.owner.id(), parent.id());
-        assert_eq!(transaction.child_id(), None);
-        assert_eq!(transaction.phase, DuplicationPhase::Admitted);
         assert!(matches!(
             parent.begin_duplication(),
             Err(BrokerError::WouldBlock)
@@ -1628,6 +1701,152 @@ mod tests {
             parent.begin_duplication(),
             Err(BrokerError::PolicyDenied)
         ));
+    }
+
+    #[test]
+    fn duplication_publication_releases_transaction_slot() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let (transaction, child, identity) = staged_duplication(&broker, &parent);
+
+        assert_eq!(child.complete_start(), Err(BrokerError::Internal));
+        assert_eq!(transaction.publish(Arc::clone(&child)), Ok(identity));
+        assert_eq!(child.state.lock().record, ProcessRecordState::Running);
+        assert!(parent.begin_duplication().is_ok());
+
+        let second_parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        second_parent.complete_start().unwrap();
+        let (transaction, second_child, identity) = staged_duplication(&broker, &second_parent);
+        assert_eq!(transaction.publish(Arc::clone(&second_child)), Ok(identity));
+
+        second_parent.handle_owner_death();
+
+        assert_eq!(
+            second_child.state.lock().record,
+            ProcessRecordState::Running
+        );
+        assert_eq!(parent_id(&second_child), None);
+    }
+
+    #[test]
+    fn duplication_publication_rejects_owner_and_unrelated_child() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+
+        let owner = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        owner.complete_start().unwrap();
+        let transaction = owner.begin_duplication().unwrap();
+        assert_eq!(
+            transaction.publish(Arc::clone(&owner)),
+            Err(BrokerError::Internal)
+        );
+        assert!(owner.begin_duplication().is_ok());
+
+        let first_parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        first_parent.complete_start().unwrap();
+        let first_transaction = first_parent.begin_duplication().unwrap();
+
+        let second_parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        second_parent.complete_start().unwrap();
+        let (second_transaction, second_child, second_identity) =
+            staged_duplication(&broker, &second_parent);
+
+        assert_eq!(
+            first_transaction.publish(Arc::clone(&second_child)),
+            Err(BrokerError::Internal)
+        );
+        assert_eq!(
+            second_child.state.lock().record,
+            ProcessRecordState::Starting(ProcessStartKind::Duplication)
+        );
+        assert!(first_parent.begin_duplication().is_ok());
+        assert_eq!(
+            second_transaction.publish(Arc::clone(&second_child)),
+            Ok(second_identity)
+        );
+    }
+
+    #[test]
+    fn duplication_publication_survives_parent_teardown_and_refuses_child_failure() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+
+        let cancelled_parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        cancelled_parent.complete_start().unwrap();
+        let (transaction, cancelled_child, identity) =
+            staged_duplication(&broker, &cancelled_parent);
+        let shutdowns = Arc::new(AtomicUsize::new(0));
+        let shutdown_count = Arc::clone(&shutdowns);
+        cancelled_child.install_shutdown(Arc::new(move || {
+            shutdown_count.fetch_add(1, Ordering::Relaxed);
+        }));
+        cancelled_parent.request_cancellation();
+
+        assert_eq!(
+            transaction.publish(Arc::clone(&cancelled_child)),
+            Ok(identity)
+        );
+        assert_eq!(
+            cancelled_child.state.lock().record,
+            ProcessRecordState::Running
+        );
+        assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
+        assert!(matches!(
+            cancelled_parent.begin_duplication(),
+            Err(BrokerError::PeerClosed)
+        ));
+
+        let dead_parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        dead_parent.complete_start().unwrap();
+        let (transaction, dead_child, identity) = staged_duplication(&broker, &dead_parent);
+        dead_parent.handle_owner_death();
+
+        assert_eq!(transaction.publish(Arc::clone(&dead_child)), Ok(identity));
+        assert_eq!(dead_child.state.lock().record, ProcessRecordState::Running);
+        assert_eq!(parent_id(&dead_child), None);
+
+        let live_parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        live_parent.complete_start().unwrap();
+        let (transaction, failed_child, _) = staged_duplication(&broker, &live_parent);
+        assert_eq!(
+            failed_child.fail_start(BrokerError::PeerClosed, false, true),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            transaction.publish(Arc::clone(&failed_child)),
+            Err(BrokerError::WouldBlock)
+        );
+        assert!(live_parent.begin_duplication().is_ok());
     }
 
     #[test]
