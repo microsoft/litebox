@@ -15,7 +15,7 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
-use spin::{Mutex, rwlock::RwLock};
+use spin::{Mutex, Once, rwlock::RwLock};
 
 /// Platform-provided notification destination for broker-process lifecycle changes.
 pub trait ProcessLifecycleSink: Send + Sync {
@@ -113,6 +113,8 @@ pub struct BrokerProcess {
     pub(crate) core: BrokerCore,
     /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
+    /// ID assigned to the initial thread when process creation completes.
+    initial_thread_id: Once<ThreadId>,
     root: Arc<ProcessRoot>,
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
@@ -219,6 +221,7 @@ impl BrokerProcess {
         Self {
             core,
             id,
+            initial_thread_id: Once::new(),
             root,
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
@@ -245,6 +248,31 @@ impl BrokerProcess {
     #[must_use]
     pub const fn id(&self) -> ProcessId {
         self.id
+    }
+
+    /// Returns the ID assigned to this process's initial thread.
+    ///
+    /// This is immutable creation metadata. Live thread ownership remains
+    /// authoritative in the process thread set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on crate-internal process state before process creation
+    /// initializes the initial thread.
+    #[must_use]
+    pub fn initial_thread_id(&self) -> ThreadId {
+        *self
+            .initial_thread_id
+            .get()
+            .expect("broker process creation did not initialize its initial thread ID")
+    }
+
+    pub(crate) fn set_initial_thread_id(&self, initial_thread_id: ThreadId) {
+        assert!(
+            self.initial_thread_id.get().is_none(),
+            "broker process initial thread ID was initialized twice"
+        );
+        self.initial_thread_id.call_once(|| initial_thread_id);
     }
 
     /// Returns the credential authenticated for this process association.
@@ -1226,7 +1254,7 @@ mod tests {
     }
 
     fn prepared_duplication(parent: &Arc<BrokerProcess>) -> Arc<BrokerProcess> {
-        let (child, _) = parent
+        let child = parent
             .core
             .create_process(parent.caller_credential(), Some(parent.id()))
             .unwrap();
@@ -1311,7 +1339,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         other_owner.complete_start().unwrap();
-        let (child, _) = broker
+        let child = broker
             .create_process(owner.caller_credential(), Some(owner.id()))
             .unwrap();
 

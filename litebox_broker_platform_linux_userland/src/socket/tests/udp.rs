@@ -49,8 +49,7 @@ fn udp_gateway_translates_sources_filters_spoofing_and_reuses_endpoint() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
@@ -135,8 +134,7 @@ fn connected_udp_gateway_preserves_guest_visible_mapping() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
@@ -191,8 +189,7 @@ fn unmatched_guest_udp_destinations_fail_closed() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
     let socket = create_udp_socket(&process, Arc::new(TestReadinessSink { published, retired }));
@@ -236,8 +233,7 @@ fn failed_initial_udp_readiness_does_not_retain_process_state() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -273,12 +269,10 @@ fn guest_udp_readiness_failure_rolls_back_enqueue() {
     .unwrap();
     let receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let sender_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -372,8 +366,7 @@ fn external_udp_readiness_failure_does_not_fail_shared_reactor() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -485,8 +478,7 @@ fn udp_status_publication_failure_still_rearms_native_endpoint() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -559,8 +551,7 @@ fn udp_status_republishes_when_another_error_remains_pending() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -612,12 +603,10 @@ fn guest_udp_queue_pressure_drops_new_datagrams_successfully() {
     .unwrap();
     let receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let sender_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -705,8 +694,7 @@ fn udp_external_peer_authorization_is_bounded_without_eviction() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -798,8 +786,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1153,12 +1140,10 @@ fn guest_udp_namespace_routes_across_processes_and_filters_private_endpoints() {
     .unwrap();
     let receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let sender_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1419,12 +1404,10 @@ fn udp_exact_bindings_coexist_and_wildcard_covers_guest_addresses() {
     .unwrap();
     let receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let sender_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1609,8 +1592,7 @@ fn udp_native_endpoint_is_reused_and_retired() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1675,8 +1657,7 @@ fn udp_endpoint_staging_error_rolls_back_external_peer_reservation() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1714,12 +1695,10 @@ fn stale_udp_datagrams_are_not_relabelled_after_guest_port_reuse() {
     .unwrap();
     let receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let source_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1823,20 +1802,16 @@ fn udp_queued_datagrams_survive_source_process_teardown() {
     .unwrap();
     let source_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let first_receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let second_receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let replacement_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1972,12 +1947,10 @@ fn connected_guest_udp_enforces_barriers_peek_and_peer_generations() {
     .unwrap();
     let first_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let second_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2106,8 +2079,7 @@ fn connected_guest_udp_filters_other_wildcard_peer_aliases() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2186,8 +2158,7 @@ fn wildcard_udp_reconnect_updates_guest_source_identity() {
     .unwrap();
     let process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2274,12 +2245,10 @@ fn externally_connected_udp_preserves_guest_routing_identity() {
     .unwrap();
     let source_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2386,12 +2355,10 @@ fn internally_connected_udp_drains_external_datagrams_without_delivering_them() 
     .unwrap();
     let receiver_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let sender_process = broker
         .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap()
-        .0;
+        .unwrap();
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });

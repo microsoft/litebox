@@ -39,7 +39,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
-use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
@@ -401,10 +401,13 @@ impl BrokerCore {
         &self,
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
-    ) -> Result<(Arc<BrokerProcess>, ThreadId)> {
+    ) -> Result<Arc<BrokerProcess>> {
         let process = self.allocate_process(caller_credential, parent_id)?;
         match process.create_thread() {
-            Ok(initial_thread_id) => Ok((process, initial_thread_id)),
+            Ok(initial_thread_id) => {
+                process.set_initial_thread_id(initial_thread_id);
+                Ok(process)
+            }
             Err(error) => {
                 process.retire(true);
                 Err(error)
