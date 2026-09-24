@@ -34,9 +34,8 @@ use windows_sys::Win32::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
         EXCEPTION_POINTERS, EXCEPTION_RECORD,
     },
-    System::Memory::{self as Win32_Memory, VirtualAlloc2},
     System::SystemInformation::{self as Win32_SysInfo, GetSystemTimePreciseAsFileTime},
-    System::Threading::{self as Win32_Threading, GetCurrentProcess},
+    System::Threading as Win32_Threading,
     System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise,
 };
 use zerocopy::{FromBytes, IntoBytes};
@@ -1931,40 +1930,6 @@ impl litebox::platform::RawPointerProvider for WindowsUserland {
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
-#[global_allocator]
-static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
-    litebox::mm::allocator::SafeZoneAllocator::new();
-
-impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
-    fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
-        let size = core::cmp::max(
-            layout.size().next_power_of_two(),
-            // Note `mmap` provides no guarantee of alignment, so we double the size to ensure we
-            // can always find a required chunk within the returned memory region.
-            core::cmp::max(layout.align(), 0x1000) << 1,
-        );
-
-        match unsafe {
-            VirtualAlloc2(
-                GetCurrentProcess(),
-                core::ptr::null_mut(),
-                size,
-                Win32_Memory::MEM_COMMIT | Win32_Memory::MEM_RESERVE,
-                Win32_Memory::PAGE_READWRITE,
-                core::ptr::null_mut(),
-                0,
-            )
-        } {
-            addr if addr.is_null() => None,
-            addr => Some((addr as usize, size)),
-        }
-    }
-
-    unsafe fn free(_addr: usize) {
-        unimplemented!("Memory deallocation is not implemented for Windows yet.");
-    }
-}
-
 unsafe extern "C" {
     // Defined in asm blocks above
     fn syscall_callback() -> isize;
@@ -2273,7 +2238,7 @@ mod tests {
         assert_ne!(
             unsafe {
                 windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-                    crate::GetCurrentProcess(),
+                    windows_sys::Win32::System::Threading::GetCurrentProcess(),
                     code,
                     instructions.len(),
                 )
