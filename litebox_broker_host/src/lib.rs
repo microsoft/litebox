@@ -1320,7 +1320,9 @@ mod tests {
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
-    use litebox_broker_core::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
+    use litebox_broker_core::test_support::{
+        BrokerCoreTestExt, TestBrokerCoreBuilder, TestStdioProvider,
+    };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -1751,7 +1753,7 @@ mod tests {
 
     fn duplication_startup_completion_publishes_after_activation(broker: &BrokerCore) {
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
         let (child, _) = broker
@@ -1778,7 +1780,7 @@ mod tests {
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         shared_buffers
@@ -1890,7 +1892,7 @@ mod tests {
 
     fn association_shared_buffer_sequence_stages_random_data(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         shared_buffers
@@ -1945,7 +1947,7 @@ mod tests {
         provider: &TestStdioProvider,
     ) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         shared_buffers
@@ -2158,7 +2160,7 @@ mod tests {
         assert!(!setup_called.get());
         assert_eq!(
             broker
-                .create_process(CallerCredential::Unauthenticated, None)
+                .create_test_process(CallerCredential::Unauthenticated, None)
                 .unwrap()
                 .id(),
             root_process_id(5)
@@ -2373,7 +2375,7 @@ mod tests {
 
     fn active_request_closes_object_reference(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let response = handle_test_request(
             &process,
@@ -2405,7 +2407,7 @@ mod tests {
 
     fn active_request_allocates_and_releases_thread_id(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let response = handle_test_request(&process, BrokerOperation::CreateThread);
         let BrokerResult::ThreadCreated(thread_id) = response else {
@@ -2424,7 +2426,7 @@ mod tests {
 
     fn association_shared_buffer_sequences_stage_pipe_data(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let memory = TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE);
         let shared_buffers = SharedBufferPool::new(memory.clone(), SHARED_BUFFER_LAYOUT).unwrap();
@@ -2485,7 +2487,7 @@ mod tests {
 
     fn association_shared_buffer_sequences_stage_socket_data(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let shared_buffers = test_shared_buffers();
         let created = handle_test_request_with_buffers(
@@ -2907,7 +2909,7 @@ mod tests {
     ) -> BrokerHostAssociation<Memory> {
         BrokerHostAssociation {
             process: broker
-                .create_process(CallerCredential::Unauthenticated, None)
+                .create_test_process(CallerCredential::Unauthenticated, None)
                 .unwrap(),
             shared_buffers,
             readiness_sink: test_readiness_sink(),

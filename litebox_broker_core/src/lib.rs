@@ -331,11 +331,48 @@ impl BrokerCore {
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
-    pub fn create_process(
+    pub(crate) fn create_process(
         &self,
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
+        let allocate_process = |parent: Option<ProcessParent>, root: Option<Arc<ProcessRoot>>| {
+            let mut processes = self.processes.write();
+            if processes.len() >= self.limits.max_processes {
+                return Err(BrokerError::ResourceExhausted);
+            }
+            processes
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            let raw_id = self.ids.lock().allocate()?;
+            let id = ProcessId(raw_id);
+            let process = if let Some(root) = root {
+                Arc::new(BrokerProcess::new(
+                    self.clone(),
+                    id,
+                    root,
+                    parent,
+                    caller_credential,
+                ))
+            } else {
+                assert!(parent.is_none(), "a root process cannot have a parent");
+                Arc::new_cyclic(|root_process| {
+                    BrokerProcess::new(
+                        self.clone(),
+                        id,
+                        Arc::new(ProcessRoot::new(root_process.clone())),
+                        None,
+                        caller_credential,
+                    )
+                })
+            };
+            assert!(
+                processes.insert(id, Arc::downgrade(&process)).is_none(),
+                "the ID allocator returned an occupied process ID"
+            );
+            Ok(process)
+        };
+
         if let Some(parent_id) = parent_id {
             let parent = self
                 .processes
@@ -344,14 +381,10 @@ impl BrokerCore {
                 .and_then(Weak::upgrade)
                 .ok_or(BrokerError::UnknownObject)?;
             return parent.with_live_owner(|root| {
-                self.register_process(
-                    caller_credential,
-                    Some(ProcessParent::new(&parent)),
-                    Some(root),
-                )
+                allocate_process(Some(ProcessParent::new(&parent)), Some(root))
             })?;
         }
-        self.register_process(caller_credential, None, None)
+        allocate_process(None, None)
     }
 
     /// Allocates one process and its initial thread.
@@ -376,47 +409,5 @@ impl BrokerCore {
                 Err(error)
             }
         }
-    }
-
-    pub(crate) fn register_process(
-        &self,
-        caller_credential: CallerCredential,
-        parent: Option<ProcessParent>,
-        root: Option<Arc<ProcessRoot>>,
-    ) -> Result<Arc<BrokerProcess>> {
-        let mut processes = self.processes.write();
-        if processes.len() >= self.limits.max_processes {
-            return Err(BrokerError::ResourceExhausted);
-        }
-        processes
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        let raw_id = self.ids.lock().allocate()?;
-        let id = ProcessId(raw_id);
-        let process = if let Some(root) = root {
-            Arc::new(BrokerProcess::new(
-                self.clone(),
-                id,
-                root,
-                parent,
-                caller_credential,
-            ))
-        } else {
-            assert!(parent.is_none(), "a root process cannot have a parent");
-            Arc::new_cyclic(|root_process| {
-                BrokerProcess::new(
-                    self.clone(),
-                    id,
-                    Arc::new(ProcessRoot::new(root_process.clone())),
-                    None,
-                    caller_credential,
-                )
-            })
-        };
-        assert!(
-            processes.insert(id, Arc::downgrade(&process)).is_none(),
-            "the ID allocator returned an occupied process ID"
-        );
-        Ok(process)
     }
 }
