@@ -199,3 +199,24 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox::platform::PageManagementProvider;
+
+    #[test]
+    fn test_reserved_pages() {
+        let platform = LinuxUserland::new(None);
+        let reserved_pages: Vec<_> =
+            <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
+
+        // Check that the reserved pages are in order and non-overlapping
+        let mut prev = 0;
+        for page in reserved_pages {
+            assert!(page.start >= prev);
+            assert!(page.end > page.start);
+            prev = page.end;
+        }
+    }
+}

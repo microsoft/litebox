@@ -332,3 +332,117 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         self.reserved_pages.iter()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use litebox::platform::{PageManagementProvider, RawConstPointer};
+
+    #[test]
+    fn test_reserved_pages() {
+        let platform = WindowsUserland::new();
+        let reserved_pages: Vec<_> =
+            <WindowsUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
+
+        // Check that the reserved pages are not empty
+        assert!(!reserved_pages.is_empty(), "No reserved pages found");
+
+        // Check that the reserved pages are in order and non-overlapping
+        let mut prev = 0;
+        for page in reserved_pages {
+            assert!(page.start >= prev);
+            assert!(page.end > page.start);
+            prev = page.end;
+        }
+    }
+
+    #[test]
+    fn test_page_provider() {
+        let collect_regions = |r| {
+            let mut regions = Vec::new();
+            process_memory_range_by_regions(
+                r,
+                |region, state| -> Result<bool, core::convert::Infallible> {
+                    regions.push((region, state));
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            regions
+        };
+
+        let platform = WindowsUserland::new();
+        let system_allocation_granularity =
+            platform.sys_info.read().unwrap().dwAllocationGranularity as usize;
+        // Allocate some pages: it should reserve `system_allocation_granularity` bytes but only commit 0x1000 bytes
+        let addr = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            0..0x1000,
+            MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        assert_eq!(
+            collect_regions(addr..addr + system_allocation_granularity),
+            vec![
+                (
+                    addr..addr + 0x1000,
+                    windows_sys::Win32::System::Memory::MEM_COMMIT
+                ),
+                (
+                    addr + 0x1000..addr + system_allocation_granularity,
+                    windows_sys::Win32::System::Memory::MEM_RESERVE
+                ),
+            ]
+        );
+
+        assert!(system_allocation_granularity >= 0x1_0000);
+        // We should be able to allocate [addr + 0x8000, addr + 0x1_0000)
+        let addr2 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            (addr + 0x8000)..(addr + 0x1_0000),
+            MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        // Even though `fixed_address` is false, we should still get the requested address if it's free.
+        assert_eq!(addr2, addr + 0x8000);
+        assert_eq!(
+            collect_regions(addr..addr + 0x1_0000),
+            vec![
+                (
+                    addr..addr + 0x1000,
+                    windows_sys::Win32::System::Memory::MEM_COMMIT
+                ),
+                (
+                    addr + 0x1000..addr + 0x8000,
+                    windows_sys::Win32::System::Memory::MEM_RESERVE
+                ),
+                (
+                    addr + 0x8000..addr + 0x1_0000,
+                    windows_sys::Win32::System::Memory::MEM_COMMIT
+                ),
+            ]
+        );
+
+        // Try to allocate [addr + 0x4000, addr + 0x1_0000), which overlaps with existing committed pages.
+        // OS should allocate a new region instead of the requested one (as `fixed_address` is false)
+        let addr3 = <WindowsUserland as PageManagementProvider<4096>>::allocate_pages(
+            platform,
+            (addr + 0x4000)..(addr + 0x1_0000),
+            MemoryRegionPermissions::WRITE,
+            false,
+            true,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap()
+        .as_usize();
+        assert_ne!(addr3, addr + 0x4000);
+    }
+}

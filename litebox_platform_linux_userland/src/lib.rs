@@ -2231,7 +2231,6 @@ mod tests {
     use litebox::{fs::OFlags, platform::RawMutex};
 
     use crate::LinuxUserland;
-    use litebox::platform::PageManagementProvider;
 
     extern crate std;
 
@@ -2251,21 +2250,6 @@ mod tests {
         });
 
         assert!(mutex.block(0).is_ok());
-    }
-
-    #[test]
-    fn test_reserved_pages() {
-        let platform = LinuxUserland::new(None);
-        let reserved_pages: Vec<_> =
-            <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
-
-        // Check that the reserved pages are in order and non-overlapping
-        let mut prev = 0;
-        for page in reserved_pages {
-            assert!(page.start >= prev);
-            assert!(page.end > page.start);
-            prev = page.end;
-        }
     }
 
     #[test]
