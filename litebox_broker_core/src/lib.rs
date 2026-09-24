@@ -50,10 +50,10 @@ pub use policy::{
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 pub use process::{
-    AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, ObjectRights,
-    ProcessLifecycleSink, ProcessShutdown,
+    AssociationCancellation, BrokerProcess, CallerCredential, ObjectRights, ProcessLifecycleSink,
+    ProcessShutdown,
 };
-use process::{ObjectReference, ProcessParent, ProcessRoot};
+use process::{ObjectReference, ProcessRoot};
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
@@ -336,7 +336,8 @@ impl BrokerCore {
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
-        let allocate_process = |parent: Option<ProcessParent>, root: Option<Arc<ProcessRoot>>| {
+        let allocate_process = |parent: Option<Weak<BrokerProcess>>,
+                                root: Option<Arc<ProcessRoot>>| {
             let mut processes = self.processes.write();
             if processes.len() >= self.limits.max_processes {
                 return Err(BrokerError::ResourceExhausted);
@@ -381,7 +382,7 @@ impl BrokerCore {
                 .and_then(Weak::upgrade)
                 .ok_or(BrokerError::UnknownObject)?;
             return parent.with_live_owner(|root| {
-                allocate_process(Some(ProcessParent::new(&parent)), Some(root))
+                allocate_process(Some(Arc::downgrade(&parent)), Some(root))
             })?;
         }
         allocate_process(None, None)

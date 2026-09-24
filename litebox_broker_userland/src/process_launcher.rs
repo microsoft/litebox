@@ -12,7 +12,7 @@ use std::time::Instant;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ProcessLifecycleSink,
 };
-use litebox_broker_host::{ProcessLauncher, ProcessStartupCompletion};
+use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::ThreadId;
 use litebox_broker_protocol::process::ProcessStartupData;
 
@@ -30,7 +30,6 @@ pub(crate) struct PendingRunnerAssociation {
     pub(super) process: Arc<BrokerProcess>,
     initial_thread_id: ThreadId,
     data: Option<ProcessStartupData>,
-    completion: ProcessStartupCompletion,
 }
 
 impl PendingRunnerAssociation {
@@ -38,28 +37,18 @@ impl PendingRunnerAssociation {
         process: Arc<BrokerProcess>,
         initial_thread_id: ThreadId,
         data: Option<ProcessStartupData>,
-        completion: ProcessStartupCompletion,
     ) -> Self {
         Self {
             process,
             initial_thread_id,
             data,
-            completion,
         }
     }
 
     pub(crate) fn into_process_and_startup(
         self,
-    ) -> (
-        (Arc<BrokerProcess>, ThreadId),
-        Option<ProcessStartupData>,
-        ProcessStartupCompletion,
-    ) {
-        (
-            (self.process, self.initial_thread_id),
-            self.data,
-            self.completion,
-        )
+    ) -> ((Arc<BrokerProcess>, ThreadId), Option<ProcessStartupData>) {
+        ((self.process, self.initial_thread_id), self.data)
     }
 }
 
@@ -140,12 +129,8 @@ impl UserlandProcessLauncher {
             .broker
             .create_process_with_initial_thread(CallerCredential::HostGuaranteed, None)
             .map_err(broker_io_error)?;
-        let association = PendingRunnerAssociation::new(
-            Arc::clone(&process),
-            initial_thread_id,
-            None,
-            ProcessStartupCompletion::CompleteStart,
-        );
+        let association =
+            PendingRunnerAssociation::new(Arc::clone(&process), initial_thread_id, None);
         let (completion_sender, completion_receiver) = sync_channel(1);
         let startup =
             Arc::clone(&launcher).launch_runner(association, config, Some(completion_sender));
@@ -222,24 +207,9 @@ impl ProcessLauncher for UserlandProcessLauncher {
         initial_thread_id: ThreadId,
         data: ProcessStartupData,
     ) -> Result<(), BrokerError> {
-        self.launch_with_completion(
-            process,
-            initial_thread_id,
-            data,
-            ProcessStartupCompletion::CompleteStart,
-        )
-    }
-
-    fn launch_with_completion(
-        self: Arc<Self>,
-        process: Arc<BrokerProcess>,
-        initial_thread_id: ThreadId,
-        data: ProcessStartupData,
-        completion: ProcessStartupCompletion,
-    ) -> Result<(), BrokerError> {
         let config = self.started_runner_config.clone();
         self.launch_runner(
-            PendingRunnerAssociation::new(process, initial_thread_id, Some(data), completion),
+            PendingRunnerAssociation::new(process, initial_thread_id, Some(data)),
             config,
             None,
         )

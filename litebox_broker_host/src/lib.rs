@@ -96,14 +96,6 @@ struct AssociationState {
     shared_buffer_usage: SharedBufferUsage,
 }
 
-/// Broker-core action that commits one validated runner association.
-pub enum ProcessStartupCompletion {
-    /// Completes ordinary process startup.
-    CompleteStart,
-    /// Publishes the prepared duplication child associated with the runner.
-    PublishDuplication,
-}
-
 impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
     fn new(
         process: Arc<BrokerProcess>,
@@ -121,22 +113,9 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
         }
     }
 
-    /// Commits process startup after deployment-specific installation and validation.
-    pub fn complete_startup(
-        &self,
-        completion: ProcessStartupCompletion,
-    ) -> litebox_broker_core::Result<()> {
-        match completion {
-            ProcessStartupCompletion::CompleteStart => self.process.complete_start(),
-            ProcessStartupCompletion::PublishDuplication => {
-                self.process.complete_duplication_start()
-            }
-        }
-    }
-
-    /// Commits ordinary process startup after installation and validation.
+    /// Commits process startup after installation and validation.
     pub fn activate_process(&self) -> litebox_broker_core::Result<()> {
-        self.complete_startup(ProcessStartupCompletion::CompleteStart)
+        self.process.complete_start()
     }
 
     /// Treats association loss as owner death; cleanup waits for confirmed runner teardown.
@@ -804,31 +783,6 @@ pub trait ProcessLauncher: Send + Sync {
         initial_thread_id: ThreadId,
         startup: ProcessStartupData,
     ) -> core::result::Result<(), BrokerError>;
-
-    /// Starts one process with a non-default startup completion action.
-    ///
-    /// Launchers that support duplication publication transfer `completion`
-    /// to the runner association and consume it only after deployment-specific
-    /// installation and validation.
-    fn launch_with_completion(
-        self: Arc<Self>,
-        process: Arc<BrokerProcess>,
-        initial_thread_id: ThreadId,
-        startup: ProcessStartupData,
-        completion: ProcessStartupCompletion,
-    ) -> core::result::Result<(), BrokerError> {
-        match completion {
-            ProcessStartupCompletion::CompleteStart => {
-                self.launch(process, initial_thread_id, startup)
-            }
-            ProcessStartupCompletion::PublishDuplication => {
-                let error = BrokerError::UnsupportedOperation;
-                let _ = process.fail_start(error, false, true);
-                process.retire(true);
-                Err(error)
-            }
-        }
-    }
 }
 
 /// Handles a process operation using the configured platform launcher.
@@ -1665,7 +1619,7 @@ mod tests {
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
         setup_failure_transfers_process_to_the_deployment_owner(&broker);
         precreated_root_negotiates_without_startup_data(&broker);
-        duplication_startup_completion_publishes_after_activation(&broker);
+        prepared_duplication_publishes_after_activation(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
@@ -1745,7 +1699,7 @@ mod tests {
         association.finish();
     }
 
-    fn duplication_startup_completion_publishes_after_activation(broker: &BrokerCore) {
+    fn prepared_duplication_publishes_after_activation(broker: &BrokerCore) {
         let parent = broker
             .create_test_process(CallerCredential::Unauthenticated, None)
             .unwrap();
@@ -1761,9 +1715,7 @@ mod tests {
         );
 
         assert!(!child.is_running());
-        association
-            .complete_startup(ProcessStartupCompletion::PublishDuplication)
-            .unwrap();
+        association.activate_process().unwrap();
         assert!(child.is_running());
 
         association.finish();

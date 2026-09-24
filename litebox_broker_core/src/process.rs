@@ -12,7 +12,7 @@ use crate::fs::File;
 use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, rwlock::RwLock};
@@ -104,39 +104,6 @@ struct ProcessReferences {
     pending_handles: usize,
 }
 
-pub(crate) struct ProcessParent {
-    process: Weak<BrokerProcess>,
-}
-
-impl ProcessParent {
-    pub(crate) fn new(process: &Arc<BrokerProcess>) -> Self {
-        Self {
-            process: Arc::downgrade(process),
-        }
-    }
-}
-
-/// Broker-owned state for one guest thread.
-///
-/// Execution remains platform-local. This object owns the authoritative
-/// broker identity and is the extension point for execution-control state when
-/// a broker platform needs to manage thread execution.
-pub struct BrokerThread {
-    id: ThreadId,
-}
-
-impl BrokerThread {
-    const fn new(id: ThreadId) -> Self {
-        Self { id }
-    }
-
-    /// Returns the assigned thread ID.
-    #[must_use]
-    pub const fn id(&self) -> ThreadId {
-        self.id
-    }
-}
-
 /// Broker-owned state for one authenticated guest process.
 ///
 /// User mode cannot choose the process ID. The broker entry layer authenticates
@@ -147,15 +114,13 @@ pub struct BrokerProcess {
     /// Assigned process ID and internal authority.
     pub(crate) id: ProcessId,
     root: Arc<ProcessRoot>,
-    /// Parent that created this record; unlike the wait parent, never changes.
-    creation_parent: Option<Weak<BrokerProcess>>,
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
     /// Handles of the live object references owned by this process.
     references: Mutex<ProcessReferences>,
     /// Authoritative broker threads owned by this process.
-    threads: Mutex<HashMap<ThreadId, BrokerThread>>,
+    threads: Mutex<HashSet<ThreadId>>,
     /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
@@ -167,7 +132,7 @@ pub struct BrokerProcess {
 struct BrokerProcessState {
     record: ProcessRecordState,
     /// Immediate wait parent; `None` on a non-root means future zombies auto-reap.
-    parent: Option<ProcessParent>,
+    parent: Option<Weak<BrokerProcess>>,
     owner_alive: bool,
     /// Whether a starting child continues after its parent dies.
     reparent_startup_on_parent_death: bool,
@@ -176,34 +141,9 @@ struct BrokerProcessState {
     shutdown: Option<ProcessShutdown>,
 }
 
-/// Origin of a request concerning one process record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "later request dispatch PRs consume the origin classification"
-    )
-)]
-pub(crate) enum ProcessRequestOrigin {
-    /// Transport or host notification that must be handled in every state.
-    Lifecycle,
-    /// Operation initiated by guest execution.
-    Guest,
-}
-
 /// Authoritative lifecycle state of one broker process record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "later process lifecycle PRs construct these states"
-    )
-)]
 pub(crate) enum ProcessRecordState {
-    /// Identity reserved, with no host process selected yet.
-    Reserved,
     /// Host process setup is in progress.
     Starting,
     /// The process is published and may issue guest-originated operations.
@@ -212,42 +152,17 @@ pub(crate) enum ProcessRecordState {
     Failed(BrokerError),
     /// The process exited and has a waitable status.
     Zombie,
-    /// A failed host process has been confirmed dead.
-    Collected,
     /// A zombie's waitable status was consumed.
     Reaped,
-    /// An unused reservation expired.
-    Expired,
 }
 
 impl ProcessRecordState {
-    /// Returns whether requests from this origin can be considered in this state.
-    ///
-    /// Guest operations still require operation-specific authorization.
-    /// Startup negotiation is lifecycle traffic, so guest operations begin
-    /// only after the process reaches a running state.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "later request dispatch PRs apply the operation-specific checks"
-        )
-    )]
-    fn admits_request_origin(self, origin: ProcessRequestOrigin) -> bool {
-        match origin {
-            ProcessRequestOrigin::Lifecycle => true,
-            ProcessRequestOrigin::Guest => matches!(self, Self::Running),
-        }
-    }
-
     fn transition(&mut self, next: Self) -> Result<()> {
         let allowed = matches!(
             (*self, next),
-            (Self::Reserved, Self::Starting | Self::Expired)
-                | (Self::Starting, Self::Running | Self::Failed(_))
+            (Self::Starting, Self::Running | Self::Failed(_))
                 | (Self::Running, Self::Zombie)
                 | (Self::Zombie, Self::Reaped)
-                | (Self::Failed(_), Self::Collected)
         );
         if !allowed {
             return Err(BrokerError::Internal);
@@ -298,15 +213,13 @@ impl BrokerProcess {
         core: BrokerCore,
         id: ProcessId,
         root: Arc<ProcessRoot>,
-        parent: Option<ProcessParent>,
+        parent: Option<Weak<BrokerProcess>>,
         caller_credential: CallerCredential,
     ) -> Self {
-        let creation_parent = parent.as_ref().map(|parent| Weak::clone(&parent.process));
         Self {
             core,
             id,
             root,
-            creation_parent,
             state: Mutex::new(BrokerProcessState {
                 record: ProcessRecordState::Starting,
                 parent,
@@ -321,7 +234,7 @@ impl BrokerProcess {
                 handles: Vec::new(),
                 pending_handles: 0,
             }),
-            threads: Mutex::new(HashMap::new()),
+            threads: Mutex::new(HashSet::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             cancellation: AssociationCancellation::default(),
@@ -352,14 +265,7 @@ impl BrokerProcess {
         if self.cancellation.is_cancelled() {
             return Err(BrokerError::PeerClosed);
         }
-        if core::ptr::eq(self, child)
-            || !Arc::ptr_eq(&self.core.processes, &child.core.processes)
-            || !child
-                .creation_parent
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .is_some_and(|parent| core::ptr::eq(parent.as_ref(), self))
-        {
+        if core::ptr::eq(self, child) || !Arc::ptr_eq(&self.core.processes, &child.core.processes) {
             return Err(BrokerError::Internal);
         }
 
@@ -373,6 +279,11 @@ impl BrokerProcess {
         let mut child_state = child.state.lock();
         if !child_state.owner_alive
             || !matches!(child_state.record, ProcessRecordState::Starting)
+            || !child_state
+                .parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .is_some_and(|parent| core::ptr::eq(parent.as_ref(), self))
             || child_state.reparent_startup_on_parent_death
             || !matches!(child_state.retirement, ProcessRetirement::Active { .. })
         {
@@ -393,13 +304,12 @@ impl BrokerProcess {
     /// Returns the completed startup outcome, or `None` while startup is pending.
     pub fn startup_result(&self) -> Option<Result<()>> {
         match self.state.lock().record {
-            ProcessRecordState::Reserved | ProcessRecordState::Starting => None,
+            ProcessRecordState::Starting => None,
             ProcessRecordState::Running => Some(Ok(())),
             ProcessRecordState::Failed(error) => Some(Err(error)),
-            ProcessRecordState::Zombie
-            | ProcessRecordState::Collected
-            | ProcessRecordState::Reaped
-            | ProcessRecordState::Expired => Some(Err(BrokerError::PeerClosed)),
+            ProcessRecordState::Zombie | ProcessRecordState::Reaped => {
+                Some(Err(BrokerError::PeerClosed))
+            }
         }
     }
 
@@ -407,40 +317,14 @@ impl BrokerProcess {
     pub fn complete_start(&self) -> Result<()> {
         {
             let mut state = self.state.lock();
-            if !matches!(state.retirement, ProcessRetirement::Active { .. }) {
-                return Err(BrokerError::PeerClosed);
-            }
-            match state.record {
-                ProcessRecordState::Starting if !state.reparent_startup_on_parent_death => {}
-                ProcessRecordState::Starting | ProcessRecordState::Running => {
-                    return Err(BrokerError::Internal);
-                }
-                ProcessRecordState::Failed(error) => return Err(error),
-                _ => return Err(BrokerError::PeerClosed),
-            }
-            state.record.transition(ProcessRecordState::Running)?;
-        }
-        self.core.process_lifecycle_sink.changed();
-        Ok(())
-    }
-
-    /// Publishes a prepared duplication child after its association is active.
-    pub fn complete_duplication_start(&self) -> Result<()> {
-        {
-            let mut state = self.state.lock();
             if !state.owner_alive || !matches!(state.retirement, ProcessRetirement::Active { .. }) {
                 return Err(BrokerError::PeerClosed);
             }
             match state.record {
-                ProcessRecordState::Starting if state.reparent_startup_on_parent_death => {}
-                ProcessRecordState::Starting | ProcessRecordState::Running => {
-                    return Err(BrokerError::Internal);
-                }
+                ProcessRecordState::Starting => {}
+                ProcessRecordState::Running => return Err(BrokerError::Internal),
                 ProcessRecordState::Failed(error) => return Err(error),
                 _ => return Err(BrokerError::PeerClosed),
-            }
-            if self.threads.lock().len() != 1 {
-                return Err(BrokerError::Internal);
             }
             state.record.transition(ProcessRecordState::Running)?;
             state.reparent_startup_on_parent_death = false;
@@ -503,11 +387,6 @@ impl BrokerProcess {
         self.state.lock().shutdown_request == ProcessShutdownRequest::Expected
     }
 
-    /// Marks process retirement as abnormal.
-    pub fn mark_abnormal(&self) {
-        self.state.lock().retirement.mark_abnormal();
-    }
-
     /// Records final retirement disposition without releasing resources early.
     pub fn retire(&self, release_ids: bool) {
         {
@@ -519,10 +398,9 @@ impl BrokerProcess {
 
     /// Applies owner-death handling to every direct child process.
     ///
-    /// Reserved children expire, ordinary startup fails, retained duplication
-    /// startup continues after reparenting, and live or zombie children reparent
-    /// to the tree root. Zombies are reaped immediately when the root owner is
-    /// gone.
+    /// Ordinary startup fails, prepared duplication startup continues after
+    /// reparenting, and live or zombie children reparent to the tree root.
+    /// Zombies are reaped immediately when the root owner is gone.
     pub fn handle_owner_death(self: &Arc<Self>) {
         {
             let mut state = self.state.lock();
@@ -598,20 +476,13 @@ impl BrokerProcess {
         if !state
             .parent
             .as_ref()
-            .is_some_and(|parent| Weak::ptr_eq(&parent.process, owner))
+            .is_some_and(|parent| Weak::ptr_eq(parent, owner))
         {
             return (false, None);
         }
 
         let mut shutdown = None;
         let reparent = match state.record {
-            ProcessRecordState::Reserved => {
-                state
-                    .record
-                    .transition(ProcessRecordState::Expired)
-                    .expect("reserved child expiration must be a valid transition");
-                false
-            }
             ProcessRecordState::Starting if state.reparent_startup_on_parent_death => true,
             ProcessRecordState::Starting => {
                 state
@@ -625,14 +496,11 @@ impl BrokerProcess {
                 false
             }
             ProcessRecordState::Running | ProcessRecordState::Zombie => true,
-            ProcessRecordState::Failed(_)
-            | ProcessRecordState::Collected
-            | ProcessRecordState::Reaped
-            | ProcessRecordState::Expired => return (false, None),
+            ProcessRecordState::Failed(_) | ProcessRecordState::Reaped => return (false, None),
         };
 
         if reparent {
-            state.parent = live_root.map(ProcessParent::new);
+            state.parent = live_root.map(Arc::downgrade);
             if live_root.is_none() && state.record == ProcessRecordState::Zombie {
                 state
                     .record
@@ -706,10 +574,9 @@ impl BrokerProcess {
                 return Err(error);
             }
         };
-        let thread = BrokerThread::new(ThreadId(raw_id));
-        let thread_id = thread.id();
+        let thread_id = ThreadId(raw_id);
         assert!(
-            threads.insert(thread_id, thread).is_none(),
+            threads.insert(thread_id),
             "the ID allocator returned an occupied thread ID"
         );
         Ok(thread_id)
@@ -718,14 +585,14 @@ impl BrokerProcess {
     /// Records broker thread exit after its local task teardown completes.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<()> {
         let mut threads = self.threads.lock();
-        let thread = threads
-            .remove(&thread_id)
-            .ok_or(BrokerError::UnknownObject)?;
+        if !threads.remove(&thread_id) {
+            return Err(BrokerError::UnknownObject);
+        }
         drop(threads);
         self.core
             .active_thread_count
             .fetch_sub(1, Ordering::Relaxed);
-        self.core.ids.lock().release(thread.id().0);
+        self.core.ids.lock().release(thread_id.0);
         Ok(())
     }
 
@@ -1209,8 +1076,8 @@ impl BrokerProcess {
                 .active_thread_count
                 .fetch_sub(threads.len(), Ordering::Relaxed);
             let mut ids = self.core.ids.lock();
-            for thread in threads.into_values() {
-                ids.release(thread.id().0);
+            for thread_id in threads {
+                ids.release(thread_id.0);
             }
             ids.release(self.id.0);
         }
@@ -1316,7 +1183,7 @@ mod tests {
 
     use super::{
         BrokerProcess, ProcessLifecycleSink, ProcessRecordState, ProcessReferences,
-        ProcessRequestOrigin, release_pending_reference,
+        release_pending_reference,
     };
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
@@ -1356,7 +1223,7 @@ mod tests {
             .lock()
             .parent
             .as_ref()
-            .and_then(|parent| parent.process.upgrade())
+            .and_then(alloc::sync::Weak::upgrade)
             .map(|parent| parent.id())
     }
 
@@ -1369,18 +1236,15 @@ mod tests {
         child
     }
 
-    fn process_record_states() -> [ProcessRecordState; 8] {
+    fn process_record_states() -> [ProcessRecordState; 5] {
         use ProcessRecordState as State;
 
         [
-            State::Reserved,
             State::Starting,
             State::Running,
             State::Failed(BrokerError::PeerClosed),
             State::Zombie,
-            State::Collected,
             State::Reaped,
-            State::Expired,
         ]
     }
 
@@ -1391,13 +1255,10 @@ mod tests {
         let failed = State::Failed(BrokerError::PeerClosed);
         let states = process_record_states();
         let allowed = [
-            (State::Reserved, State::Starting),
-            (State::Reserved, State::Expired),
             (State::Starting, State::Running),
             (State::Starting, failed),
             (State::Running, State::Zombie),
             (State::Zombie, State::Reaped),
-            (failed, State::Collected),
         ];
 
         for initial in states {
@@ -1411,21 +1272,6 @@ mod tests {
                 );
                 assert_eq!(current, if expected { next } else { initial });
             }
-        }
-    }
-
-    #[test]
-    fn request_origin_classification_preserves_lifecycle_notifications() {
-        use ProcessRecordState as State;
-        use ProcessRequestOrigin as Origin;
-
-        for state in process_record_states() {
-            assert!(state.admits_request_origin(Origin::Lifecycle), "{state:?}");
-            assert_eq!(
-                state.admits_request_origin(Origin::Guest),
-                matches!(state, State::Running),
-                "{state:?}"
-            );
         }
     }
 
@@ -1476,17 +1322,12 @@ mod tests {
             Err(BrokerError::Internal)
         );
         assert_eq!(child.startup_result(), None);
-        assert_eq!(
-            child.complete_duplication_start(),
-            Err(BrokerError::Internal)
-        );
         owner.prepare_duplication_child(&child).unwrap();
         assert_eq!(
             owner.prepare_duplication_child(&child),
             Err(BrokerError::Internal)
         );
-        assert_eq!(child.complete_start(), Err(BrokerError::Internal));
-        child.complete_duplication_start().unwrap();
+        child.complete_start().unwrap();
         assert!(child.is_running());
         assert_eq!(
             owner.prepare_duplication_child(&owner),
@@ -1509,8 +1350,8 @@ mod tests {
         let first_child = prepared_duplication(&parent);
         let second_child = prepared_duplication(&parent);
 
-        first_child.complete_duplication_start().unwrap();
-        second_child.complete_duplication_start().unwrap();
+        first_child.complete_start().unwrap();
+        second_child.complete_start().unwrap();
 
         assert!(first_child.is_running());
         assert!(second_child.is_running());
@@ -1537,7 +1378,7 @@ mod tests {
         }));
         cancelled_parent.request_cancellation();
 
-        cancelled_child.complete_duplication_start().unwrap();
+        cancelled_child.complete_start().unwrap();
         assert_eq!(
             cancelled_child.state.lock().record,
             ProcessRecordState::Running
@@ -1561,7 +1402,7 @@ mod tests {
         let dead_child = prepared_duplication(&dead_parent);
         dead_parent.handle_owner_death();
 
-        dead_child.complete_duplication_start().unwrap();
+        dead_child.complete_start().unwrap();
         assert_eq!(dead_child.state.lock().record, ProcessRecordState::Running);
         assert_eq!(parent_id(&dead_child), None);
 
@@ -1574,10 +1415,7 @@ mod tests {
             failed_child.fail_start(BrokerError::PeerClosed, false, true),
             Err(BrokerError::PeerClosed)
         );
-        assert_eq!(
-            failed_child.complete_duplication_start(),
-            Err(BrokerError::PeerClosed)
-        );
+        assert_eq!(failed_child.complete_start(), Err(BrokerError::PeerClosed));
     }
 
     #[test]
@@ -1658,11 +1496,6 @@ mod tests {
             .record
             .transition(ProcessRecordState::Zombie)
             .unwrap();
-        let reserved = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
-            .unwrap();
-        reserved.state.lock().record = ProcessRecordState::Reserved;
-
         parent.handle_owner_death();
 
         assert!(!parent.state.lock().owner_alive);
@@ -1670,7 +1503,6 @@ mod tests {
         assert_eq!(running.state.lock().record, ProcessRecordState::Running);
         assert_eq!(parent_id(&zombie), Some(root.id()));
         assert_eq!(zombie.state.lock().record, ProcessRecordState::Zombie);
-        assert_eq!(reserved.state.lock().record, ProcessRecordState::Expired);
         assert!(matches!(
             broker.create_process(CallerCredential::Unauthenticated, Some(parent.id())),
             Err(BrokerError::PeerClosed)
