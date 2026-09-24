@@ -1213,6 +1213,11 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
                 );
             }
         }
+        // This must run last, after all guest-memory accesses and the broker
+        // thread-exit response. Once this decrements `nr_threads`, another task
+        // may reuse memory during exec or the runner may terminate the process
+        // and close the broker association.
+        self.thread.detach_from_process();
     }
 }
 
