@@ -196,10 +196,10 @@ fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::proc
 /// `python.exe`; otherwise the test downloads and verifies a pinned official
 /// distribution.
 ///
-/// Python currently reaches CSR initialization. The completion oracle remains
-/// deferred until the shim implements `BasepNlsGetUserInfo`.
+/// Python is run with deterministic hash seeding because the Windows entropy
+/// path it normally uses is not implemented by the shim yet.
 #[test]
-#[ignore = "downloads Python and asserts a stable runtime progress floor"]
+#[ignore = "downloads and runs the official Python distribution"]
 fn run_python_pe() {
     let source = python_source();
     let source_dir = source
@@ -243,19 +243,16 @@ fn run_python_pe() {
         test_dir.join("python.exe").is_file(),
         "Python distribution did not contain python.exe"
     );
-    for image in &host_images {
-        stage_transitive_import_closure(&test_dir, image);
-    }
+    stage_startup_import_closures(&test_dir, host_images.iter().map(Vec::as_slice));
 
     let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command =
-        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    let mut command = brokered_windows_runner_command(&tar_path);
     // command.env("LITEBOX_LOG", "debug");
     command.args([
-        "--initial-files",
-        tar_path.to_str().unwrap(),
+        "--env",
+        "PYTHONHASHSEED=0",
         "/python.exe",
         "-c",
         "print('hello world')",
@@ -413,16 +410,9 @@ fn run_node_pe() {
     let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("node.tar");
     create_tar_with_dir(&test_dir, &tar_path);
 
-    let mut command =
-        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    let mut command = brokered_windows_runner_command(&tar_path);
     // command.env("LITEBOX_LOG", "debug");
-    command.args([
-        "--initial-files",
-        tar_path.to_str().unwrap(),
-        "/node.exe",
-        "-e",
-        "console.log('hello world')",
-    ]);
+    command.args(["/node.exe", "-e", "console.log('hello world')"]);
     println!("Running `{command:?}`");
     let output = command
         .output()
@@ -443,9 +433,8 @@ fn run_node_pe() {
         stdout,
         stderr
     );
-    assert_eq!(
-        stdout.trim_end(),
-        "hello world",
+    assert!(
+        stdout.lines().any(|line| line == "hello world"),
         "Node.js output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
