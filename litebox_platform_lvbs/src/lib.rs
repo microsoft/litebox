@@ -12,11 +12,11 @@ use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider,
-    RawPointerProvider, page_mgmt::DeallocationError,
+    RawPointerProvider,
+    page_mgmt::{DeallocationError, NoReservations, PageReservation},
 };
 use litebox::{
     mm::linux::{PAGE_SIZE, PageRange},
-    platform::page_mgmt::FixedAddressBehavior,
     shim::ContinueOperation,
     utils::TruncateExt,
 };
@@ -435,6 +435,14 @@ pub struct LinuxKernel<Host: HostInterface> {
     page_table_manager: PageTableManager,
     vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
     end_of_boot: core::sync::atomic::AtomicBool,
+}
+
+litebox::define_page_reservation!(LinuxKernelReservation);
+
+impl<const ALIGN: usize> From<LinuxKernelReservation<ALIGN>> for core::ops::Range<usize> {
+    fn from(reservation: LinuxKernelReservation<ALIGN>) -> Self {
+        reservation.range()
+    }
 }
 
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
@@ -986,90 +994,202 @@ pub trait HostInterface: 'static {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+    type Reservations = NoReservations<ALIGN, LinuxKernelReservation<ALIGN>>;
+
     // User space occupies the low canonical half (0 .. 0x0000_7FFF_FFFF_FFFF).
     // Kernel memory lives in the high canonical half (at KERNEL_OFFSET).
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
     const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
 
-    fn allocate_pages(
+    /// Represent a range already selected and owned by the page manager.
+    ///
+    /// No external allocator exists, so ordinary reservations require no platform operation.
+    /// Replacement still removes any old page-table mappings before ownership is transferred.
+    unsafe fn reserve_pages<Reservations>(
         &self,
-        suggested_range: core::ops::Range<usize>,
-        initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
-        fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
-        let range = PageRange::new(suggested_range.start, suggested_range.end)
-            .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
-        let current_pt = self.page_table_manager.current_page_table();
-        match fixed_address_behavior {
-            FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
-            FixedAddressBehavior::Replace => {
-                // Clear the existing mappings first.
-                unsafe { current_pt.unmap_pages(range, true, true, false).unwrap() };
+        replaced_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        _can_grow_down: bool,
+        behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
+    ) -> Result<LinuxKernelReservation<ALIGN>, litebox::platform::page_mgmt::AllocationError>
+    where
+        Reservations: Iterator<Item = LinuxKernelReservation<ALIGN>>,
+    {
+        use litebox::platform::page_mgmt::{AllocationError, FixedAddressBehavior};
+        assert!(ALIGN.is_power_of_two() && ALIGN.is_multiple_of(4096));
+        let pages =
+            PageRange::<ALIGN>::new(range.start, range.end).ok_or(AllocationError::Unaligned)?;
+        if behavior == FixedAddressBehavior::Replace {
+            // SAFETY: The caller transfers all overlapping ownership and excludes users of replaced pages.
+            unsafe {
+                self.page_table_manager.current_page_table().unmap_pages(
+                    PageRange::new(pages.start, pages.end).unwrap(),
+                    true,
+                    true,
+                    false,
+                )
             }
+            .expect("failed to unmap replaced backing");
+            replaced_reservations().for_each(drop);
         }
-        let flags = u32::from(initial_permissions.bits())
-            | if can_grow_down {
-                litebox::mm::linux::VmFlags::VM_GROWSDOWN.bits()
-            } else {
-                0
-            };
-        let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
-        Ok(current_pt.map_pages(range, flags, populate_pages_immediately))
+        // SAFETY: The manager already owns this free aligned range, or transferred ownership
+        // through the replacement operation above.
+        Ok(unsafe { LinuxKernelReservation::new(range) })
     }
 
-    unsafe fn deallocate_pages(
+    unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
-    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        _can_grow_down: bool,
+        populate: bool,
+        behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
+    ) -> Result<LinuxKernelReservation<ALIGN>, litebox::platform::page_mgmt::ReserveAndCommitError>
+    where
+        Reservations: Iterator<Item = LinuxKernelReservation<ALIGN>>,
+    {
+        use litebox::platform::page_mgmt::{AllocationError, FixedAddressBehavior};
+        assert!(ALIGN.is_power_of_two() && ALIGN.is_multiple_of(4096));
+        let pages =
+            PageRange::<ALIGN>::new(range.start, range.end).ok_or(AllocationError::Unaligned)?;
+        if behavior == FixedAddressBehavior::Replace {
+            // SAFETY: The caller authorizes replacement and excludes users of this range.
+            unsafe {
+                self.page_table_manager.current_page_table().unmap_pages(
+                    PageRange::new(pages.start, pages.end).unwrap(),
+                    true,
+                    true,
+                    false,
+                )
+            }
+            .expect("failed to unmap replaced backing");
+            replaced_reservations().for_each(drop);
+        }
+        let flags = litebox::mm::linux::VmFlags::from(permissions);
+        self.page_table_manager.current_page_table().map_pages(
+            PageRange::new(pages.start, pages.end).unwrap(),
+            flags,
+            populate,
+        );
+        // SAFETY: The provider now owns this exact committed extent.
+        Ok(unsafe { LinuxKernelReservation::new(range) })
+    }
+
+    unsafe fn commit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        populate: bool,
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError>
+    where
+        Reservations: Iterator<Item = &'reservation LinuxKernelReservation<ALIGN>>,
+    {
         let range = PageRange::new(range.start, range.end)
-            .ok_or(litebox::platform::page_mgmt::DeallocationError::Unaligned)?;
+            .ok_or(litebox::platform::page_mgmt::PageStateUpdateError::Unaligned)?;
+        let flags = litebox::mm::linux::VmFlags::from(permissions);
+        let current = self.page_table_manager.current_page_table();
+        // SAFETY: The caller owns the range and excludes conflicting accesses; existing frames
+        // must be preserved while missing pages may be populated.
+        unsafe { current.commit_pages(range, flags, populate) }
+    }
+
+    unsafe fn protect_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError>
+    where
+        Reservations: Iterator<Item = &'reservation LinuxKernelReservation<ALIGN>>,
+    {
+        let range = PageRange::new(range.start, range.end)
+            .ok_or(litebox::platform::page_mgmt::PageStateUpdateError::Unaligned)?;
+        // SAFETY: The caller supplies committed pages and excludes conflicting accesses; frames are preserved.
+        unsafe {
+            self.page_table_manager
+                .current_page_table()
+                .mprotect_pages(range, litebox::mm::linux::VmFlags::from(permissions))
+        }
+    }
+
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::PageStateUpdateError>
+    where
+        Reservations: Iterator<Item = &'reservation LinuxKernelReservation<ALIGN>>,
+    {
+        let range = PageRange::new(range.start, range.end)
+            .ok_or(litebox::platform::page_mgmt::PageStateUpdateError::Unaligned)?;
+        // SAFETY: The caller excludes all users; physical frames are freed while ownership remains tracked.
         unsafe {
             self.page_table_manager
                 .current_page_table()
                 .unmap_pages(range, true, true, false)
         }
+        .expect("failed to decommit owned pages");
+        Ok(())
     }
 
-    unsafe fn remap_pages(
+    unsafe fn release_pages(&self, range: core::ops::Range<usize>) {
+        let range = PageRange::new(range.start, range.end).expect("invalid release range");
+        // SAFETY: The caller relinquishes all backing in this range and excludes mappings and users.
+        unsafe {
+            self.page_table_manager
+                .current_page_table()
+                .unmap_pages(range, true, true, false)
+        }
+        .expect("failed to release owned backing");
+    }
+
+    unsafe fn try_remap_pages<Reservations>(
         &self,
+        source_reservations: impl FnOnce() -> Reservations,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
-        _permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<UserMutPtr<u8>, litebox::platform::page_mgmt::RemapError> {
-        let old_range = PageRange::new(old_range.start, old_range.end)
-            .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
-        let new_range = PageRange::new(new_range.start, new_range.end)
-            .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<LinuxKernelReservation<ALIGN>, litebox::platform::page_mgmt::RemapError>
+    where
+        Reservations: Iterator<Item = LinuxKernelReservation<ALIGN>>,
+    {
+        assert!(ALIGN.is_power_of_two() && ALIGN.is_multiple_of(4096));
+        let Some(old_range) = PageRange::new(old_range.start, old_range.end) else {
+            return Err(litebox::platform::page_mgmt::RemapError::Unaligned);
+        };
+        let Some(new_range) = PageRange::<ALIGN>::new(new_range.start, new_range.end) else {
+            return Err(litebox::platform::page_mgmt::RemapError::Unaligned);
+        };
         if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
-        unsafe {
-            self.page_table_manager
-                .current_page_table()
-                .remap_pages(old_range, new_range)
+        assert!(new_range.len() > old_range.len());
+        if new_range.start < <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
+            || new_range.end > <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+        {
+            return Err(litebox::platform::page_mgmt::RemapError::OutOfMemory);
         }
-    }
-
-    unsafe fn update_permissions(
-        &self,
-        range: core::ops::Range<usize>,
-        new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
-        let range = PageRange::new(range.start, range.end)
-            .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
-        let new_flags =
-            litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
+        let page_table = self.page_table_manager.current_page_table();
+        page_table.map_pages(
+            PageRange::new(new_range.start + old_range.len(), new_range.end).unwrap(),
+            litebox::mm::linux::VmFlags::from(permissions),
+            true,
+        );
+        // SAFETY: The caller keeps the destination free of mappings and reservations and excludes
+        // source users. Moving PTEs leaves the source unmapped.
         unsafe {
-            self.page_table_manager
-                .current_page_table()
-                .mprotect_pages(range, new_flags)
+            page_table.remap_pages(
+                old_range,
+                PageRange::new(new_range.start, new_range.end).unwrap(),
+            )
         }
-    }
-
-    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        core::iter::empty()
+        .expect("failed to move remap page tables");
+        source_reservations().for_each(drop);
+        // SAFETY: Remapping acquired the caller-selected, previously unreserved destination.
+        let reservation = unsafe { LinuxKernelReservation::new(new_range.into()) };
+        Ok(reservation)
     }
 }
 

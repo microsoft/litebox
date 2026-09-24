@@ -1692,7 +1692,7 @@ mod tests {
     use litebox::platform::PageManagementProvider;
     use litebox::{
         mm::linux::{NonZeroAddress, NonZeroPageSize},
-        platform::page_mgmt::MemoryRegionPermissions,
+        platform::page_mgmt::{MemoryRegionPermissions, PageReservation},
     };
     use litebox_broker_protocol::fs::FileMode as Mode;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -1702,6 +1702,22 @@ mod tests {
     use crate::UserPtrMut;
     use crate::syscalls::file::AnyTypedFd;
     use crate::syscalls::tests::{TestPlatform as Platform, create_file, init_platform};
+
+    unsafe fn release_reservation(
+        platform: &Platform,
+        reservation: litebox::platform::page_mgmt::ReservationOf<Platform, 4096>,
+    ) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: The caller relinquishes every page represented by this handle.
+        unsafe {
+            platform.release_pages(reservation.range());
+        }
+        #[cfg(target_os = "windows")]
+        // SAFETY: The caller relinquishes this exact reservation without remaining users.
+        unsafe {
+            platform.release_pages(reservation);
+        }
+    }
 
     fn elf_patch_key(task: &Task<Platform>, fd: i32) -> ElfPatchKey {
         let AnyTypedFd::Fs(fd) = task.typed_fd(fd).expect("file descriptor should resolve") else {
@@ -2205,7 +2221,43 @@ mod tests {
         addr.write_slice_at_offset::<Platform>(0, &[0xff; 0x2000])
             .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0x1000).unwrap(), 0xff,);
+        let reservations = task.global.pm.reservations();
+        let backing = reservations
+            .iter()
+            .find(|range| range.contains(&addr.as_usize()))
+            .unwrap();
+        let alignment = <Platform as PageManagementProvider<4096>>::RESERVATION_ALIGNMENT;
+        assert_eq!(backing.start, addr.as_usize());
+        assert_eq!(backing.len(), 0x2000usize.next_multiple_of(alignment));
         task.sys_munmap(addr, 0x2000).unwrap();
+        assert!(
+            task.global
+                .pm
+                .reservations()
+                .iter()
+                .all(|range| !range.contains(&addr.as_usize()))
+        );
+        assert!(
+            task.global
+                .pm
+                .mappings()
+                .iter()
+                .all(|(range, _)| { !range.contains(&addr.as_usize()) })
+        );
+        let reused = task
+            .sys_mmap(
+                addr.as_usize(),
+                0x2000,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(reused.as_usize(), addr.as_usize());
+        assert_eq!(reused.read_at_offset::<Platform>(0x1000).unwrap(), 0);
+        assert_eq!(task.global.pm.reservations(), reservations);
+        task.sys_munmap(reused, 0x2000).unwrap();
     }
 
     #[test]
@@ -2404,56 +2456,56 @@ mod tests {
             )]
             #[cfg(target_os = "windows")]
             let addr = {
-                let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
-                let addr = buf.as_ptr() as usize;
-                data.push(buf);
-                addr
-            };
-            #[cfg(target_os = "linux")]
-            let addr = {
-                let addr = unsafe {
-                    libc::mmap(
-                        core::ptr::null_mut(),
-                        0x10_000,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
+                use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
+
+                let hint = 0x5000_0000_0000 + data.len() * 0x20000;
+                let permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+                // SAFETY: Hint acquisition returns fresh address space owned by this fixture.
+                let reservation = unsafe {
+                    <Platform as PageManagementProvider<4096>>::reserve_pages(
+                        platform,
+                        core::iter::empty,
+                        hint..hint + 0x1000,
+                        false,
+                        FixedAddressBehavior::Hint,
                     )
-                } as usize;
-                data.push(alloc::vec::Vec::<u8>::from(unsafe {
-                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
-                }));
-                addr
+                }
+                .unwrap();
+                let address = reservation.range().start;
+                // SAFETY: These fresh pages are uncommitted and have no users.
+                if let Err(error) = unsafe {
+                    <Platform as PageManagementProvider<4096>>::commit_pages(
+                        platform,
+                        || core::iter::once(&reservation),
+                        reservation.range(),
+                        permissions,
+                        false,
+                    )
+                } {
+                    // SAFETY: Failed commitment leaves this unpublished extent uncommitted.
+                    unsafe {
+                        release_reservation(platform, reservation);
+                    }
+                    panic!("failed to commit fixture pages: {error}");
+                }
+                data.push(reservation);
+                address
             };
 
-            let mut included = false;
-            for r in <crate::syscalls::tests::TestPlatform as PageManagementProvider<
-                4096,
-            >>::reserved_pages(platform)
-            {
-                if r.contains(&addr) {
-                    included = true;
-                    break;
+            // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
+            if let Ok(ptr) = task.sys_mmap(
+                addr - 0x1000,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                -1,
+                0,
+            ) {
+                if ptr.as_usize() != addr - 0x1000 {
+                    task.sys_munmap(ptr, 0x1000).unwrap();
+                    continue;
                 }
-            }
-
-            if !included {
-                // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
-                if let Ok(ptr) = task.sys_mmap(
-                    addr - 0x1000,
-                    0x1000,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
-                    -1,
-                    0,
-                ) {
-                    if ptr.as_usize() != addr - 0x1000 {
-                        task.sys_munmap(ptr, 0x1000).unwrap();
-                        continue;
-                    }
-                    break addr;
-                }
+                break addr;
             }
         };
 
@@ -2482,6 +2534,22 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
+
+        task.sys_munmap(res, 0x1000).unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(addr - 0x1000), 0x1000)
+            .unwrap();
+        for reservation in data {
+            // SAFETY: The remaining page belongs to this test and was never mapped by the shim.
+            unsafe {
+                <Platform as PageManagementProvider<4096>>::decommit_pages(
+                    platform,
+                    || core::iter::once(&reservation),
+                    reservation.range(),
+                )
+                .unwrap();
+                release_reservation(platform, reservation);
+            }
+        }
     }
 
     #[test]

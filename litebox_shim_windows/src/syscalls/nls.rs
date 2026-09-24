@@ -6,8 +6,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
-use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroPageSize};
-use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
+use litebox::mm::{CreatePagesFlags, MappingError, NonZeroPageSize};
+use litebox::platform::{
+    RawConstPointer as _, RawMutPointer as _, RawPointerProvider,
+    page_mgmt::MemoryRegionPermissions,
+};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};
 use litebox_common_windows::loader::PAGE_SIZE;
@@ -733,22 +736,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let mut copy_status = None;
-        // SAFETY: No fixed address is requested, so the page manager chooses an unused guest
-        // range. The callback only initializes the newly allocated pages before they are exposed.
-        let mapping = unsafe {
-            self.global.page_manager.create_readable_pages(
-                None,
-                page_len,
-                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                |ptr| match self.copy_nls_section_file(&section_file.fd, section_len, ptr) {
-                    Ok(copied) => Ok(copied),
-                    Err(status) => {
-                        copy_status = Some(status);
-                        Err(MappingError::OutOfMemory)
-                    }
-                },
-            )
-        };
+        let mapping = crate::syscalls::mm::create_pages(
+            &self.global.page_manager,
+            None,
+            page_len,
+            CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+            MemoryRegionPermissions::READ,
+            |ptr| match self.copy_nls_section_file(&section_file.fd, section_len, ptr) {
+                Ok(copied) => Ok(copied),
+                Err(status) => {
+                    copy_status = Some(status);
+                    Err(MappingError::OutOfMemory)
+                }
+            },
+        );
         let _ = self.fs.close_file(&section_file.fd);
         let mapping = mapping.map_err(|_| copy_status.unwrap_or(NtStatus::NO_MEMORY))?;
         Ok(MappedNlsSection {

@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{LinuxPageManager, linux::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
     shim::ContinueOperation,
@@ -236,7 +236,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let net = Network::new(&litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&litebox),
+            pm: LinuxPageManager::new(&litebox),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&litebox),
             net: litebox::sync::Mutex::new(net),
@@ -326,7 +326,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     }
 
     /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+    pub fn page_manager(&self) -> &LinuxPageManager<Platform, PAGE_SIZE> {
         &self.0.pm
     }
 
@@ -1155,7 +1155,7 @@ struct GlobalState<Platform: ShimPlatform> {
     /// The LiteBox instance used throughout the shim.
     litebox: Arc<litebox::LiteBox<Platform>>,
     /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    pm: litebox::mm::LinuxPageManager<Platform, { PAGE_SIZE }>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.

@@ -4,12 +4,13 @@
 use core::mem::{offset_of, size_of};
 
 use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroPageSize};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox_common_windows::loader::PAGE_SIZE;
 use rangemap::RangeMap;
 
 use crate::nt_types::ProcessEnvironmentBlock;
-use crate::syscalls::mm::{MemoryType, PageProtection};
+use crate::syscalls::mm::{MemoryType, PageProtection, create_pages};
 use crate::{MutPtr, ShimPlatform, Task, WindowsVirtualAllocation};
 
 const GDI_SHARED_TABLE_SIZE: usize = 0x182000;
@@ -42,14 +43,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         // SAFETY: no fixed address is requested, so the page manager selects an unused guest
         // range. The callback initializes only offsets within the newly allocated mapping.
-        let mapping = unsafe {
-            self.global.page_manager.create_writable_pages(
-                None,
-                length,
-                CreatePagesFlags::empty(),
-                initialize_gdi_shared_table::<Platform>,
-            )
-        };
+        let mapping = create_pages(
+            &self.global.page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            initialize_gdi_shared_table::<Platform>,
+        );
         let Ok(mapping) = mapping else {
             return 0;
         };
@@ -66,7 +67,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 size: GDI_SHARED_TABLE_SIZE,
                 allocation_protect: PageProtection::PAGE_READWRITE,
                 type_: MemoryType::MEM_MAPPED,
-                pages,
+                page_protections: pages,
             },
         );
 

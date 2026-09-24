@@ -13,7 +13,7 @@ use litebox::{
     mm::linux::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
     },
-    platform::RawPointerProvider,
+    platform::{RawPointerProvider, page_mgmt::MemoryRegionPermissions},
 };
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
 use litebox_common_windows::loader::{
@@ -30,7 +30,7 @@ use crate::nt_types::{
     ClientId, Luid, PebBitField, ProcessEnvironmentBlock, RtlUserProcFlags,
     RtlUserProcessParameters, ThreadEnvironmentBlock, UnicodeString, X64Context,
 };
-use crate::syscalls::mm::{MemoryType, PageProtection};
+use crate::syscalls::mm::{MemoryType, PageProtection, create_pages};
 
 const NTDLL_WRITABLE_SECTIONS: &[&[u8]] = &[b".mrdata"];
 const NTDLL_PATH: &str = "/Windows/System32/ntdll.dll";
@@ -236,11 +236,14 @@ fn create_process_environment<Platform: crate::ShimPlatform>(
         let aligned_length = size.next_multiple_of(PAGE_SIZE);
         let length =
             NonZeroPageSize::new(aligned_length).ok_or(PeImageAccessError::AddressOverflow)?;
-        // SAFETY: `suggested_address` is `None` and `CreatePagesFlags::empty()` leaves address
-        // selection to the page manager, so this cannot replace an existing mapping.
-        let ptr = unsafe {
-            page_manager.create_writable_pages(None, length, CreatePagesFlags::empty(), |_| Ok(0))
-        }?;
+        let ptr = create_pages(
+            page_manager,
+            None,
+            length,
+            CreatePagesFlags::empty(),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            |_| Ok(0),
+        )?;
         Ok(ptr.as_usize())
     };
     let peb_ptr = create_pages(size_of::<ProcessEnvironmentBlock>())?;
@@ -413,9 +416,15 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
     };
     let length = NonZeroPageSize::new(stack_size).ok_or(PeImageAccessError::AddressOverflow)?;
     // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
-    let stack_base =
-        unsafe { page_manager.create_stack_pages(None, length, CreatePagesFlags::empty()) }
-            .map_err(PeImageAccessError::Mapping)?;
+    let stack_base = create_pages(
+        page_manager,
+        None,
+        length,
+        CreatePagesFlags::IS_STACK,
+        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        |_| Ok(0),
+    )
+    .map_err(PeImageAccessError::Mapping)?;
     let stack_allocation_top = stack_base
         .as_usize()
         .checked_add(stack_size)
@@ -430,18 +439,27 @@ pub(crate) fn create_thread_environment<Platform: crate::ShimPlatform>(
         NonZeroPageSize::new(size_of::<ThreadEnvironmentBlock>().next_multiple_of(PAGE_SIZE))
             .ok_or(PeImageAccessError::AddressOverflow)?;
     // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
-    let teb_ptr = unsafe {
-        page_manager.create_writable_pages(None, teb_length, CreatePagesFlags::empty(), |_| Ok(0))
-    }
+    let teb_ptr = create_pages(
+        page_manager,
+        None,
+        teb_length,
+        CreatePagesFlags::empty(),
+        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        |_| Ok(0),
+    )
     .map_err(PeImageAccessError::Mapping)?
     .as_usize();
     let context_length = NonZeroPageSize::new(size_of::<X64Context>().next_multiple_of(PAGE_SIZE))
         .ok_or(PeImageAccessError::AddressOverflow)?;
     // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
-    let context = unsafe {
-        page_manager
-            .create_writable_pages(None, context_length, CreatePagesFlags::empty(), |_| Ok(0))
-    }
+    let context = create_pages(
+        page_manager,
+        None,
+        context_length,
+        CreatePagesFlags::empty(),
+        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        |_| Ok(0),
+    )
     .map_err(PeImageAccessError::Mapping)?
     .as_usize();
 
@@ -584,7 +602,7 @@ fn register_image_virtual_allocation<Platform: crate::ShimPlatform>(
             size: mapping.mapping_size,
             allocation_protect: PageProtection::PAGE_EXECUTE_WRITECOPY,
             type_: MemoryType::MEM_IMAGE,
-            pages,
+            page_protections: pages,
         },
     );
 }
@@ -1223,17 +1241,14 @@ impl<Platform: crate::ShimPlatform> MapMemory for PeImageMapper<'_, Platform> {
             Some(NonZeroAddress::new(preferred_base).ok_or(PeImageAccessError::AddressOverflow)?)
         };
 
-        // SAFETY: `CreatePagesFlags::empty()` does not set `fixed_addr`, so the kernel
-        // treats `suggested_address` as a hint and never silently unmaps an existing
-        // mapping; the documented overlap precondition therefore does not apply.
-        let ptr = unsafe {
-            self.page_manager.create_inaccessible_pages(
-                suggested_address,
-                length,
-                CreatePagesFlags::empty(),
-                |_| Ok(0),
-            )?
-        };
+        let ptr = create_pages(
+            self.page_manager,
+            suggested_address,
+            length,
+            CreatePagesFlags::empty(),
+            MemoryRegionPermissions::empty(),
+            |_| Ok(0),
+        )?;
         let base = ptr.as_usize();
         self.record_pages(base, len, PageProtection::PAGE_NOACCESS)?;
         Ok(base)

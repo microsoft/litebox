@@ -99,7 +99,7 @@ pub(crate) type ConstPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 pub(crate) type MutPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
-pub(crate) type WindowsPageManager<Platform> = PageManager<Platform, PAGE_SIZE>;
+pub(crate) type WindowsPageManager<Platform> = litebox::mm::WindowsPageManager<Platform, PAGE_SIZE>;
 pub(crate) type WindowsHandleStore<Platform> =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
 
@@ -196,7 +196,8 @@ pub(crate) struct WindowsVirtualAllocation {
     pub(crate) size: usize,
     pub(crate) allocation_protect: syscalls::mm::PageProtection,
     pub(crate) type_: syscalls::mm::MemoryType,
-    pub(crate) pages: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
+    /// Exact Windows protections; commitment is determined by the page manager.
+    pub(crate) page_protections: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
 }
 
 pub(crate) struct WindowsSectionView<Platform: ShimPlatform> {
@@ -460,26 +461,25 @@ fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Option<usize> {
     use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize};
+    use litebox::platform::page_mgmt::MemoryRegionPermissions;
     use zerocopy::IntoBytes as _;
     let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)?;
     let length =
         NonZeroPageSize::new(size_of::<nt_types::KUserSharedData>().next_multiple_of(PAGE_SIZE))?;
     let shared_data = windows_user_shared_data();
     let shared_data_bytes = shared_data.as_bytes();
-    // SAFETY: `NOREPLACE` makes the fixed mapping fail instead of replacing any
-    // existing host or guest mapping at the shared-data address.
-    unsafe {
-        page_manager.create_readable_pages(
-            Some(address),
-            length,
-            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-            |ptr| {
-                ptr.copy_from_slice(0, shared_data_bytes)
-                    .ok_or(MappingError::OutOfMemory)?;
-                Ok(0)
-            },
-        )
-    }
+    crate::syscalls::mm::create_pages(
+        page_manager,
+        Some(address),
+        length,
+        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+        MemoryRegionPermissions::READ,
+        |ptr| {
+            ptr.copy_from_slice(0, shared_data_bytes)
+                .ok_or(MappingError::OutOfMemory)?;
+            Ok(0)
+        },
+    )
     .map(|ptr| ptr.as_usize())
     .ok()
 }

@@ -283,7 +283,8 @@ impl From<litebox::mm::linux::VmemResetError> for Errno {
 impl From<litebox::mm::linux::MappingError> for Errno {
     fn from(value: litebox::mm::linux::MappingError) -> Self {
         match value {
-            litebox::mm::linux::MappingError::UnAligned => Errno::EINVAL,
+            litebox::mm::linux::MappingError::UnAligned
+            | litebox::mm::linux::MappingError::InvalidFlags => Errno::EINVAL,
             litebox::mm::linux::MappingError::OutOfMemory => Errno::ENOMEM,
             litebox::mm::linux::MappingError::BadFD(_) => Errno::EBADF,
             litebox::mm::linux::MappingError::NotAFile => Errno::EISDIR,
@@ -299,6 +300,7 @@ impl From<litebox::mm::linux::MappingError> for Errno {
 impl From<litebox::platform::page_mgmt::RemapError> for Errno {
     fn from(value: litebox::platform::page_mgmt::RemapError) -> Self {
         match value {
+            litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform => Errno::ENOSYS,
             litebox::platform::page_mgmt::RemapError::Unaligned
             | litebox::platform::page_mgmt::RemapError::Overlapping => Errno::EINVAL,
             litebox::platform::page_mgmt::RemapError::AlreadyAllocated
@@ -310,14 +312,17 @@ impl From<litebox::platform::page_mgmt::RemapError> for Errno {
     }
 }
 
-impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
-    fn from(value: litebox::platform::page_mgmt::PermissionUpdateError) -> Self {
+impl From<litebox::platform::page_mgmt::PageStateUpdateError> for Errno {
+    fn from(value: litebox::platform::page_mgmt::PageStateUpdateError) -> Self {
         match value {
-            litebox::platform::page_mgmt::PermissionUpdateError::Unaligned => Errno::EINVAL,
-            litebox::platform::page_mgmt::PermissionUpdateError::Unallocated
-            | litebox::platform::page_mgmt::PermissionUpdateError::OutOfMemory => Errno::ENOMEM,
-            litebox::platform::page_mgmt::PermissionUpdateError::PermissionDenied => Errno::EACCES,
-            litebox::platform::page_mgmt::PermissionUpdateError::PlatformFailure => Errno::EINVAL,
+            litebox::platform::page_mgmt::PageStateUpdateError::Unaligned => Errno::EINVAL,
+            litebox::platform::page_mgmt::PageStateUpdateError::Unallocated
+            | litebox::platform::page_mgmt::PageStateUpdateError::OutOfMemory => Errno::ENOMEM,
+            litebox::platform::page_mgmt::PageStateUpdateError::PermissionDenied => Errno::EACCES,
+            litebox::platform::page_mgmt::PageStateUpdateError::PlatformFailure => Errno::EINVAL,
+            litebox::platform::page_mgmt::PageStateUpdateError::UnsupportedByPlatform => {
+                Errno::ENOSYS
+            }
             _ => unimplemented!(),
         }
     }
@@ -327,7 +332,8 @@ impl From<litebox::mm::linux::VmemProtectError> for Errno {
     fn from(value: litebox::mm::linux::VmemProtectError) -> Self {
         match value {
             litebox::mm::linux::VmemProtectError::UnAligned(_) => Errno::EINVAL,
-            litebox::mm::linux::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
+            litebox::mm::linux::VmemProtectError::InvalidRange(_)
+            | litebox::mm::linux::VmemProtectError::NotCommitted(_) => Errno::ENOMEM,
             litebox::mm::linux::VmemProtectError::NoAccess { .. } => Errno::EACCES,
             litebox::mm::linux::VmemProtectError::ProtectError(e) => e.into(),
         }

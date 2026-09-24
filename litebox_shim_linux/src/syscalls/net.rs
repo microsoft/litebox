@@ -1669,7 +1669,7 @@ fn copy_iovs_to_vec<Platform: ShimPlatform>(
 }
 
 fn user_write_prefix<Platform: ShimPlatform>(
-    page_manager: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+    page_manager: &litebox::mm::LinuxPageManager<Platform, PAGE_SIZE>,
     ptr: UserPtrMut<u8>,
     offset: usize,
     len: usize,
@@ -1680,7 +1680,7 @@ fn user_write_prefix<Platform: ShimPlatform>(
 }
 
 fn iov_write_prefix<Platform: ShimPlatform>(
-    page_manager: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+    page_manager: &litebox::mm::LinuxPageManager<Platform, PAGE_SIZE>,
     iovs: &[litebox_common_linux::IoVec],
     mut skip: usize,
     mut len: usize,

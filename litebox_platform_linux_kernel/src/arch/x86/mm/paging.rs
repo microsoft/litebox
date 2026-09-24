@@ -66,7 +66,7 @@ impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
 
 pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
     let mut flags = PageTableFlags::empty();
-    if values.intersects(VmFlags::VM_READ | VmFlags::VM_WRITE) {
+    if values.intersects(VmFlags::VM_ACCESS_FLAGS) {
         flags |= PageTableFlags::USER_ACCESSIBLE;
     }
     if values.contains(VmFlags::VM_WRITE) {
@@ -81,6 +81,70 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     pub(crate) unsafe fn new(item: PhysAddr) -> Self {
         unsafe { Self::init(item) }
+    }
+
+    unsafe fn map_page(
+        inner: &mut MappedPageTable<'_, FrameMapping<M>>,
+        page: Page<Size4KiB>,
+        flags: PageTableFlags,
+    ) -> Result<(), PageFaultError> {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
+        // ACCESSED and DIRTY are pre-set here (mirroring the Linux kernel's
+        // `_KERNPG_TABLE`) so the CPU's page-table walker doesn't need an
+        // atomic read-modify-write on this entry the first time it's traversed.
+        let table_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::ACCESSED
+            | PageTableFlags::DIRTY;
+        match unsafe {
+            inner.map_to_with_table_flags(
+                page,
+                frame,
+                flags | PageTableFlags::PRESENT,
+                table_flags,
+                &mut allocator,
+            )
+        } {
+            Ok(flush) => {
+                if FLUSH_TLB {
+                    flush.flush();
+                }
+                Ok(())
+            }
+            Err(error) => {
+                unsafe { allocator.deallocate_frame(frame) };
+                match error {
+                    MapToError::PageAlreadyMapped(_) => unreachable!(),
+                    MapToError::ParentEntryHugePage => Err(PageFaultError::HugePage),
+                    MapToError::FrameAllocationFailed => Err(PageFaultError::AllocationFailed),
+                }
+            }
+        }
+    }
+
+    unsafe fn update_page_flags(
+        inner: &mut MappedPageTable<'_, FrameMapping<M>>,
+        page: Page<Size4KiB>,
+        flags: PageTableFlags,
+        new_flags: PageTableFlags,
+    ) {
+        let updated_flags = (flags & !Self::MPROTECT_PTE_MASK) | new_flags;
+        if flags == updated_flags {
+            return;
+        }
+        match unsafe { inner.update_flags(page, updated_flags) } {
+            Ok(flush) => {
+                if FLUSH_TLB {
+                    flush.flush();
+                }
+            }
+            Err(FlagUpdateError::PageNotMapped) => unreachable!(),
+            Err(FlagUpdateError::ParentEntryHugePage) => {
+                todo!("return an error for protecting a huge page")
+            }
+        }
     }
 
     pub(crate) fn map_pages(
@@ -101,6 +165,41 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
         UserMutPtr::from_usize(range.start)
+    }
+
+    pub(crate) unsafe fn commit_pages(
+        &self,
+        range: PageRange<ALIGN>,
+        new_flags: VmFlags,
+        populate_pages: bool,
+    ) -> Result<(), page_mgmt::PageStateUpdateError> {
+        let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
+        let mut inner = self.inner.lock();
+        for address in range {
+            let page = Page::<Size4KiB>::from_start_address(VirtAddr::new(address as u64)).unwrap();
+            match inner.translate(page.start_address()) {
+                TranslateResult::Mapped { flags, .. } => {
+                    unsafe { Self::update_page_flags(&mut inner, page, flags, new_flags) };
+                }
+                TranslateResult::NotMapped if populate_pages => {
+                    match unsafe { Self::map_page(&mut inner, page, new_flags) } {
+                        Ok(()) => {}
+                        Err(PageFaultError::AllocationFailed) => {
+                            return Err(page_mgmt::PageStateUpdateError::OutOfMemory);
+                        }
+                        Err(PageFaultError::HugePage) => {
+                            todo!("return an error for committing a huge page")
+                        }
+                        Err(PageFaultError::AccessError(_)) => unreachable!(),
+                    }
+                }
+                TranslateResult::NotMapped => {}
+                TranslateResult::InvalidFrameAddress(pa) => {
+                    panic!("Invalid frame address: {pa:#x}");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Unmap 4KiB pages from the page table
@@ -216,12 +315,12 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         range: PageRange<ALIGN>,
         new_flags: VmFlags,
-    ) -> Result<(), page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), page_mgmt::PageStateUpdateError> {
         let start = VirtAddr::new(range.start as _);
         let end = VirtAddr::new(range.end as _);
         let new_flags = vmflags_to_pteflags(new_flags) & Self::MPROTECT_PTE_MASK;
         let start: Page<Size4KiB> =
-            Page::from_start_address(start).or(Err(page_mgmt::PermissionUpdateError::Unaligned))?;
+            Page::from_start_address(start).or(Err(page_mgmt::PageStateUpdateError::Unaligned))?;
         let end: Page<Size4KiB> = Page::containing_address(end - 1);
 
         // TODO: this implementation is slow as each page requires two full page table walks.
@@ -234,31 +333,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     offset: _,
                     flags,
                 } => {
-                    // If it is changed to writable, we leave it to page fault handler (COW)
-                    let change_to_write = new_flags.contains(PageTableFlags::WRITABLE)
-                        && !flags.contains(PageTableFlags::WRITABLE);
-                    let new_flags = if change_to_write {
-                        new_flags - PageTableFlags::WRITABLE
-                    } else {
-                        new_flags
-                    };
-                    if flags != new_flags {
-                        match unsafe {
-                            inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
-                        } {
-                            Ok(fl) => {
-                                if FLUSH_TLB {
-                                    fl.flush();
-                                }
-                            }
-                            Err(e) => match e {
-                                FlagUpdateError::PageNotMapped => unreachable!(),
-                                FlagUpdateError::ParentEntryHugePage => {
-                                    todo!("return Err(ProtectError::ProtectHugePage);")
-                                }
-                            },
-                        }
-                    }
+                    unsafe { Self::update_page_flags(&mut inner, page, flags, new_flags) };
                 }
                 TranslateResult::NotMapped => {}
                 TranslateResult::InvalidFrameAddress(pa) => {
@@ -321,46 +396,8 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 panic!("Page fault on present page: {:#x}", page.start_address());
             }
             TranslateResult::NotMapped => {
-                let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
-                let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
-                // ACCESSED and DIRTY are pre-set here (mirroring the Linux kernel's
-                // `_KERNPG_TABLE`) so the CPU's page-table walker doesn't need an
-                // atomic read-modify-write on this entry the first time it's traversed.
-                let table_flags = PageTableFlags::PRESENT
-                    | PageTableFlags::WRITABLE
-                    | PageTableFlags::USER_ACCESSIBLE
-                    | PageTableFlags::ACCESSED
-                    | PageTableFlags::DIRTY;
-                match unsafe {
-                    inner.map_to_with_table_flags(
-                        page,
-                        frame,
-                        flags | PageTableFlags::PRESENT,
-                        table_flags,
-                        &mut allocator,
-                    )
-                } {
-                    Ok(fl) => {
-                        if FLUSH_TLB {
-                            fl.flush();
-                        }
-                    }
-                    Err(e) => {
-                        unsafe { allocator.deallocate_frame(frame) };
-                        match e {
-                            MapToError::PageAlreadyMapped(_) => {
-                                unreachable!()
-                            }
-                            MapToError::ParentEntryHugePage => {
-                                return Err(PageFaultError::HugePage);
-                            }
-                            MapToError::FrameAllocationFailed => {
-                                return Err(PageFaultError::AllocationFailed);
-                            }
-                        }
-                    }
-                }
+                unsafe { Self::map_page(&mut inner, page, flags) }?;
             }
             TranslateResult::InvalidFrameAddress(pa) => {
                 panic!("Invalid frame address: {pa:#x}");

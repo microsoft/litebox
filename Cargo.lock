@@ -1703,7 +1703,6 @@ dependencies = [
  "litebox_platform",
  "litebox_util_log",
  "paste",
- "rangemap",
  "spin 0.9.8",
  "syscalls",
  "thiserror",
