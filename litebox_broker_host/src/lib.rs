@@ -332,7 +332,7 @@ where
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(Err(ConnectionTermination::Rejected(error)));
             }
-            None => match core.create_process_with_initial_thread(caller_credential, None) {
+            None => match core.create_process(caller_credential, None) {
                 Ok(process) => process,
                 Err(
                     error @ (litebox_broker_core::BrokerError::ResourceExhausted
@@ -830,7 +830,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
     let (process, initial_thread_id) = broker
-        .create_process_with_initial_thread(parent.caller_credential(), Some(parent.id()))
+        .create_process(parent.caller_credential(), Some(parent.id()))
         .map_err(RequestFailure::from)?;
     let inherited_objects = match parent
         .duplicate_object_references_to(requested_inherited_objects.as_slice(), &process)
@@ -1670,7 +1670,7 @@ mod tests {
 
     fn precreated_root_negotiates_without_startup_data(broker: &BrokerCore) {
         let (process, initial_thread_id) = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
@@ -1699,12 +1699,12 @@ mod tests {
 
     fn prepared_duplication_publishes_after_activation(broker: &BrokerCore) {
         let parent = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         parent.complete_start().unwrap();
         let (child, _) = broker
-            .create_process_with_initial_thread(parent.caller_credential(), Some(parent.id()))
+            .create_process(parent.caller_credential(), Some(parent.id()))
             .unwrap();
         parent.prepare_duplication_child(&child).unwrap();
         let association = BrokerHostAssociation::new(
@@ -1724,7 +1724,7 @@ mod tests {
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
         let process = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         let shared_buffers = test_shared_buffers();
@@ -1837,7 +1837,7 @@ mod tests {
 
     fn association_shared_buffer_sequence_stages_random_data(broker: &BrokerCore) {
         let process = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         let shared_buffers = test_shared_buffers();
@@ -1893,7 +1893,7 @@ mod tests {
         provider: &TestStdioProvider,
     ) {
         let process = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         let shared_buffers = test_shared_buffers();
@@ -2106,7 +2106,7 @@ mod tests {
         );
         assert!(!setup_called.get());
         let (process, initial_thread_id) = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(process.id(), root_process_id(5));
         assert_eq!(initial_thread_id, ThreadId(6));
@@ -2320,7 +2320,7 @@ mod tests {
 
     fn active_request_closes_object_reference(broker: &BrokerCore) {
         let process = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         let response = handle_test_request(
@@ -2353,7 +2353,7 @@ mod tests {
 
     fn active_request_allocates_and_releases_thread_id(broker: &BrokerCore) {
         let process = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         let response = handle_test_request(&process, BrokerOperation::CreateThread);
@@ -2373,7 +2373,7 @@ mod tests {
 
     fn association_shared_buffer_sequences_stage_pipe_data(broker: &BrokerCore) {
         let process = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         let memory = TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE);
@@ -2435,7 +2435,7 @@ mod tests {
 
     fn association_shared_buffer_sequences_stage_socket_data(broker: &BrokerCore) {
         let process = broker
-            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+            .create_process(CallerCredential::Unauthenticated, None)
             .unwrap()
             .0;
         let shared_buffers = test_shared_buffers();
@@ -2858,7 +2858,7 @@ mod tests {
     ) -> BrokerHostAssociation<Memory> {
         BrokerHostAssociation {
             process: broker
-                .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+                .create_process(CallerCredential::Unauthenticated, None)
                 .unwrap()
                 .0,
             shared_buffers,

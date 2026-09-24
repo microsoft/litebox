@@ -127,7 +127,7 @@ impl UserlandProcessLauncher {
         let launcher = Self::new(config.without_initial_arguments(), broker.clone());
         let (process, initial_thread_id) = launcher
             .broker
-            .create_process_with_initial_thread(CallerCredential::HostGuaranteed, None)
+            .create_process(CallerCredential::HostGuaranteed, None)
             .map_err(broker_io_error)?;
         let association =
             PendingRunnerAssociation::new(Arc::clone(&process), initial_thread_id, None);

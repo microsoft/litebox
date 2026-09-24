@@ -1228,7 +1228,7 @@ mod tests {
     fn prepared_duplication(parent: &Arc<BrokerProcess>) -> Arc<BrokerProcess> {
         let (child, _) = parent
             .core
-            .create_process_with_initial_thread(parent.caller_credential(), Some(parent.id()))
+            .create_process(parent.caller_credential(), Some(parent.id()))
             .unwrap();
         parent.prepare_duplication_child(&child).unwrap();
         child
@@ -1281,11 +1281,11 @@ mod tests {
         .build()
         .unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
         let child = broker
-            .create_process(parent.caller_credential(), Some(parent.id()))
+            .allocate_process(parent.caller_credential(), Some(parent.id()))
             .unwrap();
 
         assert!(matches!(
@@ -1304,15 +1304,15 @@ mod tests {
         .build()
         .unwrap();
         let owner = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         owner.complete_start().unwrap();
         let other_owner = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         other_owner.complete_start().unwrap();
         let (child, _) = broker
-            .create_process_with_initial_thread(owner.caller_credential(), Some(owner.id()))
+            .create_process(owner.caller_credential(), Some(owner.id()))
             .unwrap();
 
         assert_eq!(
@@ -1342,7 +1342,7 @@ mod tests {
         .build()
         .unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
         let first_child = prepared_duplication(&parent);
@@ -1365,7 +1365,7 @@ mod tests {
         .unwrap();
 
         let cancelled_parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         cancelled_parent.complete_start().unwrap();
         let cancelled_child = prepared_duplication(&cancelled_parent);
@@ -1380,7 +1380,7 @@ mod tests {
         assert_eq!(cancelled_child.state.lock().status, ProcessStatus::Running);
         assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
         let unprepared_child = broker
-            .create_process(
+            .allocate_process(
                 cancelled_parent.caller_credential(),
                 Some(cancelled_parent.id()),
             )
@@ -1391,7 +1391,7 @@ mod tests {
         ));
 
         let dead_parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         dead_parent.complete_start().unwrap();
         let dead_child = prepared_duplication(&dead_parent);
@@ -1402,7 +1402,7 @@ mod tests {
         assert_eq!(parent_id(&dead_child), None);
 
         let live_parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         live_parent.complete_start().unwrap();
         let failed_child = prepared_duplication(&live_parent);
@@ -1421,11 +1421,11 @@ mod tests {
         .build()
         .unwrap();
         let first = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let thread = first.create_thread().unwrap();
         let second = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
 
         assert_eq!(first.id().0, 1);
@@ -1441,11 +1441,11 @@ mod tests {
         .build()
         .unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
         let child = broker
-            .create_process(parent.caller_credential(), Some(parent.id()))
+            .allocate_process(parent.caller_credential(), Some(parent.id()))
             .unwrap();
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let shutdown_count = Arc::clone(&shutdowns);
@@ -1469,20 +1469,20 @@ mod tests {
         .build()
         .unwrap();
         let root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
         parent.complete_start().unwrap();
 
         let running = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
         running.complete_start().unwrap();
         let zombie = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
         zombie.complete_start().unwrap();
         zombie
@@ -1499,7 +1499,7 @@ mod tests {
         assert_eq!(parent_id(&zombie), Some(root.id()));
         assert_eq!(zombie.state.lock().status, ProcessStatus::Zombie);
         assert!(matches!(
-            broker.create_process(CallerCredential::Unauthenticated, Some(parent.id())),
+            broker.allocate_process(CallerCredential::Unauthenticated, Some(parent.id())),
             Err(BrokerError::PeerClosed)
         ));
     }
@@ -1512,16 +1512,16 @@ mod tests {
         .build()
         .unwrap();
         let root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
 
         let running = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
         running.complete_start().unwrap();
         let zombie = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
         zombie.complete_start().unwrap();
         zombie
@@ -1546,15 +1546,15 @@ mod tests {
         .build()
         .unwrap();
         let root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
         parent.complete_start().unwrap();
         let child = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
         child.complete_start().unwrap();
         child
@@ -1582,15 +1582,15 @@ mod tests {
         broker.ids =
             alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(3).unwrap()));
         let root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
         parent.complete_start().unwrap();
         let zombie = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
         zombie.complete_start().unwrap();
         zombie
@@ -1603,7 +1603,7 @@ mod tests {
         root.handle_owner_death();
         root.cleanup(true);
         let replacement = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
         assert_eq!(replacement.id(), root.id());
         let shutdowns = Arc::new(AtomicUsize::new(0));
@@ -1631,15 +1631,15 @@ mod tests {
         .build()
         .unwrap();
         let root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         root.complete_start().unwrap();
         let parent = broker
-            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
         parent.complete_start().unwrap();
         let other_root = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         other_root.complete_start().unwrap();
 
@@ -1680,7 +1680,7 @@ mod tests {
         .unwrap()
         .with_process_lifecycle_sink(sink.clone());
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let retained = Arc::clone(&process);
         process.complete_start().unwrap();
@@ -1694,7 +1694,7 @@ mod tests {
         drop(process);
 
         assert!(matches!(
-            broker.create_process(CallerCredential::Unauthenticated, None),
+            broker.allocate_process(CallerCredential::Unauthenticated, None),
             Err(BrokerError::ResourceExhausted)
         ));
         assert_eq!(sink.changes.load(Ordering::Relaxed), 1);
@@ -1704,7 +1704,7 @@ mod tests {
         assert_eq!(sink.changes.load(Ordering::Relaxed), 2);
         assert!(
             broker
-                .create_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated, None)
                 .is_ok()
         );
     }
@@ -1717,10 +1717,10 @@ mod tests {
         .build()
         .unwrap();
         let source = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let target = broker
-            .create_process(source.caller_credential(), None)
+            .allocate_process(source.caller_credential(), None)
             .unwrap();
         let source_handle = crate::event::create(&source, 1).unwrap();
 
@@ -1746,7 +1746,7 @@ mod tests {
         broker.ids =
             alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let first = process.create_thread().unwrap();
 
@@ -1763,10 +1763,10 @@ mod tests {
         .build()
         .unwrap();
         let first = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let second = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let thread = first.create_thread().unwrap();
 
@@ -1783,13 +1783,13 @@ mod tests {
         .build()
         .unwrap();
         let first = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let second = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let third = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let first_thread = first.create_thread().unwrap();
         let second_thread = second.create_thread().unwrap();
@@ -1811,18 +1811,18 @@ mod tests {
         .build()
         .unwrap();
         let first = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
 
         assert!(matches!(
-            broker.create_process(CallerCredential::Unauthenticated, None),
+            broker.allocate_process(CallerCredential::Unauthenticated, None),
             Err(BrokerError::ResourceExhausted)
         ));
 
         first.cleanup(true);
         assert!(
             broker
-                .create_process(CallerCredential::Unauthenticated, None)
+                .allocate_process(CallerCredential::Unauthenticated, None)
                 .is_ok()
         );
     }
@@ -1837,7 +1837,7 @@ mod tests {
         broker.ids =
             alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(2).unwrap()));
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let process_id = process.id();
         let thread_id = process.create_thread().unwrap();
@@ -1856,7 +1856,7 @@ mod tests {
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
 
         let replacement = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(replacement.id(), process_id);
         assert_eq!(replacement.create_thread().unwrap(), thread_id);
@@ -1873,7 +1873,7 @@ mod tests {
         broker.ids =
             alloc::sync::Arc::new(spin::Mutex::new(crate::id::IdAllocator::new(4).unwrap()));
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let process_id = process.id();
         let thread_id = process.create_thread().unwrap();
@@ -1882,10 +1882,10 @@ mod tests {
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 1);
 
         let first_replacement = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let second_replacement = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_ne!(first_replacement.id(), process_id);
         assert_ne!(first_replacement.id().0, thread_id.0);
@@ -1896,7 +1896,7 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         assert!(matches!(
-            broker.create_process(CallerCredential::Unauthenticated, None),
+            broker.allocate_process(CallerCredential::Unauthenticated, None),
             Err(BrokerError::ResourceExhausted)
         ));
     }
@@ -1909,7 +1909,7 @@ mod tests {
         .build()
         .unwrap();
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let process_id = process.id();
         crate::event::create(&process, 1).unwrap();
@@ -1919,7 +1919,7 @@ mod tests {
 
         assert!(broker.references.read().is_empty());
         let replacement = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_ne!(replacement.id(), process_id);
     }
@@ -1948,13 +1948,13 @@ mod tests {
 
     fn check_supported_references_duplicate_between_processes(broker: &BrokerCore) {
         let source = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let target = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let denied_target = broker
-            .create_process(CallerCredential::HostGuaranteed, None)
+            .allocate_process(CallerCredential::HostGuaranteed, None)
             .unwrap();
 
         let event = crate::event::create(&source, 1).unwrap();
@@ -2011,10 +2011,10 @@ mod tests {
 
     fn check_file_reference_lifecycle(broker: &BrokerCore, stdio_provider: &TestStdioProvider) {
         let source = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let target = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let mode = FileMode::from_bits(0o600).unwrap();
         let file = crate::fs::open(
@@ -2289,10 +2289,10 @@ mod tests {
 
     fn check_event_reference_lifecycle(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let other = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let handle = crate::event::create(&process, 0).unwrap();
         let unknown_handle = ObjectHandle(handle.0.checked_add(1).unwrap());
@@ -2343,7 +2343,7 @@ mod tests {
 
     fn check_process_drop_releases_references(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let first = crate::event::create(&process, 0).unwrap();
         let second = crate::event::create(&process, 0).unwrap();
@@ -2363,7 +2363,7 @@ mod tests {
 
     fn check_pipe_lifecycle(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
             crate::pipe::create(&process, 5, 2),
@@ -2411,7 +2411,7 @@ mod tests {
 
     fn check_pipe_reader_closure(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let (reader, writer) = crate::pipe::create(&process, 4, 2).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
@@ -2431,7 +2431,7 @@ mod tests {
 
     fn check_corrupt_index_fails_without_mutation(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let older = crate::event::create(&process, 0).unwrap();
         let newer = crate::event::create(&process, 0).unwrap();
@@ -2454,7 +2454,7 @@ mod tests {
 
     fn check_corrupt_index_does_not_break_teardown(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let _older = crate::event::create(&process, 0).unwrap();
         let newer = crate::event::create(&process, 0).unwrap();
@@ -2472,10 +2472,10 @@ mod tests {
 
     fn check_reference_quota_is_per_process(broker: &BrokerCore) {
         let greedy = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let neighbor = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
 
         let greedy_first = crate::event::create(&greedy, 0).unwrap();
@@ -2490,7 +2490,7 @@ mod tests {
         assert_eq!(broker.references.read().len(), TEST_MAX_REFERENCES);
 
         let latecomer = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
             crate::event::create(&latecomer, 0),
@@ -2509,10 +2509,10 @@ mod tests {
 
     fn check_pending_references_count_toward_process_quota(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let neighbor = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
 
         let first = process
@@ -2536,10 +2536,10 @@ mod tests {
 
     fn check_pipe_capacity_quota_is_per_process(broker: &BrokerCore) {
         let greedy = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let neighbor = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
 
         let (greedy_reader, greedy_writer) =
@@ -2561,7 +2561,7 @@ mod tests {
         );
 
         let latecomer = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
             crate::pipe::create(&latecomer, 1, 1),
@@ -2581,7 +2581,7 @@ mod tests {
 
     fn check_pipe_capacity_outlives_process_for_in_flight_object(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let (reader, _writer) =
             crate::pipe::create(&process, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
@@ -2610,7 +2610,7 @@ mod tests {
 
     fn check_pair_handle_exhaustion(broker: &BrokerCore) {
         let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         {
             let mut next_reference_handle = broker.next_reference_handle.write();

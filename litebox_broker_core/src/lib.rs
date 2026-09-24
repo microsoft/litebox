@@ -325,13 +325,13 @@ impl BrokerCore {
         Ok((first, second))
     }
 
-    /// Allocates one authenticated process awaiting association activation.
+    /// Allocates one authenticated process without an initial thread.
     ///
     /// # Panics
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
-    pub(crate) fn create_process(
+    pub(crate) fn allocate_process(
         &self,
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
@@ -388,7 +388,7 @@ impl BrokerCore {
         allocate_process(None, None)
     }
 
-    /// Allocates one process and its initial thread.
+    /// Creates one process and its initial thread.
     ///
     /// If initial-thread creation fails, the process is retired before the
     /// error is returned.
@@ -397,12 +397,12 @@ impl BrokerCore {
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
-    pub fn create_process_with_initial_thread(
+    pub fn create_process(
         &self,
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
     ) -> Result<(Arc<BrokerProcess>, ThreadId)> {
-        let process = self.create_process(caller_credential, parent_id)?;
+        let process = self.allocate_process(caller_credential, parent_id)?;
         match process.create_thread() {
             Ok(initial_thread_id) => Ok((process, initial_thread_id)),
             Err(error) => {
