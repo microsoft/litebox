@@ -7,13 +7,11 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
 use spin::Mutex;
 
 use crate::{
-    AssociationCancellation, BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential,
-    PolicyEngine, Result,
+    AssociationCancellation, BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
     fs::{FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
     socket::{SocketProvider, UnsupportedSocketProvider},
@@ -93,26 +91,6 @@ impl TestBrokerCoreBuilder {
             self.stdio_provider,
             self.fs,
         )
-    }
-}
-
-/// Test-only access to low-level broker process construction.
-pub trait BrokerCoreTestExt {
-    /// Creates a process without allocating its initial thread.
-    fn create_test_process(
-        &self,
-        caller_credential: CallerCredential,
-        parent_id: Option<ProcessId>,
-    ) -> Result<Arc<BrokerProcess>>;
-}
-
-impl BrokerCoreTestExt for BrokerCore {
-    fn create_test_process(
-        &self,
-        caller_credential: CallerCredential,
-        parent_id: Option<ProcessId>,
-    ) -> Result<Arc<BrokerProcess>> {
-        self.create_process(caller_credential, parent_id)
     }
 }
 

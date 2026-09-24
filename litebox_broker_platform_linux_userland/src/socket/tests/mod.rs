@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::*;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::socket::{GUEST_IPV4_ADDRESS, HOST_GATEWAY_IPV4_ADDRESS};
-use litebox_broker_core::test_support::{BrokerCoreTestExt, TestBrokerCoreBuilder};
+use litebox_broker_core::test_support::TestBrokerCoreBuilder;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, BrokerProcess, CallerCredential, DestinationPortRange,
     DestinationRule, Ipv4Cidr, ObjectRights, PolicyEngine, SocketPolicy,
@@ -378,8 +378,9 @@ fn directional_shutdown_survives_readiness_publication_failure() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {

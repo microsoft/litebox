@@ -24,11 +24,13 @@ fn connected_guest_tcp_pair(port: u16) -> GuestTcpPair {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -154,8 +156,9 @@ fn reactor_drives_a_loopback_tcp_socket() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -483,8 +486,9 @@ fn external_tcp_deferred_abortive_close_resets_peer() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -528,8 +532,9 @@ fn external_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -604,8 +609,9 @@ fn external_tcp_route_keeps_guest_private_identity() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -645,8 +651,9 @@ fn tcp_connect_to_zero_port_returns_an_ordinary_socket_outcome() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, _publications) = channel();
     let (retired, _retirements) = channel();
     let socket = create_socket(&process, Arc::new(TestReadinessSink { published, retired }));
@@ -683,8 +690,9 @@ fn tcp_receive_survives_readiness_publication_failure() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -745,8 +753,9 @@ fn tcp_status_publication_failure_preserves_consumed_error() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -819,8 +828,9 @@ fn external_tcp_readiness_failure_does_not_fail_shared_reactor() {
     .unwrap();
 
     let process_a = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published_a, publications_a) = channel();
     let (retired_a, _retirements_a) = channel();
     let readiness_a = Arc::new(FailingReadinessSink {
@@ -846,8 +856,9 @@ fn external_tcp_readiness_failure_does_not_fail_shared_reactor() {
     // Process B gets its own readiness sink, mirroring production's
     // per-association sinks.
     let process_b = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published_b, publications_b) = channel();
     let (retired_b, _retirements_b) = channel();
     let readiness_b = Arc::new(FailingReadinessSink {
@@ -942,8 +953,9 @@ fn external_tcp_connect_completion_readiness_failure_does_not_fail_shared_reacto
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -1029,8 +1041,9 @@ fn exhausted_tcp_peek_cache_refreshes_before_terminal_eof() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1112,11 +1125,13 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1470,11 +1485,13 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let client_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1612,11 +1629,13 @@ fn tcp_exact_bindings_coexist_and_wildcard_accepts_concrete_destinations() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1764,11 +1783,13 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1826,8 +1847,9 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     assert_ne!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
 
     let final_connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let final_connector = create_socket(&final_connector_process, readiness);
     assert!(matches!(
         litebox_broker_core::socket::connect(
@@ -1870,11 +1892,13 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -1964,11 +1988,13 @@ fn guest_tcp_zero_backlog_accepts_one_unspecified_destination() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2052,11 +2078,13 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2171,11 +2199,13 @@ fn guest_tcp_stream_preserves_options_peek_waitall_and_half_close() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2631,11 +2661,13 @@ fn guest_tcp_connect_publication_failure_purges_committed_queue() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -2686,11 +2718,13 @@ fn guest_tcp_accept_publication_failure_purges_registered_endpoint() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, _retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -2751,11 +2785,13 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2777,8 +2813,9 @@ fn queued_guest_accept_transfers_capacity_without_global_growth() {
     );
     assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
     let capacity_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let _global_capacity = create_socket(&capacity_process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::create(
@@ -2811,11 +2848,13 @@ fn queued_guest_accept_rejects_exhausted_listener_process_capacity() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, _publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2868,11 +2907,13 @@ fn abortive_connector_close_releases_descriptor_capacity() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });
@@ -2949,11 +2990,13 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     )
     .unwrap();
     let listener_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let connector_process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(FailingReadinessSink {
@@ -3033,8 +3076,9 @@ fn reactor_drives_a_loopback_tcp_listener() {
     )
     .unwrap();
     let process = broker
-        .create_test_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
+        .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
+        .unwrap()
+        .0;
     let (published, publications) = channel();
     let (retired, retirements) = channel();
     let readiness = Arc::new(TestReadinessSink { published, retired });

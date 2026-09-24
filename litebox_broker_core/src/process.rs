@@ -130,7 +130,7 @@ pub struct BrokerProcess {
 }
 
 struct BrokerProcessState {
-    record: ProcessRecordState,
+    status: ProcessStatus,
     /// Immediate wait parent; `None` on a non-root means future zombies auto-reap.
     parent: Option<Weak<BrokerProcess>>,
     owner_alive: bool,
@@ -141,9 +141,9 @@ struct BrokerProcessState {
     shutdown: Option<ProcessShutdown>,
 }
 
-/// Authoritative lifecycle state of one broker process record.
+/// Broker-visible status of one process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProcessRecordState {
+pub(crate) enum ProcessStatus {
     /// Host process setup is in progress.
     Starting,
     /// The process is published and may issue guest-originated operations.
@@ -156,7 +156,7 @@ pub(crate) enum ProcessRecordState {
     Reaped,
 }
 
-impl ProcessRecordState {
+impl ProcessStatus {
     fn transition(&mut self, next: Self) -> Result<()> {
         let allowed = matches!(
             (*self, next),
@@ -221,7 +221,7 @@ impl BrokerProcess {
             id,
             root,
             state: Mutex::new(BrokerProcessState {
-                record: ProcessRecordState::Starting,
+                status: ProcessStatus::Starting,
                 parent,
                 owner_alive: true,
                 reparent_startup_on_parent_death: false,
@@ -271,14 +271,14 @@ impl BrokerProcess {
 
         let state = self.state.lock();
         if !state.owner_alive
-            || !matches!(state.record, ProcessRecordState::Running)
+            || !matches!(state.status, ProcessStatus::Running)
             || !matches!(state.retirement, ProcessRetirement::Active { .. })
         {
             return Err(BrokerError::PeerClosed);
         }
         let mut child_state = child.state.lock();
         if !child_state.owner_alive
-            || !matches!(child_state.record, ProcessRecordState::Starting)
+            || !matches!(child_state.status, ProcessStatus::Starting)
             || !child_state
                 .parent
                 .as_ref()
@@ -297,19 +297,17 @@ impl BrokerProcess {
     #[must_use]
     pub fn is_running(&self) -> bool {
         let state = self.state.lock();
-        matches!(state.record, ProcessRecordState::Running)
+        matches!(state.status, ProcessStatus::Running)
             && matches!(state.retirement, ProcessRetirement::Active { .. })
     }
 
     /// Returns the completed startup outcome, or `None` while startup is pending.
     pub fn startup_result(&self) -> Option<Result<()>> {
-        match self.state.lock().record {
-            ProcessRecordState::Starting => None,
-            ProcessRecordState::Running => Some(Ok(())),
-            ProcessRecordState::Failed(error) => Some(Err(error)),
-            ProcessRecordState::Zombie | ProcessRecordState::Reaped => {
-                Some(Err(BrokerError::PeerClosed))
-            }
+        match self.state.lock().status {
+            ProcessStatus::Starting => None,
+            ProcessStatus::Running => Some(Ok(())),
+            ProcessStatus::Failed(error) => Some(Err(error)),
+            ProcessStatus::Zombie | ProcessStatus::Reaped => Some(Err(BrokerError::PeerClosed)),
         }
     }
 
@@ -320,13 +318,13 @@ impl BrokerProcess {
             if !state.owner_alive || !matches!(state.retirement, ProcessRetirement::Active { .. }) {
                 return Err(BrokerError::PeerClosed);
             }
-            match state.record {
-                ProcessRecordState::Starting => {}
-                ProcessRecordState::Running => return Err(BrokerError::Internal),
-                ProcessRecordState::Failed(error) => return Err(error),
+            match state.status {
+                ProcessStatus::Starting => {}
+                ProcessStatus::Running => return Err(BrokerError::Internal),
+                ProcessStatus::Failed(error) => return Err(error),
                 _ => return Err(BrokerError::PeerClosed),
             }
-            state.record.transition(ProcessRecordState::Running)?;
+            state.status.transition(ProcessStatus::Running)?;
             state.reparent_startup_on_parent_death = false;
         }
         self.core.process_lifecycle_sink.changed();
@@ -354,16 +352,16 @@ impl BrokerProcess {
     ) -> Result<()> {
         let shutdown = {
             let mut state = self.state.lock();
-            match state.record {
-                ProcessRecordState::Starting => {}
-                ProcessRecordState::Running => return Ok(()),
-                ProcessRecordState::Failed(error) => return Err(error),
+            match state.status {
+                ProcessStatus::Starting => {}
+                ProcessStatus::Running => return Ok(()),
+                ProcessStatus::Failed(error) => return Err(error),
                 _ => return Err(BrokerError::PeerClosed),
             }
             if abnormal {
                 state.retirement.mark_abnormal();
             }
-            state.record.transition(ProcessRecordState::Failed(error))?;
+            state.status.transition(ProcessStatus::Failed(error))?;
             state.reparent_startup_on_parent_death = false;
             if state.shutdown_request == ProcessShutdownRequest::None {
                 state.shutdown_request = if expected_shutdown {
@@ -482,12 +480,12 @@ impl BrokerProcess {
         }
 
         let mut shutdown = None;
-        let reparent = match state.record {
-            ProcessRecordState::Starting if state.reparent_startup_on_parent_death => true,
-            ProcessRecordState::Starting => {
+        let reparent = match state.status {
+            ProcessStatus::Starting if state.reparent_startup_on_parent_death => true,
+            ProcessStatus::Starting => {
                 state
-                    .record
-                    .transition(ProcessRecordState::Failed(BrokerError::PeerClosed))
+                    .status
+                    .transition(ProcessStatus::Failed(BrokerError::PeerClosed))
                     .expect("starting child rejection must be a valid transition");
                 if state.shutdown_request == ProcessShutdownRequest::None {
                     state.shutdown_request = ProcessShutdownRequest::Expected;
@@ -495,16 +493,16 @@ impl BrokerProcess {
                 shutdown.clone_from(&state.shutdown);
                 false
             }
-            ProcessRecordState::Running | ProcessRecordState::Zombie => true,
-            ProcessRecordState::Failed(_) | ProcessRecordState::Reaped => return (false, None),
+            ProcessStatus::Running | ProcessStatus::Zombie => true,
+            ProcessStatus::Failed(_) | ProcessStatus::Reaped => return (false, None),
         };
 
         if reparent {
             state.parent = live_root.map(Arc::downgrade);
-            if live_root.is_none() && state.record == ProcessRecordState::Zombie {
+            if live_root.is_none() && state.status == ProcessStatus::Zombie {
                 state
-                    .record
-                    .transition(ProcessRecordState::Reaped)
+                    .status
+                    .transition(ProcessStatus::Reaped)
                     .expect("orphaned zombie reaping must be a valid transition");
             }
         }
@@ -1182,7 +1180,7 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        BrokerProcess, ProcessLifecycleSink, ProcessRecordState, ProcessReferences,
+        BrokerProcess, ProcessLifecycleSink, ProcessReferences, ProcessStatus,
         release_pending_reference,
     };
     use crate::test_platform::TestPlatform;
@@ -1236,8 +1234,8 @@ mod tests {
         child
     }
 
-    fn process_record_states() -> [ProcessRecordState; 5] {
-        use ProcessRecordState as State;
+    fn process_statuses() -> [ProcessStatus; 5] {
+        use ProcessStatus as State;
 
         [
             State::Starting,
@@ -1249,11 +1247,11 @@ mod tests {
     }
 
     #[test]
-    fn process_record_state_transition_matrix() {
-        use ProcessRecordState as State;
+    fn process_status_transition_matrix() {
+        use ProcessStatus as State;
 
         let failed = State::Failed(BrokerError::PeerClosed);
-        let states = process_record_states();
+        let states = process_statuses();
         let allowed = [
             (State::Starting, State::Running),
             (State::Starting, failed),
@@ -1379,10 +1377,7 @@ mod tests {
         cancelled_parent.request_cancellation();
 
         cancelled_child.complete_start().unwrap();
-        assert_eq!(
-            cancelled_child.state.lock().record,
-            ProcessRecordState::Running
-        );
+        assert_eq!(cancelled_child.state.lock().status, ProcessStatus::Running);
         assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
         let unprepared_child = broker
             .create_process(
@@ -1403,7 +1398,7 @@ mod tests {
         dead_parent.handle_owner_death();
 
         dead_child.complete_start().unwrap();
-        assert_eq!(dead_child.state.lock().record, ProcessRecordState::Running);
+        assert_eq!(dead_child.state.lock().status, ProcessStatus::Running);
         assert_eq!(parent_id(&dead_child), None);
 
         let live_parent = broker
@@ -1493,16 +1488,16 @@ mod tests {
         zombie
             .state
             .lock()
-            .record
-            .transition(ProcessRecordState::Zombie)
+            .status
+            .transition(ProcessStatus::Zombie)
             .unwrap();
         parent.handle_owner_death();
 
         assert!(!parent.state.lock().owner_alive);
         assert_eq!(parent_id(&running), Some(root.id()));
-        assert_eq!(running.state.lock().record, ProcessRecordState::Running);
+        assert_eq!(running.state.lock().status, ProcessStatus::Running);
         assert_eq!(parent_id(&zombie), Some(root.id()));
-        assert_eq!(zombie.state.lock().record, ProcessRecordState::Zombie);
+        assert_eq!(zombie.state.lock().status, ProcessStatus::Zombie);
         assert!(matches!(
             broker.create_process(CallerCredential::Unauthenticated, Some(parent.id())),
             Err(BrokerError::PeerClosed)
@@ -1532,15 +1527,15 @@ mod tests {
         zombie
             .state
             .lock()
-            .record
-            .transition(ProcessRecordState::Zombie)
+            .status
+            .transition(ProcessStatus::Zombie)
             .unwrap();
         root.handle_owner_death();
 
         assert_eq!(parent_id(&running), None);
-        assert_eq!(running.state.lock().record, ProcessRecordState::Running);
+        assert_eq!(running.state.lock().status, ProcessStatus::Running);
         assert_eq!(parent_id(&zombie), None);
-        assert_eq!(zombie.state.lock().record, ProcessRecordState::Reaped);
+        assert_eq!(zombie.state.lock().status, ProcessStatus::Reaped);
     }
 
     #[test]
@@ -1565,8 +1560,8 @@ mod tests {
         child
             .state
             .lock()
-            .record
-            .transition(ProcessRecordState::Zombie)
+            .status
+            .transition(ProcessStatus::Zombie)
             .unwrap();
 
         root.handle_owner_death();
@@ -1574,7 +1569,7 @@ mod tests {
 
         assert_eq!(parent_id(&parent), None);
         assert_eq!(parent_id(&child), None);
-        assert_eq!(child.state.lock().record, ProcessRecordState::Reaped);
+        assert_eq!(child.state.lock().status, ProcessStatus::Reaped);
     }
 
     #[test]
@@ -1601,8 +1596,8 @@ mod tests {
         zombie
             .state
             .lock()
-            .record
-            .transition(ProcessRecordState::Zombie)
+            .status
+            .transition(ProcessStatus::Zombie)
             .unwrap();
 
         root.handle_owner_death();
@@ -1625,7 +1620,7 @@ mod tests {
         );
         assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
         assert_eq!(parent_id(&zombie), None);
-        assert_eq!(zombie.state.lock().record, ProcessRecordState::Reaped);
+        assert_eq!(zombie.state.lock().status, ProcessStatus::Reaped);
     }
 
     #[test]
