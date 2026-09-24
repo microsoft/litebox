@@ -782,7 +782,7 @@ fn test_create_mapping_relocates_hints_before_selecting_backing() {
                 Err(AllocationError::AddressInUse)
             ));
             let pointer = vmem
-                .create_mapping(Some(address), length, vma, CreatePagesFlags::empty())
+                .create_mapping(Some(address), length, vma, CreatePagesFlags::TOP_DOWN)
                 .unwrap();
             let relocated =
                 PageRange::new(pointer.as_usize(), pointer.as_usize() + PAGE_SIZE).unwrap();
@@ -4189,7 +4189,7 @@ fn test_placement_uses_reservations_and_stack_boundaries() {
                         .create_pages(
                             None,
                             page,
-                            CreatePagesFlags::empty(),
+                            CreatePagesFlags::TOP_DOWN,
                             MemoryRegionPermissions::READ
                         )
                         .unwrap()
@@ -5198,7 +5198,7 @@ fn test_vmm_mapping() {
                 None,
                 NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
-                CreatePagesFlags::empty(),
+                CreatePagesFlags::TOP_DOWN,
             )
         }
         .unwrap()

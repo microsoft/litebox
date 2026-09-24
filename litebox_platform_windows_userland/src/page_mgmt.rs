@@ -168,6 +168,8 @@ impl WindowsUserland {
         };
         let mut pointer = reserve(start as *mut c_void);
         if pointer.is_null() && start != 0 && behavior == FixedAddressBehavior::Hint {
+            // The OS-selected fallback may not preserve the page manager's bottom-up or top-down
+            // search direction; hints permit relocation to any available address.
             pointer = reserve(core::ptr::null_mut());
         }
         if pointer.is_null() {

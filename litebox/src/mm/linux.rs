@@ -861,7 +861,7 @@ impl<Platform: PageManagementProvider<ALIGN> + RawPointerProvider + 'static, con
     /// - [`CreatePagesFlags::FIXED_ADDR`] with [`CreatePagesFlags::NOREPLACE`]: Forces allocation at
     ///   the exact address, but fails with [`AllocationError::AddressInUse`] if any part of the
     ///   range is already mapped. This is safe to use without checking for existing mappings first.
-    /// - Without [`CreatePagesFlags::FIXED_ADDR`], the address is treated as a hint.
+    /// - Otherwise, an address without [`CreatePagesFlags::FIXED_ADDR`] is treated as a hint.
     ///
     /// Note: `NOREPLACE` error responses (`AddressInUse` / `EEXIST`) can be used to probe memory
     /// layout. This matches Linux kernel behavior for `MAP_FIXED_NOREPLACE`.
@@ -897,9 +897,13 @@ impl<Platform: PageManagementProvider<ALIGN> + RawPointerProvider + 'static, con
             FixedAddressBehavior::Hint
         };
         let new_addr = self
-            .get_unmmaped_area(suggested_address, total_length, behavior)?
+            .get_unmmaped_area(
+                suggested_address,
+                total_length,
+                behavior,
+                flags.contains(CreatePagesFlags::TOP_DOWN),
+            )?
             .ok_or(AllocationError::OutOfMemory)?;
-        // new_addr must be ALIGN aligned
         let new_range = PageRange::from_start_len(new_addr, length.as_usize()).unwrap();
         // SAFETY: The caller authorizes fixed replacement; other placements exclude live mappings.
         unsafe {
@@ -1079,7 +1083,12 @@ impl<Platform: PageManagementProvider<ALIGN> + RawPointerProvider + 'static, con
             Ok(destination) => destination,
             Err(RemapError::UnsupportedByPlatform) => {
                 let new_start = self
-                    .get_unmmaped_area(suggested_new_address, new_size, FixedAddressBehavior::Hint)
+                    .get_unmmaped_area(
+                        suggested_new_address,
+                        new_size,
+                        FixedAddressBehavior::Hint,
+                        true,
+                    )
                     .map_err(|_| VmemMoveError::OutOfMemory)?
                     .ok_or(VmemMoveError::OutOfMemory)?;
                 let new_range = PageRange::from_start_len(new_start, new_size.as_usize()).unwrap();
@@ -1214,9 +1223,15 @@ impl<Platform: PageManagementProvider<ALIGN> + RawPointerProvider + 'static, con
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         behavior: FixedAddressBehavior,
+        top_down: bool,
     ) -> Result<Option<usize>, AllocationError> {
         // Fresh automatic mappings need room for reservation-aligned native backing.
         // Explicit addresses remain guest-page aligned and are validated as requested.
+        let address_range_start = if !top_down && behavior == FixedAddressBehavior::Hint {
+            suggested_address.map_or(Platform::TASK_ADDR_MIN, NonZeroAddress::as_usize)
+        } else {
+            Platform::TASK_ADDR_MIN
+        };
         let address_range_end = if suggested_address.is_none() {
             Platform::TASK_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1)
         } else {
@@ -1236,8 +1251,8 @@ impl<Platform: PageManagementProvider<ALIGN> + RawPointerProvider + 'static, con
                 behavior,
                 alignment,
                 include_reservations: false,
-                address_range: Platform::TASK_ADDR_MIN..address_range_end,
-                top_down: true,
+                address_range: address_range_start..address_range_end,
+                top_down,
             },
         )
     }
