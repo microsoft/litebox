@@ -6,6 +6,7 @@
 pub mod allocator;
 pub mod exception_table;
 pub mod linux;
+mod vmem;
 
 #[cfg(test)]
 mod tests;
