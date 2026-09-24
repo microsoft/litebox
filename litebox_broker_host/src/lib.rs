@@ -24,9 +24,7 @@ extern crate std;
 use alloc::{sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, DuplicationTransaction,
-};
+use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, CallerCredential};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -102,8 +100,8 @@ struct AssociationState {
 pub enum ProcessStartupCompletion {
     /// Completes ordinary process startup.
     CompleteStart,
-    /// Publishes the exact staged child owned by a duplication transaction.
-    PublishDuplication(DuplicationTransaction),
+    /// Publishes the prepared duplication child associated with the runner.
+    PublishDuplication,
 }
 
 impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
@@ -124,17 +122,14 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
     }
 
     /// Commits process startup after deployment-specific installation and validation.
-    ///
-    /// A duplication completion must remain paired with the exact process
-    /// association supplied by its transaction.
     pub fn complete_startup(
         &self,
         completion: ProcessStartupCompletion,
     ) -> litebox_broker_core::Result<()> {
         match completion {
             ProcessStartupCompletion::CompleteStart => self.process.complete_start(),
-            ProcessStartupCompletion::PublishDuplication(transaction) => {
-                transaction.publish(&self.process).map(|_| ())
+            ProcessStartupCompletion::PublishDuplication => {
+                self.process.complete_duplication_start()
             }
         }
     }
@@ -826,10 +821,9 @@ pub trait ProcessLauncher: Send + Sync {
             ProcessStartupCompletion::CompleteStart => {
                 self.launch(process, initial_thread_id, startup)
             }
-            ProcessStartupCompletion::PublishDuplication(transaction) => {
+            ProcessStartupCompletion::PublishDuplication => {
                 let error = BrokerError::UnsupportedOperation;
                 let _ = process.fail_start(error, false, true);
-                drop(transaction);
                 process.retire(true);
                 Err(error)
             }
@@ -1759,8 +1753,7 @@ mod tests {
         let (child, _) = broker
             .create_process_with_initial_thread(parent.caller_credential(), Some(parent.id()))
             .unwrap();
-        let mut transaction = parent.begin_duplication().unwrap();
-        transaction.retain_child(Arc::clone(&child)).unwrap();
+        parent.prepare_duplication_child(&child).unwrap();
         let association = BrokerHostAssociation::new(
             Arc::clone(&child),
             Arc::new(test_shared_buffers()),
@@ -1769,7 +1762,7 @@ mod tests {
 
         assert!(!child.is_running());
         association
-            .complete_startup(ProcessStartupCompletion::PublishDuplication(transaction))
+            .complete_startup(ProcessStartupCompletion::PublishDuplication)
             .unwrap();
         assert!(child.is_running());
 
