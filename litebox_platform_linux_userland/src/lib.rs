@@ -2448,6 +2448,263 @@ mod tests {
         assert!(mutex.block(0).is_ok());
     }
 
+    /// Drives `FutexManager` over the real Linux futex-backed `RawMutex` (real
+    /// `FUTEX_WAIT`/`FUTEX_WAKE`) instead of the in-crate mock platform, confirming a
+    /// registered waiter is always woken by a concurrent waker and never left to time
+    /// out. Ignored because it is a probabilistic stress test that spawns real threads.
+    ///
+    /// Run under the default (debug) profile, not `--release`: the waiter's
+    /// `update_waker` writes through a TLS base that only `run_test_thread` sets up, and
+    /// that override is compiled in only with `debug_assertions`.
+    #[test]
+    #[ignore = "real-platform futex stress test"]
+    fn stress_real_platform_waiter_is_not_missed() {
+        use litebox::event::wait::{WaitError, WaitState};
+        use litebox::platform::{RawConstPointer as _, RawPointerProvider, ThreadProvider};
+        use litebox::sync::futex::{FutexError, FutexManager};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let platform = LinuxUserland::new(None);
+        let futex_manager = Arc::new(FutexManager::<LinuxUserland>::new());
+        let futex_word = Arc::new(AtomicU32::new(0));
+        let iterations: u64 = std::env::var("LITEBOX_FUTEX_STRESS_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(50_000);
+
+        let start = Arc::new(Barrier::new(3));
+        let finish = Arc::new(Barrier::new(3));
+        let waiter_registered = Arc::new(AtomicBool::new(false));
+        let waiter_timed_out = Arc::new(AtomicBool::new(false));
+
+        let waiter = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex_word = Arc::clone(&futex_word);
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let waiter_registered = Arc::clone(&waiter_registered);
+            let waiter_timed_out = Arc::clone(&waiter_timed_out);
+            std::thread::spawn(move || {
+                // `update_waker` accesses TLS relative to the guest base that this sets up.
+                LinuxUserland::run_test_thread(|| {
+                    let futex_addr =
+                        <LinuxUserland as RawPointerProvider>::RawMutPointer::<u32>::from_usize(
+                            futex_word.as_ptr() as usize,
+                        );
+                    for _ in 0..iterations {
+                        start.wait();
+                        waiter_registered.store(true, Ordering::Release);
+                        let result = futex_manager.wait(
+                            &WaitState::new(platform)
+                                .context()
+                                .with_timeout(Duration::from_millis(500)),
+                            futex_addr,
+                            0,
+                            None,
+                        );
+                        waiter_timed_out.store(
+                            matches!(result, Err(FutexError::WaitError(WaitError::TimedOut))),
+                            Ordering::Relaxed,
+                        );
+                        finish.wait();
+                    }
+                });
+            })
+        };
+
+        let waker = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex_word = Arc::clone(&futex_word);
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let waiter_registered = Arc::clone(&waiter_registered);
+            std::thread::spawn(move || {
+                let futex_addr =
+                    <LinuxUserland as RawPointerProvider>::RawMutPointer::<u32>::from_usize(
+                        futex_word.as_ptr() as usize,
+                    );
+                for _ in 0..iterations {
+                    start.wait();
+                    while !waiter_registered.load(Ordering::Acquire) {
+                        core::hint::spin_loop();
+                    }
+                    // Retry until the registered waiter is actually selected, so a lost
+                    // wake shows up as the waiter timing out rather than a no-op wake.
+                    while futex_manager
+                        .wake(futex_addr, core::num::NonZeroU32::new(1).unwrap(), None)
+                        .unwrap()
+                        != 1
+                    {
+                        core::hint::spin_loop();
+                    }
+                    finish.wait();
+                }
+            })
+        };
+
+        let mut lost_wakeups = 0u64;
+        for _ in 0..iterations {
+            futex_word.store(0, Ordering::Relaxed);
+            waiter_registered.store(false, Ordering::Relaxed);
+            waiter_timed_out.store(false, Ordering::Relaxed);
+            start.wait();
+            finish.wait();
+            if waiter_timed_out.load(Ordering::Relaxed) {
+                lost_wakeups += 1;
+            }
+        }
+
+        waiter.join().unwrap();
+        waker.join().unwrap();
+        std::eprintln!("iterations={iterations} lost_wakeups={lost_wakeups}");
+        assert_eq!(
+            lost_wakeups, 0,
+            "a registered waiter on the real Linux platform missed its wake"
+        );
+    }
+
+    /// Reproduces the futex wake-path store-buffering bug over the **real** Linux platform
+    /// by driving `litebox`'s `ordering_stress` rendezvous hooks (enabled via the
+    /// `ordering_stress` dev-dependency feature). Unlike the in-crate mock test, this
+    /// runs the waiter's `WAITING` store and the waker's relaxed `done` store through real
+    /// `FUTEX_WAIT`/`FUTEX_WAKE`, and fails if either side reads the other's stale value.
+    ///
+    /// Run with release codegen *and* debug-assertions so the relaxed `done` store keeps its
+    /// plain `mov` while `run_test_thread` (which sets up the TLS base `update_waker` needs)
+    /// is still compiled in:
+    ///
+    /// ```text
+    /// RUSTFLAGS="-C debug-assertions=on" LITEBOX_FUTEX_STRESS_ITERS=200000 \
+    ///   cargo test -p litebox_platform_linux_userland --release \
+    ///   stress_real_platform_reproduces_lost_wake -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "real-platform futex ordering reproduction"]
+    fn stress_real_platform_reproduces_lost_wake() {
+        use litebox::event::wait::{WaitError, WaitState};
+        use litebox::ordering_stress;
+        use litebox::platform::{RawConstPointer as _, RawPointerProvider, ThreadProvider};
+        use litebox::sync::futex::{FutexError, FutexManager};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::time::Duration;
+
+        let platform = LinuxUserland::new(None);
+        let futex_manager = Arc::new(FutexManager::<LinuxUserland>::new());
+        let futex_word = Arc::new(AtomicU32::new(0));
+        let iterations: u64 = std::env::var("LITEBOX_FUTEX_STRESS_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100_000);
+
+        ordering_stress::activate();
+        let start = Arc::new(Barrier::new(3));
+        let finish = Arc::new(Barrier::new(3));
+        let waiter_timed_out = Arc::new(AtomicBool::new(false));
+        let was_selected = Arc::new(AtomicBool::new(false));
+
+        let waiter = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex_word = Arc::clone(&futex_word);
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let waiter_timed_out = Arc::clone(&waiter_timed_out);
+            std::thread::spawn(move || {
+                // `update_waker` accesses TLS relative to the guest base that this sets up.
+                LinuxUserland::run_test_thread(|| {
+                    let futex_addr =
+                        <LinuxUserland as RawPointerProvider>::RawMutPointer::<u32>::from_usize(
+                            futex_word.as_ptr() as usize,
+                        );
+                    for _ in 0..iterations {
+                        start.wait();
+                        let result = futex_manager.wait(
+                            &WaitState::new(platform)
+                                .context()
+                                .with_timeout(Duration::from_millis(100)),
+                            futex_addr,
+                            0,
+                            None,
+                        );
+                        waiter_timed_out.store(
+                            matches!(result, Err(FutexError::WaitError(WaitError::TimedOut))),
+                            Ordering::Relaxed,
+                        );
+                        finish.wait();
+                    }
+                });
+            })
+        };
+
+        let waker = {
+            let futex_manager = Arc::clone(&futex_manager);
+            let futex_word = Arc::clone(&futex_word);
+            let start = Arc::clone(&start);
+            let finish = Arc::clone(&finish);
+            let was_selected = Arc::clone(&was_selected);
+            std::thread::spawn(move || {
+                let futex_addr =
+                    <LinuxUserland as RawPointerProvider>::RawMutPointer::<u32>::from_usize(
+                        futex_word.as_ptr() as usize,
+                    );
+                for _ in 0..iterations {
+                    start.wait();
+                    while !ordering_stress::waiter_is_registered() {
+                        core::hint::spin_loop();
+                    }
+                    was_selected.store(
+                        futex_manager
+                            .wake(futex_addr, core::num::NonZeroU32::new(1).unwrap(), None)
+                            .unwrap()
+                            == 1,
+                        Ordering::Relaxed,
+                    );
+                    finish.wait();
+                }
+            })
+        };
+
+        let mut selected = 0u64;
+        let mut both_old = 0u64;
+        let mut lost_wakeups = 0u64;
+        for _ in 0..iterations {
+            futex_word.store(0, Ordering::Relaxed);
+            ordering_stress::begin_round();
+            waiter_timed_out.store(false, Ordering::Relaxed);
+            was_selected.store(false, Ordering::Relaxed);
+            start.wait();
+            ordering_stress::wait_until_parked();
+            ordering_stress::release();
+            finish.wait();
+            if was_selected.load(Ordering::Relaxed) {
+                selected += 1;
+                if ordering_stress::observed_both_old() {
+                    both_old += 1;
+                }
+                if waiter_timed_out.load(Ordering::Relaxed) {
+                    lost_wakeups += 1;
+                }
+            }
+        }
+
+        waiter.join().unwrap();
+        waker.join().unwrap();
+        ordering_stress::deactivate();
+        std::eprintln!(
+            "iterations={iterations} selected={selected} both_old={both_old} lost_wakeups={lost_wakeups}"
+        );
+        assert_eq!(
+            both_old, 0,
+            "the real Linux futex wake path saw both old values"
+        );
+        assert_eq!(
+            lost_wakeups, 0,
+            "a selected waiter on the real Linux platform missed its wake"
+        );
+    }
+
     #[test]
     fn test_reserved_pages() {
         let platform = LinuxUserland::new(None);
