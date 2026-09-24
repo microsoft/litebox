@@ -1947,6 +1947,8 @@ dependencies = [
  "litebox_shim_windows",
  "litebox_syscall_rewriter",
  "litebox_util_log",
+ "object",
+ "sha2",
  "tar",
  "tracing-subscriber",
 ]
