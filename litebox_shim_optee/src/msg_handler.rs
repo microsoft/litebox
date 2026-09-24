@@ -80,11 +80,11 @@ fn page_align_up(len: u64) -> Option<u64> {
 }
 
 #[inline]
-fn checked_memref_size(size: u64) -> Result<usize, OpteeSmcReturnCode> {
+pub fn checked_memref_size(size: u64) -> Result<usize, OpteeSmcReturnCode> {
     if size > MAX_SHM_MEMREF_SIZE as u64 {
         return Err(OpteeSmcReturnCode::ENomem);
     }
-    Ok(size.trunc())
+    usize::try_from(size).map_err(|_| OpteeSmcReturnCode::ENomem)
 }
 
 fn parse_optee_msg_args(
@@ -208,6 +208,85 @@ pub fn read_optee_msg_args_from_phys<Platform: crate::OpteeShimPlatform>(
     parse_optee_msg_args(&blob, has_rpc_arg)
 }
 
+/// Read main and RPC arguments from an explicitly identified registered SHM view.
+#[allow(clippy::type_complexity)]
+pub fn read_optee_msg_args_from_regd_shm<
+    Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>,
+>(
+    platform: &Platform,
+    shm_ref: u64,
+    offset: usize,
+) -> Result<(Box<OpteeMsgArgs>, Option<Box<OpteeRpcArgs>>, u64), OpteeSmcReturnCode> {
+    let shm_info = shm_ref_map()
+        .get(shm_ref)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.trunc());
+    let copy_size =
+        main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc());
+    let mut blob = alloc::vec![0u8; copy_size];
+    shm_info.read_at(platform, offset, &mut blob)?;
+    let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
+
+    let total_offset = shm_info
+        .page_offset
+        .checked_add(offset)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let page_index = total_offset / PAGE_SIZE;
+    let offset_in_page = total_offset % PAGE_SIZE;
+    let msg_args_phys_addr = shm_info
+        .page_addrs
+        .get(page_index)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?
+        .as_usize()
+        .checked_add(offset_in_page)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)? as u64;
+
+    Ok((msg_args, rpc_args, msg_args_phys_addr))
+}
+
+/// Register a page-list-backed TMEM allocation returned by normal world.
+pub fn register_rpc_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+    platform: &Platform,
+    tmem: &OpteeMsgParamTmem,
+) -> Result<(), OpteeSmcReturnCode> {
+    checked_memref_size(tmem.size)?;
+    let pages_data_phys_addr = page_align_down(tmem.buf_ptr);
+    let page_offset = tmem
+        .buf_ptr
+        .checked_sub(pages_data_phys_addr)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let total_size = page_offset
+        .checked_add(tmem.size)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let aligned_size = page_align_up(total_size).ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    shm_ref_map().register_shm(
+        platform,
+        pages_data_phys_addr,
+        page_offset,
+        tmem.size,
+        aligned_size,
+        tmem.shm_ref,
+    )
+}
+
+/// Remove a shared-memory mapping inserted for an RPC allocation.
+pub fn unregister_rpc_shm(shm_ref: u64) -> bool {
+    shm_ref_map().remove(shm_ref).is_some()
+}
+
+/// Copy bytes from a registered RPC allocation into trusted memory.
+pub fn read_rpc_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+    platform: &Platform,
+    shm_ref: u64,
+    offset: usize,
+    buffer: &mut [u8],
+) -> Result<(), OpteeSmcReturnCode> {
+    shm_ref_map()
+        .get(shm_ref)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?
+        .read_at(platform, offset, buffer)
+}
+
 /// This function handles `OpteeSmcArgs` passed from the normal world (VTL0) via an OP-TEE SMC call.
 /// It returns an `OpteeSmcResult` representing the result of the SMC call or `OpteeMsgArgs` it contains
 /// if the SMC call involves with an OP-TEE message which should be handled by
@@ -244,41 +323,17 @@ pub fn handle_optee_smc_args<'a, Platform: crate::OpteeShimPlatform>(
                 msg_args_phys_addr: msg_args_addr as u64,
             })
         }
+        OpteeSmcFunction::ReturnFromRpc => Err(OpteeSmcReturnCode::EBadCmd),
         OpteeSmcFunction::CallWithRegdArg => {
             // `OpteeMsgArgs` is located at the offset specified in args[3] within the shared memory region pointed by args[1]:args[2].
             let (shm_ref, offset) = smc.optee_regd_shm_ref_and_offset()?;
-            let shm_info = shm_ref_map()
-                .get(shm_ref)
-                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-
-            // Compute copy size from known-good upper bounds — no untrusted data involved.
-            let main_max = optee_msg_args_total_size(OpteeMsgArgs::MAX_ARG_PARAM_COUNT.trunc());
-            let copy_size =
-                main_max + optee_msg_args_total_size(OpteeRpcArgs::MAX_RPC_ARG_PARAM_COUNT.trunc());
-
-            let mut blob = alloc::vec![0u8; copy_size];
-            shm_info.read_at(platform, offset, &mut blob)?;
-            let (msg_args, rpc_args) = parse_optee_msg_args(&blob, true)?;
-
-            // Compute the physical address of `OpteeMsgArgs`
-            let total_offset = shm_info
-                .page_offset
-                .checked_add(offset)
-                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
-            let page_index = total_offset / PAGE_SIZE;
-            let offset_in_page = total_offset % PAGE_SIZE;
-            if page_index >= shm_info.page_addrs.len() {
-                return Err(OpteeSmcReturnCode::EBadAddr);
-            }
-            let msg_args_addr = shm_info.page_addrs[page_index]
-                .as_usize()
-                .checked_add(offset_in_page)
-                .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+            let (msg_args, rpc_args, msg_args_phys_addr) =
+                read_optee_msg_args_from_regd_shm(platform, shm_ref, offset)?;
 
             Ok(OpteeSmcResult::CallWithArg {
                 msg_args,
                 rpc_args,
-                msg_args_phys_addr: msg_args_addr as u64,
+                msg_args_phys_addr,
             })
         }
         OpteeSmcFunction::ExchangeCapabilities => {
@@ -758,6 +813,32 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
         Ok(())
     }
 
+    /// Write `buffer` to the normal-world shared memory pages referenced by `self`,
+    /// starting at byte `offset` within the view.
+    fn write_at<Platform: litebox_common_linux::vmap::VmapManager<ALIGN>>(
+        &self,
+        platform: &Platform,
+        offset: usize,
+        buffer: &[u8],
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if offset
+            .checked_add(buffer.len())
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let ptr = NormalWorldMutPtr::<Platform, u8, ALIGN>::new(
+            platform,
+            &self.page_addrs,
+            self.page_offset,
+        )?;
+        ptr.write_slice_at_offset(offset, buffer)?;
+        Ok(())
+    }
+
     /// Copy from this normal-world shared memory into TA userspace.
     pub(crate) fn copy_to_user<Platform>(
         &self,
@@ -933,6 +1014,26 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         )?;
         Ok(())
     }
+}
+
+/// Serialize RPC arguments immediately after the main message in registered shared memory.
+pub fn write_rpc_args_to_regd_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+    platform: &Platform,
+    shm_ref: u64,
+    msg_args_offset: usize,
+    msg_args_num_params: u32,
+    rpc_args: &OpteeRpcArgs,
+) -> Result<(), OpteeSmcReturnCode> {
+    let shm_info = shm_ref_map()
+        .get(shm_ref)
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let rpc_args_offset = msg_args_offset
+        .checked_add(optee_msg_args_total_size(msg_args_num_params))
+        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+    let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
+    let mut blob = alloc::vec![0u8; rpc_args_size];
+    rpc_args.serialize(&mut blob)?;
+    shm_info.write_at(platform, rpc_args_offset, &blob)
 }
 
 fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {

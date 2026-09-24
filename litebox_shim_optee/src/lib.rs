@@ -30,6 +30,7 @@ use litebox_common_optee::{
 };
 
 pub mod loader;
+pub mod rpc_context;
 pub mod session;
 pub(crate) mod syscalls;
 
@@ -224,17 +225,14 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
-    /// Get the TA binary associated with the given TA UUID.
+    /// Get the cached TA binary associated with the given TA UUID.
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
-            Some(ta_bin)
-        } else {
-            let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
-            if !self.store_ta_bin(ta_uuid, &ta_bin) {
-                return None;
-            }
-            Some(ta_bin)
-        }
+        self.ta_uuid_map.get(ta_uuid)
+    }
+
+    /// Return whether a TA binary is cached for the given UUID.
+    pub(crate) fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
+        self.ta_uuid_map.contains(ta_uuid)
     }
 
     /// Get the TA flags associated with the given TA UUID.
@@ -251,20 +249,9 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         TimeProvider::now(self.platform).duration_since(&self.boot_instant)
     }
 
-    /// Remove the TA binary associated with the given TA UUID.
-    ///
-    /// Since a TA binary can be continuously loaded/used by multiple clients, we cache it
-    /// to avoid repeated RPCs and memory transfers. We remove it lazily if there is
-    /// a memory pressure.
-    ///
-    #[expect(dead_code)]
+    /// Remove a TA binary after it is no longer needed in the trusted cache.
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         let _ = self.ta_uuid_map.remove(ta_uuid);
-    }
-
-    /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
-    fn rpc_get_ta_bin(_ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        None
     }
 }
 
@@ -364,9 +351,19 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         self.0.store_ta_bin(ta_uuid, ta_bin)
     }
 
-    /// Get the TA binary associated with the given TA UUID.
+    /// Get the cached TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
+    }
+
+    /// Return whether a TA binary is cached for the given UUID.
+    pub fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
+        self.0.contains_ta_bin(ta_uuid)
+    }
+
+    /// Remove a TA binary from the trusted cache.
+    pub fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
+        self.0.remove_ta_bin(ta_uuid);
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -1444,6 +1441,10 @@ impl TaUuidMap {
 
     pub(crate) fn get(&self, uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.inner.read().get(uuid).map(|info| info.binary.clone())
+    }
+
+    pub(crate) fn contains(&self, uuid: &TeeUuid) -> bool {
+        self.inner.read().contains_key(uuid)
     }
 
     /// Get the TA flags for a given UUID.
