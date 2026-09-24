@@ -39,7 +39,7 @@ use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
@@ -53,7 +53,7 @@ pub use process::{
     AssociationCancellation, BrokerProcess, BrokerThread, CallerCredential, DuplicationTransaction,
     ObjectRights, ProcessLifecycleSink, ProcessShutdown,
 };
-use process::{ObjectReference, ProcessParent, ProcessRoot, ProcessStartKind};
+use process::{ObjectReference, ProcessParent, ProcessRoot};
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
@@ -348,11 +348,34 @@ impl BrokerCore {
                     caller_credential,
                     Some(ProcessParent::new(&parent)),
                     Some(root),
-                    ProcessStartKind::Association,
                 )
             })?;
         }
-        self.register_process(caller_credential, None, None, ProcessStartKind::Association)
+        self.register_process(caller_credential, None, None)
+    }
+
+    /// Allocates one process and its initial thread.
+    ///
+    /// If initial-thread creation fails, the process is retired before the
+    /// error is returned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the shared ID allocator violates its range or uniqueness
+    /// invariants.
+    pub fn create_process_with_initial_thread(
+        &self,
+        caller_credential: CallerCredential,
+        parent_id: Option<ProcessId>,
+    ) -> Result<(Arc<BrokerProcess>, ThreadId)> {
+        let process = self.create_process(caller_credential, parent_id)?;
+        match process.create_thread() {
+            Ok(initial_thread_id) => Ok((process, initial_thread_id)),
+            Err(error) => {
+                process.retire(true);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn register_process(
@@ -360,7 +383,6 @@ impl BrokerCore {
         caller_credential: CallerCredential,
         parent: Option<ProcessParent>,
         root: Option<Arc<ProcessRoot>>,
-        start_kind: ProcessStartKind,
     ) -> Result<Arc<BrokerProcess>> {
         let mut processes = self.processes.write();
         if processes.len() >= self.limits.max_processes {
@@ -377,7 +399,6 @@ impl BrokerCore {
                 id,
                 root,
                 parent,
-                start_kind,
                 caller_credential,
             ))
         } else {
@@ -388,7 +409,6 @@ impl BrokerCore {
                     id,
                     Arc::new(ProcessRoot::new(root_process.clone())),
                     None,
-                    start_kind,
                     caller_credential,
                 )
             })

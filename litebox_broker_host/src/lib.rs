@@ -100,10 +100,10 @@ struct AssociationState {
 
 /// Broker-core action that commits one validated runner association.
 pub enum ProcessStartupCompletion {
-    /// Completes ordinary association startup.
-    Association,
+    /// Completes ordinary process startup.
+    CompleteStart,
     /// Publishes the exact staged child owned by a duplication transaction.
-    Duplication(DuplicationTransaction),
+    PublishDuplication(DuplicationTransaction),
 }
 
 impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
@@ -132,11 +132,16 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
         completion: ProcessStartupCompletion,
     ) -> litebox_broker_core::Result<()> {
         match completion {
-            ProcessStartupCompletion::Association => self.process.complete_start(),
-            ProcessStartupCompletion::Duplication(transaction) => {
+            ProcessStartupCompletion::CompleteStart => self.process.complete_start(),
+            ProcessStartupCompletion::PublishDuplication(transaction) => {
                 transaction.publish(&self.process).map(|_| ())
             }
         }
+    }
+
+    /// Commits ordinary process startup after installation and validation.
+    pub fn activate_process(&self) -> litebox_broker_core::Result<()> {
+        self.complete_startup(ProcessStartupCompletion::CompleteStart)
     }
 
     /// Treats association loss as owner death; cleanup waits for confirmed runner teardown.
@@ -353,27 +358,13 @@ where
                     .map_err(BrokerHostError::Channel)?;
                 return Ok(Err(ConnectionTermination::Rejected(error)));
             }
-            None => match core.create_process(caller_credential, None) {
-                Ok(process) => match process.create_thread() {
-                    Ok(initial_thread_id) => (process, initial_thread_id),
-                    Err(
-                        error @ (litebox_broker_core::BrokerError::ResourceExhausted
-                        | litebox_broker_core::BrokerError::OutOfMemory),
-                    ) => {
-                        process.retire(true);
-                        let error = ErrorCode::from(error);
-                        setup_channel
-                            .send_handshake_response(&BrokerHandshakeResponse::Error(error))
-                            .map_err(BrokerHostError::Channel)?;
-                        return Ok(Err(ConnectionTermination::Rejected(error)));
-                    }
-                    Err(error) => {
-                        process.retire(true);
-                        return Err(BrokerHostError::from(error));
-                    }
-                },
-                Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
-                    let error = ErrorCode::ResourceExhausted;
+            None => match core.create_process_with_initial_thread(caller_credential, None) {
+                Ok(process) => process,
+                Err(
+                    error @ (litebox_broker_core::BrokerError::ResourceExhausted
+                    | litebox_broker_core::BrokerError::OutOfMemory),
+                ) => {
+                    let error = ErrorCode::from(error);
                     setup_channel
                         .send_handshake_response(&BrokerHandshakeResponse::Error(error))
                         .map_err(BrokerHostError::Channel)?;
@@ -812,16 +803,38 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
 /// fails. Success means process startup reached `Running`.
 pub trait ProcessLauncher: Send + Sync {
     /// Starts one process and waits for startup to commit or fail.
-    ///
-    /// The launcher transfers `completion` to the runner association and
-    /// consumes it only after deployment-specific installation and validation.
     fn launch(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
         initial_thread_id: ThreadId,
         startup: ProcessStartupData,
-        completion: ProcessStartupCompletion,
     ) -> core::result::Result<(), BrokerError>;
+
+    /// Starts one process with a non-default startup completion action.
+    ///
+    /// Launchers that support duplication publication transfer `completion`
+    /// to the runner association and consume it only after deployment-specific
+    /// installation and validation.
+    fn launch_with_completion(
+        self: Arc<Self>,
+        process: Arc<BrokerProcess>,
+        initial_thread_id: ThreadId,
+        startup: ProcessStartupData,
+        completion: ProcessStartupCompletion,
+    ) -> core::result::Result<(), BrokerError> {
+        match completion {
+            ProcessStartupCompletion::CompleteStart => {
+                self.launch(process, initial_thread_id, startup)
+            }
+            ProcessStartupCompletion::PublishDuplication(transaction) => {
+                let error = BrokerError::UnsupportedOperation;
+                let _ = process.fail_start(error, false, true);
+                drop(transaction);
+                process.retire(true);
+                Err(error)
+            }
+        }
+    }
 }
 
 /// Handles a process operation using the configured platform launcher.
@@ -868,20 +881,13 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
-    let process = broker
-        .create_process(parent.caller_credential(), Some(parent.id()))
+    let (process, initial_thread_id) = broker
+        .create_process_with_initial_thread(parent.caller_credential(), Some(parent.id()))
         .map_err(RequestFailure::from)?;
     let inherited_objects = match parent
         .duplicate_object_references_to(requested_inherited_objects.as_slice(), &process)
     {
         Ok(inherited_objects) => inherited_objects,
-        Err(error) => {
-            process.retire(true);
-            return Err(RequestFailure::from(error));
-        }
-    };
-    let initial_thread_id = match process.create_thread() {
-        Ok(initial_thread_id) => initial_thread_id,
         Err(error) => {
             process.retire(true);
             return Err(RequestFailure::from(error));
@@ -904,7 +910,6 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
                 payload,
                 inherited_objects,
             },
-            ProcessStartupCompletion::Association,
         )
         .map_err(RequestFailure::from)?;
     Ok(ProcessIdentity {
@@ -1716,10 +1721,9 @@ mod tests {
     }
 
     fn precreated_root_negotiates_without_startup_data(broker: &BrokerCore) {
-        let process = broker
-            .create_process(CallerCredential::Unauthenticated, None)
+        let (process, initial_thread_id) = broker
+            .create_process_with_initial_thread(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let initial_thread_id = process.create_thread().unwrap();
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -1741,9 +1745,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(association.process.id(), process.id());
-        association
-            .complete_startup(ProcessStartupCompletion::Association)
-            .unwrap();
+        association.activate_process().unwrap();
         association.finish();
     }
 
@@ -1752,8 +1754,11 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
+        let (child, _) = broker
+            .create_process_with_initial_thread(parent.caller_credential(), Some(parent.id()))
+            .unwrap();
         let mut transaction = parent.begin_duplication().unwrap();
-        let (child, _) = transaction.create_child().unwrap();
+        transaction.retain_child(Arc::clone(&child)).unwrap();
         let association = BrokerHostAssociation::new(
             Arc::clone(&child),
             Arc::new(test_shared_buffers()),
@@ -1762,7 +1767,7 @@ mod tests {
 
         assert!(!child.is_running());
         association
-            .complete_startup(ProcessStartupCompletion::Duplication(transaction))
+            .complete_startup(ProcessStartupCompletion::PublishDuplication(transaction))
             .unwrap();
         assert!(child.is_running());
 
@@ -3005,7 +3010,7 @@ mod tests {
             Err(termination) => return Ok(termination),
         };
         association
-            .complete_startup(ProcessStartupCompletion::Association)
+            .activate_process()
             .expect("test broker process must activate once");
         let result = (|| {
             loop {

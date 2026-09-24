@@ -206,7 +206,7 @@ where
             let (process, data, completion) = startup.into_process_and_startup();
             (Some(process), data, completion)
         }
-        None => (None, None, ProcessStartupCompletion::Association),
+        None => (None, None, ProcessStartupCompletion::CompleteStart),
     };
     let finish_process = process.is_none();
     let shared_memory = create_shared_memory()?;
@@ -943,7 +943,7 @@ mod tests {
                         shutdown,
                         None,
                         true,
-                        ProcessStartupCompletion::Association,
+                        ProcessStartupCompletion::CompleteStart,
                     )
                     .result,
                 )

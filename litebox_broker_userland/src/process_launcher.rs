@@ -136,22 +136,15 @@ impl UserlandProcessLauncher {
 
     pub(crate) fn run_root(config: RunnerConfig, broker: &BrokerCore) -> IoResult<ExitStatus> {
         let launcher = Self::new(config.without_initial_arguments(), broker.clone());
-        let process = launcher
+        let (process, initial_thread_id) = launcher
             .broker
-            .create_process(CallerCredential::HostGuaranteed, None)
+            .create_process_with_initial_thread(CallerCredential::HostGuaranteed, None)
             .map_err(broker_io_error)?;
-        let initial_thread_id = match process.create_thread() {
-            Ok(initial_thread_id) => initial_thread_id,
-            Err(error) => {
-                process.retire(true);
-                return Err(broker_io_error(error));
-            }
-        };
         let association = PendingRunnerAssociation::new(
             Arc::clone(&process),
             initial_thread_id,
             None,
-            ProcessStartupCompletion::Association,
+            ProcessStartupCompletion::CompleteStart,
         );
         let (completion_sender, completion_receiver) = sync_channel(1);
         let startup =
@@ -224,6 +217,20 @@ impl UserlandProcessLauncher {
 
 impl ProcessLauncher for UserlandProcessLauncher {
     fn launch(
+        self: Arc<Self>,
+        process: Arc<BrokerProcess>,
+        initial_thread_id: ThreadId,
+        data: ProcessStartupData,
+    ) -> Result<(), BrokerError> {
+        self.launch_with_completion(
+            process,
+            initial_thread_id,
+            data,
+            ProcessStartupCompletion::CompleteStart,
+        )
+    }
+
+    fn launch_with_completion(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
         initial_thread_id: ThreadId,
