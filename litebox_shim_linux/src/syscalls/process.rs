@@ -10,11 +10,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::offset_of;
-use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
-use litebox::mm::linux::VmFlags;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
@@ -1510,10 +1508,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         self.signals.reset_for_exec();
 
-        // Don't release reserved mappings.
-        let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
-            .expect("failed to release memory mappings");
+        let _ = unsafe { self.global.pm.release_memory() };
 
         self.global
             .platform

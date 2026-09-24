@@ -17,7 +17,7 @@ use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{LinuxPageManager, linux::PAGE_SIZE},
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
     utils::TruncateExt,
@@ -180,7 +180,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             platform: self.platform,
             session_manager: self.session_manager,
             boot_instant: TimeProvider::now(self.platform),
-            pm: PageManager::new(&self.litebox),
+            pm: LinuxPageManager::new(&self.litebox),
             _litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
@@ -200,7 +200,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// See [`GlobalState::system_time`].
     boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
     /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    pm: litebox::mm::LinuxPageManager<Platform, { PAGE_SIZE }>,
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
@@ -352,7 +352,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     }
 
     /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
+    pub fn page_manager(&self) -> &LinuxPageManager<Platform, PAGE_SIZE> {
         &self.0.pm
     }
 
@@ -379,9 +379,8 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// The caller must ensure that no references to the released memory regions
     /// are held after this call.
     pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| true;
         unsafe {
-            let _ = self.page_manager().release_memory(release);
+            let _ = self.page_manager().release_memory();
         }
     }
 }

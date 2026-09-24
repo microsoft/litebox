@@ -19,7 +19,7 @@ pub fn do_mmap<
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::LinuxPageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     suggested_addr: Option<usize>,
     len: usize,
     prot: ProtFlags,
@@ -92,7 +92,7 @@ pub fn sys_munmap<
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::LinuxPageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
     len: usize,
 ) -> Result<(), Errno> {
@@ -109,7 +109,7 @@ pub fn sys_munmap<
         return Err(Errno::EINVAL);
     }
 
-    match unsafe { pm.remove_pages(addr.to_platform_ptr::<Platform>(), aligned_len) } {
+    match unsafe { pm.unmap_pages(addr.to_platform_ptr::<Platform>(), aligned_len) } {
         Err(VmemUnmapError::UnAligned) => Err(Errno::EINVAL),
         Err(VmemUnmapError::UnmapError(e)) => match e {
             DeallocationError::Unaligned => Err(Errno::EINVAL),
@@ -127,7 +127,7 @@ pub fn sys_mprotect<
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::LinuxPageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
     len: usize,
     prot: ProtFlags,
@@ -162,7 +162,7 @@ pub fn sys_mremap<
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::LinuxPageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     old_addr: UserPtrMut<u8>,
     old_size: usize,
     new_size: usize,
@@ -225,7 +225,7 @@ pub fn sys_brk<
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::LinuxPageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
 ) -> Result<usize, Errno> {
     // On failure, the brk syscall returns the current break, not a negative errno.
@@ -237,7 +237,7 @@ pub fn sys_madvise<
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::LinuxPageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
     len: usize,
     advice: crate::MadviseBehavior,

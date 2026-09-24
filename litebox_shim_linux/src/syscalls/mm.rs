@@ -8,11 +8,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::fs::errors::ReadError;
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE, PageRange},
-    platform::{
-        PageManagementProvider, RawConstPointer,
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
-    },
+    mm::linux::{MappingError, PAGE_SIZE},
+    platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
 };
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
@@ -268,36 +265,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             perms
         };
 
-        // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
-        // unified lock, so there is a theoretical race if two threads concurrently attempt a
-        // fixed-address mapping with replacement at the same address. In practice this is benign:
-        // if a program races like this both threads will register the same mapping anyway. Updating
-        // to a begin/attempt/commit scheme could close this race window entirely.
-        match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
-            self.global.platform,
-            suggested_addr.unwrap_or(0),
-            &static_data[offset..offset + len],
-            permissions,
-            fixed_behavior,
-        ) {
-            Ok(ptr) => {
-                let range =
-                    PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
-                        .unwrap();
-                // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
-                // `permissions`.
-                unsafe {
-                    self.global.pm.register_existing_mapping(
-                        range,
-                        permissions,
-                        true,
-                        fixed_behavior == FixedAddressBehavior::Replace,
-                        flags.contains(MapFlags::MAP_SHARED),
-                    )
-                }
-                .unwrap();
-                Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr)))
-            }
+        // SAFETY: Fixed replacement is authorized by the mmap flags, and the static source meets
+        // the provider's CoW backing requirements.
+        match unsafe {
+            self.global.pm.try_create_cow_pages(
+                suggested_addr.unwrap_or(0),
+                &static_data[offset..offset + len],
+                permissions,
+                fixed_behavior,
+                flags.contains(MapFlags::MAP_SHARED),
+            )
+        } {
+            Ok(ptr) => Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr))),
             Err(_cow_not_supported) => None,
         }
     }
@@ -1196,10 +1175,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{
-        fs::{Mode, OFlags},
-        platform::PageManagementProvider,
-    };
+    use litebox::fs::{Mode, OFlags};
     use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::TestPlatform as Platform;
@@ -1406,10 +1382,8 @@ mod tests {
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform(None);
-        let platform = task.global.platform;
         let mut data = alloc::vec::Vec::new();
-        // Find an address that is allocated to the global allocator but not in reserved regions.
-        // LiteBox's page manager is not aware of the global allocator's allocations.
+        // Find an address allocated outside LiteBox's page manager.
         let addr = loop {
             #[allow(
                 unused_variables,
@@ -1440,33 +1414,20 @@ mod tests {
                 addr
             };
 
-            let mut included = false;
-            for r in <crate::syscalls::tests::TestPlatform as PageManagementProvider<
-                4096,
-            >>::reserved_pages(platform)
-            {
-                if r.contains(&addr) {
-                    included = true;
-                    break;
+            // Also ensure that [addr - 0x1000, addr) is available, which is needed below.
+            if let Ok(ptr) = task.sys_mmap(
+                addr - 0x1000,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                -1,
+                0,
+            ) {
+                if ptr.as_usize() != addr - 0x1000 {
+                    task.sys_munmap(ptr, 0x1000).unwrap();
+                    continue;
                 }
-            }
-
-            if !included {
-                // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
-                if let Ok(ptr) = task.sys_mmap(
-                    addr - 0x1000,
-                    0x1000,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
-                    -1,
-                    0,
-                ) {
-                    if ptr.as_usize() != addr - 0x1000 {
-                        task.sys_munmap(ptr, 0x1000).unwrap();
-                        continue;
-                    }
-                    break addr;
-                }
+                break addr;
             }
         };
 

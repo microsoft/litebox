@@ -6,10 +6,11 @@ use core::alloc::{GlobalAlloc, Layout};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
+use litebox::platform::page_mgmt::PageReservation;
 use litebox::{
     LiteBox,
     mm::{
-        PageManager,
+        LinuxPageManager,
         allocator::SafeZoneAllocator,
         linux::{
             CreatePagesFlags, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, PageFaultError,
@@ -217,7 +218,7 @@ fn test_vmm_page_fault() {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new(p4.start_address());
     let litebox = LiteBox::new(platform);
-    let vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
+    let vmm = LinuxPageManager::<_, PAGE_SIZE>::new(&litebox);
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(
@@ -294,4 +295,500 @@ fn test_vmm_page_fault() {
         },
         Err(PageFaultError::AllocationFailed)
     ));
+}
+
+#[test]
+fn test_release_committed_and_decommitted_backing() {
+    use litebox::platform::{
+        PageManagementProvider,
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
+    };
+
+    let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
+    let platform = MockKernel::new(p4.start_address());
+    let range = 0x90000..0x90000 + 5 * PAGE_SIZE;
+    let permissions = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
+    let release = <MockKernel as PageManagementProvider<PAGE_SIZE>>::release_pages;
+    // SAFETY: The fixture owns all synthetic mappings; no users survive decommit or release.
+    unsafe {
+        let reservation = <MockKernel as PageManagementProvider<PAGE_SIZE>>::reserve_pages(
+            platform,
+            || -> core::iter::Empty<_> {
+                panic!("no-replace reserve must not request reservations")
+            },
+            range.clone(),
+            false,
+            FixedAddressBehavior::NoReplace,
+        )
+        .unwrap();
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+            permissions,
+            true,
+        )
+        .unwrap();
+        let middle = range.start + PAGE_SIZE..range.end - PAGE_SIZE;
+        let (prefix, released, suffix) = reservation.split(middle.clone());
+        let prefix = prefix.unwrap();
+        let suffix = suffix.unwrap();
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+            platform,
+            || core::iter::once(&released),
+            middle.start + PAGE_SIZE..middle.end - PAGE_SIZE,
+        )
+        .unwrap();
+        release(platform, middle.clone());
+        for address in middle.step_by(PAGE_SIZE) {
+            assert!(matches!(
+                platform.page_table.translate(VirtAddr::new(address as u64)),
+                TranslateResult::NotMapped
+            ));
+        }
+        for address in [prefix.range().start, suffix.range().start] {
+            check_flags(
+                &platform.page_table,
+                address,
+                vmflags_to_pteflags(VmFlags::from(permissions)) | PageTableFlags::PRESENT,
+            );
+        }
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+            platform,
+            || core::iter::once(&prefix),
+            prefix.range(),
+        )
+        .unwrap();
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::release_pages(platform, range.clone());
+        for address in range.clone().step_by(PAGE_SIZE) {
+            assert!(matches!(
+                platform.page_table.translate(VirtAddr::new(address as u64)),
+                TranslateResult::NotMapped
+            ));
+        }
+    }
+}
+
+unsafe fn release_reservations<const ALIGN: usize>(
+    platform: &MockKernel,
+    reservations: Vec<litebox::platform::page_mgmt::ReservationOf<MockKernel, ALIGN>>,
+) {
+    use litebox::platform::PageManagementProvider;
+    for reservation in reservations {
+        let range = reservation.range();
+        // SAFETY: The fixture relinquishes this exact owned extent without remaining users.
+        unsafe { <MockKernel as PageManagementProvider<ALIGN>>::release_pages(platform, range) };
+    }
+}
+
+#[test]
+fn test_backing_primitives() {
+    use litebox::platform::{
+        PageManagementProvider,
+        page_mgmt::{AllocationError, FixedAddressBehavior, MemoryRegionPermissions},
+    };
+
+    const HANDLE_ALIGN: usize = 2 * PAGE_SIZE;
+    let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
+    let platform = MockKernel::new(p4.start_address());
+    // SAFETY: The fixture acquires and releases fresh uncommitted pages with no users.
+    unsafe {
+        let reservation = <MockKernel as PageManagementProvider<HANDLE_ALIGN>>::reserve_pages(
+            platform,
+            || -> core::iter::Empty<_> { panic!("hint reserve must not request reservations") },
+            0x80000..0x80000 + HANDLE_ALIGN,
+            false,
+            FixedAddressBehavior::Hint,
+        )
+        .unwrap();
+        assert_eq!(reservation.range().start, 0x80000);
+        assert_eq!(reservation.range().len(), HANDLE_ALIGN);
+        <MockKernel as PageManagementProvider<HANDLE_ALIGN>>::release_pages(
+            platform,
+            0x80000..0x80000 + HANDLE_ALIGN,
+        );
+    }
+    let range = 0x50000..0x50000 + 3 * PAGE_SIZE;
+    let reserve = |platform: &MockKernel,
+                   range: core::ops::Range<usize>,
+                   behavior: FixedAddressBehavior,
+                   grow| {
+        assert_ne!(behavior, FixedAddressBehavior::Replace);
+        // SAFETY: The fixture requests exclusively owned synthetic pages without replacement.
+        unsafe {
+            <MockKernel as PageManagementProvider<PAGE_SIZE>>::reserve_pages(
+                platform,
+                || -> core::iter::Empty<_> {
+                    panic!("non-replacing reserve must not request reservations")
+                },
+                range.clone(),
+                grow,
+                behavior,
+            )
+        }
+    };
+    let reservation = reserve(
+        platform,
+        range.clone(),
+        FixedAddressBehavior::NoReplace,
+        false,
+    )
+    .unwrap();
+    let release = release_reservations::<PAGE_SIZE>;
+    assert!(matches!(
+        platform
+            .page_table
+            .translate(VirtAddr::new(range.start as u64)),
+        TranslateResult::NotMapped
+    ));
+    assert_eq!(reservation.range(), range);
+    assert!(matches!(
+        reserve(
+            platform,
+            range.start + 1..range.end,
+            FixedAddressBehavior::NoReplace,
+            false
+        ),
+        Err(AllocationError::Unaligned)
+    ));
+    let physical_pointer =
+        |address: usize| match platform.page_table.translate(VirtAddr::new(address as u64)) {
+            TranslateResult::Mapped {
+                frame: MappedFrame::Size4KiB(frame),
+                ..
+            } => MockKernel::pa_to_va(frame.start_address()).as_mut_ptr::<u8>(),
+            other => panic!("expected committed physical page: {other:?}"),
+        };
+    // SAFETY: All frames and handles belong exclusively to this test; no users survive decommit or release.
+    unsafe {
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.start..range.start + PAGE_SIZE,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            true,
+        )
+        .unwrap();
+        let original = physical_pointer(range.start);
+        original.write(0x5a);
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+            MemoryRegionPermissions::READ,
+            true,
+        )
+        .unwrap();
+        assert_eq!(physical_pointer(range.start), original);
+        assert_eq!(original.read(), 0x5a);
+        assert!(matches!(
+            platform.page_table.translate(VirtAddr::new(range.start as u64)),
+            TranslateResult::Mapped { flags, .. } if !flags.contains(PageTableFlags::WRITABLE)
+        ));
+        for recommit in [true, false] {
+            for permissions in [
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                MemoryRegionPermissions::EXEC,
+                MemoryRegionPermissions::READ,
+            ] {
+                if recommit {
+                    <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+                        platform,
+                        || core::iter::once(&reservation),
+                        range.clone(),
+                        permissions,
+                        true,
+                    )
+                    .unwrap();
+                } else {
+                    <MockKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
+                        platform,
+                        || core::iter::once(&reservation),
+                        range.clone(),
+                        permissions,
+                    )
+                    .unwrap();
+                }
+                let mut expected = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+                expected.set(
+                    PageTableFlags::WRITABLE,
+                    permissions.contains(MemoryRegionPermissions::WRITE),
+                );
+                expected.set(
+                    PageTableFlags::NO_EXECUTE,
+                    !permissions.contains(MemoryRegionPermissions::EXEC),
+                );
+                for address in range.clone().step_by(PAGE_SIZE) {
+                    check_flags(&platform.page_table, address, expected);
+                }
+                assert_eq!(physical_pointer(range.start), original);
+                assert_eq!(original.read(), 0x5a);
+            }
+        }
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+            MemoryRegionPermissions::READ,
+        )
+        .unwrap();
+        assert_eq!(physical_pointer(range.start), original);
+        assert_eq!(original.read(), 0x5a);
+        assert_eq!(physical_pointer(range.start + PAGE_SIZE).read(), 0);
+        let old_range = range.start..range.start + PAGE_SIZE;
+        let mut remaining = vec![reservation];
+        let destination_reservation =
+            <MockKernel as PageManagementProvider<PAGE_SIZE>>::try_remap_pages(
+                platform,
+                || {
+                    let (prefix, source, suffix) =
+                        remaining.pop().unwrap().split(old_range.clone());
+                    remaining.extend(prefix);
+                    remaining.extend(suffix);
+                    core::iter::once(source)
+                },
+                old_range.clone(),
+                0x70000..0x70000 + 2 * PAGE_SIZE,
+                MemoryRegionPermissions::READ,
+            )
+            .unwrap();
+        let destination_range = destination_reservation.range();
+        remaining.push(destination_reservation);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(litebox::platform::page_mgmt::PageReservation::range)
+                .collect::<Vec<_>>(),
+            vec![old_range.end..range.end, 0x70000..0x70000 + 2 * PAGE_SIZE]
+        );
+        let suffix = remaining.remove(0);
+        assert_eq!(suffix.range(), old_range.end..range.end);
+        assert_eq!(physical_pointer(suffix.range().start).read(), 0);
+        assert_eq!(destination_range.start, 0x70000);
+        assert_eq!(destination_range.len(), 2 * PAGE_SIZE);
+        assert_eq!(physical_pointer(destination_range.start), original);
+        assert_eq!(physical_pointer(destination_range.start).read(), 0x5a);
+        assert_eq!(
+            physical_pointer(destination_range.start + PAGE_SIZE).read(),
+            0
+        );
+        assert!(matches!(
+            platform
+                .page_table
+                .translate(VirtAddr::new(range.start as u64)),
+            TranslateResult::NotMapped
+        ));
+        for destination in &remaining {
+            <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+                platform,
+                || core::iter::once(destination),
+                destination.range(),
+            )
+            .unwrap();
+        }
+        release(platform, remaining);
+        let reservation = reserve(
+            platform,
+            old_range.clone(),
+            FixedAddressBehavior::NoReplace,
+            false,
+        )
+        .unwrap();
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.start..range.start + PAGE_SIZE,
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            true,
+        )
+        .unwrap();
+        physical_pointer(range.start).write(0x5a);
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+            platform,
+            || core::iter::once(&suffix),
+            suffix.range(),
+        )
+        .unwrap();
+        let original = physical_pointer(range.start);
+        let mut remaining = vec![reservation];
+        let destination_reservation =
+            <MockKernel as PageManagementProvider<PAGE_SIZE>>::try_remap_pages(
+                platform,
+                || remaining.drain(..),
+                old_range.clone(),
+                0x80000..0x80000 + 2 * PAGE_SIZE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            )
+            .unwrap();
+        let moved = destination_reservation.range();
+        remaining.push(destination_reservation);
+        assert_eq!(moved, 0x80000..0x80000 + 2 * PAGE_SIZE);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].range(), moved);
+        assert_eq!(physical_pointer(moved.start), original);
+        assert_eq!(physical_pointer(moved.start).read(), 0x5a);
+        assert_eq!(physical_pointer(moved.end - PAGE_SIZE).read(), 0);
+        assert!(matches!(
+            platform
+                .page_table
+                .translate(VirtAddr::new(range.start as u64)),
+            TranslateResult::NotMapped
+        ));
+        release(platform, remaining);
+        release(platform, vec![suffix]);
+        let reservation = reserve(
+            platform,
+            range.clone(),
+            FixedAddressBehavior::NoReplace,
+            false,
+        )
+        .unwrap();
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+            MemoryRegionPermissions::READ,
+            true,
+        )
+        .unwrap();
+        physical_pointer(range.start).write(0x5a);
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
+            platform,
+            || -> core::iter::Once<
+                &litebox::platform::page_mgmt::ReservationOf<MockKernel, PAGE_SIZE>,
+            > {
+                panic!("range protection must not request reservations")
+            },
+            range.clone(),
+            MemoryRegionPermissions::empty(),
+        )
+        .unwrap();
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+            MemoryRegionPermissions::READ,
+        )
+        .unwrap();
+        assert_eq!(physical_pointer(range.start).read(), 0x5a);
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            platform
+                .page_table
+                .translate(VirtAddr::new(range.start as u64)),
+            TranslateResult::NotMapped
+        ));
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+            MemoryRegionPermissions::READ,
+            true,
+        )
+        .unwrap();
+        assert_eq!(physical_pointer(range.start).read(), 0);
+        let middle = range.start + PAGE_SIZE..range.start + 2 * PAGE_SIZE;
+        let prefix_frame = physical_pointer(range.start);
+        let suffix_frame = physical_pointer(range.end - PAGE_SIZE);
+        let mut remaining = vec![reservation];
+        let replacement = <MockKernel as PageManagementProvider<PAGE_SIZE>>::reserve_pages(
+            platform,
+            || {
+                let (prefix, replaced, suffix) = remaining.pop().unwrap().split(middle.clone());
+                remaining.extend(prefix);
+                remaining.extend(suffix);
+                core::iter::once(replaced)
+            },
+            middle.clone(),
+            false,
+            FixedAddressBehavior::Replace,
+        )
+        .unwrap();
+        assert_eq!(replacement.range(), middle);
+        assert!(matches!(
+            platform
+                .page_table
+                .translate(VirtAddr::new(middle.start as u64)),
+            TranslateResult::NotMapped
+        ));
+        assert_eq!(physical_pointer(range.start), prefix_frame);
+        assert_eq!(physical_pointer(range.end - PAGE_SIZE), suffix_frame);
+        assert_eq!(physical_pointer(range.start).read(), 0);
+        assert_eq!(physical_pointer(range.end - PAGE_SIZE).read(), 0);
+        assert_eq!(remaining.len(), 2);
+        let suffix = remaining.pop().unwrap();
+        let prefix = remaining.pop().unwrap();
+        assert_eq!(prefix.range(), range.start..range.start + PAGE_SIZE);
+        assert_eq!(suffix.range(), range.end - PAGE_SIZE..range.end);
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+            platform,
+            || core::iter::once(&prefix),
+            prefix.range(),
+        )
+        .unwrap();
+        release(platform, vec![prefix]);
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+            platform,
+            || core::iter::once(&suffix),
+            suffix.range(),
+        )
+        .unwrap();
+        release(platform, vec![suffix]);
+        release(platform, vec![replacement]);
+        let restored = reserve(
+            platform,
+            range.clone(),
+            FixedAddressBehavior::NoReplace,
+            false,
+        )
+        .unwrap();
+        release(platform, vec![restored]);
+
+        let reservation = <MockKernel as PageManagementProvider<PAGE_SIZE>>::reserve_pages(
+            platform,
+            || -> core::iter::Empty<_> {
+                panic!("no-replace reserve must not request reservations")
+            },
+            range.clone(),
+            false,
+            FixedAddressBehavior::NoReplace,
+        )
+        .unwrap();
+        assert_eq!(reservation.range(), range);
+        for address in range.clone().step_by(PAGE_SIZE) {
+            assert!(matches!(
+                platform.page_table.translate(VirtAddr::new(address as u64)),
+                TranslateResult::NotMapped
+            ));
+        }
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::commit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+            MemoryRegionPermissions::READ,
+            true,
+        )
+        .unwrap();
+        assert_eq!(physical_pointer(range.start).read(), 0);
+        <MockKernel as PageManagementProvider<PAGE_SIZE>>::decommit_pages(
+            platform,
+            || core::iter::once(&reservation),
+            range.clone(),
+        )
+        .unwrap();
+        release(platform, vec![reservation]);
+        assert!(matches!(
+            platform
+                .page_table
+                .translate(VirtAddr::new(range.start as u64)),
+            TranslateResult::NotMapped
+        ));
+        let restored = reserve(platform, range, FixedAddressBehavior::NoReplace, false).unwrap();
+        release(platform, vec![restored]);
+    }
 }

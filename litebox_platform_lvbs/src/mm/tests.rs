@@ -9,7 +9,7 @@ use arrayvec::ArrayVec;
 use litebox::{
     LiteBox,
     mm::{
-        PageManager,
+        LinuxPageManager,
         allocator::SafeZoneAllocator,
         linux::{PAGE_SIZE, PageFaultError, PageRange, VmFlags},
     },
@@ -30,6 +30,18 @@ use crate::{
 };
 
 use super::pgtable::PageTableImpl;
+
+#[test]
+fn test_execute_only_permissions_are_user_accessible() {
+    assert_eq!(
+        vmflags_to_pteflags(VmFlags::VM_EXEC),
+        PageTableFlags::USER_ACCESSIBLE
+    );
+    assert_eq!(
+        vmflags_to_pteflags(VmFlags::empty()),
+        PageTableFlags::NO_EXECUTE
+    );
+}
 
 const MAX_ORDER: usize = 23;
 
@@ -237,7 +249,7 @@ fn test_vmm_page_fault() {
         x86_64::PhysAddr::new(0),
     );
     let litebox = LiteBox::new(platform);
-    let vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
+    let vmm = LinuxPageManager::<_, PAGE_SIZE>::new(&litebox);
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(
