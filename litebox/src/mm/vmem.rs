@@ -188,6 +188,9 @@ bitflags::bitflags! {
         /// The mapping is shared.
         const SHARED = 1 << 6;
         /// Search for free address space from high addresses toward low addresses.
+        ///
+        /// This controls the page manager's initial candidate. A platform may relocate a hint
+        /// if that candidate collides with address space not tracked by the page manager.
         const TOP_DOWN = 1 << 7;
     }
 }

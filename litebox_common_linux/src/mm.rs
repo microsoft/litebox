@@ -72,6 +72,7 @@ pub fn do_mmap<
             CreatePagesFlags::SHARED,
             flags.contains(MapFlags::MAP_SHARED),
         );
+        create_flags.insert(CreatePagesFlags::TOP_DOWN);
         create_flags
     };
     let suggested_addr = match suggested_addr {
