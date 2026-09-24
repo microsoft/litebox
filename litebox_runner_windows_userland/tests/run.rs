@@ -191,6 +191,347 @@ fn brokered_windows_runner_command(initial_files: &std::path::Path) -> std::proc
     command
 }
 
+/// Runs the official Windows embeddable Python distribution through the
+/// runner. `LITEBOX_PYTHON_PATH` can point at a locally provided x64
+/// `python.exe`; otherwise the test downloads and verifies a pinned official
+/// distribution.
+///
+/// Python currently reaches CSR initialization. The completion oracle remains
+/// deferred until the shim implements `BasepNlsGetUserInfo`.
+#[test]
+#[ignore = "downloads Python and asserts a stable runtime progress floor"]
+fn run_python_pe() {
+    let source = python_source();
+    let source_dir = source
+        .parent()
+        .expect("LITEBOX_PYTHON_PATH must have a parent directory");
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let mut host_images = Vec::new();
+    for entry in std::fs::read_dir(source_dir)
+        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source_dir.display()))
+    {
+        let entry = entry.expect("failed to read Python distribution entry");
+        let file_type = entry
+            .file_type()
+            .expect("failed to read Python distribution entry type");
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let source_path = entry.path();
+        let destination = test_dir.join(entry.file_name());
+        let bytes = std::fs::read(&source_path)
+            .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source_path.display()));
+        let file_name = entry.file_name();
+        let file_name = file_name.to_str();
+        if matches!(file_name, Some("python.exe" | "python312.dll")) {
+            let rewritten =
+                litebox_syscall_rewriter::rewrite_binary(&bytes, None).unwrap_or_else(|error| {
+                    panic!("failed to rewrite `{}`: {error}", source_path.display())
+                });
+            std::fs::write(&destination, rewritten).unwrap();
+            host_images.push(bytes);
+        } else {
+            std::fs::write(&destination, bytes).unwrap();
+        }
+    }
+
+    assert!(
+        test_dir.join("python.exe").is_file(),
+        "Python distribution did not contain python.exe"
+    );
+    for image in &host_images {
+        stage_transitive_import_closure(&test_dir, image);
+    }
+
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    // command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/python.exe",
+        "-c",
+        "print('hello world')",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!(
+        "Python exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    assert!(
+        output.status.success(),
+        "Python failed; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert!(
+        stdout.lines().any(|line| line == "hello world"),
+        "Python output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn python_source() -> std::path::PathBuf {
+    const DISTRIBUTION_URL: &str =
+        "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip";
+    const DISTRIBUTION_SHA256: &str =
+        "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3";
+
+    if let Some(source) = std::env::var_os("LITEBOX_PYTHON_PATH") {
+        return source.into();
+    }
+
+    let download_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("python_3.12.10_embed_amd64");
+    std::fs::create_dir_all(&download_dir).expect("failed to create Python download directory");
+    let archive = download_dir.join("python-3.12.10-embed-amd64.zip");
+
+    if archive.exists() && sha256_file(&archive) != DISTRIBUTION_SHA256 {
+        println!(
+            "Removing cached Python distribution with an unexpected SHA-256: `{}`",
+            archive.display()
+        );
+        std::fs::remove_file(&archive)
+            .expect("failed to remove invalid cached Python distribution");
+    }
+
+    if !archive.exists() {
+        let temporary_archive = download_dir.join(format!(
+            "python-3.12.10-embed-amd64.zip.{}.tmp",
+            std::process::id()
+        ));
+        println!("Downloading Python from `{DISTRIBUTION_URL}`");
+        let status = std::process::Command::new("curl.exe")
+            .args([
+                "--fail",
+                "--location",
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "--output",
+            ])
+            .arg(&temporary_archive)
+            .arg(DISTRIBUTION_URL)
+            .status()
+            .expect("failed to start curl.exe to download Python");
+        assert!(status.success(), "curl.exe failed to download Python");
+
+        let actual_sha256 = sha256_file(&temporary_archive);
+        assert_eq!(
+            actual_sha256, DISTRIBUTION_SHA256,
+            "downloaded Python distribution has an unexpected SHA-256"
+        );
+        std::fs::rename(&temporary_archive, &archive)
+            .expect("failed to cache verified Python distribution");
+    }
+
+    let distribution_dir = download_dir.join("distribution");
+    let source = distribution_dir.join("python.exe");
+    if !source.exists() {
+        std::fs::create_dir_all(&distribution_dir)
+            .expect("failed to create Python extraction directory");
+        println!("Extracting verified Python distribution");
+        let status = std::process::Command::new("tar.exe")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&distribution_dir)
+            .status()
+            .expect("failed to start tar.exe");
+        assert!(
+            status.success(),
+            "tar.exe failed to extract Python with status {status}"
+        );
+        assert!(
+            source.is_file(),
+            "Python archive did not extract `{}`",
+            source.display()
+        );
+    }
+
+    source
+}
+
+/// Runs the official Windows Node.js distribution through the runner.
+/// `LITEBOX_NODE_PATH` can point at a locally provided x64 `node.exe`;
+/// otherwise the test downloads and verifies a pinned official distribution.
+#[test]
+#[ignore = "downloads and runs the official Node.js distribution"]
+fn run_node_pe() {
+    let source = node_source();
+    let test_dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("node");
+    let _ = std::fs::remove_dir_all(&test_dir);
+    std::fs::create_dir_all(&test_dir).unwrap();
+
+    let host_exe = std::fs::read(&source)
+        .unwrap_or_else(|error| panic!("failed to read `{}`: {error}", source.display()));
+    let rewritten = litebox_syscall_rewriter::rewrite_binary(&host_exe, None)
+        .expect("failed to rewrite node.exe");
+    std::fs::write(test_dir.join("node.exe"), rewritten).unwrap();
+
+    let host_mswsock = std::fs::read(host_system32_file_path("mswsock.dll"))
+        .expect("failed to read host mswsock.dll");
+    build_rewritten_system_dll(&test_dir, "mswsock.dll");
+
+    let host_dbgcore = std::fs::read(host_system32_file_path("dbgcore.dll"))
+        .expect("failed to read host dbgcore.dll");
+    build_rewritten_system_dll(&test_dir, "dbgcore.dll");
+
+    let host_bcryptprimitives = std::fs::read(host_system32_file_path("bcryptprimitives.dll"))
+        .expect("failed to read host bcryptprimitives.dll");
+    build_rewritten_system_dll(&test_dir, "bcryptprimitives.dll");
+
+    let host_cryptbase = std::fs::read(host_system32_file_path("cryptbase.dll"))
+        .expect("failed to read host cryptbase.dll");
+    build_rewritten_system_dll(&test_dir, "cryptbase.dll");
+    stage_startup_import_closures(
+        &test_dir,
+        [
+            host_exe.as_slice(),
+            host_mswsock.as_slice(),
+            host_dbgcore.as_slice(),
+            host_bcryptprimitives.as_slice(),
+            host_cryptbase.as_slice(),
+        ],
+    );
+
+    let tar_path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("node.tar");
+    create_tar_with_dir(&test_dir, &tar_path);
+
+    let mut command =
+        std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
+    // command.env("LITEBOX_LOG", "debug");
+    command.args([
+        "--initial-files",
+        tar_path.to_str().unwrap(),
+        "/node.exe",
+        "-e",
+        "console.log('hello world')",
+    ]);
+    println!("Running `{command:?}`");
+    let output = command
+        .output()
+        .expect("failed to run litebox_runner_windows_userland");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!(
+        "Node.js exit: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+
+    assert!(
+        output.status.success(),
+        "Node.js failed; status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        stdout,
+        stderr
+    );
+    assert_eq!(
+        stdout.trim_end(),
+        "hello world",
+        "Node.js output was not captured\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+fn node_source() -> std::path::PathBuf {
+    const DISTRIBUTION_URL: &str = "https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.zip";
+    const DISTRIBUTION_SHA256: &str =
+        "55b639295920b219bb2acbcfa00f90393a2789095b7323f79475c9f34795f217";
+
+    if let Some(source) = std::env::var_os("LITEBOX_NODE_PATH") {
+        return source.into();
+    }
+
+    let download_dir =
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("node_22.14.0_win_x64");
+    std::fs::create_dir_all(&download_dir).expect("failed to create Node.js download directory");
+    let archive = download_dir.join("node-v22.14.0-win-x64.zip");
+
+    if archive.exists() && sha256_file(&archive) != DISTRIBUTION_SHA256 {
+        println!(
+            "Removing cached Node.js distribution with an unexpected SHA-256: `{}`",
+            archive.display()
+        );
+        std::fs::remove_file(&archive)
+            .expect("failed to remove invalid cached Node.js distribution");
+    }
+
+    if !archive.exists() {
+        let temporary_archive = download_dir.join(format!(
+            "node-v22.14.0-win-x64.zip.{}.tmp",
+            std::process::id()
+        ));
+        println!("Downloading Node.js from `{DISTRIBUTION_URL}`");
+        let status = std::process::Command::new("curl.exe")
+            .args([
+                "--fail",
+                "--location",
+                "--proto",
+                "=https",
+                "--tlsv1.2",
+                "--output",
+            ])
+            .arg(&temporary_archive)
+            .arg(DISTRIBUTION_URL)
+            .status()
+            .expect("failed to start curl.exe to download Node.js");
+        assert!(status.success(), "curl.exe failed to download Node.js");
+
+        let actual_sha256 = sha256_file(&temporary_archive);
+        assert_eq!(
+            actual_sha256, DISTRIBUTION_SHA256,
+            "downloaded Node.js distribution has an unexpected SHA-256"
+        );
+        std::fs::rename(&temporary_archive, &archive)
+            .expect("failed to cache verified Node.js distribution");
+    }
+
+    let distribution_dir = download_dir.join("distribution");
+    let source = distribution_dir
+        .join("node-v22.14.0-win-x64")
+        .join("node.exe");
+    if !source.exists() {
+        std::fs::create_dir_all(&distribution_dir)
+            .expect("failed to create Node.js extraction directory");
+        println!("Extracting verified Node.js distribution");
+        let status = std::process::Command::new("tar.exe")
+            .arg("-xf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(&distribution_dir)
+            .status()
+            .expect("failed to start tar.exe");
+        assert!(
+            status.success(),
+            "tar.exe failed to extract Node.js with status {status}"
+        );
+        assert!(
+            source.is_file(),
+            "Node.js archive did not extract `{}`",
+            source.display()
+        );
+    }
+
+    source
+}
+
 /// Drives the real `7za b` CPU benchmark through the runner using the
 /// transitive-import-closure staging helper. `7za` is a large third-party
 /// binary that must not be committed. `LITEBOX_7ZA_PATH` can point at a locally
@@ -255,7 +596,7 @@ fn run_7za_benchmark_pe() {
 
     let mut command =
         std::process::Command::new(env!("CARGO_BIN_EXE_litebox_runner_windows_userland"));
-    command.env("LITEBOX_LOG", "debug");
+    // command.env("LITEBOX_LOG", "debug");
     command.args([
         "--initial-files",
         tar_path.to_str().unwrap(),
@@ -810,6 +1151,7 @@ impl core::fmt::Display for ClosureDiagnostic {
 #[derive(Default)]
 struct ImportScan {
     names: Vec<String>,
+    regular_names: Vec<String>,
     diagnostics: Vec<ClosureDiagnostic>,
 }
 
@@ -847,7 +1189,11 @@ fn scan_imports(image: &[u8]) -> ImportScan {
             Ok(mut descriptors) => loop {
                 match descriptors.next() {
                     Ok(Some(descriptor)) => match table.name(descriptor.name.get(LE)) {
-                        Ok(name) => scan.names.push(String::from_utf8_lossy(name).into_owned()),
+                        Ok(name) => {
+                            let name = String::from_utf8_lossy(name).into_owned();
+                            scan.regular_names.push(name.clone());
+                            scan.names.push(name);
+                        }
                         Err(error) => scan.diagnostics.push(ClosureDiagnostic::MalformedName(
                             ImportDirectory::Regular,
                             error.to_string(),
@@ -1027,15 +1373,37 @@ fn stage_transitive_import_closure(
     test_dir: &std::path::Path,
     guest_image: &[u8],
 ) -> StagingReport {
+    stage_import_closure(test_dir, [guest_image], true)
+}
+
+fn stage_startup_import_closures<'a>(
+    test_dir: &std::path::Path,
+    guest_images: impl IntoIterator<Item = &'a [u8]>,
+) -> StagingReport {
+    stage_import_closure(test_dir, guest_images, false)
+}
+
+fn stage_import_closure<'a>(
+    test_dir: &std::path::Path,
+    guest_images: impl IntoIterator<Item = &'a [u8]>,
+    include_delay_imports: bool,
+) -> StagingReport {
     let mut report = StagingReport::default();
     let mut staged = std::collections::BTreeSet::new();
+    let mut worklist = Vec::new();
 
-    let scan = scan_imports(guest_image);
-    for diagnostic in &scan.diagnostics {
-        println!("closure: {diagnostic}");
+    for guest_image in guest_images {
+        let scan = scan_imports(guest_image);
+        for diagnostic in &scan.diagnostics {
+            println!("closure: {diagnostic}");
+        }
+        report.diagnostics.extend(scan.diagnostics);
+        worklist.extend(if include_delay_imports {
+            scan.names
+        } else {
+            scan.regular_names
+        });
     }
-    report.diagnostics.extend(scan.diagnostics);
-    let mut worklist = scan.names;
 
     while let Some(import_name) = worklist.pop() {
         let Some(host_dll) = resolve_to_host_dll(&import_name) else {
@@ -1068,7 +1436,11 @@ fn stage_transitive_import_closure(
             println!("closure: {diagnostic}");
         }
         report.diagnostics.extend(scan.diagnostics);
-        worklist.extend(scan.names);
+        worklist.extend(if include_delay_imports {
+            scan.names
+        } else {
+            scan.regular_names
+        });
 
         match litebox_syscall_rewriter::rewrite_binary(&host_bytes, None) {
             Ok(rewritten) => {
