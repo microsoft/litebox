@@ -7,7 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::{
-    mm::linux::{CreatePagesFlags, NonZeroAddress},
+    mm::vmem::{CreatePagesFlags, NonZeroAddress},
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::MemoryRegionPermissions,
@@ -16,7 +16,7 @@ use crate::{
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::linux::{
+use super::vmem::{
     NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
 };
 
@@ -30,12 +30,14 @@ impl crate::platform::RawPointerProvider for DummyVmemBackend {
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
 impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
-    #[cfg(target_os = "linux")]
-    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    const TASK_ADDR_MIN: usize = 0x1_0000; // default linux/windows config
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
     #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
+    #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
 
     fn allocate_pages(
         &self,

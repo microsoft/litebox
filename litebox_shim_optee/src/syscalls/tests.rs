@@ -64,7 +64,7 @@ fn test_sys_get_time_system_is_monotonic() {
 
 #[test]
 fn test_sys_map_zi_uses_bottom_up_placement() {
-    use litebox::mm::linux::PAGE_SIZE;
+    use litebox::mm::vmem::PAGE_SIZE;
     use litebox_common_optee::LdelfMapFlags;
 
     let task = init_platform();

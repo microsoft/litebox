@@ -856,6 +856,7 @@ fn test_nine_p_deep_path_walk() {
     assert_eq!(status.size, 12);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn test_nine_p_chmod() {
     let ctx = crate::fs::resolver::Context::new();

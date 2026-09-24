@@ -8,7 +8,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::fs::errors::ReadError;
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE, PageRange},
+    mm::vmem::{MappingError, PAGE_SIZE, PageRange},
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},

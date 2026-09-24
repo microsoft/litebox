@@ -14,7 +14,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
-use litebox::mm::linux::VmFlags;
+use litebox::mm::vmem::VmFlags;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};

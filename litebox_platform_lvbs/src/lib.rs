@@ -17,7 +17,7 @@ use litebox::platform::{
     page_mgmt::DeallocationError,
 };
 use litebox::{
-    mm::linux::{PAGE_SIZE, PageRange},
+    mm::vmem::{PAGE_SIZE, PageRange},
     platform::page_mgmt::FixedAddressBehavior,
     shim::ContinueOperation,
     utils::TruncateExt,
@@ -1037,11 +1037,11 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         }
         let flags = u32::from(initial_permissions.bits())
             | if can_grow_down {
-                litebox::mm::linux::VmFlags::VM_GROWSDOWN.bits()
+                litebox::mm::vmem::VmFlags::VM_GROWSDOWN.bits()
             } else {
                 0
             };
-        let flags = litebox::mm::linux::VmFlags::from_bits(flags).unwrap();
+        let flags = litebox::mm::vmem::VmFlags::from_bits(flags).unwrap();
         Ok(current_pt.map_pages(range, flags, populate_pages_immediately))
     }
 
@@ -1086,7 +1086,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
         let new_flags =
-            litebox::mm::linux::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
+            litebox::mm::vmem::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
         unsafe {
             self.page_table_manager
                 .current_page_table()
@@ -1099,13 +1099,13 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     }
 }
 
-impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKernel<Host> {
+impl<Host: HostInterface> litebox::mm::vmem::VmemPageFaultHandler for LinuxKernel<Host> {
     unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,
-        flags: litebox::mm::linux::VmFlags,
+        flags: litebox::mm::vmem::VmFlags,
         error_code: u64,
-    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+    ) -> Result<(), litebox::mm::vmem::PageFaultError> {
         unsafe {
             self.page_table_manager
                 .current_page_table()
@@ -1113,7 +1113,7 @@ impl<Host: HostInterface> litebox::mm::linux::VmemPageFaultHandler for LinuxKern
         }
     }
 
-    fn access_error(error_code: u64, flags: litebox::mm::linux::VmFlags) -> bool {
+    fn access_error(error_code: u64, flags: litebox::mm::vmem::VmFlags) -> bool {
         mm::PageTable::<PAGE_SIZE>::access_error(error_code, flags)
     }
 }

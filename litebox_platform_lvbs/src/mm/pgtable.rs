@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use litebox::mm::linux::PageFaultError;
+use litebox::mm::vmem::PageFaultError;
 
 use crate::arch::{
     Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,

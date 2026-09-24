@@ -22,7 +22,7 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{PageManager, vmem::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
     platform::TimeProvider,
@@ -66,7 +66,7 @@ pub trait ShimPlatform:
     litebox::platform::RawPointerProvider
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox::mm::linux::VmemPageFaultHandler
+    + litebox::mm::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
@@ -85,7 +85,7 @@ impl<T> ShimPlatform for T where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox::mm::linux::VmemPageFaultHandler
+        + litebox::mm::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider

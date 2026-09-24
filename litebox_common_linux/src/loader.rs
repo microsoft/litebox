@@ -11,7 +11,7 @@
 use alloc::vec::Vec;
 use elf::file::FileHeader;
 use litebox::{
-    mm::linux::PAGE_SIZE,
+    mm::vmem::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };

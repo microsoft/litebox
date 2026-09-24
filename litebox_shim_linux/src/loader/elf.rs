@@ -6,7 +6,7 @@
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     fs::{Mode, OFlags},
-    mm::linux::{CreatePagesFlags, MappingError, PAGE_SIZE, VmFlags},
+    mm::vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmFlags},
     platform::PageManagementProvider,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
@@ -146,7 +146,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
             .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
             .and_then(|len| {
                 len.checked_add(if self.reserve_runtime_trampoline {
-                    litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE
+                    litebox::mm::vmem::DEFAULT_RESERVED_SPACE_SIZE
                 } else {
                     0
                 })
@@ -311,7 +311,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // embedded trampoline, reserve space so that brk starts past the
         // runtime trampoline region.
         let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
-            Some(litebox::mm::linux::DEFAULT_RESERVED_SPACE_SIZE)
+            Some(litebox::mm::vmem::DEFAULT_RESERVED_SPACE_SIZE)
         } else {
             None
         };
@@ -375,7 +375,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         };
 
         let sp = unsafe {
-            let length = litebox::mm::linux::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+            let length = litebox::mm::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
                 .pm
@@ -639,8 +639,8 @@ mod tests {
         // A grow-down mapping protects its guard gap below the mapped pages.
         // Bottom-up placement must skip the guard and the stack itself.
         let stack_start = hint + (STACK_GUARD_GAP << 1);
-        let stack_address = litebox::mm::linux::NonZeroAddress::new(stack_start).unwrap();
-        let stack_len = litebox::mm::linux::NonZeroPageSize::new(PAGE_SIZE).unwrap();
+        let stack_address = litebox::mm::vmem::NonZeroAddress::new(stack_start).unwrap();
+        let stack_len = litebox::mm::vmem::NonZeroPageSize::new(PAGE_SIZE).unwrap();
         // SAFETY: FIXED_ADDR is paired with NOREPLACE, so this cannot replace
         // an existing mapping. The test does not retain or access the returned
         // pointer and unmaps the exact range before continuing.

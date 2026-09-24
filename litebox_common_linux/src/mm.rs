@@ -4,7 +4,7 @@
 //! Common implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
 use litebox::{
-    mm::linux::{
+    mm::vmem::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
     platform::page_mgmt::DeallocationError,
@@ -17,16 +17,16 @@ const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 pub fn do_mmap<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+        + litebox::platform::PageManagementProvider<{ litebox::mm::vmem::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::vmem::PAGE_SIZE }>,
     suggested_addr: Option<usize>,
     len: usize,
     prot: ProtFlags,
     flags: MapFlags,
     ensure_space_after: bool,
-    op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, litebox::mm::linux::MappingError>,
-) -> Result<UserPtrMut<u8>, litebox::mm::linux::MappingError> {
+    op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, litebox::mm::vmem::MappingError>,
+) -> Result<UserPtrMut<u8>, litebox::mm::vmem::MappingError> {
     let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_platform_ptr::<Platform>(p));
     let flags = {
         let mut create_flags = CreatePagesFlags::empty();
@@ -90,9 +90,9 @@ pub fn do_mmap<
 pub fn sys_munmap<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+        + litebox::platform::PageManagementProvider<{ litebox::mm::vmem::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::vmem::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
     len: usize,
 ) -> Result<(), Errno> {
@@ -125,9 +125,9 @@ pub fn sys_munmap<
 pub fn sys_mprotect<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+        + litebox::platform::PageManagementProvider<{ litebox::mm::vmem::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::vmem::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
     len: usize,
     prot: ProtFlags,
@@ -160,9 +160,9 @@ pub fn sys_mprotect<
 pub fn sys_mremap<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+        + litebox::platform::PageManagementProvider<{ litebox::mm::vmem::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::vmem::PAGE_SIZE }>,
     old_addr: UserPtrMut<u8>,
     old_size: usize,
     new_size: usize,
@@ -223,9 +223,9 @@ pub fn sys_mremap<
 pub fn sys_brk<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+        + litebox::platform::PageManagementProvider<{ litebox::mm::vmem::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::vmem::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
 ) -> Result<usize, Errno> {
     // On failure, the brk syscall returns the current break, not a negative errno.
@@ -235,9 +235,9 @@ pub fn sys_brk<
 pub fn sys_madvise<
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
-        + litebox::platform::PageManagementProvider<{ litebox::mm::linux::PAGE_SIZE }>,
+        + litebox::platform::PageManagementProvider<{ litebox::mm::vmem::PAGE_SIZE }>,
 >(
-    pm: &litebox::mm::PageManager<Platform, { litebox::mm::linux::PAGE_SIZE }>,
+    pm: &litebox::mm::PageManager<Platform, { litebox::mm::vmem::PAGE_SIZE }>,
     addr: UserPtrMut<u8>,
     len: usize,
     advice: crate::MadviseBehavior,

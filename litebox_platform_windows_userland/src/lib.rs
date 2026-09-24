@@ -2147,17 +2147,17 @@ impl litebox::platform::CrngProvider for WindowsUserland {
 ///
 /// Page faults are handled transparently by the host Windows kernel.
 /// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
-impl litebox::mm::linux::VmemPageFaultHandler for WindowsUserland {
+impl litebox::mm::vmem::VmemPageFaultHandler for WindowsUserland {
     unsafe fn handle_page_fault(
         &self,
         _fault_addr: usize,
-        _flags: litebox::mm::linux::VmFlags,
+        _flags: litebox::mm::vmem::VmFlags,
         _error_code: u64,
-    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+    ) -> Result<(), litebox::mm::vmem::PageFaultError> {
         unreachable!("host kernel handles page faults for Windows userland")
     }
 
-    fn access_error(_error_code: u64, _flags: litebox::mm::linux::VmFlags) -> bool {
+    fn access_error(_error_code: u64, _flags: litebox::mm::vmem::VmFlags) -> bool {
         unreachable!("host kernel handles page faults for Windows userland")
     }
 }
@@ -2167,7 +2167,6 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use crate::WindowsUserland;
     use crate::{XsaveArea, XsaveLayout};
     use litebox::platform::RawMutex;
 

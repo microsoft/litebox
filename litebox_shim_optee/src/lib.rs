@@ -17,7 +17,7 @@ use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{PageManager, vmem::PAGE_SIZE},
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
     utils::TruncateExt,
@@ -47,7 +47,7 @@ pub trait OpteeShimPlatform:
     litebox::platform::RawPointerProvider
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox::mm::linux::VmemPageFaultHandler
+    + litebox::mm::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
@@ -63,7 +63,7 @@ impl<T> OpteeShimPlatform for T where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox::mm::linux::VmemPageFaultHandler
+        + litebox::mm::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider
@@ -324,7 +324,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
                 entrypoints.task.get_ta_stack_base_addr(),
             )
             .ok_or(loader::elf::ElfLoaderError::MappingError(
-                litebox::mm::linux::MappingError::OutOfMemory,
+                litebox::mm::vmem::MappingError::OutOfMemory,
             ))?;
             Some(ta_stack.get_params_address())
         } else {
@@ -379,7 +379,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// The caller must ensure that no references to the released memory regions
     /// are held after this call.
     pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::linux::VmFlags| true;
+        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::vmem::VmFlags| true;
         unsafe {
             let _ = self.page_manager().release_memory(release);
         }
@@ -882,7 +882,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
             let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
             elf_loader.load_ta_trampoline(ta_entry_point)?;
             self.allocate_guest_tls(None).map_err(|_| {
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory)
+                ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory)
             })?;
             self.ta_prepared.set(true);
         }
@@ -892,7 +892,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
 
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
-                ElfLoaderError::MappingError(litebox::mm::linux::MappingError::OutOfMemory),
+                ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory),
             )?;
         let memref_addresses = ta_stack
             .init(self.global.platform, params, shm_info)

@@ -12,7 +12,7 @@ use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
-    mm::linux::PAGE_SIZE,
+    mm::vmem::PAGE_SIZE,
     path,
     platform::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
