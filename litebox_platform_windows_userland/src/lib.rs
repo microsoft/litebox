@@ -49,56 +49,26 @@ thread_local! {
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct WindowsUserland {
-    // Windows cannot reacquire a released 4 KiB hole while adjacent pages retain the same
-    // 64 KiB native reservation, so keep native backing until its final logical owner releases it.
-    native_reservations: std::sync::Mutex<std::collections::BTreeMap<usize, NativeReservation>>,
     #[cfg(test)]
     fail_commit_at: core::sync::atomic::AtomicUsize,
 }
 
-struct NativeReservation {
-    range: core::ops::Range<usize>,
-    owned: Vec<core::ops::Range<usize>>,
-}
-
-/// Exclusive ownership of a logical extent within a Windows native reservation.
+/// Exclusive ownership of a logical address-space extent.
 #[derive(Debug)]
 pub struct WindowsUserlandReservation<const ALIGN: usize> {
     range: core::ops::Range<usize>,
-    backing: core::ops::Range<usize>,
 }
 
 impl<const ALIGN: usize> WindowsUserlandReservation<ALIGN> {
     unsafe fn new(range: core::ops::Range<usize>) -> Self {
         assert!(!range.is_empty());
         assert!(range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN));
-        Self {
-            backing: range.clone(),
-            range,
-        }
-    }
-
-    unsafe fn new_with_backing(
-        range: core::ops::Range<usize>,
-        backing: core::ops::Range<usize>,
-    ) -> Self {
-        assert!(backing.start <= range.start && range.end <= backing.end);
-        // SAFETY: The caller registered this unique owned range within the supplied backing.
-        unsafe { Self::new(range) }.with_backing(backing)
-    }
-
-    fn with_backing(mut self, backing: core::ops::Range<usize>) -> Self {
-        self.backing = backing;
-        self
-    }
-
-    fn into_parts(self) -> (core::ops::Range<usize>, core::ops::Range<usize>) {
-        (self.range, self.backing)
+        Self { range }
     }
 }
 
 // SAFETY: Construction is private, the type is neither Clone nor Copy, and split consumes the
-// original handle while returning disjoint ownership with the same native backing identity.
+// original handle while returning disjoint ownership covering the same extent.
 unsafe impl<const ALIGN: usize> litebox::platform::page_mgmt::PageReservation
     for WindowsUserlandReservation<ALIGN>
 {
@@ -108,21 +78,17 @@ unsafe impl<const ALIGN: usize> litebox::platform::page_mgmt::PageReservation
 
     fn split(self, range: core::ops::Range<usize>) -> (Option<Self>, Self, Option<Self>) {
         let extent = self.range;
-        let backing = self.backing;
         assert!(extent.start <= range.start && range.end <= extent.end && !range.is_empty());
         assert!(range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN));
         (
-            (extent.start < range.start).then(|| Self {
+            (extent.start < range.start).then_some(Self {
                 range: extent.start..range.start,
-                backing: backing.clone(),
             }),
             Self {
                 range: range.clone(),
-                backing: backing.clone(),
             },
             (range.end < extent.end).then_some(Self {
                 range: range.end..extent.end,
-                backing,
             }),
         )
     }
@@ -353,7 +319,6 @@ impl WindowsUserland {
         }
 
         let platform = Self {
-            native_reservations: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(test)]
             fail_commit_at: core::sync::atomic::AtomicUsize::new(0),
         };

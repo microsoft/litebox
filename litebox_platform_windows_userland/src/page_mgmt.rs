@@ -201,7 +201,6 @@ impl WindowsUserland {
 
 impl WindowsUserland {
     fn allocate_native_reservation<const ALIGN: usize>(
-        &self,
         range: core::ops::Range<usize>,
         permissions: Option<MemoryRegionPermissions>,
         behavior: FixedAddressBehavior,
@@ -219,36 +218,6 @@ impl WindowsUserland {
         }
         if range.end > maximum {
             return Err(AllocationError::AboveMaxAddress);
-        }
-        let reusable_backing = {
-            let mut reservations = self.native_reservations.lock().unwrap();
-            reservations.values_mut().find_map(|reservation| {
-                let is_covered =
-                    reservation.range.start <= range.start && range.end <= reservation.range.end;
-                let is_available = reservation
-                    .owned
-                    .iter()
-                    .all(|owned| range.end <= owned.start || owned.end <= range.start);
-                (is_covered && is_available).then(|| {
-                    reservation.owned.push(range.clone());
-                    reservation.range.clone()
-                })
-            })
-        };
-        if let Some(backing) = reusable_backing {
-            if let Some(permissions) = permissions {
-                // SAFETY: The registry transferred this currently unowned reserved range.
-                if unsafe { self.commit_native(range.clone(), permissions) }.is_err() {
-                    let mut reservations = self.native_reservations.lock().unwrap();
-                    let reservation = reservations
-                        .get_mut(&backing.start)
-                        .expect("registered backing must remain live");
-                    reservation.owned.retain(|owned| owned != &range);
-                    return Err(AllocationError::OutOfMemory);
-                }
-            }
-            // SAFETY: The registry granted unique ownership within this live native backing.
-            return Ok(unsafe { WindowsUserlandReservation::new_with_backing(range, backing) });
         }
         let extent = range;
         let base = Self::reserve_native::<ALIGN>(
@@ -268,16 +237,8 @@ impl WindowsUserland {
             unsafe { Self::release_native(base) };
             return Err(AllocationError::OutOfMemory);
         }
-        let backing = base..end;
-        self.native_reservations.lock().unwrap().insert(
-            base,
-            crate::NativeReservation {
-                range: backing.clone(),
-                owned: vec![backing.clone()],
-            },
-        );
         // SAFETY: Native reservation acquired this fresh exact extent with no other owner.
-        Ok(unsafe { WindowsUserlandReservation::new_with_backing(backing.clone(), backing) })
+        Ok(unsafe { WindowsUserlandReservation::new(base..end) })
     }
 }
 
@@ -298,7 +259,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
     where
         Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
     {
-        let reservation = self.allocate_native_reservation(range, None, behavior)?;
+        let reservation = Self::allocate_native_reservation(range, None, behavior)?;
         if behavior == FixedAddressBehavior::Replace {
             replaced_reservations().for_each(drop);
         }
@@ -320,7 +281,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
         if behavior == FixedAddressBehavior::Replace {
             return Err(ReserveAndCommitError::UnsupportedByPlatform);
         }
-        let reservation = self.allocate_native_reservation(range, Some(permissions), behavior)?;
+        let reservation = Self::allocate_native_reservation(range, Some(permissions), behavior)?;
         if populate {
             let extent = reservation.range();
             do_prefetch_on_range(extent.start, extent.len());
@@ -460,63 +421,46 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
                 kind: u32,
             ) -> i32;
         }
-        let (range, backing) = reservation.into_parts();
+        let range = reservation.range();
         assert!(!range.is_empty());
         debug_assert_alignment!(range, ALIGN);
-        let release_backing = {
-            let mut reservations = self.native_reservations.lock().unwrap();
-            let Some(native) = reservations.get_mut(&backing.start) else {
-                drop(reservations);
-                let mut address = range.start as *mut c_void;
-                let mut length = range.len();
-                // SAFETY: This unregistered fixture handle owns the supplied exact extent.
-                let status = unsafe {
-                    NtFreeVirtualMemory(
-                        GetCurrentProcess(),
-                        &raw mut address,
-                        &raw mut length,
-                        Win32_Memory::MEM_RELEASE,
-                    )
-                };
-                assert_eq!(status, 0, "failed to release owned backing: {status:#x}");
-                assert_eq!(address.addr(), range.start);
-                assert_eq!(length, range.len());
-                return;
+        let mut allocation = range.start..range.start;
+        loop {
+            let mut information = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: VirtualQuery only reads metadata for the supplied address.
+            let queried = unsafe {
+                Win32_Memory::VirtualQuery(
+                    allocation.end as *const c_void,
+                    &raw mut information,
+                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
+                )
             };
-            let mut survivors = Vec::new();
-            let mut removed = 0;
-            for owned in native.owned.drain(..) {
-                let start = owned.start.max(range.start);
-                let end = owned.end.min(range.end);
-                if start < end {
-                    removed += end - start;
-                    if owned.start < start {
-                        survivors.push(owned.start..start);
-                    }
-                    if end < owned.end {
-                        survivors.push(end..owned.end);
-                    }
-                } else {
-                    survivors.push(owned);
-                }
+            assert_ne!(
+                queried,
+                0,
+                "failed to query owned reservation: {}",
+                std::io::Error::last_os_error()
+            );
+            if allocation.is_empty() {
+                allocation.start = information.AllocationBase.addr();
+                allocation.end = allocation.start;
+            } else if information.AllocationBase.addr() != allocation.start {
+                break;
             }
-            assert_eq!(removed, range.len());
-            native.owned = survivors;
-            if native.owned.is_empty() {
-                reservations.remove(&backing.start);
-                true
-            } else {
-                false
-            }
-        };
-        if !release_backing {
-            // SAFETY: The released logical extent remains inside live registered native backing.
-            unsafe { Self::decommit_native(range) };
+            assert_eq!(information.AllocationBase.addr(), allocation.start);
+            let region_end = information.BaseAddress.addr() + information.RegionSize;
+            assert!(allocation.end < region_end);
+            allocation.end = region_end;
+        }
+        assert!(allocation.start <= range.start && range.end <= allocation.end);
+        if range == allocation {
+            // SAFETY: The handle covers this complete native allocation and has no users.
+            unsafe { Self::release_native(range.start) };
             return;
         }
-        let mut address = backing.start as *mut c_void;
-        let mut length = backing.len();
-        // SAFETY: The handle owns this extent exclusively; no users depend on the released pages.
+        let mut address = range.start as *mut c_void;
+        let mut length = range.len();
+        // SAFETY: The handle owns this strict subrange exclusively and has no remaining users.
         let status = unsafe {
             NtFreeVirtualMemory(
                 GetCurrentProcess(),
@@ -526,8 +470,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Wi
             )
         };
         assert_eq!(status, 0, "failed to release owned backing: {status:#x}");
-        assert_eq!(address.addr(), backing.start);
-        assert_eq!(length, backing.len());
+        assert_eq!(address.addr(), range.start);
+        assert_eq!(length, range.len());
     }
 }
 
@@ -562,6 +506,14 @@ mod tests {
     use super::PageStateUpdateError;
     use windows_sys::Win32::Foundation::GetLastError;
 
+    static VM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_vm_tests() -> std::sync::MutexGuard<'static, ()> {
+        VM_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn do_query_on_region(
         mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION,
         base_addr: *mut c_void,
@@ -594,6 +546,7 @@ mod tests {
     fn test_batched_commit_failure_restores_native_state() {
         const PAGE_SIZE: usize = 4096;
         const GRANULARITY: usize = 0x10000;
+        let _guard = lock_vm_tests();
         let platform = WindowsUserland::new();
         let writable = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         // SAFETY: The fixture exclusively owns all acquired private anonymous pages and excludes users during updates and release.
@@ -734,6 +687,7 @@ mod tests {
     #[test]
     fn test_page_backend_native_remap_is_unsupported() {
         type Pages = WindowsUserland;
+        let _guard = lock_vm_tests();
         for permissions in [
             MemoryRegionPermissions::empty(),
             MemoryRegionPermissions::READ,
@@ -817,6 +771,7 @@ mod tests {
         use litebox::platform::page_mgmt::AllocationError;
 
         const PAGE_SIZE: usize = 4096;
+        let _guard = lock_vm_tests();
         let base = WindowsUserland::reserve_native::<PAGE_SIZE>(
             0..PAGE_SIZE,
             FixedAddressBehavior::Hint,

@@ -12,6 +12,13 @@ use windows_sys::Win32::System::Memory as memory;
 
 const RESERVATION_ALIGNMENT: usize =
     <WindowsUserland as PageManagementProvider<4096>>::RESERVATION_ALIGNMENT;
+static VM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_vm_tests() -> std::sync::MutexGuard<'static, ()> {
+    VM_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn query(address: usize) -> memory::MEMORY_BASIC_INFORMATION {
     let mut information = memory::MEMORY_BASIC_INFORMATION::default();
@@ -66,6 +73,7 @@ fn startup_reservations_preserve_exact_native_ranges() {
     const PAGE_SIZE: usize = 4096;
     const ALIGNMENT: usize =
         <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::RESERVATION_ALIGNMENT;
+    let _guard = lock_vm_tests();
 
     let owner = WindowsUserland::new();
     let reservation =
@@ -97,6 +105,7 @@ fn startup_reservations_preserve_exact_native_ranges() {
 
 #[test]
 fn native_reserve_and_commit_preserves_ownership() {
+    let _guard = lock_vm_tests();
     let platform = WindowsUserland::new();
     let writable = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
     // SAFETY: The test owns all returned extents and ends accesses before releasing them.
@@ -186,6 +195,7 @@ fn native_reserve_and_commit_preserves_ownership() {
 #[test]
 fn automatic_hint_relocates_after_native_collision() {
     use litebox::mm::{CreatePagesFlags, LinuxPageManager, NonZeroAddress, NonZeroPageSize};
+    let _guard = lock_vm_tests();
 
     let platform = WindowsUserland::new();
     let manager = LinuxPageManager::<_, 4096>::new(&litebox::LiteBox::new(platform));
@@ -234,6 +244,7 @@ fn automatic_hint_relocates_after_native_collision() {
 
 #[test]
 fn explicit_backing_lifecycle() {
+    let _guard = lock_vm_tests();
     let platform = WindowsUserland::new();
     let reservation_alignment =
         <WindowsUserland as PageManagementProvider<4096>>::RESERVATION_ALIGNMENT;
@@ -345,6 +356,7 @@ fn explicit_backing_lifecycle() {
 #[test]
 fn batched_page_operations_preserve_native_boundaries() {
     const ALIGNMENT: usize = 0x10000;
+    let _guard = lock_vm_tests();
     let platform = WindowsUserland::new();
     let writable = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
     let probe = reserve_backing(
@@ -486,6 +498,7 @@ fn batched_page_operations_preserve_native_boundaries() {
 #[test]
 fn program_break_changes_within_a_page() {
     use litebox::mm::{CreatePagesFlags, LinuxPageManager, NonZeroPageSize};
+    let _guard = lock_vm_tests();
 
     let platform = WindowsUserland::new();
     let manager = LinuxPageManager::<_, 4096>::new(&litebox::LiteBox::new(platform));
@@ -518,6 +531,7 @@ fn manager_reuses_unmapped_hole_and_releases_empty_backing() {
         linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize},
     };
     use litebox::platform::RawPointerProvider;
+    let _guard = lock_vm_tests();
 
     let platform = WindowsUserland::new();
     let manager = LinuxPageManager::<_, 4096>::new(&litebox::LiteBox::new(platform));
@@ -615,7 +629,7 @@ fn manager_reuses_unmapped_hole_and_releases_empty_backing() {
         );
         manager.remove_pages(middle, 4096).unwrap();
         assert_eq!(query(extent.start).State, memory::MEM_COMMIT);
-        assert_eq!(query(extent.start + 4096).State, memory::MEM_RESERVE);
+        assert_eq!(query(extent.start + 4096).State, memory::MEM_FREE);
         assert_eq!(query(extent.start + 8192).State, memory::MEM_RESERVE);
         assert_eq!(
             manager
@@ -658,6 +672,7 @@ fn manager_commit_decommit_and_protect_preserve_ownership() {
         WindowsPageManager,
         linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize},
     };
+    let _guard = lock_vm_tests();
     let platform = WindowsUserland::new();
     let manager = WindowsPageManager::<_, 4096>::new(&litebox::LiteBox::new(platform));
     let initial_mappings = manager.mappings();
@@ -743,6 +758,7 @@ fn manager_split_release_and_bulk_cleanup_match_native_extents() {
         linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize},
     };
     use litebox::platform::RawPointerProvider;
+    let _guard = lock_vm_tests();
 
     let platform = WindowsUserland::new();
     let manager = WindowsPageManager::<_, 4096>::new(&litebox::LiteBox::new(platform));
@@ -772,7 +788,7 @@ fn manager_split_release_and_bulk_cleanup_match_native_extents() {
         let middle =
             <WindowsUserland as RawPointerProvider>::RawMutPointer::<u8>::from_usize(base + 4096);
         manager.remove_pages(middle, 4096).unwrap();
-        assert_eq!(query(base + 4096).State, memory::MEM_RESERVE);
+        assert_eq!(query(base + 4096).State, memory::MEM_FREE);
         assert_eq!(
             manager
                 .reservations()
@@ -782,7 +798,7 @@ fn manager_split_release_and_bulk_cleanup_match_native_extents() {
             vec![base..base + 4096, base + 8192..base + 12288]
         );
         assert_eq!(query(base).RegionSize, 4096);
-        assert_eq!(query(base + 8192).AllocationBase.addr(), base);
+        assert_eq!(query(base + 8192).AllocationBase.addr(), base + 8192);
         assert_eq!((base as *const u8).read(), 0x5a);
         assert_eq!(((base + 8192) as *const u8).read(), 0xa5);
         let suffix =
@@ -876,6 +892,7 @@ fn manager_remap_keeps_backing_and_page_state_consistent() {
         LinuxPageManager,
         linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize},
     };
+    let _guard = lock_vm_tests();
     for permissions in [
         None,
         Some(MemoryRegionPermissions::empty()),
@@ -970,6 +987,7 @@ fn manager_handles_native_boundaries_and_guest_replacement() {
         linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize},
     };
     const GRANULARITY: usize = 0x10000;
+    let _guard = lock_vm_tests();
     let platform = WindowsUserland::new();
     let probe = reserve_backing(
         platform,
@@ -1083,6 +1101,7 @@ fn manager_rejects_foreign_backing_without_changing_existing_mapping() {
         linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize},
     };
     const GRANULARITY: usize = 0x10000;
+    let _guard = lock_vm_tests();
     let platform = WindowsUserland::new();
     let probe = reserve_backing(
         platform,
