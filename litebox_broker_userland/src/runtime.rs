@@ -467,7 +467,7 @@ where
     if let Err(error) = association.activate_process() {
         return AssociationOutcome {
             result: Err(IoError::other(format!(
-                "failed to activate broker process association: {error}"
+                "failed to complete broker process startup: {error}"
             ))),
             abnormal: true,
         };

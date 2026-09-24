@@ -63,7 +63,7 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId, ThreadId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferError, SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
@@ -113,7 +113,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
         }
     }
 
-    /// Marks the process running after deployment-specific association activation.
+    /// Commits process startup after installation and validation.
     pub fn activate_process(&self) -> litebox_broker_core::Result<()> {
         self.process.complete_start()
     }
@@ -223,7 +223,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
 #[allow(clippy::too_many_arguments)]
 pub fn setup_connection<SetupChannel, Memory, ChannelError>(
     core: &BrokerCore,
-    process: Option<(Arc<BrokerProcess>, ThreadId)>,
+    process: Option<Arc<BrokerProcess>>,
     startup: Option<ProcessStartupData>,
     setup_channel: &mut SetupChannel,
     shared_buffers: Arc<SharedBufferPool<Memory>>,
@@ -319,12 +319,8 @@ where
         }
 
         let finish_on_setup_error = process.is_none();
-        let (process, initial_thread_id) = match process.take() {
-            Some((process, initial_thread_id))
-                if process.caller_credential() == caller_credential =>
-            {
-                (process, initial_thread_id)
-            }
+        let process = match process.take() {
+            Some(process) if process.caller_credential() == caller_credential => process,
             Some(_) => {
                 let error = ErrorCode::PolicyDenied;
                 setup_channel
@@ -333,26 +329,12 @@ where
                 return Ok(Err(ConnectionTermination::Rejected(error)));
             }
             None => match core.create_process(caller_credential, None) {
-                Ok(process) => match process.create_thread() {
-                    Ok(initial_thread_id) => (process, initial_thread_id),
-                    Err(
-                        error @ (litebox_broker_core::BrokerError::ResourceExhausted
-                        | litebox_broker_core::BrokerError::OutOfMemory),
-                    ) => {
-                        process.retire(true);
-                        let error = ErrorCode::from(error);
-                        setup_channel
-                            .send_handshake_response(&BrokerHandshakeResponse::Error(error))
-                            .map_err(BrokerHostError::Channel)?;
-                        return Ok(Err(ConnectionTermination::Rejected(error)));
-                    }
-                    Err(error) => {
-                        process.retire(true);
-                        return Err(BrokerHostError::from(error));
-                    }
-                },
-                Err(litebox_broker_core::BrokerError::ResourceExhausted) => {
-                    let error = ErrorCode::ResourceExhausted;
+                Ok(process) => process,
+                Err(
+                    error @ (litebox_broker_core::BrokerError::ResourceExhausted
+                    | litebox_broker_core::BrokerError::OutOfMemory),
+                ) => {
+                    let error = ErrorCode::from(error);
                     setup_channel
                         .send_handshake_response(&BrokerHandshakeResponse::Error(error))
                         .map_err(BrokerHostError::Channel)?;
@@ -364,7 +346,7 @@ where
         let response = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
-            initial_thread_id,
+            initial_thread_id: process.initial_thread_id(),
             startup,
         };
         let process_retained = retain_process(&process);
@@ -794,7 +776,6 @@ pub trait ProcessLauncher: Send + Sync {
     fn launch(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
-        initial_thread_id: ThreadId,
         startup: ProcessStartupData,
     ) -> core::result::Result<(), BrokerError>;
 }
@@ -855,16 +836,10 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
             return Err(RequestFailure::from(error));
         }
     };
-    let initial_thread_id = match process.create_thread() {
-        Ok(initial_thread_id) => initial_thread_id,
-        Err(error) => {
-            process.retire(true);
-            return Err(RequestFailure::from(error));
-        }
-    };
     let inherited_objects = InheritedProcessObjects::new(&inherited_objects)
         .expect("child handle count must match the bounded inheritance request");
     let process_id = process.id();
+    let initial_thread_id = process.initial_thread_id();
     if parent.is_cancellation_requested() {
         process.retire(true);
         return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
@@ -872,7 +847,6 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     launcher
         .launch(
             process,
-            initial_thread_id,
             ProcessStartupData {
                 format,
                 version,
@@ -1315,7 +1289,7 @@ mod tests {
         TcpOptionValue,
     };
     use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
-    use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, RequestId};
+    use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
     use litebox_platform::sync::{
         ImmediatelyWokenUp, RawMutex, RawMutexProvider, UnblockedOrTimedOut,
@@ -1613,7 +1587,8 @@ mod tests {
         );
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_socket_policy(SocketPolicy::guest_network()),
+                .with_socket_policy(SocketPolicy::guest_network())
+                .with_process_duplication_enabled(true),
         )
         .with_socket_provider(Arc::new(TestSocketProvider))
         .with_random_provider(Arc::new(TestRandomProvider))
@@ -1637,6 +1612,7 @@ mod tests {
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
         setup_failure_transfers_process_to_the_deployment_owner(&broker);
         precreated_root_negotiates_without_startup_data(&broker);
+        prepared_duplication_publishes_after_activation(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
@@ -1691,7 +1667,6 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let initial_thread_id = process.create_thread().unwrap();
         let mut channel = FakeHostControlChannel::new(
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerHandshakeRequest {
                 protocol_version: BROKER_PROTOCOL_VERSION,
@@ -1701,7 +1676,7 @@ mod tests {
 
         let association = setup_connection(
             broker,
-            Some((Arc::clone(&process), initial_thread_id)),
+            Some(Arc::clone(&process)),
             None,
             &mut channel,
             Arc::new(test_shared_buffers()),
@@ -1715,6 +1690,30 @@ mod tests {
         assert_eq!(association.process.id(), process.id());
         association.activate_process().unwrap();
         association.finish();
+    }
+
+    fn prepared_duplication_publishes_after_activation(broker: &BrokerCore) {
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child = broker
+            .create_process(parent.caller_credential(), Some(parent.id()))
+            .unwrap();
+        parent.prepare_duplication_child(&child).unwrap();
+        let association = BrokerHostAssociation::new(
+            Arc::clone(&child),
+            Arc::new(test_shared_buffers()),
+            test_readiness_sink(),
+        );
+
+        assert!(!child.is_running());
+        association.activate_process().unwrap();
+        assert!(child.is_running());
+
+        association.finish();
+        drop(child);
+        parent.retire(true);
     }
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
@@ -2097,13 +2096,11 @@ mod tests {
             }]
         );
         assert!(!setup_called.get());
-        assert_eq!(
-            broker
-                .create_process(CallerCredential::Unauthenticated, None)
-                .unwrap()
-                .id(),
-            root_process_id(5)
-        );
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        assert_eq!(process.id(), root_process_id(5));
+        assert_eq!(process.initial_thread_id(), ThreadId(6));
     }
 
     fn test_channel_rejects_active_request_before_negotiation(broker: &BrokerCore) {
@@ -2137,8 +2134,8 @@ mod tests {
             channel.handshake_responses,
             [BrokerHandshakeResponse::Negotiated {
                 broker_protocol_version: BROKER_PROTOCOL_VERSION,
-                process_id: root_process_id(6),
-                initial_thread_id: ThreadId(7),
+                process_id: root_process_id(7),
+                initial_thread_id: ThreadId(8),
                 startup: None,
             }]
         );
