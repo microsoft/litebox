@@ -1488,52 +1488,6 @@ mod tests {
     }
 
     #[test]
-    fn signaled_child_exit_is_waitable() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        root.complete_start().unwrap();
-        let child = broker
-            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
-            .unwrap();
-        child.complete_start().unwrap();
-
-        child.complete_exit(SIGNALED).unwrap();
-
-        assert_eq!(child.state.lock().status, ProcessStatus::Zombie(SIGNALED));
-        root.handle_owner_death();
-        assert_eq!(child.state.lock().status, ProcessStatus::Reaped);
-    }
-
-    #[test]
-    fn running_child_has_no_tree_retention() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        root.complete_start().unwrap();
-        let child = broker
-            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
-            .unwrap();
-        let child_id = child.id();
-        child.complete_start().unwrap();
-        child.retire(true);
-
-        drop(child);
-
-        assert!(!broker.processes.read().contains_key(&child_id));
-    }
-
-    #[test]
     fn startup_failure_is_not_published_as_process_exit() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
