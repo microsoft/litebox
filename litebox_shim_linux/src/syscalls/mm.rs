@@ -8,11 +8,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::fs::errors::ReadError;
 use litebox::{
-    mm::vmem::{MappingError, PAGE_SIZE, PageRange},
-    platform::{
-        PageManagementProvider, RawConstPointer,
-        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
-    },
+    mm::vmem::{CreatePagesFlags, MappingError, PAGE_SIZE},
+    platform::page_mgmt::MemoryRegionPermissions,
 };
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
@@ -168,7 +165,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Perform the normal mmap first (CoW or memcpy fallback).
         let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, &typed_fd, offset)
+            self.try_cow_mmap_file(suggested_addr, len, prot, flags, &typed_fd, offset)
         {
             cow_result?
         } else {
@@ -221,8 +218,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         suggested_addr: Option<usize>,
         len: usize,
-        prot: &ProtFlags,
-        flags: &MapFlags,
+        prot: ProtFlags,
+        flags: MapFlags,
         fd: &FileFd<Platform>,
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
@@ -243,61 +240,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return None;
         }
 
-        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
-            FixedAddressBehavior::NoReplace
-        } else if flags.contains(MapFlags::MAP_FIXED) {
-            FixedAddressBehavior::Replace
-        } else {
-            FixedAddressBehavior::Hint
-        };
-
-        let permissions = {
-            let mut perms = MemoryRegionPermissions::empty();
-            perms.set(
-                MemoryRegionPermissions::READ,
-                prot.contains(ProtFlags::PROT_READ),
-            );
-            perms.set(
-                MemoryRegionPermissions::WRITE,
-                prot.contains(ProtFlags::PROT_WRITE),
-            );
-            perms.set(
-                MemoryRegionPermissions::EXEC,
-                prot.contains(ProtFlags::PROT_EXEC),
-            );
-            perms
-        };
-
-        // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
-        // unified lock, so there is a theoretical race if two threads concurrently attempt a
-        // fixed-address mapping with replacement at the same address. In practice this is benign:
-        // if a program races like this both threads will register the same mapping anyway. Updating
-        // to a begin/attempt/commit scheme could close this race window entirely.
-        match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
-            self.global.platform,
-            suggested_addr.unwrap_or(0),
-            &static_data[offset..offset + len],
-            permissions,
-            fixed_behavior,
-        ) {
-            Ok(ptr) => {
-                let range =
-                    PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
-                        .unwrap();
-                // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
-                // `permissions`.
-                unsafe {
-                    self.global.pm.register_existing_mapping(
-                        range,
-                        permissions,
-                        true,
-                        fixed_behavior == FixedAddressBehavior::Replace,
-                        flags.contains(MapFlags::MAP_SHARED),
-                    )
-                }
-                .unwrap();
-                Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr)))
-            }
+        let create_flags = CreatePagesFlags::from(flags);
+        let permissions = MemoryRegionPermissions::from(prot);
+        match unsafe {
+            self.global.pm.try_create_cow_pages(
+                suggested_addr,
+                &static_data[offset..offset + len],
+                permissions,
+                create_flags,
+            )
+        } {
+            Ok(ptr) => Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr))),
             Err(_cow_not_supported) => None,
         }
     }

@@ -18,74 +18,79 @@ use crate::{
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::vmem::{
-    FindAreaRequest, MappingState, NoTrackedReservations, NonZeroPageSize, PAGE_SIZE, PageRange,
-    VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
+    FindAreaRequest, NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem,
+    VmemProtectError, VmemResizeError,
 };
 
 crate::define_page_reservation!(TestReservation);
 
 #[test]
-fn mapping_state_supports_untracked_reservations() {
-    let mut state = MappingState::<NoTrackedReservations>::default();
-    state
-        .vmas
-        .insert(0x1000..0x2000, VmArea::new(VmFlags::VM_READ, false));
-
-    assert!(state.vmas.contains_key(&0x1000));
-    assert_eq!(state.reservations.iter().count(), 0);
-    assert_eq!(state.reservations.overlapping(0x1000..0x2000).count(), 0);
-    assert!(
-        state
-            .reservations
-            .take_overlapping(0x1000..0x2000)
-            .is_empty()
-    );
-}
-
-#[test]
-fn find_area_optionally_excludes_tracked_reservations() {
+fn find_area_respects_tracked_reservations_in_both_directions() {
     let mut reservations = TrackedReservations::default();
-    let reserved = 0x1_7000..0x1_8000;
-    // SAFETY: The test range is nonempty, aligned, and uniquely represented.
-    let reservation = unsafe { TestReservation::<PAGE_SIZE>::new(reserved.clone()) };
-    assert!(reservations.insert(reserved.start, reservation).is_none());
+    for reserved in [0x1_0000..0x1_2000, 0x1_7000..0x1_8000] {
+        // SAFETY: Each test range is nonempty, aligned, disjoint, and uniquely represented.
+        let reservation = unsafe { TestReservation::<PAGE_SIZE>::new(reserved.clone()) };
+        assert!(reservations.insert(reserved.start, reservation).is_none());
+    }
     let vmas = rangemap::RangeMap::new();
-    let request = |include_reservations| FindAreaRequest {
+    let request = |include_reservations, top_down| FindAreaRequest {
         suggested_address: None,
         length: NonZeroPageSize::new(PAGE_SIZE).unwrap(),
         behavior: crate::platform::page_mgmt::FixedAddressBehavior::Hint,
         alignment: PAGE_SIZE,
         include_reservations,
         address_range: 0x1_0000..0x1_8000,
-        top_down: true,
+        top_down,
     };
 
     assert_eq!(
-        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(&reservations, &vmas, request(false))
-            .unwrap(),
+        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(
+            &reservations,
+            &vmas,
+            request(false, true)
+        )
+        .unwrap(),
         Some(0x1_7000)
     );
     assert_eq!(
-        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(&reservations, &vmas, request(true))
-            .unwrap(),
+        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(
+            &reservations,
+            &vmas,
+            request(true, true)
+        )
+        .unwrap(),
         Some(0x1_6000)
+    );
+    assert_eq!(
+        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(
+            &reservations,
+            &vmas,
+            request(false, false)
+        )
+        .unwrap(),
+        Some(0x1_0000)
+    );
+    assert_eq!(
+        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(
+            &reservations,
+            &vmas,
+            request(true, false)
+        )
+        .unwrap(),
+        Some(0x1_2000)
     );
 }
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
-struct DummyVmemBackend<const RESERVATION_ALIGN: usize = PAGE_SIZE>;
+struct DummyVmemBackend;
 
-impl<const RESERVATION_ALIGN: usize> crate::platform::RawPointerProvider
-    for DummyVmemBackend<RESERVATION_ALIGN>
-{
+impl crate::platform::RawPointerProvider for DummyVmemBackend {
     type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
-impl<const RESERVATION_ALIGN: usize> crate::platform::PageManagementProvider<PAGE_SIZE>
-    for DummyVmemBackend<RESERVATION_ALIGN>
-{
+impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux/windows config
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -94,7 +99,6 @@ impl<const RESERVATION_ALIGN: usize> crate::platform::PageManagementProvider<PAG
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
-    const RESERVATION_ALIGNMENT: usize = RESERVATION_ALIGN;
 
     fn allocate_pages(
         &self,
@@ -134,23 +138,6 @@ impl<const RESERVATION_ALIGN: usize> crate::platform::PageManagementProvider<PAG
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
         core::iter::empty()
     }
-}
-
-#[test]
-fn automatic_placement_uses_reservation_alignment() {
-    type Backend = DummyVmemBackend<0x1_0000>;
-    let vmm = Vmem::<Backend, PAGE_SIZE>::new(&DummyVmemBackend::<0x1_0000>);
-    let address = vmm
-        .get_unmmaped_area(
-            None,
-            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-            crate::platform::page_mgmt::FixedAddressBehavior::Hint,
-            true,
-        )
-        .unwrap()
-        .unwrap();
-
-    assert!(address.is_multiple_of(Backend::RESERVATION_ALIGNMENT));
 }
 
 fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
@@ -312,7 +299,7 @@ fn test_vmm_mapping() {
         }
         .unwrap()
         .as_usize(),
-        DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE,
+        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE,
     );
     assert_eq!(
         collect_mappings(&vmm),
@@ -320,8 +307,7 @@ fn test_vmm_mapping() {
             start_addr..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
-                ..DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
 
@@ -346,8 +332,7 @@ fn test_vmm_mapping() {
             start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
-                ..DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
 
@@ -369,8 +354,7 @@ fn test_vmm_mapping() {
             start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
             start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
-                ..DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
         ]
     );
 }

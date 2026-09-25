@@ -107,6 +107,20 @@ bitflags::bitflags! {
     }
 }
 
+impl From<CreatePagesFlags> for FixedAddressBehavior {
+    fn from(flags: CreatePagesFlags) -> Self {
+        if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+            if flags.contains(CreatePagesFlags::NOREPLACE) {
+                FixedAddressBehavior::NoReplace
+            } else {
+                FixedAddressBehavior::Replace
+            }
+        } else {
+            FixedAddressBehavior::Hint
+        }
+    }
+}
+
 impl VmFlags {
     /// Compute the default `VM_MAY*` and `VM_SHARED` flags for a mapping.
     ///
@@ -177,6 +191,7 @@ pub const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
 
 bitflags::bitflags! {
     /// Options for page creation.
+    #[derive(Clone, Copy)]
     pub struct CreatePagesFlags: u8 {
         /// Force the mapping to be created at the given address, resulting in any
         /// existing overlapping mappings being removed.
@@ -197,8 +212,9 @@ bitflags::bitflags! {
         const SHARED = 1 << 6;
         /// Search for free address space from high addresses toward low addresses.
         ///
-        /// This controls the page manager's initial candidate. A platform may relocate a hint
-        /// if that candidate collides with address space not tracked by the page manager.
+        /// This controls the page manager's initial candidate. However, the candidate may collides
+        /// with address space not tracked by the page manager (due to external allocators), and
+        /// a platform may relocate a hint to a different address using its own search strategy.
         const TOP_DOWN = 1 << 7;
     }
 }
@@ -513,56 +529,6 @@ where
         Ok(())
     }
 
-    /// Reset pages without removing its mapping (similar to Linux `madvise` with
-    /// `MADV_DONTNEED` or `MADV_FREE`).
-    ///
-    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
-    /// returns `Err(VmemResetError::FileBacked)`.
-    ///
-    /// The current implementation effectively re-inserts the mapping with the same
-    /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
-    ///
-    /// # Panics
-    ///
-    /// File-backed mapping is not supported yet.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the memory contents in the affected region are no longer accessed or
-    /// relied upon. Any pointers or references to the previous contents become invalid.
-    pub(super) unsafe fn reset_pages(
-        &mut self,
-        range: PageRange<ALIGN>,
-        anonymous_only: bool,
-    ) -> Result<(), VmemResetError> {
-        let range: Range<usize> = range.into();
-        // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
-        // while still resetting all of the existing vmas in the range.
-        let unmapped_error = self.vmas.gaps(&range).next().is_some();
-        let overlapping_ranges: Vec<(Range<usize>, VmArea)> = self
-            .overlapping(range.clone())
-            .map(|(r, vma)| (r.clone(), *vma))
-            .collect();
-        for (r, vma) in overlapping_ranges {
-            if vma.is_file_backed() {
-                if anonymous_only {
-                    return Err(VmemResetError::FileBacked);
-                }
-                unimplemented!("resetting file-backed mappings is not supported yet");
-            }
-            let start = r.start.max(range.start);
-            let end = r.end.min(range.end);
-            let new_range = PageRange::new(start, end).unwrap();
-            unsafe { self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Replace) }
-                .expect("failed to reset pages");
-        }
-        if unmapped_error {
-            Err(VmemResetError::AlreadyUnallocated)
-        } else {
-            Ok(())
-        }
-    }
-
     /// Insert a range to its virtual address space.
     ///
     /// If the inserted range partially or completely overlaps any
@@ -595,7 +561,7 @@ where
             FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
             FixedAddressBehavior::NoReplace => {
                 // Ensure there are no mappings managed by us.
-                if self.overlaps(start..end, true) {
+                if self.vmas.overlaps(&(start..end)) {
                     return Err(AllocationError::AddressInUse);
                 }
                 FixedAddressBehavior::NoReplace
@@ -674,7 +640,7 @@ where
     /// - [`CreatePagesFlags::FIXED_ADDR`] with [`CreatePagesFlags::NOREPLACE`]: Forces allocation at
     ///   the exact address, but fails with [`AllocationError::AddressInUse`] if any part of the
     ///   range is already mapped. This is safe to use without checking for existing mappings first.
-    /// - Otherwise, an address without [`CreatePagesFlags::FIXED_ADDR`] is treated as a hint.
+    /// - Without [`CreatePagesFlags::FIXED_ADDR`], the address is treated as a hint.
     ///
     /// Note: `NOREPLACE` error responses (`AddressInUse` / `EEXIST`) can be used to probe memory
     /// layout. This matches Linux kernel behavior for `MAP_FIXED_NOREPLACE`.
@@ -698,15 +664,7 @@ where
                 0
             })
         .unwrap();
-        let behavior = if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-            if flags.contains(CreatePagesFlags::NOREPLACE) {
-                FixedAddressBehavior::NoReplace
-            } else {
-                FixedAddressBehavior::Replace
-            }
-        } else {
-            FixedAddressBehavior::Hint
-        };
+        let behavior = FixedAddressBehavior::from(flags);
         let new_addr = self
             .get_unmmaped_area(
                 suggested_address,
@@ -1020,11 +978,11 @@ where
     /*================================Internal Functions================================ */
 
     /// Get an unmapped area in the virtual address space.
-    /// `suggested_address` and `behavior` describe the requested mmap placement.
+    /// `suggested_address` and `behavior` are the hint address and placement policy respectively,
+    /// similar to how `mmap` works.
     ///
     /// Returns `None` if no area was found. Otherwise, returns the start address of an
     /// `ALIGN`-aligned area.
-    #[inline]
     pub(super) fn get_unmmaped_area(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -1108,10 +1066,10 @@ where
             return Err(AllocationError::BelowMinAddress);
         }
 
-        Ok(Self::find_area_in_range_with(reservations, vmas, &request))
+        Ok(Self::find_area_in_range(reservations, vmas, &request))
     }
 
-    fn find_area_in_range_with(
+    fn find_area_in_range(
         reservations: &Store,
         vmas: &RangeMap<usize, VmArea>,
         request: &FindAreaRequest<ALIGN>,

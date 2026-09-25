@@ -5,6 +5,7 @@
 
 pub mod allocator;
 pub mod exception_table;
+pub mod linux;
 pub mod vmem;
 
 #[cfg(test)]
@@ -14,17 +15,14 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use vmem::{
-    CreatePagesFlags, MappingError, NoTrackedReservations, PageFaultError, PageRange, VmArea,
-    VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
+    CreatePagesFlags, MappingError, NoTrackedReservations, PageFaultError, PageRange, VmFlags,
+    Vmem, VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
 };
 
 use crate::{
     LiteBox,
-    mm::vmem::{NonZeroAddress, NonZeroPageSize, VmemResetError},
-    platform::{
-        PageManagementProvider, RawConstPointer,
-        page_mgmt::{MemoryRegionPermissions, RemapError},
-    },
+    mm::vmem::{NonZeroAddress, NonZeroPageSize},
+    platform::{PageManagementProvider, RawConstPointer, page_mgmt::MemoryRegionPermissions},
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -278,87 +276,6 @@ where
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
     }
 
-    /// Set the initial program break address.
-    ///
-    /// This function should be called once to set the initial program break,
-    /// which is usually the end of the data segment.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the initial program break is already set.
-    pub fn set_initial_brk(&self, brk: usize) {
-        let mut vmem = self.vmem.write();
-        assert_eq!(vmem.brk, 0, "initial brk is already set");
-        vmem.brk = brk;
-    }
-
-    /// Set the program break to the given address.
-    ///
-    /// Increasing the program break has the effect of allocating memory to the process;
-    /// decreasing the break deallocates memory.
-    /// Calling `brk` with 0 can be used to find the current location of the program break.
-    ///
-    /// Note the initial program break is set to zero and the first call to `brk` would set it
-    /// to the given address, which is usually the end of the data segment.
-    ///
-    /// ## Returns
-    ///
-    /// If the operation is successful, it returns the new program break address.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the initial program break is not set yet.
-    ///
-    /// # Safety
-    ///
-    /// If shrinking the program break, the caller must ensure that the released memory region is no longer used.
-    pub unsafe fn brk(&self, brk: usize) -> Result<usize, MappingError> {
-        let mut vmem = self.vmem.write();
-        assert_ne!(vmem.brk, 0, "initial brk is not set yet");
-        if brk == 0 {
-            // Calling `brk` with 0 can be used to find the current location of the program break.
-            return Ok(vmem.brk);
-        }
-
-        let old_brk = vmem.brk.next_multiple_of(vmem::PAGE_SIZE);
-        let new_brk = brk.next_multiple_of(vmem::PAGE_SIZE);
-        if vmem.brk >= brk {
-            // Shrink the memory region
-            let brk = match unsafe {
-                vmem.remove_mapping(
-                    PageRange::new(new_brk, old_brk).ok_or(MappingError::UnAligned)?,
-                )
-            } {
-                Ok(()) => {
-                    vmem.brk = brk;
-                    brk
-                }
-                Err(_) => {
-                    vmem.brk // No change, return the old brk
-                }
-            };
-            return Ok(brk);
-        }
-
-        if vmem.overlapping(old_brk..new_brk).next().is_some() {
-            return Err(MappingError::OutOfMemory);
-        }
-        if let Some(range) = PageRange::<ALIGN>::new(old_brk, new_brk) {
-            let (suggested_address, length) = range.start_and_length();
-            let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-            unsafe {
-                vmem.create_pages(
-                    Some(suggested_address),
-                    length,
-                    CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                    perms,
-                )
-            }?;
-        }
-        vmem.brk = brk;
-        Ok(brk)
-    }
-
     /// Release memory mappings that satisfy the given condition and reset the program break.
     ///
     /// # Safety
@@ -384,107 +301,6 @@ where
         vmem.brk = 0;
 
         Ok(())
-    }
-
-    /// Expands (or shrinks) an existing memory mapping
-    ///
-    /// `old_addr` is the old address of the virtual memory block that you want to expand (or shrink).
-    ///
-    /// `old_size` is the size of the old memory block.
-    ///
-    /// `new_size` is the new size of the memory block.
-    ///
-    /// `may_move` indicates whether the memory block can be moved to a new address if there is not sufficient
-    /// space to expand the old memory block at its current location.
-    ///
-    /// ## Returns
-    ///
-    /// If the operation is successful, it returns the new address of the memory block.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the memory region is no longer used by any other.
-    pub unsafe fn remap_pages(
-        &self,
-        old_addr: Platform::RawMutPointer<u8>,
-        old_size: usize,
-        new_size: usize,
-        may_move: bool,
-    ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
-        let mut vmem = self.vmem.write();
-        let old_range = PageRange::new(old_addr.as_usize(), old_addr.as_usize() + old_size)
-            .ok_or(RemapError::Unaligned)?;
-        match unsafe {
-            vmem.resize_mapping(
-                old_range,
-                NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
-            )
-        } {
-            Ok(()) => Ok(old_addr),
-            Err(vmem::VmemResizeError::RangeOccupied(_)) => {
-                // trying to remap a subset of an existing mapping
-                if !may_move {
-                    return Err(RemapError::OutOfMemory);
-                }
-                match unsafe {
-                    vmem.move_mappings(
-                        old_range,
-                        None,
-                        NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
-                    )
-                } {
-                    Ok(new_addr) => Ok(new_addr),
-                    Err(vmem::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
-                    Err(vmem::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
-                    Err(vmem::VmemMoveError::RemapError(err)) => Err(err),
-                }
-            }
-            Err(vmem::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
-            Err(vmem::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
-            Err(vmem::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
-        }
-    }
-
-    /// Remove pages from the mapping.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the memory region is no longer used by any other.
-    pub unsafe fn remove_pages(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-    ) -> Result<(), VmemUnmapError> {
-        let mut vmem = self.vmem.write();
-        let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
-        unsafe { vmem.remove_mapping(range) }
-    }
-
-    /// Reset pages without removing its mapping.
-    ///
-    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
-    /// returns `Err(VmemResetError::FileBacked)`.
-    ///
-    /// After calling this function, the memory region remains mapped, but its contents are invalidated.
-    /// Subsequent accesses to the region will result in repopulating the memory contents, either from
-    /// the underlying mapped file (for file-backed mappings, which is supported) or as zero-filled pages
-    /// (for anonymous mappings).
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the memory contents in the affected region are no longer accessed or
-    /// relied upon. Any pointers or references to the previous contents become invalid.
-    pub unsafe fn reset_pages(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-        anonymous_only: bool,
-    ) -> Result<(), VmemResetError> {
-        let mut vmem = self.vmem.write();
-        let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len).ok_or(VmemResetError::UnAligned)?;
-        unsafe { vmem.reset_pages(range, anonymous_only) }
     }
 
     /// Internal common function used by `make_pages_*` to change page permissions.
@@ -589,40 +405,6 @@ where
                 | MemoryRegionPermissions::WRITE
                 | MemoryRegionPermissions::EXEC,
         )
-    }
-
-    /// Register an already-allocated memory region in the VMA tracker.
-    ///
-    /// This is used when memory has been allocated by some means other than the normal
-    /// `create_*_pages` path (e.g., CoW mappings created directly by the platform), so that the
-    /// page manager tracks the region for future `mprotect`, `munmap`, etc.
-    ///
-    /// If `replace` is `true`, any overlapping tracked mappings are evicted from the tracker
-    /// (without calling the platform deallocator) before inserting. Otherwise, returns `None`
-    /// without registering if the provided `range` overlaps with any existing mapping.
-    ///
-    /// # Safety
-    ///
-    /// The `range` must be an already-mapped region with the given `permissions`.
-    #[must_use]
-    pub unsafe fn register_existing_mapping(
-        &self,
-        range: PageRange<ALIGN>,
-        permissions: MemoryRegionPermissions,
-        is_file_backed: bool,
-        replace: bool,
-        shared: bool,
-    ) -> Option<()> {
-        let vma = VmArea::new(
-            VmFlags::from(permissions) | VmFlags::may_flags_for_mapping(shared, is_file_backed),
-            is_file_backed,
-        );
-        let mut vmem = self.vmem.write();
-        if !replace && vmem.overlapping(range.into()).next().is_some() {
-            return None;
-        }
-        vmem.register_existing_mapping_overwrite(range, vma);
-        Some(())
     }
 
     /// Returns all mappings in a vector.

@@ -66,7 +66,7 @@ impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
 
 pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
     let mut flags = PageTableFlags::empty();
-    if values.intersects(VmFlags::VM_READ | VmFlags::VM_WRITE) {
+    if values.intersects(VmFlags::VM_ACCESS_FLAGS) {
         flags |= PageTableFlags::USER_ACCESSIBLE;
     }
     if values.contains(VmFlags::VM_WRITE) {
