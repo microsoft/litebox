@@ -114,7 +114,6 @@ pub(crate) struct RunnerCompletion {
     abnormal: bool,
     runner_signal: Option<i32>,
     runner_exit_code: Option<i32>,
-    runner_core_dumped: bool,
     broker_termination: bool,
 }
 
@@ -125,7 +124,6 @@ impl RunnerCompletion {
             abnormal: true,
             runner_signal: None,
             runner_exit_code: None,
-            runner_core_dumped: false,
             broker_termination: false,
         }
     }
@@ -145,7 +143,6 @@ impl RunnerCompletion {
         if let Some(signal) = self.runner_signal {
             ProcessExitStatus::Signaled {
                 signal: signal.cast_unsigned(),
-                core_dumped: self.runner_core_dumped,
             }
         } else if let Some(code) = self.runner_exit_code {
             ProcessExitStatus::Exited {
@@ -311,11 +308,6 @@ impl RunnerInstance {
             .copied()
             .and_then(runner_exit_signal);
         let runner_exit_code = runner_status.as_ref().ok().and_then(ExitStatus::code);
-        let runner_core_dumped = runner_status
-            .as_ref()
-            .ok()
-            .copied()
-            .is_some_and(runner_core_dumped);
         let result = runner_status.and_then(|runner_status| {
             runner_exited.map(|_| ())?;
             association_result.result?;
@@ -326,7 +318,6 @@ impl RunnerInstance {
             abnormal,
             runner_signal,
             runner_exit_code,
-            runner_core_dumped,
             broker_termination: self.shutdown.termination_was_dispatched(),
         }
     }
@@ -351,18 +342,6 @@ fn runner_exit_signal(status: ExitStatus) -> Option<i32> {
     use std::os::unix::process::ExitStatusExt;
 
     status.signal()
-}
-
-#[cfg(target_os = "linux")]
-fn runner_core_dumped(status: ExitStatus) -> bool {
-    use std::os::unix::process::ExitStatusExt;
-
-    status.core_dumped()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn runner_core_dumped(_status: ExitStatus) -> bool {
-    false
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -463,55 +442,8 @@ fn wait_for_runner_exit(runner: &Arc<Mutex<Child>>) -> IoResult<ExitStatus> {
 
 #[cfg(test)]
 mod tests {
-    use litebox_broker_protocol::process::ProcessExitStatus;
     use std::sync::{Arc, Condvar, Mutex, atomic::AtomicBool, mpsc};
     use std::time::Duration;
-
-    #[test]
-    fn runner_completion_preserves_exit_code() {
-        let completion = super::RunnerCompletion {
-            result: Err(std::io::Error::other("unused")),
-            abnormal: false,
-            runner_signal: None,
-            runner_exit_code: Some(23),
-            runner_core_dumped: false,
-            broker_termination: false,
-        };
-
-        assert_eq!(
-            completion.process_exit_status(),
-            ProcessExitStatus::Exited { code: 23 }
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn runner_completion_preserves_signal_status() {
-        let completion = super::RunnerCompletion {
-            result: Err(std::io::Error::other("unused")),
-            abnormal: true,
-            runner_signal: Some(11),
-            runner_exit_code: None,
-            runner_core_dumped: true,
-            broker_termination: false,
-        };
-
-        assert_eq!(
-            completion.process_exit_status(),
-            ProcessExitStatus::Signaled {
-                signal: 11,
-                core_dumped: true,
-            }
-        );
-    }
-
-    #[test]
-    fn panicked_runner_completion_has_unknown_status() {
-        assert_eq!(
-            super::RunnerCompletion::panicked().process_exit_status(),
-            ProcessExitStatus::Unknown
-        );
-    }
 
     #[cfg(target_os = "linux")]
     #[test]

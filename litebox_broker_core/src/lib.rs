@@ -381,9 +381,9 @@ impl BrokerCore {
                 .get(&parent_id)
                 .and_then(Weak::upgrade)
                 .ok_or(BrokerError::UnknownObject)?;
-            return parent.create_retained_child(|root| {
+            return parent.with_live_owner(|root| {
                 allocate_process(Some(Arc::downgrade(&parent)), Some(root))
-            });
+            })?;
         }
         allocate_process(None, None)
     }
