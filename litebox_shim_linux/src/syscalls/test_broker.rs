@@ -9,6 +9,7 @@
 extern crate std;
 
 use alloc::{sync::Arc, vec};
+use core::convert::Infallible;
 use std::sync::OnceLock;
 
 use litebox_broker_core::{
@@ -16,12 +17,16 @@ use litebox_broker_core::{
     fs::{in_mem::InitialNode, resolver::Resolver},
     test_support::{TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
 };
-use litebox_broker_host::test_support::InProcessBrokerSetup;
+use litebox_broker_host::{
+    BrokerHostError,
+    test_support::{InProcessBrokerChannel, InProcessBrokerSetup},
+};
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::{
     fs::{FileMode, FileUser},
     stdio::StdioStream,
 };
+use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::syscalls::tests::TestPlatform;
 
@@ -43,11 +48,22 @@ pub(crate) fn litebox_with_limits(
     platform: &'static TestPlatform,
     limits: BrokerCoreLimits,
 ) -> (litebox::LiteBox<TestPlatform>, i32) {
+    litebox_with_channel(platform, limits, |channel| channel)
+}
+
+pub(crate) fn litebox_with_channel<Channel>(
+    platform: &'static TestPlatform,
+    limits: BrokerCoreLimits,
+    wrap_channel: impl FnOnce(InProcessBrokerChannel) -> Channel,
+) -> (litebox::LiteBox<TestPlatform>, i32)
+where
+    Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
+{
     let setup = InProcessBrokerSetup::new(test_broker(limits).clone());
     let readiness = setup.readiness_sink();
     let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
-        Ok((setup.activate(), memory, ()))
+        Ok((wrap_channel(setup.activate()), memory, ()))
     })
     .expect("the test broker must negotiate");
     let process_id =

@@ -76,10 +76,12 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
-    fn detach_from_process(&self) {
-        if let Some(tid) = self.tid.take() {
-            self.process.detach_thread(tid);
-        }
+    pub(crate) fn begin_detach_from_process(&self) -> Option<ThreadDetachGuard<'_, Platform>> {
+        let tid = self.tid.take()?;
+        self.process.remove_thread(tid);
+        Some(ThreadDetachGuard {
+            process: &self.process,
+        })
     }
 
     fn tid(&self) -> i32 {
@@ -110,7 +112,17 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
 
 impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
     fn drop(&mut self) {
-        self.detach_from_process();
+        drop(self.begin_detach_from_process());
+    }
+}
+
+pub(crate) struct ThreadDetachGuard<'a, Platform: ShimPlatform> {
+    process: &'a Process<Platform>,
+}
+
+impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
+    fn drop(&mut self) {
+        self.process.complete_thread_detach();
     }
 }
 
@@ -245,17 +257,19 @@ impl<Platform: ShimPlatform> Process<Platform> {
         Some(remote)
     }
 
-    /// Detaches a thread from this process.
+    /// Removes a detaching thread's local identity from this process.
     ///
     /// # Panics
     /// Panics if the thread ID does not exist in this process.
-    fn detach_thread(&self, tid: i32) {
-        let data;
+    fn remove_thread(&self, tid: i32) {
+        let data = self.inner.lock().threads.remove(&tid);
+        assert!(data.is_some());
+    }
+
+    /// Completes detachment after external thread teardown has finished.
+    fn complete_thread_detach(&self) {
         let notify = {
             let mut inner = self.inner.lock();
-            data = inner.threads.remove(&tid);
-            assert!(data.is_some());
-
             let nr_threads = self.nr_threads.underlying_atomic();
             let n = nr_threads.load(Ordering::Relaxed);
             let new_count = n.checked_sub(1).expect("decrementing from zero threads");
@@ -591,14 +605,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(robust_list) = self.thread.robust_list.take() {
             let _ = wake_robust_list::<Platform>(robust_list);
         }
-
-        // This must run last, after all of this task's remaining accesses to
-        // guest memory have completed. Otherwise, because this decrements the
-        // `nr_threads` counter, other tasks may assume that the memory of this
-        // task isn't referenced any more, and therefore can be de-allocated and
-        // re-used (e.g., for an `exec`d process). See
-        // https://github.com/microsoft/litebox/pull/1155.
-        self.thread.detach_from_process();
     }
 
     pub(crate) fn sys_exit(&self, status: i32) {
@@ -1831,6 +1837,90 @@ mod tests {
     use crate::{UserPtr, UserPtrMut};
 
     extern crate std;
+
+    use std::sync::{Mutex as StdMutex, mpsc};
+    use std::time::Duration;
+
+    use litebox_broker_host::test_support::InProcessBrokerChannel;
+    use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest, BrokerResponse};
+    use litebox_broker_transport::channel::LocalCallChannel;
+
+    struct BlockingThreadExitChannel {
+        inner: InProcessBrokerChannel,
+        exit_started: mpsc::SyncSender<()>,
+        exit_release: StdMutex<mpsc::Receiver<()>>,
+    }
+
+    impl LocalCallChannel for BlockingThreadExitChannel {
+        type Error = <InProcessBrokerChannel as LocalCallChannel>::Error;
+
+        fn call(
+            &self,
+            request: BrokerRequest,
+        ) -> core::result::Result<BrokerResponse, Self::Error> {
+            if matches!(&request.operation, BrokerOperation::ExitThread(_)) {
+                self.exit_started
+                    .send(())
+                    .expect("thread-exit observer must remain available");
+                self.exit_release
+                    .lock()
+                    .expect("thread-exit release mutex poisoned")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("timed out waiting to release broker thread exit");
+            }
+            self.inner.call(request)
+        }
+    }
+
+    #[test]
+    fn local_thread_identity_is_removed_before_broker_exit_completion() {
+        use litebox_broker_core::BrokerCoreLimits;
+
+        let platform = crate::syscalls::tests::test_platform();
+        let limits = BrokerCoreLimits::new(
+            super::super::test_broker::MAX_TEST_BROKER_REFERENCES,
+            BrokerCoreLimits::DEFAULT.max_total_pipe_capacity,
+        )
+        .with_thread_quotas(2, 2);
+        let (exit_started_tx, exit_started_rx) = mpsc::sync_channel(1);
+        let (exit_release_tx, exit_release_rx) = mpsc::sync_channel(1);
+        let (litebox, process_id) =
+            super::super::test_broker::litebox_with_channel(platform, limits, move |inner| {
+                BlockingThreadExitChannel {
+                    inner,
+                    exit_started: exit_started_tx,
+                    exit_release: StdMutex::new(exit_release_rx),
+                }
+            });
+        let shim_builder = crate::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+        let leader = shim_builder.build().0.new_test_task();
+        let task = leader
+            .clone_for_test()
+            .expect("the broker thread slot must be available");
+        let exiting_tid = task.tid();
+        let process = task.process().clone();
+        drop(leader);
+
+        let exiting = std::thread::spawn(move || drop(task));
+        exit_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("task did not begin broker thread exit");
+        assert_eq!(
+            process.nr_threads(),
+            1,
+            "local process completion preceded broker thread exit"
+        );
+        assert!(
+            !process.inner.lock().threads.contains_key(&exiting_tid),
+            "exiting thread identity remained available for a broker-reused ID"
+        );
+
+        exit_release_tx
+            .send(())
+            .expect("exiting task must still be waiting");
+        exiting.join().expect("exiting task panicked");
+        assert_eq!(process.nr_threads(), 0);
+    }
 
     #[test]
     fn nonleader_exec_rebinds_identity_and_retains_broker_thread() {

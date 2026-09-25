@@ -28,6 +28,7 @@ aarch64_virtualize_x18 = []
 litebox_broker_core = { path = "../litebox_broker_core/", version = "0.1.0", features = ["test-support"] }
 litebox_broker_host = { path = "../litebox_broker_host/", version = "0.1.0", features = ["test-support"] }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
 libc = "0.2.177"
 
 # The unit tests need a concrete platform to run against. The platform is selected

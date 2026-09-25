@@ -1203,6 +1203,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 impl<Platform: ShimPlatform> Drop for Task<Platform> {
     fn drop(&mut self) {
         self.prepare_for_exit();
+        // Remove the local identity before the broker can release it for reuse,
+        // but keep the process thread count until broker exit is acknowledged.
+        let detach = self.thread.begin_detach_from_process();
         if let Some(thread) = self.litebox_thread.take() {
             let thread_id = thread.id();
             if let Err(error) = thread.exit() {
@@ -1213,6 +1216,7 @@ impl<Platform: ShimPlatform> Drop for Task<Platform> {
                 );
             }
         }
+        drop(detach);
     }
 }
 
