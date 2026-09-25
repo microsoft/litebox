@@ -10,9 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::process::{
-    InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessStartupData,
-};
+use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
@@ -26,8 +24,6 @@ use litebox_broker_transport_linux_userland::unix_socket::{
 const RUNNER_ARGUMENT: &str = "broker-userland-test-runner";
 const NETWORK_RUNNER_ARGUMENT: &str = "broker-userland-network-test-runner";
 const CHILD_START_RUNNER_ARGUMENT: &str = "broker-userland-child-start-runner";
-const TEST_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x7465_7374);
-const FAILING_BOOTSTRAP_FORMAT: ProcessBootstrapFormat = ProcessBootstrapFormat(0x6661_696c);
 const BROKER_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn main() {
@@ -233,33 +229,23 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
         let marker = Path::new(&args[4]);
         let bootstrap = marker.as_os_str().as_encoded_bytes();
-        let inherited_event = local.create_event_with_count(1).unwrap();
-        let inherited_objects = InheritedProcessObjects::new(&[inherited_event]).unwrap();
         let failed = local
             .start_child_process(
-                FAILING_BOOTSTRAP_FORMAT,
-                ProcessBootstrapVersion(1),
-                SharedBufferSequence::new(
-                    &[SharedBufferSlotIndex(0)],
-                    bootstrap.len().try_into().unwrap(),
-                )
-                .unwrap(),
-                bootstrap,
-                inherited_objects,
+                None,
+                SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 0).unwrap(),
+                &[],
             )
             .unwrap();
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
         let started = local
             .start_child_process(
-                TEST_BOOTSTRAP_FORMAT,
-                ProcessBootstrapVersion(1),
+                None,
                 SharedBufferSequence::new(
                     &[SharedBufferSlotIndex(0)],
                     bootstrap.len().try_into().unwrap(),
                 )
                 .unwrap(),
                 bootstrap,
-                inherited_objects,
             )
             .unwrap();
         assert_ne!(started.process_id.0, started.initial_thread_id.0);
@@ -340,18 +326,10 @@ fn run_fake_child(
     local: BrokerLocal<UnixControlRingLocalCallChannel>,
     bootstrap: ProcessStartupData,
 ) {
-    if bootstrap.format == FAILING_BOOTSTRAP_FORMAT {
+    if bootstrap.payload.is_empty() {
         return;
     }
-    assert_eq!(bootstrap.format, TEST_BOOTSTRAP_FORMAT);
-    assert_eq!(bootstrap.version, ProcessBootstrapVersion(1));
     let marker = Path::new(OsStr::from_bytes(&bootstrap.payload));
-    let inherited_objects = bootstrap.inherited_objects.as_slice();
-    assert_eq!(inherited_objects.len(), 1);
-    assert_eq!(
-        local.check_readiness(inherited_objects[0]).unwrap(),
-        ReadinessFlags::READ | ReadinessFlags::WRITE
-    );
     std::fs::write(marker, format!("ready:{}\n", local.process_id().0)).unwrap();
     std::fs::OpenOptions::new()
         .append(true)

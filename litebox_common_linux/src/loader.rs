@@ -227,7 +227,7 @@ impl ElfParsedFile {
         } else {
             size_of::<elf::segment::Elf32_Phdr>()
         };
-        if usize::from(header.e_phentsize) != phent_size {
+        if header.e_phnum == 0 || usize::from(header.e_phentsize) != phent_size {
             return Err(ElfParseError::BadFormat);
         }
         // Limit to 64KB of program headers.
@@ -239,6 +239,17 @@ impl ElfParsedFile {
         let mut phdrs = alloc::vec![0u8; usize::from(phdr_size)];
         file.read_at(header.e_phoff, &mut phdrs)
             .map_err(ElfParseError::Io)?;
+
+        // Callers use parsing as the recoverable exec preflight before replacing the old image.
+        let table = elf::segment::SegmentTable::new(header.endianness, CLASS, &phdrs);
+        for ph in table.iter().filter(|ph| ph.p_type == elf::abi::PT_LOAD) {
+            if ph.p_filesz > ph.p_memsz
+                || ph.p_vaddr.checked_add(ph.p_memsz).is_none()
+                || ph.p_offset.checked_add(ph.p_filesz).is_none()
+            {
+                return Err(ElfParseError::BadFormat);
+            }
+        }
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {

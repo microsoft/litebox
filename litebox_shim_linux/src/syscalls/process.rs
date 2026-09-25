@@ -21,7 +21,7 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
-    errno::Errno,
+    errno::Errno, program_startup::LinuxProgramStartup,
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
@@ -227,6 +227,12 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// Returns the current number of threads in this process.
     pub fn nr_threads(&self) -> u32 {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn has_default_alarm_state(&self) -> bool {
+        let alarm = self.alarm_timer.lock();
+        alarm.handle.is_none() && alarm.deadline.is_none()
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
@@ -683,9 +689,46 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_clone(ctx, &args, true)
     }
 
-    /// Creates a new thread or process.
+    /// Begins a constrained `vfork` child in the current runner.
     ///
-    /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
+    /// Only single-threaded processes with default filesystem, signal, resource-limit, alarm, and
+    /// transferable descriptor state are admitted. The parent remains suspended until the child
+    /// successfully transfers to a fresh runner through `execve`. The child must not change
+    /// standard descriptor mappings or flags, or platform-managed architectural state outside
+    /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that state.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+        if self.vfork.borrow().is_some()
+            || self.thread.process.nr_threads() != 1
+            || !self.files.borrow().has_only_standard_descriptor_numbers()
+            || !self.fs.borrow().has_default_fs_state(&self.credentials)
+            || !self.signals.has_default_signal_state()
+            || !self.thread.process.limits.has_default_state()
+            || !self.thread.process.has_default_alarm_state()
+        {
+            return Err(Errno::EAGAIN);
+        }
+        let child = self
+            .global
+            .litebox
+            .allocate_child_process()
+            .map_err(Errno::from)?;
+        let child_pid = i32::try_from(child.0).expect("broker process IDs must fit Linux pid_t");
+        let mut parent_context = ctx.clone();
+        parent_context.rax = child_pid.cast_unsigned() as usize;
+        self.vfork.replace(Some(crate::VforkState {
+            child_process_id: child,
+            child_pid,
+            parent_context,
+        }));
+        Ok(0)
+    }
+
+    /// Creates a new thread.
+    ///
+    /// Process creation, including `clone` or `clone3` with `CLONE_VFORK`, is intentionally
+    /// unsupported. Those calls require child-stack and ancillary clone-argument semantics rather
+    /// than being aliases for `vfork(2)`.
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -858,6 +901,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         litebox_thread: Cell::new(None),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
+                        vfork: core::cell::RefCell::new(None),
                         pid: self.pid,
                         ppid: self.ppid,
                         credentials: self.credentials.clone(),
@@ -908,23 +952,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `gettid`.
     pub(crate) fn sys_gettid(&self) -> i32 {
-        self.tid()
+        self.vfork
+            .borrow()
+            .as_ref()
+            .map_or_else(|| self.tid(), |state| state.child_pid)
     }
 }
 
 // TODO: enforce the following limits:
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+type ResourceLimitValues =
+    [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS];
 
 pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
-    limits: RwLock<
-        Platform,
-        [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
-    >,
+    limits: RwLock<Platform, ResourceLimitValues>,
 }
 
 impl<Platform: ShimPlatform> ResourceLimits<Platform> {
-    fn default() -> Self {
+    fn default_values() -> ResourceLimitValues {
         let mut limits = [const {
             litebox_common_linux::Rlimit {
                 rlim_cur: 0,
@@ -941,9 +987,24 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
                 rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
                 rlim_max: litebox_common_linux::rlim_t::MAX,
             };
+        limits
+    }
+
+    fn default() -> Self {
         Self {
-            limits: RwLock::new(limits),
+            limits: RwLock::new(Self::default_values()),
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn has_default_state(&self) -> bool {
+        self.limits
+            .read()
+            .iter()
+            .zip(Self::default_values())
+            .all(|(actual, expected)| {
+                actual.rlim_cur == expected.rlim_cur && actual.rlim_max == expected.rlim_max
+            })
     }
 
     pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
@@ -1375,11 +1436,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
-        self.pid
+        self.vfork
+            .borrow()
+            .as_ref()
+            .map_or(self.pid, |state| state.child_pid)
     }
 
     pub(crate) fn sys_getppid(&self) -> i32 {
-        self.ppid
+        self.vfork.borrow().as_ref().map_or(self.ppid, |_| self.pid)
     }
 
     /// Handle syscall `getuid`.
@@ -1642,9 +1706,41 @@ impl<Platform: ShimPlatform> Task<Platform> {
             copy_vector::<Platform>(envp, "envp")?
         };
 
+        let vfork_child = self
+            .vfork
+            .borrow()
+            .as_ref()
+            .map(|state| state.child_process_id);
+        if vfork_child.is_some() && !path.starts_with('/') {
+            return Err(Errno::ENOENT);
+        }
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
-
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
+        if let Some(child) = vfork_child {
+            drop(loader);
+            let startup = LinuxProgramStartup {
+                parent_process_id: self.pid,
+                uid: self.credentials.uid,
+                euid: self.credentials.euid,
+                gid: self.credentials.gid,
+                egid: self.credentials.egid,
+                path,
+                argv: argv_vec,
+                envp: envp_vec,
+            };
+            let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
+            self.global
+                .litebox
+                .start_child_process(Some(child), &payload)
+                .map_err(Errno::from)?;
+            let state = self
+                .vfork
+                .borrow_mut()
+                .take()
+                .expect("successful vfork transfer lost its parent context");
+            *ctx = state.parent_context;
+            return Ok(state.child_pid.cast_unsigned() as usize);
+        }
 
         // After this point, the old program is torn down and failures must terminate the process.
 
@@ -2021,6 +2117,29 @@ mod tests {
 
         writer_a.join().unwrap();
         writer_b.join().unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vfork_rejects_nondefault_resource_limits() {
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::{PtRegs, Rlimit, RlimitResource, errno::Errno};
+
+        let task = init_platform();
+        assert!(task.process().limits.has_default_state());
+
+        let default = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: default.rlim_cur - 1,
+                rlim_max: default.rlim_max,
+            }),
+        )
+        .unwrap();
+
+        assert!(!task.process().limits.has_default_state());
+        assert_eq!(task.sys_vfork(&PtRegs::default()), Err(Errno::EAGAIN));
     }
 
     #[cfg(target_arch = "x86_64")]

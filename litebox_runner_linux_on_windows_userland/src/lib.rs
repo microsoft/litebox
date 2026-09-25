@@ -69,12 +69,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .as_deref()
         .context("file operations require --broker-control-channel")?;
     let (connection, startup) = broker::connect(control_pipe)?;
-    if let Some(bootstrap) = startup {
-        anyhow::bail!(
-            "unsupported child Linux process bootstrap format {:?} version {:?}",
-            bootstrap.format,
-            bootstrap.version
-        );
+    if startup.is_some() {
+        anyhow::bail!("unsupported child Linux process startup");
     }
     let broker::BrokerConnection {
         local,

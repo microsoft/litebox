@@ -275,7 +275,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             gid,
             egid,
         } = task;
-        if pid != self.0.process_id || ppid != 0 {
+        if pid != self.0.process_id || ppid < 0 {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
         }
 
@@ -298,6 +298,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 litebox_thread: Cell::new(Some(initial_thread)),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
+                vfork: RefCell::new(None),
                 pid,
                 ppid,
                 credentials,
@@ -546,7 +547,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
-        let return_value = match self.do_syscall(ctx) {
+        let result = self.do_syscall(ctx);
+        if self.vfork.borrow().is_some() && result.is_err() {
+            // The current constrained vfork scope cannot return an error to a child running in the
+            // parent's runner while leaving the parent suspended. Only a successful exec transfer
+            // can complete the shared-runner window.
+            self.sys_exit_group(127);
+            return;
+        }
+        let return_value = match result {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
         };
@@ -574,6 +583,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        // The constrained vfork child may only inspect its temporary identity or complete the
+        // transfer with execve. The caller terminates the shared runner when this rejection is
+        // returned.
+        if self.vfork.borrow().is_some()
+            && !matches!(
+                &request,
+                SyscallRequest::Execve { .. }
+                    | SyscallRequest::Getpid
+                    | SyscallRequest::Getppid
+                    | SyscallRequest::Gettid
+            )
+        {
+            return Err(Errno::EPERM);
+        }
 
         match request {
             SyscallRequest::Exit { status } => {
@@ -1048,6 +1071,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
+            SyscallRequest::Vfork => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    self.sys_vfork(ctx)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    Err(Errno::ENOSYS)
+                }
+            }
             SyscallRequest::SetThreadArea { user_desc } => {
                 // Neither x86-64 nor AArch64 supports `set_thread_area`.
                 let _ = user_desc;
@@ -1177,6 +1210,7 @@ struct Task<Platform: ShimPlatform> {
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
+    vfork: RefCell<Option<VforkState>>,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1192,6 +1226,12 @@ struct Task<Platform: ShimPlatform> {
     files: RefCell<Arc<syscalls::file::FilesState<Platform>>>,
     /// Signal state
     signals: syscalls::signal::SignalState<Platform>,
+}
+
+struct VforkState {
+    child_process_id: litebox_broker_protocol::ProcessId,
+    child_pid: i32,
+    parent_context: litebox_common_linux::PtRegs,
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {
@@ -1242,6 +1282,7 @@ mod test_utils {
                 wait_state: wait::WaitState::new(self.platform),
                 litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid),
+                vfork: RefCell::new(None),
                 pid,
                 ppid: 0,
                 credentials,
@@ -1269,6 +1310,7 @@ mod test_utils {
                 global: self.global.clone(),
                 litebox_thread: Cell::new(Some(litebox_thread)),
                 thread,
+                vfork: RefCell::new(None),
                 pid: self.pid,
                 ppid: self.ppid,
                 credentials: self.credentials.clone(),

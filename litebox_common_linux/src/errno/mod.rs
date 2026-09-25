@@ -111,6 +111,20 @@ impl TryFrom<u8> for Errno {
     }
 }
 
+impl From<litebox::process::ProcessError> for Errno {
+    fn from(value: litebox::process::ProcessError) -> Self {
+        match value {
+            litebox::process::ProcessError::PolicyDenied => Errno::EPERM,
+            litebox::process::ProcessError::Unavailable => Errno::ENOSYS,
+            litebox::process::ProcessError::Busy
+            | litebox::process::ProcessError::ResourceExhausted => Errno::EAGAIN,
+            litebox::process::ProcessError::OutOfMemory => Errno::ENOMEM,
+            litebox::process::ProcessError::ServiceFailed
+            | litebox::process::ProcessError::InvalidChild => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::PathError> for Errno {
     fn from(value: litebox::fs::errors::PathError) -> Self {
         match value {
@@ -707,6 +721,29 @@ impl From<litebox::platform::ArchSpecificError> for Errno {
             litebox::platform::ArchSpecificError::RegisterReserved => Errno::EINVAL,
             litebox::platform::ArchSpecificError::RegisterUnpermittedValue => Errno::EPERM,
             _ => unimplemented!(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Errno;
+    use litebox::process::ProcessError;
+
+    #[test]
+    fn process_errors_map_to_linux_errno() {
+        let cases = [
+            (ProcessError::PolicyDenied, Errno::EPERM),
+            (ProcessError::Unavailable, Errno::ENOSYS),
+            (ProcessError::Busy, Errno::EAGAIN),
+            (ProcessError::ResourceExhausted, Errno::EAGAIN),
+            (ProcessError::OutOfMemory, Errno::ENOMEM),
+            (ProcessError::ServiceFailed, Errno::EIO),
+            (ProcessError::InvalidChild, Errno::EIO),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(Errno::from(error), expected);
         }
     }
 }

@@ -17,7 +17,10 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::process::{ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest};
+use crate::process::{
+    CreateThreadRequest, CreateThreadResponse, ProcessIdentity, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource,
+};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -45,8 +48,8 @@ pub struct BrokerHandshakeRequest {
 /// Operation requested over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerOperation {
-    /// Create a broker thread belonging to this process.
-    CreateThread,
+    /// Create a thread in this process or a pending child process.
+    CreateThread(CreateThreadRequest),
     /// Record broker thread exit after local teardown completes.
     ExitThread(ThreadId),
     /// Close one broker object reference.
@@ -101,11 +104,13 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
-            | Self::StartChildProcess(
-                StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor { buffer, .. })
-                | StartChildProcessRequest::Duplicate(buffer),
-            ) => Some(*buffer),
-            Self::CreateThread
+            | Self::StartChildProcess(StartChildProcessRequest {
+                source:
+                    StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer, .. })
+                    | StartChildProcessSource::Duplicate(buffer),
+                ..
+            }) => Some(*buffer),
+            Self::CreateThread(_)
             | Self::ExitThread(_)
             | Self::CloseObject(_)
             | Self::CheckReadiness(_)
@@ -225,8 +230,8 @@ pub enum SocketRequest {
 /// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResult {
-    /// A thread was created with this broker-assigned ID.
-    ThreadCreated(ThreadId),
+    /// Thread or pending-process creation result.
+    CreateThread(CreateThreadResponse),
     /// Thread exit completed.
     ThreadExited,
     /// Object close operation completed.

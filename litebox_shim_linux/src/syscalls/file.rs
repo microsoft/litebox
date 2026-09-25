@@ -85,6 +85,15 @@ impl<Platform: ShimPlatform> FsState<Platform> {
     fn umask(&self) -> Mode {
         Mode::from_u32_bits_truncate(self.umask.load(Ordering::Relaxed))
     }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn has_default_fs_state(&self, credentials: &super::process::Credentials) -> bool {
+        let context = self.context.read();
+        self.umask() == Mode::from_u32_bits_truncate(u32::from((Mode::WGRP | Mode::WOTH).bits()))
+            && context.cwd().to_string() == "/"
+            && u32::from(context.acting_user().user) == credentials.euid
+            && u32::from(context.acting_user().group) == credentials.egid
+    }
 }
 
 /// Translate Linux open flags after descriptor-local `O_CLOEXEC` has been removed.
@@ -152,6 +161,11 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 
     pub(crate) fn set_max_fd(&self, max_fd: usize) {
         self.max_fd.store(max_fd, Ordering::Relaxed);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn has_only_standard_descriptor_numbers(&self) -> bool {
+        self.raw_descriptor_store.read().iter_alive().eq([0, 1, 2])
     }
 
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the

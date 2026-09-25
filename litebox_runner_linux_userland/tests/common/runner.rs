@@ -12,6 +12,10 @@ const MULTIARCH_LIB_DIR: &str = "lib/x86_64-linux-gnu";
 const MULTIARCH_LIB_DIR: &str = "lib/aarch64-linux-gnu";
 
 #[must_use]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "test runner switches model independent broker and execution modes"
+)]
 pub(crate) struct Runner {
     command: std::process::Command,
     dir_path: PathBuf,
@@ -25,6 +29,8 @@ pub(crate) struct Runner {
     use_userland_broker: bool,
     #[cfg(target_os = "linux")]
     in_process_mode: bool,
+    #[cfg(target_os = "linux")]
+    allow_process_duplication: bool,
     has_run: bool,
 }
 
@@ -97,6 +103,8 @@ impl Runner {
             use_userland_broker: true,
             #[cfg(target_os = "linux")]
             in_process_mode: false,
+            #[cfg(target_os = "linux")]
+            allow_process_duplication: false,
             has_run: false,
             unique_name: unique_name.to_owned(),
         }
@@ -158,6 +166,12 @@ impl Runner {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn allow_process_duplication(&mut self) -> &mut Self {
+        self.allow_process_duplication = true;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn allow_proxy_host(&mut self, host: impl AsRef<OsStr>) -> &mut Self {
         self.managed_proxy_hosts.push(host.as_ref().to_os_string());
         self
@@ -175,6 +189,22 @@ impl Runner {
     #[must_use]
     pub(crate) fn output(&mut self) -> Vec<u8> {
         self.run_inner(true)
+    }
+
+    #[must_use]
+    pub(crate) fn output_expect_failure(&mut self) -> Vec<u8> {
+        self.prepare_command();
+        self.command.stderr(std::process::Stdio::inherit());
+        println!("Running `{:?}`", self.command);
+        let output = self
+            .command
+            .output()
+            .expect("Failed to run litebox_runner_linux_userland");
+        assert!(
+            !output.status.success(),
+            "litebox_runner_linux_userland unexpectedly succeeded"
+        );
+        output.stdout
     }
 
     fn prepare_command(&mut self) {
@@ -221,6 +251,9 @@ impl Runner {
                 command.args(["--unstable", "--in-process-runner"]);
             } else {
                 command.arg("--runner").arg(runner);
+            }
+            if self.allow_process_duplication {
+                command.args(["--unstable", "--allow-process-duplication"]);
             }
             command.args(runner_arguments);
             self.command = command;

@@ -84,12 +84,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         litebox_platform_linux_userland::with_guest_signals_blocked(|| {
             broker::connect(control_socket)
         })?;
-    if let Some(bootstrap) = startup {
-        return Err(anyhow::anyhow!(
-            "unsupported child Windows process bootstrap format {:?} version {:?}",
-            bootstrap.format,
-            bootstrap.version
-        ));
+    if startup.is_some() {
+        return Err(anyhow::anyhow!("unsupported child Windows process startup"));
     }
     let broker::BrokerConnection {
         local,

@@ -40,9 +40,9 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest,
+    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
+    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -149,12 +149,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                             .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
                         payload.resize(startup.buffer.length() as usize, 0);
                         local.read_shared_buffer(startup.buffer, &mut payload);
-                        Some(ProcessStartupData {
-                            format: startup.format,
-                            version: startup.version,
-                            payload,
-                            inherited_objects: startup.inherited_objects,
-                        })
+                        Some(ProcessStartupData { payload })
                     }
                     None => None,
                 };
@@ -201,27 +196,39 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// or the broker returns a response for another operation.
     pub fn start_child_process(
         &self,
-        format: ProcessBootstrapFormat,
-        version: ProcessBootstrapVersion,
+        child_process_id: Option<ProcessId>,
         buffer: SharedBufferSequence,
         bootstrap: &[u8],
-        inherited_objects: InheritedProcessObjects,
     ) -> Result<ProcessIdentity, Channel::Error> {
         if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
+
         self.write_shared_buffer(buffer, bootstrap);
         match self.request(BrokerOperation::StartChildProcess(
-            StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
-                format,
-                version,
-                buffer,
-                inherited_objects,
-            }),
+            StartChildProcessRequest {
+                child_process_id,
+                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }),
+            },
         ))? {
             BrokerResult::ProcessStarted(started) => Ok(started),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
+        }
+    }
+
+    /// Allocates one pending child process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn allocate_child_process(&self) -> Result<ProcessId, Channel::Error> {
+        match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Process))? {
+            BrokerResult::CreateThread(CreateThreadResponse::Process(process_id)) => Ok(process_id),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected allocate-child-process response: {response:?}")
+            }
         }
     }
 
@@ -231,8 +238,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for a different operation.
     pub fn create_thread(&self) -> Result<ThreadId, Channel::Error> {
-        match self.request(BrokerOperation::CreateThread)? {
-            BrokerResult::ThreadCreated(thread_id) => Ok(thread_id),
+        match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Thread))? {
+            BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id)) => Ok(thread_id),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected create-thread response: {response:?}"),
         }
@@ -450,7 +457,12 @@ mod tests {
     #[test]
     fn thread_lifecycle_sends_owned_id() {
         let thread_id = ThreadId(7);
-        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadCreated(thread_id)));
+        let channel = FakeControlChannel::new(
+            None,
+            Some(BrokerResult::CreateThread(CreateThreadResponse::Thread(
+                thread_id,
+            ))),
+        );
         let local = test_broker_local(channel, noop_shared_memory());
 
         assert_eq!(local.create_thread().unwrap(), thread_id);
@@ -458,7 +470,7 @@ mod tests {
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::CreateThread,
+                operation: BrokerOperation::CreateThread(CreateThreadRequest::Thread),
             })
         );
 

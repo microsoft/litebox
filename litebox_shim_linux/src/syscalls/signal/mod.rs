@@ -115,6 +115,30 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
         self.clear_sigaltstack();
     }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn has_default_signal_state(&self) -> bool {
+        let altstack = self.altstack.get();
+        self.pending.borrow().pending.is_empty()
+            && self.shared_pending.lock().pending.is_empty()
+            && self.blocked.get().is_empty()
+            && altstack.sp == 0
+            && altstack.size == 0
+            && altstack.flags.bits() == SsFlags::DISABLE.bits()
+            && self
+                .handlers
+                .borrow()
+                .inner
+                .lock()
+                .handlers
+                .iter()
+                .all(|handler| {
+                    handler.action.sigaction == SIG_DFL
+                        && handler.action.restorer == 0
+                        && handler.action.flags.is_empty()
+                        && handler.action.mask.is_empty()
+                })
+    }
 }
 
 struct SignalHandlers<Platform: ShimPlatform> {
@@ -836,6 +860,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             _ => (Signal::SIGSEGV, info.fault_address),
         };
         self.signals.last_exception.set(*info);
+        if self.vfork.borrow().is_some() {
+            // The current successful-exec-only scope cannot resume the parent after a child fault.
+            // Terminate instead of deferring the signal and retrying the faulting instruction.
+            self.exit_group(ExitStatus::Signal(signal));
+            return;
+        }
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
 }

@@ -108,6 +108,15 @@ struct CliArgs {
     /// broker and is intended only for testing and development.
     #[arg(long, hide = true, requires = "unstable", conflicts_with = "runner")]
     in_process_runner: bool,
+    /// Enable the experimental constrained process-duplication path.
+    #[cfg(target_os = "linux")]
+    #[arg(
+        long,
+        hide = true,
+        requires = "unstable",
+        conflicts_with = "in_process_runner"
+    )]
+    allow_process_duplication: bool,
     /// Local runner executable to launch.
     #[arg(
         long,
@@ -340,6 +349,21 @@ mod cli_tests {
 
         assert_eq!(args.allow_tcp_destination.len(), 1);
         assert_eq!(args.allow_udp_destination.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_rejects_process_duplication_with_in_process_runner() {
+        let error = CliArgs::try_parse_from([
+            "litebox-broker-userland",
+            "--unstable",
+            "--in-process-runner",
+            "--allow-process-duplication",
+            "guest",
+        ])
+        .unwrap_err();
+
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

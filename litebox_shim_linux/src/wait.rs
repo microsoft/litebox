@@ -42,7 +42,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             });
             #[cfg(feature = "alarm_fallback")]
             self.check_alarm_deadline();
-            self.process_signals(ctx);
+            // The vfork parent is suspended; defer signal delivery until its context is restored.
+            if self.vfork.borrow().is_none() {
+                self.process_signals(ctx);
+            }
             !self.is_exiting()
         })
     }

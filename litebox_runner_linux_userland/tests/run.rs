@@ -70,6 +70,9 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
+    "vfork_fault_parent.c",
+    "vfork_exec_child.c",
+    "vfork_exec_parent.c",
 ];
 
 const BROKER_ONLY_C_TESTS: &[&str] = &[
@@ -179,6 +182,97 @@ fn test_static_exec_with_rewriter() {
         configure_pipe_broker(&path, &mut runner);
         runner.run();
     }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
+    fn numeric_field(line: &str, name: &str) -> i32 {
+        line.split_whitespace()
+            .find_map(|field| {
+                field
+                    .strip_prefix(name)
+                    .and_then(|value| value.parse().ok())
+            })
+            .unwrap_or_else(|| panic!("missing {name} in {line:?}"))
+    }
+
+    let parent = common::compile(
+        "./tests/vfork_exec_parent.c",
+        "vfork_exec_parent",
+        true,
+        false,
+    );
+    let child = common::compile(
+        "./tests/vfork_exec_child.c",
+        "vfork_exec_child",
+        true,
+        false,
+    );
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "vfork_exec_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let parent_line = output
+        .lines()
+        .find(|line| line.starts_with("parent "))
+        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
+    let child_line = output
+        .lines()
+        .find(|line| line.starts_with("child "))
+        .unwrap_or_else(|| panic!("missing child output in {output:?}"));
+
+    let parent_before = numeric_field(parent_line, "before=");
+    let parent_after = numeric_field(parent_line, "after=");
+    let reported_child = numeric_field(parent_line, "child=");
+    assert_eq!(parent_after, parent_before);
+    assert_ne!(reported_child, parent_before);
+    assert_eq!(numeric_field(child_line, "pid="), reported_child);
+    assert_eq!(numeric_field(child_line, "ppid="), parent_before);
+    assert_eq!(numeric_field(child_line, "tid="), reported_child);
+    assert!(child_line.contains("marker=from-vfork"));
+    assert!(child_line.contains("env=1"));
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_exec_failure_does_not_resume_parent() {
+    let parent = common::compile(
+        "./tests/vfork_exec_parent.c",
+        "vfork_exec_failure_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "vfork_exec_failure_parent");
+    runner
+        .allow_process_duplication()
+        .arg("/missing-vfork-executable");
+
+    let output = String::from_utf8(runner.output_expect_failure()).unwrap();
+    assert_eq!(output, "vfork-started\n");
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_child_fault_terminates_shared_runner() {
+    let parent = common::compile(
+        "./tests/vfork_fault_parent.c",
+        "vfork_fault_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "vfork_fault_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output_expect_failure()).unwrap();
+    assert_eq!(output, "vfork-started\n");
 }
 
 /// Get the path of a program using `which`
