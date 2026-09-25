@@ -245,6 +245,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn has_default_alarm_state(&self) -> bool {
         let alarm = self.alarm_timer.lock();
         alarm.handle.is_none() && alarm.deadline.is_none()

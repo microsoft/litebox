@@ -86,6 +86,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         Mode::from_u32_bits_truncate(self.umask.load(Ordering::Relaxed))
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn supports_initial_vfork_exec(
         &self,
         credentials: &super::process::Credentials,
@@ -165,6 +166,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         self.max_fd.store(max_fd, Ordering::Relaxed);
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn has_only_standard_descriptors(&self) -> bool {
         self.raw_descriptor_store.read().iter_alive().eq([0, 1, 2])
     }
