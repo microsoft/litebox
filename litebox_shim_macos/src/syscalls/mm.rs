@@ -22,12 +22,16 @@ use litebox::{
 use litebox_common_macos::{
     MmapFlags, PAGE_SIZE, VmProtection, errno::Errno, loader::MAX_IMAGE_SIZE,
 };
-use litebox_syscall_rewriter::{
-    TargetHost,
-    macho::{CodeMetadata, Rewriter},
-};
+use litebox_syscall_rewriter::macho::{CodeMetadata, Rewriter};
 
-use crate::{ShimPlatform, Task};
+use crate::{SharedCacheRegion, SharedCacheTrampoline, ShimPlatform, Task};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedCacheRewriteMode {
+    Guest,
+    HostAware,
+    NativeThreadPointer,
+}
 
 /// File provenance and rewrite state retained for a live guest mapping.
 pub(crate) struct MachoMapping {
@@ -67,6 +71,7 @@ struct MachoPatchInfo {
     metadata: CodeMetadata,
     slice_range: Range<usize>,
     trampoline_capacity: usize,
+    rewrite_id: Arc<()>,
 }
 
 impl MachoPatchInfo {
@@ -101,7 +106,7 @@ impl MachoPatchInfo {
 
 /// Shared append-only runtime trampoline for one parsed Mach-O image.
 pub(crate) struct MachoRuntimeTrampoline {
-    patch_info: Arc<MachoPatchInfo>,
+    rewrite_id: Arc<()>,
     range: Option<Range<usize>>,
     cursor: usize,
     invalidated: bool,
@@ -234,6 +239,17 @@ fn forget_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usi
     }
 }
 
+fn reserve_shared_cache_gates(
+    cursor: usize,
+    gate_length: usize,
+    capacity: usize,
+) -> Option<Range<usize>> {
+    let start =
+        cursor.checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)?;
+    let end = start.checked_add(gate_length)?;
+    (end <= capacity).then_some(start..end)
+}
+
 impl<P: ShimPlatform> Task<P> {
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
         self.global
@@ -246,6 +262,168 @@ impl<P: ShimPlatform> Task<P> {
                 (start < end).then_some((start..end, flags))
             })
             .collect()
+    }
+
+    /// Rewrite one executable region of an externally prepared shared cache.
+    pub(crate) fn rewrite_shared_cache_region(
+        &self,
+        region: &SharedCacheRegion<'_>,
+        trampoline: &SharedCacheTrampoline,
+        trampoline_cursor: usize,
+    ) -> Result<usize, crate::SharedCacheInstallError> {
+        use crate::SharedCacheInstallError as Error;
+        const DARWIN_SVC: u32 = 0xd400_1001;
+        const MRS_TPIDRRO_MASK: u32 = 0xffff_ffe0;
+        const MRS_TPIDRRO_BITS: u32 = 0xd53b_d060;
+        const MAX_BATCH_SPAN: usize = 64 * 1024;
+
+        let length = region.range.len();
+        let valid_ranges = |ranges: &[Range<usize>]| {
+            !ranges.iter().any(|range| {
+                range.start >= range.end
+                    || range.end > length
+                    || !range.start.is_multiple_of(size_of::<u32>())
+                    || !range.end.is_multiple_of(size_of::<u32>())
+            }) && !ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+        };
+        let range_sets = [
+            region.guest_ranges,
+            region.host_aware_ranges,
+            region.native_thread_pointer_ranges,
+        ];
+        if range_sets.iter().all(|ranges| ranges.is_empty())
+            || range_sets.iter().any(|ranges| !valid_ranges(ranges))
+            || range_sets.iter().enumerate().any(|(index, ranges)| {
+                range_sets[index + 1..].iter().any(|other| {
+                    ranges.iter().any(|range| {
+                        other.iter().any(|candidate| {
+                            range.start < candidate.end && candidate.start < range.end
+                        })
+                    })
+                })
+            })
+        {
+            return Err(Error::InvalidRegion);
+        }
+        let pointer = P::RawMutPointer::<u8>::from_usize(region.writable_alias);
+        let rewriter = Rewriter::new(crate::aarch64_rewrite_options().target_host())
+            .map_err(|_| Error::Rewrite)?;
+        let callback = self.global.platform.get_syscall_entry_point();
+        let tls_offset = self
+            .global
+            .platform
+            .guest_thread_pointer_offset()
+            .and_then(|offset| u16::try_from(offset).ok())
+            .ok_or(Error::Rewrite)?;
+        let mut patches = Vec::new();
+        let mut next_cursor = trampoline_cursor;
+        for (ranges, mode) in [
+            (region.guest_ranges, SharedCacheRewriteMode::Guest),
+            (region.host_aware_ranges, SharedCacheRewriteMode::HostAware),
+            (
+                region.native_thread_pointer_ranges,
+                SharedCacheRewriteMode::NativeThreadPointer,
+            ),
+        ] {
+            let mut first = 0;
+            while first < ranges.len() {
+                let batch_start = ranges[first].start;
+                let mut batch_end = ranges[first].end;
+                let mut last = first + 1;
+                while let Some(next) = ranges.get(last)
+                    && next.end - batch_start <= MAX_BATCH_SPAN
+                    && next.start - batch_end <= PAGE_SIZE
+                {
+                    batch_end = next.end;
+                    last += 1;
+                }
+                let mut code =
+                    P::RawMutPointer::<u8>::from_usize(region.writable_alias + batch_start)
+                        .to_owned_slice(batch_end - batch_start)
+                        .ok_or(Error::UnreadableAlias)?
+                        .into_vec();
+                let mut local_ranges: Vec<_> = ranges[first..last]
+                    .iter()
+                    .map(|range| range.start - batch_start..range.end - batch_start)
+                    .collect();
+                local_ranges.retain(|range| {
+                    code[range.clone()].as_chunks::<4>().0.iter().any(|word| {
+                        let word = u32::from_le_bytes(*word);
+                        word == DARWIN_SVC
+                            || (mode != SharedCacheRewriteMode::NativeThreadPointer
+                                && word & MRS_TPIDRRO_MASK == MRS_TPIDRRO_BITS)
+                    })
+                });
+                first = last;
+                if local_ranges.is_empty() {
+                    continue;
+                }
+                let cursor = next_cursor
+                    .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN)
+                    .ok_or(Error::Rewrite)?;
+                let gate_address = trampoline
+                    .range
+                    .start
+                    .checked_add(cursor)
+                    .ok_or(Error::Rewrite)?;
+                let code_address = region
+                    .range
+                    .start
+                    .checked_add(batch_start)
+                    .ok_or(Error::Rewrite)?;
+                let result = match mode {
+                    SharedCacheRewriteMode::Guest => rewriter.patch_code_segment(
+                        &mut code,
+                        code_address as u64,
+                        &local_ranges,
+                        gate_address as u64,
+                        callback as u64,
+                        tls_offset,
+                    ),
+                    SharedCacheRewriteMode::HostAware => rewriter.patch_host_shared_cache_code(
+                        &mut code,
+                        code_address as u64,
+                        &local_ranges,
+                        gate_address as u64,
+                        callback as u64,
+                        tls_offset,
+                    ),
+                    SharedCacheRewriteMode::NativeThreadPointer => rewriter
+                        .patch_native_guest_tpidrro_code(
+                            &mut code,
+                            code_address as u64,
+                            &local_ranges,
+                            gate_address as u64,
+                            callback as u64,
+                            tls_offset,
+                        ),
+                };
+                let (gates, trapped) = result.map_err(|error| {
+                    litebox_util_log::warn!(error:?; "failed to build shared-cache gates");
+                    Error::Rewrite
+                })?;
+                let gate_range =
+                    reserve_shared_cache_gates(next_cursor, gates.len(), trampoline.range.len())
+                        .ok_or(Error::Rewrite)?;
+                if !trapped.is_empty() {
+                    litebox_util_log::warn!(trapped:? = trapped, gates:? = gates.len(), cursor:? = cursor; "shared-cache gates do not fit or cannot reach their sites");
+                    return Err(Error::Rewrite);
+                }
+                P::RawMutPointer::<u8>::from_usize(trampoline.writable_alias + gate_range.start)
+                    .copy_from_slice(0, &gates)
+                    .ok_or(Error::Rewrite)?;
+                next_cursor = gate_range.end;
+                patches.push((batch_start, code, local_ranges));
+            }
+        }
+        for (batch_start, code, local_ranges) in patches {
+            for local_range in local_ranges {
+                pointer
+                    .copy_from_slice(batch_start + local_range.start, &code[local_range])
+                    .ok_or(Error::Rewrite)?;
+            }
+        }
+        Ok(next_cursor)
     }
 
     pub(crate) fn sys_mmap(
@@ -366,7 +544,13 @@ impl<P: ShimPlatform> Task<P> {
                             .ok_or(MappingError::OutOfMemory)?;
                     }
                     if let Some(info) = macho.as_ref().filter(|_| executable) {
-                        self.rewrite_macho_mapping(pointer, length.as_usize(), &ranges, info)?;
+                        self.rewrite_macho_mapping(
+                            pointer,
+                            length.as_usize(),
+                            &ranges,
+                            &info.rewrite_id,
+                            info.trampoline_capacity,
+                        )?;
                     }
                     Ok(copied)
                 },
@@ -418,7 +602,14 @@ impl<P: ShimPlatform> Task<P> {
         &self,
         patch_info: &Arc<MachoPatchInfo>,
     ) -> MachoTrampolineCheckpoint {
-        let key = Arc::as_ptr(patch_info) as usize;
+        self.macho_trampoline_checkpoint_for_id(&patch_info.rewrite_id)
+    }
+
+    fn macho_trampoline_checkpoint_for_id(
+        &self,
+        rewrite_id: &Arc<()>,
+    ) -> MachoTrampolineCheckpoint {
+        let key = Arc::as_ptr(rewrite_id) as usize;
         self.global.macho_trampolines.lock().get(&key).map_or(
             MachoTrampolineCheckpoint {
                 range: None,
@@ -436,7 +627,15 @@ impl<P: ShimPlatform> Task<P> {
         patch_info: &Arc<MachoPatchInfo>,
         checkpoint: MachoTrampolineCheckpoint,
     ) {
-        let key = Arc::as_ptr(patch_info) as usize;
+        self.rollback_macho_trampoline_for_id(&patch_info.rewrite_id, checkpoint);
+    }
+
+    fn rollback_macho_trampoline_for_id(
+        &self,
+        rewrite_id: &Arc<()>,
+        checkpoint: MachoTrampolineCheckpoint,
+    ) {
+        let key = Arc::as_ptr(rewrite_id) as usize;
         let mut trampolines = self.global.macho_trampolines.lock();
         let Some(state) = trampolines.get_mut(&key) else {
             return;
@@ -466,12 +665,14 @@ impl<P: ShimPlatform> Task<P> {
         pointer: P::RawMutPointer<u8>,
         length: usize,
         ranges: &[core::ops::Range<usize>],
-        patch_info: &Arc<MachoPatchInfo>,
+        rewrite_id: &Arc<()>,
+        trampoline_capacity: usize,
     ) -> Result<(), MappingError> {
         if ranges.is_empty() {
             return Ok(());
         }
-        let rewriter = Rewriter::new(TargetHost::MacOs).map_err(|_| MappingError::OutOfMemory)?;
+        let rewriter = Rewriter::new(crate::aarch64_rewrite_options().target_host())
+            .map_err(|_| MappingError::OutOfMemory)?;
         let callback = self.global.platform.get_syscall_entry_point();
         if callback == 0 {
             litebox_util_log::warn!(
@@ -483,11 +684,12 @@ impl<P: ShimPlatform> Task<P> {
             .to_owned_slice(length)
             .ok_or(MappingError::OutOfMemory)?
             .into_vec();
+        let virtual_address = pointer.as_usize();
         let trap_fallback = |error: &dyn core::fmt::Display| {
             litebox_util_log::warn!(error:% = error; "using traps for Mach-O mapping rewrite");
             let mut trapped = original.clone();
             let count = rewriter
-                .trap_code_segment(&mut trapped, pointer.as_usize() as u64, ranges)
+                .trap_code_segment(&mut trapped, virtual_address as u64, ranges)
                 .map_err(|rewrite_error| {
                     litebox_util_log::error!(error:% = rewrite_error; "Mach-O trap fallback failed");
                     MappingError::OutOfMemory
@@ -508,30 +710,27 @@ impl<P: ShimPlatform> Task<P> {
             return trap_fallback(&"invalid guest thread-pointer offset");
         };
 
-        let key = Arc::as_ptr(patch_info) as usize;
+        let key = Arc::as_ptr(rewrite_id) as usize;
         let mut trampolines = self.global.macho_trampolines.lock();
         let state = trampolines
             .entry(key)
             .or_insert_with(|| MachoRuntimeTrampoline {
-                patch_info: Arc::clone(patch_info),
+                rewrite_id: Arc::clone(rewrite_id),
                 range: None,
                 cursor: 0,
                 invalidated: false,
             });
-        debug_assert!(Arc::ptr_eq(&state.patch_info, patch_info));
+        debug_assert!(Arc::ptr_eq(&state.rewrite_id, rewrite_id));
         if state.invalidated {
             return Err(MappingError::OutOfMemory);
         }
         let newly_allocated = state.range.is_none();
         if newly_allocated {
-            state.range = match self.reserve_trampoline(
-                pointer.as_usize(),
-                length,
-                patch_info.trampoline_capacity,
-            ) {
-                Ok(range) => Some(range),
-                Err(error) => return trap_fallback(&error),
-            };
+            state.range =
+                match self.reserve_trampoline(virtual_address, length, trampoline_capacity) {
+                    Ok(range) => Some(range),
+                    Err(error) => return trap_fallback(&error),
+                };
             state.cursor = 0;
         }
         let mut range = state.range.clone().expect("trampoline was just allocated");
@@ -544,14 +743,15 @@ impl<P: ShimPlatform> Task<P> {
             .checked_add(cursor)
             .ok_or(MappingError::OutOfMemory)?;
         let mut code = original.clone();
-        let (gates, trapped) = match rewriter.patch_code_segment(
+        let patch = rewriter.patch_code_segment(
             &mut code,
-            pointer.as_usize() as u64,
+            virtual_address as u64,
             ranges,
             trampoline_address as u64,
             callback as u64,
             tls_offset,
-        ) {
+        );
+        let (gates, trapped) = match patch {
             Ok(result) => result,
             Err(error) => {
                 if newly_allocated {
@@ -650,11 +850,13 @@ impl<P: ShimPlatform> Task<P> {
                 .max(address.abs_diff(code_end))
                 <= litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT
         };
-        // TODO: derive preferred placement from the full image load layout once
-        // dynamic loading is supported, as the Linux shim does for ELF.
         let hint = self
             .trampoline_address_after(code_address, code_length, capacity)
             .filter(|&address| reachable(address))
+            .or_else(|| {
+                self.trampoline_address_before(code_address, capacity)
+                    .filter(|&address| reachable(address))
+            })
             .or_else(|| {
                 self.trampoline_address_after(code_address, code_length, PAGE_SIZE)
                     .filter(|&address| reachable(address))
@@ -735,7 +937,7 @@ impl<P: ShimPlatform> Task<P> {
         };
         let mut mappings = self.global.macho_mappings.lock();
         for mapping in mappings.values_mut() {
-            if invalidated.contains(&(Arc::as_ptr(&mapping.patch_info) as usize)) {
+            if invalidated.contains(&(Arc::as_ptr(&mapping.patch_info.rewrite_id) as usize)) {
                 mapping.trampoline_invalidated = true;
             }
         }
@@ -849,7 +1051,7 @@ impl<P: ShimPlatform> Task<P> {
         let trampoline_capacity = metadata
             .trampoline_size_upper_bound(
                 slice,
-                litebox_syscall_rewriter::RewriteOptions::new(TargetHost::MacOs, false),
+                crate::aarch64_rewrite_options(),
             )
             .and_then(|size| {
                 size.max(PAGE_SIZE)
@@ -866,6 +1068,7 @@ impl<P: ShimPlatform> Task<P> {
             metadata,
             slice_range,
             trampoline_capacity,
+            rewrite_id: Arc::new(()),
         });
         self.cache_macho_patch_info(file, Some(Arc::clone(&patch_info)));
         Ok(patch_info)
@@ -967,7 +1170,8 @@ impl<P: ShimPlatform> Task<P> {
                 P::RawMutPointer::from_usize(patch.range.start),
                 patch.range.len(),
                 &ranges,
-                &patch.patch_info,
+                &patch.patch_info.rewrite_id,
+                patch.patch_info.trampoline_capacity,
             );
             let mut restore_error = None;
             for (range, previous_permissions) in previous {
@@ -1018,6 +1222,24 @@ impl<P: ShimPlatform> Task<P> {
             )
         }
         .map_err(protection_error)
+    }
+
+    fn trampoline_address_before(&self, code_address: usize, length: usize) -> Option<usize> {
+        let mut previous_end = P::TASK_ADDR_MIN;
+        let mut candidate = None;
+        for (range, _) in self.global.pm.mappings() {
+            if range.start >= code_address {
+                break;
+            }
+            if range.start.saturating_sub(previous_end) >= length {
+                candidate = Some(range.start - length);
+            }
+            previous_end = previous_end.max(range.end);
+        }
+        if code_address.saturating_sub(previous_end) >= length {
+            candidate = Some(code_address - length);
+        }
+        candidate
     }
 
     fn trampoline_address_after(
@@ -1094,11 +1316,26 @@ impl<P: ShimPlatform> Task<P> {
         let length = length
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
-        address.checked_add(length).ok_or(Errno::EINVAL)?;
+        let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
+        let dyld_range = self.global.privately_mapped_dyld_range.lock().clone();
+        // This process-lifetime override lets dyld update DATA_CONST: its
+        // helper restarts at the authenticated call site after a fault, so a
+        // read-only transition would repeatedly fault before the write. Remove
+        // it when those protection transitions can complete without that loop.
+        let protection = if dyld_range
+            .as_ref()
+            .is_some_and(|dyld| address >= dyld.start && end <= dyld.end)
+            && protection.contains(VmProtection::READ)
+            && !protection.intersects(VmProtection::WRITE | VmProtection::EXECUTE)
+        {
+            protection | VmProtection::WRITE
+        } else {
+            protection
+        };
         if protection.contains(VmProtection::EXECUTE) {
             self.rewrite_mprotect_range(address, length)?;
         }
-        let range = address..address + length;
+        let range = address..end;
         if protection.contains(VmProtection::WRITE) {
             // Publish writable permissions and invalidate rewrite state while
             // holding the same lock used by executable transitions. Code may
@@ -1251,6 +1488,7 @@ mod tests {
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
+            thread: crate::ThreadState { id: 1u64 << 32 },
         }
     }
 
@@ -1296,6 +1534,7 @@ mod tests {
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
+            thread: crate::ThreadState { id: 1u64 << 32 },
         };
 
         assert_eq!(
@@ -1306,6 +1545,21 @@ mod tests {
             task.sys_mprotect(1, 0, VmProtection::READ),
             Err(Errno::EINVAL)
         );
+    }
+
+    #[test]
+    fn trampoline_search_includes_gap_immediately_before_code() {
+        let task = task_with_file(&macho_image());
+        let base = task.allocate_trampoline(None, 4 * PAGE_SIZE).unwrap();
+        task.sys_munmap(base + PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
+
+        assert_eq!(
+            task.trampoline_address_before(base + 3 * PAGE_SIZE, 2 * PAGE_SIZE),
+            Some(base + PAGE_SIZE)
+        );
+
+        task.sys_munmap(base, PAGE_SIZE).unwrap();
+        task.sys_munmap(base + 3 * PAGE_SIZE, PAGE_SIZE).unwrap();
     }
 
     #[test]
@@ -1364,7 +1618,7 @@ mod tests {
             patch_info
         };
         let trampolines = task.global.macho_trampolines.lock();
-        let range = trampolines[&(Arc::as_ptr(&patch_info) as usize)]
+        let range = trampolines[&(Arc::as_ptr(&patch_info.rewrite_id) as usize)]
             .range
             .as_ref()
             .unwrap();
@@ -1527,7 +1781,7 @@ mod tests {
         let gate = UserPtr::<u8>::from_usize(target)
             .to_owned_slice::<Platform>(64)
             .unwrap();
-        let classified = Rewriter::new(TargetHost::MacOs)
+        let classified = Rewriter::new(litebox_syscall_rewriter::TargetHost::MacOs)
             .unwrap()
             .classify_gate_slot(&gate, target as u64, target as u64)
             .unwrap();

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! AArch64 Mach-O rewriting for LiteBox on macOS.
+//! AArch64 Mach-O rewriting for LiteBox.
 //!
 //! SVC callbacks receive SP decremented by [`aarch64::DARWIN_SVC_FRAME_BYTES`],
 //! with saved x16 (the syscall number) at `[SP]`. They must supply Darwin's x0/x1
@@ -65,11 +65,6 @@ pub struct Rewriter {
 
 impl Rewriter {
     pub fn new(host: TargetHost) -> Result<Self> {
-        if host != TargetHost::MacOs {
-            return Err(Error::UnsupportedExecutable(
-                "Mach-O rewriting requires a macOS host".into(),
-            ));
-        }
         Ok(Self { host })
     }
 
@@ -116,7 +111,7 @@ impl Rewriter {
             trampoline_vaddr,
             callback,
             guest_tp_offset,
-            RewriteOptions::macos_native_guest_tpidrro(),
+            RewriteOptions::native_guest_thread_pointer(self.host),
         )
     }
 
@@ -138,7 +133,7 @@ impl Rewriter {
             trampoline_vaddr,
             callback,
             guest_tp_offset,
-            RewriteOptions::macos_host_shared_cache(),
+            RewriteOptions::host_aware_thread_pointer(self.host),
         )
     }
 

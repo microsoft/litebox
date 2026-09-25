@@ -106,6 +106,18 @@ impl<P: ShimPlatform> Task<P> {
         if path.as_bytes().contains(&0) {
             return Err(Errno::EINVAL);
         }
+        if flags.bits() & !OpenFlags::all().bits() != 0 {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(OpenFlags::NOFOLLOW_ANY)
+            && path
+                .split('/')
+                .filter(|component| !component.is_empty())
+                .count()
+                > 1
+        {
+            return Err(Errno::ENOTSUP);
+        }
         let access = match flags.bits() & 3 {
             0 => FileAccessMode::ReadOnly,
             1 => FileAccessMode::WriteOnly,
@@ -120,12 +132,18 @@ impl<P: ShimPlatform> Task<P> {
             (OpenFlags::APPEND, FileOpenFlags::APPEND),
             (OpenFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
             (OpenFlags::NOFOLLOW, FileOpenFlags::NO_FOLLOW),
+            // With at most one component, checking the final component also
+            // implements NOFOLLOW_ANY.
+            (OpenFlags::NOFOLLOW_ANY, FileOpenFlags::NO_FOLLOW),
             (OpenFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
             (OpenFlags::DIRECTORY, FileOpenFlags::DIRECTORY),
         ] {
             if flags.contains(guest) {
                 open_flags = open_flags.union(broker);
             }
+        }
+        if path.ends_with('/') {
+            open_flags = open_flags.union(FileOpenFlags::DIRECTORY);
         }
         let mut context = litebox::fs::Context::new();
         context.set_acting_user(FileUser {
@@ -295,6 +313,9 @@ mod tests {
     };
     use litebox_platform_macos_userland::MacosUserland as Platform;
 
+    const O_SHLOCK: i32 = 0x10;
+    const O_EXLOCK: i32 = 0x20;
+
     #[test]
     fn inherited_litebox_files_use_the_syscall_dispatcher() {
         let platform = Platform::new();
@@ -361,6 +382,7 @@ mod tests {
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
+            thread: crate::ThreadState { id: 1u64 << 32 },
         };
         // SAFETY: a fresh, non-fixed mapping owned by this task.
         let buf = unsafe {
@@ -491,6 +513,12 @@ mod tests {
         assert_eq!(invoke(nr::READ, reopened, 3), Ok(3));
         assert_eq!(&*buf.to_owned_slice(3).unwrap(), b"new");
         assert_eq!(invoke(nr::CLOSE_NOCANCEL, reopened, 0), Ok(0));
+        for unsupported in [O_SHLOCK, O_EXLOCK] {
+            assert_eq!(
+                open(nr::OPEN, path, OpenFlags::from_bits_retain(unsupported), 0,),
+                Err(Errno::EINVAL)
+            );
+        }
         assert_eq!(open(nr::OPEN, 0, OpenFlags::RDONLY, 0), Err(Errno::EFAULT));
         buf.copy_from_slice(0, &[b'x'; PATH_MAX]).unwrap();
         assert_eq!(
@@ -501,6 +529,30 @@ mod tests {
         assert_eq!(
             open(nr::OPEN, buf.as_usize(), OpenFlags::RDONLY, 0),
             Err(Errno::ENOENT)
+        );
+        assert_eq!(
+            task.sys_open("/data/", OpenFlags::RDONLY, FileMode::empty()),
+            Err(Errno::ENOTDIR)
+        );
+        let relative = task
+            .sys_open("data", OpenFlags::RDONLY, FileMode::empty())
+            .unwrap();
+        task.sys_close(i32::try_from(relative).unwrap()).unwrap();
+        let no_follow = task
+            .sys_open(
+                "/data",
+                OpenFlags::RDONLY | OpenFlags::NOFOLLOW_ANY,
+                FileMode::empty(),
+            )
+            .unwrap();
+        task.sys_close(i32::try_from(no_follow).unwrap()).unwrap();
+        assert_eq!(
+            task.sys_open(
+                "/directory/data",
+                OpenFlags::RDONLY | OpenFlags::NOFOLLOW_ANY,
+                FileMode::empty(),
+            ),
+            Err(Errno::ENOTSUP)
         );
 
         let directory = task

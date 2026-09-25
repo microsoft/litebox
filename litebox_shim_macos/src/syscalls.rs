@@ -4,10 +4,13 @@
 //! Typed BSD syscall implementations.
 
 use crate::{ShimPlatform, Task};
+use core::sync::atomic::Ordering;
 use litebox::utils::TruncateExt as _;
 use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers::UserPtrMut};
 
 pub(crate) mod file;
+pub(crate) mod mach;
+pub(crate) mod misc;
 pub(crate) mod mm;
 
 impl<P: ShimPlatform> Task<P> {
@@ -32,6 +35,25 @@ impl<P: ShimPlatform> Task<P> {
     }
     pub(crate) fn sys_getegid(&self) -> u32 {
         self.params.egid
+    }
+
+    pub(crate) fn sys_shared_region_check_np(
+        &self,
+        start_address: UserPtrMut<usize>,
+    ) -> Result<(), litebox_common_macos::errno::Errno> {
+        use litebox_common_macos::errno::Errno;
+
+        let base = self.global.shared_cache_base.load(Ordering::Acquire);
+        if base == 0 {
+            return Err(Errno::EINVAL);
+        }
+        // XNU accepts this exact sentinel without copying out a cache base.
+        if start_address.as_usize() == usize::MAX {
+            return Ok(());
+        }
+        start_address
+            .write_at_offset::<P>(0, base)
+            .ok_or(Errno::EFAULT)
     }
 
     pub(crate) fn sys_mach_absolute_time(&self) -> usize {
