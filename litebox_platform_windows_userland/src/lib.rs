@@ -69,11 +69,6 @@ pub enum GuestTlsMode {
 
 mod page_mgmt;
 
-// Thread-local storage for FS base state
-thread_local! {
-    static THREAD_FS_BASE: Cell<usize> = const { Cell::new(0) };
-}
-
 const GUEST_TLS_MODE_UNCONFIGURED: u8 = 0;
 static GUEST_TLS_MODE: AtomicU8 = AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);
 
