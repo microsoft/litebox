@@ -6,6 +6,7 @@
 //! Hyper-V facilities and VTL-specific operations are not yet separate
 //! interfaces; this module is not a backend-neutral kernel dependency.
 
+pub mod clock;
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
 mod hvcall_vp;

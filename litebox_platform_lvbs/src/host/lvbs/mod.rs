@@ -10,6 +10,7 @@
 
 pub mod boot;
 pub mod bootparam;
+pub mod clock;
 pub mod linux;
 pub mod per_cpu_variables;
 pub mod phys_memory;

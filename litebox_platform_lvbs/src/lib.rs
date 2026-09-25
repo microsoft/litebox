@@ -717,58 +717,18 @@ impl<Host: HostInterface> RawMutex<Host> {
     }
 }
 
-/// An implementation of [`litebox::platform::Instant`].
-///
-/// Backed by the Hyper-V partition reference counter, which is monotonic
-/// and normalized by the hypervisor across TSC scaling and live migration.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Instant(u64);
-
-/// An implementation of [`litebox::platform::SystemTime`]
-pub struct SystemTime();
-
-impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
-    type Instant = Instant;
-    type SystemTime = SystemTime;
+// Time representation and clock access belong to the selected host. In
+// particular, the shared kernel must not assume Hyper-V counter units.
+impl<Host: HostInterface + TimeProvider> TimeProvider for LinuxKernel<Host> {
+    type Instant = Host::Instant;
+    type SystemTime = Host::SystemTime;
 
     fn now(&self) -> Self::Instant {
-        Instant::now()
+        self.host.now()
     }
 
     fn current_time(&self) -> Self::SystemTime {
-        unimplemented!()
-    }
-}
-
-impl litebox::platform::Instant for Instant {
-    fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
-        let ticks = self.0.checked_sub(earlier.0)?;
-        // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
-        let nanos = ticks.checked_mul(timer::REF_COUNTER_TICK_NANOS)?;
-        Some(core::time::Duration::from_nanos(nanos))
-    }
-
-    fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
-        let nanos: u64 = duration.as_nanos().try_into().ok()?;
-        let ticks = nanos / timer::REF_COUNTER_TICK_NANOS;
-        Some(Instant(self.0.checked_add(ticks)?))
-    }
-}
-
-impl Instant {
-    fn now() -> Self {
-        Instant(timer::reference_time_100ns())
-    }
-}
-
-impl litebox::platform::SystemTime for SystemTime {
-    const UNIX_EPOCH: Self = SystemTime();
-
-    fn duration_since(
-        &self,
-        _earlier: &Self,
-    ) -> Result<core::time::Duration, core::time::Duration> {
-        unimplemented!()
+        self.host.current_time()
     }
 }
 

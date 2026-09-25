@@ -29,8 +29,9 @@ use crate::arch::instrs::{rdmsr, wrmsr};
 use crate::mshv::{
     HV_FEATURE_REFERENCE_COUNTER, HV_FEATURE_STIMER_DIRECT, HV_FEATURE_SYNTHETIC_TIMER,
     HV_STIMER_CONFIG_DIRECT_MODE, HV_STIMER_CONFIG_ENABLE, HV_STIMER_CONFIG_VECTOR_SHIFT,
-    HV_X64_MSR_STIMER0_CONFIG, HV_X64_MSR_STIMER0_COUNT, HV_X64_MSR_TIME_REF_COUNT,
-    HYPERV_CPUID_FEATURES, HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
+    HV_X64_MSR_STIMER0_CONFIG, HV_X64_MSR_STIMER0_COUNT, HYPERV_CPUID_FEATURES,
+    HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, HYPERV_HYPERVISOR_PRESENT_BIT,
+    clock::{REF_TICKS_PER_MICRO, reference_time_100ns},
 };
 use crate::per_cpu_variables::with_per_cpu_variables;
 use core::arch::x86_64::__cpuid_count as cpuid_count;
@@ -72,23 +73,8 @@ const QUANTUM_MICROS: u64 = 50_000_000; // 50 s
 #[cfg(feature = "preemption_test_quantum")]
 const QUANTUM_MICROS: u64 = 10_000; // 10 ms
 
-/// Partition reference counter granularity: 100 ns ticks, i.e., 10 per microsecond.
-const REF_TICKS_PER_MICRO: u64 = 10;
-
 /// Quantum as a reference-counter tick count (STIMER deadlines are in ticks).
 const QUANTUM_100NS: u64 = QUANTUM_MICROS * REF_TICKS_PER_MICRO;
-
-/// Nanoseconds per partition reference-counter tick: the counter runs at
-/// 10 MHz (`REF_TICKS_PER_MICRO` ticks per microsecond).
-pub(crate) const REF_COUNTER_TICK_NANOS: u64 = 1_000 / REF_TICKS_PER_MICRO;
-
-/// Read the Hyper-V partition reference counter (`HV_X64_MSR_TIME_REF_COUNT`).
-///
-/// A monotonic, frequency-invariant counter in 100 ns units, normalized by the
-/// hypervisor across TSC scaling and live migration.
-pub(crate) fn reference_time_100ns() -> u64 {
-    rdmsr(HV_X64_MSR_TIME_REF_COUNT)
-}
 
 // TODO: This backend is Hyper-V specific (STIMER direct mode). For non-Hyper-V
 // platforms, add alternative one-shot timer sources behind the same
@@ -180,7 +166,7 @@ fn init_stimer() -> bool {
 /// owns the `preemption_armed` flag and the `preemption_timer_enabled` gate.
 #[inline]
 fn program_stimer_deadline() {
-    let now = rdmsr(HV_X64_MSR_TIME_REF_COUNT);
+    let now = reference_time_100ns();
     wrmsr(HV_X64_MSR_STIMER0_COUNT, now.wrapping_add(QUANTUM_100NS));
     let cfg = HV_STIMER_CONFIG_ENABLE
         | HV_STIMER_CONFIG_DIRECT_MODE
