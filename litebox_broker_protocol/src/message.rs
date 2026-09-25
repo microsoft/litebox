@@ -18,8 +18,8 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest, VforkRequest,
-    VforkResponse,
+    CreateThreadRequest, CreateThreadResponse, ProcessIdentity, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -48,8 +48,8 @@ pub struct BrokerHandshakeRequest {
 /// Operation requested over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerOperation {
-    /// Create a broker thread belonging to this process.
-    CreateThread,
+    /// Create a thread in this process or a pending child process.
+    CreateThread(CreateThreadRequest),
     /// Record broker thread exit after local teardown completes.
     ExitThread(ThreadId),
     /// Close one broker object reference.
@@ -70,8 +70,6 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process.
     StartChildProcess(StartChildProcessRequest),
-    /// Perform one constrained shared-address-space `vfork` operation.
-    Vfork(VforkRequest),
 }
 
 impl BrokerOperation {
@@ -106,15 +104,13 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
-            | Self::StartChildProcess(
-                StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor { buffer, .. })
-                | StartChildProcessRequest::Duplicate(buffer),
-            )
-            | Self::Vfork(VforkRequest::Start {
-                startup: ProcessStartupDescriptor { buffer, .. },
+            | Self::StartChildProcess(StartChildProcessRequest {
+                source:
+                    StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer, .. })
+                    | StartChildProcessSource::Duplicate(buffer),
                 ..
             }) => Some(*buffer),
-            Self::CreateThread
+            Self::CreateThread(_)
             | Self::ExitThread(_)
             | Self::CloseObject(_)
             | Self::CheckReadiness(_)
@@ -134,8 +130,7 @@ impl BrokerOperation {
             | Self::Stdio(StdioRequest::IsTerminal(_))
             | Self::File(
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
-            )
-            | Self::Vfork(VforkRequest::Create) => None,
+            ) => None,
         }
     }
 }
@@ -235,8 +230,8 @@ pub enum SocketRequest {
 /// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResult {
-    /// A thread was created with this broker-assigned ID.
-    ThreadCreated(ThreadId),
+    /// Thread or pending-process creation result.
+    CreateThread(CreateThreadResponse),
     /// Thread exit completed.
     ThreadExited,
     /// Object close operation completed.
@@ -257,8 +252,6 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A child established its broker association.
     ProcessStarted(ProcessIdentity),
-    /// Constrained `vfork` response family.
-    Vfork(VforkResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

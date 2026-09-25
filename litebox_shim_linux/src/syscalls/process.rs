@@ -52,15 +52,14 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
 }
 
-fn vfork_errno(error: litebox::process::VforkError) -> Errno {
+fn vfork_errno(error: litebox::process::ProcessError) -> Errno {
     match error {
-        litebox::process::VforkError::PolicyDenied => Errno::EPERM,
-        litebox::process::VforkError::Unavailable => Errno::ENOSYS,
-        litebox::process::VforkError::Busy | litebox::process::VforkError::ResourceExhausted => {
-            Errno::EAGAIN
-        }
-        litebox::process::VforkError::ServiceFailed
-        | litebox::process::VforkError::InvalidChild => Errno::EIO,
+        litebox::process::ProcessError::PolicyDenied => Errno::EPERM,
+        litebox::process::ProcessError::Unavailable => Errno::ENOSYS,
+        litebox::process::ProcessError::Busy
+        | litebox::process::ProcessError::ResourceExhausted => Errno::EAGAIN,
+        litebox::process::ProcessError::ServiceFailed
+        | litebox::process::ProcessError::InvalidChild => Errno::EIO,
     }
 }
 
@@ -722,14 +721,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child = self
             .global
             .litebox
-            .create_vfork_child()
+            .create_child_process()
             .map_err(vfork_errno)?;
-        let child_pid =
-            i32::try_from(child.process_id.0).expect("broker process IDs must fit Linux pid_t");
+        let child_pid = i32::try_from(child.0).expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
         parent_context.rax = child_pid.cast_unsigned() as usize;
         self.vfork.replace(Some(crate::VforkState {
-            child,
+            child_process_id: child,
             parent_context,
         }));
         Ok(0)
@@ -965,7 +963,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.vfork.borrow().as_ref().map_or_else(
             || self.tid(),
             |state| {
-                i32::try_from(state.child.process_id.0)
+                i32::try_from(state.child_process_id.0)
                     .expect("broker process IDs must fit Linux pid_t")
             },
         )
@@ -1436,7 +1434,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
         self.vfork.borrow().as_ref().map_or(self.pid, |state| {
-            i32::try_from(state.child.process_id.0)
+            i32::try_from(state.child_process_id.0)
                 .expect("broker process IDs must fit Linux pid_t")
         })
     }
@@ -1715,7 +1713,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
         let (path, argv_vec, envp_vec) = copy_exec_arguments::<Platform>(pathname, argv, envp)?;
-        let vfork_child = self.vfork.borrow().as_ref().map(|state| state.child);
+        let vfork_child = self
+            .vfork
+            .borrow()
+            .as_ref()
+            .map(|state| state.child_process_id);
         if vfork_child.is_some() && !path.starts_with('/') {
             return Err(Errno::ENOENT);
         }
@@ -1742,8 +1744,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
             self.global
                 .litebox
-                .start_vfork_child(
-                    child.process_id,
+                .start_child_process(
+                    Some(child),
                     LINUX_PROGRAM_BOOTSTRAP_FORMAT,
                     LINUX_PROGRAM_BOOTSTRAP_VERSION,
                     &payload,

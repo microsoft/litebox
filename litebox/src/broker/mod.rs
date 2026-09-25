@@ -19,7 +19,8 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
+    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
+    ProcessBootstrapVersion, ProcessIdentity,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -52,15 +53,17 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn create_vfork_child(&self) -> core::result::Result<ProcessIdentity, BrokerControlError>;
-
-    fn start_vfork_child(
+    fn create_child_process(
         &self,
-        child_process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<litebox_broker_protocol::ProcessId, BrokerControlError>;
+
+    fn start_child_process(
+        &self,
+        child_process_id: Option<litebox_broker_protocol::ProcessId>,
         format: ProcessBootstrapFormat,
         version: ProcessBootstrapVersion,
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError>;
+    ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -450,23 +453,32 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn create_vfork_child(&self) -> core::result::Result<ProcessIdentity, BrokerControlError> {
-        self.request(BrokerLocal::create_vfork_child)
+    fn create_child_process(
+        &self,
+    ) -> core::result::Result<litebox_broker_protocol::ProcessId, BrokerControlError> {
+        self.request(BrokerLocal::create_child_process)
     }
 
-    fn start_vfork_child(
+    fn start_child_process(
         &self,
-        child_process_id: litebox_broker_protocol::ProcessId,
+        child_process_id: Option<litebox_broker_protocol::ProcessId>,
         format: ProcessBootstrapFormat,
         version: ProcessBootstrapVersion,
         payload: &[u8],
-    ) -> core::result::Result<(), BrokerControlError> {
+    ) -> core::result::Result<ProcessIdentity, BrokerControlError> {
         if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
         let lease = self.acquire_shared_buffer(payload.len())?;
         self.request(|local| {
-            local.start_vfork_child(child_process_id, format, version, lease.sequence(), payload)
+            local.start_child_process(
+                child_process_id,
+                format,
+                version,
+                lease.sequence(),
+                payload,
+                InheritedProcessObjects::EMPTY,
+            )
         })
     }
 

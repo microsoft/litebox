@@ -44,9 +44,9 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest, VforkRequest, VforkResponse,
+    CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -483,10 +483,18 @@ fn handle_request<Memory: SharedMemory>(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<BrokerResult> {
     match operation {
-        BrokerOperation::CreateThread => process
-            .create_thread()
-            .map(BrokerResult::ThreadCreated)
-            .map_err(RequestFailure::from),
+        BrokerOperation::CreateThread(request) => match request {
+            CreateThreadRequest::Thread => process
+                .create_thread()
+                .map(CreateThreadResponse::Thread)
+                .map(BrokerResult::CreateThread)
+                .map_err(RequestFailure::from),
+            CreateThreadRequest::Process => process
+                .create_child_process()
+                .map(CreateThreadResponse::Process)
+                .map(BrokerResult::CreateThread)
+                .map_err(RequestFailure::from),
+        },
         BrokerOperation::ExitThread(thread_id) => process
             .exit_thread(thread_id)
             .map(|()| BrokerResult::ThreadExited)
@@ -524,7 +532,7 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
-        BrokerOperation::StartChildProcess(_) | BrokerOperation::Vfork(_) => {
+        BrokerOperation::StartChildProcess(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
@@ -793,103 +801,55 @@ where
     Launcher: ProcessLauncher + ?Sized,
 {
     match operation {
-        BrokerOperation::StartChildProcess(StartChildProcessRequest::Bootstrap(request)) => Some(
-            read_shared_buffer(shared_buffers, request.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
+        BrokerOperation::StartChildProcess(StartChildProcessRequest {
+            child_process_id,
+            source: StartChildProcessSource::Bootstrap(startup),
+        }) => Some(
+            read_shared_buffer(shared_buffers, startup.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
                 .and_then(|payload| {
                     start_child_process(
                         broker,
                         Arc::clone(launcher),
                         parent,
-                        request.format,
-                        request.version,
-                        payload,
-                        request.inherited_objects,
+                        *child_process_id,
+                        ProcessStartupData {
+                            format: startup.format,
+                            version: startup.version,
+                            payload,
+                            inherited_objects: startup.inherited_objects,
+                        },
                     )
                 })
                 .map(BrokerResult::ProcessStarted),
         ),
-        BrokerOperation::Vfork(VforkRequest::Create) => Some(
-            parent
-                .create_vfork_child()
-                .map(VforkResponse::Created)
-                .map(BrokerResult::Vfork)
-                .map_err(RequestFailure::from),
-        ),
-        BrokerOperation::Vfork(VforkRequest::Start {
-            child_process_id,
-            startup,
-        }) => Some(
-            read_shared_buffer(shared_buffers, startup.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
-                .and_then(|payload| {
-                    start_vfork_child(
-                        Arc::clone(launcher),
-                        parent,
-                        *child_process_id,
-                        startup.format,
-                        startup.version,
-                        payload,
-                        startup.inherited_objects,
-                    )
-                })
-                .map(|()| BrokerResult::Vfork(VforkResponse::Started)),
-        ),
         _ => None,
     }
-}
-
-fn start_vfork_child<Launcher: ProcessLauncher + ?Sized>(
-    launcher: Arc<Launcher>,
-    parent: &BrokerProcess,
-    child_process_id: litebox_broker_protocol::ProcessId,
-    format: ProcessBootstrapFormat,
-    version: ProcessBootstrapVersion,
-    payload: Vec<u8>,
-    inherited_objects: InheritedProcessObjects,
-) -> RequestResult<()> {
-    if !inherited_objects.as_slice().is_empty() {
-        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
-    }
-    let process = parent
-        .take_vfork_child(child_process_id)
-        .map_err(RequestFailure::from)?;
-    if parent.is_cancellation_requested() {
-        let _ = process.fail_start(BrokerError::PeerClosed, false, true);
-        process.retire(true);
-        return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
-    }
-    launcher
-        .launch(
-            process,
-            ProcessStartupData {
-                format,
-                version,
-                payload,
-                inherited_objects: InheritedProcessObjects::EMPTY,
-            },
-        )
-        .map_err(RequestFailure::from)
 }
 
 fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     broker: &BrokerCore,
     launcher: Arc<Launcher>,
     parent: &BrokerProcess,
-    format: ProcessBootstrapFormat,
-    version: ProcessBootstrapVersion,
-    payload: Vec<u8>,
-    requested_inherited_objects: InheritedProcessObjects,
+    child_process_id: Option<litebox_broker_protocol::ProcessId>,
+    startup: ProcessStartupData,
 ) -> RequestResult<ProcessIdentity> {
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
-    let process = broker
-        .create_process(parent.caller_credential(), Some(parent.id()))
-        .map_err(RequestFailure::from)?;
+    let process = match child_process_id {
+        Some(child_process_id) => parent
+            .take_child_process(child_process_id)
+            .map_err(RequestFailure::from)?,
+        None => broker
+            .create_process(parent.caller_credential(), Some(parent.id()))
+            .map_err(RequestFailure::from)?,
+    };
     let inherited_objects = match parent
-        .duplicate_object_references_to(requested_inherited_objects.as_slice(), &process)
+        .duplicate_object_references_to(startup.inherited_objects.as_slice(), &process)
     {
         Ok(inherited_objects) => inherited_objects,
         Err(error) => {
+            let _ = process.fail_start(error, false, true);
             process.retire(true);
             return Err(RequestFailure::from(error));
         }
@@ -899,6 +859,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     let process_id = process.id();
     let initial_thread_id = process.initial_thread_id();
     if parent.is_cancellation_requested() {
+        let _ = process.fail_start(BrokerError::PeerClosed, false, true);
         process.retire(true);
         return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
     }
@@ -906,9 +867,9 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
         .launch(
             process,
             ProcessStartupData {
-                format,
-                version,
-                payload,
+                format: startup.format,
+                version: startup.version,
+                payload: startup.payload,
                 inherited_objects,
             },
         )
@@ -2403,8 +2364,11 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let response = handle_test_request(&process, BrokerOperation::CreateThread);
-        let BrokerResult::ThreadCreated(thread_id) = response else {
+        let response = handle_test_request(
+            &process,
+            BrokerOperation::CreateThread(CreateThreadRequest::Thread),
+        );
+        let BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id)) = response else {
             panic!("unexpected thread-ID allocation response: {response:?}");
         };
         assert_ne!(thread_id.0, process.id().0);

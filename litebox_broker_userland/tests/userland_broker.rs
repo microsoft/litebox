@@ -237,6 +237,7 @@ fn run_fake_runner(args: &[OsString]) {
         let inherited_objects = InheritedProcessObjects::new(&[inherited_event]).unwrap();
         let failed = local
             .start_child_process(
+                None,
                 FAILING_BOOTSTRAP_FORMAT,
                 ProcessBootstrapVersion(1),
                 SharedBufferSequence::new(
@@ -251,6 +252,7 @@ fn run_fake_runner(args: &[OsString]) {
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
         let started = local
             .start_child_process(
+                None,
                 TEST_BOOTSTRAP_FORMAT,
                 ProcessBootstrapVersion(1),
                 SharedBufferSequence::new(

@@ -94,9 +94,27 @@ pub struct ProcessIdentity {
     pub initial_thread_id: ThreadId,
 }
 
-/// Selects how the broker starts one child process.
+/// Selects whether thread creation extends the current process or creates a child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartChildProcessRequest {
+pub enum CreateThreadRequest {
+    /// Creates another thread in the requesting process.
+    Thread,
+    /// Creates a pending child process and its initial thread.
+    Process,
+}
+
+/// Successful thread or process creation result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateThreadResponse {
+    /// A thread was created in the requesting process.
+    Thread(ThreadId),
+    /// A pending child process was created.
+    Process(ProcessId),
+}
+
+/// Source used to start one child process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartChildProcessSource {
     /// Starts a child from an opaque platform bootstrap.
     Bootstrap(ProcessStartupDescriptor),
     /// Starts a child by duplicating the calling process from an encoded,
@@ -104,25 +122,11 @@ pub enum StartChildProcessRequest {
     Duplicate(SharedBufferSequence),
 }
 
-/// One constrained shared-address-space `vfork` operation.
+/// Starts either a newly allocated child or a pending child created earlier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VforkRequest {
-    /// Allocates one pending child process and its initial thread identity.
-    Create,
-    /// Transfers a pending child into a fresh runner using a Program startup.
-    Start {
-        /// Pending child process allocated by [`Self::Create`].
-        child_process_id: ProcessId,
-        /// Program startup delivered to the fresh child runner.
-        startup: ProcessStartupDescriptor,
-    },
-}
-
-/// Successful result of a constrained `vfork` operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VforkResponse {
-    /// The pending child identity allocated for the shared execution window.
-    Created(ProcessIdentity),
-    /// The pending child established its fresh runner association.
-    Started,
+pub struct StartChildProcessRequest {
+    /// Existing pending child to start, or `None` to allocate a new child.
+    pub child_process_id: Option<ProcessId>,
+    /// Process startup source.
+    pub source: StartChildProcessSource,
 }

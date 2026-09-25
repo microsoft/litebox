@@ -13,9 +13,9 @@ use crate::LiteBox;
 use crate::broker::error::BrokerControlError;
 use crate::sync::RawSyncPrimitivesProvider;
 
-/// Error returned by the constrained `vfork` process service.
+/// Error returned by the broker-backed process service.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
-pub enum VforkError {
+pub enum ProcessError {
     /// This LiteBox process has no broker process service.
     #[error("process creation is unavailable")]
     Unavailable,
@@ -25,42 +25,42 @@ pub enum VforkError {
     /// Process duplication is disabled by policy.
     #[error("process duplication is denied")]
     PolicyDenied,
-    /// Another pending `vfork` child already exists.
-    #[error("a vfork child is already pending")]
+    /// Another pending child process already exists.
+    #[error("a child process is already pending")]
     Busy,
     /// Process or memory capacity is exhausted.
     #[error("process capacity is exhausted")]
     ResourceExhausted,
     /// The pending child identity is invalid or no longer available.
-    #[error("invalid pending vfork child")]
+    #[error("invalid pending child process")]
     InvalidChild,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
-    /// Allocates one pending child for a constrained `vfork` execution window.
-    pub fn create_vfork_child(&self) -> Result<ProcessIdentity, VforkError> {
+    /// Allocates one pending child process.
+    pub fn create_child_process(&self) -> Result<ProcessId, ProcessError> {
         self.broker_control()
-            .ok_or(VforkError::Unavailable)?
-            .create_vfork_child()
-            .map_err(VforkError::from)
+            .ok_or(ProcessError::Unavailable)?
+            .create_child_process()
+            .map_err(ProcessError::from)
     }
 
-    /// Transfers one pending `vfork` child into a fresh runner.
-    pub fn start_vfork_child(
+    /// Starts a new child or transfers an existing pending child to a fresh runner.
+    pub fn start_child_process(
         &self,
-        child_process_id: ProcessId,
+        child_process_id: Option<ProcessId>,
         format: ProcessBootstrapFormat,
         version: ProcessBootstrapVersion,
         payload: &[u8],
-    ) -> Result<(), VforkError> {
+    ) -> Result<ProcessIdentity, ProcessError> {
         self.broker_control()
-            .ok_or(VforkError::Unavailable)?
-            .start_vfork_child(child_process_id, format, version, payload)
-            .map_err(VforkError::from)
+            .ok_or(ProcessError::Unavailable)?
+            .start_child_process(child_process_id, format, version, payload)
+            .map_err(ProcessError::from)
     }
 }
 
-impl From<BrokerControlError> for VforkError {
+impl From<BrokerControlError> for ProcessError {
     fn from(error: BrokerControlError) -> Self {
         match error {
             BrokerControlError::AssociationFailed => Self::ServiceFailed,
@@ -74,7 +74,7 @@ impl From<BrokerControlError> for VforkError {
                 ErrorCode::UnknownObject | ErrorCode::PeerClosed | ErrorCode::ProtocolState,
             ) => Self::InvalidChild,
             BrokerControlError::Broker(error) => {
-                panic!("process service returned unexpected vfork error: {error}")
+                panic!("process service returned unexpected error: {error}")
             }
         }
     }

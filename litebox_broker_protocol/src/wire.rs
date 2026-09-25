@@ -23,9 +23,9 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
-    VforkRequest, VforkResponse,
+    CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects,
+    MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat, ProcessBootstrapVersion,
+    ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -50,12 +50,11 @@ const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
-const REQUEST_TAG_VFORK: u8 = 12;
 
+const CREATE_THREAD_TAG_THREAD: u8 = 0;
+const CREATE_THREAD_TAG_PROCESS: u8 = 1;
 const START_CHILD_PROCESS_TAG_BOOTSTRAP: u8 = 0;
 const START_CHILD_PROCESS_TAG_DUPLICATE: u8 = 1;
-const VFORK_TAG_CREATE: u8 = 0;
-const VFORK_TAG_START: u8 = 1;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -67,10 +66,9 @@ const RESPONSE_TAG_SOCKET: u8 = 5;
 const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
 const RESPONSE_TAG_STDIO: u8 = 7;
 const RESPONSE_TAG_FILE: u8 = 8;
-const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
+const RESPONSE_TAG_CREATE_THREAD: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
-const RESPONSE_TAG_VFORK: u8 = 12;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -80,7 +78,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 90;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 91;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -130,8 +128,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_CHILD_PROCESS
-        | REQUEST_TAG_VFORK => {
+        | REQUEST_TAG_START_CHILD_PROCESS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -151,9 +148,13 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
         operation,
     } = request;
     match operation {
-        BrokerOperation::CreateThread => {
+        BrokerOperation::CreateThread(request) => {
             encoder.u8(REQUEST_TAG_CREATE_THREAD);
             encoder.request_id(request_id);
+            encoder.u8(match request {
+                CreateThreadRequest::Thread => CREATE_THREAD_TAG_THREAD,
+                CreateThreadRequest::Process => CREATE_THREAD_TAG_PROCESS,
+            });
         }
         BrokerOperation::ExitThread(thread_id) => {
             encoder.u8(REQUEST_TAG_EXIT_THREAD);
@@ -203,8 +204,15 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
         BrokerOperation::StartChildProcess(request) => {
             encoder.u8(REQUEST_TAG_START_CHILD_PROCESS);
             encoder.request_id(request_id);
-            match request {
-                StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
+            match request.child_process_id {
+                None => encoder.u8(0),
+                Some(process_id) => {
+                    encoder.u8(1);
+                    encoder.process_id(process_id);
+                }
+            }
+            match request.source {
+                StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
                     format,
                     version,
                     buffer,
@@ -216,33 +224,9 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
                     encoder.shared_buffer_sequence(buffer);
                     encode_inherited_objects(&mut encoder, inherited_objects);
                 }
-                StartChildProcessRequest::Duplicate(buffer) => {
+                StartChildProcessSource::Duplicate(buffer) => {
                     encoder.u8(START_CHILD_PROCESS_TAG_DUPLICATE);
                     encoder.shared_buffer_sequence(buffer);
-                }
-            }
-        }
-        BrokerOperation::Vfork(request) => {
-            encoder.u8(REQUEST_TAG_VFORK);
-            encoder.request_id(request_id);
-            match request {
-                VforkRequest::Create => encoder.u8(VFORK_TAG_CREATE),
-                VforkRequest::Start {
-                    child_process_id,
-                    startup:
-                        ProcessStartupDescriptor {
-                            format,
-                            version,
-                            buffer,
-                            inherited_objects,
-                        },
-                } => {
-                    encoder.u8(VFORK_TAG_START);
-                    encoder.process_id(child_process_id);
-                    encoder.u32(format.0);
-                    encoder.u16(version.0);
-                    encoder.shared_buffer_sequence(buffer);
-                    encode_inherited_objects(&mut encoder, inherited_objects);
                 }
             }
         }
@@ -266,13 +250,16 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_CHILD_PROCESS
-        | REQUEST_TAG_VFORK => {}
+        | REQUEST_TAG_START_CHILD_PROCESS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
     let operation = match tag {
-        REQUEST_TAG_CREATE_THREAD => BrokerOperation::CreateThread,
+        REQUEST_TAG_CREATE_THREAD => BrokerOperation::CreateThread(match decoder.u8()? {
+            CREATE_THREAD_TAG_THREAD => CreateThreadRequest::Thread,
+            CREATE_THREAD_TAG_PROCESS => CreateThreadRequest::Process,
+            _ => return Err(WireError::InvalidTag),
+        }),
         REQUEST_TAG_EXIT_THREAD => BrokerOperation::ExitThread(decoder.thread_id()?),
         REQUEST_TAG_CLOSE_OBJECT => BrokerOperation::CloseObject(decoder.handle()?),
         REQUEST_TAG_CHECK_READINESS => BrokerOperation::CheckReadiness(decoder.handle()?),
@@ -283,9 +270,14 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
         REQUEST_TAG_START_CHILD_PROCESS => {
-            let request = match decoder.u8()? {
+            let child_process_id = match decoder.u8()? {
+                0 => None,
+                1 => Some(decoder.process_id()?),
+                _ => return Err(WireError::InvalidTag),
+            };
+            let source = match decoder.u8()? {
                 START_CHILD_PROCESS_TAG_BOOTSTRAP => {
-                    StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
+                    StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
                         format: ProcessBootstrapFormat(decoder.u32()?),
                         version: ProcessBootstrapVersion(decoder.u16()?),
                         buffer: decoder.shared_buffer_sequence()?,
@@ -293,27 +285,14 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                     })
                 }
                 START_CHILD_PROCESS_TAG_DUPLICATE => {
-                    StartChildProcessRequest::Duplicate(decoder.shared_buffer_sequence()?)
+                    StartChildProcessSource::Duplicate(decoder.shared_buffer_sequence()?)
                 }
                 _ => return Err(WireError::InvalidTag),
             };
-            BrokerOperation::StartChildProcess(request)
-        }
-        REQUEST_TAG_VFORK => {
-            let request = match decoder.u8()? {
-                VFORK_TAG_CREATE => VforkRequest::Create,
-                VFORK_TAG_START => VforkRequest::Start {
-                    child_process_id: decoder.process_id()?,
-                    startup: ProcessStartupDescriptor {
-                        format: ProcessBootstrapFormat(decoder.u32()?),
-                        version: ProcessBootstrapVersion(decoder.u16()?),
-                        buffer: decoder.shared_buffer_sequence()?,
-                        inherited_objects: decode_inherited_objects(&mut decoder)?,
-                    },
-                },
-                _ => return Err(WireError::InvalidTag),
-            };
-            BrokerOperation::Vfork(request)
+            BrokerOperation::StartChildProcess(StartChildProcessRequest {
+                child_process_id,
+                source,
+            })
         }
         _ => unreachable!("active request tag was validated"),
     };
@@ -400,10 +379,9 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
-        | RESPONSE_TAG_THREAD_CREATED
+        | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
-        | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_VFORK => {
+        | RESPONSE_TAG_PROCESS_STARTED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -426,10 +404,19 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
     let mut encoder = Encoder::default();
     let BrokerResponse { request_id, result } = response;
     match result {
-        BrokerResult::ThreadCreated(thread_id) => {
-            encoder.u8(RESPONSE_TAG_THREAD_CREATED);
+        BrokerResult::CreateThread(response) => {
+            encoder.u8(RESPONSE_TAG_CREATE_THREAD);
             encoder.request_id(request_id);
-            encoder.thread_id(thread_id);
+            match response {
+                CreateThreadResponse::Thread(thread_id) => {
+                    encoder.u8(CREATE_THREAD_TAG_THREAD);
+                    encoder.thread_id(thread_id);
+                }
+                CreateThreadResponse::Process(process_id) => {
+                    encoder.u8(CREATE_THREAD_TAG_PROCESS);
+                    encoder.process_id(process_id);
+                }
+            }
         }
         BrokerResult::ThreadExited => {
             encoder.u8(RESPONSE_TAG_THREAD_EXITED);
@@ -482,21 +469,6 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.process_id(process_id);
             encoder.thread_id(initial_thread_id);
         }
-        BrokerResult::Vfork(response) => {
-            encoder.u8(RESPONSE_TAG_VFORK);
-            encoder.request_id(request_id);
-            match response {
-                VforkResponse::Created(ProcessIdentity {
-                    process_id,
-                    initial_thread_id,
-                }) => {
-                    encoder.u8(VFORK_TAG_CREATE);
-                    encoder.process_id(process_id);
-                    encoder.thread_id(initial_thread_id);
-                }
-                VforkResponse::Started => encoder.u8(VFORK_TAG_START),
-            }
-        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -523,10 +495,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_RANDOM_FILLED
         | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
-        | RESPONSE_TAG_THREAD_CREATED
+        | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
-        | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_VFORK => {}
+        | RESPONSE_TAG_PROCESS_STARTED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -535,7 +506,11 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_PIPE => BrokerResult::Pipe(pipe::decode_pipe_response(&mut decoder)?),
         RESPONSE_TAG_SOCKET => BrokerResult::Socket(socket::decode_socket_response(&mut decoder)?),
         RESPONSE_TAG_ERROR => BrokerResult::Error(decode_error_code(&mut decoder)?),
-        RESPONSE_TAG_THREAD_CREATED => BrokerResult::ThreadCreated(decoder.thread_id()?),
+        RESPONSE_TAG_CREATE_THREAD => BrokerResult::CreateThread(match decoder.u8()? {
+            CREATE_THREAD_TAG_THREAD => CreateThreadResponse::Thread(decoder.thread_id()?),
+            CREATE_THREAD_TAG_PROCESS => CreateThreadResponse::Process(decoder.process_id()?),
+            _ => return Err(WireError::InvalidTag),
+        }),
         RESPONSE_TAG_THREAD_EXITED => BrokerResult::ThreadExited,
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
@@ -545,14 +520,6 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(ProcessIdentity {
             process_id: decoder.process_id()?,
             initial_thread_id: decoder.thread_id()?,
-        }),
-        RESPONSE_TAG_VFORK => BrokerResult::Vfork(match decoder.u8()? {
-            VFORK_TAG_CREATE => VforkResponse::Created(ProcessIdentity {
-                process_id: decoder.process_id()?,
-                initial_thread_id: decoder.thread_id()?,
-            }),
-            VFORK_TAG_START => VforkResponse::Started,
-            _ => return Err(WireError::InvalidTag),
         }),
         _ => unreachable!("active response tag was validated"),
     };
@@ -672,8 +639,9 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
-        ProcessStartupDescriptor, StartChildProcessRequest, VforkRequest, VforkResponse,
+        CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects, ProcessBootstrapFormat,
+        ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
+        StartChildProcessRequest, StartChildProcessSource,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -730,10 +698,9 @@ mod tests {
                 RESPONSE_TAG_RANDOM_FILLED,
                 RESPONSE_TAG_STDIO,
                 RESPONSE_TAG_FILE,
-                RESPONSE_TAG_THREAD_CREATED,
+                RESPONSE_TAG_CREATE_THREAD,
                 RESPONSE_TAG_THREAD_EXITED,
                 RESPONSE_TAG_PROCESS_STARTED,
-                RESPONSE_TAG_VFORK,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -748,7 +715,6 @@ mod tests {
                 REQUEST_TAG_CREATE_THREAD,
                 REQUEST_TAG_EXIT_THREAD,
                 REQUEST_TAG_START_CHILD_PROCESS,
-                REQUEST_TAG_VFORK,
             ]
         );
         assert_eq!(
@@ -795,7 +761,8 @@ mod tests {
         )
         .unwrap();
         let operations = [
-            BrokerOperation::CreateThread,
+            BrokerOperation::CreateThread(CreateThreadRequest::Thread),
+            BrokerOperation::CreateThread(CreateThreadRequest::Process),
             BrokerOperation::ExitThread(thread_id(17)),
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
@@ -1017,8 +984,9 @@ mod tests {
                 name: TcpOptionName::KeepAlive,
             })),
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
-            BrokerOperation::StartChildProcess(StartChildProcessRequest::Bootstrap(
-                ProcessStartupDescriptor {
+            BrokerOperation::StartChildProcess(StartChildProcessRequest {
+                child_process_id: Some(process_id(u32::MAX)),
+                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
                     format: ProcessBootstrapFormat(u32::MAX),
                     version: ProcessBootstrapVersion(u16::MAX),
                     buffer: largest_sequence,
@@ -1029,24 +997,11 @@ mod tests {
                         ObjectHandle(4),
                     ])
                     .unwrap(),
-                },
-            )),
-            BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate(sequence(0, 2))),
-            BrokerOperation::Vfork(VforkRequest::Create),
-            BrokerOperation::Vfork(VforkRequest::Start {
-                child_process_id: process_id(u32::MAX),
-                startup: ProcessStartupDescriptor {
-                    format: ProcessBootstrapFormat(u32::MAX),
-                    version: ProcessBootstrapVersion(u16::MAX),
-                    buffer: largest_sequence,
-                    inherited_objects: InheritedProcessObjects::new(&[
-                        ObjectHandle(1),
-                        ObjectHandle(2),
-                        ObjectHandle(3),
-                        ObjectHandle(4),
-                    ])
-                    .unwrap(),
-                },
+                }),
+            }),
+            BrokerOperation::StartChildProcess(StartChildProcessRequest {
+                child_process_id: None,
+                source: StartChildProcessSource::Duplicate(sequence(0, 2)),
             }),
         ];
         let mut maximum_encoded_size = 0;
@@ -1258,7 +1213,8 @@ mod tests {
     fn response_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
         let results = [
-            BrokerResult::ThreadCreated(thread_id(17)),
+            BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id(17))),
+            BrokerResult::CreateThread(CreateThreadResponse::Process(process_id(19))),
             BrokerResult::ThreadExited,
             BrokerResult::ObjectClosed,
             BrokerResult::Readiness(ReadinessFlags::READ),
@@ -1401,11 +1357,6 @@ mod tests {
                 process_id: process_id(9),
                 initial_thread_id: thread_id(11),
             }),
-            BrokerResult::Vfork(VforkResponse::Created(ProcessIdentity {
-                process_id: process_id(u32::MAX),
-                initial_thread_id: thread_id(u32::MAX - 1),
-            })),
-            BrokerResult::Vfork(VforkResponse::Started),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1446,7 +1397,17 @@ mod tests {
         for thread_id in [ThreadId(0), ThreadId(u32::MAX)] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
-                result: BrokerResult::ThreadCreated(thread_id),
+                result: BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id)),
+            };
+            assert_eq!(
+                decode_response(&encode_response(response.clone())).unwrap(),
+                response
+            );
+        }
+        for process_id in [ProcessId(0), ProcessId(u32::MAX)] {
+            let response = BrokerResponse {
+                request_id: TEST_REQUEST_ID,
+                result: BrokerResult::CreateThread(CreateThreadResponse::Process(process_id)),
             };
             assert_eq!(
                 decode_response(&encode_response(response.clone())).unwrap(),
@@ -1534,23 +1495,39 @@ mod tests {
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
         );
+        let mut unknown_create_thread = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::CreateThread(CreateThreadRequest::Thread),
+        });
+        unknown_create_thread[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_create_thread),
+            Err(WireError::InvalidTag)
+        );
+        let mut unknown_child_selector = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::StartChildProcess(StartChildProcessRequest {
+                child_process_id: None,
+                source: StartChildProcessSource::Duplicate(sequence(0, 2)),
+            }),
+        });
+        unknown_child_selector[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_child_selector),
+            Err(WireError::InvalidTag)
+        );
         let mut unknown_child_start = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate(
-                sequence(0, 2),
-            )),
+            operation: BrokerOperation::StartChildProcess(StartChildProcessRequest {
+                child_process_id: None,
+                source: StartChildProcessSource::Duplicate(sequence(0, 2)),
+            }),
         });
-        unknown_child_start[9] = 0xff;
+        unknown_child_start[10] = 0xff;
         assert_eq!(
             decode_request(&unknown_child_start),
             Err(WireError::InvalidTag)
         );
-        let mut unknown_vfork = encode_request(BrokerRequest {
-            request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Vfork(VforkRequest::Create),
-        });
-        unknown_vfork[9] = 0xff;
-        assert_eq!(decode_request(&unknown_vfork), Err(WireError::InvalidTag));
         let mut frame = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
@@ -1991,6 +1968,13 @@ mod tests {
 
         let truncated = [RESPONSE_TAG_EVENT, 2, 2, 0];
         assert_eq!(decode_response(&truncated), Err(WireError::TruncatedFrame));
+
+        let mut invalid_create = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id(1))),
+        });
+        invalid_create[9] = 0xff;
+        assert_eq!(decode_response(&invalid_create), Err(WireError::InvalidTag));
 
         let mut frame = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

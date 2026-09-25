@@ -40,9 +40,9 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
-    ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest, VforkRequest, VforkResponse,
+    CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -201,6 +201,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// or the broker returns a response for another operation.
     pub fn start_child_process(
         &self,
+        child_process_id: Option<ProcessId>,
         format: ProcessBootstrapFormat,
         version: ProcessBootstrapVersion,
         buffer: SharedBufferSequence,
@@ -213,12 +214,15 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
         self.write_shared_buffer(buffer, bootstrap);
         match self.request(BrokerOperation::StartChildProcess(
-            StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
-                format,
-                version,
-                buffer,
-                inherited_objects,
-            }),
+            StartChildProcessRequest {
+                child_process_id,
+                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
+                    format,
+                    version,
+                    buffer,
+                    inherited_objects,
+                }),
+            },
         ))? {
             BrokerResult::ProcessStarted(started) => Ok(started),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
@@ -226,53 +230,18 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Allocates one pending child for a constrained `vfork` execution window.
+    /// Allocates one pending child process.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn create_vfork_child(&self) -> Result<ProcessIdentity, Channel::Error> {
-        match self.request(BrokerOperation::Vfork(VforkRequest::Create))? {
-            BrokerResult::Vfork(VforkResponse::Created(identity)) => Ok(identity),
+    pub fn create_child_process(&self) -> Result<ProcessId, Channel::Error> {
+        match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Process))? {
+            BrokerResult::CreateThread(CreateThreadResponse::Process(process_id)) => Ok(process_id),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected create-vfork response: {response:?}"),
-        }
-    }
-
-    /// Transfers one pending `vfork` child into a fresh runner.
-    ///
-    /// This call blocks until the child's broker association is active or
-    /// launch fails. The caller must retain exclusive ownership of the
-    /// bootstrap sequence until this method returns.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the bootstrap length differs from the shared-buffer sequence
-    /// or the broker returns a response for another operation.
-    pub fn start_vfork_child(
-        &self,
-        child_process_id: ProcessId,
-        format: ProcessBootstrapFormat,
-        version: ProcessBootstrapVersion,
-        buffer: SharedBufferSequence,
-        bootstrap: &[u8],
-    ) -> Result<(), Channel::Error> {
-        if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
-            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
-        }
-        self.write_shared_buffer(buffer, bootstrap);
-        match self.request(BrokerOperation::Vfork(VforkRequest::Start {
-            child_process_id,
-            startup: ProcessStartupDescriptor {
-                format,
-                version,
-                buffer,
-                inherited_objects: InheritedProcessObjects::EMPTY,
-            },
-        }))? {
-            BrokerResult::Vfork(VforkResponse::Started) => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected start-vfork response: {response:?}"),
+            response => {
+                panic!("broker returned unexpected create-child-process response: {response:?}")
+            }
         }
     }
 
@@ -282,8 +251,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for a different operation.
     pub fn create_thread(&self) -> Result<ThreadId, Channel::Error> {
-        match self.request(BrokerOperation::CreateThread)? {
-            BrokerResult::ThreadCreated(thread_id) => Ok(thread_id),
+        match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Thread))? {
+            BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id)) => Ok(thread_id),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected create-thread response: {response:?}"),
         }
@@ -501,7 +470,12 @@ mod tests {
     #[test]
     fn thread_lifecycle_sends_owned_id() {
         let thread_id = ThreadId(7);
-        let channel = FakeControlChannel::new(None, Some(BrokerResult::ThreadCreated(thread_id)));
+        let channel = FakeControlChannel::new(
+            None,
+            Some(BrokerResult::CreateThread(CreateThreadResponse::Thread(
+                thread_id,
+            ))),
+        );
         let local = test_broker_local(channel, noop_shared_memory());
 
         assert_eq!(local.create_thread().unwrap(), thread_id);
@@ -509,7 +483,7 @@ mod tests {
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::CreateThread,
+                operation: BrokerOperation::CreateThread(CreateThreadRequest::Thread),
             })
         );
 

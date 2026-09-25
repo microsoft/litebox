@@ -1229,7 +1229,7 @@ struct Task<Platform: ShimPlatform> {
 }
 
 struct VforkState {
-    child: litebox_broker_protocol::process::ProcessIdentity,
+    child_process_id: litebox_broker_protocol::ProcessId,
     parent_context: litebox_common_linux::PtRegs,
 }
 

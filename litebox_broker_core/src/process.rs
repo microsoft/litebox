@@ -13,7 +13,6 @@ use crate::pipe::PipeObject;
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
-use litebox_broker_protocol::process::ProcessIdentity;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -137,8 +136,8 @@ struct BrokerProcessState {
     /// Immediate wait parent; `None` on a non-root means future zombies auto-reap.
     parent: Option<Weak<BrokerProcess>>,
     owner_alive: bool,
-    /// Child retained while this process executes its constrained `vfork` window.
-    pending_vfork_child: Option<Arc<BrokerProcess>>,
+    /// Child retained until this process requests startup.
+    pending_child_process: Option<Arc<BrokerProcess>>,
     /// Whether a starting child continues after its parent dies.
     reparent_startup_on_parent_death: bool,
     retirement: ProcessRetirement,
@@ -230,7 +229,7 @@ impl BrokerProcess {
                 status: ProcessStatus::Starting,
                 parent,
                 owner_alive: true,
-                pending_vfork_child: None,
+                pending_child_process: None,
                 reparent_startup_on_parent_death: false,
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
@@ -325,8 +324,8 @@ impl BrokerProcess {
         Ok(())
     }
 
-    /// Allocates and retains one pending child for constrained `vfork` execution.
-    pub fn create_vfork_child(&self) -> Result<ProcessIdentity> {
+    /// Allocates and retains one pending child process.
+    pub fn create_child_process(&self) -> Result<ProcessId> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
@@ -344,7 +343,7 @@ impl BrokerProcess {
                 || !matches!(state.retirement, ProcessRetirement::Active { .. })
             {
                 Err(BrokerError::PeerClosed)
-            } else if state.pending_vfork_child.is_some() {
+            } else if state.pending_child_process.is_some() {
                 Err(BrokerError::WouldBlock)
             } else {
                 let child_state = child.state.lock();
@@ -360,11 +359,8 @@ impl BrokerProcess {
                     Err(BrokerError::Internal)
                 } else {
                     drop(child_state);
-                    state.pending_vfork_child = Some(Arc::clone(&child));
-                    Ok(ProcessIdentity {
-                        process_id: child.id(),
-                        initial_thread_id: child.initial_thread_id(),
-                    })
+                    state.pending_child_process = Some(Arc::clone(&child));
+                    Ok(child.id())
                 }
             }
         };
@@ -374,8 +370,8 @@ impl BrokerProcess {
         result
     }
 
-    /// Takes the pending `vfork` child selected for fresh-runner startup.
-    pub fn take_vfork_child(&self, child_process_id: ProcessId) -> Result<Arc<BrokerProcess>> {
+    /// Takes the pending child selected for startup.
+    pub fn take_child_process(&self, child_process_id: ProcessId) -> Result<Arc<BrokerProcess>> {
         if self.cancellation.is_cancelled() {
             return Err(BrokerError::PeerClosed);
         }
@@ -387,7 +383,7 @@ impl BrokerProcess {
             return Err(BrokerError::PeerClosed);
         }
         let child = state
-            .pending_vfork_child
+            .pending_child_process
             .as_ref()
             .filter(|child| child.id() == child_process_id)
             .ok_or(BrokerError::UnknownObject)?;
@@ -401,7 +397,7 @@ impl BrokerProcess {
             }
         }
         state
-            .pending_vfork_child
+            .pending_child_process
             .take()
             .ok_or(BrokerError::Internal)
     }
@@ -513,13 +509,13 @@ impl BrokerProcess {
     /// reparenting, and live or zombie children reparent to the tree root.
     /// Zombies are reaped immediately when the root owner is gone.
     pub fn handle_owner_death(self: &Arc<Self>) {
-        let pending_vfork_child = {
+        let pending_child_process = {
             let mut state = self.state.lock();
             if !state.owner_alive {
                 return;
             }
             state.owner_alive = false;
-            state.pending_vfork_child.take()
+            state.pending_child_process.take()
         };
         let processes = {
             let processes = self.core.processes.read();
@@ -566,7 +562,7 @@ impl BrokerProcess {
         for shutdown in shutdowns {
             shutdown();
         }
-        if let Some(child) = pending_vfork_child {
+        if let Some(child) = pending_child_process {
             let _ = child.fail_start(BrokerError::PeerClosed, false, true);
             child.retire(true);
         }
@@ -1414,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn vfork_child_admission_is_policy_gated() {
+    fn child_process_creation_is_policy_gated() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1424,11 +1420,14 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        assert_eq!(parent.create_vfork_child(), Err(BrokerError::PolicyDenied));
+        assert_eq!(
+            parent.create_child_process(),
+            Err(BrokerError::PolicyDenied)
+        );
     }
 
     #[test]
-    fn vfork_child_admission_allows_one_pending_child() {
+    fn child_process_creation_allows_one_pending_child() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
@@ -1439,15 +1438,15 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let identity = parent.create_vfork_child().unwrap();
-        assert_eq!(parent.create_vfork_child(), Err(BrokerError::WouldBlock));
+        let process_id = parent.create_child_process().unwrap();
+        assert_eq!(parent.create_child_process(), Err(BrokerError::WouldBlock));
         assert!(matches!(
-            parent.take_vfork_child(ProcessId(identity.process_id.0 + 1)),
+            parent.take_child_process(ProcessId(process_id.0 + 1)),
             Err(BrokerError::UnknownObject)
         ));
 
-        let child = parent.take_vfork_child(identity.process_id).unwrap();
-        assert_eq!(child.initial_thread_id(), identity.initial_thread_id);
+        let child = parent.take_child_process(process_id).unwrap();
+        assert_eq!(child.id(), process_id);
         assert_eq!(parent_id(&child), Some(parent.id()));
         assert_eq!(child.startup_result(), None);
         child.complete_start().unwrap();
@@ -1455,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_death_fails_and_retires_pending_vfork_child() {
+    fn owner_death_fails_and_retires_pending_child_process() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
@@ -1466,11 +1465,11 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let identity = parent.create_vfork_child().unwrap();
+        let process_id = parent.create_child_process().unwrap();
         let child = broker
             .processes
             .read()
-            .get(&identity.process_id)
+            .get(&process_id)
             .and_then(alloc::sync::Weak::upgrade)
             .unwrap();
 
@@ -1478,7 +1477,7 @@ mod tests {
 
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert!(matches!(
-            parent.take_vfork_child(identity.process_id),
+            parent.take_child_process(process_id),
             Err(BrokerError::PeerClosed)
         ));
     }
