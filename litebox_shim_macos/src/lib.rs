@@ -13,7 +13,6 @@ extern crate alloc;
 
 use alloc::{collections::BTreeMap, ffi::CString, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicI32, Ordering};
-use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{
     LiteBox,
@@ -276,7 +275,6 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::Read { fd, buf, count } => {
                 let fd = self.files.typed_fd(fd)?;
                 let length = Self::io_length(count)?;
-                self.check_user_buffer(buf.as_usize(), length, Permissions::WRITE)?;
                 let mut bytes = vec![0; length];
                 let size = self.do_read(&fd, &mut bytes, None)?;
                 if size != 0 {
@@ -288,7 +286,6 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::Write { fd, buf, count } => {
                 let fd = self.files.typed_fd(fd)?;
                 let length = Self::io_length(count)?;
-                self.check_user_buffer(buf.as_usize(), length, Permissions::READ)?;
                 if length == 0 {
                     return self.do_write(&fd, &[]);
                 }
@@ -296,7 +293,7 @@ impl<P: ShimPlatform> Task<P> {
                 self.do_write(&fd, &bytes)
             }
             SyscallRequest::Open { path, flags, mode } => {
-                let path = self.read_path(path)?;
+                let path = Self::read_path(path)?;
                 self.sys_open(path, flags, mode).to_syscall_result()
             }
             SyscallRequest::Close { fd } => self.sys_close(fd).to_syscall_result(),
@@ -345,35 +342,11 @@ impl<P: ShimPlatform> Task<P> {
         Ok(count.min(MAX_KERNEL_BUF_SIZE))
     }
 
-    fn check_user_buffer(
-        &self,
-        address: usize,
-        length: usize,
-        permissions: Permissions,
-    ) -> Result<(), Errno> {
-        if length == 0 {
-            return Ok(());
-        }
-        let end = address.checked_add(length).ok_or(Errno::EFAULT)?;
-        if self
-            .global
-            .pm
-            .range_has_permissions(address..end, permissions)
-        {
-            Ok(())
-        } else {
-            Err(Errno::EFAULT)
-        }
-    }
-
     fn continuation(&self, ctx: &PtRegs) -> ContinueOperation {
         if self.process.exit_status().is_some() {
             ContinueOperation::Terminate
         } else if !ctx.pc.is_multiple_of(size_of::<u32>())
             || !ctx.sp.is_multiple_of(STACK_ALIGNMENT)
-            || self
-                .check_user_buffer(ctx.pc, size_of::<u32>(), Permissions::EXEC)
-                .is_err()
         {
             self.process.exit(128 + SIGSEGV);
             ContinueOperation::Terminate
