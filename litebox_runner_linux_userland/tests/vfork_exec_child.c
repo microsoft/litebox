@@ -13,5 +13,5 @@ int main(int argc, char **argv) {
     printf("child pid=%d ppid=%d tid=%ld marker=%s env=%s\n", getpid(),
            getppid(), syscall(SYS_gettid), marker,
            environment == NULL ? "" : environment);
-    return 0;
+    return 42;
 }

@@ -18,8 +18,8 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    CreateThreadRequest, CreateThreadResponse, ProcessIdentity, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildProcessSource,
+    ChildExit, CreateThreadRequest, CreateThreadResponse, ProcessIdentity,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource, WaitChildTarget,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -70,6 +70,11 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process.
     StartChildProcess(StartChildProcessRequest),
+    /// Consume one terminated direct child without blocking.
+    ///
+    /// The broker returns `WouldBlock` while matching children are still live,
+    /// and `UnknownObject` when no direct child matches.
+    WaitChild(WaitChildTarget),
 }
 
 impl BrokerOperation {
@@ -113,6 +118,7 @@ impl BrokerOperation {
             Self::CreateThread(_)
             | Self::ExitThread(_)
             | Self::CloseObject(_)
+            | Self::WaitChild(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
             | Self::Pipe(PipeRequest::Create(_))
@@ -252,6 +258,8 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A child established its broker association.
     ProcessStarted(ProcessIdentity),
+    /// A terminated direct child was reaped.
+    ChildExited(ChildExit),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -422,6 +430,9 @@ pub enum FileResponse {
 pub enum BrokerNotification {
     /// Readiness changed or should be re-checked for a broker-owned object.
     Readiness(ReadinessNotification),
+    /// A direct child changed state, so waiters should re-check
+    /// [`BrokerOperation::WaitChild`].
+    ChildStateChanged,
 }
 
 /// Readiness notification for a broker-owned object.

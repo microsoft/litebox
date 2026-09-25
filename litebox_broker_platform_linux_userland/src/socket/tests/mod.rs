@@ -268,6 +268,8 @@ impl ReadinessSink for TestReadinessSink {
     fn retire(&self, handle: ObjectHandle) {
         let _ = self.retired.send(handle);
     }
+
+    fn child_state_changed(&self) {}
 }
 
 struct PendingPublishFailure {
@@ -356,6 +358,10 @@ impl ReadinessSink for FailingReadinessSink {
 
     fn retire(&self, handle: ObjectHandle) {
         self.inner.retire(handle);
+    }
+
+    fn child_state_changed(&self) {
+        self.inner.child_state_changed();
     }
 }
 

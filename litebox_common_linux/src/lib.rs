@@ -1086,6 +1086,15 @@ pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
 }
+
+/// Linux `struct rusage`.
+#[repr(C)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+pub struct Rusage {
+    user_time: TimeVal,
+    system_time: TimeVal,
+    counters: [core::ffi::c_long; 14],
+}
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ItimerVal {
@@ -2063,6 +2072,12 @@ impl ShutdownHow {
 #[derive(Debug)]
 pub enum SyscallRequest {
     Vfork,
+    Wait4 {
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: u32,
+        rusage: Option<UserPtrMut<Rusage>>,
+    },
     Exit {
         status: i32,
     },
@@ -2803,6 +2818,7 @@ impl SyscallRequest {
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             #[cfg(target_arch = "x86_64")]
             Sysno::vfork => SyscallRequest::Vfork,
+            Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);

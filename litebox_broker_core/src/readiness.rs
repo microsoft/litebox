@@ -24,6 +24,9 @@ pub trait ReadinessSink: Send + Sync {
 
     /// Retires all readiness state for an object that can no longer publish.
     fn retire(&self, handle: ObjectHandle);
+
+    /// Wakes local waiters that re-check direct-child process state.
+    fn child_state_changed(&self);
 }
 
 /// Capability for publishing readiness for one broker-assigned object handle.
@@ -169,6 +172,7 @@ pub(crate) mod tests {
     pub(crate) struct TestReadinessSink {
         pub(crate) published: Mutex<std::vec::Vec<(ObjectHandle, ReadinessFlags)>>,
         pub(crate) retired: Mutex<std::vec::Vec<ObjectHandle>>,
+        pub(crate) child_state_changes: core::sync::atomic::AtomicUsize,
     }
 
     impl ReadinessSink for TestReadinessSink {
@@ -187,6 +191,11 @@ pub(crate) mod tests {
 
         fn retire(&self, handle: ObjectHandle) {
             self.retired.lock().unwrap().push(handle);
+        }
+
+        fn child_state_changed(&self) {
+            self.child_state_changes
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
 

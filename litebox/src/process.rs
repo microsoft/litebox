@@ -1,14 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-backed guest process creation.
+//! Broker-backed guest process creation and child waiting.
 
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::process::ProcessIdentity;
+use litebox_broker_protocol::process::{ChildExit, ProcessIdentity, WaitChildTarget};
+use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
 use crate::broker::error::BrokerControlError;
+use crate::event::Events;
+use crate::event::polling::TryOpError;
+use crate::event::wait::WaitContext;
 use crate::sync::RawSyncPrimitivesProvider;
 
 /// Error returned by the broker-backed process service.
@@ -37,6 +41,17 @@ pub enum ProcessError {
     InvalidChild,
 }
 
+/// Error returned while waiting for a child process.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum WaitChildError {
+    /// No direct child matches the wait target.
+    #[error("no matching child process")]
+    NoChild,
+    /// The broker association failed.
+    #[error("process service failed")]
+    ServiceFailed,
+}
+
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
     pub fn allocate_child_process(&self) -> Result<ProcessId, ProcessError> {
@@ -56,6 +71,45 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             .ok_or(ProcessError::Unavailable)?
             .start_child_process(child_process_id, payload)
             .map_err(ProcessError::from)
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
+    /// Consumes one terminated direct child matching `target`.
+    ///
+    /// While a matching child is still live, this waits for a broker child-state
+    /// notification, or returns [`TryOpError::TryAgain`] when `nonblock` is set.
+    pub fn wait_child(
+        &self,
+        cx: &WaitContext<'_, Platform>,
+        target: WaitChildTarget,
+        nonblock: bool,
+    ) -> Result<ChildExit, TryOpError<WaitChildError>> {
+        // Without a broker process service this process cannot have children.
+        let broker = self
+            .broker_control()
+            .ok_or(TryOpError::Other(WaitChildError::NoChild))?;
+        let registry = self.broker_pollable_registry();
+        registry.child_state().wait(cx, nonblock, Events::IN, || {
+            match broker.wait_child(target) {
+                Ok(exit) => Ok(exit),
+                Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Err(TryOpError::TryAgain),
+                Err(error) => Err(TryOpError::Other(error.into())),
+            }
+        })
+    }
+}
+
+impl From<BrokerControlError> for WaitChildError {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::Broker(ErrorCode::UnknownObject) => Self::NoChild,
+            BrokerControlError::AssociationFailed
+            | BrokerControlError::Broker(ErrorCode::PeerClosed) => Self::ServiceFailed,
+            BrokerControlError::Broker(error) => {
+                panic!("child wait returned unexpected error: {error}")
+            }
+        }
     }
 }
 
