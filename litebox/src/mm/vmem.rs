@@ -195,6 +195,11 @@ bitflags::bitflags! {
         const NOREPLACE = 1 << 5;
         /// The mapping is shared.
         const SHARED = 1 << 6;
+        /// Search for free address space from high addresses toward low addresses.
+        ///
+        /// This controls the page manager's initial candidate. A platform may relocate a hint
+        /// if that candidate collides with address space not tracked by the page manager.
+        const TOP_DOWN = 1 << 7;
     }
 }
 
@@ -669,7 +674,7 @@ where
     /// - [`CreatePagesFlags::FIXED_ADDR`] with [`CreatePagesFlags::NOREPLACE`]: Forces allocation at
     ///   the exact address, but fails with [`AllocationError::AddressInUse`] if any part of the
     ///   range is already mapped. This is safe to use without checking for existing mappings first.
-    /// - Without [`CreatePagesFlags::FIXED_ADDR`], the address is treated as a hint.
+    /// - Otherwise, an address without [`CreatePagesFlags::FIXED_ADDR`] is treated as a hint.
     ///
     /// Note: `NOREPLACE` error responses (`AddressInUse` / `EEXIST`) can be used to probe memory
     /// layout. This matches Linux kernel behavior for `MAP_FIXED_NOREPLACE`.
@@ -703,7 +708,12 @@ where
             FixedAddressBehavior::Hint
         };
         let new_addr = self
-            .get_unmmaped_area(suggested_address, total_length, behavior, true)?
+            .get_unmmaped_area(
+                suggested_address,
+                total_length,
+                behavior,
+                flags.contains(CreatePagesFlags::TOP_DOWN),
+            )?
             .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
@@ -1028,11 +1038,15 @@ where
             Platform::TASK_ADDR_MIN
         };
         let address_range_end = if suggested_address.is_none() {
+            // Some platform may allocate more than requested to satisfy alignment requirements,
+            // so we restrict the maximum address to avoid exceeding the platform's addressable range.
             Platform::TASK_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1)
         } else {
             Platform::TASK_ADDR_MAX
         };
         let alignment = if suggested_address.is_none() {
+            // When no specific address is suggested, use the platform's reservation alignment
+            // to minimize fragmentation and number of system calls.
             Platform::RESERVATION_ALIGNMENT
         } else {
             ALIGN

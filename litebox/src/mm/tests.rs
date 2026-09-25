@@ -307,7 +307,7 @@ fn test_vmm_mapping() {
                 None,
                 NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
-                CreatePagesFlags::empty(),
+                CreatePagesFlags::TOP_DOWN,
             )
         }
         .unwrap()
