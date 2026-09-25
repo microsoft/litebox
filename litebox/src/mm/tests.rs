@@ -73,15 +73,19 @@ fn find_area_optionally_excludes_tracked_reservations() {
 }
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
-struct DummyVmemBackend;
+struct DummyVmemBackend<const RESERVATION_ALIGN: usize = PAGE_SIZE>;
 
-impl crate::platform::RawPointerProvider for DummyVmemBackend {
+impl<const RESERVATION_ALIGN: usize> crate::platform::RawPointerProvider
+    for DummyVmemBackend<RESERVATION_ALIGN>
+{
     type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
-impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
+impl<const RESERVATION_ALIGN: usize> crate::platform::PageManagementProvider<PAGE_SIZE>
+    for DummyVmemBackend<RESERVATION_ALIGN>
+{
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux/windows config
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -90,6 +94,7 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
     #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    const RESERVATION_ALIGNMENT: usize = RESERVATION_ALIGN;
 
     fn allocate_pages(
         &self,
@@ -129,6 +134,23 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
         core::iter::empty()
     }
+}
+
+#[test]
+fn automatic_placement_uses_reservation_alignment() {
+    type Backend = DummyVmemBackend<0x1_0000>;
+    let vmm = Vmem::<Backend, PAGE_SIZE>::new(&DummyVmemBackend::<0x1_0000>);
+    let address = vmm
+        .get_unmmaped_area(
+            None,
+            NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            crate::platform::page_mgmt::FixedAddressBehavior::Hint,
+            true,
+        )
+        .unwrap()
+        .unwrap();
+
+    assert!(address.is_multiple_of(Backend::RESERVATION_ALIGNMENT));
 }
 
 fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
@@ -290,7 +312,7 @@ fn test_vmm_mapping() {
         }
         .unwrap()
         .as_usize(),
-        DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE,
+        DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE,
     );
     assert_eq!(
         collect_mappings(&vmm),
@@ -298,7 +320,8 @@ fn test_vmm_mapping() {
             start_addr..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
+                ..DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX,
         ]
     );
 
@@ -323,7 +346,8 @@ fn test_vmm_mapping() {
             start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
             start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
+                ..DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX,
         ]
     );
 
@@ -345,7 +369,8 @@ fn test_vmm_mapping() {
             start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
             start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
             start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX - PAGE_SIZE
+                ..DummyVmemBackend::<PAGE_SIZE>::TASK_ADDR_MAX,
         ]
     );
 }

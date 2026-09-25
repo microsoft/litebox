@@ -431,6 +431,8 @@ where
 
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
     pub(super) fn new(platform: &'static Platform) -> Self {
+        assert!(Platform::RESERVATION_ALIGNMENT.is_power_of_two());
+        assert!(Platform::RESERVATION_ALIGNMENT.is_multiple_of(ALIGN));
         let mut vmem = Self {
             mappings: MappingState::default(),
             brk: 0,
@@ -1013,7 +1015,7 @@ where
     /// Returns `None` if no area was found. Otherwise, returns the start address of an
     /// `ALIGN`-aligned area.
     #[inline]
-    fn get_unmmaped_area(
+    pub(super) fn get_unmmaped_area(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -1025,6 +1027,16 @@ where
         } else {
             Platform::TASK_ADDR_MIN
         };
+        let address_range_end = if suggested_address.is_none() {
+            Platform::TASK_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1)
+        } else {
+            Platform::TASK_ADDR_MAX
+        };
+        let alignment = if suggested_address.is_none() {
+            Platform::RESERVATION_ALIGNMENT
+        } else {
+            ALIGN
+        };
         Self::find_area(
             &self.reservations,
             &self.vmas,
@@ -1032,9 +1044,9 @@ where
                 suggested_address,
                 length,
                 behavior,
-                alignment: ALIGN,
+                alignment,
                 include_reservations: false,
-                address_range: address_range_start..Platform::TASK_ADDR_MAX,
+                address_range: address_range_start..address_range_end,
                 top_down,
             },
         )

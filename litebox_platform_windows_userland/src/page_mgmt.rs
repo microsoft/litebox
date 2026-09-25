@@ -191,6 +191,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    const RESERVATION_ALIGNMENT: usize = 0x1_0000;
 
     fn allocate_pages(
         &self,

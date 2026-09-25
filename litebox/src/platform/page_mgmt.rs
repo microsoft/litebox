@@ -77,6 +77,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Note it must be aligned to `ALIGN`.
     const TASK_ADDR_MAX: usize;
 
+    /// Alignment of native reservation base addresses, in bytes.
+    ///
+    /// This must be a nonzero power of two and a multiple of `ALIGN`.
+    const RESERVATION_ALIGNMENT: usize = ALIGN;
+
     /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
     ///
     /// # Parameters
