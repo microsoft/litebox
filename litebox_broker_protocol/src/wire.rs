@@ -25,6 +25,7 @@ use crate::message::{
 use crate::process::{
     InheritedProcessObjects, MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat,
     ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
+    VforkRequest, VforkResponse,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -49,9 +50,12 @@ const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
+const REQUEST_TAG_VFORK: u8 = 12;
 
 const START_CHILD_PROCESS_TAG_BOOTSTRAP: u8 = 0;
 const START_CHILD_PROCESS_TAG_DUPLICATE: u8 = 1;
+const VFORK_TAG_CREATE: u8 = 0;
+const VFORK_TAG_START: u8 = 1;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -66,6 +70,7 @@ const RESPONSE_TAG_FILE: u8 = 8;
 const RESPONSE_TAG_THREAD_CREATED: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
+const RESPONSE_TAG_VFORK: u8 = 12;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -75,7 +80,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 86;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 90;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -125,7 +130,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_CHILD_PROCESS => {
+        | REQUEST_TAG_START_CHILD_PROCESS
+        | REQUEST_TAG_VFORK => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -216,6 +222,30 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
                 }
             }
         }
+        BrokerOperation::Vfork(request) => {
+            encoder.u8(REQUEST_TAG_VFORK);
+            encoder.request_id(request_id);
+            match request {
+                VforkRequest::Create => encoder.u8(VFORK_TAG_CREATE),
+                VforkRequest::Start {
+                    child_process_id,
+                    startup:
+                        ProcessStartupDescriptor {
+                            format,
+                            version,
+                            buffer,
+                            inherited_objects,
+                        },
+                } => {
+                    encoder.u8(VFORK_TAG_START);
+                    encoder.process_id(child_process_id);
+                    encoder.u32(format.0);
+                    encoder.u16(version.0);
+                    encoder.shared_buffer_sequence(buffer);
+                    encode_inherited_objects(&mut encoder, inherited_objects);
+                }
+            }
+        }
     }
     encoder.finish()
 }
@@ -236,7 +266,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
-        | REQUEST_TAG_START_CHILD_PROCESS => {}
+        | REQUEST_TAG_START_CHILD_PROCESS
+        | REQUEST_TAG_VFORK => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -267,6 +298,22 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                 _ => return Err(WireError::InvalidTag),
             };
             BrokerOperation::StartChildProcess(request)
+        }
+        REQUEST_TAG_VFORK => {
+            let request = match decoder.u8()? {
+                VFORK_TAG_CREATE => VforkRequest::Create,
+                VFORK_TAG_START => VforkRequest::Start {
+                    child_process_id: decoder.process_id()?,
+                    startup: ProcessStartupDescriptor {
+                        format: ProcessBootstrapFormat(decoder.u32()?),
+                        version: ProcessBootstrapVersion(decoder.u16()?),
+                        buffer: decoder.shared_buffer_sequence()?,
+                        inherited_objects: decode_inherited_objects(&mut decoder)?,
+                    },
+                },
+                _ => return Err(WireError::InvalidTag),
+            };
+            BrokerOperation::Vfork(request)
         }
         _ => unreachable!("active request tag was validated"),
     };
@@ -355,7 +402,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_THREAD_CREATED
         | RESPONSE_TAG_THREAD_EXITED
-        | RESPONSE_TAG_PROCESS_STARTED => {
+        | RESPONSE_TAG_PROCESS_STARTED
+        | RESPONSE_TAG_VFORK => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -434,6 +482,21 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.process_id(process_id);
             encoder.thread_id(initial_thread_id);
         }
+        BrokerResult::Vfork(response) => {
+            encoder.u8(RESPONSE_TAG_VFORK);
+            encoder.request_id(request_id);
+            match response {
+                VforkResponse::Created(ProcessIdentity {
+                    process_id,
+                    initial_thread_id,
+                }) => {
+                    encoder.u8(VFORK_TAG_CREATE);
+                    encoder.process_id(process_id);
+                    encoder.thread_id(initial_thread_id);
+                }
+                VforkResponse::Started => encoder.u8(VFORK_TAG_START),
+            }
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -462,7 +525,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_THREAD_CREATED
         | RESPONSE_TAG_THREAD_EXITED
-        | RESPONSE_TAG_PROCESS_STARTED => {}
+        | RESPONSE_TAG_PROCESS_STARTED
+        | RESPONSE_TAG_VFORK => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -481,6 +545,14 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(ProcessIdentity {
             process_id: decoder.process_id()?,
             initial_thread_id: decoder.thread_id()?,
+        }),
+        RESPONSE_TAG_VFORK => BrokerResult::Vfork(match decoder.u8()? {
+            VFORK_TAG_CREATE => VforkResponse::Created(ProcessIdentity {
+                process_id: decoder.process_id()?,
+                initial_thread_id: decoder.thread_id()?,
+            }),
+            VFORK_TAG_START => VforkResponse::Started,
+            _ => return Err(WireError::InvalidTag),
         }),
         _ => unreachable!("active response tag was validated"),
     };
@@ -601,7 +673,7 @@ mod tests {
     };
     use crate::process::{
         InheritedProcessObjects, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
-        ProcessStartupDescriptor, StartChildProcessRequest,
+        ProcessStartupDescriptor, StartChildProcessRequest, VforkRequest, VforkResponse,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -661,6 +733,7 @@ mod tests {
                 RESPONSE_TAG_THREAD_CREATED,
                 RESPONSE_TAG_THREAD_EXITED,
                 RESPONSE_TAG_PROCESS_STARTED,
+                RESPONSE_TAG_VFORK,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -675,6 +748,7 @@ mod tests {
                 REQUEST_TAG_CREATE_THREAD,
                 REQUEST_TAG_EXIT_THREAD,
                 REQUEST_TAG_START_CHILD_PROCESS,
+                REQUEST_TAG_VFORK,
             ]
         );
         assert_eq!(
@@ -958,6 +1032,22 @@ mod tests {
                 },
             )),
             BrokerOperation::StartChildProcess(StartChildProcessRequest::Duplicate(sequence(0, 2))),
+            BrokerOperation::Vfork(VforkRequest::Create),
+            BrokerOperation::Vfork(VforkRequest::Start {
+                child_process_id: process_id(u32::MAX),
+                startup: ProcessStartupDescriptor {
+                    format: ProcessBootstrapFormat(u32::MAX),
+                    version: ProcessBootstrapVersion(u16::MAX),
+                    buffer: largest_sequence,
+                    inherited_objects: InheritedProcessObjects::new(&[
+                        ObjectHandle(1),
+                        ObjectHandle(2),
+                        ObjectHandle(3),
+                        ObjectHandle(4),
+                    ])
+                    .unwrap(),
+                },
+            }),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1311,6 +1401,11 @@ mod tests {
                 process_id: process_id(9),
                 initial_thread_id: thread_id(11),
             }),
+            BrokerResult::Vfork(VforkResponse::Created(ProcessIdentity {
+                process_id: process_id(u32::MAX),
+                initial_thread_id: thread_id(u32::MAX - 1),
+            })),
+            BrokerResult::Vfork(VforkResponse::Started),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1450,6 +1545,12 @@ mod tests {
             decode_request(&unknown_child_start),
             Err(WireError::InvalidTag)
         );
+        let mut unknown_vfork = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Vfork(VforkRequest::Create),
+        });
+        unknown_vfork[9] = 0xff;
+        assert_eq!(decode_request(&unknown_vfork), Err(WireError::InvalidTag));
         let mut frame = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {

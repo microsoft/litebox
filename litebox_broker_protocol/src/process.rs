@@ -103,3 +103,26 @@ pub enum StartChildProcessRequest {
     /// input-only image whose exact length is the buffer sequence length.
     Duplicate(SharedBufferSequence),
 }
+
+/// One constrained shared-address-space `vfork` operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VforkRequest {
+    /// Allocates one pending child process and its initial thread identity.
+    Create,
+    /// Transfers a pending child into a fresh runner using a Program startup.
+    Start {
+        /// Pending child process allocated by [`Self::Create`].
+        child_process_id: ProcessId,
+        /// Program startup delivered to the fresh child runner.
+        startup: ProcessStartupDescriptor,
+    },
+}
+
+/// Successful result of a constrained `vfork` operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VforkResponse {
+    /// The pending child identity allocated for the shared execution window.
+    Created(ProcessIdentity),
+    /// The pending child established its fresh runner association.
+    Started,
+}

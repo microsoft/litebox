@@ -17,7 +17,10 @@ use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
 };
-use crate::process::{ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest};
+use crate::process::{
+    ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest, VforkRequest,
+    VforkResponse,
+};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::socket::{
@@ -67,6 +70,8 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process.
     StartChildProcess(StartChildProcessRequest),
+    /// Perform one constrained shared-address-space `vfork` operation.
+    Vfork(VforkRequest),
 }
 
 impl BrokerOperation {
@@ -104,7 +109,11 @@ impl BrokerOperation {
             | Self::StartChildProcess(
                 StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor { buffer, .. })
                 | StartChildProcessRequest::Duplicate(buffer),
-            ) => Some(*buffer),
+            )
+            | Self::Vfork(VforkRequest::Start {
+                startup: ProcessStartupDescriptor { buffer, .. },
+                ..
+            }) => Some(*buffer),
             Self::CreateThread
             | Self::ExitThread(_)
             | Self::CloseObject(_)
@@ -125,7 +134,8 @@ impl BrokerOperation {
             | Self::Stdio(StdioRequest::IsTerminal(_))
             | Self::File(
                 FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
-            ) => None,
+            )
+            | Self::Vfork(VforkRequest::Create) => None,
         }
     }
 }
@@ -247,6 +257,8 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A child established its broker association.
     ProcessStarted(ProcessIdentity),
+    /// Constrained `vfork` response family.
+    Vfork(VforkResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

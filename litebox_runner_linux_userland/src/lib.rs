@@ -7,6 +7,9 @@ use litebox_platform_linux_userland::LinuxUserland as Platform;
 use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
+use litebox_shim_linux::process_startup::{
+    LINUX_PROGRAM_BOOTSTRAP_FORMAT, LINUX_PROGRAM_BOOTSTRAP_VERSION, LinuxProgramStartup,
+};
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with packaged guest files and avoids truncating high host IDs.
@@ -94,22 +97,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         litebox_platform_linux_userland::with_guest_signals_blocked(|| {
             broker::connect(control_socket_path)
         })?;
-    if let Some(bootstrap) = startup {
-        return Err(anyhow!(
-            "unsupported child Linux process bootstrap format {:?} version {:?}",
-            bootstrap.format,
-            bootstrap.version
-        ));
-    }
-
-    let prog_path = cli_args
-        .program_and_arguments
-        .first()
-        .context("program path missing")?;
-    if !prog_path.starts_with('/') {
-        anyhow::bail!("program path must be absolute (e.g., /usr/bin/ls), got: {prog_path}");
-    }
-
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
 
@@ -137,39 +124,93 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     })?;
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
-    let task_params = litebox_common_linux::TaskParams {
-        pid: process_id,
-        ppid: 0,
-        uid: u32::from(DEFAULT_GUEST_UID),
-        euid: u32::from(DEFAULT_GUEST_UID),
-        gid: u32::from(DEFAULT_GUEST_GID),
-        egid: u32::from(DEFAULT_GUEST_GID),
-    };
 
     let shim = shim_builder.build();
-
-    let argv = cli_args
-        .program_and_arguments
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let proxy_url = cli_args.broker_proxy_url;
-    let mut environment = cli_args.environment_variables;
-    if cli_args.forward_environment_variables {
-        environment.extend(std::env::vars().map(|(key, value)| format!("{key}={value}")));
-    }
-    apply_broker_proxy_environment(&mut environment, proxy_url.as_deref());
-    let envp = environment
-        .iter()
-        .map(|value| std::ffi::CString::new(value.as_bytes()).unwrap())
-        .collect();
+    let (task_params, prog_path, argv, envp) = if let Some(startup) = startup {
+        if startup.format != LINUX_PROGRAM_BOOTSTRAP_FORMAT
+            || startup.version != LINUX_PROGRAM_BOOTSTRAP_VERSION
+            || !startup.inherited_objects.as_slice().is_empty()
+        {
+            return Err(anyhow!(
+                "unsupported child Linux process bootstrap format {:?} version {:?}",
+                startup.format,
+                startup.version
+            ));
+        }
+        let startup = LinuxProgramStartup::decode(&startup.payload)
+            .context("invalid child Linux Program startup")?;
+        let argv = startup
+            .argv
+            .into_iter()
+            .map(std::ffi::CString::new)
+            .collect::<Result<Vec<_>, _>>()
+            .context("invalid child argument")?;
+        let envp = startup
+            .envp
+            .into_iter()
+            .map(std::ffi::CString::new)
+            .collect::<Result<Vec<_>, _>>()
+            .context("invalid child environment")?;
+        (
+            litebox_common_linux::TaskParams {
+                pid: process_id,
+                ppid: startup.parent_process_id,
+                uid: startup.uid,
+                euid: startup.euid,
+                gid: startup.gid,
+                egid: startup.egid,
+            },
+            startup.path,
+            argv,
+            envp,
+        )
+    } else {
+        let prog_path = cli_args
+            .program_and_arguments
+            .first()
+            .context("program path missing")?
+            .clone();
+        if !prog_path.starts_with('/') {
+            anyhow::bail!("program path must be absolute (e.g., /usr/bin/ls), got: {prog_path}");
+        }
+        let argv = cli_args
+            .program_and_arguments
+            .iter()
+            .map(|value| std::ffi::CString::new(value.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .context("invalid program argument")?;
+        let proxy_url = cli_args.broker_proxy_url;
+        let mut environment = cli_args.environment_variables;
+        if cli_args.forward_environment_variables {
+            environment.extend(std::env::vars().map(|(key, value)| format!("{key}={value}")));
+        }
+        apply_broker_proxy_environment(&mut environment, proxy_url.as_deref());
+        let envp = environment
+            .iter()
+            .map(|value| std::ffi::CString::new(value.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .context("invalid environment variable")?;
+        (
+            litebox_common_linux::TaskParams {
+                pid: process_id,
+                ppid: 0,
+                uid: u32::from(DEFAULT_GUEST_UID),
+                euid: u32::from(DEFAULT_GUEST_UID),
+                gid: u32::from(DEFAULT_GUEST_GID),
+                egid: u32::from(DEFAULT_GUEST_GID),
+            },
+            prog_path,
+            argv,
+            envp,
+        )
+    };
 
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
         &broker_positional_io_fds,
         &broker_shutdown_fds,
     );
 
-    let program = shim.load_program(task_params, initial_thread, prog_path, argv, envp)?;
+    let program = shim.load_program(task_params, initial_thread, &prog_path, argv, envp)?;
 
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();

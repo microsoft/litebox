@@ -115,6 +115,29 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         }
         self.clear_sigaltstack();
     }
+
+    pub(crate) fn supports_initial_vfork_exec(&self) -> bool {
+        let altstack = self.altstack.get();
+        self.pending.borrow().pending.is_empty()
+            && self.shared_pending.lock().pending.is_empty()
+            && self.blocked.get().is_empty()
+            && altstack.sp == 0
+            && altstack.size == 0
+            && altstack.flags.bits() == SsFlags::DISABLE.bits()
+            && self
+                .handlers
+                .borrow()
+                .inner
+                .lock()
+                .handlers
+                .iter()
+                .all(|handler| {
+                    handler.action.sigaction == SIG_DFL
+                        && handler.action.restorer == 0
+                        && handler.action.flags.is_empty()
+                        && handler.action.mask.is_empty()
+                })
+    }
 }
 
 struct SignalHandlers<Platform: ShimPlatform> {

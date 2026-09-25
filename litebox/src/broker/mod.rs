@@ -18,6 +18,9 @@ use litebox_broker_protocol::fs::{
     FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
+use litebox_broker_protocol::process::{
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
+};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
@@ -49,6 +52,16 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
+    fn create_vfork_child(&self) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+
+    fn start_vfork_child(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        format: ProcessBootstrapFormat,
+        version: ProcessBootstrapVersion,
+        payload: &[u8],
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
     fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
@@ -437,6 +450,26 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
+    fn create_vfork_child(&self) -> core::result::Result<ProcessIdentity, BrokerControlError> {
+        self.request(BrokerLocal::create_vfork_child)
+    }
+
+    fn start_vfork_child(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        format: ProcessBootstrapFormat,
+        version: ProcessBootstrapVersion,
+        payload: &[u8],
+    ) -> core::result::Result<(), BrokerControlError> {
+        if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(payload.len())?;
+        self.request(|local| {
+            local.start_vfork_child(child_process_id, format, version, lease.sequence(), payload)
+        })
+    }
+
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {
         self.request(BrokerLocal::create_thread)
     }

@@ -2061,6 +2061,7 @@ impl ShutdownHow {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum SyscallRequest {
+    Vfork,
     Exit {
         status: i32,
     },
@@ -2799,6 +2800,8 @@ impl SyscallRequest {
             Sysno::getpeername => sys_req!(Getpeername { sockfd, addr:*, addrlen:* }),
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::vfork => SyscallRequest::Vfork,
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);

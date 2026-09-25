@@ -46,7 +46,7 @@ use litebox_broker_protocol::pipe::{
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
     ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest,
+    StartChildProcessRequest, VforkRequest, VforkResponse,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -524,7 +524,7 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
-        BrokerOperation::StartChildProcess(_) => {
+        BrokerOperation::StartChildProcess(_) | BrokerOperation::Vfork(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
@@ -808,8 +808,66 @@ where
                 })
                 .map(BrokerResult::ProcessStarted),
         ),
+        BrokerOperation::Vfork(VforkRequest::Create) => Some(
+            parent
+                .create_vfork_child()
+                .map(VforkResponse::Created)
+                .map(BrokerResult::Vfork)
+                .map_err(RequestFailure::from),
+        ),
+        BrokerOperation::Vfork(VforkRequest::Start {
+            child_process_id,
+            startup,
+        }) => Some(
+            read_shared_buffer(shared_buffers, startup.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
+                .and_then(|payload| {
+                    start_vfork_child(
+                        Arc::clone(launcher),
+                        parent,
+                        *child_process_id,
+                        startup.format,
+                        startup.version,
+                        payload,
+                        startup.inherited_objects,
+                    )
+                })
+                .map(|()| BrokerResult::Vfork(VforkResponse::Started)),
+        ),
         _ => None,
     }
+}
+
+fn start_vfork_child<Launcher: ProcessLauncher + ?Sized>(
+    launcher: Arc<Launcher>,
+    parent: &BrokerProcess,
+    child_process_id: litebox_broker_protocol::ProcessId,
+    format: ProcessBootstrapFormat,
+    version: ProcessBootstrapVersion,
+    payload: Vec<u8>,
+    inherited_objects: InheritedProcessObjects,
+) -> RequestResult<()> {
+    if !inherited_objects.as_slice().is_empty() {
+        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+    }
+    let process = parent
+        .take_vfork_child(child_process_id)
+        .map_err(RequestFailure::from)?;
+    if parent.is_cancellation_requested() {
+        let _ = process.fail_start(BrokerError::PeerClosed, false, true);
+        process.retire(true);
+        return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
+    }
+    launcher
+        .launch(
+            process,
+            ProcessStartupData {
+                format,
+                version,
+                payload,
+                inherited_objects: InheritedProcessObjects::EMPTY,
+            },
+        )
+        .map_err(RequestFailure::from)
 }
 
 fn start_child_process<Launcher: ProcessLauncher + ?Sized>(

@@ -42,7 +42,7 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::process::{
     InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat,
     ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest,
+    StartChildProcessRequest, VforkRequest, VforkResponse,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -210,6 +210,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
+
         self.write_shared_buffer(buffer, bootstrap);
         match self.request(BrokerOperation::StartChildProcess(
             StartChildProcessRequest::Bootstrap(ProcessStartupDescriptor {
@@ -222,6 +223,56 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerResult::ProcessStarted(started) => Ok(started),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
+        }
+    }
+
+    /// Allocates one pending child for a constrained `vfork` execution window.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn create_vfork_child(&self) -> Result<ProcessIdentity, Channel::Error> {
+        match self.request(BrokerOperation::Vfork(VforkRequest::Create))? {
+            BrokerResult::Vfork(VforkResponse::Created(identity)) => Ok(identity),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected create-vfork response: {response:?}"),
+        }
+    }
+
+    /// Transfers one pending `vfork` child into a fresh runner.
+    ///
+    /// This call blocks until the child's broker association is active or
+    /// launch fails. The caller must retain exclusive ownership of the
+    /// bootstrap sequence until this method returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bootstrap length differs from the shared-buffer sequence
+    /// or the broker returns a response for another operation.
+    pub fn start_vfork_child(
+        &self,
+        child_process_id: ProcessId,
+        format: ProcessBootstrapFormat,
+        version: ProcessBootstrapVersion,
+        buffer: SharedBufferSequence,
+        bootstrap: &[u8],
+    ) -> Result<(), Channel::Error> {
+        if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.write_shared_buffer(buffer, bootstrap);
+        match self.request(BrokerOperation::Vfork(VforkRequest::Start {
+            child_process_id,
+            startup: ProcessStartupDescriptor {
+                format,
+                version,
+                buffer,
+                inherited_objects: InheritedProcessObjects::EMPTY,
+            },
+        }))? {
+            BrokerResult::Vfork(VforkResponse::Started) => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected start-vfork response: {response:?}"),
         }
     }
 

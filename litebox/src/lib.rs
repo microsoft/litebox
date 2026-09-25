@@ -24,6 +24,7 @@ pub mod net;
 pub mod path;
 pub mod pipes;
 pub mod platform;
+pub mod process;
 pub mod random;
 pub mod shim;
 pub mod stdio;

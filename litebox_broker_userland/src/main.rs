@@ -108,6 +108,10 @@ struct CliArgs {
     /// broker and is intended only for testing and development.
     #[arg(long, hide = true, requires = "unstable", conflicts_with = "runner")]
     in_process_runner: bool,
+    /// Enable the experimental constrained process-duplication path.
+    #[cfg(target_os = "linux")]
+    #[arg(long, hide = true, requires = "unstable")]
+    allow_process_duplication: bool,
     /// Local runner executable to launch.
     #[arg(
         long,

@@ -26,6 +26,10 @@ use litebox_common_linux::{
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 
+use crate::process_startup::{
+    LINUX_PROGRAM_BOOTSTRAP_FORMAT, LINUX_PROGRAM_BOOTSTRAP_VERSION, LinuxProgramStartup,
+};
+
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
     init_state: Cell<ThreadInitState>,
@@ -46,6 +50,18 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
     /// of the futex has died. This notification consists of two pieces: the FUTEX_OWNER_DIED bit is set in the futex word,
     /// and the kernel performs a futex(2) FUTEX_WAKE operation on one of the threads waiting on the futex.
     robust_list: Cell<Option<UserPtr<litebox_common_linux::RobustListHead>>>,
+}
+
+fn vfork_errno(error: litebox::process::VforkError) -> Errno {
+    match error {
+        litebox::process::VforkError::PolicyDenied => Errno::EPERM,
+        litebox::process::VforkError::Unavailable => Errno::ENOSYS,
+        litebox::process::VforkError::Busy | litebox::process::VforkError::ResourceExhausted => {
+            Errno::EAGAIN
+        }
+        litebox::process::VforkError::ServiceFailed
+        | litebox::process::VforkError::InvalidChild => Errno::EIO,
+    }
 }
 
 // TODO: remove once we figure out how to handle Send/Sync for raw pointers.
@@ -227,6 +243,11 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// Returns the current number of threads in this process.
     pub fn nr_threads(&self) -> u32 {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
+    }
+
+    fn has_default_alarm_state(&self) -> bool {
+        let alarm = self.alarm_timer.lock();
+        alarm.handle.is_none() && alarm.deadline.is_none()
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
@@ -683,6 +704,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_clone(ctx, &args, true)
     }
 
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+        if self.vfork.borrow().is_some()
+            || self.thread.process.nr_threads() != 1
+            || !self.files.borrow().has_only_standard_descriptors()
+            || !self
+                .fs
+                .borrow()
+                .supports_initial_vfork_exec(&self.credentials)
+            || !self.signals.supports_initial_vfork_exec()
+            || !self.thread.process.has_default_alarm_state()
+        {
+            return Err(Errno::EAGAIN);
+        }
+        let child = self
+            .global
+            .litebox
+            .create_vfork_child()
+            .map_err(vfork_errno)?;
+        let child_pid =
+            i32::try_from(child.process_id.0).expect("broker process IDs must fit Linux pid_t");
+        let mut parent_context = ctx.clone();
+        parent_context.rax = child_pid.cast_unsigned() as usize;
+        self.vfork.replace(Some(crate::VforkState {
+            child,
+            parent_context,
+        }));
+        Ok(0)
+    }
+
     /// Creates a new thread or process.
     ///
     /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
@@ -858,6 +909,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         litebox_thread: Cell::new(None),
                         wait_state: crate::wait::WaitState::new(self.global.platform),
                         thread,
+                        vfork: core::cell::RefCell::new(None),
+                        skip_syscall_result: Cell::new(false),
                         pid: self.pid,
                         ppid: self.ppid,
                         credentials: self.credentials.clone(),
@@ -908,7 +961,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `gettid`.
     pub(crate) fn sys_gettid(&self) -> i32 {
-        self.tid()
+        self.vfork.borrow().as_ref().map_or_else(
+            || self.tid(),
+            |state| {
+                i32::try_from(state.child.process_id.0)
+                    .expect("broker process IDs must fit Linux pid_t")
+            },
+        )
     }
 }
 
@@ -1375,11 +1434,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
-        self.pid
+        self.vfork.borrow().as_ref().map_or(self.pid, |state| {
+            i32::try_from(state.child.process_id.0)
+                .expect("broker process IDs must fit Linux pid_t")
+        })
     }
 
     pub(crate) fn sys_getppid(&self) -> i32 {
-        self.ppid
+        self.vfork.borrow().as_ref().map_or(self.ppid, |_| self.pid)
     }
 
     /// Handle syscall `getuid`.
@@ -1508,6 +1570,64 @@ const MAX_TOTAL_BYTES: usize = 256 * 1024; // size cap
 /// Maximum shebang (#!) recursion depth (from Linux's `exec_binprm`)
 const SHEBANG_MAX_RECURSION: u32 = 6;
 
+fn copy_exec_arguments<Platform: ShimPlatform>(
+    pathname: UserPtr<core::ffi::c_char>,
+    argv: UserPtr<UserPtr<core::ffi::c_char>>,
+    envp: UserPtr<UserPtr<core::ffi::c_char>>,
+) -> Result<
+    (
+        alloc::string::String,
+        alloc::vec::Vec<alloc::ffi::CString>,
+        alloc::vec::Vec<alloc::ffi::CString>,
+    ),
+    Errno,
+> {
+    fn copy_vector<Platform: ShimPlatform>(
+        mut base: UserPtr<UserPtr<core::ffi::c_char>>,
+    ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
+        let mut out = alloc::vec::Vec::new();
+        let mut total = 0usize;
+        for _ in 0..MAX_VEC {
+            let p = base.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
+            if p.as_usize() == 0 {
+                return Ok(out);
+            }
+            let cs = p.to_cstring::<Platform>().ok_or(Errno::EFAULT)?;
+            total = total
+                .checked_add(cs.as_bytes().len() + 1)
+                .ok_or(Errno::E2BIG)?;
+            if total > MAX_TOTAL_BYTES {
+                return Err(Errno::E2BIG);
+            }
+            out.push(cs);
+            base = UserPtr::from_usize(
+                base.as_usize()
+                    .checked_add(core::mem::size_of::<usize>())
+                    .ok_or(Errno::EFAULT)?,
+            );
+        }
+        Err(Errno::E2BIG)
+    }
+
+    let path = pathname
+        .to_cstring::<Platform>()
+        .ok_or(Errno::EFAULT)?
+        .to_str()
+        .map_err(|_| Errno::ENOENT)?
+        .into();
+    let argv = if argv.as_usize() == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        copy_vector::<Platform>(argv)?
+    };
+    let envp = if envp.as_usize() == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        copy_vector::<Platform>(envp)?
+    };
+    Ok((path, argv, envp))
+}
+
 /// Maximum length of a shebang line that we inspect. Matches Linux `BINPRM_BUF_SIZE`.
 const SHEBANG_MAX_LINE: usize = 256;
 
@@ -1593,58 +1713,50 @@ impl<Platform: ShimPlatform> Task<Platform> {
         envp: UserPtr<UserPtr<core::ffi::c_char>>,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> Result<usize, Errno> {
-        fn copy_vector<Platform: ShimPlatform>(
-            mut base: UserPtr<UserPtr<core::ffi::c_char>>,
-            _which: &str,
-        ) -> Result<alloc::vec::Vec<alloc::ffi::CString>, Errno> {
-            let mut out = alloc::vec::Vec::new();
-            let mut total = 0usize;
-            for _ in 0..MAX_VEC {
-                let p: UserPtr<core::ffi::c_char> = {
-                    // read pointer-sized entries
-                    match base.read_at_offset::<Platform>(0) {
-                        Some(ptr) => ptr,
-                        None => return Err(Errno::EFAULT),
-                    }
-                };
-                if p.as_usize() == 0 {
-                    break;
-                }
-                let Some(cs) = p.to_cstring::<Platform>() else {
-                    return Err(Errno::EFAULT);
-                };
-                total += cs.as_bytes().len() + 1;
-                if total > MAX_TOTAL_BYTES {
-                    return Err(Errno::E2BIG);
-                }
-                out.push(cs);
-                // advance to next pointer
-                base = UserPtr::from_usize(base.as_usize() + core::mem::size_of::<usize>());
-            }
-            Ok(out)
+        let (path, argv_vec, envp_vec) = copy_exec_arguments::<Platform>(pathname, argv, envp)?;
+        let vfork_child = self.vfork.borrow().as_ref().map(|state| state.child);
+        if vfork_child.is_some() && !path.starts_with('/') {
+            return Err(Errno::ENOENT);
         }
-
-        // Copy pathname
-        let Some(path_cstr) = pathname.to_cstring::<Platform>() else {
-            return Err(Errno::EFAULT);
-        };
-        let path = path_cstr.to_str().map_err(|_| Errno::ENOENT)?;
-
-        // Copy argv and envp vectors
-        let argv_vec = if argv.as_usize() == 0 {
-            alloc::vec::Vec::new()
-        } else {
-            copy_vector::<Platform>(argv, "argv")?
-        };
-        let envp_vec = if envp.as_usize() == 0 {
-            alloc::vec::Vec::new()
-        } else {
-            copy_vector::<Platform>(envp, "envp")?
-        };
-
-        let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
-
+        let (path, argv_vec) = self.resolve_shebang(path, argv_vec)?;
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
+        if let Some(child) = vfork_child {
+            drop(loader);
+            let startup = LinuxProgramStartup {
+                parent_process_id: self.pid,
+                uid: self.credentials.uid,
+                euid: self.credentials.euid,
+                gid: self.credentials.gid,
+                egid: self.credentials.egid,
+                path,
+                argv: argv_vec
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect(),
+                envp: envp_vec
+                    .iter()
+                    .map(|value| value.as_bytes().to_vec())
+                    .collect(),
+            };
+            let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
+            self.global
+                .litebox
+                .start_vfork_child(
+                    child.process_id,
+                    LINUX_PROGRAM_BOOTSTRAP_FORMAT,
+                    LINUX_PROGRAM_BOOTSTRAP_VERSION,
+                    &payload,
+                )
+                .map_err(vfork_errno)?;
+            let state = self
+                .vfork
+                .borrow_mut()
+                .take()
+                .expect("successful vfork transfer lost its parent context");
+            *ctx = state.parent_context;
+            self.skip_syscall_result.set(true);
+            return Ok(0);
+        }
 
         // After this point, the old program is torn down and failures must terminate the process.
 

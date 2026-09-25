@@ -42,9 +42,12 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         .as_ref()
         .map(|proxy| format!("http://{HOST_GATEWAY_IPV4_ADDRESS}:{}", proxy.port));
 
-    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-        configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
-    );
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+        .with_socket_policy(configured_socket_policy(
+            &args.allow_tcp_destination,
+            &args.allow_udp_destination,
+        )?)
+        .with_process_duplication_enabled(args.allow_process_duplication);
     let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
     )?;
