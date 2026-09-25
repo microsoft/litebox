@@ -731,9 +731,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
-    /// Creates a new thread or process.
+    /// Creates a new thread.
     ///
-    /// Note we currently only support creating threads with the VM, FS, and FILES flags set.
+    /// Process creation, including `clone` or `clone3` with `CLONE_VFORK`, is intentionally
+    /// unsupported. Those calls require child-stack and ancillary clone-argument semantics rather
+    /// than being aliases for `vfork(2)`.
     fn do_clone(
         &self,
         ctx: &litebox_common_linux::PtRegs,
