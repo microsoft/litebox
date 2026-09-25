@@ -10,15 +10,59 @@ use crate::{
     mm::vmem::{CreatePagesFlags, NonZeroAddress},
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::MemoryRegionPermissions,
+        page_mgmt::{MemoryRegionPermissions, PageReservation, ReservationStore as _},
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
 };
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::vmem::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
+    NonZeroPageSize, PAGE_SIZE, PageRange, TrackedReservations, VmArea, VmFlags, Vmem,
+    VmemProtectError, VmemResizeError,
 };
+
+crate::define_page_reservation!(TestReservation);
+
+#[test]
+fn reservation_segments_and_take_overlapping_in_order() {
+    let mut reservations = TrackedReservations::default();
+    for range in [0x1000..0x3000, 0x3000..0x4000, 0x5000..0x6000] {
+        // SAFETY: Each test range is nonempty, aligned, disjoint, and uniquely represented.
+        let reservation = unsafe { TestReservation::<0x1000>::new(range.clone()) };
+        assert!(reservations.insert(range.start, reservation).is_none());
+    }
+
+    assert_eq!(
+        reservations.segments(0x800..0x5800),
+        [
+            (0x800..0x1000, None),
+            (0x1000..0x3000, Some(0x1000)),
+            (0x3000..0x4000, Some(0x3000)),
+            (0x4000..0x5000, None),
+            (0x5000..0x5800, Some(0x5000)),
+        ]
+    );
+    assert_eq!(
+        reservations
+            .overlapping(0x2000..0x3800)
+            .map(|(_, reservation)| reservation.range())
+            .collect::<Vec<_>>(),
+        [0x1000..0x3000, 0x3000..0x4000]
+    );
+    assert_eq!(reservations.iter().count(), 3);
+
+    let taken = reservations.take_overlapping(0x2000..0x3800);
+    assert_eq!(
+        taken.iter().map(PageReservation::range).collect::<Vec<_>>(),
+        [0x1000..0x3000, 0x3000..0x4000]
+    );
+    let remaining = reservations
+        .iter()
+        .map(|(_, reservation)| reservation.range())
+        .collect::<Vec<_>>();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0], 0x5000..0x6000);
+}
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;

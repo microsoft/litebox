@@ -3,11 +3,85 @@
 
 //! Page-management related types and traits
 
+use alloc::vec::Vec;
+
 use crate::platform::{RawConstPointer as _, RawMutPointer as _};
 
 use super::RawPointerProvider;
 use core::ops::Range;
 use thiserror::Error;
+
+/// Exclusive ownership of a reserved virtual-address extent.
+///
+/// # Safety
+///
+/// Implementations must represent unique ownership and must not implement [`Copy`] or [`Clone`].
+pub unsafe trait PageReservation {
+    /// Return the owned address range.
+    fn range(&self) -> Range<usize>;
+}
+
+/// Define an opaque page-reservation handle with a private constructor.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! define_page_reservation {
+    ($name:ident) => {
+        #[doc(hidden)]
+        pub struct $name<const ALIGN: usize> {
+            range: ::core::ops::Range<usize>,
+        }
+
+        impl<const ALIGN: usize> $name<ALIGN> {
+            unsafe fn new(range: ::core::ops::Range<usize>) -> Self {
+                assert!(!range.is_empty());
+                assert!(range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN));
+                Self { range }
+            }
+        }
+
+        // SAFETY: Construction is private and the generated handle is neither Clone nor Copy.
+        unsafe impl<const ALIGN: usize> $crate::platform::page_mgmt::PageReservation
+            for $name<ALIGN>
+        {
+            fn range(&self) -> ::core::ops::Range<usize> {
+                self.range.clone()
+            }
+        }
+
+        const _: fn() = || {
+            trait AmbiguousIfCloneOrCopy<Marker> {
+                fn assert_not_impl() {}
+            }
+            struct Invalid;
+            impl<T: ?Sized> AmbiguousIfCloneOrCopy<()> for T {}
+            impl<T: ?Sized + Clone> AmbiguousIfCloneOrCopy<Invalid> for T {}
+            impl<T: ?Sized + Copy> AmbiguousIfCloneOrCopy<(Invalid, Invalid)> for T {}
+
+            let _ = <$name<4096> as AmbiguousIfCloneOrCopy<_>>::assert_not_impl;
+        };
+    };
+}
+
+/// Storage for reservations indexed by their starting address.
+pub trait ReservationStore {
+    /// Reservation value retained by the store.
+    type Reservation: PageReservation;
+
+    /// Insert a reservation at `base`.
+    fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
+
+    /// Iterate over reservation bases and values in ascending address order.
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Self::Reservation)>;
+
+    /// Iterate over every reservation overlapping `range` in ascending address order.
+    fn overlapping(
+        &self,
+        range: Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)>;
+
+    /// Remove and return every reservation overlapping `range` in ascending address order.
+    fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Self::Reservation>;
+}
 
 bitflags::bitflags! {
     /// Permissions for a memory region

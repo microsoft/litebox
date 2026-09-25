@@ -16,6 +16,7 @@ use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use litebox::mm::vmem::PAGE_SIZE;
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
@@ -53,12 +54,13 @@ thread_local! {
 ///
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
-pub struct WindowsUserland {
+pub struct WindowsUserland<const ALIGN: usize = PAGE_SIZE> {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
+    reservations: std::sync::Mutex<page_mgmt::WindowsReservationStore<ALIGN>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
 }
 
-impl core::fmt::Debug for WindowsUserland {
+impl<const ALIGN: usize> core::fmt::Debug for WindowsUserland<ALIGN> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WindowsUserland").finish_non_exhaustive()
     }
@@ -68,11 +70,11 @@ impl core::fmt::Debug for WindowsUserland {
 // ensure that the sys_info is only accessed in a thread-safe manner.
 // Moreover, SYSTEM_INFO is only initialized once during platform creation, and it is read-only
 // after that.
-unsafe impl Send for WindowsUserland {}
-unsafe impl Sync for WindowsUserland {}
+unsafe impl<const ALIGN: usize> Send for WindowsUserland<ALIGN> {}
+unsafe impl<const ALIGN: usize> Sync for WindowsUserland<ALIGN> {}
 
 /// Helper functions for managing per-thread FS base
-impl WindowsUserland {
+impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     /// Get the current thread's FS base state
     fn get_thread_fs_base() -> usize {
         THREAD_FS_BASE.get()
@@ -168,7 +170,7 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     // the interrupt path to ensure that any pending interrupts are also handled.
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
         && unsafe { litebox_common_linux::rdfsbase() } == 0
-        && WindowsUserland::get_thread_fs_base() != 0
+        && WindowsUserland::<PAGE_SIZE>::get_thread_fs_base() != 0
     {
         set_context_to_interrupt_callback(context);
     } else {
@@ -262,7 +264,7 @@ fn save_guest_context(
     tls.guest_xstate_format.set(GuestXstateFormat::Windows);
 }
 
-impl WindowsUserland {
+impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     /// Create a new userland-Windows platform for use in `LiteBox`.
     ///
     /// # Panics
@@ -293,11 +295,14 @@ impl WindowsUserland {
 
         let platform = Self {
             reserved_pages,
+            reservations: std::sync::Mutex::new(
+                page_mgmt::WindowsReservationStore::<ALIGN>::default(),
+            ),
             sys_info: std::sync::RwLock::new(sys_info),
         };
 
         // Initialize it's own fs-base (for the main thread)
-        WindowsUserland::init_thread_fs_base();
+        Self::init_thread_fs_base();
 
         // Windows sets FS_BASE to 0 regularly upon scheduling; we register an exception handler
         // to set FS_BASE back to a "stored" value whenever we notice that it has become 0.
@@ -383,7 +388,7 @@ impl WindowsUserland {
 
 impl litebox::platform::Provider for WindowsUserland {}
 
-impl litebox::platform::SignalProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::SignalProvider for WindowsUserland<ALIGN> {
     type Signal = litebox_common_linux::signal::Signal;
 
     fn take_pending_signals(&self, mut f: impl FnMut(Self::Signal)) {
@@ -1160,7 +1165,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     assert!(!tls.is_in_guest.get());
 
     // Restore fsbase for the guest.
-    WindowsUserland::restore_thread_fs_base();
+    WindowsUserland::<PAGE_SIZE>::restore_thread_fs_base();
 
     // The fast path for switching to the guest relies on rcx == rip. This is
     // the common case, because the syscall instruction sets rcx to rip at entry
@@ -1188,7 +1193,7 @@ fn thread_start(
     run_thread_inner(shim.as_ref(), &mut ctx);
 }
 
-impl litebox::platform::ThreadProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<ALIGN> {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
@@ -1230,7 +1235,7 @@ impl litebox::platform::ThreadProvider for WindowsUserland {
     }
 }
 
-impl litebox::platform::TimerProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::TimerProvider for WindowsUserland<ALIGN> {
     type TimerHandle = TimerHandle;
     type Signal = litebox_common_linux::signal::Signal;
 
@@ -1782,7 +1787,7 @@ impl litebox::platform::RawMutex for RawMutex {
     }
 }
 
-impl litebox::platform::IPInterfaceProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::IPInterfaceProvider for WindowsUserland<ALIGN> {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
         unimplemented!(
             "send_ip_packet is not implemented for Windows yet. packet length: {}",
@@ -1801,7 +1806,7 @@ impl litebox::platform::IPInterfaceProvider for WindowsUserland {
     }
 }
 
-impl litebox::platform::TimeProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::TimeProvider for WindowsUserland<ALIGN> {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
@@ -1879,7 +1884,7 @@ impl litebox::platform::SystemTime for SystemTime {
     }
 }
 
-impl litebox::platform::ArchSpecificProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::ArchSpecificProvider for WindowsUserland<ALIGN> {
     fn set_arch_specific_register(
         &self,
         reg: &litebox::platform::ArchSpecificRegister,
@@ -1929,12 +1934,12 @@ type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::Us
     T,
 >;
 
-impl litebox::platform::RawPointerProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::RawPointerProvider for WindowsUserland<ALIGN> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
-impl litebox::platform::StdioProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::StdioProvider for WindowsUserland<ALIGN> {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
         use std::io::Read as _;
         std::io::stdin().read(buf).map_err(|err| {
@@ -1989,7 +1994,7 @@ impl litebox::platform::StdioProvider for WindowsUserland {
 static SLAB_ALLOC: litebox::mm::allocator::SafeZoneAllocator<'static, 28, WindowsUserland> =
     litebox::mm::allocator::SafeZoneAllocator::new();
 
-impl litebox::mm::allocator::MemoryProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::mm::allocator::MemoryProvider for WindowsUserland<ALIGN> {
     fn alloc(layout: &std::alloc::Layout) -> Option<(usize, usize)> {
         let size = core::cmp::max(
             layout.size().next_power_of_two(),
@@ -2109,7 +2114,7 @@ impl ThreadContext<'_> {
     }
 }
 
-impl litebox::platform::SystemInfoProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::SystemInfoProvider for WindowsUserland<ALIGN> {
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
     }
@@ -2127,7 +2132,9 @@ thread_local! {
 }
 
 /// WindowsUserland platform's thread-local storage implementation.
-unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
+unsafe impl<const ALIGN: usize> litebox::platform::ThreadLocalStorageProvider
+    for WindowsUserland<ALIGN>
+{
     fn get_thread_local_storage() -> *mut () {
         PLATFORM_TLS.get()
     }
@@ -2137,7 +2144,7 @@ unsafe impl litebox::platform::ThreadLocalStorageProvider for WindowsUserland {
     }
 }
 
-impl litebox::platform::CrngProvider for WindowsUserland {
+impl<const ALIGN: usize> litebox::platform::CrngProvider for WindowsUserland<ALIGN> {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
         getrandom::fill(buf).expect("getrandom failed");
     }
@@ -2147,7 +2154,7 @@ impl litebox::platform::CrngProvider for WindowsUserland {
 ///
 /// Page faults are handled transparently by the host Windows kernel.
 /// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
-impl litebox::mm::vmem::VmemPageFaultHandler for WindowsUserland {
+impl<const ALIGN: usize> litebox::mm::vmem::VmemPageFaultHandler for WindowsUserland<ALIGN> {
     unsafe fn handle_page_fault(
         &self,
         _fault_addr: usize,
@@ -2167,7 +2174,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use crate::{XsaveArea, XsaveLayout};
+    use crate::{PAGE_SIZE, XsaveArea, XsaveLayout};
     use litebox::platform::RawMutex;
 
     #[test]
@@ -2311,7 +2318,7 @@ mod tests {
         let code = unsafe {
             VirtualAlloc(
                 core::ptr::null(),
-                4096,
+                PAGE_SIZE,
                 MEM_COMMIT | MEM_RESERVE,
                 PAGE_READWRITE,
             )
@@ -2334,7 +2341,7 @@ mod tests {
         let mut old_protection = 0;
         // SAFETY: The page is exclusively owned and the worker has not started.
         assert_ne!(
-            unsafe { VirtualProtect(code, 4096, PAGE_EXECUTE_READ, &raw mut old_protection) },
+            unsafe { VirtualProtect(code, PAGE_SIZE, PAGE_EXECUTE_READ, &raw mut old_protection) },
             0
         );
         // SAFETY: Flush the newly populated executable page before running it.
