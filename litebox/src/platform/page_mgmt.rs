@@ -23,7 +23,7 @@ pub trait ReservationStore {
     /// Reservation value retained by the store.
     type Reservation: PageReservation;
 
-    /// Check whether a range overlaps committed mappings or, when requested, reservations.
+    /// Check whether a range overlaps committed mappings in `vmas` or, when requested, reservations.
     fn overlaps<V>(
         &self,
         vmas: &RangeMap<usize, V>,

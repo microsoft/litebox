@@ -94,6 +94,7 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
         include_reservations: bool,
     ) -> bool {
         if include_reservations {
+            // Reservations should be a superset of the committed mappings in `vmas`.
             self.overlapping(range).next().is_some()
         } else {
             vmas.overlaps(&range)

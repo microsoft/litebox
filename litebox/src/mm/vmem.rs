@@ -700,20 +700,9 @@ where
         } else {
             FixedAddressBehavior::Hint
         };
-        let new_addr = Self::find_area(
-            &self.reservations,
-            &self.vmas,
-            FindAreaRequest {
-                suggested_address,
-                length: total_length,
-                behavior,
-                alignment: ALIGN,
-                include_reservations: true,
-                address_range: Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX,
-                top_down: true,
-            },
-        )?
-        .ok_or(AllocationError::OutOfMemory)?;
+        let new_addr = self
+            .get_unmmaped_area(suggested_address, total_length, behavior, true)?
+            .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
         unsafe {
@@ -847,22 +836,15 @@ where
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
         }
-        let new_addr = Self::find_area(
-            &self.reservations,
-            &self.vmas,
-            FindAreaRequest {
-                suggested_address: suggested_new_address,
-                length: new_size,
-                behavior: FixedAddressBehavior::Hint,
-                alignment: ALIGN,
-                include_reservations: true,
-                address_range: Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX,
-                top_down: true,
-            },
-        )
-        .ok()
-        .flatten()
-        .ok_or(VmemMoveError::OutOfMemory)?;
+        let new_addr = self
+            .get_unmmaped_area(
+                suggested_new_address,
+                new_size,
+                FixedAddressBehavior::Hint,
+                true,
+            )
+            .map_err(|_| VmemMoveError::OutOfMemory)?
+            .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
             self.platform
@@ -1024,6 +1006,39 @@ where
     }
 
     /*================================Internal Functions================================ */
+
+    /// Get an unmapped area in the virtual address space.
+    /// `suggested_address` and `behavior` describe the requested mmap placement.
+    ///
+    /// Returns `None` if no area was found. Otherwise, returns the start address of an
+    /// `ALIGN`-aligned area.
+    #[inline]
+    fn get_unmmaped_area(
+        &self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        behavior: FixedAddressBehavior,
+        top_down: bool,
+    ) -> Result<Option<usize>, AllocationError> {
+        let address_range_start = if !top_down && behavior == FixedAddressBehavior::Hint {
+            suggested_address.map_or(Platform::TASK_ADDR_MIN, NonZeroAddress::as_usize)
+        } else {
+            Platform::TASK_ADDR_MIN
+        };
+        Self::find_area(
+            &self.reservations,
+            &self.vmas,
+            FindAreaRequest {
+                suggested_address,
+                length,
+                behavior,
+                alignment: ALIGN,
+                include_reservations: false,
+                address_range: address_range_start..Platform::TASK_ADDR_MAX,
+                top_down,
+            },
+        )
+    }
 
     /// Search VMA gaps, preserving stack guards while optionally excluding reservations.
     pub(super) fn find_area(
