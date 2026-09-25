@@ -76,10 +76,12 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
-    pub(crate) fn detach_from_process(&self) {
-        if let Some(tid) = self.tid.take() {
-            self.process.detach_thread(tid);
-        }
+    pub(crate) fn begin_detach_from_process(&self) -> Option<ThreadDetachGuard<'_, Platform>> {
+        let tid = self.tid.take()?;
+        self.process.remove_thread(tid);
+        Some(ThreadDetachGuard {
+            process: &self.process,
+        })
     }
 
     fn tid(&self) -> i32 {
@@ -110,7 +112,17 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
 
 impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
     fn drop(&mut self) {
-        self.detach_from_process();
+        drop(self.begin_detach_from_process());
+    }
+}
+
+pub(crate) struct ThreadDetachGuard<'a, Platform: ShimPlatform> {
+    process: &'a Process<Platform>,
+}
+
+impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
+    fn drop(&mut self) {
+        self.process.complete_thread_detach();
     }
 }
 
@@ -245,17 +257,19 @@ impl<Platform: ShimPlatform> Process<Platform> {
         Some(remote)
     }
 
-    /// Detaches a thread from this process.
+    /// Removes a detaching thread's local identity from this process.
     ///
     /// # Panics
     /// Panics if the thread ID does not exist in this process.
-    fn detach_thread(&self, tid: i32) {
-        let data;
+    fn remove_thread(&self, tid: i32) {
+        let data = self.inner.lock().threads.remove(&tid);
+        assert!(data.is_some());
+    }
+
+    /// Completes detachment after external thread teardown has finished.
+    fn complete_thread_detach(&self) {
         let notify = {
             let mut inner = self.inner.lock();
-            data = inner.threads.remove(&tid);
-            assert!(data.is_some());
-
             let nr_threads = self.nr_threads.underlying_atomic();
             let n = nr_threads.load(Ordering::Relaxed);
             let new_count = n.checked_sub(1).expect("decrementing from zero threads");
@@ -1859,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn local_process_detaches_after_broker_thread_exit() {
+    fn local_thread_identity_is_removed_before_broker_exit_completion() {
         use litebox_broker_core::BrokerCoreLimits;
 
         let platform = crate::syscalls::tests::test_platform();
@@ -1883,6 +1897,7 @@ mod tests {
         let task = leader
             .clone_for_test()
             .expect("the broker thread slot must be available");
+        let exiting_tid = task.tid();
         let process = task.process().clone();
         drop(leader);
 
@@ -1894,6 +1909,10 @@ mod tests {
             process.nr_threads(),
             1,
             "local process completion preceded broker thread exit"
+        );
+        assert!(
+            !process.inner.lock().threads.contains_key(&exiting_tid),
+            "exiting thread identity remained available for a broker-reused ID"
         );
 
         exit_release_tx
