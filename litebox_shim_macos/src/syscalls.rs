@@ -4,9 +4,7 @@
 //! Typed BSD syscall implementations.
 
 use crate::{ShimPlatform, Task};
-use litebox::{
-    platform::page_mgmt::MemoryRegionPermissions as Permissions, utils::TruncateExt as _,
-};
+use litebox::utils::TruncateExt as _;
 use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers::UserPtrMut};
 
 pub(crate) mod file;
@@ -41,22 +39,8 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     pub(crate) fn sys_mach_timebase_info(&self, info: UserPtrMut<MachTimebaseInfo>) -> KernReturn {
-        if self
-            .check_user_buffer(
-                info.as_usize(),
-                size_of::<MachTimebaseInfo>(),
-                Permissions::WRITE,
-            )
-            .is_err()
-        {
-            // XNU deliberately ignores copyout failure for this trap.
-            return KernReturn::SUCCESS;
-        }
-        let written = info.write_at_offset::<P>(0, self.global.platform.mach_timebase_info());
-        debug_assert!(
-            written.is_some(),
-            "validated Mach timebase output became invalid"
-        );
+        // XNU deliberately ignores copyout failure for this trap.
+        let _ = info.write_at_offset::<P>(0, self.global.platform.mach_timebase_info());
         KernReturn::SUCCESS
     }
 

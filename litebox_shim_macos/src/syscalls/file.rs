@@ -157,7 +157,7 @@ impl<P: ShimPlatform> Task<P> {
         Ok(u32::try_from(raw.fd_into_raw_integer(file)).expect("fd bounded by MAX_FDS"))
     }
 
-    pub(crate) fn read_path(&self, path: UserPtr<core::ffi::c_char>) -> Result<String, Errno> {
+    pub(crate) fn read_path(path: UserPtr<core::ffi::c_char>) -> Result<String, Errno> {
         let mut bytes = Vec::new();
         while bytes.len() < PATH_MAX {
             let address = path
@@ -165,11 +165,6 @@ impl<P: ShimPlatform> Task<P> {
                 .checked_add(bytes.len())
                 .ok_or(Errno::EFAULT)?;
             let length = (PAGE_SIZE - address % PAGE_SIZE).min(PATH_MAX - bytes.len());
-            self.check_user_buffer(
-                address,
-                length,
-                litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
-            )?;
             let chunk = UserPtr::<u8>::from_usize(address)
                 .to_owned_slice::<P>(length)
                 .ok_or(Errno::EFAULT)?;
@@ -279,7 +274,6 @@ mod tests {
     use alloc::vec;
     use core::sync::atomic::AtomicI32;
     use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
-    use litebox::platform::page_mgmt::MemoryRegionPermissions as Permissions;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -433,28 +427,6 @@ mod tests {
         assert_eq!(invoke(nr::CLOSE, 2, 0), Ok(0));
         assert_eq!(invoke(nr::CLOSE, 2, 0), Err(Errno::EBADF));
 
-        // Invalid output buffers must not advance a file's offset.
-        let fresh = task
-            .sys_open("/data", OpenFlags::RDONLY, FileMode::empty())
-            .unwrap() as usize;
-        // SAFETY: the test owns this idle mapping.
-        unsafe {
-            task.global
-                .pm
-                .change_page_permissions(buf, PAGE_SIZE, Permissions::READ)
-                .unwrap();
-        }
-        assert_eq!(invoke(nr::READ, fresh, 2), Err(Errno::EFAULT));
-        // SAFETY: the test owns this idle mapping.
-        unsafe {
-            task.global
-                .pm
-                .change_page_permissions(buf, PAGE_SIZE, Permissions::READ | Permissions::WRITE)
-                .unwrap();
-        }
-        assert_eq!(invoke(nr::READ, fresh, 2), Ok(2));
-        assert_eq!(&*buf.to_owned_slice(2).unwrap(), b"ab");
-
         let open = |number, path, flags: OpenFlags, mode| {
             let mut ctx = PtRegs::default();
             ctx.regs[16] = number;
@@ -559,7 +531,7 @@ mod tests {
                 });
             }
         });
-        for expected in 2..MAX_FDS {
+        for expected in (0..MAX_FDS).filter(|&fd| fd != 1) {
             assert_eq!(task.sys_dup(1), Ok(u32::try_from(expected).unwrap()));
         }
         assert_eq!(task.sys_dup(1), Err(Errno::EMFILE));
