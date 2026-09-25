@@ -59,6 +59,8 @@ impl litebox::mm::allocator::MemoryProvider for MockKernel {
 }
 
 impl super::MemoryProvider for MockKernel {
+    type Tlb = crate::host::mock::MockTlb;
+
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
 

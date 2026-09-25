@@ -14,3 +14,4 @@ const _: () = assert!(PAGE_SIZE == 1 << PAGE_SHIFT);
 const _: () = assert!(PAGE_SIZE == PTES_PER_PAGE * core::mem::size_of::<u64>());
 
 pub(crate) mod paging;
+pub mod tlb;

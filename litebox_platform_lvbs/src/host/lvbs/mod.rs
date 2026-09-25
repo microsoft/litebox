@@ -14,6 +14,7 @@ pub mod linux;
 pub mod per_cpu_variables;
 pub mod phys_memory;
 pub mod timer;
+pub mod tlb;
 
 /// Anchor byte that ensures the `.hvcall_page` linker section is emitted.
 #[used]
@@ -62,6 +63,8 @@ mod alloc {
     }
 
     impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
+        type Tlb = super::tlb::LvbsTlb;
+
         const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
         const PRIVATE_PTE_MASK: u64 = 0;
 
@@ -83,6 +86,8 @@ mod alloc {
 
 #[cfg(test)]
 impl crate::mm::MemoryProvider for LvbsLinuxKernel {
+    type Tlb = crate::host::mock::MockTlb;
+
     const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
     const PRIVATE_PTE_MASK: u64 = 0;
 

@@ -9,6 +9,18 @@ pub struct MockHostInterface {}
 
 pub type MockKernel = crate::LinuxKernel<MockHostInterface>;
 
+/// Invalidator for test-only page tables that are never installed in CR3.
+pub struct MockTlb;
+
+// SAFETY: these software-only tables have no hardware translations to invalidate.
+unsafe impl crate::mm::tlb::TlbInvalidation for MockTlb {
+    fn invalidate(
+        _start: x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>,
+        _page_count: usize,
+    ) {
+    }
+}
+
 #[macro_export]
 macro_rules! mock_log_println {
     ($($tt:tt)*) => {{

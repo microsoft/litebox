@@ -6,13 +6,18 @@
 use crate::arch::{PhysAddr, VirtAddr};
 
 pub(crate) mod pgtable;
+pub mod tlb;
 pub(crate) mod vmap;
 
 #[cfg(test)]
 pub mod tests;
 
-/// Memory provider trait for global allocator.
+/// Memory and translation-coherence resources used by the kernel page tables.
 pub trait MemoryProvider {
+    /// Platform-selected synchronous invalidation. No implicit local-only
+    /// default: a backend must account for every CPU that can use its mappings.
+    type Tlb: tlb::TlbInvalidation;
+
     /// Global virtual address offset for one-to-one mapping of physical memory
     /// to kernel virtual memory.
     const GVA_OFFSET: VirtAddr;

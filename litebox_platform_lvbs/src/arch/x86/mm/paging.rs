@@ -26,14 +26,11 @@ use crate::UserMutPtr;
 use crate::mm::{
     MemoryProvider,
     pgtable::{PageTableAllocator, PageTableImpl},
+    tlb::TlbInvalidation,
 };
 
-/// When we flush multiple TLB entries, flushing the entire TLB (e.g., write to CR3)
-/// can be more efficient than flushing individual entries (e.g., `invlpg`).
-/// This threshold is a heuristic from the Linux kernel:
-/// <https://elixir.bootlin.com/linux/v6.18.6/source/arch/x86/mm/tlb.c#L1394>
-#[cfg(not(test))]
-const TLB_SINGLE_PAGE_FLUSH_CEILING: usize = 33;
+#[cfg(test)]
+mod tests;
 
 /// Bit position of the PML4 (level-4) index within a virtual address, for
 /// x86-64 4-level paging: 12 page-offset bits + 9 bits each for P1-P3.
@@ -54,48 +51,6 @@ const PML4_INDEX_MASK: u64 = 0x1FF;
 /// `KERNEL_OFFSET` is `PML4_SLOT_SIZE` aligned, so this is an exact cutoff.
 pub(crate) const KERNEL_PML4_START: usize =
     ((crate::KERNEL_OFFSET >> PML4_SHIFT) & PML4_INDEX_MASK) as usize;
-
-/// Flush TLB entries for a contiguous page range across all cores.
-///
-/// Uses Hyper-V hypercalls so that remote cores sharing the same page table
-/// also see the invalidation.
-#[cfg(not(test))]
-fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
-    use crate::mshv::{hvcall_mm, is_hvcall_ready};
-
-    if count == 0 {
-        return;
-    }
-
-    // If the current VP is the BSP, it might use MM operations **before** the hypercall page is set up.
-    // In that case, we fall back to local TLB flushes. This is safe because no AP enters VTL1 yet.
-    if !is_hvcall_ready() {
-        if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
-            let base = start.start_address().as_u64();
-            for i in 0..count {
-                x86_64::instructions::tlb::flush(VirtAddr::new(base + (i as u64) * Size4KiB::SIZE));
-            }
-        } else {
-            x86_64::instructions::tlb::flush_all();
-        }
-        return;
-    }
-
-    let result = if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
-        hvcall_mm::hv_flush_virtual_address_list(start.start_address().as_u64(), count)
-    } else {
-        hvcall_mm::hv_flush_virtual_address_space()
-    };
-
-    if let Err(e) = result {
-        // Hypercall failed — fall back to local flush so this core is at least coherent.
-        debug_assert!(false, "TLB flush hypercall failed: {e:?}");
-        x86_64::instructions::tlb::flush_all();
-    }
-}
-
-#[cfg(test)]
-fn flush_tlb_range(_start: Page<Size4KiB>, _count: usize) {}
 
 #[inline]
 fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
@@ -187,7 +142,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         flush_tlb: bool,
         clean_up_page_tables: bool,
     ) -> Result<(), page_mgmt::DeallocationError> {
-        // This is based on `TLB_SINGLE_PAGE_FLUSH_CEILING` which is governed by `HvCallFlushVirtualAddressList`.
+        // Bound temporary frame storage while amortizing invalidation calls.
+        // The platform invalidator chooses the mechanism for each batch.
         const UNMAP_BATCH: usize = 32;
         if range.is_empty() {
             return Ok(());
@@ -234,7 +190,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 }
                 let count =
                     ((end.start_address() - start.start_address()) / Size4KiB::SIZE).trunc();
-                flush_tlb_range(start, count);
+                M::Tlb::invalidate(start, count);
             }
             (true, false) => {
                 // Page table is being torn down, so frames can be returned to the allocator immediately.
@@ -257,7 +213,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     }
                     if (i + 1) % UNMAP_BATCH == 0 {
                         if !unmapped_frames.is_empty() {
-                            flush_tlb_range(flush_start, UNMAP_BATCH);
+                            M::Tlb::invalidate(flush_start, UNMAP_BATCH);
                             for frame in unmapped_frames.drain(..) {
                                 unsafe { allocator.deallocate_frame(frame) };
                             }
@@ -272,7 +228,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     let count = ((end.start_address() - flush_start.start_address())
                         / Size4KiB::SIZE)
                         .trunc();
-                    flush_tlb_range(flush_start, count);
+                    M::Tlb::invalidate(flush_start, count);
                     for frame in unmapped_frames.drain(..) {
                         unsafe { allocator.deallocate_frame(frame) };
                     }
@@ -467,7 +423,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         // Flush old (unmapped) addresses — other cores may hold stale entries.
         let page_count = (end.start_address() - flush_start.start_address()) / Size4KiB::SIZE;
-        flush_tlb_range(flush_start, page_count.trunc());
+        M::Tlb::invalidate(flush_start, page_count.trunc());
 
         Ok(UserMutPtr::from_ptr(new_range.start as *mut u8))
     }
@@ -538,7 +494,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         let page_count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
         // Permission change: other cores may hold stale (wider) permissions.
-        flush_tlb_range(start, page_count.trunc());
+        M::Tlb::invalidate(start, page_count.trunc());
 
         Ok(())
     }
@@ -636,7 +592,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             Page::<Size4KiB>::containing_address(M::pa_to_va(frame_range.start.start_address()));
         let count =
             (frame_range.end.start_address() - frame_range.start.start_address()) / Size4KiB::SIZE;
-        flush_tlb_range(start_page, count.trunc());
+        M::Tlb::invalidate(start_page, count.trunc());
 
         Ok(M::pa_to_va(frame_range.start.start_address()).as_mut_ptr())
     }
@@ -722,7 +678,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             }
         }
 
-        flush_tlb_range(start_page, mapped_count);
+        M::Tlb::invalidate(start_page, mapped_count);
 
         Ok(base_va.as_mut_ptr())
     }
@@ -746,7 +702,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let start = pages.start;
         let end = pages.end; // inclusive
         let count = (end.start_address() - start.start_address()) / Size4KiB::SIZE + 1;
-        flush_tlb_range(start, count.trunc());
+        M::Tlb::invalidate(start, count.trunc());
 
         // Safety: all leaf entries in `pages` have been unmapped above while
         // holding `self.inner`, so any P1/P2/P3 frames that became empty can
