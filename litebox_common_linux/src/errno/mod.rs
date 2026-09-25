@@ -125,6 +125,15 @@ impl From<litebox::process::ProcessError> for Errno {
     }
 }
 
+impl From<litebox::process::WaitChildError> for Errno {
+    fn from(value: litebox::process::WaitChildError) -> Self {
+        match value {
+            litebox::process::WaitChildError::NoChild => Errno::ECHILD,
+            litebox::process::WaitChildError::ServiceFailed => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::PathError> for Errno {
     fn from(value: litebox::fs::errors::PathError) -> Self {
         match value {

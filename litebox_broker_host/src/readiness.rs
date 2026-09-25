@@ -132,6 +132,33 @@ impl Drop for PendingReadiness<'_> {
     }
 }
 
+/// One child-state notification claimed for publication.
+///
+/// Dropping it without calling [`confirm`] marks child state pending again, so
+/// a send that fails or unwinds leaves the notification publishable.
+///
+/// [`confirm`]: Self::confirm
+#[derive(Debug)]
+pub(crate) struct PendingChildState<'publisher> {
+    publisher: &'publisher ReadinessPublisher,
+}
+
+impl PendingChildState<'_> {
+    /// Reports that the notification reached the notification channel.
+    pub(crate) fn confirm(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for PendingChildState<'_> {
+    fn drop(&mut self) {
+        let mut state = self.publisher.state.lock();
+        if !state.closed {
+            state.child_state_pending = true;
+        }
+    }
+}
+
 /// Coalescing readiness publication state shared by backend sources and one
 /// notification publisher.
 #[derive(Debug)]
@@ -153,6 +180,8 @@ struct PublisherState {
     /// changes to elapse while one send is in flight, so it is treated as
     /// unreachable.
     next_generation: u64,
+    /// A direct-child state change has not yet been claimed for publication.
+    child_state_pending: bool,
     closed: bool,
 }
 
@@ -189,6 +218,7 @@ impl ReadinessPublisher {
                 entries: HashMap::new(),
                 queue: VecDeque::new(),
                 next_generation: 0,
+                child_state_pending: false,
                 closed: false,
             }),
         }
@@ -297,6 +327,31 @@ impl ReadinessPublisher {
         None
     }
 
+    /// Records that a direct child of the associated process changed state.
+    ///
+    /// Repeated changes collapse into one notification. The caller must wake the
+    /// publisher when the outcome is [`PublishOutcome::Queued`].
+    pub fn publish_child_state(&self) -> PublishOutcome {
+        let mut state = self.state.lock();
+        if state.closed {
+            PublishOutcome::Closed
+        } else if state.child_state_pending {
+            PublishOutcome::Coalesced
+        } else {
+            state.child_state_pending = true;
+            PublishOutcome::Queued
+        }
+    }
+
+    /// Claims the pending child-state notification, if any.
+    #[must_use]
+    pub(crate) fn take_child_state(&self) -> Option<PendingChildState<'_>> {
+        if !core::mem::take(&mut self.state.lock().child_state_pending) {
+            return None;
+        }
+        Some(PendingChildState { publisher: self })
+    }
+
     /// Drops readiness state for an object whose backend resource is retired.
     ///
     /// Notifications already claimed for the object stay valid to send. A
@@ -320,6 +375,7 @@ impl ReadinessPublisher {
     pub fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
+        state.child_state_pending = false;
         state.entries.clear();
         state.queue.clear();
     }
@@ -368,6 +424,11 @@ pub fn publish_readiness<Channel: HostNotificationChannel>(
     mut wait_for_work: impl FnMut(),
 ) -> Result<(), Channel::Error> {
     loop {
+        if let Some(pending) = publisher.take_child_state() {
+            channel.send_notification(&BrokerNotification::ChildStateChanged)?;
+            pending.confirm();
+            continue;
+        }
         if let Some(pending) = publisher.take_pending() {
             channel.send_notification(&BrokerNotification::Readiness(pending.notification()))?;
             pending.confirm();
@@ -676,7 +737,9 @@ mod tests {
     }
 
     fn readiness_of(notification: &BrokerNotification) -> ReadinessNotification {
-        let BrokerNotification::Readiness(readiness) = notification;
+        let BrokerNotification::Readiness(readiness) = notification else {
+            panic!("expected a readiness notification, got {notification:?}");
+        };
         *readiness
     }
 
@@ -888,5 +951,43 @@ mod tests {
                 readiness: ReadinessFlags::READ,
             }]
         );
+    }
+
+    #[test]
+    fn child_state_changes_coalesce_until_claimed_and_requeue_when_abandoned() {
+        let publisher = ReadinessPublisher::new();
+        assert!(publisher.take_child_state().is_none());
+        assert_eq!(publisher.publish_child_state(), PublishOutcome::Queued);
+        assert_eq!(publisher.publish_child_state(), PublishOutcome::Coalesced);
+
+        drop(publisher.take_child_state().unwrap());
+        assert_eq!(publisher.publish_child_state(), PublishOutcome::Coalesced);
+
+        let claim = publisher.take_child_state().unwrap();
+        assert_eq!(publisher.publish_child_state(), PublishOutcome::Queued);
+        claim.confirm();
+        publisher.take_child_state().unwrap().confirm();
+        assert!(publisher.take_child_state().is_none());
+
+        publisher.publish_child_state();
+        let claim = publisher.take_child_state().unwrap();
+        publisher.close();
+        drop(claim);
+        assert!(publisher.take_child_state().is_none());
+        assert_eq!(publisher.publish_child_state(), PublishOutcome::Closed);
+    }
+
+    #[test]
+    fn a_failed_child_state_send_leaves_the_notification_pending() {
+        let publisher = ReadinessPublisher::new();
+        publisher.publish_child_state();
+
+        assert_eq!(
+            publish_readiness(&publisher, &mut FailingChannel, || {
+                unreachable!("a failed send must not park the publisher")
+            }),
+            Err("notification channel failed")
+        );
+        assert_eq!(publisher.publish_child_state(), PublishOutcome::Coalesced);
     }
 }

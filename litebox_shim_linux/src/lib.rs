@@ -1119,6 +1119,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::GetRandom { buf, count, flags } => {
                 self.sys_getrandom(buf, count, flags)
             }
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),

@@ -234,6 +234,11 @@ fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
     let reported_child = numeric_field(parent_line, "child=");
     assert_eq!(parent_after, parent_before);
     assert_ne!(reported_child, parent_before);
+    assert_eq!(numeric_field(parent_line, "waited="), reported_child);
+    assert_eq!(numeric_field(parent_line, "exited="), 1);
+    assert_eq!(numeric_field(parent_line, "code="), 42);
+    assert_eq!(numeric_field(parent_line, "again="), -1);
+    assert_eq!(numeric_field(parent_line, "echild="), 1);
     assert_eq!(numeric_field(child_line, "pid="), reported_child);
     assert_eq!(numeric_field(child_line, "ppid="), parent_before);
     assert_eq!(numeric_field(child_line, "tid="), reported_child);

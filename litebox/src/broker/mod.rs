@@ -18,7 +18,9 @@ use litebox_broker_protocol::fs::{
     FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
-use litebox_broker_protocol::process::{MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity};
+use litebox_broker_protocol::process::{
+    ChildExit, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity, WaitChildTarget,
+};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
@@ -59,6 +61,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         child_process_id: Option<litebox_broker_protocol::ProcessId>,
         payload: &[u8],
     ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+
+    fn wait_child(
+        &self,
+        target: WaitChildTarget,
+    ) -> core::result::Result<ChildExit, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -298,13 +305,27 @@ pub(crate) trait BrokerControl: Send + Sync {
 
 pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
     pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
+    child_state: Pollee<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
             pollables: Mutex::new(HashMap::new()),
+            child_state: Pollee::new(),
         }
+    }
+
+    /// Pollee woken whenever a direct child process may have changed state.
+    pub(crate) fn child_state(&self) -> &Pollee<Platform> {
+        &self.child_state
+    }
+
+    pub(crate) fn notify_child_state(&self)
+    where
+        Platform: TimeProvider,
+    {
+        self.child_state.notify_observers(Events::IN);
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
@@ -359,6 +380,7 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         for pollee in pollables {
             pollee.notify_observers(events);
         }
+        self.child_state.notify_observers(events);
     }
 }
 
@@ -466,6 +488,13 @@ where
         self.request(|local| {
             local.start_child_process(child_process_id, shared_buffer_lease.sequence(), payload)
         })
+    }
+
+    fn wait_child(
+        &self,
+        target: WaitChildTarget,
+    ) -> core::result::Result<ChildExit, BrokerControlError> {
+        self.request(|local| local.wait_child(target))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

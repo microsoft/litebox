@@ -3115,6 +3115,8 @@ impl ReadinessSink for BlockingReadinessSink {
     fn retire(&self, _handle: ObjectHandle) {
         self.retired.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn child_state_changed(&self) {}
 }
 
 fn check_quota_waits_for_deferred_retirement(broker: &BrokerCore, provider: &TestSocketProvider) {

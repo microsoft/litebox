@@ -13,14 +13,17 @@ use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use litebox::event::polling::TryOpError;
 use litebox::event::wait::WaitError;
 use litebox::mm::linux::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
+use litebox_broker_protocol::ProcessId;
+use litebox_broker_protocol::process::{ProcessExitStatus, WaitChildTarget};
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
+    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno, program_startup::LinuxProgramStartup,
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
@@ -1432,6 +1435,65 @@ impl<Platform: ShimPlatform> Task<Platform> {
             WaitError::Interrupted => Err(Errno::EINTR),
             WaitError::TimedOut => unreachable!("pause sleep has no deadline"),
         }
+    }
+
+    /// Handle syscall `wait4`.
+    ///
+    /// Only terminated children are reported. Process groups are not modeled, so `pid == 0`
+    /// waits for any child and `pid < -1` matches no child. Resource usage is reported as zero.
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: u32,
+        rusage: Option<UserPtrMut<Rusage>>,
+    ) -> Result<usize, Errno> {
+        const WNOHANG: u32 = 0x1;
+        const WUNTRACED: u32 = 0x2;
+        const WCONTINUED: u32 = 0x8;
+        const WNOTHREAD: u32 = 0x2000_0000;
+        const WALL: u32 = 0x4000_0000;
+        const WCLONE: u32 = 0x8000_0000;
+
+        if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target = match pid {
+            -1 | 0 => WaitChildTarget::Any,
+            1.. => WaitChildTarget::Process(ProcessId(pid.cast_unsigned())),
+            _ => return Err(Errno::ECHILD),
+        };
+        // Every child is created with the default exit signal, so only __WALL selects it
+        // together with __WCLONE.
+        if options & WCLONE != 0 && options & WALL == 0 {
+            return Err(Errno::ECHILD);
+        }
+        let exit =
+            match self
+                .global
+                .litebox
+                .wait_child(&self.wait_cx(), target, options & WNOHANG != 0)
+            {
+                Ok(exit) => exit,
+                Err(TryOpError::TryAgain) => return Ok(0),
+                Err(error) => return Err(error.into()),
+            };
+        let status = match exit.status {
+            ProcessExitStatus::Exited { code } => ((code & 0xff) << 8).cast_signed(),
+            ProcessExitStatus::Signaled { signal } => (signal & 0x7f).cast_signed(),
+            _ => litebox_common_linux::signal::Signal::SIGKILL.as_i32(),
+        };
+        if let Some(wstatus) = wstatus {
+            wstatus
+                .write_at_offset::<Platform>(0, status)
+                .ok_or(Errno::EFAULT)?;
+        }
+        if let Some(rusage) = rusage {
+            rusage
+                .write_at_offset::<Platform>(0, Rusage::default())
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(exit.process_id.0 as usize)
     }
 
     /// Handle syscall `getpid`.
