@@ -37,7 +37,6 @@ use litebox_platform_lvbs::{
             get_text_start_address,
         },
     },
-    serial_println,
 };
 use litebox_shim_optee::msg_handler::{
     decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
@@ -1444,7 +1443,9 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_println!("{}", info);
+    // Boot may fail before shared-console installation (or final relocation).
+    // Use the concrete early-output path, preserving serial + optional ringbuffer.
+    litebox_platform_lvbs::host::lvbs::console::print(format_args!("{info}\n"));
     match raise_vtl0_gp_fault() {
         Ok(result) => vtl_switch(Some(result.reinterpret_as_signed())),
         Err(err) => vtl_switch(Some((err as u32).reinterpret_as_signed().neg().into())),

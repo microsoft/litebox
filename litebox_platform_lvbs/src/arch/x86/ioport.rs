@@ -1,19 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! I/O Port-based serial communication
+//! I/O port UART mechanics. Callers choose the port, lifetime, locking and routing.
 
-use crate::mshv::ringbuffer::ringbuffer;
 use core::{arch::asm, fmt};
-use spin::{Mutex, Once};
-
-// devbox uses COM PORT 2
-#[cfg(feature = "devbox")]
-const DEST_COM_PORT: u16 = 0x2F8;
-
-// all other configurations use COM PORT 1
-#[cfg(not(feature = "devbox"))]
-const DEST_COM_PORT: u16 = 0x3F8;
 
 const INTERRUPT_ENABLE_OFFSET: u16 = 1;
 const OUT_FIFO_CONTROL_OFFSET: u16 = 2;
@@ -138,53 +128,9 @@ impl ComPort {
     }
 }
 
-fn com() -> &'static Mutex<ComPort> {
-    static COM_ONCE: Once<Mutex<ComPort>> = Once::new();
-    COM_ONCE.call_once(|| {
-        let mut com_port = ComPort::new(DEST_COM_PORT);
-        com_port.init();
-        Mutex::new(com_port)
-    })
-}
-
 impl fmt::Write for ComPort {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.write_string(s);
         Ok(())
     }
-}
-
-#[doc(hidden)]
-pub fn print(args: ::core::fmt::Arguments) {
-    use core::fmt::Write;
-    let _ = com().lock().write_fmt(args);
-    if let Some(rb) = ringbuffer() {
-        let _ = rb.lock().write_fmt(args);
-    }
-}
-
-#[macro_export]
-macro_rules! serial_print {
-    ($($arg:tt)*) => ($crate::arch::ioport::print(format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! serial_println {
-    () => ($crate::serial_print!("\n"));
-    ($($arg:tt)*) => ($crate::serial_print!("{}\n", format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! debug_serial_print {
-    ($($arg:tt)*) => (#[cfg(debug_assertions)] $crate::arch::ioport::print(format_args!($($arg)*)));
-}
-
-#[macro_export]
-macro_rules! debug_serial_println {
-    () => (#[cfg(debug_assertions)] $crate::serial_print!("\n"));
-    ($($arg:tt)*) => (#[cfg(debug_assertions)] $crate::serial_print!("{}\n", format_args!($($arg)*)));
-}
-
-pub fn serial_print_string(s: &str) {
-    com().lock().write_string(s);
 }

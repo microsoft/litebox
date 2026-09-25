@@ -11,6 +11,7 @@
 pub mod boot;
 pub mod bootparam;
 pub mod clock;
+pub mod console;
 pub mod interrupts;
 pub mod linux;
 pub mod per_cpu_variables;
@@ -33,7 +34,7 @@ pub fn hv_hypercall_page_address() -> u64 {
     crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address()
 }
 
-use crate::{Errno, HostInterface, arch::ioport::serial_print_string};
+use crate::{Errno, HostInterface};
 use digest::Digest;
 use litebox_common_lvbs::PRK_LEN;
 use rand_core::{RngCore, SeedableRng};
@@ -286,7 +287,7 @@ impl HostInterface for HostLvbsInterface {
     }
 
     fn log(msg: &str) {
-        serial_print_string(msg);
+        console::write_serial(msg);
     }
 
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {

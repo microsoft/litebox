@@ -32,6 +32,7 @@ use zerocopy::{FromBytes, IntoBytes};
 extern crate alloc;
 
 pub mod arch;
+pub mod console;
 pub mod execution;
 pub mod host;
 pub mod mm;

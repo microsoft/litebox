@@ -32,7 +32,7 @@ impl log::Log for HostLogger {
     fn log(&self, record: &log::Record) {
         let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         let _ = litebox_util_log::format_record(&mut buf, record);
-        litebox_platform_lvbs::arch::ioport::serial_print_string(&buf);
+        litebox_platform_lvbs::host::lvbs::console::write_serial(&buf);
     }
 
     fn flush(&self) {}
@@ -393,6 +393,10 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
     enable_extended_states();
 
     if is_bsp {
+        // Relocation is now final. Publish the diagnostic writer before heap
+        // seeding emits messages; APs inherit the same VM-wide selection.
+        litebox_platform_lvbs::console::install(litebox_platform_lvbs::host::lvbs::console::print)
+            .expect("the BSP must install the console exactly once");
         litebox_runner_lvbs::seed_initial_heap();
     }
 
