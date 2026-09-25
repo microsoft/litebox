@@ -5,7 +5,7 @@
 
 use super::{PrivilegedVmap, PrivilegedVtl0PhysMutPtr};
 use core::fmt;
-use litebox::mm::linux::PAGE_SIZE;
+use litebox::mm::vmem::PAGE_SIZE;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmap::PhysPageAddr;
 use spin::{Mutex, Once};

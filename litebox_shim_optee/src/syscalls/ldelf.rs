@@ -3,7 +3,7 @@
 
 use crate::syscalls::Cleanup;
 use crate::{Task, UserMutPtr};
-use litebox::mm::linux::PAGE_SIZE;
+use litebox::mm::vmem::PAGE_SIZE;
 use litebox::platform::page_mgmt::PageManagementProvider;
 use litebox::platform::{RawConstPointer, RawMutPointer};
 use litebox_common_linux::{MapFlags, ProtFlags};

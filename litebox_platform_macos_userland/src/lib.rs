@@ -652,18 +652,18 @@ impl<const PAGE_SIZE: usize> litebox::platform::SignalProvider
         }
     }
 }
-impl<const PAGE_SIZE: usize> litebox::mm::linux::VmemPageFaultHandler
+impl<const PAGE_SIZE: usize> litebox::mm::vmem::VmemPageFaultHandler
     for MacosUserlandWithPageSize<PAGE_SIZE>
 {
     unsafe fn handle_page_fault(
         &self,
         _: usize,
-        _: litebox::mm::linux::VmFlags,
+        _: litebox::mm::vmem::VmFlags,
         _: u64,
-    ) -> Result<(), litebox::mm::linux::PageFaultError> {
+    ) -> Result<(), litebox::mm::vmem::PageFaultError> {
         unreachable!("XNU handles page faults for macOS userland")
     }
-    fn access_error(_: u64, _: litebox::mm::linux::VmFlags) -> bool {
+    fn access_error(_: u64, _: litebox::mm::vmem::VmFlags) -> bool {
         unreachable!("XNU handles page faults for macOS userland")
     }
 }

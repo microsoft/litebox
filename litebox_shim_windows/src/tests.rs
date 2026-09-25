@@ -103,7 +103,7 @@ pub(crate) fn run_with_test_platform_pointers<R>(f: impl FnOnce() -> R) -> R {
 fn map_csr_server_shared_memory(
     page_manager: &crate::WindowsPageManager<TestPlatform>,
 ) -> Option<usize> {
-    let length = litebox::mm::linux::NonZeroPageSize::new(
+    let length = litebox::mm::vmem::NonZeroPageSize::new(
         crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE,
     )?;
     // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
@@ -111,7 +111,7 @@ fn map_csr_server_shared_memory(
         page_manager.create_writable_pages(
             None,
             length,
-            litebox::mm::linux::CreatePagesFlags::empty(),
+            litebox::mm::vmem::CreatePagesFlags::empty(),
             |_| Ok(0),
         )
     }

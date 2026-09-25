@@ -291,7 +291,7 @@ mod tests {
     use crate::{MAX_KERNEL_BUF_SIZE, MacosShimBuilder, Process};
     use alloc::vec;
     use core::sync::atomic::AtomicI32;
-    use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
+    use litebox::mm::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };

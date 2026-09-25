@@ -14,7 +14,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
-use litebox::mm::linux::VmFlags;
+use litebox::mm::vmem::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
 use litebox::sync::{Mutex, RwLock};
@@ -2297,7 +2297,7 @@ mod tests {
             );
 
              // `process_signals` is called when about to switch back to userspace, so simulate that here.
-            let mut stack = [0u8; 2 * litebox::mm::linux::PAGE_SIZE];
+            let mut stack = [0u8; 2 * litebox::mm::vmem::PAGE_SIZE];
              #[cfg(target_arch = "x86_64")]
              let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
              #[cfg(target_arch = "aarch64")]

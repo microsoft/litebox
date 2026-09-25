@@ -4,7 +4,7 @@
 extern crate std;
 
 use super::*;
-use litebox::mm::linux::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
+use litebox::mm::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
 use litebox::platform::{RawConstPointer as _, page_mgmt::MemoryRegionPermissions as Permissions};
 use litebox_platform_macos_userland::MacosUserland as Platform;
 

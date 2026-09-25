@@ -395,7 +395,7 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
         // are executing or borrowed. Vmem's platform reservations have empty
         // flags; our anonymous mappings have VM_MAY_ACCESS_FLAGS, even guards.
         for (range, flags) in self.pm.mappings() {
-            if !flags.intersects(litebox::mm::linux::VmFlags::VM_MAY_ACCESS_FLAGS) {
+            if !flags.intersects(litebox::mm::vmem::VmFlags::VM_MAY_ACCESS_FLAGS) {
                 continue;
             }
             let ptr = litebox_common_macos::user_pointers::UserPtrMut::from_usize(range.start)

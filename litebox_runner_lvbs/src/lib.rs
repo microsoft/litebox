@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::{boxed::Box, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
-    mm::linux::PAGE_SIZE,
+    mm::vmem::PAGE_SIZE,
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };

@@ -7,7 +7,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::{
-    mm::linux::{MappingError, PAGE_SIZE},
+    mm::vmem::{MappingError, PAGE_SIZE},
     platform::page_mgmt::MemoryRegionPermissions,
 };
 use litebox_common_linux::{
@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use core::ops::Range;
 #[cfg(target_arch = "aarch64")]
-use litebox::mm::linux::VmFlags;
+use litebox::mm::vmem::VmFlags;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
@@ -1691,7 +1691,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox::platform::PageManagementProvider;
     use litebox::{
-        mm::linux::{NonZeroAddress, NonZeroPageSize},
+        mm::vmem::{NonZeroAddress, NonZeroPageSize},
         platform::page_mgmt::MemoryRegionPermissions,
     };
     use litebox_broker_protocol::fs::FileMode as Mode;

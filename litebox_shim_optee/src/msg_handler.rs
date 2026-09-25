@@ -20,7 +20,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use hashbrown::{HashMap, HashSet};
 use litebox::{
-    mm::linux::PAGE_SIZE,
+    mm::vmem::PAGE_SIZE,
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt,
 };

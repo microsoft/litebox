@@ -11,7 +11,7 @@ use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
 use core::ops::Range;
 use litebox::{
     fs::errors::ReadError,
-    mm::linux::{
+    mm::vmem::{
         CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
     },
     platform::{
@@ -1361,7 +1361,7 @@ mod tests {
     use super::*;
     use alloc::{sync::Arc, vec::Vec};
     use core::sync::atomic::AtomicI32;
-    use litebox::{LiteBox, mm::linux::VmFlags};
+    use litebox::{LiteBox, mm::vmem::VmFlags};
     use litebox_broker_core::{
         ObjectRights, PolicyEngine,
         fs::{

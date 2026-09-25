@@ -459,7 +459,7 @@ const WINDOWS_USER_SHARED_DATA_BASE: usize = 0x7FFE_0000;
 fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Option<usize> {
-    use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize};
+    use litebox::mm::vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize};
     use zerocopy::IntoBytes as _;
     let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)?;
     let length =

@@ -5,7 +5,7 @@
 
 pub mod allocator;
 pub mod exception_table;
-pub mod linux;
+pub mod vmem;
 
 #[cfg(test)]
 mod tests;
@@ -13,14 +13,14 @@ mod tests;
 use core::ops::Range;
 
 use alloc::vec::Vec;
-use linux::{
+use vmem::{
     CreatePagesFlags, MappingError, PageFaultError, PageRange, VmArea, VmFlags, Vmem,
     VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
 };
 
 use crate::{
     LiteBox,
-    mm::linux::{NonZeroAddress, NonZeroPageSize, VmemResetError},
+    mm::vmem::{NonZeroAddress, NonZeroPageSize, VmemResetError},
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{MemoryRegionPermissions, RemapError},
@@ -42,7 +42,7 @@ where
 {
     /// Create a new `PageManager` instance.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
-        let vmem = RwLock::new(linux::Vmem::new(litebox.x.platform));
+        let vmem = RwLock::new(vmem::Vmem::new(litebox.x.platform));
         Self { vmem }
     }
 
@@ -356,8 +356,8 @@ where
             return Ok(vmem.brk);
         }
 
-        let old_brk = vmem.brk.next_multiple_of(linux::PAGE_SIZE);
-        let new_brk = brk.next_multiple_of(linux::PAGE_SIZE);
+        let old_brk = vmem.brk.next_multiple_of(vmem::PAGE_SIZE);
+        let new_brk = brk.next_multiple_of(vmem::PAGE_SIZE);
         if vmem.brk >= brk {
             // Shrink the memory region
             let brk = match unsafe {
@@ -453,11 +453,11 @@ where
         match unsafe {
             vmem.resize_mapping(
                 old_range,
-                linux::NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
+                NonZeroPageSize::new(new_size).ok_or(RemapError::Unaligned)?,
             )
         } {
             Ok(()) => Ok(old_addr),
-            Err(linux::VmemResizeError::RangeOccupied(_)) => {
+            Err(vmem::VmemResizeError::RangeOccupied(_)) => {
                 // trying to remap a subset of an existing mapping
                 if !may_move {
                     return Err(RemapError::OutOfMemory);
@@ -470,15 +470,15 @@ where
                     )
                 } {
                     Ok(new_addr) => Ok(new_addr),
-                    Err(linux::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
-                    Err(linux::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
-                    Err(linux::VmemMoveError::RemapError(err)) => Err(err),
+                    Err(vmem::VmemMoveError::OutOfMemory) => Err(RemapError::OutOfMemory),
+                    Err(vmem::VmemMoveError::UnAligned) => Err(RemapError::Unaligned),
+                    Err(vmem::VmemMoveError::RemapError(err)) => Err(err),
                 }
             }
-            Err(linux::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
-            Err(linux::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
-            Err(linux::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
-            Err(linux::VmemResizeError::PermissionDenied) => Err(RemapError::PermissionDenied),
+            Err(vmem::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
+            Err(vmem::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
+            Err(vmem::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
+            Err(vmem::VmemResizeError::PermissionDenied) => Err(RemapError::PermissionDenied),
         }
     }
 
