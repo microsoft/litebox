@@ -16,7 +16,7 @@
 //! - **MCE (Vector 18)**: Machine Check Exceptions are delivered to VTL0 and handled
 //!   by the VTL0 kernel. VTL1 does not receive MCEs.
 
-use super::timer::{SPURIOUS_VECTOR, STIMER_VECTOR};
+use crate::host::lvbs::timer::{self, SPURIOUS_VECTOR, STIMER_VECTOR};
 use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
 use core::ops::IndexMut;
 use litebox_common_linux::PtRegs;
@@ -212,10 +212,10 @@ extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
 /// that prologue's quantum.
 #[unsafe(no_mangle)]
 extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
-    use crate::host::per_cpu_variables::with_per_cpu_variables;
-    super::timer::eoi();
+    use crate::per_cpu_variables::with_per_cpu_variables;
+    timer::eoi();
     if with_per_cpu_variables(|pcv| pcv.preemption_armed.get()) {
-        super::timer::rearm_preemption();
+        timer::rearm_preemption();
     }
 }
 

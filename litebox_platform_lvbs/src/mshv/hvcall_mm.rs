@@ -4,18 +4,19 @@
 //! Hyper-V Hypercall functions for memory management
 
 #[cfg(not(test))]
-use crate::mshv::{
+use super::{
     HV_FLUSH_ALL_VIRTUAL_ADDRESS_SPACES, HV_FLUSH_EX_ALL_BANKS_VALID,
     HV_FLUSH_EX_VP_SET_QWORD_COUNT, HV_GENERIC_SET_SPARSE_4K, HVCALL_FLUSH_VIRTUAL_ADDRESS_LIST_EX,
     HVCALL_FLUSH_VIRTUAL_ADDRESS_SPACE_EX, HvInputFlushVirtualAddressListEx,
     HvInputFlushVirtualAddressSpaceEx,
     vtl_switch::{is_only_vp_in_vtl1, vtl1_vp_mask},
 };
+use crate::arch::mm::PAGE_SHIFT;
 use crate::{
-    host::per_cpu_variables::with_per_cpu_variables,
+    host::lvbs::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask,
-        HvInputVtl, HvPageProtFlags, hvcall::hv_do_rep_hypercall, vtl1_mem_layout::PAGE_SHIFT,
+        HvInputVtl, HvPageProtFlags, hvcall::hv_do_rep_hypercall,
     },
 };
 use litebox::utils::TruncateExt;

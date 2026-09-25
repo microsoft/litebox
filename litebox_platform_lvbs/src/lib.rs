@@ -6,7 +6,8 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables};
+use crate::host::lvbs::timer;
+use crate::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
@@ -14,7 +15,6 @@ use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
     ImmediatelyWokenUp, PageManagementProvider, RawMutex as _, RawMutexProvider,
     RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
-    page_mgmt::DeallocationError,
 };
 use litebox::{
     mm::vmem::{PAGE_SIZE, PageRange},
@@ -23,19 +23,11 @@ use litebox::{
     utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
-use litebox_common_linux::vmap::{
-    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
-};
 use x86_64::{
     VirtAddr,
-    structures::paging::{
-        PageOffset, PageSize, PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange,
-        mapper::MapToError,
-    },
+    structures::paging::{PageTableFlags, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::{FromBytes, IntoBytes};
-
-use crate::mm::vmap::vmap_allocator;
 
 extern crate alloc;
 
@@ -43,36 +35,9 @@ pub mod arch;
 pub mod host;
 pub mod mm;
 pub mod mshv;
+pub mod per_cpu_variables;
 
 pub mod syscall_entry;
-
-/// Mapping metadata. Ordinary writable mappings retain an opaque protected-frame access guard for
-/// the mapping's lifetime.
-pub struct LvbsPhysPageMapInfo {
-    base: *mut u8,
-    size: usize,
-    protected_frame_access: Option<crate::mshv::vsm::ProtectedFrameAccessGuard<'static>>,
-}
-
-impl LvbsPhysPageMapInfo {
-    fn new(base: *mut u8, size: usize) -> Self {
-        Self {
-            base,
-            size,
-            protected_frame_access: None,
-        }
-    }
-}
-
-impl PhysPageMapInfo for LvbsPhysPageMapInfo {
-    fn base(&self) -> *mut u8 {
-        self.base
-    }
-
-    fn size(&self) -> usize {
-        self.size
-    }
-}
 
 /// Special page table ID for the base (kernel-only) page table.
 /// No real physical frame has address 0, so this is a safe sentinel.
@@ -426,10 +391,8 @@ impl PageTableManager {
 /// This is the platform for running LiteBox in kernel mode.
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
-    host_and_task: core::marker::PhantomData<Host>,
+    host: Host,
     page_table_manager: PageTableManager,
-    vtl1_phys_frame_range: PhysFrameRange<Size4KiB>,
-    end_of_boot: core::sync::atomic::AtomicBool,
 }
 
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
@@ -496,6 +459,23 @@ impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
+unsafe impl<Host: HostInterface> litebox::platform::ThreadLocalStorageProvider
+    for LinuxKernel<Host>
+{
+    fn get_thread_local_storage() -> *mut () {
+        let tls = with_per_cpu_variables(|pcv| pcv.tls.get());
+        tls.as_mut_ptr::<()>()
+    }
+
+    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
+        with_per_cpu_variables(|pcv| {
+            let old = pcv.tls.get();
+            pcv.tls.set(x86_64::VirtAddr::new(value as u64));
+            old.as_u64() as *mut ()
+        })
+    }
+}
+
 impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     fn set_arch_specific_register(
         &self,
@@ -535,102 +515,30 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
 }
 
 impl<Host: HostInterface> LinuxKernel<Host> {
-    /// Initializes the VTL1 kernel platform, building the base page table
-    /// with Data Execution Prevention (DEP).
+    /// Construct and load the kernel address space from explicit boot inputs.
+    /// Only `exec_ranges` are executable; all other mapped pages are NX.
+    /// The caller owns boot-resource reclamation after this returns.
     ///
-    /// A *new* top-level (PML4) page table is allocated from the heap, populated
-    /// with a high-canonical mapping (`VA = PA + KERNEL_OFFSET`) covering the
-    /// entire kernel physical range, and loaded via CR3. Pages inside the kernel
-    /// text section (`text_phys_start..text_phys_end`) and the Hyper-V hypercall
-    /// code page are mapped executable; every other page is marked `NO_EXECUTE`.
-    ///
-    /// # Prerequisites
-    ///
-    /// The caller must ensure the following conditions are met before
-    /// invoking this function:
-    ///
-    /// 1. **High-canonical address space**: The CPU must be executing at
-    ///    high-canonical virtual addresses (`VA >= KERNEL_OFFSET`). All code
-    ///    and stack references must use relocated high-canonical pointers.
-    ///
-    /// 2. **ELF relocations fully applied**: All `R_X86_64_RELATIVE`
-    ///    relocations must have been processed for the final (high-canonical)
-    ///    link address. Linker-emitted symbols (e.g., `_text_start`,
-    ///    `_text_end`, `_hvcall_page_start`) must resolve to correct
-    ///    high-canonical addresses.
-    ///
-    /// 3. **Global allocator seeded**: The heap must contain enough free
-    ///    memory to allocate the Phase 2 page table frames (e.g., ~256 KiB for
-    ///    128 MiB of physical memory).
-    ///
-    /// 4. **Early page table active**: CR3 must reference an early page
-    ///    table that identity-maps (or otherwise maps) at least the kernel
-    ///    code and stack at high-canonical addresses. This function
-    ///    replaces it with the new base page table; it must only be
-    ///    called once.
-    ///
-    /// # Post-conditions
-    ///
-    /// After this function returns:
-    ///
-    /// - CR3 points to the new base page table covering the **full** kernel
-    ///   physical range with DEP enforcement.
-    /// - The previous trampoline page table frames (early page table pages and
-    ///   any Phase 1 scratch pages) are no longer referenced and may be
-    ///   reclaimed by the caller.
-    /// - Memory beyond the initial pre-populated region is now mapped and
-    ///   can be added to the global allocator.
-    ///
-    /// # Arguments
-    ///
-    /// * `phys_start` / `phys_end`: Page-aligned physical address range of
-    ///   the entire VTL1 memory.
-    /// * `text_phys_start` / `text_phys_end`: Page-aligned physical address
-    ///   range of the kernel `.text` section (converted to PA after
-    ///   relocation).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the heap is not seeded, if any address argument is invalid
-    /// or misaligned, or if the text section falls outside the VTL1 range.
-    pub fn new(
-        phys_start: x86_64::PhysAddr,
-        phys_end: x86_64::PhysAddr,
-        text_phys_start: x86_64::PhysAddr,
-        text_phys_end: x86_64::PhysAddr,
+    /// # Safety
+    /// Call once, with a seeded allocator and completed relocation. `memory`
+    /// must cover all live code, data, stacks and allocator memory at
+    /// `PA + KERNEL_OFFSET`. `exec_ranges` must include every required code
+    /// page. The active boot mappings must permit constructing the new tables.
+    pub(crate) unsafe fn from_memory(
+        host: Host,
+        memory: PhysFrameRange<Size4KiB>,
+        exec_ranges: &[core::ops::Range<x86_64::PhysAddr>],
     ) -> &'static Self {
-        let physframe_start = PhysFrame::containing_address(phys_start);
-        let physframe_end = PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE));
-        let vtl1_range = PhysFrame::range(physframe_start, physframe_end);
-
-        // Create the base page table with DEP enforcement.
-        //
-        // Build the list of physical address ranges that must remain executable:
-        //   1. The kernel .text section
-        //   2. The Hyper-V hypercall code page (defined in the linker script;
-        //      the hypervisor writes executable code into it at runtime)
-        #[allow(unused_mut)]
-        let mut exec_ranges = alloc::vec![text_phys_start..text_phys_end];
-        #[cfg(not(test))]
-        {
-            use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
-            // get_hvcall_page_start_address() now returns a virtual address (two-phase relocation).
-            let hvcall_phys = <crate::host::LvbsLinuxKernel as crate::mm::MemoryProvider>::va_to_pa(
-                x86_64::VirtAddr::new(get_hvcall_page_start_address()),
-            );
-            exec_ranges.push(hvcall_phys..hvcall_phys + PAGE_SIZE as u64);
-        }
-
         let base_pt = unsafe { mm::PageTable::new_top_level() };
         if base_pt
             .map_phys_frame_range(
-                vtl1_range,
+                memory,
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-                Some(&exec_ranges),
+                Some(exec_ranges),
             )
             .is_err()
         {
-            panic!("Failed to map VTL1 physical memory to base page table with DEP");
+            panic!("Failed to map kernel physical memory to base page table with DEP");
         }
 
         // Enable the NX (No-eXecute) bit in IA32_EFER before loading the new
@@ -640,74 +548,16 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         crate::arch::enable_dep();
 
         // Switch to the new base page table.
-        // Safety: the new page table maps the entire VTL1 memory range at
-        // high-canonical addresses, including the code and stack currently
-        // in use. The Phase 1 trampoline page table (VTL0's PML4) is no
-        // longer needed.
+        // Safety: the caller guarantees that the new mappings cover all
+        // live kernel state, including the executing code and current stack.
         base_pt.load();
 
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
-            host_and_task: core::marker::PhantomData,
+            host,
             page_table_manager: PageTableManager::new(base_pt),
-            vtl1_phys_frame_range: vtl1_range,
-            end_of_boot: core::sync::atomic::AtomicBool::new(false),
         }))
-    }
-
-    /// Whether VTL1's window of trusting VTL0 has closed.
-    pub(crate) fn end_of_boot_reached(&self) -> bool {
-        self.end_of_boot.load(core::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Close VTL1's window of trusting VTL0. One-way.
-    pub(crate) fn signal_end_of_boot(&self) {
-        self.end_of_boot
-            .store(true, core::sync::atomic::Ordering::SeqCst);
-    }
-
-    /// Returns the physical frame range belonging to VTL1.
-    pub fn vtl1_phys_frame_range(&self) -> PhysFrameRange<Size4KiB> {
-        self.vtl1_phys_frame_range
-    }
-
-    /// This function unmaps VTL0 pages from the page table.
-    ///
-    /// Allocator does not allocate memory frames for VTL0 pages, so frame deallocation is not needed.
-    ///
-    /// Note: VTL0 physical memory is external memory not owned by LiteBox, similar to DMA/shared
-    /// physical memory. Physical pointer APIs access it by creating a temporary mapping, copying
-    /// data to/from a LiteBox-owned buffer with fallible raw-pointer copies, and unmapping
-    /// immediately. These APIs do not create Rust references to the mapped VTL0 memory.
-    fn unmap_vtl0_pages(
-        &self,
-        page_addr: *const u8,
-        length: usize,
-    ) -> Result<(), DeallocationError> {
-        let page_addr = x86_64::VirtAddr::new(page_addr as u64);
-        if page_addr.page_offset() != PageOffset::new(0) {
-            return Err(DeallocationError::Unaligned);
-        }
-        let end = x86_64::VirtAddr::try_new(
-            page_addr
-                .as_u64()
-                .checked_add(length as u64)
-                .ok_or(DeallocationError::Unaligned)?,
-        )
-        .map_err(|_| DeallocationError::Unaligned)?;
-        unsafe {
-            self.page_table_manager.current_page_table().unmap_pages(
-                PageRange::<PAGE_SIZE>::new(
-                    page_addr.as_u64().trunc(),
-                    end.align_up(Size4KiB::SIZE).as_u64().trunc(),
-                )
-                .ok_or(DeallocationError::Unaligned)?,
-                false,
-                true,
-                false,
-            )
-        }
     }
 
     /// Create a new task page table for VTL1 user space and returns its ID.
@@ -894,20 +744,20 @@ impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let ticks = self.0.checked_sub(earlier.0)?;
         // Each reference-counter tick is `REF_COUNTER_TICK_NANOS` (100) ns.
-        let nanos = ticks.checked_mul(crate::arch::timer::REF_COUNTER_TICK_NANOS)?;
+        let nanos = ticks.checked_mul(timer::REF_COUNTER_TICK_NANOS)?;
         Some(core::time::Duration::from_nanos(nanos))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
         let nanos: u64 = duration.as_nanos().try_into().ok()?;
-        let ticks = nanos / crate::arch::timer::REF_COUNTER_TICK_NANOS;
+        let ticks = nanos / timer::REF_COUNTER_TICK_NANOS;
         Some(Instant(self.0.checked_add(ticks)?))
     }
 }
 
 impl Instant {
     fn now() -> Self {
-        Instant(crate::arch::timer::reference_time_100ns())
+        Instant(timer::reference_time_100ns())
     }
 }
 
@@ -1148,206 +998,6 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 }
 
-unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for crate::host::LvbsLinuxKernel {
-    type MapInfo = LvbsPhysPageMapInfo;
-
-    unsafe fn vmap(
-        &self,
-        pages: &PhysPageAddrArray<ALIGN>,
-        perms: PhysPageMapPermissions,
-    ) -> Result<Self::MapInfo, PhysPointerError> {
-        let protected_frame_access = if perms.contains(PhysPageMapPermissions::WRITE) {
-            // This shared guard spans map/copy/unmap. It permits concurrent foreign-memory writes
-            // but does not support re-entry into a VTL protection change.
-            Some(crate::mshv::vsm::protected_frame_registry().acquire_access_guard(pages)?)
-        } else {
-            None
-        };
-        // SAFETY: ordinary writable mappings were checked against protected and in-flight frames;
-        // the guard is retained through map, access, and unmap. `vmap_privileged` provides the
-        // shared raw mapping implementation.
-        let mut map_info = unsafe { self.vmap_privileged(pages, perms)? };
-        map_info.protected_frame_access = protected_frame_access;
-        Ok(map_info)
-    }
-
-    unsafe fn vmap_privileged(
-        &self,
-        pages: &PhysPageAddrArray<ALIGN>,
-        perms: PhysPageMapPermissions,
-    ) -> Result<Self::MapInfo, PhysPointerError> {
-        if pages.is_empty() {
-            return Err(PhysPointerError::InvalidPhysicalAddress(0));
-        }
-
-        if ALIGN != PAGE_SIZE {
-            unimplemented!("ALIGN other than 4KiB is not supported yet");
-        }
-
-        self.validate_unowned(pages)?;
-
-        // Reject duplicates early as an API-level validation. The page-table implementation also
-        // rejects duplicate/shared mappings, but this keeps the error local to the input array.
-        // A single page can never collide with itself, so skip the set allocation.
-        if pages.len() > 1 {
-            let mut seen = hashbrown::HashSet::with_capacity(pages.len());
-            for page in pages {
-                if !seen.insert(page.as_usize()) {
-                    return Err(PhysPointerError::DuplicatePhysicalAddress(page.as_usize()));
-                }
-            }
-        }
-
-        // VTL0 memory must never be executable from VTL1 (DEP).
-        let mut flags = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
-        if perms.contains(PhysPageMapPermissions::WRITE) {
-            flags |= PageTableFlags::WRITABLE;
-        }
-
-        // Always allocate a fresh, private virtual address window for the mapping. This lets
-        // multiple cores map the same physical frame(s) concurrently at distinct VAs (used only for
-        // transient data copy in/out via raw pointers), so a core unmapping its window never
-        // disturbs another core's access to the same frame.
-        //
-        // `validate_unowned` rejects VTL1-owned PA before callers reach `vmap`, so these pages are
-        // foreign and the vmap VA range never aliases VTL1-owned Rust memory.
-        let frames: alloc::vec::Vec<PhysFrame<Size4KiB>> = pages
-            .iter()
-            .map(|p| {
-                let address = p.as_usize();
-                x86_64::PhysAddr::try_new(address as u64)
-                    .map(PhysFrame::containing_address)
-                    .map_err(|_| PhysPointerError::InvalidPhysicalAddress(address))
-            })
-            .collect::<Result<_, _>>()?;
-
-        let base_va = vmap_allocator()
-            .allocate_va(frames.len())
-            .map_err(|e| match e {
-                crate::mm::vmap::VmapAllocError::VaSpaceExhausted => {
-                    PhysPointerError::VaSpaceExhausted
-                }
-                // `pages` was checked non-empty above and `frames` is built 1:1 from it, so the
-                // allocator cannot report an empty input here.
-                crate::mm::vmap::VmapAllocError::EmptyInput => {
-                    unreachable!("frames is derived 1:1 from a non-empty pages slice")
-                }
-            })?;
-
-        match self
-            .page_table_manager
-            .current_page_table()
-            .map_non_contiguous_phys_frames(&frames, base_va, flags)
-        {
-            Ok(page_addr) => Ok(LvbsPhysPageMapInfo::new(page_addr, pages.len() * ALIGN)),
-            Err(e) => {
-                vmap_allocator().free_va(base_va, frames.len());
-                match e {
-                    MapToError::PageAlreadyMapped(_) => {
-                        Err(PhysPointerError::AlreadyMapped(pages[0].as_usize()))
-                    }
-                    MapToError::FrameAllocationFailed => {
-                        Err(PhysPointerError::FrameAllocationFailed)
-                    }
-                    MapToError::ParentEntryHugePage => Err(
-                        PhysPointerError::InvalidPhysicalAddress(pages[0].as_usize()),
-                    ),
-                }
-            }
-        }
-    }
-
-    unsafe fn vunmap(
-        &self,
-        vmap_info: Self::MapInfo,
-    ) -> Result<(), (PhysPointerError, Self::MapInfo)> {
-        if ALIGN != PAGE_SIZE {
-            unimplemented!("ALIGN other than 4KiB is not supported yet");
-        }
-
-        let base = vmap_info.base();
-        let size = vmap_info.size();
-        let base_va = x86_64::VirtAddr::new(base as u64);
-
-        // Unmap the page table entries first. Only release the VA range back
-        // to the allocator when unmapping succeeds; if it fails, stale PTE
-        // entries remain and recycling the VA would cause collisions.
-        if self.unmap_vtl0_pages(base, size).is_err() {
-            return Err((PhysPointerError::Unmapped(base as usize), vmap_info));
-        }
-
-        // PTEs are already cleared at this point, so the mapping is functionally gone
-        // and a retry would only re-fail against empty page-table entries. Return the VA
-        // range to the allocator. `vmap_info` is consumed by value and never cloned, so this
-        // range is freed exactly once.
-        if crate::mm::vmap::is_vmap_address(base_va) {
-            crate::mm::vmap::vmap_allocator().free_va(base_va, size / ALIGN);
-        }
-
-        Ok(())
-    }
-
-    fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError> {
-        if pages.is_empty() {
-            return Ok(());
-        }
-        let start_address = self.vtl1_phys_frame_range.start.start_address().as_u64();
-        let end_address = self.vtl1_phys_frame_range.end.start_address().as_u64();
-        for page in pages {
-            let addr = page.as_usize() as u64;
-            // a physical page belonging to LiteBox (VTL1) should not be used for `vmap`
-            if addr >= start_address && addr < end_address {
-                return Err(PhysPointerError::InvalidPhysicalAddress(page.as_usize()));
-            }
-        }
-        Ok(())
-    }
-
-    unsafe fn protect(
-        &self,
-        pages: &PhysPageAddrArray<ALIGN>,
-        perms: PhysPageMapPermissions,
-    ) -> Result<(), PhysPointerError> {
-        if ALIGN != PAGE_SIZE {
-            unimplemented!("ALIGN other than 4KiB is not supported yet");
-        }
-
-        // Build a RangeSet so that adjacent pages are coalesced into contiguous
-        // ranges, minimizing the number of hypercalls.
-        let mut range_set = rangemap::RangeSet::new();
-        for page in pages {
-            let start = page.as_usize() as u64;
-            let end = start
-                .checked_add(ALIGN as u64)
-                .ok_or(PhysPointerError::Overflow)?;
-            range_set.insert(start..end);
-        }
-
-        let page_prot = if perms.contains(PhysPageMapPermissions::WRITE) {
-            // VTL1 needs writable access, so deny VTL0 all access.
-            crate::mshv::HvPageProtFlags::HV_PAGE_ACCESS_NONE
-        } else if perms.contains(PhysPageMapPermissions::READ) {
-            // VTL1 wants to read data from the pages, preventing VTL0 from writing to the pages.
-            crate::mshv::HvPageProtFlags::HV_PAGE_READABLE
-                | crate::mshv::HvPageProtFlags::HV_PAGE_EXECUTABLE
-        } else {
-            // VTL1 no longer protects the pages.
-            crate::mshv::HvPageProtFlags::HV_PAGE_FULL_ACCESS
-        };
-
-        for range in range_set.iter() {
-            let frame_range = PhysFrame::range(
-                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.start)),
-                PhysFrame::<Size4KiB>::containing_address(x86_64::PhysAddr::new(range.end)),
-            );
-            crate::mshv::vsm::protect_physical_memory_range(self, frame_range, page_prot)
-                .map_err(|_| PhysPointerError::UnsupportedPermissions(perms.bits()))?;
-        }
-
-        Ok(())
-    }
-}
-
 /// Runs a user thread with the given initial context.
 ///
 /// This will run until the thread terminates or returns.
@@ -1414,7 +1064,7 @@ fn run_thread_inner(
     //
     // Arm the preemption timer for this user-thread execution. This function is
     // idempotent, so `reenter` does not change the timeout.
-    crate::arch::timer::arm_preemption();
+    timer::arm_preemption();
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
     // the duration of the call, and `run_thread_arch` returns exactly once.
     unsafe {
@@ -1454,14 +1104,11 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
     };
 }
 
-// NOTE: VTL1 extended states are currently stored in per-CPU storage (PerCpuVariablesAsm).
-// In the future, we may need to use a global data structure for this because, if there is
-// an RPC from VTL1 to VTL0, the core resuming execution might be different from the core
-// that requested the RPC. In that case, we also need to save/restore general purpose
-// registers in that global data structure.
+// Kernel/user extended state is per-CPU. Resuming an execution context on
+// another CPU would require transferring both extended and general registers.
 
 // ============================================================================
-// VTL1 XSAVE/XRSTOR macros (with XSAVEOPT optimization for kernel-user switches)
+// XSAVE/XRSTOR macros (with XSAVEOPT optimization for kernel-user switches)
 // ============================================================================
 // XSAVE/XRSTOR state tracking (xsaved flag values):
 //   0: never saved - use XSAVE, then set to 1
@@ -1470,14 +1117,14 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
 //
 // XSAVEOPT requires that XRSTOR has established tracking for this buffer.
 // Only after an XRSTOR can we safely use XSAVEOPT for subsequent saves.
-// VTL1 xsaved flags are reset at each VTL1 entry since returning to VTL0 invalidates
-// the CPU's tracking (VTL0 does XRSTOR from VTL0's buffer, not VTL1's).
+// Platforms must reset xsaved flags when an external context may have changed
+// the CPU's tracking. That transition policy is outside these common macros.
 
-/// Assembly macro to save VTL1 extended states (XSAVE/XSAVEOPT).
+/// Assembly macro to save kernel/user extended states (XSAVE/XSAVEOPT).
 /// Uses xsaveopt only after XRSTOR has established tracking (xsaved == 2).
 /// Clobbers: rax, rcx, rdx
 #[cfg(target_arch = "x86_64")]
-macro_rules! XSAVE_VTL1_ASM {
+macro_rules! XSAVE_TRACKED_ASM {
     ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
         concat!(
             "mov rcx, gs:[",
@@ -1510,12 +1157,12 @@ macro_rules! XSAVE_VTL1_ASM {
     };
 }
 
-/// Assembly macro to restore VTL1 extended states (XRSTOR).
+/// Assembly macro to restore kernel/user extended states (XRSTOR).
 /// Skips restore if state was never saved (xsaved == 0).
 /// Sets xsaved to 2 after restore to enable XSAVEOPT optimization.
 /// Clobbers: rax, rcx, rdx
 #[cfg(target_arch = "x86_64")]
-macro_rules! XRSTOR_VTL1_ASM {
+macro_rules! XRSTOR_TRACKED_ASM {
     ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
         concat!(
             "cmp byte ptr gs:[",
@@ -1691,7 +1338,7 @@ unsafe extern "C" fn run_thread_arch(
         "mov r9b, dl",
         // Extended states are callee-saved. Save all extended states for now because
         // we don't know whether the caller touched any of them.
-        XSAVE_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
+        XSAVE_TRACKED_ASM!({kernel_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {kernel_xsaved_off}),
         "push rdi", // save `thread_ctx`
         // Save kernel rsp and rbp and user context top in PerCpuVariablesAsm.
         "mov gs:[{cur_kernel_sp_off}], rsp",
@@ -1716,7 +1363,7 @@ unsafe extern "C" fn run_thread_arch(
         "mov r11, rsp", // store user `rsp` in `r11`
         "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_SYSCALL_USER_CONTEXT_ASM!(),
-        XSAVE_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
+        XSAVE_TRACKED_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         // Handle the syscall. This will jump back to the user but
@@ -1741,7 +1388,7 @@ unsafe extern "C" fn run_thread_arch(
         "mov rax, rsp", // store ISR `rsp` in `rax`
         "mov rsp, gs:[{user_context_top_off}]", // `rsp` points to the top address of user context area
         SAVE_PF_USER_CONTEXT_ASM!(),
-        XSAVE_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
+        XSAVE_TRACKED_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
         "mov rbp, gs:[{cur_kernel_bp_off}]",
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         "mov rdi, [rsp]", // pass `thread_ctx`
@@ -1813,18 +1460,18 @@ unsafe extern "C" fn run_thread_arch(
         "mov rsp, gs:[{cur_kernel_sp_off}]",
         // Zero cur_kernel_sp as defence in depth
         "mov qword ptr gs:[{cur_kernel_sp_off}], 0",
-        XRSTOR_VTL1_ASM!({vtl1_kernel_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_kernel_xsaved_off}),
+        XRSTOR_TRACKED_ASM!({kernel_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {kernel_xsaved_off}),
         RESTORE_CALLEE_SAVED_REGISTERS_ASM!(),
         "ret",
         cur_kernel_sp_off = const { PerCpuVariablesAsm::cur_kernel_stack_ptr_offset() },
         cur_kernel_bp_off = const { PerCpuVariablesAsm::cur_kernel_base_ptr_offset() },
         user_context_top_off = const { PerCpuVariablesAsm::user_context_top_addr_offset() },
-        vtl1_kernel_xsave_area_off = const { PerCpuVariablesAsm::vtl1_kernel_xsave_area_addr_offset() },
-        vtl1_user_xsave_area_off = const { PerCpuVariablesAsm::vtl1_user_xsave_area_addr_offset() },
-        vtl1_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_lo_offset() },
-        vtl1_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset() },
-        vtl1_kernel_xsaved_off = const { PerCpuVariablesAsm::vtl1_kernel_xsaved_offset() },
-        vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
+        kernel_xsave_area_off = const { PerCpuVariablesAsm::kernel_xsave_area_addr_offset() },
+        user_xsave_area_off = const { PerCpuVariablesAsm::user_xsave_area_addr_offset() },
+        xsave_mask_lo_off = const { PerCpuVariablesAsm::xsave_mask_lo_offset() },
+        xsave_mask_hi_off = const { PerCpuVariablesAsm::xsave_mask_hi_offset() },
+        kernel_xsaved_off = const { PerCpuVariablesAsm::kernel_xsaved_offset() },
+        user_xsaved_off = const { PerCpuVariablesAsm::user_xsaved_offset() },
         USER_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
         scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
         user_rflags_off = const { PerCpuVariablesAsm::user_rflags_offset() },
@@ -1928,7 +1575,7 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: true,
         }
     } else {
-        use crate::host::per_cpu_variables::with_per_cpu_variables;
+        use crate::per_cpu_variables::with_per_cpu_variables;
         use litebox::utils::TruncateExt as _;
         litebox::shim::ExceptionInfo {
             exception: with_per_cpu_variables(|pcv| pcv.asm.get_exception()),
@@ -1939,9 +1586,9 @@ unsafe extern "C" fn exception_handler(
     };
     // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
     // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
-    if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
-        crate::arch::timer::eoi();
-        crate::arch::timer::mark_user_timeout_kill();
+    if !kernel_mode && info.exception.0 == timer::STIMER_VECTOR {
+        timer::eoi();
+        timer::mark_user_timeout_kill();
     }
     match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
         ContinueOperation::Resume => {
@@ -2012,7 +1659,7 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         "mov cr3, rax",
         // Clear rax to not leak CR3 value to user
         "xor eax, eax",
-        XRSTOR_VTL1_ASM!({vtl1_user_xsave_area_off}, {vtl1_xsave_mask_lo_off}, {vtl1_xsave_mask_hi_off}, {vtl1_user_xsaved_off}),
+        XRSTOR_TRACKED_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
         // Restore user context from ctx.
         "mov rsp, rdi",
         RESTORE_CPU_CONTEXT_ASM!(),
@@ -2021,9 +1668,9 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         "swapgs",
         "iretq",
         "switch_to_user_end:",
-        vtl1_user_xsave_area_off = const { PerCpuVariablesAsm::vtl1_user_xsave_area_addr_offset() },
-        vtl1_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_lo_offset() },
-        vtl1_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset() },
-        vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
+        user_xsave_area_off = const { PerCpuVariablesAsm::user_xsave_area_addr_offset() },
+        xsave_mask_lo_off = const { PerCpuVariablesAsm::xsave_mask_lo_offset() },
+        xsave_mask_hi_off = const { PerCpuVariablesAsm::xsave_mask_hi_offset() },
+        user_xsaved_off = const { PerCpuVariablesAsm::user_xsaved_offset() },
     );
 }

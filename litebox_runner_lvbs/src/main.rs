@@ -8,14 +8,14 @@
 use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
-    arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap},
-    host::{
+    arch::{enable_fsgsbase, enable_smep_smap, mm::PAGE_SIZE},
+    host::lvbs::{
+        boot::enable_extended_states,
         bootparam::save_boot_info,
-        per_cpu_variables::{
-            PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables,
-        },
+        per_cpu_variables::{allocate_per_cpu_variables, init_per_cpu_variables},
     },
     mshv::vtl1_mem_layout::{self, VTL1_REMAP_PDE_PAGE, VTL1_REMAP_PDPT_PAGE},
+    per_cpu_variables::PerCpuVariablesAsm,
     serial_println,
 };
 use x86_64::VirtAddr;
@@ -73,7 +73,7 @@ const PTE_TABLE_FLAGS: u64 = PageTableFlags::PRESENT.bits()
 
 /// x86-64 page table structure constants
 const ENTRIES_PER_PT_PAGE: usize = 512;
-const CR3_ADDR_MASK: u64 = !(vtl1_mem_layout::PAGE_SIZE as u64 - 1);
+const CR3_ADDR_MASK: u64 = !(PAGE_SIZE as u64 - 1);
 
 /// Apply ELF relocations to support position-independent execution.
 /// This code has NO dependency on absolute addresses - uses only RIP-relative addressing.
@@ -281,12 +281,12 @@ unsafe fn remap_to_high_canonical() -> ! {
     let pml4_ptr = pml4_pa as *mut u64;
 
     // Set up the PDPT page.
-    let pdpt_page_pa = memory_base + (VTL1_REMAP_PDPT_PAGE * vtl1_mem_layout::PAGE_SIZE) as u64;
+    let pdpt_page_pa = memory_base + (VTL1_REMAP_PDPT_PAGE * PAGE_SIZE) as u64;
     let pdpt_ptr = pdpt_page_pa as *mut u64;
     unsafe { core::ptr::write_bytes(pdpt_ptr, 0, ENTRIES_PER_PT_PAGE) };
 
     // Set up the PDE page.
-    let pde_page_pa = memory_base + (VTL1_REMAP_PDE_PAGE * vtl1_mem_layout::PAGE_SIZE) as u64;
+    let pde_page_pa = memory_base + (VTL1_REMAP_PDE_PAGE * PAGE_SIZE) as u64;
     let pde_ptr = pde_page_pa as *mut u64;
     unsafe { core::ptr::write_bytes(pde_ptr, 0, ENTRIES_PER_PT_PAGE) };
 
@@ -296,7 +296,7 @@ unsafe fn remap_to_high_canonical() -> ! {
         .take(vtl1_mem_layout::VTL1_REMAP_PTE_COUNT)
         .enumerate()
     {
-        let pte_page_pa = memory_base + (pte_page_idx * vtl1_mem_layout::PAGE_SIZE) as u64;
+        let pte_page_pa = memory_base + (pte_page_idx * PAGE_SIZE) as u64;
         let pde_entry = pte_page_pa | PTE_TABLE_FLAGS;
         unsafe {
             pde_ptr.add(pde_start_idx + i).write_volatile(pde_entry);

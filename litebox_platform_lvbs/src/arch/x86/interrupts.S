@@ -197,7 +197,7 @@ isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl 19
  *
  * Common case is a fire in USER mode (a TA overran its quantum): the macro's
  * user-mode path routes it to exception_callback. The kernel path into
- * stimer_handler_impl is a safety net only. See arch::timer.
+ * stimer_handler_impl is a safety net only. See host::lvbs::timer.
  */
 isr_no_err_code isr_stimer stimer_handler_impl 0x40
 
@@ -222,7 +222,7 @@ isr_hyperv_sint:
  *
  * Delivered when the APIC raised an interrupt that vanished before the core
  * acknowledged it. It carries no work and takes no EOI (the Intel SDM), so
- * a bare iretq (no registers touched). See arch::timer (SPURIOUS_VECTOR).
+ * a bare iretq (no registers touched). See host::lvbs::timer (SPURIOUS_VECTOR).
  */
 .global isr_spurious
 isr_spurious:

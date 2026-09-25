@@ -1,7 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Hyper-V-specific code
+//! Hyper-V mechanisms and VTL/VSM implementation used by LVBS.
+//!
+//! Hyper-V facilities and VTL-specific operations are not yet separate
+//! interfaces; this module is not a backend-neutral kernel dependency.
 
 pub mod hvcall;
 pub(crate) mod hvcall_mm;
@@ -12,7 +15,7 @@ pub mod vsm_intercept;
 pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use crate::arch::mm::PAGE_SIZE;
 use litebox_common_linux::vmap::{
     PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
@@ -74,7 +77,7 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
 type Vtl0PhysConstPtr<'a, T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysConstPtr<
         'a,
-        crate::host::LvbsLinuxKernel,
+        crate::host::lvbs::LvbsLinuxKernel,
         T,
         ALIGN,
     >;
@@ -85,7 +88,7 @@ type Vtl0PhysConstPtr<'a, T, const ALIGN: usize> =
 type PrivilegedVtl0PhysMutPtr<'a, T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysMutPtr<
         'a,
-        PrivilegedVmap<'a, crate::host::LvbsLinuxKernel>,
+        PrivilegedVmap<'a, crate::host::lvbs::LvbsLinuxKernel>,
         T,
         ALIGN,
     >;
@@ -969,11 +972,11 @@ impl HvPendingExceptionEvent {
 #[cfg(not(test))]
 #[inline]
 pub(crate) fn is_hvcall_ready() -> bool {
-    use crate::host::per_cpu_variables::with_per_cpu_variables;
+    use crate::host::lvbs::per_cpu_variables::with_per_cpu_variables;
     // The VTL return address is configured only after the hypercall page
     // has been set up, so a non-zero value indicates that hypercalls are
     // available.
-    with_per_cpu_variables(|pcv| pcv.asm.get_vtl_return_addr() != 0)
+    with_per_cpu_variables(|pcv| pcv.vtl0_asm.get_return_addr() != 0)
 }
 
 #[cfg(test)]

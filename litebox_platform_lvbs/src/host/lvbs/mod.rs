@@ -1,12 +1,36 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! An implementation of [`HostInterface`] for LVBS
+//! Concrete Hyper-V VTL1 platform implementation.
+//!
+//! This module owns LVBS boot policy, per-CPU composition, foreign-memory
+//! access, and platform-specific providers. Hyper-V/VSM mechanisms remain in
+//! [`crate::mshv`]; supporting another VM does not require generalizing the
+//! cross-domain service interfaces.
 
-use crate::{
-    Errno, HostInterface, arch::ioport::serial_print_string,
-    host::per_cpu_variables::with_per_cpu_variables,
-};
+pub mod boot;
+pub mod bootparam;
+pub mod linux;
+pub mod per_cpu_variables;
+pub mod phys_memory;
+pub mod timer;
+
+/// Anchor byte that ensures the `.hvcall_page` linker section is emitted.
+#[used]
+#[unsafe(link_section = ".hvcall_page")]
+static HVCALL_PAGE_ANCHOR: u8 = 0;
+
+/// Get the address of the Hyper-V hypercall code page.
+///
+/// The linker script gives this page a well-known, page-aligned location.
+/// Hyper-V writes executable code into it via `HV_X64_MSR_HYPERCALL`.
+/// VPs share this address; Hyper-V identifies the calling VP internally.
+#[inline]
+pub fn hv_hypercall_page_address() -> u64 {
+    crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address()
+}
+
+use crate::{Errno, HostInterface, arch::ioport::serial_print_string};
 use digest::Digest;
 use litebox_common_lvbs::PRK_LEN;
 use rand_core::{RngCore, SeedableRng};
@@ -86,21 +110,6 @@ impl LvbsLinuxKernel {
             euid: 1000,
             egid: 1000,
         }
-    }
-}
-
-unsafe impl litebox::platform::ThreadLocalStorageProvider for LvbsLinuxKernel {
-    fn get_thread_local_storage() -> *mut () {
-        let tls = with_per_cpu_variables(|pcv| pcv.tls.get());
-        tls.as_mut_ptr::<()>()
-    }
-
-    unsafe fn replace_thread_local_storage(value: *mut ()) -> *mut () {
-        with_per_cpu_variables(|pcv| {
-            let old = pcv.tls.get();
-            pcv.tls.set(x86_64::VirtAddr::new(value as u64));
-            old.as_u64() as *mut ()
-        })
     }
 }
 
@@ -254,9 +263,11 @@ fn crng_reseed_from_rdrand_and_state(
         .into()
 }
 
-pub struct HostLvbsInterface;
-
-impl HostLvbsInterface {}
+pub struct HostLvbsInterface {
+    vtl1_phys_frame_range:
+        x86_64::structures::paging::frame::PhysFrameRange<x86_64::structures::paging::Size4KiB>,
+    end_of_boot: core::sync::atomic::AtomicBool,
+}
 
 impl HostInterface for HostLvbsInterface {
     fn send_ip_packet(_packet: &[u8]) -> Result<usize, Errno> {

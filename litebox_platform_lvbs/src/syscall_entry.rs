@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::host::per_cpu_variables::with_per_cpu_variables;
+use crate::per_cpu_variables::with_per_cpu_variables;
 use core::arch::naked_asm;
 use x86_64::{
     VirtAddr,

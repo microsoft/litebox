@@ -3,9 +3,7 @@
 
 //! VTL1 physical memory layout (LVBS-specific)
 
-pub const PAGE_SIZE: usize = 4096;
-pub const PAGE_SHIFT: usize = 12;
-pub const PTES_PER_PAGE: usize = 512;
+use crate::arch::mm::{PAGE_SIZE, PTES_PER_PAGE};
 
 pub const VSM_PMD_SIZE: usize = PAGE_SIZE * PTES_PER_PAGE;
 pub const VSM_SK_INITIAL_MAP_SIZE: usize = 16 * 1024 * 1024;

@@ -7,7 +7,6 @@ pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;
-pub mod timer;
 
 pub(crate) use x86_64::{
     addr::{PhysAddr, VirtAddr},
@@ -43,15 +42,10 @@ pub fn enable_fsgsbase() {
     }
 }
 
-/// Enable CPU extended states such as XMM and instructions to use and manage them
-/// such as SSE and XSAVE
+/// Enable SSE/XSAVE instruction support in CR0 and CR4.
 ///
-/// VTL0 and VTL1 share the same XCR0 register. This function verifies that XCR0 already
-/// has x87 and SSE enabled (by VTL0) rather than modifying it.
-///
-/// # Panics
-///
-/// Panics if XCR0 (from the VTL0 kernel) does not have x87 and SSE enabled.
+/// This does not configure XCR0. The platform must configure or validate its
+/// enabled-state mask before allocating XSAVE buffers or entering user code.
 #[cfg(target_arch = "x86_64")]
 pub fn enable_extended_states() {
     let mut flags = x86_64::registers::control::Cr0::read();
@@ -68,17 +62,6 @@ pub fn enable_extended_states() {
     unsafe {
         x86_64::registers::control::Cr4::write(flags);
     }
-
-    // VTL1 should not modify XCR0 - verify that VTL0 has already enabled x87 and SSE
-    let xcr0 = x86_64::registers::xcontrol::XCr0::read();
-    assert!(
-        xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::X87),
-        "XCR0 must have x87 enabled by VTL0"
-    );
-    assert!(
-        xcr0.contains(x86_64::registers::xcontrol::XCr0Flags::SSE),
-        "XCR0 must have SSE enabled by VTL0"
-    );
 }
 
 #[inline]

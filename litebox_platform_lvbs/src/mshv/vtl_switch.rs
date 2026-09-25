@@ -3,15 +3,16 @@
 
 //! VTL switch related functions
 
-use crate::host::{
-    hv_hypercall_page_address,
-    per_cpu_variables::{PerCpuVariables, PerCpuVariablesAsm, with_per_cpu_variables},
-};
-use crate::mshv::{
+use super::{
     HV_FLUSH_EX_VP_SET_BANKS, HV_REGISTER_VSM_CODEPAGE_OFFSETS, HvRegisterVsmCodePageOffsets,
     VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
     hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
 };
+use crate::host::lvbs::{
+    hv_hypercall_page_address,
+    per_cpu_variables::{LvbsPerCpuVariables, Vtl0PerCpuVariablesAsm, with_per_cpu_variables},
+};
+use crate::per_cpu_variables::PerCpuVariablesAsm;
 use core::sync::atomic::{AtomicU64, Ordering};
 use litebox::utils::{ReinterpretUnsignedExt, TruncateExt};
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError};
@@ -96,13 +97,13 @@ static VTL1_VP_MASK: AtomicVpMask = AtomicVpMask::new();
 /// Mark the current VP as executing in VTL1.
 #[inline]
 fn vtl1_vp_enter() {
-    VTL1_VP_MASK.set(with_per_cpu_variables(PerCpuVariables::vp_index) as usize);
+    VTL1_VP_MASK.set(with_per_cpu_variables(LvbsPerCpuVariables::vp_index) as usize);
 }
 
 /// Remove the current VP from the VTL1 mask (it is returning to VTL0).
 #[inline]
 fn vtl1_vp_exit() {
-    VTL1_VP_MASK.clear(with_per_cpu_variables(PerCpuVariables::vp_index) as usize);
+    VTL1_VP_MASK.clear(with_per_cpu_variables(LvbsPerCpuVariables::vp_index) as usize);
 }
 
 /// Return the current VTL1 VP mask for use in TLB flush hypercalls.
@@ -125,7 +126,7 @@ pub(crate) fn vtl1_vp_mask() -> [u64; HV_FLUSH_EX_VP_SET_BANKS] {
 #[cfg(not(test))]
 #[inline]
 pub(crate) fn is_only_vp_in_vtl1() -> bool {
-    VTL1_VP_MASK.is_single_vp(with_per_cpu_variables(PerCpuVariables::vp_index))
+    VTL1_VP_MASK.is_single_vp(with_per_cpu_variables(LvbsPerCpuVariables::vp_index))
 }
 
 // ============================================================================
@@ -175,7 +176,7 @@ macro_rules! XRSTOR_VTL0_ASM {
 /// Assembly macro to return to VTL0 using the Hyper-V hypercall stub.
 /// Although Hyper-V lets each core use the same VTL return address, this implementation
 /// uses per-CPU return address to avoid using a mutable global variable.
-/// `ret_off` is the offset of the PerCpuVariablesAsm which holds the VTL return address.
+/// `ret_off` is the GS-relative offset of the VTL return address in the LVBS extension.
 macro_rules! VTL_RETURN_ASM {
     ($ret_off:tt) => {
         concat!(
@@ -397,7 +398,7 @@ pub(crate) fn mshv_vsm_get_code_page_offsets() -> Result<(), VsmError> {
         .checked_add(usize::from(code_page_offsets.vtl_return_offset()))
         .ok_or(VsmError::CodePageOffsetOverflow)?;
     with_per_cpu_variables(|pcv| {
-        pcv.asm.set_vtl_return_addr(vtl_return_address);
+        pcv.vtl0_asm.set_return_addr(vtl_return_address);
     });
     Ok(())
 }
@@ -420,8 +421,8 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
 
     loop {
         // Never hand the VP back to VTL0 with the preemption timer live.
-        crate::arch::timer::disarm_preemption();
-        if crate::arch::timer::take_user_timeout_kill() {
+        crate::host::lvbs::timer::disarm_preemption();
+        if crate::host::lvbs::timer::take_user_timeout_kill() {
             crate::serial_println!(
                 "Terminated user-mode code which exceeded its execution quantum"
             );
@@ -459,12 +460,12 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
                 // A pending SINT can be fired here. Our SINT handler only executes `iretq` so returns to here immediately.
                 "pop rbp",
                 "pop rbx",
-                vtl_ret_addr_off = const { PerCpuVariablesAsm::vtl_return_addr_offset() },
+                vtl_ret_addr_off = const { Vtl0PerCpuVariablesAsm::return_addr_offset() },
                 scratch_off = const { PerCpuVariablesAsm::scratch_offset() },
-                vtl0_state_top_addr_off = const { PerCpuVariablesAsm::vtl0_state_top_addr_offset() },
-                vtl0_xsave_area_off = const { PerCpuVariablesAsm::vtl0_xsave_area_addr_offset() },
-                vtl0_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_lo_offset() },
-                vtl0_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl0_xsave_mask_hi_offset() },
+                vtl0_state_top_addr_off = const { Vtl0PerCpuVariablesAsm::state_top_addr_offset() },
+                vtl0_xsave_area_off = const { Vtl0PerCpuVariablesAsm::xsave_area_addr_offset() },
+                vtl0_xsave_mask_lo_off = const { Vtl0PerCpuVariablesAsm::xsave_mask_lo_offset() },
+                vtl0_xsave_mask_hi_off = const { Vtl0PerCpuVariablesAsm::xsave_mask_hi_offset() },
                 VTL_STATE_SIZE = const core::mem::size_of::<VtlState>(),
                 clobber_abi("C"),
                 out("r12") _,
@@ -481,7 +482,7 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
             // one buffer at a time. At this point, the CPU's tracking might rely on VTL0's
             // buffer (if VTL0 called XRSTOR). Thus, we shouldn't use XSAVEOPT until XRSTOR
             // re-establishes tracking for VTL1's buffer.
-            with_per_cpu_variables(|pcv| pcv.asm.reset_vtl1_xsaved());
+            with_per_cpu_variables(|pcv| pcv.kernel.asm.reset_xsaved());
 
             return params;
         }

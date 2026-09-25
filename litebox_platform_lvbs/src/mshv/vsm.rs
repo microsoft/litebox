@@ -4,10 +4,10 @@
 //! Enabling Virtual Secure Mode (VSM) using Hyper-V hypercalls to
 //! secure both VTL0 and VTL1.
 
-use crate::host::linux::CpuMask;
+use crate::host::lvbs::{LvbsLinuxKernel, linux::CpuMask};
 use crate::{
     debug_serial_println,
-    host::{bootparam::get_vtl1_memory_info, per_cpu_variables::with_per_cpu_variables},
+    host::lvbs::{bootparam::get_vtl1_memory_info, per_cpu_variables::with_per_cpu_variables},
     mshv::{
         HV_REGISTER_CR_INTERCEPT_CONTROL, HV_REGISTER_CR_INTERCEPT_CR0_MASK,
         HV_REGISTER_CR_INTERCEPT_CR4_MASK, HV_REGISTER_VSM_PARTITION_CONFIG,
@@ -116,7 +116,7 @@ pub(crate) fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
 
 /// VSM function for locking VTL0's control registers, snapshotting their
 /// current values into VTL1 per-CPU state.
-pub(crate) fn mshv_vsm_lock_regs(platform: &crate::host::LvbsLinuxKernel) -> Result<i64, VsmError> {
+pub(crate) fn mshv_vsm_lock_regs(platform: &LvbsLinuxKernel) -> Result<i64, VsmError> {
     debug_serial_println!("VSM: Lock control registers");
 
     if platform.end_of_boot_reached() {
@@ -282,14 +282,14 @@ pub(crate) fn protect_vtl1_physical_memory_range(
 /// a frame's current VTL protection mask. The reservation remembers which ranges
 /// it changed, enabling reliable rollback.
 pub(crate) struct FrameReservation<'a> {
-    platform: &'a crate::host::LvbsLinuxKernel,
+    platform: &'a LvbsLinuxKernel,
     owned_ranges: Vec<PhysFrameRange<Size4KiB>>,
     owned_frames: RangeSet<u64>,
     committed: bool,
 }
 
 impl<'a> FrameReservation<'a> {
-    pub(crate) fn new(platform: &'a crate::host::LvbsLinuxKernel) -> Self {
+    pub(crate) fn new(platform: &'a LvbsLinuxKernel) -> Self {
         Self {
             platform,
             owned_ranges: Vec::new(),
@@ -500,7 +500,7 @@ pub(crate) fn protected_frame_registry() -> &'static ProtectedFrameRegistry {
 /// portions are ignored.
 /// `page_prot` specifies the hypervisor page-protection flags (VTL0's allowed access) to apply.
 pub(crate) fn protect_physical_memory_range(
-    platform: &crate::host::LvbsLinuxKernel,
+    platform: &LvbsLinuxKernel,
     phys_frame_range: PhysFrameRange<Size4KiB>,
     page_prot: HvPageProtFlags,
 ) -> Result<(), VsmError> {
@@ -559,7 +559,7 @@ pub(crate) fn protect_physical_memory_range(
 /// it also restores user-mode execute — see [`mem_attr_to_hv_page_prot_flags`]
 /// for why that rides along with read.
 pub(crate) fn unprotect_physical_memory_range(
-    platform: &crate::host::LvbsLinuxKernel,
+    platform: &LvbsLinuxKernel,
     phys_frame_range: PhysFrameRange<Size4KiB>,
 ) -> Result<(), VsmError> {
     protect_physical_memory_range(
@@ -577,14 +577,14 @@ pub(crate) fn unprotect_physical_memory_range(
 pub struct LvbsVtl0Gate {
     /// Private, so the capability is built only via [`LvbsVtl0Gate::mint`],
     /// never a bare literal.
-    platform: &'static crate::host::LvbsLinuxKernel,
+    platform: &'static LvbsLinuxKernel,
 }
 
 /// Capability implementing [`Vtl1Gate`] for VTL1 setup requests.
 pub struct LvbsVtl1Gate {
     /// Private, so the capability is built only via [`LvbsVtl1Gate::mint`],
     /// never a bare literal.
-    platform: &'static crate::host::LvbsLinuxKernel,
+    platform: &'static LvbsLinuxKernel,
 }
 
 /// Capability implementing [`Vtl0PrivilegedWrite`]: VTL0 writes with the
@@ -597,14 +597,14 @@ pub struct LvbsVtl1Gate {
 pub struct LvbsVtl0PrivilegedWriter<'a> {
     /// Private, so the capability is built only via
     /// [`LvbsVtl0PrivilegedWriter::mint`], never a bare literal.
-    platform: &'a crate::host::LvbsLinuxKernel,
+    platform: &'a LvbsLinuxKernel,
 }
 
 impl LvbsVtl0Gate {
     /// Mint the VTL0 mediation capability. Reserved for VTL1-trusted
     /// composition-root code (the runner).
     #[must_use]
-    pub fn mint(platform: &'static crate::host::LvbsLinuxKernel) -> Self {
+    pub fn mint(platform: &'static LvbsLinuxKernel) -> Self {
         Self { platform }
     }
 }
@@ -613,7 +613,7 @@ impl LvbsVtl1Gate {
     /// Mint the VTL1 setup capability. Reserved for VTL1-trusted
     /// composition-root code (the runner).
     #[must_use]
-    pub fn mint(platform: &'static crate::host::LvbsLinuxKernel) -> Self {
+    pub fn mint(platform: &'static LvbsLinuxKernel) -> Self {
         Self { platform }
     }
 }
@@ -622,7 +622,7 @@ impl<'a> LvbsVtl0PrivilegedWriter<'a> {
     /// Mint the protection-mask-bypassing write capability. The audit point for
     /// every privileged VTL0 write.
     #[must_use]
-    pub fn mint(platform: &'a crate::host::LvbsLinuxKernel) -> Self {
+    pub fn mint(platform: &'a LvbsLinuxKernel) -> Self {
         Self { platform }
     }
 }
@@ -716,8 +716,7 @@ impl Vtl0Gate for LvbsVtl0Gate {
     }
 
     fn install_ringbuffer(&self, pa: u64, size: u64) {
-        let _ =
-            crate::mshv::ringbuffer::set_ringbuffer(self.platform, PhysAddr::new(pa), size.trunc());
+        let _ = super::ringbuffer::set_ringbuffer(self.platform, PhysAddr::new(pa), size.trunc());
     }
 
     fn end_of_boot_reached(&self) -> bool {
@@ -771,7 +770,7 @@ impl Vtl1Gate for LvbsVtl1Gate {
         // Best-effort: attempt every online CPU, surfacing the last init failure.
         let mut error = None;
         cpu_online_mask.for_each_cpu(|cpu_id| {
-            if let Err(e) = crate::mshv::hvcall_vp::init_vtl_ap(TruncateExt::<u32>::trunc(cpu_id)) {
+            if let Err(e) = super::hvcall_vp::init_vtl_ap(TruncateExt::<u32>::trunc(cpu_id)) {
                 error = Some(e);
             }
         });
@@ -796,7 +795,7 @@ impl Vtl1Gate for LvbsVtl1Gate {
         LvbsVtl0Gate::mint(self.platform)
             .read_vtl0_contiguous(key_pa.as_u64(), &mut *keybuf)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        crate::host::set_platform_root_key(&keybuf);
+        crate::host::lvbs::set_platform_root_key(&keybuf);
         Ok(())
     }
 }

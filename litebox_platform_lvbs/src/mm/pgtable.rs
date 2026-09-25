@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
+use crate::arch::mm::PAGE_SIZE;
 use litebox::mm::vmem::PageFaultError;
 
 use crate::arch::{

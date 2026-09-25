@@ -3,21 +3,20 @@
 
 //! Hyper-V Hypercall functions for virtual processor (VP)
 
+use crate::arch::mm::PAGE_SIZE;
 use crate::{
     arch::{
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
     debug_serial_println,
-    host::per_cpu_variables::with_per_cpu_variables,
+    host::lvbs::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
         HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvGetVpRegistersInput,
         HvGetVpRegistersOutput, HvInputVtl, HvSetVpRegistersInput, SegmentRegisterAttributeFlags,
         hvcall::{hv_do_hypercall, hv_do_rep_hypercall},
-        vtl1_mem_layout::{
-            PAGE_SIZE, VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page,
-        },
+        vtl1_mem_layout::{VTL1_KERNEL_STACK_PAGE, VTL1_TSS_PAGE, get_address_of_special_page},
     },
     serial_println,
 };

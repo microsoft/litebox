@@ -3,7 +3,7 @@
 
 //! Global Descriptor Table (GDT) and Task State Segment (TSS)
 
-use crate::host::per_cpu_variables::with_per_cpu_variables;
+use crate::per_cpu_variables::with_per_cpu_variables;
 use alloc::boxed::Box;
 use x86_64::{
     PrivilegeLevel, VirtAddr,

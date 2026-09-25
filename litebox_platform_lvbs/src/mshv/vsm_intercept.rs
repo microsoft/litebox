@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::{
-    host::per_cpu_variables::with_per_cpu_variables,
+    host::lvbs::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
         HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
@@ -63,8 +63,8 @@ pub fn vsm_handle_intercept() {
             #[cfg(debug_assertions)]
             {
                 let int_msg = unsafe {
-                    let ptr = core::ptr::addr_of!(msg.payload)
-                        .cast::<crate::mshv::HvMemInterceptMessage>();
+                    let ptr =
+                        core::ptr::addr_of!(msg.payload).cast::<super::HvMemInterceptMessage>();
                     &*ptr
                 };
                 let gpa = int_msg.gpa;

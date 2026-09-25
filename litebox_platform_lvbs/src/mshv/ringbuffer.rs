@@ -4,6 +4,7 @@
 //! RingBuffer implementation and functions
 
 use super::{PrivilegedVmap, PrivilegedVtl0PhysMutPtr};
+use crate::host::lvbs::LvbsLinuxKernel;
 use core::fmt;
 use litebox::mm::vmem::PAGE_SIZE;
 use litebox::utils::TruncateExt;
@@ -12,7 +13,7 @@ use spin::{Mutex, Once};
 use x86_64::PhysAddr;
 
 pub struct RingBuffer {
-    pvmap: PrivilegedVmap<'static, crate::host::LvbsLinuxKernel>,
+    pvmap: PrivilegedVmap<'static, LvbsLinuxKernel>,
     rb_pa: PhysAddr,
     write_offset: usize,
     size: usize,
@@ -25,7 +26,7 @@ pub struct RingBuffer {
 
 impl RingBuffer {
     pub fn new(
-        platform: &'static crate::host::LvbsLinuxKernel,
+        platform: &'static LvbsLinuxKernel,
         phys_addr: PhysAddr,
         requested_size: usize,
     ) -> Self {
@@ -68,7 +69,7 @@ fn advance_offset(size: usize, write_offset: usize, len: usize) -> usize {
 /// the wrap span as `[rb_pa + (start_page + i) % page_count * PAGE_SIZE]`.
 /// Returns the new write offset after attempting the write.
 fn write_fast(
-    pvmap: &PrivilegedVmap<'static, crate::host::LvbsLinuxKernel>,
+    pvmap: &PrivilegedVmap<'static, LvbsLinuxKernel>,
     rb_pa: PhysAddr,
     size: usize,
     write_offset: usize,
@@ -120,7 +121,7 @@ fn write_fast(
 /// Wraparound issues two map/unmap cycles. Returns the new write offset
 /// after attempting the write.
 fn write_slow(
-    pvmap: &PrivilegedVmap<'static, crate::host::LvbsLinuxKernel>,
+    pvmap: &PrivilegedVmap<'static, LvbsLinuxKernel>,
     rb_pa: PhysAddr,
     size: usize,
     write_offset: usize,
@@ -156,7 +157,7 @@ fn write_slow(
 
 static RINGBUFFER_ONCE: Once<Mutex<RingBuffer>> = Once::new();
 pub(crate) fn set_ringbuffer(
-    platform: &'static crate::host::LvbsLinuxKernel,
+    platform: &'static LvbsLinuxKernel,
     pa: PhysAddr,
     size: usize,
 ) -> &'static Mutex<RingBuffer> {
