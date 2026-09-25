@@ -193,8 +193,8 @@ impl UserlandProcessLauncher {
         abnormal: bool,
     ) {
         let _ = process.fail_start(BrokerError::PeerClosed, abnormal, false);
-        let _ = process.complete_exit(exit_status);
         process.retire(!abnormal);
+        let _ = process.complete_exit(exit_status);
     }
 }
 
