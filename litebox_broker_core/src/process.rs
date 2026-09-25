@@ -1410,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn child_process_creation_is_policy_gated() {
+    fn child_process_allocation_is_policy_gated() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1427,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn child_process_creation_allows_one_pending_child() {
+    fn child_process_allocation_allows_one_pending_child() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
