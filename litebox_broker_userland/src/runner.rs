@@ -14,6 +14,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
+use litebox_broker_protocol::process::ProcessExitStatus;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -136,6 +137,20 @@ impl RunnerCompletion {
 
     pub(crate) fn into_result(self) -> IoResult<ExitStatus> {
         self.result
+    }
+
+    pub(crate) fn process_exit_status(&self) -> ProcessExitStatus {
+        if let Some(signal) = self.runner_signal {
+            ProcessExitStatus::Signaled {
+                signal: signal.cast_unsigned(),
+            }
+        } else if let Some(code) = self.runner_exit_code {
+            ProcessExitStatus::Exited {
+                code: code.cast_unsigned(),
+            }
+        } else {
+            ProcessExitStatus::Unknown
+        }
     }
 }
 

@@ -102,6 +102,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
         shared_buffers: Arc<SharedBufferPool<Memory>>,
         readiness_sink: Arc<dyn ReadinessSink>,
     ) -> Self {
+        process.install_readiness_sink(Arc::clone(&readiness_sink));
         Self {
             process,
             shared_buffers,
@@ -525,6 +526,10 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::StartChildProcess(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
+        BrokerOperation::WaitChild(target) => process
+            .wait_child(target)
+            .map(BrokerResult::ChildExited)
+            .map_err(RequestFailure::from),
     }
 }
 
@@ -1380,6 +1385,8 @@ mod tests {
         }
 
         fn retire(&self, _handle: ObjectHandle) {}
+
+        fn child_state_changed(&self) {}
     }
 
     fn test_readiness_sink() -> Arc<dyn ReadinessSink> {

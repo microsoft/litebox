@@ -13,7 +13,7 @@ use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
-use litebox_broker_protocol::process::ProcessStartupData;
+use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
 
 use crate::runner::{RunnerCompletion, RunnerConfig, RunnerInstance};
 
@@ -168,7 +168,11 @@ impl UserlandProcessLauncher {
                     Err(_) => (RunnerCompletion::panicked(), true),
                 };
                 let abnormal = completion.is_abnormal(thread_panicked);
-                Self::runner_finished(&completion_process, abnormal);
+                Self::runner_finished(
+                    &completion_process,
+                    completion.process_exit_status(),
+                    abnormal,
+                );
                 if let Some(completion_sender) = completion_sender {
                     let _ = completion_sender.send(completion.into_result());
                 }
@@ -183,9 +187,14 @@ impl UserlandProcessLauncher {
         self.lifecycle.wait_for_start(&process, setup_deadline)
     }
 
-    fn runner_finished(process: &BrokerProcess, abnormal: bool) {
+    fn runner_finished(
+        process: &Arc<BrokerProcess>,
+        exit_status: ProcessExitStatus,
+        abnormal: bool,
+    ) {
         let _ = process.fail_start(BrokerError::PeerClosed, abnormal, false);
         process.retire(!abnormal);
+        let _ = process.complete_exit(exit_status);
     }
 }
 

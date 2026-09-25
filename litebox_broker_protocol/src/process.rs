@@ -32,6 +32,39 @@ pub struct ProcessIdentity {
     pub initial_thread_id: ThreadId,
 }
 
+/// Portable process termination status retained until the process is reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessExitStatus {
+    /// The process exited normally with the supplied status code.
+    Exited { code: u32 },
+    /// The process was terminated by a signal.
+    Signaled {
+        /// Signal number reported by the runner platform.
+        signal: u32,
+    },
+    /// The runner terminated without an observable platform status.
+    Unknown,
+}
+
+/// Selects the direct children a wait may consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitChildTarget {
+    /// Any direct child of the caller.
+    Any,
+    /// One direct child of the caller.
+    Process(ProcessId),
+}
+
+/// Exit status consumed from one direct child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildExit {
+    /// Reaped child process ID.
+    pub process_id: ProcessId,
+    /// Child termination status.
+    pub status: ProcessExitStatus,
+}
+
 /// Selects whether thread creation extends the current process or creates a child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateThreadRequest {

@@ -2,8 +2,10 @@
 // Licensed under the MIT license.
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 int main(int argc, char **argv) {
@@ -29,7 +31,13 @@ int main(int argc, char **argv) {
     }
 
     pid_t parent_after = getpid();
-    printf("parent before=%d after=%d child=%d\n", parent_before, parent_after,
-           child_pid);
+    int status = 0;
+    pid_t waited = waitpid(child_pid, &status, 0);
+    pid_t again = waitpid(-1, NULL, WNOHANG);
+    int again_errno = errno;
+    printf("parent before=%d after=%d child=%d waited=%d exited=%d code=%d "
+           "again=%d echild=%d\n",
+           parent_before, parent_after, child_pid, waited, WIFEXITED(status),
+           WEXITSTATUS(status), again, again == -1 && again_errno == ECHILD);
     return parent_before == parent_after ? 0 : 4;
 }

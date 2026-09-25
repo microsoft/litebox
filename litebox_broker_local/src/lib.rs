@@ -40,9 +40,9 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
-    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    ChildExit, CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource, WaitChildTarget,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -229,6 +229,19 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             response => {
                 panic!("broker returned unexpected allocate-child-process response: {response:?}")
             }
+        }
+    }
+
+    /// Consumes one terminated direct child matching `target` without blocking.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn wait_child(&self, target: WaitChildTarget) -> Result<ChildExit, Channel::Error> {
+        match self.request(BrokerOperation::WaitChild(target))? {
+            BrokerResult::ChildExited(exit) => Ok(exit),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected wait-child response: {response:?}"),
         }
     }
 
