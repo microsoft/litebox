@@ -292,7 +292,6 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.create_mapping(
                 None,
-                None,
                 NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
                 CreatePagesFlags::TOP_DOWN,
@@ -317,7 +316,6 @@ fn test_vmm_mapping() {
         unsafe {
             vmm.create_mapping(
                 Some(NonZeroAddress::new(start_addr + PAGE_SIZE).unwrap()),
-                None,
                 NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                 VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
                 CreatePagesFlags::FIXED_ADDR,

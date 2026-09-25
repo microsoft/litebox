@@ -64,14 +64,9 @@ where
     /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
     ///
     /// Also, caller must ensure flags are set correctly.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "common helper carries placement, permissions, and initialization state"
-    )]
     unsafe fn create_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
-        address_range: Option<Range<usize>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         before_perms: MemoryRegionPermissions,
@@ -83,15 +78,7 @@ where
     {
         let addr = {
             let mut vmem = self.vmem.write();
-            unsafe {
-                vmem.create_pages(
-                    suggested_address,
-                    address_range,
-                    length,
-                    flags,
-                    before_perms,
-                )
-            }?
+            unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
         };
         // call the user function with the pages
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
@@ -145,7 +132,6 @@ where
         unsafe {
             self.create_pages(
                 suggested_address,
-                None,
                 length,
                 flags,
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
@@ -184,7 +170,7 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        unsafe { self.create_pages(suggested_address, None, length, flags, perms, perms, op) }
+        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
     }
 
     /// Create read-only pages.
@@ -216,7 +202,6 @@ where
         unsafe {
             self.create_pages(
                 suggested_address,
-                None,
                 length,
                 flags,
                 // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
@@ -233,20 +218,11 @@ where
     /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
     /// Otherwise, let the kernel choose an available memory region.
     ///
-    /// If `address_range` is provided, it constrains the page manager's initial candidate. The
-    /// platform may relocate the hint outside that range. Fixed-address flags are not supported
-    /// with an address range.
-    ///
     /// `length` is the size of the pages to be created.
     ///
     /// Set `flags` to control options such as fixed address, stack, and populate pages.
     ///
     /// `op` is a callback for caller to initialize the created pages.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `address_range` is provided with [`CreatePagesFlags::FIXED_ADDR`] or
-    /// [`CreatePagesFlags::NOREPLACE`].
     ///
     /// # Safety
     ///
@@ -256,7 +232,6 @@ where
     pub unsafe fn create_inaccessible_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
-        address_range: Option<Range<usize>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         op: F,
@@ -264,14 +239,9 @@ where
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
-        assert!(
-            address_range.is_none()
-                || !flags.intersects(CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE)
-        );
         unsafe {
             self.create_pages(
                 suggested_address,
-                address_range,
                 length,
                 flags,
                 MemoryRegionPermissions::empty(),
@@ -303,11 +273,7 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let flags = CreatePagesFlags::IS_STACK | flags;
-        unsafe {
-            self.create_pages(suggested_address, None, length, flags, perms, perms, |_| {
-                Ok(0)
-            })
-        }
+        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
     }
 
     /// Release memory mappings that satisfy the given condition and reset the program break.

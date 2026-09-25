@@ -6,7 +6,7 @@
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
     fs::{Mode, OFlags},
-    mm::vmem::{CreatePagesFlags, MappingError, NonZeroPageSize, PAGE_SIZE},
+    mm::vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE},
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
@@ -94,23 +94,22 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
         let aligned_len = mapping_len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::ENOMEM)?;
-        let flags = if self.load_high {
+        let (address, flags) = if self.load_high {
             // Reserve the interpreter top-down so that it does not cap the low main executable's
             // upward-growing brk heap.
-            CreatePagesFlags::TOP_DOWN
+            (None, CreatePagesFlags::TOP_DOWN)
         } else {
-            // Place the main PIE in the first gap at or above DEFAULT_LOW_ADDR,
+            // Place the main PIE bottom-up, default to `super::DEFAULT_LOW_ADDR`,
             // preserving the low executable and upward-growing brk layout.
-            CreatePagesFlags::empty()
+            (
+                Some(NonZeroAddress::new(super::DEFAULT_LOW_ADDR).expect("nonzero ELF base")),
+                CreatePagesFlags::empty(),
+            )
         };
         // SAFETY: The inaccessible mapping is only used as an ELF address-space reservation.
         let mapping_ptr = unsafe {
             self.task.global.pm.create_inaccessible_pages(
-                None,
-                Some(
-                    super::DEFAULT_LOW_ADDR
-                        ..<Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX,
-                ),
+                address,
                 NonZeroPageSize::new(aligned_len).expect("page-aligned ELF reservation"),
                 flags,
                 |_| Ok(0),
@@ -519,7 +518,7 @@ mod tests {
         let mut pie = ElfFile::new(&task, "/pie").expect("test PIE should open");
         let reserved =
             litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
-                .expect("PIE reservation should use the next low gap");
+                .expect("PIE reservation should retry at the next low gap");
         assert_eq!(reserved, hint + PAGE_SIZE);
         task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
             .expect("failed to release test PIE reservation");

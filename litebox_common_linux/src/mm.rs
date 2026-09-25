@@ -80,7 +80,7 @@ pub fn do_mmap<
             pm.create_readable_pages(suggested_addr, length, flags, op)
         },
         ProtFlags::PROT_NONE => unsafe {
-            pm.create_inaccessible_pages(suggested_addr, None, length, flags, op)
+            pm.create_inaccessible_pages(suggested_addr, length, flags, op)
         },
         _ => {
             #[cfg(debug_assertions)]
@@ -89,7 +89,7 @@ pub fn do_mmap<
             // for both executable and writable might be needed for JIT.
             #[cfg(not(debug_assertions))]
             unsafe {
-                pm.create_inaccessible_pages(suggested_addr, None, length, flags, op)
+                pm.create_inaccessible_pages(suggested_addr, length, flags, op)
             }
         }
     }

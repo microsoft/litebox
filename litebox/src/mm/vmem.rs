@@ -212,7 +212,7 @@ bitflags::bitflags! {
         const SHARED = 1 << 6;
         /// Search for free address space from high addresses toward low addresses.
         ///
-        /// This controls the page manager's initial candidate. However, the candidate may collide
+        /// This controls the page manager's initial candidate. However, the candidate may collides
         /// with address space not tracked by the page manager (due to external allocators), and
         /// a platform may relocate a hint to a different address using its own search strategy.
         const TOP_DOWN = 1 << 7;
@@ -649,7 +649,6 @@ where
     pub(super) unsafe fn create_mapping(
         &mut self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
-        address_range: Option<Range<usize>>,
         length: NonZeroPageSize<ALIGN>,
         vma: VmArea,
         flags: CreatePagesFlags,
@@ -665,7 +664,6 @@ where
         let new_addr = self
             .get_unmmaped_area(
                 suggested_address,
-                address_range,
                 total_length,
                 behavior,
                 flags.contains(CreatePagesFlags::TOP_DOWN),
@@ -807,7 +805,6 @@ where
         let new_addr = self
             .get_unmmaped_area(
                 suggested_new_address,
-                None,
                 new_size,
                 FixedAddressBehavior::Hint,
                 true,
@@ -925,7 +922,6 @@ where
     pub(super) unsafe fn create_pages(
         &mut self,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
-        address_range: Option<Range<usize>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         perms: MemoryRegionPermissions,
@@ -935,7 +931,6 @@ where
         unsafe {
             self.create_mapping(
                 suggested_new_address,
-                address_range,
                 length,
                 VmArea::new(
                     VmFlags::from(perms)
@@ -981,42 +976,34 @@ where
     /// Get an unmapped area in the virtual address space.
     /// `suggested_address` and `behavior` are the hint address and placement policy respectively,
     /// similar to how `mmap` works.
-    /// `address_range`, when provided, constrains the page manager's candidate search.
     ///
     /// Returns `None` if no area was found. Otherwise, returns the start address of an
     /// `ALIGN`-aligned area.
     pub(super) fn get_unmmaped_area(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
-        address_range: Option<Range<usize>>,
         length: NonZeroPageSize<ALIGN>,
         behavior: FixedAddressBehavior,
         top_down: bool,
     ) -> Result<Option<usize>, AllocationError> {
-        let (address_range, alignment) = if let Some(address_range) = address_range {
-            debug_assert_eq!(behavior, FixedAddressBehavior::Hint);
-            (address_range, ALIGN)
+        let address_range_start = if !top_down && behavior == FixedAddressBehavior::Hint {
+            suggested_address.map_or(Platform::TASK_ADDR_MIN, NonZeroAddress::as_usize)
         } else {
-            let address_range_start = if !top_down && behavior == FixedAddressBehavior::Hint {
-                suggested_address.map_or(Platform::TASK_ADDR_MIN, NonZeroAddress::as_usize)
-            } else {
-                Platform::TASK_ADDR_MIN
-            };
-            let address_range_end = if suggested_address.is_none() {
-                // Some platform may allocate more than requested to satisfy alignment requirements,
-                // so we restrict the maximum address to avoid exceeding the platform's addressable range.
-                Platform::TASK_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1)
-            } else {
-                Platform::TASK_ADDR_MAX
-            };
-            let alignment = if suggested_address.is_none() {
-                // When no specific address is suggested, use the platform's reservation alignment
-                // to minimize fragmentation and number of system calls.
-                Platform::RESERVATION_ALIGNMENT
-            } else {
-                ALIGN
-            };
-            (address_range_start..address_range_end, alignment)
+            Platform::TASK_ADDR_MIN
+        };
+        let address_range_end = if suggested_address.is_none() {
+            // Some platform may allocate more than requested to satisfy alignment requirements,
+            // so we restrict the maximum address to avoid exceeding the platform's addressable range.
+            Platform::TASK_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1)
+        } else {
+            Platform::TASK_ADDR_MAX
+        };
+        let alignment = if suggested_address.is_none() {
+            // When no specific address is suggested, use the platform's reservation alignment
+            // to minimize fragmentation and number of system calls.
+            Platform::RESERVATION_ALIGNMENT
+        } else {
+            ALIGN
         };
         Self::find_area(
             &self.reservations,
@@ -1027,7 +1014,7 @@ where
                 behavior,
                 alignment,
                 include_reservations: false,
-                address_range,
+                address_range: address_range_start..address_range_end,
                 top_down,
             },
         )
