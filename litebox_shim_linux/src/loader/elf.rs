@@ -623,11 +623,27 @@ mod tests {
         crate::syscalls::tests::create_file(
             &task,
             "/invalid",
-            &elf_with_load_sizes(ET_EXEC, None, page_size, page_size - 1),
+            &elf_with_load_sizes(ET_DYN, None, page_size, page_size - 1),
         );
 
         assert!(matches!(
             ElfLoader::new(&task, "/invalid"),
+            Err(ElfLoaderError::ParseError(
+                litebox_common_linux::loader::ElfParseError::BadFormat
+            ))
+        ));
+    }
+
+    #[test]
+    fn elf_loader_rejects_empty_program_header_table_during_parse() {
+        let task = crate::syscalls::tests::init_platform();
+        let mut elf = Vec::new();
+        append_elf_header(&mut elf, ET_DYN, 0, 0);
+        elf.resize(PAGE_SIZE, 0);
+        crate::syscalls::tests::create_file(&task, "/empty", &elf);
+
+        assert!(matches!(
+            ElfLoader::new(&task, "/empty"),
             Err(ElfLoaderError::ParseError(
                 litebox_common_linux::loader::ElfParseError::BadFormat
             ))

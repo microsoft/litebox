@@ -227,7 +227,7 @@ impl ElfParsedFile {
         } else {
             size_of::<elf::segment::Elf32_Phdr>()
         };
-        if usize::from(header.e_phentsize) != phent_size {
+        if header.e_phnum == 0 || usize::from(header.e_phentsize) != phent_size {
             return Err(ElfParseError::BadFormat);
         }
         // Limit to 64KB of program headers.
