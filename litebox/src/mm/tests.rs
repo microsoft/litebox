@@ -10,15 +10,34 @@ use crate::{
     mm::vmem::{CreatePagesFlags, NonZeroAddress},
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::MemoryRegionPermissions,
+        page_mgmt::{MemoryRegionPermissions, ReservationStore as _},
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
 };
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::vmem::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
+    MappingState, NoTrackedReservations, NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags,
+    Vmem, VmemProtectError, VmemResizeError,
 };
+
+#[test]
+fn mapping_state_supports_untracked_reservations() {
+    let mut state = MappingState::<NoTrackedReservations>::default();
+    state
+        .vmas
+        .insert(0x1000..0x2000, VmArea::new(VmFlags::VM_READ, false));
+
+    assert!(state.vmas.contains_key(&0x1000));
+    assert_eq!(state.reservations.iter().count(), 0);
+    assert_eq!(state.reservations.overlapping(0x1000..0x2000).count(), 0);
+    assert!(
+        state
+            .reservations
+            .take_overlapping(0x1000..0x2000)
+            .is_empty()
+    );
+}
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;

@@ -14,8 +14,8 @@ use core::ops::Range;
 
 use alloc::vec::Vec;
 use vmem::{
-    CreatePagesFlags, MappingError, PageFaultError, PageRange, VmArea, VmFlags, Vmem,
-    VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
+    CreatePagesFlags, MappingError, NoTrackedReservations, PageFaultError, PageRange, VmArea,
+    VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError, VmemUnmapError,
 };
 
 use crate::{
@@ -33,7 +33,7 @@ pub struct PageManager<Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    vmem: RwLock<Platform, Vmem<Platform, ALIGN>>,
+    vmem: RwLock<Platform, Vmem<Platform, ALIGN, NoTrackedReservations>>,
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>

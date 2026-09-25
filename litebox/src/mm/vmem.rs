@@ -5,7 +5,7 @@
 //! backed by a memory [backend](PageManagementProvider). It provides functionality to create, remove, resize,
 //! move, and protect memory mappings within a process's virtual address space.
 
-use core::ops::Range;
+use core::ops::{Deref, DerefMut, Range};
 
 use alloc::vec::Vec;
 use rangemap::RangeMap;
@@ -16,6 +16,49 @@ use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::page_mgmt::{PageReservation, ReservationStore};
+
+/// Reservation store for page managers that do not retain reservation handles.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct NoTrackedReservations;
+
+/// Uninhabited reservation type used by [`NoTrackedReservations`].
+#[doc(hidden)]
+pub enum NoTrackedReservation {}
+
+impl PageReservation for NoTrackedReservation {
+    fn range(&self) -> Range<usize> {
+        match *self {}
+    }
+}
+
+impl ReservationStore for NoTrackedReservations {
+    type Reservation = NoTrackedReservation;
+
+    fn insert(
+        &mut self,
+        _base: usize,
+        reservation: Self::Reservation,
+    ) -> Option<Self::Reservation> {
+        match reservation {}
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Self::Reservation)> {
+        core::iter::empty()
+    }
+
+    fn overlapping(
+        &self,
+        _range: Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)> {
+        core::iter::empty()
+    }
+
+    fn take_overlapping(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
+        Vec::new()
+    }
+}
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -293,26 +336,77 @@ impl VmArea {
     }
 }
 
+/// Committed mappings and their reservation ownership.
+pub(super) struct MappingState<Store: ReservationStore> {
+    /// Virtual memory areas.
+    pub(super) vmas: RangeMap<usize, VmArea>,
+    /// Reservation handles associated with the mappings.
+    #[allow(
+        dead_code,
+        reason = "page managers intentionally use NoTrackedReservations for now"
+    )]
+    pub(super) reservations: Store,
+}
+
+impl<Store: ReservationStore + Default> Default for MappingState<Store> {
+    fn default() -> Self {
+        Self {
+            vmas: RangeMap::new(),
+            reservations: Store::default(),
+        }
+    }
+}
+
 /// Virtual Memory Manager
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
 /// Each range needs to be `ALIGN`-aligned.
-pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
+pub(super) struct Vmem<
+    Platform: PageManagementProvider<ALIGN> + 'static,
+    const ALIGN: usize,
+    Store: ReservationStore = NoTrackedReservations,
+> {
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
     /// Current program break address.
     pub(super) brk: usize,
-    /// Virtual memory areas.
-    vmas: RangeMap<usize, VmArea>,
+    /// Committed mappings and their reservation ownership.
+    pub(super) mappings: MappingState<Store>,
 }
 
-impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
+impl<Platform, const ALIGN: usize, Store> Deref for Vmem<Platform, ALIGN, Store>
+where
+    Platform: PageManagementProvider<ALIGN> + 'static,
+    Store: ReservationStore,
+{
+    type Target = MappingState<Store>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mappings
+    }
+}
+
+impl<Platform, const ALIGN: usize, Store> DerefMut for Vmem<Platform, ALIGN, Store>
+where
+    Platform: PageManagementProvider<ALIGN> + 'static,
+    Store: ReservationStore,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.mappings
+    }
+}
+
+impl<Platform, const ALIGN: usize, Store> Vmem<Platform, ALIGN, Store>
+where
+    Platform: PageManagementProvider<ALIGN> + 'static,
+    Store: ReservationStore + Default,
+{
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
     pub(super) fn new(platform: &'static Platform) -> Self {
         let mut vmem = Self {
-            vmas: RangeMap::new(),
+            mappings: MappingState::default(),
             brk: 0,
             platform,
         };
@@ -709,6 +803,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .get_key_value(&old_range.start)
             .expect("VMEM: range not found");
         assert!(cur_range.contains(&(old_range.end - 1)));
+        let vma = *vma;
 
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
@@ -725,7 +820,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
 
         let new_start = new_addr.as_usize();
         let new_end = new_start + new_size.as_usize();
-        self.vmas.insert(new_start..new_end, *vma);
+        self.vmas.insert(new_start..new_end, vma);
         self.vmas.remove(old_range.into());
         Ok(new_addr)
     }
