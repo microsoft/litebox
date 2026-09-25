@@ -94,12 +94,17 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
         let aligned_len = mapping_len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::ENOMEM)?;
-        let address = (!self.load_high)
-            .then(|| NonZeroAddress::new(super::DEFAULT_LOW_ADDR).expect("nonzero ELF base"));
-        let flags = if self.load_high {
-            CreatePagesFlags::TOP_DOWN
+        let (address, flags) = if self.load_high {
+            // Reserve the interpreter top-down so that it does not cap the low main executable's
+            // upward-growing brk heap.
+            (None, CreatePagesFlags::TOP_DOWN)
         } else {
-            CreatePagesFlags::empty()
+            // Place the main PIE bottom-up, default to `super::DEFAULT_LOW_ADDR`,
+            // preserving the low executable and upward-growing brk layout.
+            (
+                Some(NonZeroAddress::new(super::DEFAULT_LOW_ADDR).expect("nonzero ELF base")),
+                CreatePagesFlags::empty(),
+            )
         };
         // SAFETY: The inaccessible mapping is only used as an ELF address-space reservation.
         let mapping_ptr = unsafe {

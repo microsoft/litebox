@@ -371,10 +371,6 @@ pub(super) struct MappingState<Store: ReservationStore> {
     /// Virtual memory areas.
     pub(super) vmas: RangeMap<usize, VmArea>,
     /// Reservation handles associated with the mappings.
-    #[allow(
-        dead_code,
-        reason = "page managers intentionally use NoTrackedReservations for now"
-    )]
     pub(super) reservations: Store,
 }
 
