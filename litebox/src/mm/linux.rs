@@ -129,6 +129,7 @@ where
             unsafe {
                 vmem.create_pages(
                     Some(suggested_address),
+                    None,
                     length,
                     CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                     perms,
