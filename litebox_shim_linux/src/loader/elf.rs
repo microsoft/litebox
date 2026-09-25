@@ -559,7 +559,12 @@ mod tests {
         push_u64(buf, ph.align);
     }
 
-    fn minimal_elf(elf_type: u16, interp: Option<&[u8]>) -> Vec<u8> {
+    fn elf_with_load_sizes(
+        elf_type: u16,
+        interp: Option<&[u8]>,
+        filesz: u64,
+        memsz: u64,
+    ) -> Vec<u8> {
         let phnum = if interp.is_some() { 2 } else { 1 };
         let page_size = u64::try_from(PAGE_SIZE).expect("PAGE_SIZE fits u64");
         let entry = if elf_type == ET_EXEC {
@@ -580,8 +585,8 @@ mod tests {
                 } else {
                     0
                 },
-                filesz: page_size,
-                memsz: page_size,
+                filesz,
+                memsz,
                 align: page_size,
             },
         );
@@ -604,6 +609,29 @@ mod tests {
             buf[INTERP_PATH_OFFSET..INTERP_PATH_OFFSET + interp.len()].copy_from_slice(interp);
         }
         buf
+    }
+
+    fn minimal_elf(elf_type: u16, interp: Option<&[u8]>) -> Vec<u8> {
+        let page_size = u64::try_from(PAGE_SIZE).expect("PAGE_SIZE fits u64");
+        elf_with_load_sizes(elf_type, interp, page_size, page_size)
+    }
+
+    #[test]
+    fn elf_loader_rejects_load_segment_larger_than_memory_during_parse() {
+        let task = crate::syscalls::tests::init_platform();
+        let page_size = u64::try_from(PAGE_SIZE).expect("PAGE_SIZE fits u64");
+        crate::syscalls::tests::create_file(
+            &task,
+            "/invalid",
+            &elf_with_load_sizes(ET_EXEC, None, page_size, page_size - 1),
+        );
+
+        assert!(matches!(
+            ElfLoader::new(&task, "/invalid"),
+            Err(ElfLoaderError::ParseError(
+                litebox_common_linux::loader::ElfParseError::BadFormat
+            ))
+        ));
     }
 
     #[test]

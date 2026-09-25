@@ -691,11 +691,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Begins a constrained `vfork` child in the current runner.
     ///
-    /// Only single-threaded processes with default transferable state are admitted. The parent
-    /// remains suspended until the child successfully transfers to a fresh runner through
-    /// `execve`. The child must not change standard descriptor mappings or flags, or
-    /// platform-managed architectural state outside [`litebox_common_linux::PtRegs`], because the
-    /// current transfer does not preserve that state.
+    /// Only single-threaded processes with default filesystem, signal, resource-limit, alarm, and
+    /// transferable descriptor state are admitted. The parent remains suspended until the child
+    /// successfully transfers to a fresh runner through `execve`. The child must not change
+    /// standard descriptor mappings or flags, or platform-managed architectural state outside
+    /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that state.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
@@ -703,6 +703,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             || !self.files.borrow().has_only_standard_descriptor_numbers()
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
             || !self.signals.has_default_signal_state()
+            || !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
         {
             return Err(Errno::EAGAIN);
@@ -961,16 +962,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
 // TODO: enforce the following limits:
 pub(crate) const RLIMIT_NOFILE_CUR: usize = 1024 * 1024;
 const RLIMIT_NOFILE_MAX: usize = 1024 * 1024;
+type ResourceLimitValues =
+    [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS];
 
 pub(crate) struct ResourceLimits<Platform: ShimPlatform> {
-    limits: RwLock<
-        Platform,
-        [litebox_common_linux::Rlimit; litebox_common_linux::RlimitResource::RLIM_NLIMITS],
-    >,
+    limits: RwLock<Platform, ResourceLimitValues>,
 }
 
 impl<Platform: ShimPlatform> ResourceLimits<Platform> {
-    fn default() -> Self {
+    fn default_values() -> ResourceLimitValues {
         let mut limits = [const {
             litebox_common_linux::Rlimit {
                 rlim_cur: 0,
@@ -987,9 +987,24 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
                 rlim_cur: crate::loader::DEFAULT_STACK_SIZE,
                 rlim_max: litebox_common_linux::rlim_t::MAX,
             };
+        limits
+    }
+
+    fn default() -> Self {
         Self {
-            limits: RwLock::new(limits),
+            limits: RwLock::new(Self::default_values()),
         }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn has_default_state(&self) -> bool {
+        self.limits
+            .read()
+            .iter()
+            .zip(Self::default_values())
+            .all(|(actual, expected)| {
+                actual.rlim_cur == expected.rlim_cur && actual.rlim_max == expected.rlim_max
+            })
     }
 
     pub(crate) fn get_rlimit_cur(&self, resource: litebox_common_linux::RlimitResource) -> usize {
@@ -2102,6 +2117,29 @@ mod tests {
 
         writer_a.join().unwrap();
         writer_b.join().unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vfork_rejects_nondefault_resource_limits() {
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::{PtRegs, Rlimit, RlimitResource, errno::Errno};
+
+        let task = init_platform();
+        assert!(task.process().limits.has_default_state());
+
+        let default = task.do_prlimit(RlimitResource::NOFILE, None).unwrap();
+        task.do_prlimit(
+            RlimitResource::NOFILE,
+            Some(Rlimit {
+                rlim_cur: default.rlim_cur - 1,
+                rlim_max: default.rlim_max,
+            }),
+        )
+        .unwrap();
+
+        assert!(!task.process().limits.has_default_state());
+        assert_eq!(task.sys_vfork(&PtRegs::default()), Err(Errno::EAGAIN));
     }
 
     #[cfg(target_arch = "x86_64")]

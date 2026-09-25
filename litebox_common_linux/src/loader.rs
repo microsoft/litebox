@@ -240,6 +240,17 @@ impl ElfParsedFile {
         file.read_at(header.e_phoff, &mut phdrs)
             .map_err(ElfParseError::Io)?;
 
+        // Callers use parsing as the recoverable exec preflight before replacing the old image.
+        let table = elf::segment::SegmentTable::new(header.endianness, CLASS, &phdrs);
+        for ph in table.iter().filter(|ph| ph.p_type == elf::abi::PT_LOAD) {
+            if ph.p_filesz > ph.p_memsz
+                || ph.p_vaddr.checked_add(ph.p_memsz).is_none()
+                || ph.p_offset.checked_add(ph.p_filesz).is_none()
+            {
+                return Err(ElfParseError::BadFormat);
+            }
+        }
+
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             // Reject LOADs that overlap after guest-page alignment.
