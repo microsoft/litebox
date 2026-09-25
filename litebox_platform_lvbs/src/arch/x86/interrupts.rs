@@ -6,25 +6,18 @@
 //! This module sets up the IDT with assembly-based ISR stubs, avoiding the need for
 //! the unstable `abi_x86_interrupt` feature.
 //!
-//! # Exceptions Not Handled
-//!
-//! The following exceptions are intentionally not handled in this IDT:
-//!
-//! - **NMI (Vector 2)**: Non-Maskable Interrupts are delivered to VTL0 and handled
-//!   by the VTL0 kernel. VTL1 does not receive NMIs.
-//!
-//! - **MCE (Vector 18)**: Machine Check Exceptions are delivered to VTL0 and handled
-//!   by the VTL0 kernel. VTL1 does not receive MCEs.
+//! This builds CPU-exception entries only. Platforms/runners own the IDT's
+//! lifetime, external IRQ entries, and any additional exception policy (including
+//! NMI/MCE, which are not installed here).
 
-use crate::host::lvbs::timer::{self, SPURIOUS_VECTOR, STIMER_VECTOR};
-use crate::mshv::HYPERVISOR_CALLBACK_VECTOR;
-use core::ops::IndexMut;
 use litebox_common_linux::PtRegs;
-use spin::Once;
 use x86_64::{VirtAddr, structures::idt::InterruptDescriptorTable};
 
 // Include assembly ISR stubs
-core::arch::global_asm!(include_str!("interrupts.S"));
+core::arch::global_asm!(
+    include_str!("interrupts_macros.S"),
+    include_str!("interrupts.S")
+);
 
 // External symbols for assembly ISR stubs
 unsafe extern "C" {
@@ -42,66 +35,53 @@ unsafe extern "C" {
     fn isr_x87_floating_point();
     fn isr_alignment_check();
     fn isr_simd_floating_point();
-    fn isr_hyperv_sint();
-    fn isr_stimer();
-    fn isr_spurious();
 }
 
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-fn idt() -> &'static InterruptDescriptorTable {
-    static IDT_ONCE: Once<InterruptDescriptorTable> = Once::new();
-    IDT_ONCE.call_once(|| {
-        let mut idt = InterruptDescriptorTable::new();
+/// Build the shared synchronous-exception entries after installing the kernel
+/// GDT/TSS. The double-fault entry uses IST slot zero, whose stack the caller
+/// must configure. The caller adds platform IRQs and provides a permanent table
+/// before loading it on each CPU.
+pub fn exception_idt() -> InterruptDescriptorTable {
+    let mut idt = InterruptDescriptorTable::new();
 
-        // Safety: These are valid function pointers to assembly ISR stubs that properly
-        // handle the interrupt calling convention (save/restore registers, iretq).
-        unsafe {
-            idt.divide_error
-                .set_handler_addr(VirtAddr::from_ptr(isr_divide_error as *const ()));
-            idt.debug
-                .set_handler_addr(VirtAddr::from_ptr(isr_debug as *const ()));
-            idt.breakpoint
-                .set_handler_addr(VirtAddr::from_ptr(isr_breakpoint as *const ()));
-            idt.overflow
-                .set_handler_addr(VirtAddr::from_ptr(isr_overflow as *const ()));
-            idt.bound_range_exceeded
-                .set_handler_addr(VirtAddr::from_ptr(isr_bound_range_exceeded as *const ()));
-            idt.invalid_opcode
-                .set_handler_addr(VirtAddr::from_ptr(isr_invalid_opcode as *const ()));
-            idt.device_not_available
-                .set_handler_addr(VirtAddr::from_ptr(isr_device_not_available as *const ()));
-            idt.double_fault
-                .set_handler_addr(VirtAddr::from_ptr(isr_double_fault as *const ()))
-                .set_stack_index(DOUBLE_FAULT_IST_INDEX);
-            idt.stack_segment_fault
-                .set_handler_addr(VirtAddr::from_ptr(isr_stack_segment_fault as *const ()));
-            idt.general_protection_fault
-                .set_handler_addr(VirtAddr::from_ptr(
-                    isr_general_protection_fault as *const (),
-                ));
-            idt.page_fault
-                .set_handler_addr(VirtAddr::from_ptr(isr_page_fault as *const ()));
-            idt.x87_floating_point
-                .set_handler_addr(VirtAddr::from_ptr(isr_x87_floating_point as *const ()));
-            idt.alignment_check
-                .set_handler_addr(VirtAddr::from_ptr(isr_alignment_check as *const ()));
-            idt.simd_floating_point
-                .set_handler_addr(VirtAddr::from_ptr(isr_simd_floating_point as *const ()));
-            idt.index_mut(HYPERVISOR_CALLBACK_VECTOR)
-                .set_handler_addr(VirtAddr::from_ptr(isr_hyperv_sint as *const ()));
-            idt.index_mut(STIMER_VECTOR)
-                .set_handler_addr(VirtAddr::from_ptr(isr_stimer as *const ()));
-            idt.index_mut(SPURIOUS_VECTOR)
-                .set_handler_addr(VirtAddr::from_ptr(isr_spurious as *const ()));
-        }
-        idt
-    })
-}
-
-/// Initialize IDT (for a core)
-pub fn init_idt() {
-    idt().load();
+    // Safety: These are valid function pointers to assembly ISR stubs that properly
+    // handle the interrupt calling convention (save/restore registers, iretq).
+    unsafe {
+        idt.divide_error
+            .set_handler_addr(VirtAddr::from_ptr(isr_divide_error as *const ()));
+        idt.debug
+            .set_handler_addr(VirtAddr::from_ptr(isr_debug as *const ()));
+        idt.breakpoint
+            .set_handler_addr(VirtAddr::from_ptr(isr_breakpoint as *const ()));
+        idt.overflow
+            .set_handler_addr(VirtAddr::from_ptr(isr_overflow as *const ()));
+        idt.bound_range_exceeded
+            .set_handler_addr(VirtAddr::from_ptr(isr_bound_range_exceeded as *const ()));
+        idt.invalid_opcode
+            .set_handler_addr(VirtAddr::from_ptr(isr_invalid_opcode as *const ()));
+        idt.device_not_available
+            .set_handler_addr(VirtAddr::from_ptr(isr_device_not_available as *const ()));
+        idt.double_fault
+            .set_handler_addr(VirtAddr::from_ptr(isr_double_fault as *const ()))
+            .set_stack_index(DOUBLE_FAULT_IST_INDEX);
+        idt.stack_segment_fault
+            .set_handler_addr(VirtAddr::from_ptr(isr_stack_segment_fault as *const ()));
+        idt.general_protection_fault
+            .set_handler_addr(VirtAddr::from_ptr(
+                isr_general_protection_fault as *const (),
+            ));
+        idt.page_fault
+            .set_handler_addr(VirtAddr::from_ptr(isr_page_fault as *const ()));
+        idt.x87_floating_point
+            .set_handler_addr(VirtAddr::from_ptr(isr_x87_floating_point as *const ()));
+        idt.alignment_check
+            .set_handler_addr(VirtAddr::from_ptr(isr_alignment_check as *const ()));
+        idt.simd_floating_point
+            .set_handler_addr(VirtAddr::from_ptr(isr_simd_floating_point as *const ()));
+    }
+    idt
 }
 
 // TODO: Let's consider whether we can recover some of the below exceptions instead of panicking.
@@ -198,31 +178,3 @@ extern "C" fn alignment_check_handler_impl(regs: &PtRegs) {
 extern "C" fn simd_floating_point_handler_impl(regs: &PtRegs) {
     panic!("EXCEPTION: SIMD FLOATING-POINT ERROR\n{regs:#x?}");
 }
-
-/// Handles an STIMER preemption-timer fire delivered in kernel mode (vector
-/// 0x40); the common case fires in user mode (`exception_callback`). Re-arm
-/// only while the `preemption_armed` flag is set. A stale fire (the flag is
-/// clear) is just ACKed.
-///
-/// Two invariants keep the re-arm safe: `arm`/`disarm` set the flag before /
-/// clear it after the STIMER MSR, so no fire leaves the timer disarmed while
-/// the preemption target (i.e., user-mode code) keeps running. In-VTL1
-/// handlers run with IF clear, so an in-scope kernel-mode fire only lands
-/// in the bounded init/reenter prologue, where the re-arm just refreshes
-/// that prologue's quantum.
-#[unsafe(no_mangle)]
-extern "C" fn stimer_handler_impl(_regs: &PtRegs) {
-    use crate::per_cpu_variables::with_per_cpu_variables;
-    timer::eoi();
-    if with_per_cpu_variables(|pcv| pcv.preemption_armed.get()) {
-        timer::rearm_preemption();
-    }
-}
-
-// Note: isr_hyperv_sint is defined in interrupts.S as a minimal stub that only
-// performs iretq. This synthetic interrupt is an exception for VTL0 security
-// violations (e.g., tampering with write-protected MSRs) delivered by Hyper-V
-// to VTL1 as a SINT. Since the handler does nothing, registers are naturally
-// preserved. After iretq, the VTL switch loop will save registers and handle
-// the violation. VTL1 is not executed concurrently with VTL0, so an immediate
-// iretq is safe.

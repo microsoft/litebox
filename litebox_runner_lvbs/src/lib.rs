@@ -21,9 +21,9 @@ use litebox_common_optee::{
 use litebox_platform_lvbs::host::lvbs::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
 use litebox_platform_lvbs::{
-    arch::{gdt, instrs::hlt_loop, interrupts},
+    arch::{gdt, instrs::hlt_loop},
     debug_serial_println,
-    host::lvbs::{bootparam::get_vtl1_memory_info, per_cpu_variables, timer},
+    host::lvbs::{bootparam::get_vtl1_memory_info, interrupts, per_cpu_variables, timer},
     mm::MemoryProvider,
     mshv::{
         hvcall,
@@ -702,6 +702,7 @@ fn open_session_single_instance(
         litebox_platform_lvbs::reenter_thread_ref(
             instance.loaded_program().entrypoints.as_ref().unwrap(),
             &mut ctx,
+            &timer::LvbsTimer,
         );
     }
 
@@ -871,6 +872,7 @@ fn open_session_new_instance(
         litebox_platform_lvbs::run_thread_ref(
             loaded_program.entrypoints.as_ref().unwrap(),
             &mut ldelf_ctx,
+            &timer::LvbsTimer,
         );
     }
 
@@ -938,6 +940,7 @@ fn open_session_new_instance(
         litebox_platform_lvbs::reenter_thread_ref(
             loaded_program.entrypoints.as_ref().unwrap(),
             &mut ctx,
+            &timer::LvbsTimer,
         );
     }
 
@@ -1110,6 +1113,7 @@ fn handle_invoke_command(
             litebox_platform_lvbs::reenter_thread_ref(
                 instance.loaded_program().entrypoints.as_ref().unwrap(),
                 &mut ctx,
+                &timer::LvbsTimer,
             );
         }
 
@@ -1228,6 +1232,7 @@ fn handle_close_session(
             litebox_platform_lvbs::reenter_thread_ref(
                 instance.loaded_program().entrypoints.as_ref().unwrap(),
                 &mut ctx,
+                &timer::LvbsTimer,
             );
         }
 

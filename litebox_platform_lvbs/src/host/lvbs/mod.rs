@@ -11,6 +11,7 @@
 pub mod boot;
 pub mod bootparam;
 pub mod clock;
+pub mod interrupts;
 pub mod linux;
 pub mod per_cpu_variables;
 pub mod phys_memory;

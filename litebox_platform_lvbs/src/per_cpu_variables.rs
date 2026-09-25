@@ -35,9 +35,6 @@ pub struct PerCpuVariables {
     _guard_page_1: [u8; PAGE_SIZE],
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<VirtAddr>,
-    pub(crate) preemption_timer_enabled: Cell<bool>,
-    pub(crate) preemption_armed: Cell<bool>,
-    pub(crate) preemption_timeout_killed_user: Cell<bool>,
     active_page_table: UnsafeCell<Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
 }
 

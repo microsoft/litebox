@@ -34,6 +34,7 @@ pub struct LvbsPerCpuVariables {
     /// scopes. Rust accesses it only between save and load while VTL1 runs.
     pub(crate) vtl0_state: Cell<VtlState>,
     pub(crate) vtl0_locked_regs: Cell<ControlRegMap>,
+    pub(crate) timer: super::timer::PreemptionState,
     /// u32::MAX means that the Hyper-V VP index has not been cached yet.
     vp_index: Cell<u32>,
 }

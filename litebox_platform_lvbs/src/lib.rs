@@ -6,7 +6,7 @@
 #![cfg(target_arch = "x86_64")]
 #![no_std]
 
-use crate::host::lvbs::timer;
+use crate::execution::ExecutionTimer;
 use crate::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
@@ -32,6 +32,7 @@ use zerocopy::{FromBytes, IntoBytes};
 extern crate alloc;
 
 pub mod arch;
+pub mod execution;
 pub mod host;
 pub mod mm;
 pub mod mshv;
@@ -964,8 +965,11 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
-where
+pub unsafe fn run_thread<T>(
+    shim: T,
+    ctx: &mut litebox_common_linux::PtRegs,
+    timer: &dyn ExecutionTimer,
+) where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
     // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
@@ -973,7 +977,7 @@ where
     // This `swapgs` usage can pontetially leak a kernel address to the user, so
     // we clear the `KernelGsBase` MSR before running the user thread.
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
-    run_thread_inner(&shim, ctx, false);
+    run_thread_inner(&shim, ctx, timer, false);
 }
 
 /// Run a user thread using a reference to the shim.
@@ -983,12 +987,15 @@ where
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
-where
+pub unsafe fn run_thread_ref<T>(
+    shim: &T,
+    ctx: &mut litebox_common_linux::PtRegs,
+    timer: &dyn ExecutionTimer,
+) where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
-    run_thread_inner(shim, ctx, false);
+    run_thread_inner(shim, ctx, timer, false);
 }
 
 /// Re-enter a user thread using a reference to the shim.
@@ -998,33 +1005,54 @@ where
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs)
-where
+pub unsafe fn reenter_thread_ref<T>(
+    shim: &T,
+    ctx: &mut litebox_common_linux::PtRegs,
+    timer: &dyn ExecutionTimer,
+) where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
-    run_thread_inner(shim, ctx, true);
+    run_thread_inner(shim, ctx, timer, true);
 }
 
 struct ThreadContext<'a> {
     shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &'a mut litebox_common_linux::PtRegs,
+    timer: &'a dyn ExecutionTimer,
+}
+
+impl<'a> ThreadContext<'a> {
+    fn new(
+        shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+        ctx: &'a mut litebox_common_linux::PtRegs,
+        timer: &'a dyn ExecutionTimer,
+    ) -> Self {
+        // Idempotent within the platform's execution window; reentry must not
+        // extend its deadline. The platform/runner owns the disarm boundary.
+        timer.arm();
+        Self { shim, ctx, timer }
+    }
+
+    fn handle_exception(&mut self, info: &litebox::shim::ExceptionInfo) -> ContinueOperation {
+        if !info.kernel_mode {
+            self.timer.on_user_exception(info.exception);
+        }
+        self.call_shim(|shim, ctx| shim.exception(ctx, info))
+    }
 }
 
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
+    timer: &dyn ExecutionTimer,
     reenter: bool,
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
-    let mut thread_ctx = ThreadContext { shim, ctx };
+    let mut thread_ctx = ThreadContext::new(shim, ctx, timer);
     // `thread_ctx` will be passed to `syscall_handler` later.
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
-    //
-    // Arm the preemption timer for this user-thread execution. This function is
-    // idempotent, so `reenter` does not change the timeout.
-    timer::arm_preemption();
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
     // the duration of the call, and `run_thread_arch` returns exactly once.
     unsafe {
@@ -1285,6 +1313,16 @@ macro_rules! RESTORE_CPU_CONTEXT_ASM {
     };
 }
 
+// ISR stubs target secondary labels emitted inside run_thread_arch. Rust cannot
+// see those assembly-only references, so retain the trampoline even when a
+// boot-only runner (or host test) builds an IDT without entering user mode.
+#[used]
+static USER_EXECUTION_ENTRY: unsafe extern "C" fn(
+    &mut ThreadContext<'_>,
+    *mut litebox_common_linux::PtRegs,
+    u8,
+) = run_thread_arch;
+
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 unsafe extern "C" fn run_thread_arch(
@@ -1544,13 +1582,7 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: false,
         }
     };
-    // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
-    // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
-    if !kernel_mode && info.exception.0 == timer::STIMER_VECTOR {
-        timer::eoi();
-        timer::mark_user_timeout_kill();
-    }
-    match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
+    match thread_ctx.handle_exception(&info) {
         ContinueOperation::Resume => {
             if kernel_mode {
                 // Kernel-mode exception handled (e.g., demand paging succeeded).
