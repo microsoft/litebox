@@ -32,6 +32,23 @@ pub struct ProcessIdentity {
     pub initial_thread_id: ThreadId,
 }
 
+/// Portable process termination status retained until the process is reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessExitStatus {
+    /// The process exited normally with the supplied status code.
+    Exited { code: u32 },
+    /// The process was terminated by a signal.
+    Signaled {
+        /// Signal number reported by the runner platform.
+        signal: u32,
+        /// Whether the runner platform reported a core dump.
+        core_dumped: bool,
+    },
+    /// The runner terminated without an observable platform status.
+    Unknown,
+}
+
 /// Selects whether thread creation extends the current process or creates a child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateThreadRequest {
