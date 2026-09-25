@@ -693,12 +693,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Only single-threaded processes with default transferable state are admitted. The parent
     /// remains suspended until the child successfully transfers to a fresh runner through
-    /// `execve`.
+    /// `execve`. The child must not change standard descriptor mappings or flags, or
+    /// platform-managed architectural state outside [`litebox_common_linux::PtRegs`], because the
+    /// current transfer does not preserve that state.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
             || self.thread.process.nr_threads() != 1
-            || !self.files.borrow().has_only_standard_descriptors()
+            || !self.files.borrow().has_only_standard_descriptor_numbers()
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
             || !self.signals.has_default_signal_state()
             || !self.thread.process.has_default_alarm_state()

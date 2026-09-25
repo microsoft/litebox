@@ -15,6 +15,8 @@ int main(int argc, char **argv) {
     pid_t parent_before = getpid();
     char *child_argv[] = {argv[1], "from-vfork", NULL};
     char *child_envp[] = {"VFORK_EXEC_TEST=1", NULL};
+    printf("vfork-started\n");
+    fflush(stdout);
     pid_t child_pid = vfork();
     if (child_pid == 0) {
         execve(argv[1], child_argv, child_envp);

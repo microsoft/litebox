@@ -860,6 +860,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             _ => (Signal::SIGSEGV, info.fault_address),
         };
         self.signals.last_exception.set(*info);
+        if self.vfork.borrow().is_some() {
+            // The current successful-exec-only scope cannot resume the parent after a child fault.
+            // Terminate instead of deferring the signal and retrying the faulting instruction.
+            self.exit_group(ExitStatus::Signal(signal));
+            return;
+        }
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
 }

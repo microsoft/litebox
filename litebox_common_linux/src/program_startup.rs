@@ -12,6 +12,9 @@ use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 const HEADER_SIZE: usize = size_of::<[u32; 8]>();
 
 /// Linux program state needed to load a child in a fresh runner.
+///
+/// Broker object inheritance and platform-managed architectural context are intentionally outside
+/// this payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinuxProgramStartup {
     /// Parent process ID visible to the child.

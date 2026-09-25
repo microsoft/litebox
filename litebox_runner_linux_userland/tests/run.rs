@@ -70,6 +70,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
+    "vfork_fault_parent.c",
     "vfork_exec_child.c",
     "vfork_exec_parent.c",
 ];
@@ -255,10 +256,23 @@ fn vfork_exec_failure_does_not_resume_parent() {
         .arg("/missing-vfork-executable");
 
     let output = String::from_utf8(runner.output_expect_failure()).unwrap();
-    assert!(
-        output.is_empty(),
-        "vfork parent unexpectedly resumed after exec failure: {output:?}"
+    assert_eq!(output, "vfork-started\n");
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_child_fault_terminates_shared_runner() {
+    let parent = common::compile(
+        "./tests/vfork_fault_parent.c",
+        "vfork_fault_parent",
+        true,
+        false,
     );
+    let mut runner = Runner::new(&parent, "vfork_fault_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output_expect_failure()).unwrap();
+    assert_eq!(output, "vfork-started\n");
 }
 
 /// Get the path of a program using `which`

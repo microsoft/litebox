@@ -164,7 +164,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn has_only_standard_descriptors(&self) -> bool {
+    pub(crate) fn has_only_standard_descriptor_numbers(&self) -> bool {
         self.raw_descriptor_store.read().iter_alive().eq([0, 1, 2])
     }
 

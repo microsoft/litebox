@@ -332,6 +332,18 @@ impl BrokerProcess {
         if self.cancellation.is_cancelled() {
             return Err(BrokerError::PeerClosed);
         }
+        {
+            let state = self.state.lock();
+            if !state.owner_alive
+                || !matches!(state.status, ProcessStatus::Running)
+                || !matches!(state.retirement, ProcessRetirement::Active { .. })
+            {
+                return Err(BrokerError::PeerClosed);
+            }
+            if state.pending_child_process.is_some() {
+                return Err(BrokerError::WouldBlock);
+            }
+        }
 
         let child = self
             .core
@@ -1432,6 +1444,7 @@ mod tests {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
+        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(2))
         .build()
         .unwrap();
         let parent = broker
