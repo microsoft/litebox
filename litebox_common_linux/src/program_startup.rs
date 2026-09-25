@@ -1,19 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Bounded Linux Program startup payload used by constrained `vfork` transfer.
+//! Bounded Linux program startup payload used by constrained `vfork` transfer.
 
+use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 
 const HEADER_SIZE: usize = size_of::<[u32; 8]>();
-const MAX_VECTOR_ENTRIES: usize = 1024;
 
-/// Linux process state needed to load one Program source in a fresh runner.
-///
-/// Incompatible encoded-layout changes require a broker protocol version bump.
+/// Linux program state needed to load a child in a fresh runner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinuxProgramStartup {
     /// Parent process ID visible to the child.
@@ -28,29 +26,29 @@ pub struct LinuxProgramStartup {
     pub egid: u32,
     /// Absolute executable path.
     pub path: String,
-    /// Argument strings without trailing NUL bytes.
-    pub argv: Vec<Vec<u8>>,
-    /// Environment strings without trailing NUL bytes.
-    pub envp: Vec<Vec<u8>>,
+    /// Program arguments.
+    pub argv: Vec<CString>,
+    /// Program environment.
+    pub envp: Vec<CString>,
 }
 
-/// Invalid or unsupported Linux Program startup data.
+/// Invalid or unsupported Linux program startup data.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LinuxProgramStartupError {
-    /// The startup exceeds a bounded count or byte limit.
-    #[error("Linux Program startup is too large")]
+    /// The startup exceeds the bounded payload size.
+    #[error("Linux program startup is too large")]
     TooLarge,
     /// The startup payload is malformed.
-    #[error("malformed Linux Program startup")]
+    #[error("malformed Linux program startup")]
     Malformed,
     /// The executable path is not an absolute UTF-8 path.
-    #[error("invalid Linux Program path")]
+    #[error("invalid Linux program path")]
     InvalidPath,
     /// The parent process ID is not representable by Linux process semantics.
-    #[error("invalid Linux Program parent process ID")]
+    #[error("invalid Linux program parent process ID")]
     InvalidParentProcess,
     /// An argument or environment string contains an interior NUL.
-    #[error("invalid Linux Program string")]
+    #[error("invalid Linux program string")]
     InvalidString,
 }
 
@@ -58,9 +56,10 @@ impl LinuxProgramStartup {
     /// Encodes this startup into the bounded broker payload.
     pub fn encode(&self) -> Result<Vec<u8>, LinuxProgramStartupError> {
         validate(self)?;
+        let encoded_len = encoded_len(self)?;
         let mut output = Vec::new();
         output
-            .try_reserve_exact(MAX_PROCESS_BOOTSTRAP_SIZE as usize)
+            .try_reserve_exact(encoded_len)
             .map_err(|_| LinuxProgramStartupError::TooLarge)?;
         push_u32(&mut output, self.parent_process_id.cast_unsigned());
         push_u32(&mut output, self.uid);
@@ -81,16 +80,14 @@ impl LinuxProgramStartup {
         );
         output.extend_from_slice(self.path.as_bytes());
         for value in self.argv.iter().chain(&self.envp) {
+            let value = value.as_bytes();
             push_u32(
                 &mut output,
                 u32::try_from(value.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
             );
             output.extend_from_slice(value);
         }
-        if output.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
-            return Err(LinuxProgramStartupError::TooLarge);
-        }
-        output.shrink_to_fit();
+        debug_assert_eq!(output.len(), encoded_len);
         Ok(output)
     }
 
@@ -111,25 +108,27 @@ impl LinuxProgramStartup {
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let envp_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
-        if argv_count > MAX_VECTOR_ENTRIES || envp_count > MAX_VECTOR_ENTRIES {
-            return Err(LinuxProgramStartupError::TooLarge);
-        }
         let path_bytes = take_bytes(&mut input, path_length)?;
         let path = core::str::from_utf8(path_bytes)
             .map_err(|_| LinuxProgramStartupError::InvalidPath)?
             .into();
+        let value_count = argv_count
+            .checked_add(envp_count)
+            .ok_or(LinuxProgramStartupError::Malformed)?;
+        if value_count > input.len() / size_of::<u32>() {
+            return Err(LinuxProgramStartupError::Malformed);
+        }
         let mut values = Vec::new();
         values
-            .try_reserve_exact(
-                argv_count
-                    .checked_add(envp_count)
-                    .ok_or(LinuxProgramStartupError::TooLarge)?,
-            )
+            .try_reserve_exact(value_count)
             .map_err(|_| LinuxProgramStartupError::TooLarge)?;
-        for _ in 0..argv_count + envp_count {
+        for _ in 0..value_count {
             let length = usize::try_from(read_u32(&mut input)?)
                 .map_err(|_| LinuxProgramStartupError::Malformed)?;
-            values.push(take_bytes(&mut input, length)?.to_vec());
+            values.push(
+                CString::new(take_bytes(&mut input, length)?)
+                    .map_err(|_| LinuxProgramStartupError::InvalidString)?,
+            );
         }
         if !input.is_empty() {
             return Err(LinuxProgramStartupError::Malformed);
@@ -154,21 +153,29 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     if startup.parent_process_id <= 0 {
         return Err(LinuxProgramStartupError::InvalidParentProcess);
     }
-    if startup.argv.len() > MAX_VECTOR_ENTRIES || startup.envp.len() > MAX_VECTOR_ENTRIES {
-        return Err(LinuxProgramStartupError::TooLarge);
-    }
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
     }
-    if startup
-        .argv
-        .iter()
-        .chain(&startup.envp)
-        .any(|value| value.contains(&0))
-    {
-        return Err(LinuxProgramStartupError::InvalidString);
-    }
     Ok(())
+}
+
+fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStartupError> {
+    let mut length = HEADER_SIZE
+        .checked_add(startup.path.len())
+        .ok_or(LinuxProgramStartupError::TooLarge)?;
+    if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+        return Err(LinuxProgramStartupError::TooLarge);
+    }
+    for value in startup.argv.iter().chain(&startup.envp) {
+        length = length
+            .checked_add(size_of::<u32>())
+            .and_then(|length| length.checked_add(value.as_bytes().len()))
+            .ok_or(LinuxProgramStartupError::TooLarge)?;
+        if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+            return Err(LinuxProgramStartupError::TooLarge);
+        }
+    }
+    Ok(length)
 }
 
 fn push_u32(output: &mut Vec<u8>, value: u32) {
@@ -210,8 +217,30 @@ mod tests {
             gid: 1002,
             egid: 1003,
             path: "/bin/child".into(),
-            argv: vec![b"child".to_vec(), b"argument".to_vec()],
-            envp: vec![b"KEY=value".to_vec()],
+            argv: vec![
+                CString::new("child").unwrap(),
+                CString::new("argument").unwrap(),
+            ],
+            envp: vec![CString::new("KEY=value").unwrap()],
+        };
+
+        assert_eq!(
+            LinuxProgramStartup::decode(&startup.encode().unwrap()),
+            Ok(startup)
+        );
+    }
+
+    #[test]
+    fn program_startup_vector_count_is_payload_bounded() {
+        let startup = LinuxProgramStartup {
+            parent_process_id: 1,
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            path: "/child".into(),
+            argv: vec![CString::new("").unwrap(); 1025],
+            envp: Vec::new(),
         };
 
         assert_eq!(
@@ -229,7 +258,7 @@ mod tests {
             gid: 0,
             egid: 0,
             path: "/child".into(),
-            argv: vec![b"child".to_vec()],
+            argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),
         };
         let mut encoded = startup.encode().unwrap();
@@ -239,10 +268,11 @@ mod tests {
             Err(LinuxProgramStartupError::Malformed)
         );
 
-        let mut invalid = startup;
-        invalid.argv[0].push(0);
+        let mut invalid = startup.encode().unwrap();
+        let first_argument = HEADER_SIZE + startup.path.len() + size_of::<u32>();
+        invalid[first_argument] = 0;
         assert_eq!(
-            invalid.encode(),
+            LinuxProgramStartup::decode(&invalid),
             Err(LinuxProgramStartupError::InvalidString)
         );
     }

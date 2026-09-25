@@ -7,7 +7,7 @@ use litebox_platform_linux_userland::LinuxUserland as Platform;
 use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
-use litebox_shim_linux::process_startup::LinuxProgramStartup;
+use litebox_common_linux::program_startup::LinuxProgramStartup;
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with packaged guest files and avoids truncating high host IDs.
@@ -125,30 +125,27 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
 
     let shim = shim_builder.build();
     let (task_params, prog_path, argv, envp) = if let Some(startup) = startup {
-        let startup = LinuxProgramStartup::decode(&startup.payload)
-            .context("invalid child Linux Program startup")?;
-        let argv = startup
-            .argv
-            .into_iter()
-            .map(std::ffi::CString::new)
-            .collect::<Result<Vec<_>, _>>()
-            .context("invalid child argument")?;
-        let envp = startup
-            .envp
-            .into_iter()
-            .map(std::ffi::CString::new)
-            .collect::<Result<Vec<_>, _>>()
-            .context("invalid child environment")?;
+        let LinuxProgramStartup {
+            parent_process_id,
+            uid,
+            euid,
+            gid,
+            egid,
+            path,
+            argv,
+            envp,
+        } = LinuxProgramStartup::decode(&startup.payload)
+            .context("invalid child Linux program startup")?;
         (
             litebox_common_linux::TaskParams {
                 pid: process_id,
-                ppid: startup.parent_process_id,
-                uid: startup.uid,
-                euid: startup.euid,
-                gid: startup.gid,
-                egid: startup.egid,
+                ppid: parent_process_id,
+                uid,
+                euid,
+                gid,
+                egid,
             },
-            startup.path,
+            path,
             argv,
             envp,
         )

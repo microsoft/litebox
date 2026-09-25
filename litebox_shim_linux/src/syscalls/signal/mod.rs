@@ -117,7 +117,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn supports_initial_vfork_exec(&self) -> bool {
+    pub(crate) fn has_default_signal_state(&self) -> bool {
         let altstack = self.altstack.get();
         self.pending.borrow().pending.is_empty()
             && self.shared_pending.lock().pending.is_empty()

@@ -22,6 +22,7 @@ pub mod gate_recovery;
 pub mod loader;
 pub mod mm;
 pub mod physical_pointers;
+pub mod program_startup;
 pub mod signal;
 #[cfg(target_arch = "aarch64")]
 pub use signal::aarch64::GuestVectorState;

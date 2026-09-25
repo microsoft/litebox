@@ -37,20 +37,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     #[must_use]
     pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
-            if self.vfork.borrow().is_some() {
-                self.global.platform.take_pending_signals(|signal| {
-                    self.queue_signals(signal);
-                });
-                #[cfg(feature = "alarm_fallback")]
-                self.check_alarm_deadline();
-                return !self.is_exiting();
-            }
             self.global.platform.take_pending_signals(|signal| {
                 self.queue_signals(signal);
             });
             #[cfg(feature = "alarm_fallback")]
             self.check_alarm_deadline();
-            self.process_signals(ctx);
+            // The vfork parent is suspended; defer signal delivery until its context is restored.
+            if self.vfork.borrow().is_none() {
+                self.process_signals(ctx);
+            }
             !self.is_exiting()
         })
     }

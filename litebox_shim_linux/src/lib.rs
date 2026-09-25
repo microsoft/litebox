@@ -57,7 +57,6 @@ macro_rules! log_unsupported {
 
 pub(crate) mod channel;
 pub mod loader;
-pub mod process_startup;
 pub(crate) mod stdio;
 pub mod syscalls;
 mod wait;
@@ -300,7 +299,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 thread: syscalls::process::ThreadState::new_process(pid),
                 wait_state: wait::WaitState::new(self.0.platform),
                 vfork: RefCell::new(None),
-                skip_syscall_result: Cell::new(false),
                 pid,
                 ppid,
                 credentials,
@@ -551,9 +549,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let result = self.do_syscall(ctx);
         if self.vfork.borrow().is_some() && result.is_err() {
+            // The current constrained vfork scope cannot return an error to a child running in the
+            // parent's runner while leaving the parent suspended. Only a successful exec transfer
+            // can complete the shared-runner window.
             self.sys_exit_group(127);
-        }
-        if self.skip_syscall_result.replace(false) {
             return;
         }
         let return_value = match result {
@@ -584,6 +583,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
+        // The constrained vfork child may only inspect its temporary identity or complete the
+        // transfer with execve. The caller terminates the shared runner when this rejection is
+        // returned.
         if self.vfork.borrow().is_some()
             && !matches!(
                 &request,
@@ -593,7 +595,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Gettid
             )
         {
-            self.sys_exit_group(127);
             return Err(Errno::EPERM);
         }
 
@@ -1210,7 +1211,6 @@ struct Task<Platform: ShimPlatform> {
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
     vfork: RefCell<Option<VforkState>>,
-    skip_syscall_result: Cell<bool>,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1230,6 +1230,7 @@ struct Task<Platform: ShimPlatform> {
 
 struct VforkState {
     child_process_id: litebox_broker_protocol::ProcessId,
+    child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
 }
 
@@ -1282,7 +1283,6 @@ mod test_utils {
                 litebox_thread: Cell::new(None),
                 thread: syscalls::process::ThreadState::new_process(pid),
                 vfork: RefCell::new(None),
-                skip_syscall_result: Cell::new(false),
                 pid,
                 ppid: 0,
                 credentials,
@@ -1311,7 +1311,6 @@ mod test_utils {
                 litebox_thread: Cell::new(Some(litebox_thread)),
                 thread,
                 vfork: RefCell::new(None),
-                skip_syscall_result: Cell::new(false),
                 pid: self.pid,
                 ppid: self.ppid,
                 credentials: self.credentials.clone(),

@@ -87,10 +87,7 @@ impl<Platform: ShimPlatform> FsState<Platform> {
     }
 
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn supports_initial_vfork_exec(
-        &self,
-        credentials: &super::process::Credentials,
-    ) -> bool {
+    pub(crate) fn has_default_fs_state(&self, credentials: &super::process::Credentials) -> bool {
         let context = self.context.read();
         self.umask() == Mode::from_u32_bits_truncate(u32::from((Mode::WGRP | Mode::WOTH).bits()))
             && context.cwd().to_string() == "/"

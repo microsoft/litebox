@@ -26,9 +26,12 @@ pub enum ProcessError {
     /// Another pending child process already exists.
     #[error("a child process is already pending")]
     Busy,
-    /// Process or memory capacity is exhausted.
+    /// Process capacity is exhausted.
     #[error("process capacity is exhausted")]
     ResourceExhausted,
+    /// Memory capacity is exhausted.
+    #[error("process memory is exhausted")]
+    OutOfMemory,
     /// The pending child identity is invalid or no longer available.
     #[error("invalid pending child process")]
     InvalidChild,
@@ -63,9 +66,8 @@ impl From<BrokerControlError> for ProcessError {
             BrokerControlError::Broker(ErrorCode::UnsupportedOperation) => Self::Unavailable,
             BrokerControlError::Broker(ErrorCode::PolicyDenied) => Self::PolicyDenied,
             BrokerControlError::Broker(ErrorCode::WouldBlock) => Self::Busy,
-            BrokerControlError::Broker(ErrorCode::ResourceExhausted | ErrorCode::OutOfMemory) => {
-                Self::ResourceExhausted
-            }
+            BrokerControlError::Broker(ErrorCode::ResourceExhausted) => Self::ResourceExhausted,
+            BrokerControlError::Broker(ErrorCode::OutOfMemory) => Self::OutOfMemory,
             BrokerControlError::Broker(
                 ErrorCode::UnknownObject | ErrorCode::PeerClosed | ErrorCode::ProtocolState,
             ) => Self::InvalidChild,
