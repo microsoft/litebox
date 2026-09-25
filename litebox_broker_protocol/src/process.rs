@@ -42,8 +42,6 @@ pub enum ProcessExitStatus {
     Signaled {
         /// Signal number reported by the runner platform.
         signal: u32,
-        /// Whether the runner platform reported a core dump.
-        core_dumped: bool,
     },
     /// The runner terminated without an observable platform status.
     Unknown,

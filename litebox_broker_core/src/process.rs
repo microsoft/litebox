@@ -26,33 +26,18 @@ pub trait ProcessLifecycleSink: Send + Sync {
 /// Host runner shutdown action installed into a broker process.
 pub type ProcessShutdown = Arc<dyn Fn() + Send + Sync>;
 
-/// Process-tree lifetime state and stable handle to its initial process.
+/// Stable handle to the initial process in one process tree.
 pub(crate) struct ProcessRoot {
     process: Weak<BrokerProcess>,
-    /// Non-root processes retained until failed startup or reaping.
-    processes: Mutex<HashMap<ProcessId, Arc<BrokerProcess>>>,
 }
 
 impl ProcessRoot {
-    pub(crate) fn new(process: Weak<BrokerProcess>) -> Self {
-        Self {
-            process,
-            processes: Mutex::new(HashMap::new()),
-        }
+    pub(crate) const fn new(process: Weak<BrokerProcess>) -> Self {
+        Self { process }
     }
 
     fn process(&self) -> Option<Arc<BrokerProcess>> {
         self.process.upgrade()
-    }
-
-    fn remove(&self, process: &BrokerProcess) {
-        let mut processes = self.processes.lock();
-        if processes
-            .get(&process.id)
-            .is_some_and(|retained| core::ptr::eq(retained.as_ref(), process))
-        {
-            processes.remove(&process.id);
-        }
     }
 }
 
@@ -150,6 +135,8 @@ struct BrokerProcessState {
     status: ProcessStatus,
     /// Immediate wait parent; `None` on a non-root means future zombies auto-reap.
     parent: Option<Weak<BrokerProcess>>,
+    /// Keeps a waitable zombie alive after runner supervision releases it.
+    zombie_retention: Option<Arc<BrokerProcess>>,
     owner_alive: bool,
     /// Child retained until this process requests startup.
     pending_child_process: Option<Arc<BrokerProcess>>,
@@ -243,6 +230,7 @@ impl BrokerProcess {
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
                 parent,
+                zombie_retention: None,
                 owner_alive: true,
                 pending_child_process: None,
                 reparent_startup_on_parent_death: false,
@@ -471,8 +459,8 @@ impl BrokerProcess {
     ///
     /// A child without a live wait parent is reaped immediately. Duplicate
     /// completion preserves the first authoritative status.
-    pub fn complete_exit(&self, exit_status: ProcessExitStatus) -> Result<()> {
-        let auto_reaped = {
+    pub fn complete_exit(self: &Arc<Self>, exit_status: ProcessExitStatus) -> Result<()> {
+        {
             let mut state = self.state.lock();
             match state.status {
                 ProcessStatus::Running => {
@@ -482,18 +470,15 @@ impl BrokerProcess {
                     if state.parent.as_ref().and_then(Weak::upgrade).is_none() {
                         state.parent = None;
                         state.status.transition(ProcessStatus::Reaped)?;
-                        true
                     } else {
-                        false
+                        debug_assert!(state.zombie_retention.is_none());
+                        state.zombie_retention = Some(Arc::clone(self));
                     }
                 }
                 ProcessStatus::Zombie(_) | ProcessStatus::Reaped => return Ok(()),
                 ProcessStatus::Starting => return Err(BrokerError::WouldBlock),
                 ProcessStatus::Failed(error) => return Err(error),
             }
-        };
-        if auto_reaped {
-            self.root.remove(self);
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -555,18 +540,9 @@ impl BrokerProcess {
 
     /// Records final retirement disposition without releasing resources early.
     pub fn retire(&self, release_ids: bool) {
-        let remove_from_root = {
-            let mut state = self.state.lock();
-            state.retirement.retire(release_ids);
-            state.shutdown = None;
-            !matches!(
-                state.status,
-                ProcessStatus::Running | ProcessStatus::Zombie(_)
-            )
-        };
-        if remove_from_root {
-            self.root.remove(self);
-        }
+        let mut state = self.state.lock();
+        state.retirement.retire(release_ids);
+        state.shutdown = None;
     }
 
     /// Applies owner-death handling to every direct child process.
@@ -583,13 +559,13 @@ impl BrokerProcess {
             state.owner_alive = false;
             state.pending_child_process.take()
         };
-        let processes = self
-            .root
-            .processes
-            .lock()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let processes = {
+            let processes = self.core.processes.read();
+            processes
+                .values()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>()
+        };
 
         let root = self.root.process();
         // Serializing reparenting with the root's owner-death mark prevents a
@@ -612,12 +588,8 @@ impl BrokerProcess {
             {
                 continue;
             }
-            let (child_changed, release_retention, shutdown) =
-                child.handle_parent_death(&owner, live_root.as_ref());
+            let (child_changed, shutdown) = child.handle_parent_death(&owner, live_root.as_ref());
             changed |= child_changed;
-            if release_retention {
-                child.root.remove(child);
-            }
             if let Some(shutdown) = shutdown {
                 shutdowns.push(shutdown);
             }
@@ -638,40 +610,29 @@ impl BrokerProcess {
         }
     }
 
-    pub(crate) fn create_retained_child(
+    pub(crate) fn with_live_owner<T>(
         &self,
-        operation: impl FnOnce(Arc<ProcessRoot>) -> Result<Arc<BrokerProcess>>,
-    ) -> Result<Arc<BrokerProcess>> {
+        operation: impl FnOnce(Arc<ProcessRoot>) -> T,
+    ) -> Result<T> {
         let state = self.state.lock();
         if !state.owner_alive || !matches!(state.retirement, ProcessRetirement::Active { .. }) {
             return Err(BrokerError::PeerClosed);
         }
-        let mut processes = self.root.processes.lock();
-        processes
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        let process = operation(Arc::clone(&self.root))?;
-        assert!(
-            processes
-                .insert(process.id(), Arc::clone(&process))
-                .is_none(),
-            "new child process was already retained by its process tree"
-        );
-        Ok(process)
+        Ok(operation(Arc::clone(&self.root)))
     }
 
     fn handle_parent_death(
         &self,
         owner: &Weak<BrokerProcess>,
         live_root: Option<&Arc<BrokerProcess>>,
-    ) -> (bool, bool, Option<ProcessShutdown>) {
+    ) -> (bool, Option<ProcessShutdown>) {
         let mut state = self.state.lock();
         if !state
             .parent
             .as_ref()
             .is_some_and(|parent| Weak::ptr_eq(parent, owner))
         {
-            return (false, false, None);
+            return (false, None);
         }
 
         let mut shutdown = None;
@@ -689,10 +650,10 @@ impl BrokerProcess {
                 false
             }
             ProcessStatus::Running | ProcessStatus::Zombie(_) => true,
-            ProcessStatus::Failed(_) | ProcessStatus::Reaped => return (false, false, None),
+            ProcessStatus::Failed(_) | ProcessStatus::Reaped => return (false, None),
         };
 
-        let mut reaped = false;
+        let mut zombie_retention = None;
         if reparent {
             state.parent = live_root.map(Arc::downgrade);
             if live_root.is_none() && matches!(state.status, ProcessStatus::Zombie(_)) {
@@ -700,10 +661,12 @@ impl BrokerProcess {
                     .status
                     .transition(ProcessStatus::Reaped)
                     .expect("orphaned zombie reaping must be a valid transition");
-                reaped = true;
+                zombie_retention = state.zombie_retention.take();
             }
         }
-        (true, reaped || !reparent, shutdown)
+        drop(state);
+        drop(zombie_retention);
+        (true, shutdown)
     }
 
     /// Duplicates object references into another process.
@@ -1401,10 +1364,7 @@ mod tests {
     const TEST_MAX_PIPE_CAPACITY_PER_PROCESS: usize = 4;
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
     const EXITED: ProcessExitStatus = ProcessExitStatus::Exited { code: 23 };
-    const SIGNALED: ProcessExitStatus = ProcessExitStatus::Signaled {
-        signal: 11,
-        core_dumped: true,
-    };
+    const SIGNALED: ProcessExitStatus = ProcessExitStatus::Signaled { signal: 11 };
 
     #[derive(Default)]
     struct TestProcessLifecycleSink {
@@ -1546,6 +1506,31 @@ mod tests {
         child.complete_exit(SIGNALED).unwrap();
 
         assert_eq!(child.state.lock().status, ProcessStatus::Zombie(SIGNALED));
+        root.handle_owner_death();
+        assert_eq!(child.state.lock().status, ProcessStatus::Reaped);
+    }
+
+    #[test]
+    fn running_child_has_no_tree_retention() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let child = broker
+            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        let child_id = child.id();
+        child.complete_start().unwrap();
+        child.retire(true);
+
+        drop(child);
+
+        assert!(!broker.processes.read().contains_key(&child_id));
     }
 
     #[test]
