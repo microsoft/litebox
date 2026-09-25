@@ -325,7 +325,7 @@ impl BrokerProcess {
     }
 
     /// Allocates and retains one pending child process.
-    pub fn create_child_process(&self) -> Result<ProcessId> {
+    pub fn allocate_child_process(&self) -> Result<ProcessId> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
@@ -1421,7 +1421,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         assert_eq!(
-            parent.create_child_process(),
+            parent.allocate_child_process(),
             Err(BrokerError::PolicyDenied)
         );
     }
@@ -1438,8 +1438,11 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let process_id = parent.create_child_process().unwrap();
-        assert_eq!(parent.create_child_process(), Err(BrokerError::WouldBlock));
+        let process_id = parent.allocate_child_process().unwrap();
+        assert_eq!(
+            parent.allocate_child_process(),
+            Err(BrokerError::WouldBlock)
+        );
         assert!(matches!(
             parent.take_child_process(ProcessId(process_id.0 + 1)),
             Err(BrokerError::UnknownObject)
@@ -1465,7 +1468,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let process_id = parent.create_child_process().unwrap();
+        let process_id = parent.allocate_child_process().unwrap();
         let child = broker
             .processes
             .read()

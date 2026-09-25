@@ -44,8 +44,8 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
+    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
     StartChildProcessSource,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
@@ -242,12 +242,7 @@ where
         return Err(BrokerHostError::Broker(ErrorCode::Internal));
     }
     let startup = match startup {
-        Some(ProcessStartupData {
-            format,
-            version,
-            payload,
-            inherited_objects,
-        }) => {
+        Some(ProcessStartupData { payload }) => {
             if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
                 return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
             }
@@ -262,12 +257,7 @@ where
                 MAX_PROCESS_BOOTSTRAP_SIZE,
             )
             .map_err(|error| BrokerHostError::Broker(error.into()))?;
-            Some(ProcessStartupDescriptor {
-                format,
-                version,
-                buffer,
-                inherited_objects,
-            })
+            Some(ProcessStartupDescriptor { buffer })
         }
         None => None,
     };
@@ -490,7 +480,7 @@ fn handle_request<Memory: SharedMemory>(
                 .map(BrokerResult::CreateThread)
                 .map_err(RequestFailure::from),
             CreateThreadRequest::Process => process
-                .create_child_process()
+                .allocate_child_process()
                 .map(CreateThreadResponse::Process)
                 .map(BrokerResult::CreateThread)
                 .map_err(RequestFailure::from),
@@ -812,12 +802,7 @@ where
                         Arc::clone(launcher),
                         parent,
                         *child_process_id,
-                        ProcessStartupData {
-                            format: startup.format,
-                            version: startup.version,
-                            payload,
-                            inherited_objects: startup.inherited_objects,
-                        },
+                        ProcessStartupData { payload },
                     )
                 })
                 .map(BrokerResult::ProcessStarted),
@@ -844,18 +829,6 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
             .create_process(parent.caller_credential(), Some(parent.id()))
             .map_err(RequestFailure::from)?,
     };
-    let inherited_objects = match parent
-        .duplicate_object_references_to(startup.inherited_objects.as_slice(), &process)
-    {
-        Ok(inherited_objects) => inherited_objects,
-        Err(error) => {
-            let _ = process.fail_start(error, false, true);
-            process.retire(true);
-            return Err(RequestFailure::from(error));
-        }
-    };
-    let inherited_objects = InheritedProcessObjects::new(&inherited_objects)
-        .expect("child handle count must match the bounded inheritance request");
     let process_id = process.id();
     let initial_thread_id = process.initial_thread_id();
     if parent.is_cancellation_requested() {
@@ -867,10 +840,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
         .launch(
             process,
             ProcessStartupData {
-                format: startup.format,
-                version: startup.version,
                 payload: startup.payload,
-                inherited_objects,
             },
         )
         .map_err(RequestFailure::from)?;

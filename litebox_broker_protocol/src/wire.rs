@@ -23,9 +23,8 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects,
-    MAX_INHERITED_PROCESS_OBJECTS, ProcessBootstrapFormat, ProcessBootstrapVersion,
-    ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, ProcessIdentity, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -78,7 +77,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 91;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 67;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -212,17 +211,9 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
                 }
             }
             match request.source {
-                StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
-                    format,
-                    version,
-                    buffer,
-                    inherited_objects,
-                }) => {
+                StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }) => {
                     encoder.u8(START_CHILD_PROCESS_TAG_BOOTSTRAP);
-                    encoder.u32(format.0);
-                    encoder.u16(version.0);
                     encoder.shared_buffer_sequence(buffer);
-                    encode_inherited_objects(&mut encoder, inherited_objects);
                 }
                 StartChildProcessSource::Duplicate(buffer) => {
                     encoder.u8(START_CHILD_PROCESS_TAG_DUPLICATE);
@@ -278,10 +269,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
             let source = match decoder.u8()? {
                 START_CHILD_PROCESS_TAG_BOOTSTRAP => {
                     StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
-                        format: ProcessBootstrapFormat(decoder.u32()?),
-                        version: ProcessBootstrapVersion(decoder.u16()?),
                         buffer: decoder.shared_buffer_sequence()?,
-                        inherited_objects: decode_inherited_objects(&mut decoder)?,
                     })
                 }
                 START_CHILD_PROCESS_TAG_DUPLICATE => {
@@ -321,17 +309,9 @@ pub fn encode_handshake_response(response: BrokerHandshakeResponse) -> Vec<u8> {
             encoder.process_id(process_id);
             encoder.thread_id(initial_thread_id);
             match startup {
-                Some(ProcessStartupDescriptor {
-                    format,
-                    version,
-                    buffer,
-                    inherited_objects,
-                }) => {
+                Some(ProcessStartupDescriptor { buffer }) => {
                     encoder.u8(1);
-                    encoder.u32(format.0);
-                    encoder.u16(version.0);
                     encoder.shared_buffer_sequence(buffer);
-                    encode_inherited_objects(&mut encoder, inherited_objects);
                 }
                 None => encoder.u8(0),
             }
@@ -362,10 +342,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
             startup: match decoder.u8()? {
                 0 => None,
                 1 => Some(ProcessStartupDescriptor {
-                    format: ProcessBootstrapFormat(decoder.u32()?),
-                    version: ProcessBootstrapVersion(decoder.u16()?),
                     buffer: decoder.shared_buffer_sequence()?,
-                    inherited_objects: decode_inherited_objects(&mut decoder)?,
                 }),
                 _ => return Err(WireError::InvalidTag),
             },
@@ -527,28 +504,6 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
     Ok(BrokerResponse { request_id, result })
 }
 
-fn encode_inherited_objects(encoder: &mut Encoder, objects: InheritedProcessObjects) {
-    encoder.u8(u8::try_from(objects.as_slice().len())
-        .expect("bounded inherited-object count must fit in u8"));
-    for handle in objects.as_slice() {
-        encoder.handle(*handle);
-    }
-}
-
-fn decode_inherited_objects(
-    decoder: &mut Decoder<'_>,
-) -> Result<InheritedProcessObjects, WireError> {
-    let count = usize::from(decoder.u8()?);
-    if count > MAX_INHERITED_PROCESS_OBJECTS {
-        return Err(WireError::InvalidTag);
-    }
-    let mut handles = [crate::ObjectHandle(0); MAX_INHERITED_PROCESS_OBJECTS];
-    for handle in &mut handles[..count] {
-        *handle = decoder.handle()?;
-    }
-    InheritedProcessObjects::new(&handles[..count]).ok_or(WireError::InvalidTag)
-}
-
 fn encode_error_code(encoder: &mut Encoder, error: ErrorCode) {
     encoder.u16(match error {
         ErrorCode::UnsupportedVersion => 1,
@@ -639,8 +594,7 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects, ProcessBootstrapFormat,
-        ProcessBootstrapVersion, ProcessIdentity, ProcessStartupDescriptor,
+        CreateThreadRequest, CreateThreadResponse, ProcessIdentity, ProcessStartupDescriptor,
         StartChildProcessRequest, StartChildProcessSource,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
@@ -987,16 +941,7 @@ mod tests {
             BrokerOperation::StartChildProcess(StartChildProcessRequest {
                 child_process_id: Some(process_id(u32::MAX)),
                 source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
-                    format: ProcessBootstrapFormat(u32::MAX),
-                    version: ProcessBootstrapVersion(u16::MAX),
                     buffer: largest_sequence,
-                    inherited_objects: InheritedProcessObjects::new(&[
-                        ObjectHandle(1),
-                        ObjectHandle(2),
-                        ObjectHandle(3),
-                        ObjectHandle(4),
-                    ])
-                    .unwrap(),
                 }),
             }),
             BrokerOperation::StartChildProcess(StartChildProcessRequest {
@@ -1184,14 +1129,7 @@ mod tests {
                 process_id: process_id(7),
                 initial_thread_id: thread_id(8),
                 startup: Some(ProcessStartupDescriptor {
-                    format: ProcessBootstrapFormat(0x7465_7374),
-                    version: ProcessBootstrapVersion(1),
                     buffer: sequence(0, 37),
-                    inherited_objects: InheritedProcessObjects::new(&[
-                        ObjectHandle(5),
-                        ObjectHandle(6),
-                    ])
-                    .unwrap(),
                 }),
             },
             BrokerHandshakeResponse::VersionMismatch {
@@ -1941,10 +1879,7 @@ mod tests {
                 process_id: process_id(2),
                 initial_thread_id: thread_id(3),
                 startup: Some(ProcessStartupDescriptor {
-                    format: ProcessBootstrapFormat(3),
-                    version: ProcessBootstrapVersion(4),
                     buffer: sequence(0, 5),
-                    inherited_objects: InheritedProcessObjects::EMPTY,
                 }),
             },
             BrokerHandshakeResponse::VersionMismatch {

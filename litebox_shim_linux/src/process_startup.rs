@@ -6,21 +6,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::process::{
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessBootstrapFormat, ProcessBootstrapVersion,
-};
-
-/// Linux Program startup format carried through the broker.
-pub const LINUX_PROGRAM_BOOTSTRAP_FORMAT: ProcessBootstrapFormat =
-    ProcessBootstrapFormat(u32::from_le_bytes(*b"LXPG"));
-
-/// Initial Linux Program startup format version.
-pub const LINUX_PROGRAM_BOOTSTRAP_VERSION: ProcessBootstrapVersion = ProcessBootstrapVersion(1);
+use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 
 const HEADER_SIZE: usize = size_of::<[u32; 8]>();
 const MAX_VECTOR_ENTRIES: usize = 1024;
 
 /// Linux process state needed to load one Program source in a fresh runner.
+///
+/// Incompatible encoded-layout changes require a broker protocol version bump.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinuxProgramStartup {
     /// Parent process ID visible to the child.

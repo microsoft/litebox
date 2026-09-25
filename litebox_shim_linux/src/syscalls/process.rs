@@ -26,9 +26,7 @@ use litebox_common_linux::{
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 
-use crate::process_startup::{
-    LINUX_PROGRAM_BOOTSTRAP_FORMAT, LINUX_PROGRAM_BOOTSTRAP_VERSION, LinuxProgramStartup,
-};
+use crate::process_startup::LinuxProgramStartup;
 
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
@@ -721,7 +719,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child = self
             .global
             .litebox
-            .create_child_process()
+            .allocate_child_process()
             .map_err(vfork_errno)?;
         let child_pid = i32::try_from(child.0).expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
@@ -1744,12 +1742,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
             self.global
                 .litebox
-                .start_child_process(
-                    Some(child),
-                    LINUX_PROGRAM_BOOTSTRAP_FORMAT,
-                    LINUX_PROGRAM_BOOTSTRAP_VERSION,
-                    &payload,
-                )
+                .start_child_process(Some(child), &payload)
                 .map_err(vfork_errno)?;
             let state = self
                 .vfork

@@ -5,9 +5,7 @@
 
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::process::{
-    ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity,
-};
+use litebox_broker_protocol::process::ProcessIdentity;
 
 use crate::LiteBox;
 use crate::broker::error::BrokerControlError;
@@ -38,10 +36,10 @@ pub enum ProcessError {
 
 impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
-    pub fn create_child_process(&self) -> Result<ProcessId, ProcessError> {
+    pub fn allocate_child_process(&self) -> Result<ProcessId, ProcessError> {
         self.broker_control()
             .ok_or(ProcessError::Unavailable)?
-            .create_child_process()
+            .allocate_child_process()
             .map_err(ProcessError::from)
     }
 
@@ -49,13 +47,11 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     pub fn start_child_process(
         &self,
         child_process_id: Option<ProcessId>,
-        format: ProcessBootstrapFormat,
-        version: ProcessBootstrapVersion,
         payload: &[u8],
     ) -> Result<ProcessIdentity, ProcessError> {
         self.broker_control()
             .ok_or(ProcessError::Unavailable)?
-            .start_child_process(child_process_id, format, version, payload)
+            .start_child_process(child_process_id, payload)
             .map_err(ProcessError::from)
     }
 }

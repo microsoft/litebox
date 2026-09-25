@@ -7,9 +7,7 @@ use litebox_platform_linux_userland::LinuxUserland as Platform;
 use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
-use litebox_shim_linux::process_startup::{
-    LINUX_PROGRAM_BOOTSTRAP_FORMAT, LINUX_PROGRAM_BOOTSTRAP_VERSION, LinuxProgramStartup,
-};
+use litebox_shim_linux::process_startup::LinuxProgramStartup;
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with packaged guest files and avoids truncating high host IDs.
@@ -127,16 +125,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
 
     let shim = shim_builder.build();
     let (task_params, prog_path, argv, envp) = if let Some(startup) = startup {
-        if startup.format != LINUX_PROGRAM_BOOTSTRAP_FORMAT
-            || startup.version != LINUX_PROGRAM_BOOTSTRAP_VERSION
-            || !startup.inherited_objects.as_slice().is_empty()
-        {
-            return Err(anyhow!(
-                "unsupported child Linux process bootstrap format {:?} version {:?}",
-                startup.format,
-                startup.version
-            ));
-        }
         let startup = LinuxProgramStartup::decode(&startup.payload)
             .context("invalid child Linux Program startup")?;
         let argv = startup

@@ -96,12 +96,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let session_manager: &'static SessionManager<Platform> =
         Box::leak(Box::new(SessionManager::new()));
     let (connection, startup) = broker::connect(&cli_args.broker_control_channel)?;
-    if let Some(bootstrap) = startup {
-        return Err(anyhow::anyhow!(
-            "unsupported child OP-TEE process bootstrap format {:?} version {:?}",
-            bootstrap.format,
-            bootstrap.version
-        ));
+    if startup.is_some() {
+        return Err(anyhow::anyhow!("unsupported child OP-TEE process startup"));
     }
     let broker::BrokerConnection {
         local,

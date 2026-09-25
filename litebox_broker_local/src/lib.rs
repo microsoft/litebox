@@ -40,9 +40,9 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, InheritedProcessObjects, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessBootstrapFormat, ProcessBootstrapVersion, ProcessIdentity, ProcessStartupData,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
+    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -149,12 +149,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                             .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
                         payload.resize(startup.buffer.length() as usize, 0);
                         local.read_shared_buffer(startup.buffer, &mut payload);
-                        Some(ProcessStartupData {
-                            format: startup.format,
-                            version: startup.version,
-                            payload,
-                            inherited_objects: startup.inherited_objects,
-                        })
+                        Some(ProcessStartupData { payload })
                     }
                     None => None,
                 };
@@ -202,11 +197,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn start_child_process(
         &self,
         child_process_id: Option<ProcessId>,
-        format: ProcessBootstrapFormat,
-        version: ProcessBootstrapVersion,
         buffer: SharedBufferSequence,
         bootstrap: &[u8],
-        inherited_objects: InheritedProcessObjects,
     ) -> Result<ProcessIdentity, Channel::Error> {
         if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
@@ -216,12 +208,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request(BrokerOperation::StartChildProcess(
             StartChildProcessRequest {
                 child_process_id,
-                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
-                    format,
-                    version,
-                    buffer,
-                    inherited_objects,
-                }),
+                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }),
             },
         ))? {
             BrokerResult::ProcessStarted(started) => Ok(started),
@@ -235,12 +222,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn create_child_process(&self) -> Result<ProcessId, Channel::Error> {
+    pub fn allocate_child_process(&self) -> Result<ProcessId, Channel::Error> {
         match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Process))? {
             BrokerResult::CreateThread(CreateThreadResponse::Process(process_id)) => Ok(process_id),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => {
-                panic!("broker returned unexpected create-child-process response: {response:?}")
+                panic!("broker returned unexpected allocate-child-process response: {response:?}")
             }
         }
     }
