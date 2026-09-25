@@ -429,9 +429,11 @@ impl BrokerProcess {
     pub fn startup_result(&self) -> Option<Result<()>> {
         match self.state.lock().status {
             ProcessStatus::Starting => None,
-            ProcessStatus::Running => Some(Ok(())),
+            // Exit states are reachable only after startup completed.
+            ProcessStatus::Running | ProcessStatus::Zombie(_) | ProcessStatus::Reaped => {
+                Some(Ok(()))
+            }
             ProcessStatus::Failed(error) => Some(Err(error)),
-            ProcessStatus::Zombie(_) | ProcessStatus::Reaped => Some(Err(BrokerError::PeerClosed)),
         }
     }
 
@@ -457,10 +459,13 @@ impl BrokerProcess {
 
     /// Publishes one runner termination outcome.
     ///
-    /// A child without a live wait parent is reaped immediately. Duplicate
-    /// completion preserves the first authoritative status.
+    /// Exit releases object references, socket state, and, after clean
+    /// retirement, thread IDs. A zombie keeps only its process ID, registry
+    /// entry, and exit status until it is reaped. A child without a live wait
+    /// parent is reaped immediately. Duplicate completion preserves the first
+    /// authoritative status.
     pub fn complete_exit(self: &Arc<Self>, exit_status: ProcessExitStatus) -> Result<()> {
-        {
+        let release_thread_ids = {
             let mut state = self.state.lock();
             match state.status {
                 ProcessStatus::Running => {
@@ -479,6 +484,15 @@ impl BrokerProcess {
                 ProcessStatus::Starting => return Err(BrokerError::WouldBlock),
                 ProcessStatus::Failed(error) => return Err(error),
             }
+            matches!(
+                state.retirement,
+                ProcessRetirement::Retired { release_ids: true }
+            )
+        };
+        if self.release_references() {
+            self.state.lock().retirement.mark_abnormal();
+        } else if release_thread_ids {
+            self.release_threads(true);
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -507,9 +521,10 @@ impl BrokerProcess {
             let mut state = self.state.lock();
             match state.status {
                 ProcessStatus::Starting => {}
-                ProcessStatus::Running => return Ok(()),
+                ProcessStatus::Running | ProcessStatus::Zombie(_) | ProcessStatus::Reaped => {
+                    return Ok(());
+                }
                 ProcessStatus::Failed(error) => return Err(error),
-                _ => return Err(BrokerError::PeerClosed),
             }
             if abnormal {
                 state.retirement.mark_abnormal();
@@ -1171,6 +1186,23 @@ impl BrokerProcess {
             release_ids
         };
 
+        let mut invariant_fault = self.release_references();
+        if self.core.processes.write().remove(&self.id).is_none() {
+            invariant_fault = true;
+        }
+        let release_ids = release_ids && !invariant_fault;
+        self.release_threads(release_ids);
+        if release_ids {
+            self.core.ids.lock().release(self.id.0);
+        }
+        self.core.process_lifecycle_sink.changed();
+    }
+
+    /// Releases every object reference and provider socket state owned by this
+    /// process, returning whether an accounting fault was observed.
+    ///
+    /// Calling this method more than once is harmless.
+    fn release_references(&self) -> bool {
         let mut invariant_fault = self.references.lock().pending_handles != 0;
         loop {
             let Some(handle) = self.references.lock().handles.pop() else {
@@ -1223,13 +1255,14 @@ impl BrokerProcess {
         );
 
         self.core.socket_provider.close_process(self.id);
+        invariant_fault
+    }
 
-        if self.core.processes.write().remove(&self.id).is_none() {
-            invariant_fault = true;
-        }
-
+    /// Removes every thread owned by this process, optionally releasing their
+    /// IDs and global thread accounting.
+    fn release_threads(&self, release_ids: bool) {
         let threads = core::mem::take(&mut *self.threads.lock());
-        if release_ids && !invariant_fault {
+        if release_ids {
             self.core
                 .active_thread_count
                 .fetch_sub(threads.len(), Ordering::Relaxed);
@@ -1237,9 +1270,7 @@ impl BrokerProcess {
             for thread_id in threads {
                 ids.release(thread_id.0);
             }
-            ids.release(self.id.0);
         }
-        self.core.process_lifecycle_sink.changed();
     }
 }
 
@@ -1436,7 +1467,7 @@ mod tests {
     }
 
     #[test]
-    fn zombie_retains_first_exit_status_and_resources_until_auto_reap() {
+    fn zombie_releases_resources_but_retains_status_and_slot_until_auto_reap() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1452,25 +1483,44 @@ mod tests {
             .unwrap();
         let child_id = child.id();
         child.complete_start().unwrap();
-        let handle = crate::event::create(&child, 1).unwrap();
+        child.create_thread().unwrap();
+        let (read, write) = crate::pipe::create(&root, 1, 1).unwrap();
+        root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
+            .unwrap();
+        root.close_object_reference(write).unwrap();
+        assert!(
+            !root
+                .check_readiness(read)
+                .unwrap()
+                .contains(ReadinessFlags::HANGUP)
+        );
 
+        child.retire(true);
         child.complete_exit(EXITED).unwrap();
         child.complete_exit(SIGNALED).unwrap();
-        child.retire(true);
         assert_eq!(child.state.lock().status, ProcessStatus::Zombie(EXITED));
+        assert_eq!(child.startup_result(), Some(Ok(())));
+        assert_eq!(
+            child.fail_start(BrokerError::PeerClosed, true, true),
+            Ok(())
+        );
         drop(child);
 
-        let retained = broker
-            .processes
-            .read()
-            .get(&child_id)
-            .and_then(alloc::sync::Weak::upgrade)
-            .unwrap();
-        assert_eq!(
-            retained.check_readiness(handle).unwrap(),
-            ReadinessFlags::READ | ReadinessFlags::WRITE
+        assert!(
+            root.check_readiness(read)
+                .unwrap()
+                .contains(ReadinessFlags::HANGUP)
         );
-        drop(retained);
+        assert_eq!(broker.references.read().len(), 1);
+        assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
+        assert!(
+            broker
+                .processes
+                .read()
+                .get(&child_id)
+                .and_then(alloc::sync::Weak::upgrade)
+                .is_some()
+        );
         assert!(matches!(
             broker.allocate_process(CallerCredential::Unauthenticated, None),
             Err(BrokerError::ResourceExhausted)
@@ -1479,7 +1529,6 @@ mod tests {
         root.handle_owner_death();
 
         assert!(!broker.processes.read().contains_key(&child_id));
-        assert!(broker.references.read().is_empty());
         assert!(
             broker
                 .allocate_process(CallerCredential::Unauthenticated, None)
