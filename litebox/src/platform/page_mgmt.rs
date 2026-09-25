@@ -12,11 +12,7 @@ use core::ops::Range;
 use thiserror::Error;
 
 /// Exclusive ownership of a reserved virtual-address extent.
-///
-/// # Safety
-///
-/// Implementations must represent unique ownership and must not implement [`Copy`] or [`Clone`].
-pub unsafe trait PageReservation {
+pub trait PageReservation {
     /// Return the owned address range.
     fn range(&self) -> Range<usize>;
 }
@@ -39,10 +35,7 @@ macro_rules! define_page_reservation {
             }
         }
 
-        // SAFETY: Construction is private and the generated handle is neither Clone nor Copy.
-        unsafe impl<const ALIGN: usize> $crate::platform::page_mgmt::PageReservation
-            for $name<ALIGN>
-        {
+        impl<const ALIGN: usize> $crate::platform::page_mgmt::PageReservation for $name<ALIGN> {
             fn range(&self) -> ::core::ops::Range<usize> {
                 self.range.clone()
             }
