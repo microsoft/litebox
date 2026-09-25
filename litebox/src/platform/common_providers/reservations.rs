@@ -6,6 +6,7 @@
 use core::ops::Range;
 
 use alloc::{collections::BTreeMap, vec::Vec};
+use rangemap::RangeMap;
 
 use crate::platform::page_mgmt::{PageReservation, ReservationStore};
 
@@ -85,6 +86,19 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
 
 impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Reservation> {
     type Reservation = Reservation;
+
+    fn overlaps<V>(
+        &self,
+        vmas: &RangeMap<usize, V>,
+        range: Range<usize>,
+        include_reservations: bool,
+    ) -> bool {
+        if include_reservations {
+            self.overlapping(range).next().is_some()
+        } else {
+            vmas.overlaps(&range)
+        }
+    }
 
     fn insert(&mut self, base: usize, reservation: Reservation) -> Option<Reservation> {
         let replaced = self.0.insert(base, reservation);

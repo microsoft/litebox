@@ -36,6 +36,15 @@ impl PageReservation for NoTrackedReservation {
 impl ReservationStore for NoTrackedReservations {
     type Reservation = NoTrackedReservation;
 
+    fn overlaps<V>(
+        &self,
+        vmas: &RangeMap<usize, V>,
+        range: Range<usize>,
+        _include_reservations: bool,
+    ) -> bool {
+        vmas.overlaps(&range)
+    }
+
     fn insert(
         &mut self,
         _base: usize,
@@ -357,6 +366,23 @@ impl<Store: ReservationStore + Default> Default for MappingState<Store> {
     }
 }
 
+impl<Store: ReservationStore> MappingState<Store> {
+    fn overlaps(&self, range: Range<usize>, include_reservations: bool) -> bool {
+        self.reservations
+            .overlaps(&self.vmas, range, include_reservations)
+    }
+}
+
+pub(super) struct FindAreaRequest<const ALIGN: usize> {
+    pub(super) suggested_address: Option<NonZeroAddress<ALIGN>>,
+    pub(super) length: NonZeroPageSize<ALIGN>,
+    pub(super) behavior: FixedAddressBehavior,
+    pub(super) alignment: usize,
+    pub(super) include_reservations: bool,
+    pub(super) address_range: Range<usize>,
+    pub(super) top_down: bool,
+}
+
 /// Virtual Memory Manager
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
@@ -430,6 +456,11 @@ where
     /// ordered by key range.
     pub(super) fn iter(&self) -> impl Iterator<Item = (&Range<usize>, &VmArea)> {
         self.vmas.iter()
+    }
+
+    /// Check whether a range overlaps mappings or tracked reservations.
+    pub(super) fn overlaps(&self, range: Range<usize>, include_reservations: bool) -> bool {
+        self.mappings.overlaps(range, include_reservations)
     }
 
     /// Insert an already-allocated region (e.g., via CoW) without calling the platform allocator.
@@ -557,7 +588,7 @@ where
             FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
             FixedAddressBehavior::NoReplace => {
                 // Ensure there are no mappings managed by us.
-                if self.vmas.overlaps(&(start..end)) {
+                if self.overlaps(start..end, true) {
                     return Err(AllocationError::AddressInUse);
                 }
                 FixedAddressBehavior::NoReplace
@@ -660,13 +691,29 @@ where
                 0
             })
         .unwrap();
-        let new_addr = self
-            .get_unmmaped_area(
+        let behavior = if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+            if flags.contains(CreatePagesFlags::NOREPLACE) {
+                FixedAddressBehavior::NoReplace
+            } else {
+                FixedAddressBehavior::Replace
+            }
+        } else {
+            FixedAddressBehavior::Hint
+        };
+        let new_addr = Self::find_area(
+            &self.reservations,
+            &self.vmas,
+            FindAreaRequest {
                 suggested_address,
-                total_length,
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
-            )
-            .ok_or(AllocationError::OutOfMemory)?;
+                length: total_length,
+                behavior,
+                alignment: ALIGN,
+                include_reservations: true,
+                address_range: Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX,
+                top_down: true,
+            },
+        )?
+        .ok_or(AllocationError::OutOfMemory)?;
         // new_addr must be ALIGN aligned
         let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
         unsafe {
@@ -674,15 +721,7 @@ where
                 new_range,
                 vma,
                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-                    if flags.contains(CreatePagesFlags::NOREPLACE) {
-                        FixedAddressBehavior::NoReplace
-                    } else {
-                        FixedAddressBehavior::Replace
-                    }
-                } else {
-                    FixedAddressBehavior::Hint
-                },
+                behavior,
             )
         }
     }
@@ -808,9 +847,22 @@ where
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
         }
-        let new_addr = self
-            .get_unmmaped_area(suggested_new_address, new_size, false)
-            .ok_or(VmemMoveError::OutOfMemory)?;
+        let new_addr = Self::find_area(
+            &self.reservations,
+            &self.vmas,
+            FindAreaRequest {
+                suggested_address: suggested_new_address,
+                length: new_size,
+                behavior: FixedAddressBehavior::Hint,
+                alignment: ALIGN,
+                include_reservations: true,
+                address_range: Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX,
+                top_down: true,
+            },
+        )
+        .ok()
+        .flatten()
+        .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         let new_addr = unsafe {
             self.platform
@@ -973,75 +1025,134 @@ where
 
     /*================================Internal Functions================================ */
 
-    /// Get an unmapped area in the virtual address space.
-    /// `suggested_range` and `fixed_addr` are the hint address and MAP_FIXED flag respectively,
-    /// similar to how `mmap` works.
-    ///
-    /// Returns `None` if no area found. Otherwise, returns the start address of a page-aligned area.
-    fn get_unmmaped_area(
-        &self,
-        suggested_address: Option<NonZeroAddress<ALIGN>>,
-        length: NonZeroPageSize<ALIGN>,
-        fixed_addr: bool,
-    ) -> Option<usize> {
-        let size = length.as_usize();
+    /// Search VMA gaps, preserving stack guards while optionally excluding reservations.
+    pub(super) fn find_area(
+        reservations: &Store,
+        vmas: &RangeMap<usize, VmArea>,
+        request: FindAreaRequest<ALIGN>,
+    ) -> Result<Option<usize>, AllocationError> {
+        debug_assert!(
+            request
+                .suggested_address
+                .is_none_or(|address| address.0.is_multiple_of(request.alignment))
+        );
+        let size = request.length.as_usize();
         if size > Platform::TASK_ADDR_MAX {
+            return Ok(None);
+        }
+        if let Some(suggested_address) = request.suggested_address {
+            let end = suggested_address
+                .0
+                .checked_add(size)
+                .ok_or(AllocationError::AboveMaxAddress)?;
+            if suggested_address.0 < request.address_range.start {
+                return Err(AllocationError::BelowMinAddress);
+            }
+            if end > request.address_range.end {
+                return Err(AllocationError::AboveMaxAddress);
+            }
+            if request.behavior == FixedAddressBehavior::Replace
+                || !reservations.overlaps(
+                    vmas,
+                    suggested_address.0..end,
+                    request.include_reservations,
+                )
+            {
+                return Ok(Some(suggested_address.0));
+            }
+            if request.behavior == FixedAddressBehavior::NoReplace {
+                return Err(AllocationError::AddressInUse);
+            }
+        } else if request.behavior != FixedAddressBehavior::Hint {
+            return Err(AllocationError::BelowMinAddress);
+        }
+
+        Ok(Self::find_area_in_range_with(reservations, vmas, &request))
+    }
+
+    fn find_area_in_range_with(
+        reservations: &Store,
+        vmas: &RangeMap<usize, VmArea>,
+        request: &FindAreaRequest<ALIGN>,
+    ) -> Option<usize> {
+        let size = request.length.as_usize();
+        let low_limit = request
+            .address_range
+            .start
+            .max(Platform::TASK_ADDR_MIN)
+            .checked_next_multiple_of(request.alignment)?;
+        let high_limit = request.address_range.end.min(Platform::TASK_ADDR_MAX);
+        if high_limit.checked_sub(low_limit)? < size {
             return None;
         }
-        if let Some(suggested_address) = suggested_address {
-            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
-                return None;
-            }
-            if fixed_addr
-                || !self
-                    .vmas
-                    .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
-            {
-                return Some(suggested_address.0);
-            }
-        } else if fixed_addr {
-            // MAP_FIXED with addr=0: return 0 so insert_mapping rejects it
-            // via the TASK_ADDR_MIN check (BelowMinAddress → EPERM).
-            return Some(0);
-        }
-
-        // top down
-        // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (
-            Platform::TASK_ADDR_MIN,
-            Platform::TASK_ADDR_MAX - length.as_usize(),
-        );
         debug_assert_eq!(Platform::TASK_ADDR_MIN % ALIGN, 0);
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
-        let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
-        if last_end <= high_limit {
-            return Some(high_limit);
-        }
-
-        // 2. check gaps between ranges
-        for (r, flags) in self.vmas.iter().rev() {
-            let start = r.start.checked_sub(
-                size + if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
-                    // If it is a stack, we need to leave enough space for the stack to grow downwards.
-                    Self::STACK_GUARD_GAP << 1
+        let find_in_gap = |gap: Range<usize>| {
+            let mut start = if request.top_down {
+                gap.end.checked_sub(size)? & !(request.alignment - 1)
+            } else {
+                gap.start.checked_next_multiple_of(request.alignment)?
+            };
+            while start >= gap.start && start.checked_add(size)? <= gap.end {
+                let conflict = if request.include_reservations {
+                    let mut overlaps = reservations.overlapping(start..start + size);
+                    if request.top_down {
+                        overlaps.next()
+                    } else {
+                        overlaps.next_back()
+                    }
+                    .map(|(_, reservation)| reservation.range())
                 } else {
-                    0
-                },
-            )?;
-            if start < low_limit {
-                return None;
+                    None
+                };
+                let Some(conflict) = conflict else {
+                    return Some(start);
+                };
+                start = if request.top_down {
+                    conflict.start.checked_sub(size)? & !(request.alignment - 1)
+                } else {
+                    conflict.end.checked_next_multiple_of(request.alignment)?
+                };
             }
-            if start > high_limit {
-                // Note we may have pre-allocated memory that are higher than `TASK_ADDR_MAX`
-                // (See [`Vmem::new`]) and thus `start` may be larger than `high_limit`.
-                continue;
-            }
-            if !self.vmas.overlaps(&(start..start + size)) {
+            None
+        };
+        let mut vmas = vmas.iter();
+        let mut gap_boundary = if request.top_down {
+            high_limit
+        } else {
+            low_limit
+        };
+        while let Some((range, vma)) = if request.top_down {
+            vmas.next_back()
+        } else {
+            vmas.next()
+        } {
+            let guard = if vma.flags.contains(VmFlags::VM_GROWSDOWN) {
+                Self::STACK_GUARD_GAP << 1
+            } else {
+                0
+            };
+            let guarded_start = range.start.saturating_sub(guard).min(high_limit);
+            let gap = if request.top_down {
+                range.end.max(low_limit)..gap_boundary
+            } else {
+                gap_boundary..guarded_start
+            };
+            if let Some(start) = find_in_gap(gap) {
                 return Some(start);
             }
+            gap_boundary = if request.top_down {
+                guarded_start
+            } else {
+                range.end.max(low_limit)
+            };
         }
-
-        None
+        let gap = if request.top_down {
+            low_limit..gap_boundary
+        } else {
+            gap_boundary..high_limit
+        };
+        find_in_gap(gap)
     }
 }
 

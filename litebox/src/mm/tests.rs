@@ -10,6 +10,7 @@ use crate::{
     mm::vmem::{CreatePagesFlags, NonZeroAddress},
     platform::{
         PageManagementProvider, RawConstPointer,
+        common_providers::reservations::TrackedReservations,
         page_mgmt::{MemoryRegionPermissions, ReservationStore as _},
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     },
@@ -17,9 +18,11 @@ use crate::{
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::vmem::{
-    MappingState, NoTrackedReservations, NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags,
-    Vmem, VmemProtectError, VmemResizeError,
+    FindAreaRequest, MappingState, NoTrackedReservations, NonZeroPageSize, PAGE_SIZE, PageRange,
+    VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
 };
+
+crate::define_page_reservation!(TestReservation);
 
 #[test]
 fn mapping_state_supports_untracked_reservations() {
@@ -36,6 +39,36 @@ fn mapping_state_supports_untracked_reservations() {
             .reservations
             .take_overlapping(0x1000..0x2000)
             .is_empty()
+    );
+}
+
+#[test]
+fn find_area_optionally_excludes_tracked_reservations() {
+    let mut reservations = TrackedReservations::default();
+    let reserved = 0x1_7000..0x1_8000;
+    // SAFETY: The test range is nonempty, aligned, and uniquely represented.
+    let reservation = unsafe { TestReservation::<PAGE_SIZE>::new(reserved.clone()) };
+    assert!(reservations.insert(reserved.start, reservation).is_none());
+    let vmas = rangemap::RangeMap::new();
+    let request = |include_reservations| FindAreaRequest {
+        suggested_address: None,
+        length: NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+        behavior: crate::platform::page_mgmt::FixedAddressBehavior::Hint,
+        alignment: PAGE_SIZE,
+        include_reservations,
+        address_range: 0x1_0000..0x1_8000,
+        top_down: true,
+    };
+
+    assert_eq!(
+        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(&reservations, &vmas, request(false))
+            .unwrap(),
+        Some(0x1_7000)
+    );
+    assert_eq!(
+        Vmem::<DummyVmemBackend, PAGE_SIZE, _>::find_area(&reservations, &vmas, request(true))
+            .unwrap(),
+        Some(0x1_6000)
     );
 }
 

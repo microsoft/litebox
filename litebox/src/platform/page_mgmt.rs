@@ -4,6 +4,7 @@
 //! Page-management related types and traits
 
 use alloc::vec::Vec;
+use rangemap::RangeMap;
 
 use crate::platform::{RawConstPointer as _, RawMutPointer as _};
 
@@ -21,6 +22,14 @@ pub trait PageReservation {
 pub trait ReservationStore {
     /// Reservation value retained by the store.
     type Reservation: PageReservation;
+
+    /// Check whether a range overlaps committed mappings or, when requested, reservations.
+    fn overlaps<V>(
+        &self,
+        vmas: &RangeMap<usize, V>,
+        range: Range<usize>,
+        include_reservations: bool,
+    ) -> bool;
 
     /// Insert a reservation at `base`.
     fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
