@@ -18,7 +18,6 @@ pub trait PageReservation {
 }
 
 /// Define an opaque page-reservation handle with a private constructor.
-#[doc(hidden)]
 #[macro_export]
 macro_rules! define_page_reservation {
     ($name:ident) => {

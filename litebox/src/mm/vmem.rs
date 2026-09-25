@@ -19,7 +19,6 @@ use crate::platform::page_mgmt::MemoryRegionPermissions;
 use crate::platform::page_mgmt::{PageReservation, ReservationStore};
 
 /// Reservations indexed by their starting address.
-#[doc(hidden)]
 pub struct TrackedReservations<Reservation>(BTreeMap<usize, Reservation>);
 
 impl<Reservation> Default for TrackedReservations<Reservation> {
