@@ -40,6 +40,9 @@ macro_rules! define_page_reservation {
             }
         }
 
+        // Reservation handles must remain non-Clone and non-Copy to preserve exclusive ownership.
+        // The inferred marker below resolves to `()` only in that case; either trait adds another
+        // matching implementation, making trait selection ambiguous and compilation fail.
         const _: fn() = || {
             trait AmbiguousIfCloneOrCopy<Marker> {
                 fn assert_not_impl() {}
