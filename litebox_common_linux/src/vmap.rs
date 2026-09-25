@@ -113,11 +113,11 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
 
 /// Data structure representing a physical address with page alignment.
 ///
-/// Currently, this is an alias to `crate::mm::linux::NonZeroAddress`. This might change if
+/// Currently, this is an alias to `crate::mm::vmem::NonZeroAddress`. This might change if
 /// we selectively conduct sanity checks based on whether an address is virtual or physical
 /// (e.g., whether a virtual address is canonical, whether a physical address is tagged with
 /// a valid key ID, etc.).
-pub type PhysPageAddr<const ALIGN: usize> = litebox::mm::linux::NonZeroAddress<ALIGN>;
+pub type PhysPageAddr<const ALIGN: usize> = litebox::mm::vmem::NonZeroAddress<ALIGN>;
 
 /// Data structure for an array of physical page addresses which are virtually contiguous.
 pub type PhysPageAddrArray<const ALIGN: usize> = [PhysPageAddr<ALIGN>];

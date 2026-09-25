@@ -11,7 +11,7 @@ use litebox::{
     mm::{
         PageManager,
         allocator::SafeZoneAllocator,
-        linux::{
+        vmem::{
             CreatePagesFlags, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, PageFaultError,
             PageRange, VmFlags,
         },

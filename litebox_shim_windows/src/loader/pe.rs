@@ -10,9 +10,7 @@ use core::{
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
 use litebox::{
-    mm::linux::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
-    },
+    mm::vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError},
     platform::RawPointerProvider,
 };
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};

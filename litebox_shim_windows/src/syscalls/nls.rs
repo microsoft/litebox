@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::mem::size_of;
 use litebox::fs::errors::{FileStatusError, OpenError, PathError, ReadError};
-use litebox::mm::linux::{CreatePagesFlags, MappingError, NonZeroPageSize};
+use litebox::mm::vmem::{CreatePagesFlags, MappingError, NonZeroPageSize};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags, FileType};

@@ -18,7 +18,7 @@ use litebox::{
         wait::{WaitContext, WaitError},
     },
     fd::EntryHandle,
-    mm::linux::PAGE_SIZE,
+    mm::vmem::PAGE_SIZE,
     net::{
         CloseBehavior, SOCKET_RECEIVE_OPERATION_SIZE, TcpOptionData,
         errors::AcceptError,

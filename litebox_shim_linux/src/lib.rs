@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use litebox::{
     LiteBox,
-    mm::{PageManager, linux::PAGE_SIZE},
+    mm::{PageManager, vmem::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
     shim::ContinueOperation,
@@ -71,7 +71,7 @@ pub trait ShimPlatform:
     litebox::platform::RawPointerProvider
     + TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox::mm::linux::VmemPageFaultHandler
+    + litebox::mm::vmem::VmemPageFaultHandler
     + litebox_platform::sync::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::SystemInfoProvider
@@ -89,7 +89,7 @@ impl<T> ShimPlatform for T where
     T: litebox::platform::RawPointerProvider
         + TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox::mm::linux::VmemPageFaultHandler
+        + litebox::mm::vmem::VmemPageFaultHandler
         + litebox_platform::sync::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::SystemInfoProvider

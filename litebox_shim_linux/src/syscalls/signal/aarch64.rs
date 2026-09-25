@@ -8,7 +8,7 @@
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use crate::{ShimPlatform, Task, UserPtrMut};
 use core::mem::offset_of;
-use litebox::mm::linux::PAGE_SIZE;
+use litebox::mm::vmem::PAGE_SIZE;
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
     AARCH64_GENERAL_REGISTER_COUNT, MapFlags, ProtFlags, PtRegs,

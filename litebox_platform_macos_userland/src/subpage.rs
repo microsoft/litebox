@@ -612,7 +612,7 @@ mod tests {
     use super::*;
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
-    use litebox::mm::linux::PAGE_SIZE;
+    use litebox::mm::vmem::PAGE_SIZE;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };

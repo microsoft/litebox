@@ -3,7 +3,7 @@
 
 //! Implementation of memory management related syscalls, eg., `mmap`, `munmap`, etc.
 
-use litebox::mm::linux::{MappingError, PAGE_SIZE, VmFlags};
+use litebox::mm::vmem::{MappingError, PAGE_SIZE, VmFlags};
 use litebox::platform::page_mgmt::PageManagementProvider;
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, user_pointers::UserPtrMut};
 

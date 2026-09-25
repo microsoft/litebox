@@ -60,7 +60,7 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
     } {
         Ok(()) => (),
         Err(e) => {
-            if let litebox::mm::linux::PageFaultError::AccessError(_) = e {
+            if let litebox::mm::vmem::PageFaultError::AccessError(_) = e {
                 // Try to recover from page faults in kernel mode using the exception table.
                 // This handles fallible memory operations like memcpy_fallible.
                 // Only check the exception table for kernel-space addresses (high canonical addresses).
@@ -146,7 +146,7 @@ pub extern "C" fn sandbox_process_init(
 ) -> ! {
     let pgd = litebox_platform_linux_kernel::arch::PhysAddr::new_truncate(
         litebox_platform_linux_kernel::arch::instructions::cr3()
-            & !(litebox::mm::linux::PAGE_SIZE as u64 - 1),
+            & !(litebox::mm::vmem::PAGE_SIZE as u64 - 1),
     );
     let platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel::new(pgd);
     #[cfg(debug_assertions)]
