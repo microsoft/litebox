@@ -20,56 +20,9 @@ use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 use crate::platform::page_mgmt::{PageReservation, ReservationStore};
 
-/// Reservation store for page managers that do not retain reservation handles.
-#[doc(hidden)]
-#[derive(Default)]
-pub struct NoTrackedReservations;
-
-/// Uninhabited reservation type used by [`NoTrackedReservations`].
-#[doc(hidden)]
-pub enum NoTrackedReservation {}
-
-impl PageReservation for NoTrackedReservation {
-    fn range(&self) -> Range<usize> {
-        match *self {}
-    }
-}
-
-impl ReservationStore for NoTrackedReservations {
-    type Reservation = NoTrackedReservation;
-
-    fn overlaps<V>(
-        &self,
-        vmas: &RangeMap<usize, V>,
-        range: Range<usize>,
-        _include_reservations: bool,
-    ) -> bool {
-        vmas.overlaps(&range)
-    }
-
-    fn insert(
-        &mut self,
-        _base: usize,
-        reservation: Self::Reservation,
-    ) -> Option<Self::Reservation> {
-        match reservation {}
-    }
-
-    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Self::Reservation)> {
-        core::iter::empty()
-    }
-
-    fn overlapping(
-        &self,
-        _range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)> {
-        core::iter::empty()
-    }
-
-    fn take_overlapping(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
-        Vec::new()
-    }
-}
+pub use crate::platform::common_providers::reservations::{
+    NoTrackedReservation, NoTrackedReservations,
+};
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -408,7 +361,7 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 pub(super) struct Vmem<
     Platform: PageManagementProvider<ALIGN> + 'static,
     const ALIGN: usize,
-    Store: ReservationStore = NoTrackedReservations,
+    Store: ReservationStore = NoTrackedReservations<ALIGN>,
 > {
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,

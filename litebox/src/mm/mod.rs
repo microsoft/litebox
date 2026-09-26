@@ -33,7 +33,7 @@ pub struct PageManager<Platform, const ALIGN: usize>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
 {
-    vmem: RwLock<Platform, Vmem<Platform, ALIGN, NoTrackedReservations>>,
+    vmem: RwLock<Platform, Vmem<Platform, ALIGN, NoTrackedReservations<ALIGN>>>,
 }
 
 impl<Platform, const ALIGN: usize> PageManager<Platform, ALIGN>
