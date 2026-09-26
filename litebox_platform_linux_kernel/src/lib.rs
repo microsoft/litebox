@@ -406,6 +406,8 @@ pub trait HostInterface: 'static {
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    const HINT_PLACEMENT_BEHAVIOR: litebox::platform::page_mgmt::HintPlacementBehavior =
+        litebox::platform::page_mgmt::HintPlacementBehavior::Exact;
 
     fn allocate_pages(
         &self,
@@ -418,7 +420,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         match fixed_address_behavior {
-            FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
+            FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
                 unsafe { self.page_table.unmap_pages(range, true).unwrap() };

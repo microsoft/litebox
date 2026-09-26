@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use super::*;
+use litebox::platform::page_mgmt::{AllocationDirection, HintPlacementBehavior};
 
 fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     let mut res = ProtFlags::PROT_NONE;
@@ -27,6 +28,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+    const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
+        HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
     fn allocate_pages(
         &self,
@@ -36,10 +39,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+        debug_assert!(!matches!(
+            fixed_address_behavior,
+            FixedAddressBehavior::Hint(AllocationDirection::BottomUp)
+        ));
         let flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {
-                FixedAddressBehavior::Hint => MapFlags::empty(),
+                FixedAddressBehavior::Hint(_) => MapFlags::empty(),
                 FixedAddressBehavior::Replace => MapFlags::MAP_FIXED,
                 FixedAddressBehavior::NoReplace => MapFlags::MAP_FIXED_NOREPLACE,
             }
@@ -164,7 +171,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 
         let mut flags = MapFlags::MAP_PRIVATE;
         match fixed_address_behavior {
-            FixedAddressBehavior::Hint => {}
+            FixedAddressBehavior::Hint(_) => {}
             FixedAddressBehavior::Replace => flags |= MapFlags::MAP_FIXED,
             FixedAddressBehavior::NoReplace => flags |= MapFlags::MAP_FIXED_NOREPLACE,
         }
