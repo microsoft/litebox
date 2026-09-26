@@ -36,6 +36,7 @@ use windows_sys::Win32::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo, GetSystemTimePreciseAsFileTime},
+    System::SystemServices::MEM_TOP_DOWN,
     System::Threading::{self as Win32_Threading, GetCurrentProcess},
     System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise,
 };

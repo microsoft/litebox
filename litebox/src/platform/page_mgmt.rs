@@ -18,6 +18,43 @@ pub trait PageReservation {
     fn range(&self) -> Range<usize>;
 }
 
+/// Direction used to search for available virtual address space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationDirection {
+    /// Search from low addresses toward high addresses.
+    BottomUp,
+    /// Search from high addresses toward low addresses.
+    TopDown,
+}
+
+/// Placement behavior supported for hint allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintPlacementBehavior {
+    /// The platform may relocate a hint without guaranteeing a search direction.
+    Unspecified,
+    /// The platform always uses the suggested address, so search direction is irrelevant.
+    Exact,
+    /// The platform can relocate a hint in one direction.
+    Directional(AllocationDirection),
+    /// The platform can relocate a hint in either direction.
+    Bidirectional,
+}
+
+impl HintPlacementBehavior {
+    /// Return whether this behavior preserves the requested placement direction.
+    pub const fn supports(self, direction: AllocationDirection) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Exact | Self::Bidirectional => true,
+            Self::Directional(supported) => matches!(
+                (supported, direction),
+                (AllocationDirection::BottomUp, AllocationDirection::BottomUp)
+                    | (AllocationDirection::TopDown, AllocationDirection::TopDown)
+            ),
+        }
+    }
+}
+
 /// Storage for reservations indexed by their starting address.
 pub trait ReservationStore {
     /// Reservation value retained by the store.
@@ -81,6 +118,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// This must be a nonzero power of two and a multiple of `ALIGN`.
     const RESERVATION_ALIGNMENT: usize = ALIGN;
+
+    /// Placement behavior supported by [`FixedAddressBehavior::Hint`].
+    const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
 
     /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
     ///
@@ -241,8 +281,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixedAddressBehavior {
     /// The address is just a hint, and the platform may choose a different
-    /// address if the hint is not available.
-    Hint,
+    /// address in the specified direction if the hint is not available.
+    Hint(AllocationDirection),
     /// Allocate the pages at the specified address, replacing any existing
     /// mappings.
     Replace,

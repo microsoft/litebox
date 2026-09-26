@@ -262,7 +262,7 @@ where
         if source_data.is_empty() || !source_data.len().is_multiple_of(ALIGN) {
             return Err(CowAllocationError::Unaligned);
         }
-        if suggested_start.is_none() && behavior != FixedAddressBehavior::Hint {
+        if suggested_start.is_none() && !matches!(behavior, FixedAddressBehavior::Hint(_)) {
             return Err(CowAllocationError::InternalFailure);
         }
         if let Some(start) = suggested_start {
@@ -293,7 +293,9 @@ where
             .ok_or(CowAllocationError::InternalFailure)?;
         let actual = super::vmem::PageRange::new(actual_start, actual_end)
             .ok_or(CowAllocationError::InternalFailure)?;
-        debug_assert!(behavior == FixedAddressBehavior::Hint || suggested_start == actual_start);
+        debug_assert!(
+            matches!(behavior, FixedAddressBehavior::Hint(_)) || suggested_start == actual_start
+        );
         debug_assert!(
             actual_start >= Platform::TASK_ADDR_MIN && actual_end <= Platform::TASK_ADDR_MAX
         );

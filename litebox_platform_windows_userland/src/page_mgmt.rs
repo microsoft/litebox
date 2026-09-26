@@ -2,12 +2,14 @@
 // Licensed under the MIT license.
 
 use super::{
-    AllocationError, FixedAddressBehavior, GetCurrentProcess, GetLastError,
+    AllocationError, FixedAddressBehavior, GetCurrentProcess, GetLastError, MEM_TOP_DOWN,
     MemoryRegionPermissions, PrefetchVirtualMemory, UserMutPtr, VirtualAlloc2, VirtualFree,
     VirtualProtect, Win32_Memory, WindowsUserland, c_void,
 };
 use litebox::platform::common_providers::reservations::TrackedReservations;
-use litebox::platform::page_mgmt::{PageReservation as _, ReservationStore as _};
+use litebox::platform::page_mgmt::{
+    AllocationDirection, HintPlacementBehavior, PageReservation as _, ReservationStore as _,
+};
 
 litebox::define_page_reservation!(WindowsUserlandReservation);
 
@@ -66,9 +68,13 @@ macro_rules! debug_assert_alignment {
 }
 
 impl<const ALIGN: usize> WindowsUserland<ALIGN> {
+    /// Reserve a virtual-address range.
+    ///
+    /// `top_down` only affects address selection when `range.start` is zero.
     fn reserve_gap(
         &self,
         range: core::ops::Range<usize>,
+        top_down: bool,
     ) -> Result<WindowsUserlandReservation<ALIGN>, AllocationError> {
         let aligned_start = self.round_down_to_granu(range.start);
         let aligned_end = self.round_up_to_granu(range.end);
@@ -77,7 +83,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
                 GetCurrentProcess(),
                 aligned_start as *mut c_void,
                 aligned_end - aligned_start,
-                Win32_Memory::MEM_RESERVE,
+                Win32_Memory::MEM_RESERVE | if top_down { MEM_TOP_DOWN } else { 0 },
                 Win32_Memory::PAGE_NOACCESS,
                 core::ptr::null_mut(),
                 0,
@@ -117,7 +123,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
             if base.is_some() {
                 continue;
             }
-            match self.reserve_gap(gap) {
+            match self.reserve_gap(gap, false) {
                 Ok(reservation) => acquired.push(reservation),
                 Err(error) => {
                     for reservation in acquired {
@@ -192,6 +198,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     const TASK_ADDR_MIN: usize = 0x1_0000;
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
     const RESERVATION_ALIGNMENT: usize = 0x1_0000;
+    const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Bidirectional;
 
     fn allocate_pages(
         &self,
@@ -218,9 +225,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         let range = match self.reserve_gaps(&mut reservations, suggested_range.clone()) {
             Ok(()) => suggested_range,
             Err(AllocationError::AddressInUse)
-                if fixed_address_behavior == FixedAddressBehavior::Hint =>
+                if let FixedAddressBehavior::Hint(direction) = fixed_address_behavior =>
             {
-                let reservation = self.reserve_gap(0..suggested_range.len())?;
+                let reservation = self.reserve_gap(
+                    0..suggested_range.len(),
+                    direction == AllocationDirection::TopDown,
+                )?;
                 let base = reservation.range().start;
                 assert!(
                     reservations
@@ -394,7 +404,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
-            FixedAddressBehavior::Hint,
+            FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
         )
         .unwrap()
         .as_usize();
@@ -420,7 +430,7 @@ mod tests {
             MemoryRegionPermissions::WRITE,
             false,
             true,
-            FixedAddressBehavior::Hint,
+            FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
         )
         .unwrap()
         .as_usize();
