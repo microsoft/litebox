@@ -1090,10 +1090,40 @@ pub struct TimeVal {
 /// Linux `struct rusage`.
 #[repr(C)]
 #[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[allow(clippy::struct_field_names, reason = "field names match Linux")]
 pub struct Rusage {
-    user_time: TimeVal,
-    system_time: TimeVal,
-    counters: [core::ffi::c_long; 14],
+    /// User time used.
+    ru_utime: TimeVal,
+    /// System time used.
+    ru_stime: TimeVal,
+    /// Maximum resident set size.
+    ru_maxrss: core::ffi::c_long,
+    /// Integral shared memory size.
+    ru_ixrss: core::ffi::c_long,
+    /// Integral unshared data size.
+    ru_idrss: core::ffi::c_long,
+    /// Integral unshared stack size.
+    ru_isrss: core::ffi::c_long,
+    /// Page reclaims.
+    ru_minflt: core::ffi::c_long,
+    /// Page faults.
+    ru_majflt: core::ffi::c_long,
+    /// Swaps.
+    ru_nswap: core::ffi::c_long,
+    /// Block input operations.
+    ru_inblock: core::ffi::c_long,
+    /// Block output operations.
+    ru_oublock: core::ffi::c_long,
+    /// Messages sent.
+    ru_msgsnd: core::ffi::c_long,
+    /// Messages received.
+    ru_msgrcv: core::ffi::c_long,
+    /// Signals received.
+    ru_nsignals: core::ffi::c_long,
+    /// Voluntary context switches.
+    ru_nvcsw: core::ffi::c_long,
+    /// Involuntary context switches.
+    ru_nivcsw: core::ffi::c_long,
 }
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]

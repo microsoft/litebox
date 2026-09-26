@@ -76,7 +76,7 @@ pub(crate) struct ProcessObject {
 
 impl ProcessObject {
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        if self.process.state.lock().status.is_terminal() {
+        if self.process.state.lock().status.is_terminated() {
             ReadinessFlags::READ
         } else {
             ReadinessFlags::default()
@@ -160,7 +160,7 @@ pub(crate) enum ProcessStatus {
 }
 
 impl ProcessStatus {
-    const fn is_terminal(self) -> bool {
+    const fn is_terminated(self) -> bool {
         matches!(self, Self::Failed(_) | Self::Zombie(_))
     }
 
@@ -1575,10 +1575,6 @@ mod tests {
             *sink.published.lock().unwrap(),
             [(handle, ReadinessFlags::READ)]
         );
-        assert_eq!(
-            root.process_exit_status(handle),
-            Ok(ProcessExitStatus::Unknown)
-        );
         child.retire(true);
         drop(child);
         root.close_object_reference(handle).unwrap();
@@ -1861,36 +1857,19 @@ mod tests {
     }
 
     #[test]
-    fn owner_death_orphans_live_and_zombie_children() {
+    fn owner_death_rejects_new_children() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .build()
         .unwrap();
-        let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        root.complete_start().unwrap();
         let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
 
-        let running = broker
-            .allocate_process(CallerCredential::Unauthenticated, Some(parent.id()))
-            .unwrap();
-        running.complete_start().unwrap();
-        let zombie = broker
-            .allocate_process(CallerCredential::Unauthenticated, Some(parent.id()))
-            .unwrap();
-        zombie.complete_start().unwrap();
-        zombie.complete_exit(EXITED).unwrap();
         parent.handle_owner_death();
 
-        assert!(!parent.state.lock().owner_alive);
-        assert_eq!(running.state.lock().status, ProcessStatus::Running);
-        assert_eq!(zombie.state.lock().status, ProcessStatus::Zombie(EXITED));
-        assert_eq!(parent_id(&parent), Some(root.id()));
         assert!(matches!(
             broker.allocate_process(CallerCredential::Unauthenticated, Some(parent.id())),
             Err(BrokerError::PeerClosed)

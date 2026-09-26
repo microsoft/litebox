@@ -33,7 +33,7 @@ use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
     init_state: Cell<ThreadInitState>,
-    process: Arc<Process<Platform>>,
+    process: Arc<ProcessState<Platform>>,
     /// Thread state that can be accessed from a remote thread.
     remote: Arc<ThreadRemote<Platform>>,
     tid: Cell<Option<i32>>,
@@ -60,7 +60,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone())),
+            process: Arc::new(ProcessState::new(pid, remote.clone())),
             remote,
             tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -121,7 +121,7 @@ impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
 }
 
 pub(crate) struct ThreadDetachGuard<'a, Platform: ShimPlatform> {
-    process: &'a Process<Platform>,
+    process: &'a ProcessState<Platform>,
 }
 
 impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
@@ -155,7 +155,7 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
 }
 
 /// A Linux process, which may have multiple threads.
-pub(crate) struct Process<Platform: ShimPlatform> {
+pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
     nr_threads: <Platform as RawMutexProvider>::RawMutex,
@@ -207,7 +207,7 @@ pub(crate) enum ExitStatus {
     Signal(litebox_common_linux::signal::Signal),
 }
 
-impl<Platform: ShimPlatform> Process<Platform> {
+impl<Platform: ShimPlatform> ProcessState<Platform> {
     /// Creates a new process with the given initial thread.
     fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
         let nr_threads = <Platform as RawMutexProvider>::RawMutex::INIT;
@@ -255,7 +255,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
     /// `target` is `None`.
     ///
     /// The caller drops the returned child outside the children lock to reap it.
-    fn take_exited_child(
+    fn remove_exited_child(
         &self,
         target: Option<i32>,
     ) -> Result<(i32, litebox::process::Process<Platform>, ProcessExitStatus), TryOpError<Errno>>
@@ -523,7 +523,7 @@ pub(crate) struct Credentials {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    pub(crate) fn process(&self) -> &Arc<Process<Platform>> {
+    pub(crate) fn process(&self) -> &Arc<ProcessState<Platform>> {
         &self.thread.process
     }
 
@@ -1544,7 +1544,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 process.register_child_observer(target, &observer, mask);
                 Ok(())
             },
-            || process.take_exited_child(target),
+            || process.remove_exited_child(target),
         ) {
             Ok(exited) => exited,
             Err(TryOpError::TryAgain) => return Ok(0),

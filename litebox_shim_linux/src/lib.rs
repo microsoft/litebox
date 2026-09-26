@@ -349,7 +349,7 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
 /// This can be used to wait for the process to exit.
-pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::Process<Platform>>);
+pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::ProcessState<Platform>>);
 
 impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     /// Wait for the process to exit, returning its exit code.
