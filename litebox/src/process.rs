@@ -5,9 +5,9 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessIdentity};
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
@@ -48,25 +48,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn allocate_child_process(&self) -> Result<Process<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         let child = broker.allocate_child_process()?;
-        Ok(Process::new(self, broker, child.process_id, child.handle))
+        Ok(Process::new(self, broker, child.identity, child.handle))
     }
 
-    /// Starts a new child process in a fresh runner.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker does not return a handle for the new child.
-    pub fn start_child_process(
-        &self,
-        payload: &[u8],
-    ) -> Result<(ProcessIdentity, Process<Platform>), ProcessError> {
+    /// Creates and starts a new child process in a fresh runner.
+    pub fn create_child_process(&self, payload: &[u8]) -> Result<Process<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let started = broker.start_child_process(None, payload)?;
-        let handle = started
-            .handle
-            .expect("broker must return a handle for a newly started child");
-        let child = Process::new(self, broker, started.identity.process_id, handle);
-        Ok((started.identity, child))
+        let child = broker.create_child_process(payload)?;
+        Ok(Process::new(self, broker, child.identity, child.handle))
     }
 }
 
@@ -76,7 +65,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
 /// its handle and releases the process's retained exit status.
 pub struct Process<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
-    id: ProcessId,
+    identity: ProcessIdentity,
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
@@ -86,7 +75,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     fn new(
         litebox: &LiteBox<Platform>,
         broker: Arc<dyn BrokerControl>,
-        id: ProcessId,
+        identity: ProcessIdentity,
         handle: ObjectHandle,
     ) -> Self {
         let pollable_registry = litebox.broker_pollable_registry();
@@ -94,24 +83,23 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
         pollable_registry.register_pollable(handle, &pollee);
         Self {
             broker,
-            id,
+            identity,
             handle,
             pollable_registry,
             pollee,
         }
     }
 
-    /// Returns the broker-assigned process ID.
-    pub fn id(&self) -> ProcessId {
-        self.id
+    /// Returns the broker-assigned process and initial thread IDs.
+    pub fn identity(&self) -> ProcessIdentity {
+        self.identity
     }
 
-    /// Transfers this pending child process to a fresh runner.
-    pub fn start(&self, payload: &[u8]) -> Result<ProcessIdentity, ProcessError> {
+    /// Starts this pending child process in a fresh runner.
+    pub fn start(&self, payload: &[u8]) -> Result<(), ProcessError> {
         Ok(self
             .broker
-            .start_child_process(Some(self.id), payload)?
-            .identity)
+            .start_child_process(self.identity.process_id, payload)?)
     }
 
     /// Returns the process's termination status, or `None` while the process is live.

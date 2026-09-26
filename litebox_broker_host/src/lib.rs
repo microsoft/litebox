@@ -44,9 +44,9 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
-    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource, StartedProcess,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -63,7 +63,7 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ProcessId, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferError, SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
@@ -535,7 +535,7 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
-        BrokerOperation::StartChildProcess(_) => {
+        BrokerOperation::StartChildProcess(_) | BrokerOperation::CreateChildProcess(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
@@ -815,63 +815,82 @@ where
                         parent,
                         *child_process_id,
                         ProcessStartupData { payload },
+                    )
+                })
+                .map(|()| BrokerResult::ProcessStarted),
+        ),
+        BrokerOperation::CreateChildProcess(StartChildProcessSource::Bootstrap(startup)) => Some(
+            read_shared_buffer(shared_buffers, startup.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
+                .and_then(|payload| {
+                    create_child_process(
+                        Arc::clone(launcher),
+                        parent,
+                        ProcessStartupData { payload },
                         readiness_sink,
                     )
                 })
-                .map(BrokerResult::ProcessStarted),
+                .map(BrokerResult::ProcessCreated),
         ),
         _ => None,
     }
 }
 
+/// Starts a pending child created earlier by the parent.
 fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     launcher: Arc<Launcher>,
     parent: &BrokerProcess,
-    child_process_id: Option<litebox_broker_protocol::ProcessId>,
+    child_process_id: ProcessId,
     startup: ProcessStartupData,
-    readiness_sink: &Arc<dyn ReadinessSink>,
-) -> RequestResult<StartedProcess> {
+) -> RequestResult<()> {
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
-    let (process, handle) = if let Some(child_process_id) = child_process_id {
-        let process = parent
-            .take_child_process(child_process_id)
-            .map_err(RequestFailure::from)?;
-        (process, None)
-    } else {
-        let (process, handle) = parent
-            .create_child_process(Arc::clone(readiness_sink))
-            .map_err(RequestFailure::from)?;
-        (process, Some(handle))
-    };
+    let process = parent
+        .take_child_process(child_process_id)
+        .map_err(RequestFailure::from)?;
+    launch_child_process(launcher, parent, process, startup)
+}
+
+/// Creates and starts one child, returning its identity and handle.
+fn create_child_process<Launcher: ProcessLauncher + ?Sized>(
+    launcher: Arc<Launcher>,
+    parent: &BrokerProcess,
+    startup: ProcessStartupData,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<CreatedProcess> {
+    if !parent.is_running() {
+        return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
+    }
+    let (process, handle) = parent
+        .create_child_process(Arc::clone(readiness_sink))
+        .map_err(RequestFailure::from)?;
     let identity = ProcessIdentity {
         process_id: process.id(),
         initial_thread_id: process.initial_thread_id(),
     };
-    // A failed start closes the handle it created; an allocated child's handle
-    // stays with the guest, which learned it from allocation. The handle is
-    // already gone if the parent exited concurrently.
-    let close_created_handle = |error: RequestFailure| {
-        if let Some(handle) = handle {
-            let _ = parent.close_object_reference(handle);
-        }
-        Err(error)
-    };
+    if let Err(error) = launch_child_process(launcher, parent, process, startup) {
+        // The guest never learns this handle. It is already gone if the parent
+        // exited concurrently.
+        let _ = parent.close_object_reference(handle);
+        return Err(error);
+    }
+    Ok(CreatedProcess { identity, handle })
+}
+
+fn launch_child_process<Launcher: ProcessLauncher + ?Sized>(
+    launcher: Arc<Launcher>,
+    parent: &BrokerProcess,
+    process: Arc<BrokerProcess>,
+    startup: ProcessStartupData,
+) -> RequestResult<()> {
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
         process.retire(true);
-        return close_created_handle(RequestFailure::Respond(ErrorCode::PeerClosed));
+        return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
     }
-    if let Err(error) = launcher.launch(
-        process,
-        ProcessStartupData {
-            payload: startup.payload,
-        },
-    ) {
-        return close_created_handle(RequestFailure::from(error));
-    }
-    Ok(StartedProcess { identity, handle })
+    launcher
+        .launch(process, startup)
+        .map_err(RequestFailure::from)
 }
 
 fn write_shared_buffer<Memory: SharedMemory>(

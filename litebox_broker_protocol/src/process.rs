@@ -54,22 +54,10 @@ pub enum ProcessExitStatus {
 /// exit status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CreatedProcess {
-    /// Broker-assigned process ID.
-    pub process_id: ProcessId,
+    /// Broker-assigned process identity.
+    pub identity: ProcessIdentity,
     /// Handle used to observe process termination.
     pub handle: ObjectHandle,
-}
-
-/// Result of starting one child process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StartedProcess {
-    /// Started process identity.
-    pub identity: ProcessIdentity,
-    /// Handle to the process when this start request created it.
-    ///
-    /// Starting a pending child returns `None` because allocation already
-    /// returned its handle.
-    pub handle: Option<ObjectHandle>,
 }
 
 /// Selects whether thread creation extends the current process or creates a child process.
@@ -100,11 +88,11 @@ pub enum StartChildProcessSource {
     Duplicate(SharedBufferSequence),
 }
 
-/// Starts either a newly allocated child or a pending child created earlier.
+/// Starts a pending child created earlier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartChildProcessRequest {
-    /// Existing pending child to start, or `None` to allocate a new child.
-    pub child_process_id: Option<ProcessId>,
+    /// Pending child to start.
+    pub child_process_id: ProcessId,
     /// Process startup source.
     pub source: StartChildProcessSource,
 }

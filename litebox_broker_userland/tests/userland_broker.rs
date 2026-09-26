@@ -230,18 +230,15 @@ fn run_fake_runner(args: &[OsString]) {
         let marker = Path::new(&args[4]);
         let bootstrap = marker.as_os_str().as_encoded_bytes();
         let failed = local
-            .start_child_process(
-                None,
+            .create_child_process(
                 SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 0).unwrap(),
                 &[],
             )
-            .unwrap();
-        assert!(failed.handle.is_some());
-        let failed = failed.identity;
+            .unwrap()
+            .identity;
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
         let started = local
-            .start_child_process(
-                None,
+            .create_child_process(
                 SharedBufferSequence::new(
                     &[SharedBufferSlotIndex(0)],
                     bootstrap.len().try_into().unwrap(),
@@ -249,9 +246,8 @@ fn run_fake_runner(args: &[OsString]) {
                 .unwrap(),
                 bootstrap,
             )
-            .unwrap();
-        assert!(started.handle.is_some());
-        let started = started.identity;
+            .unwrap()
+            .identity;
         assert_ne!(started.process_id.0, started.initial_thread_id.0);
         wait_for_marker(
             marker,

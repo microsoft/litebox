@@ -19,7 +19,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, StartedProcess,
+    CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -54,11 +54,16 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 pub(crate) trait BrokerControl: Send + Sync {
     fn allocate_child_process(&self) -> core::result::Result<CreatedProcess, BrokerControlError>;
 
+    fn create_child_process(
+        &self,
+        payload: &[u8],
+    ) -> core::result::Result<CreatedProcess, BrokerControlError>;
+
     fn start_child_process(
         &self,
-        child_process_id: Option<litebox_broker_protocol::ProcessId>,
+        child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<StartedProcess, BrokerControlError>;
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn process_exit_status(
         &self,
@@ -430,6 +435,16 @@ where
         }
     }
 
+    fn acquire_bootstrap_buffer(
+        &self,
+        payload: &[u8],
+    ) -> core::result::Result<SlotLease<'_, Platform>, BrokerControlError> {
+        if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        self.acquire_shared_buffer(payload.len())
+    }
+
     fn acquire_file_path_buffer(
         &self,
         path: &str,
@@ -457,15 +472,20 @@ where
         self.request(BrokerLocal::allocate_child_process)
     }
 
+    fn create_child_process(
+        &self,
+        payload: &[u8],
+    ) -> core::result::Result<CreatedProcess, BrokerControlError> {
+        let shared_buffer_lease = self.acquire_bootstrap_buffer(payload)?;
+        self.request(|local| local.create_child_process(shared_buffer_lease.sequence(), payload))
+    }
+
     fn start_child_process(
         &self,
-        child_process_id: Option<litebox_broker_protocol::ProcessId>,
+        child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<StartedProcess, BrokerControlError> {
-        if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let shared_buffer_lease = self.acquire_shared_buffer(payload.len())?;
+    ) -> core::result::Result<(), BrokerControlError> {
+        let shared_buffer_lease = self.acquire_bootstrap_buffer(payload)?;
         self.request(|local| {
             local.start_child_process(child_process_id, shared_buffer_lease.sequence(), payload)
         })

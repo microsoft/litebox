@@ -782,8 +782,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .litebox
             .allocate_child_process()
             .map_err(Errno::from)?;
-        let child_pid =
-            i32::try_from(child.id().0).expect("broker process IDs must fit Linux pid_t");
+        let child_pid = i32::try_from(child.identity().process_id.0)
+            .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
         parent_context.rax = child_pid.cast_unsigned() as usize;
         self.vfork.replace(Some(crate::VforkState {

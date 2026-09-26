@@ -14,7 +14,7 @@ use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
-use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus};
+use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessIdentity};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -412,7 +412,10 @@ impl BrokerProcess {
                     drop(child_state);
                     state.pending_child_process = Some(Arc::clone(&child));
                     Ok(CreatedProcess {
-                        process_id: child.id(),
+                        identity: ProcessIdentity {
+                            process_id: child.id(),
+                            initial_thread_id: child.initial_thread_id(),
+                        },
                         handle,
                     })
                 }
@@ -1710,8 +1713,9 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let sink = readiness_sink();
-        let CreatedProcess { process_id, handle } =
+        let CreatedProcess { identity, handle } =
             parent.allocate_child_process(sink.clone()).unwrap();
+        let process_id = identity.process_id;
         assert_eq!(
             parent.allocate_child_process(sink.clone()),
             Err(BrokerError::WouldBlock)
@@ -1724,6 +1728,7 @@ mod tests {
 
         let child = parent.take_child_process(process_id).unwrap();
         assert_eq!(child.id(), process_id);
+        assert_eq!(child.initial_thread_id(), identity.initial_thread_id);
         assert_eq!(parent_id(&child), Some(parent.id()));
         assert_eq!(child.startup_result(), None);
         child.complete_start().unwrap();
@@ -1742,8 +1747,9 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let CreatedProcess { process_id, handle } =
+        let CreatedProcess { identity, handle } =
             parent.allocate_child_process(readiness_sink()).unwrap();
+        let process_id = identity.process_id;
         let child = broker
             .processes
             .read()
