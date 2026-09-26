@@ -73,6 +73,8 @@ def run_guest(args, image, memory, cpus=1, initrd=None, expected=None):
     if expected is None:
         markers = ["QEMU-BOOT: shared kernel initialized",
                    "QEMU-BOOT: allocation paging protection fault-recovery OK",
+                   "QEMU-USER: syscall reentry registers XSAVE OK",
+                   "QEMU-USER: faults isolation teardown OK",
                    "QEMU-BOOT: PASS"]
         ok = (result.returncode == 33 and all(m in result.stdout for m in markers)
               and "QEMU-BOOT: FAIL" not in result.stdout)

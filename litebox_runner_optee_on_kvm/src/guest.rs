@@ -2,7 +2,10 @@
 // Licensed under the MIT license.
 
 //! Experimental QEMU runner policy. Intentionally UP, no scheduler, no device
-//! interrupts, no services yet. All setup and tests here execute in ring 0.
+//! interrupts, no services yet. Boot checks run in ring 0, followed by finite
+//! ring-3 payloads in `user_smoke` using the shared execution machinery.
+
+mod user_smoke;
 
 use alloc::{boxed::Box, vec::Vec};
 use core::{
@@ -270,7 +273,8 @@ fn configure_cpu() {
             x86_64::registers::xcontrol::XCr0Flags::X87
                 | x86_64::registers::xcontrol::XCr0Flags::SSE,
         );
-        // No IRQ handlers yet. Mask legacy PIC and leave IF clear throughout.
+        // No device IRQ handlers yet. Mask legacy PIC; boot leaves IF clear.
+        // Shared user-return code enables IF for ring 3, with no timer armed.
         core::arch::asm!("out dx, al", in("dx") 0x21u16, in("al") 0xffu8, options(nostack, nomem));
         core::arch::asm!("out dx, al", in("dx") 0xa1u16, in("al") 0xffu8, options(nostack, nomem));
     }
@@ -282,8 +286,16 @@ extern "C" fn kernel_main(ram_start: u64, ram_end: u64) -> ! {
         PerCpuVariables::allocate_xsave_areas,
     );
     arch::gdt::init();
-    let idt = Box::leak(Box::new(arch::interrupts::exception_idt()));
-    idt.load();
+    let mut idt = Box::new(arch::interrupts::exception_idt());
+    // This debugging runner permits ring-3 INT3. The shared table defaults to
+    // DPL0; retain its handler and change only this runner's software gate DPL.
+    let breakpoint = idt.breakpoint.handler_addr();
+    unsafe {
+        idt.breakpoint
+            .set_handler_addr(breakpoint)
+            .set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+    }
+    Box::leak(idt).load();
     Platform::enable_syscall_support();
     let text = crate::boot::text_physical_range();
     let memory = PhysFrame::range(
@@ -302,6 +314,7 @@ extern "C" fn kernel_main(ram_start: u64, ram_end: u64) -> ! {
     arch::enable_smep_smap();
     serial_println!("QEMU-BOOT: shared kernel initialized");
     smoke(platform);
+    user_smoke::run(platform);
     serial_println!("QEMU-BOOT: PASS");
     exit(true)
 }
