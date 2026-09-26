@@ -37,7 +37,7 @@ pub fn print(args: fmt::Arguments<'_>) {
     );
 }
 
-/// Serial-only output for HostInterface::log and the runner's log backend.
+/// Serial-only output for the runner's log backend.
 /// Deliberately does not go through the shared diagnostic router or ringbuffer.
 pub fn write_serial(message: &str) {
     serial().lock().write_string(message);

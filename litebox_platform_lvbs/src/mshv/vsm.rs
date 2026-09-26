@@ -795,7 +795,7 @@ impl Vtl1Gate for LvbsVtl1Gate {
         LvbsVtl0Gate::mint(self.platform)
             .read_vtl0_contiguous(key_pa.as_u64(), &mut *keybuf)
             .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        crate::host::lvbs::set_platform_root_key(&keybuf);
+        self.platform.host().set_platform_root_key(&keybuf);
         Ok(())
     }
 }

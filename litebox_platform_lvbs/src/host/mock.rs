@@ -1,28 +1,64 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use core::sync::atomic::AtomicU32;
+//! Software-only host for page-table tests. No VM lifecycle or peer operations.
 
-use crate::HostInterface;
+use crate::host::Host;
 
 mod clock;
 
-pub struct MockHostInterface {}
-
-pub type MockKernel = crate::LinuxKernel<MockHostInterface>;
-
-/// Memory backing for the software-only mock kernel.
+pub struct MockHost {}
+pub type MockKernel = crate::LinuxKernel<MockHost>;
 pub struct MockMemory;
-
-/// Invalidator for test-only page tables that are never installed in CR3.
 pub struct MockTlb;
 
-// SAFETY: these software-only tables have no hardware translations to invalidate.
+// SAFETY: software-only tables are never installed in CR3.
 unsafe impl crate::mm::tlb::TlbInvalidation for MockTlb {
     fn invalidate(
         _start: x86_64::structures::paging::Page<x86_64::structures::paging::Size4KiB>,
         _page_count: usize,
     ) {
+    }
+}
+impl crate::console::DiagnosticOutput for MockHost {
+    fn print(args: core::fmt::Arguments<'_>) {
+        Self::log(&alloc::format!("{args}"));
+    }
+}
+impl Host for MockHost {
+    type Memory = MockMemory;
+    type Timer = Self;
+    fn execution_timer(&self) -> &Self {
+        self
+    }
+}
+impl litebox::platform::RawMutexProvider for MockHost {
+    type RawMutex = super::no_scheduler::NoSchedulerMutex;
+}
+impl crate::execution::ExecutionTimer for MockHost {
+    fn arm(&self) {
+        panic!("software-only host cannot enter user mode");
+    }
+    fn on_user_exception(&self, _exception: litebox::shim::Exception) {
+        panic!("software-only host cannot receive interrupts");
+    }
+}
+
+impl MockHost {
+    // The old ignored memory tests still lack a boot-memory harness. These
+    // fixture helpers are not part of the production Host contract.
+    pub fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+        todo!()
+    }
+    /// # Safety
+    /// The address must have been allocated by this fixture's allocation hook.
+    pub unsafe fn free(_addr: usize) {
+        todo!()
+    }
+    pub fn log(msg: &str) {
+        unsafe {
+            libc::write(libc::STDOUT_FILENO, msg.as_ptr().cast(), msg.len());
+        }
     }
 }
 
@@ -32,54 +68,6 @@ macro_rules! mock_log_println {
         use core::fmt::Write;
         let mut t: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         writeln!(t, $($tt)*).unwrap();
-        <$crate::host::mock::MockHostInterface as $crate::HostInterface>::log(&t);
+        $crate::host::mock::MockHost::log(&t);
     }};
-}
-
-impl HostInterface for MockHostInterface {
-    type Memory = MockMemory;
-
-    fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        todo!()
-    }
-
-    unsafe fn free(_addr: usize) {
-        todo!()
-    }
-
-    fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
-        todo!()
-    }
-
-    fn send_ip_packet(_packet: &[u8]) -> Result<usize, crate::Errno> {
-        todo!()
-    }
-
-    fn receive_ip_packet(_packet: &mut [u8]) -> Result<usize, crate::Errno> {
-        todo!()
-    }
-
-    fn log(msg: &str) {
-        unsafe { libc::write(libc::STDOUT_FILENO, msg.as_ptr().cast(), msg.len()) };
-    }
-
-    fn exit() -> ! {
-        todo!()
-    }
-
-    fn switch(_result: u64) -> ! {
-        todo!()
-    }
-
-    fn wake_many(_mutex: &AtomicU32, _n: usize) -> Result<usize, crate::Errno> {
-        todo!()
-    }
-
-    fn block_or_maybe_timeout(
-        _mutex: &AtomicU32,
-        _val: u32,
-        _timeout: Option<core::time::Duration>,
-    ) -> Result<(), crate::Errno> {
-        todo!()
-    }
 }

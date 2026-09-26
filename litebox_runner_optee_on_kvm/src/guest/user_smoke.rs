@@ -20,7 +20,7 @@ use litebox_common_linux::{
     arch::{EFLAGS_DF, EFLAGS_IF, USER_CS, USER_DS},
     errno::Errno,
 };
-use litebox_platform_lvbs::{KERNEL_OFFSET, execution::ExecutionTimer, serial_println};
+use litebox_platform_lvbs::{KERNEL_OFFSET, serial_println};
 
 const PAGE: usize = 4096;
 const CODE: usize = 0x200000;
@@ -66,22 +66,6 @@ unsafe extern "C" {
 
 fn user_address(label: *const u8) -> usize {
     CODE + (label as usize - &raw const user_smoke_start as usize)
-}
-
-/// An explicit debugging choice, not an implicit platform default. It counts
-/// the shared hooks but programs no device. Never use for untrusted workloads.
-#[derive(Default)]
-struct NoTimerForFiniteTests {
-    arms: Cell<usize>,
-    user_exceptions: Cell<usize>,
-}
-impl ExecutionTimer for NoTimerForFiniteTests {
-    fn arm(&self) {
-        self.arms.set(self.arms.get() + 1);
-    }
-    fn on_user_exception(&self, _exception: Exception) {
-        self.user_exceptions.set(self.user_exceptions.get() + 1);
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -412,7 +396,8 @@ pub(super) fn run(platform: &Platform) {
     data[36..40].copy_from_slice(&0x3f80u32.to_le_bytes());
     map_and_copy(platform, DATA, &data, Perms::READ | Perms::WRITE);
     map_and_copy(platform, STACK, &[], Perms::READ | Perms::WRITE);
-    let timer = NoTimerForFiniteTests::default();
+    let timer = &platform.host().timer;
+    let (initial_arms, initial_exceptions) = timer.counts();
     let mut regs = PtRegs::default();
     let roundtrip = TestShim::new(Case::RoundTrip, platform);
     // The primary test exercises first save/restore and subsequent XSAVEOPT
@@ -420,9 +405,9 @@ pub(super) fn run(platform: &Platform) {
     for (entry, seed) in KERNEL_CONTROL_SEEDS.into_iter().enumerate() {
         check_kernel_fp_restore(seed, || unsafe {
             if entry == 0 {
-                litebox_platform_lvbs::run_thread_ref(&roundtrip, &mut regs, &timer);
+                platform.run_thread_ref(&roundtrip, &mut regs);
             } else {
-                litebox_platform_lvbs::reenter_thread_ref(&roundtrip, &mut regs, &timer);
+                platform.reenter_thread_ref(&roundtrip, &mut regs);
             }
         });
         assert_eq!(regs.rax, DONE);
@@ -437,9 +422,9 @@ pub(super) fn run(platform: &Platform) {
     }
     assert_eq!(roundtrip.init_calls.get(), 1);
     assert_eq!(roundtrip.reenter_calls.get(), 2);
-    assert_eq!(timer.arms.get(), 3);
+    assert_eq!(timer.counts().0 - initial_arms, 3);
     assert_eq!(
-        timer.user_exceptions.get(),
+        timer.counts().1 - initial_exceptions,
         3,
         "kernel faults must not notify user timer hook"
     );
@@ -461,7 +446,7 @@ pub(super) fn run(platform: &Platform) {
         check_kernel_fp_restore(
             KERNEL_CONTROL_SEEDS[entry % KERNEL_CONTROL_SEEDS.len()],
             || unsafe {
-                litebox_platform_lvbs::run_thread_ref(&shim, &mut regs, &timer);
+                platform.run_thread_ref(&shim, &mut regs);
             },
         );
         assert_eq!(shim.init_calls.get(), 1);
@@ -480,8 +465,8 @@ pub(super) fn run(platform: &Platform) {
         assert_eq!(unsafe { litebox_common_linux::rdgsbase() }, shim.kernel_gs);
         serial_println!(super::console; "QEMU-USER: {case:?} OK");
     }
-    assert_eq!(timer.arms.get(), 10);
-    assert_eq!(timer.user_exceptions.get(), 9);
+    assert_eq!(timer.counts().0 - initial_arms, 10);
+    assert_eq!(timer.counts().1 - initial_exceptions, 9);
     assert_eq!(platform.current_page_table_id(), task);
     let handle = platform.page_table_manager().current_page_table();
     for base in [CODE, DATA, STACK] {

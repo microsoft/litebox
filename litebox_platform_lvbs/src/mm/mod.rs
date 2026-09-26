@@ -23,14 +23,10 @@ pub mod tests;
 /// changing an allocator or address translation while frames are live is invalid.
 /// Providers are independent of the kernel object so allocation works during
 /// early boot, before a kernel has been constructed.
-pub trait MemoryProvider: Send + Sync + 'static {
+pub trait MemoryProvider: crate::console::DiagnosticOutput + Send + Sync + 'static {
     /// Platform-selected synchronous invalidation. No implicit local-only
     /// default: a backend must account for every CPU that can use its mappings.
     type Tlb: tlb::TlbInvalidation;
-
-    /// Diagnostic output selected alongside the memory backend. No global
-    /// registration is required for allocation or page-table fault diagnostics.
-    fn print(args: core::fmt::Arguments<'_>);
 
     /// Global virtual address offset for one-to-one mapping of physical memory
     /// to kernel virtual memory.

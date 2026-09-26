@@ -5,14 +5,14 @@
 
 use litebox::shim::Exception;
 
-/// Timer integration supplied explicitly by the runner when entering user code.
+/// Execution-window capability owned and selected by the host.
 ///
 /// The platform owns initialization, the budget, interrupt registration,
 /// kernel-mode interrupt handling, and the lifetime of an armed execution
 /// window. Shared execution code does not automatically disarm on return:
 /// a platform may bound a larger window spanning multiple user entries. The
 /// runner must initialize the timer and install its IRQ entries on the current
-/// CPU before passing it to user execution.
+/// CPU before entering user execution through the kernel instance.
 ///
 /// There is no implicit disabled implementation. A debugging runner that does
 /// not provide a timer must make that choice explicitly in its implementation.

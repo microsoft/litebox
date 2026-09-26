@@ -58,11 +58,13 @@ unsafe impl<const OFFSET: u64> TlbInvalidation for RecordingTlb<OFFSET> {
 
 struct TestMemory<const OFFSET: u64 = 0>;
 
-impl<const OFFSET: u64> MemoryProvider for TestMemory<OFFSET> {
+impl<const OFFSET: u64> crate::console::DiagnosticOutput for TestMemory<OFFSET> {
     fn print(args: core::fmt::Arguments<'_>) {
         std::eprint!("{args}");
     }
+}
 
+impl<const OFFSET: u64> MemoryProvider for TestMemory<OFFSET> {
     type Tlb = RecordingTlb<OFFSET>;
     const GVA_OFFSET: VirtAddr = VirtAddr::zero();
     const PRIVATE_PTE_MASK: u64 = 0;
@@ -235,6 +237,116 @@ fn permission_updates_use_the_selected_invalidator() {
         };
         assert!(!flags.contains(PageTableFlags::WRITABLE));
     }
+}
+
+#[test]
+fn kernel_capabilities_follow_the_owned_host_instance() {
+    use crate::host::mock::MockHost;
+    use crate::{execution::ExecutionTimer, host::Host};
+    use litebox::platform::{
+        CrngProvider, DerivedKeyError, DerivedKeyProvider, KDFParams, RawMutexProvider,
+        TimeProvider,
+    };
+
+    // An atomic counter keeps the public Host Sync contract genuine.
+    struct AtomicTimer(core::sync::atomic::AtomicUsize);
+    struct TestHost {
+        marker: u8,
+        timer: AtomicTimer,
+    }
+    impl ExecutionTimer for AtomicTimer {
+        fn arm(&self) {
+            self.0.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        fn on_user_exception(&self, _exception: litebox::shim::Exception) {}
+    }
+    impl crate::console::DiagnosticOutput for TestHost {
+        fn print(args: core::fmt::Arguments<'_>) {
+            std::eprint!("{args}");
+        }
+    }
+    impl RawMutexProvider for TestHost {
+        type RawMutex = crate::host::no_scheduler::NoSchedulerMutex;
+    }
+    impl TimeProvider for TestHost {
+        type Instant = <MockHost as TimeProvider>::Instant;
+        type SystemTime = <MockHost as TimeProvider>::SystemTime;
+        fn now(&self) -> Self::Instant {
+            MockHost {}.now()
+        }
+        fn current_time(&self) -> Self::SystemTime {
+            MockHost {}.current_time()
+        }
+    }
+    impl Host for TestHost {
+        type Memory = TestMemory;
+        type Timer = AtomicTimer;
+        fn execution_timer(&self) -> &Self::Timer {
+            &self.timer
+        }
+    }
+    impl CrngProvider for TestHost {
+        fn fill_bytes_crng(&self, buf: &mut [u8]) {
+            buf.fill(self.marker);
+        }
+    }
+    impl DerivedKeyProvider for TestHost {
+        fn derive_key<E>(
+            &self,
+            kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
+            params: KDFParams,
+        ) -> Result<(), DerivedKeyError<E>> {
+            kdf.ok_or(DerivedKeyError::ShimKDFRequired)?(&[self.marker], params)
+                .map_err(DerivedKeyError::ShimKDFError)
+        }
+    }
+    let make = |marker| {
+        let base = unsafe { crate::mm::PageTable::<TestMemory, PAGE_SIZE>::new_top_level() };
+        crate::LinuxKernel {
+            host: TestHost {
+                marker,
+                timer: AtomicTimer(core::sync::atomic::AtomicUsize::new(0)),
+            },
+            page_table_manager: crate::PageTableManager::new(base),
+        }
+    };
+    let first = make(0x11);
+    let second = make(0x22);
+    for (kernel, expected) in [(&first, 0x11), (&second, 0x22)] {
+        let mut bytes = [0; 8];
+        kernel.fill_bytes_crng(&mut bytes);
+        assert_eq!(bytes, [expected; 8]);
+        kernel
+            .derive_key::<core::convert::Infallible>(
+                Some(|key, params| {
+                    params.output.fill(key[0]);
+                    Ok(())
+                }),
+                KDFParams {
+                    context: b"test",
+                    output: &mut bytes,
+                },
+            )
+            .unwrap();
+        assert_eq!(bytes, [expected; 8]);
+    }
+    first.host().execution_timer().arm();
+    assert_eq!(
+        first
+            .host()
+            .timer
+            .0
+            .load(core::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        second
+            .host()
+            .timer
+            .0
+            .load(core::sync::atomic::Ordering::Relaxed),
+        0
+    );
 }
 
 #[test]

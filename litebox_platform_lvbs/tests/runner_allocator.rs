@@ -25,11 +25,13 @@ unsafe impl TlbInvalidation for SoftwareOnlyTlb {
     fn invalidate(_start: Page<Size4KiB>, _page_count: usize) {}
 }
 
-impl MemoryProvider for RunnerMemory {
+impl litebox_platform_lvbs::console::DiagnosticOutput for RunnerMemory {
     fn print(args: core::fmt::Arguments<'_>) {
         eprint!("{args}");
     }
+}
 
+impl MemoryProvider for RunnerMemory {
     type Tlb = SoftwareOnlyTlb;
     const GVA_OFFSET: VirtAddr = VirtAddr::zero();
     const PRIVATE_PTE_MASK: u64 = 0;

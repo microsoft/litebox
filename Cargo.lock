@@ -1722,7 +1722,6 @@ dependencies = [
  "litebox_shim_optee",
  "spin 0.10.0",
  "x86_64",
- "zerocopy",
 ]
 
 [[package]]

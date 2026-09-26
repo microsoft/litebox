@@ -35,13 +35,13 @@ pub fn hv_hypercall_page_address() -> u64 {
     crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address()
 }
 
-use crate::{Errno, HostInterface};
+use crate::host::Host;
 use digest::Digest;
 use litebox_common_lvbs::PRK_LEN;
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
-pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
+pub type LvbsLinuxKernel = crate::LinuxKernel<LvbsHost>;
 
 impl LvbsLinuxKernel {
     // TODO: replace it with actual implementation (e.g., atomically increment PID/TID)
@@ -57,15 +57,15 @@ impl LvbsLinuxKernel {
     }
 }
 
-impl litebox::platform::CrngProvider for LvbsLinuxKernel {
+impl litebox::platform::CrngProvider for LvbsHost {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        static RANDOM: spin::mutex::SpinMutex<Option<LvbsCrng>> = spin::mutex::SpinMutex::new(None);
-
-        let mut random = RANDOM.lock();
+        let mut random = self.random.lock();
         random
             .get_or_insert_with(|| {
                 LvbsCrng::new(
-                    PRK_ONCE.get().expect("Platform root key not initialized"),
+                    self.root_key
+                        .get()
+                        .expect("Platform root key not initialized"),
                     rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
                 )
             })
@@ -128,31 +128,29 @@ impl LvbsCrng {
     }
 }
 
-static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
-
 // Do not expose a raw PRK getter (i.e., no `get_platform_root_key`).
 // Consumers should provide key derivation function and context
 // through `DerivedKeyProvider` so PRK access stays in this module.
 
-/// Sets the Platform Root Key (PRK) for this platform.
-///
-/// This should be called once during platform initialization with a key derived
-/// from hardware or a boot nonce.
-pub(crate) fn set_platform_root_key(key: &[u8; PRK_LEN]) {
-    PRK_ONCE.call_once(|| {
-        let mut prk = Zeroizing::new([0u8; PRK_LEN]);
-        prk.copy_from_slice(key);
-        *prk
-    });
+impl LvbsHost {
+    /// Install this host's root key once, via the VTL1 setup gate. Later
+    /// derivations never expose the raw key outside this module.
+    pub(crate) fn set_platform_root_key(&self, key: &[u8; PRK_LEN]) {
+        self.root_key.call_once(|| {
+            let mut prk = Zeroizing::new([0u8; PRK_LEN]);
+            prk.copy_from_slice(key);
+            *prk
+        });
+    }
 }
 
-impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
+impl litebox::platform::DerivedKeyProvider for LvbsHost {
     fn derive_key<E>(
         &self,
         kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
         params: litebox::platform::KDFParams,
     ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
-        let Some(prk) = PRK_ONCE.get() else {
+        let Some(prk) = self.root_key.get() else {
             return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
         };
         match kdf {
@@ -207,58 +205,31 @@ fn crng_reseed_from_rdrand_and_state(
         .into()
 }
 
-pub struct HostLvbsInterface {
+pub struct LvbsHost {
     vtl1_phys_frame_range:
         x86_64::structures::paging::frame::PhysFrameRange<x86_64::structures::paging::Size4KiB>,
     end_of_boot: core::sync::atomic::AtomicBool,
+    timer: timer::LvbsTimer,
+    random: spin::mutex::SpinMutex<Option<LvbsCrng>>,
+    root_key: spin::Once<[u8; PRK_LEN]>,
 }
 
-impl HostInterface for HostLvbsInterface {
+impl crate::console::DiagnosticOutput for LvbsHost {
+    fn print(args: core::fmt::Arguments<'_>) {
+        console::print(args);
+    }
+}
+
+impl Host for LvbsHost {
     type Memory = memory::LvbsMemory;
-
-    fn send_ip_packet(_packet: &[u8]) -> Result<usize, Errno> {
-        unimplemented!()
+    type Timer = timer::LvbsTimer;
+    fn execution_timer(&self) -> &Self::Timer {
+        &self.timer
     }
+}
 
-    fn receive_ip_packet(_packet: &mut [u8]) -> Result<usize, Errno> {
-        unimplemented!()
-    }
-
-    fn log(msg: &str) {
-        console::write_serial(msg);
-    }
-
-    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        panic!("dynamic memory allocation is not supported (layout = {layout:?})");
-    }
-
-    unsafe fn free(_addr: usize) {
-        unimplemented!()
-    }
-
-    fn exit() -> ! {
-        unimplemented!()
-    }
-
-    fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
-        unimplemented!()
-    }
-
-    fn wake_many(_mutex: &core::sync::atomic::AtomicU32, _n: usize) -> Result<usize, Errno> {
-        unimplemented!()
-    }
-
-    fn block_or_maybe_timeout(
-        _mutex: &core::sync::atomic::AtomicU32,
-        _val: u32,
-        _timeout: Option<core::time::Duration>,
-    ) -> Result<(), Errno> {
-        unimplemented!()
-    }
-
-    fn switch(_result: u64) -> ! {
-        unimplemented!()
-    }
+impl litebox::platform::RawMutexProvider for LvbsHost {
+    type RawMutex = super::no_scheduler::NoSchedulerMutex;
 }
 
 #[cfg(test)]
@@ -269,6 +240,52 @@ mod tests {
     const TEST_PRK: [u8; PRK_LEN] = [0x42; PRK_LEN];
     const INIT_SEED: CrngSeed = [0xA5; 32];
     const RESEED_SEED: CrngSeed = [0x5A; 32];
+
+    #[test]
+    fn root_key_is_owned_by_each_host_and_installed_once() {
+        use litebox::platform::{DerivedKeyError, DerivedKeyProvider, KDFParams};
+        let make = || {
+            let start =
+                x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(0));
+            LvbsHost {
+                vtl1_phys_frame_range: x86_64::structures::paging::PhysFrame::range(start, start),
+                end_of_boot: core::sync::atomic::AtomicBool::new(false),
+                timer: timer::LvbsTimer,
+                random: spin::mutex::SpinMutex::new(None),
+                root_key: spin::Once::new(),
+            }
+        };
+        let first = make();
+        let second = make();
+        let mut output = [0; PRK_LEN];
+        assert!(matches!(
+            second.derive_key::<core::convert::Infallible>(
+                None,
+                KDFParams {
+                    context: b"test",
+                    output: &mut output
+                }
+            ),
+            Err(DerivedKeyError::UnsupportedRebootPersistentKey)
+        ));
+        first.set_platform_root_key(&[0x11; PRK_LEN]);
+        second.set_platform_root_key(&[0x22; PRK_LEN]);
+        first.set_platform_root_key(&[0x33; PRK_LEN]);
+        for (host, expected) in [(&first, 0x11), (&second, 0x22)] {
+            host.derive_key::<core::convert::Infallible>(
+                Some(|key, params| {
+                    params.output.copy_from_slice(key);
+                    Ok(())
+                }),
+                KDFParams {
+                    context: b"test",
+                    output: &mut output,
+                },
+            )
+            .unwrap();
+            assert_eq!(output, [expected; PRK_LEN]);
+        }
+    }
 
     #[test]
     fn crosses_reseed_boundary_twice_with_accurate_budget() {

@@ -5,7 +5,7 @@
 //! The shared kernel receives the resulting mappings, not linker symbols or
 //! assumptions about a VTL peer.
 
-use super::{HostLvbsInterface, LvbsLinuxKernel};
+use super::{LvbsHost, LvbsLinuxKernel};
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::{
     PhysAddr,
@@ -60,9 +60,12 @@ impl LvbsLinuxKernel {
             ));
             exec_ranges.push(hypercall..hypercall + Size4KiB::SIZE);
         }
-        let host = HostLvbsInterface {
+        let host = LvbsHost {
             vtl1_phys_frame_range: range,
             end_of_boot: AtomicBool::new(false),
+            timer: super::timer::LvbsTimer,
+            random: spin::mutex::SpinMutex::new(None),
+            root_key: spin::Once::new(),
         };
         // SAFETY: the caller supplies the live VTL1 range and relocated text;
         // LVBS adds its other required executable mapping, the hypercall page.

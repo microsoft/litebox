@@ -4,18 +4,18 @@
 //! Real OP-TEE TA lifecycle test using the repository's unmodified ldelf and
 //! hello TA fixtures. No transport: all inputs are value parameters owned here.
 
-use super::{Platform as Kernel, console, optee_platform::OpteePlatform};
+use super::{Platform, console};
 use alloc::boxed::Box;
 use core::cell::Cell;
 use litebox::{
     platform::RawConstPointer,
-    shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo},
+    shim::{ContinueOperation, EnterShim, ExceptionInfo},
 };
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::{
     TeeIdentity, TeeLogin, TeeResult, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
-use litebox_platform_lvbs::{execution::ExecutionTimer, serial_println};
+use litebox_platform_lvbs::serial_println;
 use litebox_shim_optee::{OpteeShimBuilder, UserConstPtr, session::SessionManager};
 
 // Existing project test assets, with their existing BSD license/provenance.
@@ -27,14 +27,6 @@ const HELLO: &[u8] =
     include_bytes!("../../../litebox_runner_optee_on_linux_userland/tests/hello-ta.elf");
 const HELLO_3SEG: &[u8] =
     include_bytes!("../../../litebox_runner_optee_on_linux_userland/tests/hello3seg-ta.elf");
-
-/// No timer/scheduler in this debugging harness. These are trusted finite test
-/// TAs; the CI host process timeout is mandatory and a timeout fails the test.
-struct FiniteTestTimer;
-impl ExecutionTimer for FiniteTestTimer {
-    fn arm(&self) {}
-    fn on_user_exception(&self, _exception: Exception) {}
-}
 
 /// Observe genuine shim dispatch, never fabricate results or replace handlers.
 struct Observed<'a, T> {
@@ -63,16 +55,15 @@ impl<T: EnterShim<ExecutionContext = PtRegs>> EnterShim for Observed<'_, T> {
     }
 }
 
-pub(super) fn run(kernel: &'static Kernel) {
-    // Shim APIs require static platform/session-manager references. Allocate
-    // once for this VM test, not through a global singleton or registration.
-    let platform = Box::leak(Box::new(OpteePlatform::new(kernel)));
-    let sessions = Box::leak(Box::new(SessionManager::<OpteePlatform>::new()));
+pub(super) fn run(platform: &'static Platform) {
+    // Both shims use LinuxKernel<QemuHost> directly. Only the session manager
+    // needs a VM-lifetime allocation; there is no OP-TEE platform wrapper.
+    let sessions = Box::leak(Box::new(SessionManager::<Platform>::new()));
     for (name, binary) in [("hello", HELLO), ("hello3seg", HELLO_3SEG)] {
         serial_println!(console; "OPTEE-TEST: {name} begin");
-        let task = kernel.create_task_page_table().unwrap();
+        let task = platform.create_task_page_table().unwrap();
         unsafe {
-            kernel.switch_page_table(task).unwrap();
+            platform.switch_page_table(task).unwrap();
         }
         let shim = OpteeShimBuilder::new(platform, sessions).build();
         let uuid = litebox_common_optee::parse_ta_head(binary)
@@ -101,7 +92,7 @@ pub(super) fn run(kernel: &'static Kernel) {
         };
         let mut ctx = PtRegs::default();
         unsafe {
-            litebox_platform_lvbs::run_thread_ref(&observed, &mut ctx, &FiniteTestTimer);
+            platform.run_thread_ref(&observed, &mut ctx);
         }
         assert_eq!(ctx.rax, 0, "{name}: ldelf/TA_CreateEntryPoint failed");
         assert!(
@@ -116,7 +107,7 @@ pub(super) fn run(kernel: &'static Kernel) {
             .unwrap();
         let before = observed.syscalls.get();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(&observed, &mut ctx, &FiniteTestTimer);
+            platform.reenter_thread_ref(&observed, &mut ctx);
         }
         assert_eq!(ctx.rax, 0, "{name}: TA_OpenSessionEntryPoint failed");
         assert!(
@@ -145,15 +136,14 @@ pub(super) fn run(kernel: &'static Kernel) {
                 .unwrap();
             let before = observed.syscalls.get();
             unsafe {
-                litebox_platform_lvbs::reenter_thread_ref(&observed, &mut ctx, &FiniteTestTimer);
+                platform.reenter_thread_ref(&observed, &mut ctx);
             }
             assert_eq!(ctx.rax, 0, "{name}: invoke {command} failed");
             assert!(observed.syscalls.get() > before);
-            let output = UserConstPtr::<OpteePlatform, UteeParams>::from_usize(
-                loaded.params_address.unwrap(),
-            )
-            .read_at_offset(0)
-            .expect("read actual TA output params");
+            let output =
+                UserConstPtr::<Platform, UteeParams>::from_usize(loaded.params_address.unwrap())
+                    .read_at_offset(0)
+                    .expect("read actual TA output params");
             assert_eq!(
                 output.get_values(0).unwrap(),
                 Some((expected, 0)),
@@ -171,7 +161,7 @@ pub(super) fn run(kernel: &'static Kernel) {
             )
             .unwrap();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(&observed, &mut ctx, &FiniteTestTimer);
+            platform.reenter_thread_ref(&observed, &mut ctx);
         }
         assert_eq!(
             ctx.rax,
@@ -185,7 +175,7 @@ pub(super) fn run(kernel: &'static Kernel) {
             .unwrap();
         let before = observed.syscalls.get();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(&observed, &mut ctx, &FiniteTestTimer);
+            platform.reenter_thread_ref(&observed, &mut ctx);
         }
         assert_eq!(ctx.rax, 0, "{name}: TA_CloseSessionEntryPoint failed");
         assert!(observed.syscalls.get() > before);
@@ -194,10 +184,10 @@ pub(super) fn run(kernel: &'static Kernel) {
         drop(token);
         unsafe {
             shim.release_user_mappings();
-            kernel
+            platform
                 .switch_page_table(litebox_platform_lvbs::BASE_PAGE_TABLE_ID)
                 .unwrap();
-            kernel.delete_task_page_table(task).unwrap();
+            platform.delete_task_page_table(task).unwrap();
         }
         drop(shim);
         serial_println!(console; "OPTEE-TEST: {name} PASS");

@@ -9,12 +9,10 @@
 use crate::execution::ExecutionTimer;
 use crate::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables};
 use alloc::sync::Arc;
-use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
-    ImmediatelyWokenUp, PageManagementProvider, RawMutex as _, RawMutexProvider,
-    RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
+    PageManagementProvider, RawMutexProvider, RawPointerProvider, StdioProvider, TimeProvider,
 };
 use litebox::{
     mm::vmem::{PAGE_SIZE, PageRange},
@@ -398,8 +396,8 @@ impl<M: mm::MemoryProvider> PageTableManager<M> {
 }
 
 /// This is the platform for running LiteBox in kernel mode.
-/// It requires a host that implements the [`HostInterface`] trait.
-pub struct LinuxKernel<Host: HostInterface> {
+/// The host selects substrate facilities; peer-domain gates remain separate.
+pub struct LinuxKernel<Host: host::Host> {
     host: Host,
     page_table_manager: PageTableManager<Host::Memory>,
 }
@@ -463,14 +461,12 @@ type UserConstPtr<T> =
 type UserMutPtr<T> =
     litebox::platform::common_providers::userspace_pointers::UserMutPtr<LvbsValidateAccess, T>;
 
-impl<Host: HostInterface> RawPointerProvider for LinuxKernel<Host> {
+impl<Host: host::Host> RawPointerProvider for LinuxKernel<Host> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
-unsafe impl<Host: HostInterface> litebox::platform::ThreadLocalStorageProvider
-    for LinuxKernel<Host>
-{
+unsafe impl<Host: host::Host> litebox::platform::ThreadLocalStorageProvider for LinuxKernel<Host> {
     fn get_thread_local_storage() -> *mut () {
         let tls = with_per_cpu_variables(|pcv| pcv.tls.get());
         tls.as_mut_ptr::<()>()
@@ -485,7 +481,7 @@ unsafe impl<Host: HostInterface> litebox::platform::ThreadLocalStorageProvider
     }
 }
 
-impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
+impl<Host: host::Host> ArchSpecificProvider for LinuxKernel<Host> {
     fn set_arch_specific_register(
         &self,
         reg: &ArchSpecificRegister,
@@ -523,7 +519,46 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     }
 }
 
-impl<Host: HostInterface> LinuxKernel<Host> {
+impl<Host: host::Host> LinuxKernel<Host> {
+    /// Access host-owned capabilities, without a global platform lookup.
+    pub fn host(&self) -> &Host {
+        &self.host
+    }
+
+    /// Run an owned shim using this host's execution timer.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::run_thread_ref`].
+    pub unsafe fn run_thread<T>(&self, shim: T, ctx: &mut litebox_common_linux::PtRegs)
+    where
+        T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    {
+        unsafe { run_thread(shim, ctx, self.host.execution_timer()) };
+    }
+
+    /// Run user code using this host's execution timer.
+    ///
+    /// # Safety
+    /// The current CPU must be initialized for this host with a valid user
+    /// context, address space and interrupt setup.
+    pub unsafe fn run_thread_ref<T>(&self, shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+    where
+        T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    {
+        unsafe { run_thread_ref(shim, ctx, self.host.execution_timer()) };
+    }
+
+    /// Reenter user code within this host's execution window.
+    ///
+    /// # Safety
+    /// Same requirements as [`Self::run_thread_ref`].
+    pub unsafe fn reenter_thread_ref<T>(&self, shim: &T, ctx: &mut litebox_common_linux::PtRegs)
+    where
+        T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    {
+        unsafe { reenter_thread_ref(shim, ctx, self.host.execution_timer()) };
+    }
+
     /// Construct and load the kernel address space from explicit boot inputs.
     /// Only `exec_ranges` are executable; all other mapped pages are NX.
     /// The caller owns boot-resource reclamation after this returns.
@@ -654,86 +689,13 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 }
 
-impl<Host: HostInterface> RawMutexProvider for LinuxKernel<Host> {
-    type RawMutex = RawMutex<Host>;
-}
-
-/// An implementation of [`litebox::platform::RawMutex`]
-pub struct RawMutex<Host: HostInterface> {
-    inner: AtomicU32,
-    host: core::marker::PhantomData<fn(Host) -> Host>,
-}
-
-unsafe impl<Host: HostInterface> Send for RawMutex<Host> {}
-unsafe impl<Host: HostInterface> Sync for RawMutex<Host> {}
-
-/// TODO: common mutex implementation could be moved to a shared crate
-impl<Host: HostInterface> litebox::platform::RawMutex for RawMutex<Host> {
-    const INIT: Self = Self::new();
-
-    fn underlying_atomic(&self) -> &core::sync::atomic::AtomicU32 {
-        &self.inner
-    }
-
-    fn wake_many(&self, n: usize) -> usize {
-        Host::wake_many(&self.inner, n).unwrap()
-    }
-
-    fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        match self.block_or_maybe_timeout(val, None) {
-            Ok(UnblockedOrTimedOut::Unblocked) => Ok(()),
-            Ok(UnblockedOrTimedOut::TimedOut) => unreachable!(),
-            Err(ImmediatelyWokenUp) => Err(ImmediatelyWokenUp),
-        }
-    }
-
-    fn block_or_timeout(
-        &self,
-        val: u32,
-        time: core::time::Duration,
-    ) -> Result<litebox::platform::UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val, Some(time))
-    }
-}
-
-impl<Host: HostInterface> RawMutex<Host> {
-    const fn new() -> Self {
-        Self {
-            inner: AtomicU32::new(0),
-            host: core::marker::PhantomData,
-        }
-    }
-
-    fn block_or_maybe_timeout(
-        &self,
-        val: u32,
-        timeout: Option<core::time::Duration>,
-    ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        // No need to wait if the value already changed.
-        if self
-            .underlying_atomic()
-            .load(core::sync::atomic::Ordering::Relaxed)
-            != val
-        {
-            return Err(ImmediatelyWokenUp);
-        }
-
-        #[allow(clippy::match_same_arms)]
-        match Host::block_or_maybe_timeout(&self.inner, val, timeout) {
-            Ok(()) => Ok(UnblockedOrTimedOut::Unblocked),
-            // If the futex value does not match val, then the call fails
-            // immediately with the error EAGAIN.
-            Err(Errno::EAGAIN) => Err(ImmediatelyWokenUp),
-            Err(Errno::EINTR) => Ok(UnblockedOrTimedOut::Unblocked),
-            Err(Errno::ETIMEDOUT) => Ok(UnblockedOrTimedOut::TimedOut),
-            Err(e) => panic!("Error: {e:?}"),
-        }
-    }
+impl<Host: host::Host> RawMutexProvider for LinuxKernel<Host> {
+    type RawMutex = Host::RawMutex;
 }
 
 // Time representation and clock access belong to the selected host. In
 // particular, the shared kernel must not assume Hyper-V counter units.
-impl<Host: HostInterface + TimeProvider> TimeProvider for LinuxKernel<Host> {
+impl<Host: host::Host> TimeProvider for LinuxKernel<Host> {
     type Instant = Host::Instant;
     type SystemTime = Host::SystemTime;
 
@@ -746,100 +708,19 @@ impl<Host: HostInterface + TimeProvider> TimeProvider for LinuxKernel<Host> {
     }
 }
 
-impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
+impl<Host: host::Host + IPInterfaceProvider> IPInterfaceProvider for LinuxKernel<Host> {
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        match Host::send_ip_packet(packet) {
-            Ok(n) => {
-                if n != packet.len() {
-                    unimplemented!()
-                }
-                Ok(())
-            }
-            Err(e) => {
-                unimplemented!("Error: {:?}", e)
-            }
-        }
+        self.host.send_ip_packet(packet)
     }
-
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        match Host::receive_ip_packet(packet) {
-            Ok(n) => Ok(n),
-            Err(e) => {
-                unimplemented!("Error: {:?}", e)
-            }
-        }
+        self.host.receive_ip_packet(packet)
     }
 }
 
-/// Platform-Host Interface
-pub trait HostInterface: 'static {
-    /// Page allocation, address translation, and TLB completion for this host.
-    /// The same provider owns base and task tables for the kernel's lifetime.
-    type Memory: mm::MemoryProvider;
-
-    /// Page allocation from host.
-    ///
-    /// It can return more than requested size. On success, it returns the start address
-    /// and the size of the allocated memory.
-    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)>;
-    // TODO: leave this for now for testing. LVBS does not allow dynamic memory allocation,
-    // so it should be no-op or removed.
-
-    /// Returns the memory back to host.
-    ///
-    /// Note host should know the size of allocated memory and needs to check the validity
-    /// of the given address.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the `addr` is valid and was allocated by this [`Self::alloc`].
-    unsafe fn free(addr: usize);
-    // TODO: leave this for now for testing. LVBS does not allow dynamic memory allocation,
-    // so it should be no-op or removed.
-
-    /// Exit
-    ///
-    /// Exit allows to come back to handle some requests from host,
-    /// but it should not return back to the caller.
-    fn exit() -> !;
-    // TODO: leave this for now for testing. LVBS does exit (or return) but it resumes execution
-    // from this instruction point (i.e., there is no separate entry point unlike SNP).
-
-    /// Terminate LiteBox
-    fn terminate(reason_set: u64, reason_code: u64) -> !;
-    // TODO: leave this for now for testing. LVBS does not terminate, so it should be no-op or
-    // removed.
-
-    // TODO: leave this for now for testing. We might need this if we plan to run Linux apps inside VTL1.
-
-    fn wake_many(mutex: &AtomicU32, n: usize) -> Result<usize, Errno>;
-
-    fn block_or_maybe_timeout(
-        mutex: &AtomicU32,
-        val: u32,
-        timeout: Option<core::time::Duration>,
-    ) -> Result<(), Errno>;
-
-    /// For Network
-    fn send_ip_packet(packet: &[u8]) -> Result<usize, Errno>;
-
-    fn receive_ip_packet(packet: &mut [u8]) -> Result<usize, Errno>;
-
-    /// For Debugging
-    fn log(msg: &str);
-
-    /// Switch
-    ///
-    /// Switch enables a context switch from VTL1 kernel to VTL0 kernel while passing a value
-    /// through a CPU register. VTL1 kernel will execute the next instruction of `switch()`
-    /// when VTL0 kernel switches back to VTL1 kernel.
-    fn switch(result: u64) -> !;
-}
-
-impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+impl<Host: host::Host, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
     // User space occupies the low canonical half (0 .. 0x0000_7FFF_FFFF_FFFF).
     // Kernel memory lives in the high canonical half (at KERNEL_OFFSET).
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
@@ -927,7 +808,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     }
 }
 
-impl<Host: HostInterface> litebox::mm::vmem::VmemPageFaultHandler for LinuxKernel<Host> {
+impl<Host: host::Host> litebox::mm::vmem::VmemPageFaultHandler for LinuxKernel<Host> {
     unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,
@@ -946,25 +827,23 @@ impl<Host: HostInterface> litebox::mm::vmem::VmemPageFaultHandler for LinuxKerne
     }
 }
 
-impl<Host: HostInterface> StdioProvider for LinuxKernel<Host> {
-    fn read_from_stdin(&self, _buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unimplemented!()
+impl<Host: host::Host + StdioProvider> StdioProvider for LinuxKernel<Host> {
+    fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
+        self.host.read_from_stdin(buf)
     }
-
     fn write_to(
         &self,
-        _stream: litebox::platform::StdioOutStream,
-        _buf: &[u8],
+        stream: litebox::platform::StdioOutStream,
+        buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        unimplemented!()
+        self.host.write_to(stream, buf)
     }
-
-    fn is_a_tty(&self, _stream: litebox::platform::StdioStream) -> bool {
-        unimplemented!()
+    fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
+        self.host.is_a_tty(stream)
     }
 }
 
-impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
+impl<Host: host::Host> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
     fn get_syscall_entry_point(&self) -> usize {
         // Currently this is only used in ELF loader to fix trampoline code.
         // When running in kernel mode, we don't need a syscall trampoline.
@@ -972,7 +851,7 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
-        unimplemented!()
+        None
     }
 }
 
@@ -982,11 +861,8 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread<T>(
-    shim: T,
-    ctx: &mut litebox_common_linux::PtRegs,
-    timer: &dyn ExecutionTimer,
-) where
+unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs, timer: &dyn ExecutionTimer)
+where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
     // Currently, `litebox_platform_lvbs` uses `swapgs` to efficiently switch between
@@ -1004,7 +880,7 @@ pub unsafe fn run_thread<T>(
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn run_thread_ref<T>(
+unsafe fn run_thread_ref<T>(
     shim: &T,
     ctx: &mut litebox_common_linux::PtRegs,
     timer: &dyn ExecutionTimer,
@@ -1022,7 +898,7 @@ pub unsafe fn run_thread_ref<T>(
 ///
 /// # Safety
 /// The context must be valid user context.
-pub unsafe fn reenter_thread_ref<T>(
+unsafe fn reenter_thread_ref<T>(
     shim: &T,
     ctx: &mut litebox_common_linux::PtRegs,
     timer: &dyn ExecutionTimer,

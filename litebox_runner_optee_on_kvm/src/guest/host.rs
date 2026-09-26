@@ -1,36 +1,30 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Runner-owned OP-TEE capabilities. Kernel operations delegate to the shared
-//! VM kernel. No VTL peer, fake protection, persistent key, or scheduler.
+//! QEMU host facilities, independent of any shim. The shared LinuxKernel
+//! provides kernel mechanisms and delegates capabilities here; no OP-TEE
+//! platform wrapper, VTL peer, fake protection, or scheduler is needed.
 
-use super::Platform as Kernel;
-use core::{ops::Range, time::Duration};
-use litebox::{
-    mm::vmem::{PageFaultError, VmFlags, VmemPageFaultHandler},
-    platform::page_mgmt::{
-        AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-        PageManagementProvider, PermissionUpdateError, RemapError,
-    },
-    platform::{
-        ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, CrngProvider,
-        DerivedKeyError, DerivedKeyProvider, Instant, KDFParams, RawMutexProvider,
-        RawPointerProvider, SystemInfoProvider, SystemTime, TimeProvider,
-    },
+use core::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
+use litebox::platform::{
+    CrngProvider, DerivedKeyError, DerivedKeyProvider, Instant, KDFParams, RawMutexProvider,
+    SystemTime, TimeProvider,
 };
 use litebox_common_linux::vmap::{
     NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
-use zerocopy::{FromBytes, IntoBytes};
-
-pub(super) struct OpteePlatform {
-    pub kernel: &'static Kernel,
+use litebox_platform_lvbs::{execution::ExecutionTimer, host::Host};
+pub struct QemuHost {
     tsc_origin: u64,
     tsc_hz: u64,
+    pub timer: FiniteTestTimer,
 }
 
-impl OpteePlatform {
-    pub fn new(kernel: &'static Kernel) -> Self {
+impl QemuHost {
+    pub fn new() -> Self {
         let tsc_hz = calibrate_tsc();
         assert_ne!(
             core::arch::x86_64::__cpuid(1).ecx & (1 << 30),
@@ -38,9 +32,9 @@ impl OpteePlatform {
             "RDRAND required for OP-TEE random provider"
         );
         Self {
-            kernel,
             tsc_origin: tsc(),
             tsc_hz,
+            timer: FiniteTestTimer::default(),
         }
     }
 }
@@ -91,7 +85,7 @@ fn calibrate_tsc() -> u64 {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct ClockInstant(u64);
+pub struct ClockInstant(u64);
 impl Instant for ClockInstant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<Duration> {
         self.0.checked_sub(earlier.0).map(Duration::from_nanos)
@@ -102,14 +96,14 @@ impl Instant for ClockInstant {
             .map(Self)
     }
 }
-pub(super) struct NoWallTime;
+pub struct NoWallTime;
 impl SystemTime for NoWallTime {
     const UNIX_EPOCH: Self = Self;
     fn duration_since(&self, _earlier: &Self) -> Result<Duration, Duration> {
         panic!("no wall clock in QEMU OP-TEE test");
     }
 }
-impl TimeProvider for OpteePlatform {
+impl TimeProvider for QemuHost {
     type Instant = ClockInstant;
     type SystemTime = NoWallTime;
     fn now(&self) -> Self::Instant {
@@ -124,7 +118,7 @@ impl TimeProvider for OpteePlatform {
         panic!("no wall clock in QEMU OP-TEE test");
     }
 }
-impl CrngProvider for OpteePlatform {
+impl CrngProvider for QemuHost {
     fn fill_bytes_crng(&self, bytes: &mut [u8]) {
         for chunk in bytes.chunks_mut(8) {
             let mut value = 0;
@@ -141,7 +135,7 @@ impl CrngProvider for OpteePlatform {
         }
     }
 }
-impl DerivedKeyProvider for OpteePlatform {
+impl DerivedKeyProvider for QemuHost {
     fn derive_key<E>(
         &self,
         _kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
@@ -152,7 +146,7 @@ impl DerivedKeyProvider for OpteePlatform {
 }
 // SAFETY: all foreign-memory operations deny access. The test exchanges value
 // parameters through TA-owned userspace, not untrusted guest physical pointers.
-unsafe impl VmapManager<4096> for OpteePlatform {
+unsafe impl VmapManager<4096> for QemuHost {
     type MapInfo = NoopPhysPageMapInfo;
     fn validate_unowned(&self, _pages: &PhysPageAddrArray<4096>) -> Result<(), PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
@@ -165,92 +159,43 @@ unsafe impl VmapManager<4096> for OpteePlatform {
         Err(PhysPointerError::UnsupportedOperation)
     }
 }
-impl RawPointerProvider for OpteePlatform {
-    type RawConstPointer<T: FromBytes> = <Kernel as RawPointerProvider>::RawConstPointer<T>;
-    type RawMutPointer<T: FromBytes + IntoBytes> = <Kernel as RawPointerProvider>::RawMutPointer<T>;
-}
-impl RawMutexProvider for OpteePlatform {
-    type RawMutex = <Kernel as RawMutexProvider>::RawMutex;
-}
-impl ArchSpecificProvider for OpteePlatform {
-    fn set_arch_specific_register(
-        &self,
-        reg: &ArchSpecificRegister,
-        val: usize,
-    ) -> Result<(), ArchSpecificError> {
-        self.kernel.set_arch_specific_register(reg, val)
-    }
-    fn get_arch_specific_register(
-        &self,
-        reg: &ArchSpecificRegister,
-    ) -> Result<usize, ArchSpecificError> {
-        self.kernel.get_arch_specific_register(reg)
+impl litebox_platform_lvbs::console::DiagnosticOutput for QemuHost {
+    fn print(args: core::fmt::Arguments<'_>) {
+        super::console(args);
     }
 }
-impl SystemInfoProvider for OpteePlatform {
-    fn get_syscall_entry_point(&self) -> usize {
-        self.kernel.get_syscall_entry_point()
-    }
-    fn get_vdso_address(&self) -> Option<usize> {
-        None
+
+impl Host for QemuHost {
+    type Memory = super::QemuMemory;
+    type Timer = FiniteTestTimer;
+    fn execution_timer(&self) -> &Self::Timer {
+        &self.timer
     }
 }
-impl PageManagementProvider<4096> for OpteePlatform {
-    const TASK_ADDR_MIN: usize = <Kernel as PageManagementProvider<4096>>::TASK_ADDR_MIN;
-    const TASK_ADDR_MAX: usize = <Kernel as PageManagementProvider<4096>>::TASK_ADDR_MAX;
-    fn allocate_pages(
-        &self,
-        range: Range<usize>,
-        perms: MemoryRegionPermissions,
-        grow: bool,
-        populate: bool,
-        fixed: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
-        <Kernel as PageManagementProvider<4096>>::allocate_pages(
-            self.kernel,
-            range,
-            perms,
-            grow,
-            populate,
-            fixed,
+impl RawMutexProvider for QemuHost {
+    type RawMutex = litebox_platform_lvbs::host::no_scheduler::NoSchedulerMutex;
+}
+
+/// Explicit no-hardware-timer choice for trusted finite test payloads. The
+/// host process timeout bounds regressions; this is not for untrusted workloads.
+#[derive(Default)]
+pub struct FiniteTestTimer {
+    arms: AtomicUsize,
+    user_exceptions: AtomicUsize,
+}
+impl FiniteTestTimer {
+    pub fn counts(&self) -> (usize, usize) {
+        (
+            self.arms.load(Ordering::Relaxed),
+            self.user_exceptions.load(Ordering::Relaxed),
         )
     }
-    unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError> {
-        unsafe { <Kernel as PageManagementProvider<4096>>::deallocate_pages(self.kernel, range) }
-    }
-    unsafe fn remap_pages(
-        &self,
-        old: Range<usize>,
-        new: Range<usize>,
-        perms: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
-        unsafe {
-            <Kernel as PageManagementProvider<4096>>::remap_pages(self.kernel, old, new, perms)
-        }
-    }
-    unsafe fn update_permissions(
-        &self,
-        range: Range<usize>,
-        perms: MemoryRegionPermissions,
-    ) -> Result<(), PermissionUpdateError> {
-        unsafe {
-            <Kernel as PageManagementProvider<4096>>::update_permissions(self.kernel, range, perms)
-        }
-    }
-    fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
-        <Kernel as PageManagementProvider<4096>>::reserved_pages(self.kernel)
-    }
 }
-impl VmemPageFaultHandler for OpteePlatform {
-    unsafe fn handle_page_fault(
-        &self,
-        addr: usize,
-        flags: VmFlags,
-        error: u64,
-    ) -> Result<(), PageFaultError> {
-        unsafe { self.kernel.handle_page_fault(addr, flags, error) }
+impl ExecutionTimer for FiniteTestTimer {
+    fn arm(&self) {
+        self.arms.fetch_add(1, Ordering::Relaxed);
     }
-    fn access_error(error: u64, flags: VmFlags) -> bool {
-        Kernel::access_error(error, flags)
+    fn on_user_exception(&self, _exception: litebox::shim::Exception) {
+        self.user_exceptions.fetch_add(1, Ordering::Relaxed);
     }
 }

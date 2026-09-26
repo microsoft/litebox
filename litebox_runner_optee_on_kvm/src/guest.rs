@@ -5,7 +5,8 @@
 //! interrupts. Boot checks and finite ring-3 payloads precede real OP-TEE TA
 //! lifecycle tests. Service transport and arbitrary TA loading are not provided.
 
-mod optee_platform;
+mod host;
+use host::QemuHost;
 mod optee_test;
 mod user_smoke;
 
@@ -13,12 +14,11 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{
     alloc::Layout,
     fmt::{self, Write},
-    sync::atomic::AtomicU32,
 };
 use litebox::mm::allocator::SafeZoneAllocator;
 use litebox_common_linux::errno::Errno;
 use litebox_platform_lvbs::{
-    HostInterface, KERNEL_OFFSET, LinuxKernel,
+    KERNEL_OFFSET, LinuxKernel,
     arch::{self, ioport::ComPort},
     mm::{MemoryProvider, tlb::TlbInvalidation},
     per_cpu_variables::{PerCpuVariables, PerCpuVariablesAsm},
@@ -31,15 +31,15 @@ use x86_64::{
     structures::paging::{Page, PhysFrame, Size4KiB},
 };
 
-pub struct QemuHost;
 pub struct QemuMemory;
 pub struct SingleCpuTlb;
 type Platform = LinuxKernel<QemuHost>;
 
 #[global_allocator]
-static HEAP: SafeZoneAllocator<'static, 30, QemuHost> = SafeZoneAllocator::new();
+static HEAP: SafeZoneAllocator<'static, 30, NoDynamicMemory> = SafeZoneAllocator::new();
 
-impl litebox::mm::allocator::MemoryProvider for QemuHost {
+struct NoDynamicMemory;
+impl litebox::mm::allocator::MemoryProvider for NoDynamicMemory {
     fn alloc(_layout: &Layout) -> Option<(usize, usize)> {
         None
     }
@@ -48,11 +48,13 @@ impl litebox::mm::allocator::MemoryProvider for QemuHost {
     }
 }
 
-impl MemoryProvider for QemuMemory {
+impl litebox_platform_lvbs::console::DiagnosticOutput for QemuMemory {
     fn print(args: fmt::Arguments<'_>) {
         console(args);
     }
+}
 
+impl MemoryProvider for QemuMemory {
     type Tlb = SingleCpuTlb;
     const GVA_OFFSET: VirtAddr = VirtAddr::new(litebox_platform_lvbs::GVA_OFFSET);
     const PRIVATE_PTE_MASK: u64 = 0;
@@ -79,44 +81,6 @@ unsafe impl TlbInvalidation for SingleCpuTlb {
         unsafe {
             arch::mm::tlb::invalidate_local(start, page_count);
         }
-    }
-}
-
-impl HostInterface for QemuHost {
-    type Memory = QemuMemory;
-    fn alloc(_layout: &Layout) -> Option<(usize, usize)> {
-        None
-    }
-    unsafe fn free(_addr: usize) {
-        unreachable!("no host allocations");
-    }
-    fn exit() -> ! {
-        exit(true)
-    }
-    fn terminate(_reason_set: u64, _reason_code: u64) -> ! {
-        exit(false)
-    }
-    fn log(msg: &str) {
-        console(format_args!("{msg}"));
-    }
-    fn send_ip_packet(_packet: &[u8]) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn receive_ip_packet(_packet: &mut [u8]) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn wake_many(_mutex: &AtomicU32, _n: usize) -> Result<usize, Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn block_or_maybe_timeout(
-        _mutex: &AtomicU32,
-        _val: u32,
-        _timeout: Option<core::time::Duration>,
-    ) -> Result<(), Errno> {
-        Err(Errno::ENOSYS)
-    }
-    fn switch(_result: u64) -> ! {
-        panic!("plain guest has no VTL peer");
     }
 }
 
@@ -308,7 +272,7 @@ extern "C" fn kernel_main(ram_start: u64, ram_end: u64) -> ! {
     // early mapping covers it, and relocation and allocator seeding are complete.
     let platform = unsafe {
         Platform::from_memory(
-            QemuHost,
+            QemuHost::new(),
             memory,
             &[PhysAddr::new(text.start)..PhysAddr::new(text.end)],
         )

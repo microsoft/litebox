@@ -700,10 +700,9 @@ fn open_session_single_instance(
     // Run the TA's OpenSession entry point using reference-based reenter
     let mut ctx = litebox_common_linux::PtRegs::default();
     unsafe {
-        litebox_platform_lvbs::reenter_thread_ref(
+        platform.reenter_thread_ref(
             instance.loaded_program().entrypoints.as_ref().unwrap(),
             &mut ctx,
-            &timer::LvbsTimer,
         );
     }
 
@@ -870,11 +869,7 @@ fn open_session_new_instance(
     // Run ldelf to load the TA using reference-based run to avoid moving the shim
     let mut ldelf_ctx = litebox_common_linux::PtRegs::default();
     unsafe {
-        litebox_platform_lvbs::run_thread_ref(
-            loaded_program.entrypoints.as_ref().unwrap(),
-            &mut ldelf_ctx,
-            &timer::LvbsTimer,
-        );
+        platform.run_thread_ref(loaded_program.entrypoints.as_ref().unwrap(), &mut ldelf_ctx);
     }
 
     // Check ldelf return code (TA_CreateEntryPoint result)
@@ -938,11 +933,7 @@ fn open_session_new_instance(
     // Run the TA entry function using reference-based reenter to avoid moving the shim
     let mut ctx = litebox_common_linux::PtRegs::default();
     unsafe {
-        litebox_platform_lvbs::reenter_thread_ref(
-            loaded_program.entrypoints.as_ref().unwrap(),
-            &mut ctx,
-            &timer::LvbsTimer,
-        );
+        platform.reenter_thread_ref(loaded_program.entrypoints.as_ref().unwrap(), &mut ctx);
     }
 
     // Read TA output parameters from the stack buffer
@@ -1111,10 +1102,9 @@ fn handle_invoke_command(
 
         let mut ctx = litebox_common_linux::PtRegs::default();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(
+            platform.reenter_thread_ref(
                 instance.loaded_program().entrypoints.as_ref().unwrap(),
                 &mut ctx,
-                &timer::LvbsTimer,
             );
         }
 
@@ -1230,10 +1220,9 @@ fn handle_close_session(
         // Run the TA entry function (TA_CloseSessionEntryPoint)
         let mut ctx = litebox_common_linux::PtRegs::default();
         unsafe {
-            litebox_platform_lvbs::reenter_thread_ref(
+            platform.reenter_thread_ref(
                 instance.loaded_program().entrypoints.as_ref().unwrap(),
                 &mut ctx,
-                &timer::LvbsTimer,
             );
         }
 

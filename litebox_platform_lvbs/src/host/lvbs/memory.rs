@@ -6,22 +6,29 @@
 //! This allocator is compiled only with the `lvbs` feature; independent VM
 //! runners disable that feature and own their own memory providers/allocators.
 
-use super::HostLvbsInterface;
-use crate::{HostInterface, mm::MemoryProvider};
+use crate::mm::MemoryProvider;
 use litebox::mm::allocator::SafeZoneAllocator;
 
 #[cfg(not(test))]
 #[global_allocator]
-static HEAP: SafeZoneAllocator<'static, 25, HostLvbsInterface> = SafeZoneAllocator::new();
+static HEAP: SafeZoneAllocator<'static, 25, NoDynamicMemory> = SafeZoneAllocator::new();
 
 pub struct LvbsMemory;
 
-impl litebox::mm::allocator::MemoryProvider for HostLvbsInterface {
-    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-        <Self as HostInterface>::alloc(layout)
+impl crate::console::DiagnosticOutput for LvbsMemory {
+    fn print(args: core::fmt::Arguments<'_>) {
+        super::console::print(args);
     }
-    unsafe fn free(addr: usize) {
-        unsafe { <Self as HostInterface>::free(addr) };
+}
+
+/// LVBS's boot-seeded heap cannot obtain additional memory on exhaustion.
+struct NoDynamicMemory;
+impl litebox::mm::allocator::MemoryProvider for NoDynamicMemory {
+    fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
+        panic!("dynamic memory allocation is not supported (layout = {layout:?})");
+    }
+    unsafe fn free(_addr: usize) {
+        unreachable!("no dynamic regions allocated");
     }
 }
 
@@ -31,9 +38,6 @@ impl MemoryProvider for LvbsMemory {
     const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
     const PRIVATE_PTE_MASK: u64 = 0;
 
-    fn print(args: core::fmt::Arguments<'_>) {
-        super::console::print(args);
-    }
     fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
         HEAP.allocate_pages(order)
     }
@@ -52,9 +56,6 @@ impl MemoryProvider for LvbsMemory {
     type Tlb = crate::host::mock::MockTlb;
     const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
     const PRIVATE_PTE_MASK: u64 = 0;
-    fn print(_args: core::fmt::Arguments<'_>) {
-        panic!("LVBS diagnostics in host test");
-    }
     fn mem_allocate_pages(_order: u32) -> Option<*mut u8> {
         panic!("LVBS heap is not booted");
     }
@@ -75,7 +76,7 @@ mod tests {
     fn caller_owned_heap_serves_and_reuses_pages() {
         // Page allocation needs no &'static allocator; use a local fixture.
         // Returning its only page leaves no live slab metadata in backing RAM.
-        let heap = SafeZoneAllocator::<25, HostLvbsInterface>::new();
+        let heap = SafeZoneAllocator::<25, NoDynamicMemory>::new();
         let layout = Layout::from_size_align(4096, 4096).unwrap();
         let backing = unsafe { alloc::alloc::alloc_zeroed(layout) };
         assert!(!backing.is_null());
