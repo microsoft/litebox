@@ -20,7 +20,6 @@ use litebox::event::{Events, IOPollable as _};
 use litebox::mm::linux::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
-use litebox::process::ChildProcess;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::ProcessExitStatus;
@@ -162,7 +161,7 @@ pub(crate) struct Process<Platform: ShimPlatform> {
     nr_threads: <Platform as RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Started child processes that have not been reaped, mapped by process ID.
-    children: Mutex<Platform, BTreeMap<i32, ChildProcess<Platform>>>,
+    children: Mutex<Platform, BTreeMap<i32, litebox::process::Process<Platform>>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
@@ -244,7 +243,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
     }
 
     /// Adds a started child process.
-    fn add_child(&self, pid: i32, child: ChildProcess<Platform>) {
+    fn add_child(&self, pid: i32, child: litebox::process::Process<Platform>) {
         let previous = self.children.lock().insert(pid, child);
         assert!(
             previous.is_none(),
@@ -259,7 +258,8 @@ impl<Platform: ShimPlatform> Process<Platform> {
     fn take_exited_child(
         &self,
         target: Option<i32>,
-    ) -> Result<(i32, ChildProcess<Platform>, ProcessExitStatus), TryOpError<Errno>> {
+    ) -> Result<(i32, litebox::process::Process<Platform>, ProcessExitStatus), TryOpError<Errno>>
+    {
         let mut children = self.children.lock();
         let mut matched = false;
         let mut exited = None;
@@ -783,7 +783,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .allocate_child_process()
             .map_err(Errno::from)?;
         let child_pid =
-            i32::try_from(child.process_id().0).expect("broker process IDs must fit Linux pid_t");
+            i32::try_from(child.id().0).expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
         parent_context.rax = child_pid.cast_unsigned() as usize;
         self.vfork.replace(Some(crate::VforkState {

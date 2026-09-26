@@ -47,25 +47,25 @@ pub enum ProcessExitStatus {
     Unknown,
 }
 
-/// Parent-owned handle to one newly created child process.
+/// One newly created process and the creator's handle to it.
 ///
 /// The handle reports [`ReadinessFlags::READ`](crate::readiness::ReadinessFlags::READ)
-/// once the child terminates. Closing it releases the child's retained exit
-/// status.
+/// once the process terminates. Closing it releases the process's retained
+/// exit status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChildProcess {
-    /// Broker-assigned child process ID.
+pub struct CreatedProcess {
+    /// Broker-assigned process ID.
     pub process_id: ProcessId,
-    /// Parent-owned handle used to observe child termination.
+    /// Handle used to observe process termination.
     pub handle: ObjectHandle,
 }
 
 /// Result of starting one child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StartedChildProcess {
-    /// Started child identity.
+pub struct StartedProcess {
+    /// Started process identity.
     pub identity: ProcessIdentity,
-    /// Parent-owned child handle when this start request created the child.
+    /// Handle to the process when this start request created it.
     ///
     /// Starting a pending child returns `None` because allocation already
     /// returned its handle.
@@ -87,7 +87,7 @@ pub enum CreateThreadResponse {
     /// A thread was created in the requesting process.
     Thread(ThreadId),
     /// A pending child process was created.
-    Process(ChildProcess),
+    Process(CreatedProcess),
 }
 
 /// Source used to start one child process.

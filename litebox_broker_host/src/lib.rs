@@ -46,7 +46,7 @@ use litebox_broker_protocol::pipe::{
 use litebox_broker_protocol::process::{
     CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
     ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource, StartedChildProcess,
+    StartChildProcessSource, StartedProcess,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -830,7 +830,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     child_process_id: Option<litebox_broker_protocol::ProcessId>,
     startup: ProcessStartupData,
     readiness_sink: &Arc<dyn ReadinessSink>,
-) -> RequestResult<StartedChildProcess> {
+) -> RequestResult<StartedProcess> {
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
@@ -871,7 +871,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     ) {
         return close_created_handle(RequestFailure::from(error));
     }
-    Ok(StartedChildProcess { identity, handle })
+    Ok(StartedProcess { identity, handle })
 }
 
 fn write_shared_buffer<Memory: SharedMemory>(

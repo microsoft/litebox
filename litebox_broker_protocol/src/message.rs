@@ -19,7 +19,7 @@ use crate::pipe::{
 };
 use crate::process::{
     CreateThreadRequest, CreateThreadResponse, ProcessExitStatus, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildProcessSource, StartedChildProcess,
+    StartChildProcessRequest, StartChildProcessSource, StartedProcess,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -70,10 +70,10 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process.
     StartChildProcess(StartChildProcessRequest),
-    /// Read a child process's termination status through its parent-owned
-    /// handle without blocking.
+    /// Read a process's termination status through a process handle without
+    /// blocking.
     ///
-    /// The broker returns `WouldBlock` while the child is live.
+    /// The broker returns `WouldBlock` while the process is live.
     GetProcessExitStatus(ObjectHandle),
 }
 
@@ -257,7 +257,7 @@ pub enum BrokerResult {
     /// File response family.
     File(FileResponse),
     /// A child established its broker association.
-    ProcessStarted(StartedChildProcess),
+    ProcessStarted(StartedProcess),
     /// Termination status of a child process.
     ProcessExitStatus(ProcessExitStatus),
     /// Operation failed with an ABI-neutral broker error.
