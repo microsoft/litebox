@@ -6,30 +6,27 @@ use core::ops::Range;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::{
-    mm::vmem::{CreatePagesFlags, NonZeroAddress},
-    platform::{
-        PageManagementProvider, RawConstPointer,
-        page_mgmt::MemoryRegionPermissions,
-        trivial_providers::{TransparentConstPtr, TransparentMutPtr},
-    },
+use crate::vmem::{
+    CreatePagesFlags, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem,
+    VmemProtectError, VmemResizeError,
+};
+use litebox::platform::{
+    PageManagementProvider, RawConstPointer,
+    page_mgmt::MemoryRegionPermissions,
+    trivial_providers::{TransparentConstPtr, TransparentMutPtr},
 };
 use zerocopy::{FromBytes, IntoBytes};
-
-use super::vmem::{
-    NonZeroPageSize, PAGE_SIZE, PageRange, VmArea, VmFlags, Vmem, VmemProtectError, VmemResizeError,
-};
 
 /// A dummy implementation of [`VmemBackend`] that does nothing.
 struct DummyVmemBackend;
 
-impl crate::platform::RawPointerProvider for DummyVmemBackend {
+impl litebox::platform::RawPointerProvider for DummyVmemBackend {
     type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
 }
 
 #[expect(unused_variables, reason = "dummy/mock backend")]
-impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
+impl litebox::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux/windows config
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -42,18 +39,18 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
     fn allocate_pages(
         &self,
         suggested_range: Range<usize>,
-        initial_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
+        initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
-        fixed_address_behavior: crate::platform::page_mgmt::FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::AllocationError> {
+        fixed_address_behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
         Ok(TransparentMutPtr::from_usize(suggested_range.start))
     }
 
     unsafe fn deallocate_pages(
         &self,
         range: Range<usize>,
-    ) -> Result<(), crate::platform::page_mgmt::DeallocationError> {
+    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
         Ok(())
     }
 
@@ -61,16 +58,16 @@ impl crate::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
-        permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, crate::platform::page_mgmt::RemapError> {
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         Ok(TransparentMutPtr::from_usize(new_range.start))
     }
 
     unsafe fn update_permissions(
         &self,
         range: Range<usize>,
-        new_permissions: crate::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<(), crate::platform::page_mgmt::PermissionUpdateError> {
+        new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
         Ok(())
     }
 
@@ -98,7 +95,7 @@ fn test_vmm_mapping() {
                 false,
             ),
             false,
-            crate::platform::page_mgmt::FixedAddressBehavior::Replace,
+            litebox::platform::page_mgmt::FixedAddressBehavior::Replace,
         )
     }
     .unwrap();

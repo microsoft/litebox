@@ -3,11 +3,11 @@
 
 //! Implementation of generic TEE related syscalls
 
-use litebox::mm::vmem::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};
 use litebox::path::Arg;
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
+use litebox_common_linux::vmem::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};
 use litebox_common_optee::{
     TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeTime, TeeTimeCategory,
     TeeUuid, UserTaPropType, UteeParams,

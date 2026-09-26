@@ -3,10 +3,8 @@
 
 //! This module manages the stack layout for TA (stack and `UteeParams`).
 
-use litebox::{
-    mm::vmem::CreatePagesFlags,
-    platform::{RawConstPointer, RawMutPointer},
-};
+use litebox::platform::{RawConstPointer, RawMutPointer};
+use litebox_common_linux::vmem::CreatePagesFlags;
 use litebox_common_optee::{LdelfArg, TeeParamType, UteeParamOwned, UteeParams};
 use zerocopy::IntoBytes;
 
@@ -129,7 +127,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
     /// The trailing `UteeParams` slot is left untouched here because
     /// `set_utee_params` overwrites it in full.
     fn scrub(&mut self) -> Option<()> {
-        use litebox::mm::vmem::PAGE_SIZE;
+        use litebox_common_linux::vmem::PAGE_SIZE;
         const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 
         for offset in (0..self.pos).step_by(ZERO_CHUNK.len()) {
@@ -350,7 +348,7 @@ pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
     let sp = if let Some(stack_base) = stack_base {
         UserMutPtr::<Platform, _>::from_usize(stack_base)
     } else {
-        let length = litebox::mm::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+        let length = litebox_common_linux::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
         unsafe {
             task.global

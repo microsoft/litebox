@@ -7,11 +7,10 @@ use crate::{
 };
 use alloc::vec::Vec;
 use litebox::{
-    mm::vmem::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt,
 };
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{errno::Errno, vmem::PAGE_SIZE};
 use litebox_common_optee::{TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams};
 use num_enum::TryFromPrimitive;
 use p384::{
