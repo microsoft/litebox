@@ -14,7 +14,7 @@ use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
-use litebox_broker_protocol::process::{ChildProcess, ProcessExitStatus};
+use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -90,9 +90,9 @@ pub(crate) enum ObjectEntry {
     Process(ProcessObject),
 }
 
-/// Parent-owned reference to one child process.
+/// Reference to one process.
 ///
-/// The reference keeps the child's exit status available until it closes.
+/// The reference keeps the process's exit status available until it closes.
 pub(crate) struct ProcessObject {
     process: Arc<BrokerProcess>,
     readiness: ReadinessRegistration,
@@ -366,7 +366,7 @@ impl BrokerProcess {
     pub fn allocate_child_process(
         &self,
         readiness_sink: Arc<dyn ReadinessSink>,
-    ) -> Result<ChildProcess> {
+    ) -> Result<CreatedProcess> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
@@ -411,7 +411,7 @@ impl BrokerProcess {
                 } else {
                     drop(child_state);
                     state.pending_child_process = Some(Arc::clone(&child));
-                    Ok(ChildProcess {
+                    Ok(CreatedProcess {
                         process_id: child.id(),
                         handle,
                     })
@@ -1135,10 +1135,9 @@ impl BrokerProcess {
         Ok(socket.readiness())
     }
 
-    /// Returns a child's termination status through a parent-owned process
-    /// handle.
+    /// Returns a process's termination status through a process handle.
     ///
-    /// Returns `WouldBlock` while the child is live. A child whose startup
+    /// Returns `WouldBlock` while the process is live. A process whose startup
     /// failed reports [`ProcessExitStatus::Unknown`].
     pub fn process_exit_status(&self, handle: ObjectHandle) -> Result<ProcessExitStatus> {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
@@ -1433,7 +1432,7 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
-    use litebox_broker_protocol::process::{ChildProcess, ProcessExitStatus};
+    use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
@@ -1711,7 +1710,7 @@ mod tests {
             .unwrap();
         parent.complete_start().unwrap();
         let sink = readiness_sink();
-        let ChildProcess { process_id, handle } =
+        let CreatedProcess { process_id, handle } =
             parent.allocate_child_process(sink.clone()).unwrap();
         assert_eq!(
             parent.allocate_child_process(sink.clone()),
@@ -1743,7 +1742,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         parent.complete_start().unwrap();
-        let ChildProcess { process_id, handle } =
+        let CreatedProcess { process_id, handle } =
             parent.allocate_child_process(readiness_sink()).unwrap();
         let child = broker
             .processes

@@ -40,9 +40,9 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    ChildProcess, CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE,
     ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource, StartedChildProcess,
+    StartChildProcessSource, StartedProcess,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -199,7 +199,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         child_process_id: Option<ProcessId>,
         buffer: SharedBufferSequence,
         bootstrap: &[u8],
-    ) -> Result<StartedChildProcess, Channel::Error> {
+    ) -> Result<StartedProcess, Channel::Error> {
         if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -222,7 +222,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn allocate_child_process(&self) -> Result<ChildProcess, Channel::Error> {
+    pub fn allocate_child_process(&self) -> Result<CreatedProcess, Channel::Error> {
         match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Process))? {
             BrokerResult::CreateThread(CreateThreadResponse::Process(child)) => Ok(child),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
@@ -232,9 +232,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Returns a child's termination status through its parent-owned handle.
+    /// Returns a process's termination status through a process handle.
     ///
-    /// Returns `WouldBlock` while the child is live.
+    /// Returns `WouldBlock` while the process is live.
     ///
     /// # Panics
     ///

@@ -1235,7 +1235,7 @@ struct Task<Platform: ShimPlatform> {
 }
 
 struct VforkState<Platform: ShimPlatform> {
-    child: litebox::process::ChildProcess<Platform>,
+    child: litebox::process::Process<Platform>,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
 }

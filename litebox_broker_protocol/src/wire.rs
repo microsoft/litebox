@@ -23,9 +23,8 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    ChildProcess, CreateThreadRequest, CreateThreadResponse, ProcessExitStatus, ProcessIdentity,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
-    StartedChildProcess,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, ProcessExitStatus, ProcessIdentity,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource, StartedProcess,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -406,7 +405,7 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
                     encoder.u8(CREATE_THREAD_TAG_THREAD);
                     encoder.thread_id(thread_id);
                 }
-                CreateThreadResponse::Process(ChildProcess { process_id, handle }) => {
+                CreateThreadResponse::Process(CreatedProcess { process_id, handle }) => {
                     encoder.u8(CREATE_THREAD_TAG_PROCESS);
                     encoder.process_id(process_id);
                     encoder.handle(handle);
@@ -455,7 +454,7 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_response(&mut encoder, response);
         }
-        BrokerResult::ProcessStarted(StartedChildProcess {
+        BrokerResult::ProcessStarted(StartedProcess {
             identity:
                 ProcessIdentity {
                     process_id,
@@ -520,7 +519,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_ERROR => BrokerResult::Error(decode_error_code(&mut decoder)?),
         RESPONSE_TAG_CREATE_THREAD => BrokerResult::CreateThread(match decoder.u8()? {
             CREATE_THREAD_TAG_THREAD => CreateThreadResponse::Thread(decoder.thread_id()?),
-            CREATE_THREAD_TAG_PROCESS => CreateThreadResponse::Process(ChildProcess {
+            CREATE_THREAD_TAG_PROCESS => CreateThreadResponse::Process(CreatedProcess {
                 process_id: decoder.process_id()?,
                 handle: decoder.handle()?,
             }),
@@ -532,7 +531,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
-        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(StartedChildProcess {
+        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(StartedProcess {
             identity: ProcessIdentity {
                 process_id: decoder.process_id()?,
                 initial_thread_id: decoder.thread_id()?,
@@ -669,9 +668,9 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        ChildProcess, CreateThreadRequest, CreateThreadResponse, ProcessExitStatus,
+        CreateThreadRequest, CreateThreadResponse, CreatedProcess, ProcessExitStatus,
         ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
-        StartChildProcessSource, StartedChildProcess,
+        StartChildProcessSource, StartedProcess,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -1229,7 +1228,7 @@ mod tests {
         let handle = ObjectHandle(13);
         let results = [
             BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id(17))),
-            BrokerResult::CreateThread(CreateThreadResponse::Process(ChildProcess {
+            BrokerResult::CreateThread(CreateThreadResponse::Process(CreatedProcess {
                 process_id: process_id(19),
                 handle: ObjectHandle(u64::MAX),
             })),
@@ -1367,14 +1366,14 @@ mod tests {
             BrokerResult::File(FileResponse::Mkdir),
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
-            BrokerResult::ProcessStarted(StartedChildProcess {
+            BrokerResult::ProcessStarted(StartedProcess {
                 identity: ProcessIdentity {
                     process_id: process_id(u32::MAX),
                     initial_thread_id: thread_id(u32::MAX - 1),
                 },
                 handle: Some(ObjectHandle(u64::MAX)),
             }),
-            BrokerResult::ProcessStarted(StartedChildProcess {
+            BrokerResult::ProcessStarted(StartedProcess {
                 identity: ProcessIdentity {
                     process_id: process_id(9),
                     initial_thread_id: thread_id(11),
@@ -1434,7 +1433,7 @@ mod tests {
         for process_id in [ProcessId(0), ProcessId(u32::MAX)] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
-                result: BrokerResult::CreateThread(CreateThreadResponse::Process(ChildProcess {
+                result: BrokerResult::CreateThread(CreateThreadResponse::Process(CreatedProcess {
                     process_id,
                     handle: ObjectHandle(0),
                 })),

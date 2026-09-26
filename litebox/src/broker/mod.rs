@@ -19,7 +19,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildProcess, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, StartedChildProcess,
+    CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, StartedProcess,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -52,13 +52,13 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn allocate_child_process(&self) -> core::result::Result<ChildProcess, BrokerControlError>;
+    fn allocate_child_process(&self) -> core::result::Result<CreatedProcess, BrokerControlError>;
 
     fn start_child_process(
         &self,
         child_process_id: Option<litebox_broker_protocol::ProcessId>,
         payload: &[u8],
-    ) -> core::result::Result<StartedChildProcess, BrokerControlError>;
+    ) -> core::result::Result<StartedProcess, BrokerControlError>;
 
     fn process_exit_status(
         &self,
@@ -453,7 +453,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn allocate_child_process(&self) -> core::result::Result<ChildProcess, BrokerControlError> {
+    fn allocate_child_process(&self) -> core::result::Result<CreatedProcess, BrokerControlError> {
         self.request(BrokerLocal::allocate_child_process)
     }
 
@@ -461,7 +461,7 @@ where
         &self,
         child_process_id: Option<litebox_broker_protocol::ProcessId>,
         payload: &[u8],
-    ) -> core::result::Result<StartedChildProcess, BrokerControlError> {
+    ) -> core::result::Result<StartedProcess, BrokerControlError> {
         if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }

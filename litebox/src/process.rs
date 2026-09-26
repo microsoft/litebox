@@ -45,15 +45,10 @@ pub enum ProcessError {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
-    pub fn allocate_child_process(&self) -> Result<ChildProcess<Platform>, ProcessError> {
+    pub fn allocate_child_process(&self) -> Result<Process<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         let child = broker.allocate_child_process()?;
-        Ok(ChildProcess::new(
-            self,
-            broker,
-            child.process_id,
-            child.handle,
-        ))
+        Ok(Process::new(self, broker, child.process_id, child.handle))
     }
 
     /// Starts a new child process in a fresh runner.
@@ -64,34 +59,34 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn start_child_process(
         &self,
         payload: &[u8],
-    ) -> Result<(ProcessIdentity, ChildProcess<Platform>), ProcessError> {
+    ) -> Result<(ProcessIdentity, Process<Platform>), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         let started = broker.start_child_process(None, payload)?;
         let handle = started
             .handle
             .expect("broker must return a handle for a newly started child");
-        let child = ChildProcess::new(self, broker, started.identity.process_id, handle);
+        let child = Process::new(self, broker, started.identity.process_id, handle);
         Ok((started.identity, child))
     }
 }
 
-/// Parent-owned handle to one broker child process.
+/// A broker process object.
 ///
-/// The child reports [`Events::IN`] once it terminates. Dropping the handle
-/// reaps the child and releases its retained exit status.
-pub struct ChildProcess<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+/// It reports [`Events::IN`] once the process terminates. Dropping it closes
+/// its handle and releases the process's retained exit status.
+pub struct Process<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
-    process_id: ProcessId,
+    id: ProcessId,
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     pollee: Arc<Pollee<Platform>>,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ChildProcess<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     fn new(
         litebox: &LiteBox<Platform>,
         broker: Arc<dyn BrokerControl>,
-        process_id: ProcessId,
+        id: ProcessId,
         handle: ObjectHandle,
     ) -> Self {
         let pollable_registry = litebox.broker_pollable_registry();
@@ -99,27 +94,27 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ChildProcess<Platform> 
         pollable_registry.register_pollable(handle, &pollee);
         Self {
             broker,
-            process_id,
+            id,
             handle,
             pollable_registry,
             pollee,
         }
     }
 
-    /// Returns the broker-assigned child process ID.
-    pub fn process_id(&self) -> ProcessId {
-        self.process_id
+    /// Returns the broker-assigned process ID.
+    pub fn id(&self) -> ProcessId {
+        self.id
     }
 
-    /// Transfers this pending child to a fresh runner.
+    /// Transfers this pending child process to a fresh runner.
     pub fn start(&self, payload: &[u8]) -> Result<ProcessIdentity, ProcessError> {
         Ok(self
             .broker
-            .start_child_process(Some(self.process_id), payload)?
+            .start_child_process(Some(self.id), payload)?
             .identity)
     }
 
-    /// Returns the child's termination status, or `None` while the child is live.
+    /// Returns the process's termination status, or `None` while the process is live.
     pub fn exit_status(&self) -> Result<Option<ProcessExitStatus>, ProcessError> {
         match self.broker.process_exit_status(self.handle) {
             Ok(status) => Ok(Some(status)),
@@ -129,14 +124,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> ChildProcess<Platform> 
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for ChildProcess<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Process<Platform> {
     fn drop(&mut self) {
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for ChildProcess<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Process<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         self.pollee.register_observer(observer, mask);
     }
