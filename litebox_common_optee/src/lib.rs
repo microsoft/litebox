@@ -8,9 +8,7 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-#[cfg(feature = "signed-ta-rsa")]
-use alloc::vec::Vec;
+use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt;
@@ -2652,7 +2650,6 @@ mod tests {
 }
 
 /// `Shdr` from `optee_os/core/include/signed_hdr.h`
-#[cfg(feature = "signed-ta-rsa")]
 #[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct Shdr {
@@ -2665,7 +2662,6 @@ pub struct Shdr {
 }
 
 /// `SHDR_MAGIC` from `optee_os/core/include/signed_hdr.h`
-#[cfg(feature = "signed-ta-rsa")]
 const SHDR_MAGIC: u32 = 0x4f54_5348;
 
 /// From `optee_os/core/include/signed_hdr.h`
@@ -2680,16 +2676,12 @@ const SHDR_MAGIC: u32 = 0x4f54_5348;
 /// 	uint16_t timeHiAndVersion;
 /// 	uint8_t clockSeqAndNode[8];
 /// } TEE_UUID;
-#[cfg(feature = "signed-ta-rsa")]
 const SHDR_UUID_LEN: usize = 16;
-#[cfg(feature = "signed-ta-rsa")]
 const SHDR_VERSION_LEN: usize = 4;
 
 /// An RSA public key used to verify signed `.ta` files
-#[cfg(feature = "signed-ta-rsa")]
 pub struct TaVerifyKey(rsa::RsaPublicKey);
 
-#[cfg(feature = "signed-ta-rsa")]
 impl TaVerifyKey {
     pub fn from_der(der: &[u8]) -> Result<Self, &'static str> {
         use rsa::pkcs8::DecodePublicKey;
@@ -2704,7 +2696,6 @@ impl TaVerifyKey {
 /// A signed `.ta` file has the following layout:
 /// shdr || hash || sig || uuid || ta_version || img
 /// Return the parsed TaHead and the TA ELF binary.
-#[cfg(feature = "signed-ta-rsa")]
 pub fn parse_and_verify_ta<'a>(
     ta_data: &'a [u8],
     verify_key: &TaVerifyKey,
@@ -2758,7 +2749,6 @@ pub fn parse_and_verify_ta<'a>(
 
 /// Verify a signed `.ta` file's signature against the given RSA public key.
 /// TODO: Support more signature algorithms if needed.
-#[cfg(feature = "signed-ta-rsa")]
 fn verify_shdr_signature(
     message: &[u8],
     signature: &[u8],

@@ -259,8 +259,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
 impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     /// Store a trusted TA embedded in the runner image.
     ///
-    /// Raw ELF binaries are stored directly. Signed TAs are verified and
-    /// unwrapped when `signed-ta-rsa` is enabled.
+    /// Raw ELF binaries are stored directly. Signed TAs are verified and unwrapped.
     pub(crate) fn store_embedded_ta(&self, ta_bin: &[u8]) -> bool {
         if let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) {
             return self
@@ -268,18 +267,11 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
                 .insert(ta_head.uuid, ta_bin.into(), TaSource::BuiltIn);
         }
 
-        #[cfg(feature = "signed-ta-rsa")]
-        {
-            let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin) else {
-                return false;
-            };
-            self.ta_uuid_map
-                .insert(ta_uuid, ta_elf.into(), TaSource::BuiltIn)
-        }
-        #[cfg(not(feature = "signed-ta-rsa"))]
-        {
-            false
-        }
+        let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin) else {
+            return false;
+        };
+        self.ta_uuid_map
+            .insert(ta_uuid, ta_elf.into(), TaSource::BuiltIn)
     }
 
     /// Store the TA binary associated with the given TA UUID.
@@ -293,20 +285,13 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         let ta_elf = match source {
             TaSource::BuiltIn => ta_bin,
             TaSource::Dynamic => {
-                #[cfg(feature = "signed-ta-rsa")]
-                {
-                    let Some((verified_uuid, ta_elf)) = verify_signed_ta(ta_bin) else {
-                        return false;
-                    };
-                    if verified_uuid != *ta_uuid {
-                        return false;
-                    }
-                    ta_elf
-                }
-                #[cfg(not(feature = "signed-ta-rsa"))]
-                {
+                let Some((verified_uuid, ta_elf)) = verify_signed_ta(ta_bin) else {
+                    return false;
+                };
+                if verified_uuid != *ta_uuid {
                     return false;
                 }
+                ta_elf
             }
         };
         self.ta_uuid_map.insert(*ta_uuid, ta_elf.into(), source)
@@ -1602,11 +1587,11 @@ fn ta_uuid_map() -> &'static TaUuidMap {
     TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
-#[cfg(feature = "signed-ta-rsa")]
 fn verify_signed_ta(ta_bin: &[u8]) -> Option<(TeeUuid, &[u8])> {
     use litebox_common_optee::{TaVerifyKey, parse_and_verify_ta};
 
-    const TA_VERIFY_KEY_DER: &[u8] = include_bytes!(env!("LITEBOX_TA_VERIFY_KEY"));
+    const TA_VERIFY_KEY_DER: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/ta-signing-public.der"));
     let verify_key = TaVerifyKey::from_der(TA_VERIFY_KEY_DER).ok()?;
     let (ta_head, ta_elf) = parse_and_verify_ta(ta_bin, &verify_key).ok()?;
     Some((ta_head.uuid, ta_elf))

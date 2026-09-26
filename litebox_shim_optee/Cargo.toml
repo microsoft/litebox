@@ -25,7 +25,6 @@ p384 = { version = "0.13.1", default-features = false, features = ["arithmetic",
 
 [features]
 idks-production = []
-signed-ta-rsa = ["litebox_common_optee/signed-ta-rsa"]
 
 [lints]
 workspace = true
