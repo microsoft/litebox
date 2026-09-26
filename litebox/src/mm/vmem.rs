@@ -15,6 +15,7 @@ use crate::platform::PageManagementProvider;
 use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationDirection;
 use crate::platform::page_mgmt::AllocationError;
+use crate::platform::page_mgmt::CowAllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
 use crate::platform::page_mgmt::{PageReservation, ReservationStore};
@@ -525,6 +526,56 @@ where
         Ok(())
     }
 
+    /// Reset pages without removing its mapping (similar to Linux `madvise` with
+    /// `MADV_DONTNEED` or `MADV_FREE`).
+    ///
+    /// If `anonymous_only` is true and any part of the range is non-anonymous (i.e., file-backed),
+    /// returns `Err(VmemResetError::FileBacked)`.
+    ///
+    /// The current implementation effectively re-inserts the mapping with the same
+    /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
+    ///
+    /// # Panics
+    ///
+    /// File-backed mapping is not supported yet.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the memory contents in the affected region are no longer accessed or
+    /// relied upon. Any pointers or references to the previous contents become invalid.
+    pub(super) unsafe fn reset_pages(
+        &mut self,
+        range: PageRange<ALIGN>,
+        anonymous_only: bool,
+    ) -> Result<(), VmemResetError> {
+        let range: Range<usize> = range.into();
+        // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
+        // while still resetting all of the existing vmas in the range.
+        let unmapped_error = self.vmas.gaps(&range).next().is_some();
+        let overlapping_ranges: Vec<(Range<usize>, VmArea)> = self
+            .overlapping(range.clone())
+            .map(|(r, vma)| (r.clone(), *vma))
+            .collect();
+        for (r, vma) in overlapping_ranges {
+            if vma.is_file_backed() {
+                if anonymous_only {
+                    return Err(VmemResetError::FileBacked);
+                }
+                unimplemented!("resetting file-backed mappings is not supported yet");
+            }
+            let start = r.start.max(range.start);
+            let end = r.end.min(range.end);
+            let new_range = PageRange::new(start, end).unwrap();
+            unsafe { self.insert_mapping(new_range, vma, false, FixedAddressBehavior::Replace) }
+                .expect("failed to reset pages");
+        }
+        if unmapped_error {
+            Err(VmemResetError::AlreadyUnallocated)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Insert a range to its virtual address space.
     ///
     /// If the inserted range partially or completely overlaps any
@@ -921,6 +972,76 @@ where
         }
 
         Ok(())
+    }
+
+    /// Attempt a native CoW mapping and register it in the VMA tracker.
+    ///
+    /// # Safety
+    ///
+    /// For replacement, the caller must ensure overlapping mappings are not in use.
+    pub(super) unsafe fn try_create_cow_pages(
+        &mut self,
+        suggested_start: Option<usize>,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        flags: CreatePagesFlags,
+    ) -> Result<Platform::RawMutPointer<u8>, CowAllocationError> {
+        let behavior = FixedAddressBehavior::from(flags);
+        if source_data.is_empty() || !source_data.len().is_multiple_of(ALIGN) {
+            return Err(CowAllocationError::Unaligned);
+        }
+        if suggested_start.is_none() && !matches!(behavior, FixedAddressBehavior::Hint(_)) {
+            return Err(CowAllocationError::InternalFailure);
+        }
+        if let Some(start) = suggested_start {
+            let end = start
+                .checked_add(source_data.len())
+                .ok_or(CowAllocationError::Unaligned)?;
+            if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
+                return Err(CowAllocationError::InternalFailure);
+            }
+            let requested =
+                PageRange::<ALIGN>::new(start, end).ok_or(CowAllocationError::Unaligned)?;
+            if behavior == FixedAddressBehavior::NoReplace && self.overlaps(requested.into(), true)
+            {
+                return Err(CowAllocationError::InternalFailure);
+            }
+        }
+        let suggested_start = suggested_start.unwrap_or(0);
+
+        let ptr = self.platform.try_allocate_cow_pages(
+            suggested_start,
+            source_data,
+            permissions,
+            behavior,
+        )?;
+        let actual_start = ptr.as_usize();
+        let actual_end = actual_start
+            .checked_add(source_data.len())
+            .ok_or(CowAllocationError::InternalFailure)?;
+        let actual =
+            PageRange::new(actual_start, actual_end).ok_or(CowAllocationError::InternalFailure)?;
+        debug_assert!(
+            matches!(behavior, FixedAddressBehavior::Hint(_)) || suggested_start == actual_start
+        );
+        debug_assert!(
+            actual_start >= Platform::TASK_ADDR_MIN && actual_end <= Platform::TASK_ADDR_MAX
+        );
+
+        // TODO: also add the range to reservations once we allow using [`TrackedReservations`]
+        // and update [`try_allocate_cow_pages`] to return the reservation handle.
+        self.register_existing_mapping_overwrite(
+            actual,
+            VmArea::new(
+                VmFlags::from(permissions)
+                    | VmFlags::may_flags_for_mapping(
+                        flags.contains(CreatePagesFlags::SHARED),
+                        true,
+                    ),
+                true,
+            ),
+        );
+        Ok(ptr)
     }
 
     /// Create a mapping with the given flags.
