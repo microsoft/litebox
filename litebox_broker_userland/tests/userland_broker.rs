@@ -58,6 +58,8 @@ fn run_parent_test() {
     let child_marker = unique_child_marker_path();
     let mut child_command = Command::new(env!("CARGO_BIN_EXE_litebox-broker-userland"));
     child_command
+        .arg("--unstable")
+        .arg("--allow-process-duplication")
         .arg("--runner")
         .arg(&test_executable)
         .arg(CHILD_START_RUNNER_ARGUMENT)
@@ -229,17 +231,19 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
         let marker = Path::new(&args[4]);
         let bootstrap = marker.as_os_str().as_encoded_bytes();
-        let failed = local
+        let failed = local.allocate_child_process().unwrap().identity;
+        local
             .start_child_process(
-                None,
+                failed.process_id,
                 SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 0).unwrap(),
                 &[],
             )
             .unwrap();
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
-        let started = local
+        let started = local.allocate_child_process().unwrap().identity;
+        local
             .start_child_process(
-                None,
+                started.process_id,
                 SharedBufferSequence::new(
                     &[SharedBufferSlotIndex(0)],
                     bootstrap.len().try_into().unwrap(),

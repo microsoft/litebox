@@ -3,7 +3,7 @@
 
 //! Broker-owned event object operations.
 
-use crate::process::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerProcess, Result};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
@@ -24,13 +24,7 @@ pub fn create(process: &BrokerProcess, initial_count: u64) -> Result<ObjectHandl
 pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let mut object = object.write();
-    match &mut *object {
-        ObjectEntry::Event(event) => event.add(value),
-        ObjectEntry::File(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_event_mut()?.add(value)
 }
 
 /// Consumes readiness credits from a broker-owned event object.
@@ -41,12 +35,15 @@ pub fn consume(
 ) -> Result<EventConsumption> {
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let mut object = object.write();
-    match &mut *object {
-        ObjectEntry::Event(event) => event.consume(mode),
-        ObjectEntry::File(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
+    object.as_event_mut()?.consume(mode)
+}
+
+impl ObjectEntry {
+    fn as_event_mut(&mut self) -> Result<&mut EventObject> {
+        match self {
+            Self::Event(event) => Ok(event),
+            _ => Err(BrokerError::InvalidRights),
         }
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }
 

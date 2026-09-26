@@ -19,7 +19,7 @@ use super::errors::{
     ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
 };
 use super::resolver::{Resolver, ResolverEntry};
-use crate::process::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a broker file operation.
@@ -38,6 +38,15 @@ pub struct File(Arc<dyn Any + Send + Sync>);
 impl File {
     fn state<State: Any + Send + Sync>(&self) -> Result<&State> {
         self.0.as_ref().downcast_ref().ok_or(BrokerError::Internal)
+    }
+}
+
+impl ObjectEntry {
+    fn as_file(&self) -> Result<&File> {
+        match self {
+            Self::File(file) => Ok(file),
+            _ => Err(BrokerError::InvalidRights),
+        }
     }
 }
 
@@ -672,13 +681,7 @@ fn file(
 ) -> Result<File> {
     let object = process.authorized_object(handle, required_rights)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::File(file) => Ok(file.clone()),
-        ObjectEntry::Event(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_file().cloned()
 }
 
 fn file_with_any_rights(
@@ -688,13 +691,7 @@ fn file_with_any_rights(
 ) -> Result<File> {
     let object = process.authorized_object_with_any_rights(handle, allowed_rights)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::File(file) => Ok(file.clone()),
-        ObjectEntry::Event(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_file().cloned()
 }
 
 fn open_flags(access: FileAccessMode, flags: FileOpenFlags) -> Result<OFlags> {

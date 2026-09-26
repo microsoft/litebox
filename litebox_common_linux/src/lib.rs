@@ -1086,6 +1086,47 @@ pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
 }
+
+/// Linux `struct rusage`.
+///
+/// Counters use the guest's 64-bit `long`, not the host's `c_long`.
+#[repr(C)]
+#[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[allow(clippy::struct_field_names, reason = "field names match Linux")]
+pub struct Rusage {
+    /// User time used.
+    ru_utime: TimeVal,
+    /// System time used.
+    ru_stime: TimeVal,
+    /// Maximum resident set size.
+    ru_maxrss: i64,
+    /// Integral shared memory size.
+    ru_ixrss: i64,
+    /// Integral unshared data size.
+    ru_idrss: i64,
+    /// Integral unshared stack size.
+    ru_isrss: i64,
+    /// Page reclaims.
+    ru_minflt: i64,
+    /// Page faults.
+    ru_majflt: i64,
+    /// Swaps.
+    ru_nswap: i64,
+    /// Block input operations.
+    ru_inblock: i64,
+    /// Block output operations.
+    ru_oublock: i64,
+    /// Messages sent.
+    ru_msgsnd: i64,
+    /// Messages received.
+    ru_msgrcv: i64,
+    /// Signals received.
+    ru_nsignals: i64,
+    /// Voluntary context switches.
+    ru_nvcsw: i64,
+    /// Involuntary context switches.
+    ru_nivcsw: i64,
+}
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ItimerVal {
@@ -2063,6 +2104,12 @@ impl ShutdownHow {
 #[derive(Debug)]
 pub enum SyscallRequest {
     Vfork,
+    Wait4 {
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: u32,
+        rusage: Option<UserPtrMut<Rusage>>,
+    },
     Exit {
         status: i32,
     },
@@ -2803,6 +2850,7 @@ impl SyscallRequest {
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             #[cfg(target_arch = "x86_64")]
             Sysno::vfork => SyscallRequest::Vfork,
+            Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
             Sysno::uname => sys_req!(Uname { buf:* }),
             Sysno::fcntl => {
                 let cmd: i32 = ctx.sys_req_arg(1);

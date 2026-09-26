@@ -22,6 +22,7 @@ mod error;
 pub mod event;
 pub mod fs;
 mod id;
+mod object;
 pub mod pipe;
 mod policy;
 mod process;
@@ -45,15 +46,15 @@ use spin::{Mutex, rwlock::RwLock};
 pub use error::BrokerError;
 use fs::FileService;
 use id::{IdAllocator, MAX_ALLOCATED_ID};
+use object::ObjectReference;
+pub use object::ObjectRights;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 pub use process::{
-    AssociationCancellation, BrokerProcess, CallerCredential, ObjectRights, ProcessLifecycleSink,
-    ProcessShutdown,
+    AssociationCancellation, BrokerProcess, CallerCredential, ProcessLifecycleSink, ProcessShutdown,
 };
-use process::{ObjectReference, ProcessRoot};
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
@@ -336,8 +337,7 @@ impl BrokerCore {
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
-        let allocate_process = |parent: Option<Weak<BrokerProcess>>,
-                                root: Option<Arc<ProcessRoot>>| {
+        let allocate_process = |parent: Option<Weak<BrokerProcess>>| {
             let mut processes = self.processes.write();
             if processes.len() >= self.limits.max_processes {
                 return Err(BrokerError::ResourceExhausted);
@@ -347,26 +347,12 @@ impl BrokerCore {
                 .map_err(|_| BrokerError::OutOfMemory)?;
             let raw_id = self.ids.lock().allocate()?;
             let id = ProcessId(raw_id);
-            let process = if let Some(root) = root {
-                Arc::new(BrokerProcess::new(
-                    self.clone(),
-                    id,
-                    root,
-                    parent,
-                    caller_credential,
-                ))
-            } else {
-                assert!(parent.is_none(), "a root process cannot have a parent");
-                Arc::new_cyclic(|root_process| {
-                    BrokerProcess::new(
-                        self.clone(),
-                        id,
-                        Arc::new(ProcessRoot::new(root_process.clone())),
-                        None,
-                        caller_credential,
-                    )
-                })
-            };
+            let process = Arc::new(BrokerProcess::new(
+                self.clone(),
+                id,
+                parent,
+                caller_credential,
+            ));
             assert!(
                 processes.insert(id, Arc::downgrade(&process)).is_none(),
                 "the ID allocator returned an occupied process ID"
@@ -381,11 +367,9 @@ impl BrokerCore {
                 .get(&parent_id)
                 .and_then(Weak::upgrade)
                 .ok_or(BrokerError::UnknownObject)?;
-            return parent.with_live_owner(|root| {
-                allocate_process(Some(Arc::downgrade(&parent)), Some(root))
-            })?;
+            return parent.with_live_owner(|| allocate_process(Some(Arc::downgrade(&parent))))?;
         }
-        allocate_process(None, None)
+        allocate_process(None)
     }
 
     /// Creates one process and its initial thread.

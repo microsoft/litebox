@@ -18,7 +18,9 @@ use litebox_broker_protocol::fs::{
     FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
-use litebox_broker_protocol::process::{MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity};
+use litebox_broker_protocol::process::{
+    CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus,
+};
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
@@ -50,15 +52,18 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn allocate_child_process(
-        &self,
-    ) -> core::result::Result<litebox_broker_protocol::ProcessId, BrokerControlError>;
+    fn allocate_child_process(&self) -> core::result::Result<CreatedProcess, BrokerControlError>;
 
     fn start_child_process(
         &self,
-        child_process_id: Option<litebox_broker_protocol::ProcessId>,
+        child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn process_exit_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<ProcessExitStatus, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -448,17 +453,15 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn allocate_child_process(
-        &self,
-    ) -> core::result::Result<litebox_broker_protocol::ProcessId, BrokerControlError> {
+    fn allocate_child_process(&self) -> core::result::Result<CreatedProcess, BrokerControlError> {
         self.request(BrokerLocal::allocate_child_process)
     }
 
     fn start_child_process(
         &self,
-        child_process_id: Option<litebox_broker_protocol::ProcessId>,
+        child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
-    ) -> core::result::Result<ProcessIdentity, BrokerControlError> {
+    ) -> core::result::Result<(), BrokerControlError> {
         if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -466,6 +469,13 @@ where
         self.request(|local| {
             local.start_child_process(child_process_id, shared_buffer_lease.sequence(), payload)
         })
+    }
+
+    fn process_exit_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<ProcessExitStatus, BrokerControlError> {
+        self.request(|local| local.process_exit_status(handle))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

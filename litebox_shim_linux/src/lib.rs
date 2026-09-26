@@ -349,7 +349,7 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
 /// A handle to a process loaded via [`LinuxShim::load_program`].
 ///
 /// This can be used to wait for the process to exit.
-pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::Process<Platform>>);
+pub struct LinuxShimProcess<Platform: ShimPlatform>(Arc<syscalls::process::ProcessState<Platform>>);
 
 impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
     /// Wait for the process to exit, returning its exit code.
@@ -1119,6 +1119,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::GetRandom { buf, count, flags } => {
                 self.sys_getrandom(buf, count, flags)
             }
+            SyscallRequest::Wait4 {
+                pid,
+                wstatus,
+                options,
+                rusage,
+            } => self.sys_wait4(pid, wstatus, options, rusage),
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
@@ -1210,7 +1216,7 @@ struct Task<Platform: ShimPlatform> {
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
-    vfork: RefCell<Option<VforkState>>,
+    vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1228,8 +1234,8 @@ struct Task<Platform: ShimPlatform> {
     signals: syscalls::signal::SignalState<Platform>,
 }
 
-struct VforkState {
-    child_process_id: litebox_broker_protocol::ProcessId,
+struct VforkState<Platform: ShimPlatform> {
+    child: litebox::process::Process<Platform>,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
 }

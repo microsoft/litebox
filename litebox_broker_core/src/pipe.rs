@@ -11,7 +11,7 @@ use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
-use crate::process::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -60,13 +60,7 @@ pub fn read(process: &BrokerProcess, handle: ObjectHandle, length: u32) -> Resul
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
-        ObjectEntry::Event(_) | ObjectEntry::File(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_pipe()?.read(length as usize)
 }
 
 /// Writes bytes to a broker-owned pipe.
@@ -76,12 +70,15 @@ pub fn write(process: &BrokerProcess, handle: ObjectHandle, data: &[u8]) -> Resu
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::Pipe(pipe) => pipe.write(data),
-        ObjectEntry::Event(_) | ObjectEntry::File(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
+    object.as_pipe()?.write(data)
+}
+
+impl ObjectEntry {
+    fn as_pipe(&self) -> Result<&PipeObject> {
+        match self {
+            Self::Pipe(pipe) => Ok(pipe),
+            _ => Err(BrokerError::InvalidRights),
         }
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }
 

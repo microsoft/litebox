@@ -6,21 +6,25 @@
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::offset_of;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use litebox::event::observer::Observer;
+use litebox::event::polling::TryOpError;
 use litebox::event::wait::WaitError;
+use litebox::event::{Events, IOPollable as _};
 use litebox::mm::vmem::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
+use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
-    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
+    ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno, program_startup::LinuxProgramStartup,
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
@@ -29,7 +33,7 @@ use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
 /// Process-management-related state on [`Task`].
 pub(crate) struct ThreadState<Platform: ShimPlatform> {
     init_state: Cell<ThreadInitState>,
-    process: Arc<Process<Platform>>,
+    process: Arc<ProcessState<Platform>>,
     /// Thread state that can be accessed from a remote thread.
     remote: Arc<ThreadRemote<Platform>>,
     tid: Cell<Option<i32>>,
@@ -56,7 +60,7 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(Process::new(pid, remote.clone())),
+            process: Arc::new(ProcessState::new(pid, remote.clone())),
             remote,
             tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -117,7 +121,7 @@ impl<Platform: ShimPlatform> Drop for ThreadState<Platform> {
 }
 
 pub(crate) struct ThreadDetachGuard<'a, Platform: ShimPlatform> {
-    process: &'a Process<Platform>,
+    process: &'a ProcessState<Platform>,
 }
 
 impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
@@ -151,11 +155,13 @@ impl<Platform: ShimPlatform> ThreadRemote<Platform> {
 }
 
 /// A Linux process, which may have multiple threads.
-pub(crate) struct Process<Platform: ShimPlatform> {
+pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
     nr_threads: <Platform as RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
+    /// Started child processes that have not been reaped, mapped by process ID.
+    children: Mutex<Platform, BTreeMap<i32, litebox::process::Process<Platform>>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
@@ -201,7 +207,7 @@ pub(crate) enum ExitStatus {
     Signal(litebox_common_linux::signal::Signal),
 }
 
-impl<Platform: ShimPlatform> Process<Platform> {
+impl<Platform: ShimPlatform> ProcessState<Platform> {
     /// Creates a new process with the given initial thread.
     fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
         let nr_threads = <Platform as RawMutexProvider>::RawMutex::INIT;
@@ -214,6 +220,7 @@ impl<Platform: ShimPlatform> Process<Platform> {
                 is_killing_other_threads: false,
                 threads: BTreeMap::from_iter([(pid, remote)]),
             }),
+            children: Mutex::new(BTreeMap::new()),
             limits: ResourceLimits::default(),
             alarm_timer: Mutex::new(Alarm {
                 handle: None,
@@ -233,6 +240,68 @@ impl<Platform: ShimPlatform> Process<Platform> {
     fn has_default_alarm_state(&self) -> bool {
         let alarm = self.alarm_timer.lock();
         alarm.handle.is_none() && alarm.deadline.is_none()
+    }
+
+    /// Adds a started child process.
+    fn add_child(&self, pid: i32, child: litebox::process::Process<Platform>) {
+        let previous = self.children.lock().insert(pid, child);
+        assert!(
+            previous.is_none(),
+            "broker child process IDs must be unique"
+        );
+    }
+
+    /// Removes one terminated child with process ID `target`, or any terminated child when
+    /// `target` is `None`.
+    ///
+    /// The caller drops the returned child outside the children lock to reap it.
+    fn remove_exited_child(
+        &self,
+        target: Option<i32>,
+    ) -> Result<(i32, litebox::process::Process<Platform>, ProcessExitStatus), TryOpError<Errno>>
+    {
+        let mut children = self.children.lock();
+        let mut matched = false;
+        let mut exited = None;
+        for (&pid, child) in children
+            .iter()
+            .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
+        {
+            matched = true;
+            if let Some(status) = child
+                .exit_status()
+                .map_err(|error| TryOpError::Other(error.into()))?
+            {
+                exited = Some((pid, status));
+                break;
+            }
+        }
+        if !matched {
+            return Err(TryOpError::Other(Errno::ECHILD));
+        }
+        let (pid, status) = exited.ok_or(TryOpError::TryAgain)?;
+        let child = children
+            .remove(&pid)
+            .expect("matched child must remain present");
+        Ok((pid, child, status))
+    }
+
+    /// Registers `observer` on each child with process ID `target`, or on every child when
+    /// `target` is `None`.
+    fn register_child_observer(
+        &self,
+        target: Option<i32>,
+        observer: &Weak<dyn Observer<Events>>,
+        mask: Events,
+    ) {
+        for (_, child) in self
+            .children
+            .lock()
+            .iter()
+            .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
+        {
+            child.register_observer(observer.clone(), mask);
+        }
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
@@ -454,7 +523,7 @@ pub(crate) struct Credentials {
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
-    pub(crate) fn process(&self) -> &Arc<Process<Platform>> {
+    pub(crate) fn process(&self) -> &Arc<ProcessState<Platform>> {
         &self.thread.process
     }
 
@@ -713,11 +782,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .litebox
             .allocate_child_process()
             .map_err(Errno::from)?;
-        let child_pid = i32::try_from(child.0).expect("broker process IDs must fit Linux pid_t");
+        let child_pid = i32::try_from(child.identity().process_id.0)
+            .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
         parent_context.rax = child_pid.cast_unsigned() as usize;
         self.vfork.replace(Some(crate::VforkState {
-            child_process_id: child,
+            child,
             child_pid,
             parent_context,
         }));
@@ -1434,6 +1504,77 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    /// Handle syscall `wait4`.
+    ///
+    /// Only terminated children are reported. Process groups are not modeled, so `pid == 0`
+    /// waits for any child and `pid < -1` matches no child. Resource usage is reported as zero.
+    /// A child without an observable termination status is reported as killed by `SIGSEGV`.
+    /// Children belong to the process rather than the creating thread, so `__WNOTHREAD` is
+    /// accepted but does not restrict which children match.
+    pub(crate) fn sys_wait4(
+        &self,
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: u32,
+        rusage: Option<UserPtrMut<Rusage>>,
+    ) -> Result<usize, Errno> {
+        const WNOHANG: u32 = 0x1;
+        const WUNTRACED: u32 = 0x2;
+        const WCONTINUED: u32 = 0x8;
+        const WNOTHREAD: u32 = 0x2000_0000;
+        const WALL: u32 = 0x4000_0000;
+        const WCLONE: u32 = 0x8000_0000;
+
+        if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
+            return Err(Errno::EINVAL);
+        }
+        let target = match pid {
+            -1 | 0 => None,
+            1.. => Some(pid),
+            i32::MIN => return Err(Errno::ESRCH),
+            _ => return Err(Errno::ECHILD),
+        };
+        // Every child is created with the default exit signal, so only __WALL selects it
+        // together with __WCLONE.
+        if options & WCLONE != 0 && options & WALL == 0 {
+            return Err(Errno::ECHILD);
+        }
+        let process = &self.thread.process;
+        let (child_pid, child, exit_status) = match self.wait_cx().wait_on_events(
+            options & WNOHANG != 0,
+            Events::IN,
+            |observer, mask| {
+                process.register_child_observer(target, &observer, mask);
+                Ok(())
+            },
+            || process.remove_exited_child(target),
+        ) {
+            Ok(exited) => exited,
+            Err(TryOpError::TryAgain) => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        // Closing the child handle reaps the child.
+        drop(child);
+        let status = match exit_status {
+            ProcessExitStatus::Exited { code } => ((code & 0xff) << 8).cast_signed(),
+            ProcessExitStatus::Signaled { signal } => (signal & 0x7f).cast_signed(),
+            // A child without an observable status failed after its parent resumed, like a Linux
+            // exec failure past the point of no return, which the kernel reports as SIGSEGV.
+            _ => litebox_common_linux::signal::Signal::SIGSEGV.as_i32(),
+        };
+        if let Some(wstatus) = wstatus {
+            wstatus
+                .write_at_offset::<Platform>(0, status)
+                .ok_or(Errno::EFAULT)?;
+        }
+        if let Some(rusage) = rusage {
+            rusage
+                .write_at_offset::<Platform>(0, Rusage::default())
+                .ok_or(Errno::EFAULT)?;
+        }
+        Ok(child_pid.cast_unsigned() as usize)
+    }
+
     /// Handle syscall `getpid`.
     pub(crate) fn sys_getpid(&self) -> i32 {
         self.vfork
@@ -1706,17 +1847,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             copy_vector::<Platform>(envp, "envp")?
         };
 
-        let vfork_child = self
-            .vfork
-            .borrow()
-            .as_ref()
-            .map(|state| state.child_process_id);
-        if vfork_child.is_some() && !path.starts_with('/') {
+        let is_vfork_child = self.vfork.borrow().is_some();
+        if is_vfork_child && !path.starts_with('/') {
             return Err(Errno::ENOENT);
         }
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
-        if let Some(child) = vfork_child {
+        if is_vfork_child {
             drop(loader);
             let startup = LinuxProgramStartup {
                 parent_process_id: self.pid,
@@ -1729,15 +1866,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 envp: envp_vec,
             };
             let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
-            self.global
-                .litebox
-                .start_child_process(Some(child), &payload)
+            self.vfork
+                .borrow()
+                .as_ref()
+                .expect("vfork transfer lost its child")
+                .child
+                .start(&payload)
                 .map_err(Errno::from)?;
             let state = self
                 .vfork
                 .borrow_mut()
                 .take()
                 .expect("successful vfork transfer lost its parent context");
+            self.thread.process.add_child(state.child_pid, state.child);
             *ctx = state.parent_context;
             return Ok(state.child_pid.cast_unsigned() as usize);
         }

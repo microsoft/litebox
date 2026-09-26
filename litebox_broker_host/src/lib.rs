@@ -44,9 +44,8 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
-    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -63,7 +62,7 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ProcessId, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferError, SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
@@ -262,10 +261,13 @@ where
         None => None,
     };
     let limits = core.limits();
-    // Sockets are currently the only externally backed objects. Add future
+    // Sockets and child process handles register readiness. Add future
     // resource limits here so every live registration fits in the
     // association's shared readiness sink.
-    let max_live_readiness_registrations = limits.max_sockets.min(limits.max_sockets_per_process);
+    let max_live_readiness_registrations = limits
+        .max_sockets
+        .min(limits.max_sockets_per_process)
+        .saturating_add(limits.max_processes);
     if max_live_readiness_registrations > readiness_sink.max_tracked_objects() {
         return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
     }
@@ -480,7 +482,7 @@ fn handle_request<Memory: SharedMemory>(
                 .map(BrokerResult::CreateThread)
                 .map_err(RequestFailure::from),
             CreateThreadRequest::Process => process
-                .allocate_child_process()
+                .allocate_child_process(Arc::clone(readiness_sink))
                 .map(CreateThreadResponse::Process)
                 .map(BrokerResult::CreateThread)
                 .map_err(RequestFailure::from),
@@ -496,6 +498,10 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::CheckReadiness(handle) => process
             .check_readiness(handle)
             .map(BrokerResult::Readiness)
+            .map_err(RequestFailure::from),
+        BrokerOperation::GetProcessExitStatus(handle) => process
+            .process_exit_status(handle)
+            .map(BrokerResult::ProcessExitStatus)
             .map_err(RequestFailure::from),
         BrokerOperation::Event(request) => {
             handle_event_request(process, request).map(BrokerResult::Event)
@@ -780,7 +786,6 @@ pub trait ProcessLauncher: Send + Sync {
 
 /// Handles a process operation using the configured platform launcher.
 pub fn handle_process_operation<Memory, Launcher>(
-    broker: &BrokerCore,
     launcher: &Arc<Launcher>,
     parent: &BrokerProcess,
     operation: &BrokerOperation,
@@ -798,39 +803,30 @@ where
             read_shared_buffer(shared_buffers, startup.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
                 .and_then(|payload| {
                     start_child_process(
-                        broker,
                         Arc::clone(launcher),
                         parent,
                         *child_process_id,
                         ProcessStartupData { payload },
                     )
                 })
-                .map(BrokerResult::ProcessStarted),
+                .map(|()| BrokerResult::ProcessStarted),
         ),
         _ => None,
     }
 }
 
 fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
-    broker: &BrokerCore,
     launcher: Arc<Launcher>,
     parent: &BrokerProcess,
-    child_process_id: Option<litebox_broker_protocol::ProcessId>,
+    child_process_id: ProcessId,
     startup: ProcessStartupData,
-) -> RequestResult<ProcessIdentity> {
+) -> RequestResult<()> {
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
-    let process = match child_process_id {
-        Some(child_process_id) => parent
-            .take_child_process(child_process_id)
-            .map_err(RequestFailure::from)?,
-        None => broker
-            .create_process(parent.caller_credential(), Some(parent.id()))
-            .map_err(RequestFailure::from)?,
-    };
-    let process_id = process.id();
-    let initial_thread_id = process.initial_thread_id();
+    let process = parent
+        .take_child_process(child_process_id)
+        .map_err(RequestFailure::from)?;
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
         process.retire(true);
@@ -843,11 +839,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
                 payload: startup.payload,
             },
         )
-        .map_err(RequestFailure::from)?;
-    Ok(ProcessIdentity {
-        process_id,
-        initial_thread_id,
-    })
+        .map_err(RequestFailure::from)
 }
 
 fn write_shared_buffer<Memory: SharedMemory>(

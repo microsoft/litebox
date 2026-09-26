@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::shared_buffer::SharedBufferSequence;
-use crate::{ProcessId, ThreadId};
+use crate::{ObjectHandle, ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
 pub const MAX_PROCESS_BOOTSTRAP_SIZE: u32 = 64 * 1024;
@@ -32,6 +32,34 @@ pub struct ProcessIdentity {
     pub initial_thread_id: ThreadId,
 }
 
+/// Portable process termination status retained until the process is reaped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ProcessExitStatus {
+    /// The process exited normally with the supplied status code.
+    Exited { code: u32 },
+    /// The process was terminated by a signal.
+    Signaled {
+        /// Signal number reported by the runner platform.
+        signal: u32,
+    },
+    /// The runner terminated without an observable platform status.
+    Unknown,
+}
+
+/// One newly created process and the creator's handle to it.
+///
+/// The handle reports [`ReadinessFlags::READ`](crate::readiness::ReadinessFlags::READ)
+/// once the process terminates. Closing it releases the process's retained
+/// exit status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreatedProcess {
+    /// Broker-assigned process identity.
+    pub identity: ProcessIdentity,
+    /// Handle used to observe process termination.
+    pub handle: ObjectHandle,
+}
+
 /// Selects whether thread creation extends the current process or creates a child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateThreadRequest {
@@ -47,7 +75,7 @@ pub enum CreateThreadResponse {
     /// A thread was created in the requesting process.
     Thread(ThreadId),
     /// A pending child process was created.
-    Process(ProcessId),
+    Process(CreatedProcess),
 }
 
 /// Source used to start one child process.
@@ -60,11 +88,11 @@ pub enum StartChildProcessSource {
     Duplicate(SharedBufferSequence),
 }
 
-/// Starts either a newly allocated child or a pending child created earlier.
+/// Starts a pending child created earlier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartChildProcessRequest {
-    /// Existing pending child to start, or `None` to allocate a new child.
-    pub child_process_id: Option<ProcessId>,
+    /// Pending child to start.
+    pub child_process_id: ProcessId,
     /// Process startup source.
     pub source: StartChildProcessSource,
 }

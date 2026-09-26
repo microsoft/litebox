@@ -40,8 +40,8 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity,
-    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
     StartChildProcessSource,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -184,7 +184,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         self.initial_thread_id
     }
 
-    /// Starts one child process.
+    /// Starts a pending child created by [`Self::allocate_child_process`].
     ///
     /// This call blocks until the child's broker association is active or
     /// launch fails. The caller must retain exclusive ownership of the
@@ -196,10 +196,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// or the broker returns a response for another operation.
     pub fn start_child_process(
         &self,
-        child_process_id: Option<ProcessId>,
+        child_process_id: ProcessId,
         buffer: SharedBufferSequence,
         bootstrap: &[u8],
-    ) -> Result<ProcessIdentity, Channel::Error> {
+    ) -> Result<(), Channel::Error> {
         if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
             return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -211,23 +211,43 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }),
             },
         ))? {
-            BrokerResult::ProcessStarted(started) => Ok(started),
+            BrokerResult::ProcessStarted => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
         }
     }
 
-    /// Allocates one pending child process.
+    /// Allocates one pending child process and its parent-owned handle.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn allocate_child_process(&self) -> Result<ProcessId, Channel::Error> {
+    pub fn allocate_child_process(&self) -> Result<CreatedProcess, Channel::Error> {
         match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Process))? {
-            BrokerResult::CreateThread(CreateThreadResponse::Process(process_id)) => Ok(process_id),
+            BrokerResult::CreateThread(CreateThreadResponse::Process(child)) => Ok(child),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => {
                 panic!("broker returned unexpected allocate-child-process response: {response:?}")
+            }
+        }
+    }
+
+    /// Returns a process's termination status through a process handle.
+    ///
+    /// Returns `WouldBlock` while the process is live.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn process_exit_status(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<ProcessExitStatus, Channel::Error> {
+        match self.request(BrokerOperation::GetProcessExitStatus(handle))? {
+            BrokerResult::ProcessExitStatus(status) => Ok(status),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected process-exit-status response: {response:?}")
             }
         }
     }
