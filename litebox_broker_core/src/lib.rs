@@ -357,15 +357,13 @@ impl BrokerCore {
                 ))
             } else {
                 assert!(parent.is_none(), "a root process cannot have a parent");
-                Arc::new_cyclic(|root_process| {
-                    BrokerProcess::new(
-                        self.clone(),
-                        id,
-                        Arc::new(ProcessRoot::new(root_process.clone())),
-                        None,
-                        caller_credential,
-                    )
-                })
+                Arc::new(BrokerProcess::new(
+                    self.clone(),
+                    id,
+                    Arc::new(ProcessRoot),
+                    None,
+                    caller_credential,
+                ))
             };
             assert!(
                 processes.insert(id, Arc::downgrade(&process)).is_none(),

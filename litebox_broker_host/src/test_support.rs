@@ -228,11 +228,13 @@ impl InProcessReadinessSink {
         );
     }
 
-    fn dispatch(&self, notification: BrokerNotification) {
+    fn dispatch(&self, handle: ObjectHandle, readiness: ReadinessFlags) {
         self.dispatcher
             .lock()
             .as_ref()
-            .expect("the readiness sink must be attached before requests")(notification);
+            .expect("the readiness sink must be attached before requests")(
+            BrokerNotification::Readiness(ReadinessNotification { handle, readiness }),
+        );
     }
 }
 
@@ -246,10 +248,7 @@ impl ReadinessSink for InProcessReadinessSink {
         handle: ObjectHandle,
         readiness: ReadinessFlags,
     ) -> litebox_broker_core::Result<()> {
-        self.dispatch(BrokerNotification::Readiness(ReadinessNotification {
-            handle,
-            readiness,
-        }));
+        self.dispatch(handle, readiness);
         Ok(())
     }
 
@@ -258,18 +257,11 @@ impl ReadinessSink for InProcessReadinessSink {
         handle: ObjectHandle,
         readiness: ReadinessFlags,
     ) -> litebox_broker_core::Result<()> {
-        self.dispatch(BrokerNotification::Readiness(ReadinessNotification {
-            handle,
-            readiness,
-        }));
+        self.dispatch(handle, readiness);
         Ok(())
     }
 
     fn retire(&self, _handle: ObjectHandle) {}
-
-    fn child_state_changed(&self) {
-        self.dispatch(BrokerNotification::ChildStateChanged);
-    }
 }
 
 /// Creates shared memory backed by an ordinary allocation.

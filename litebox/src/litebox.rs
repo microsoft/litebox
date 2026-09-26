@@ -195,7 +195,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                 .x
                 .broker_pollables
                 .notify_readiness(notification.handle, notification.readiness),
-            BrokerNotification::ChildStateChanged => self.x.broker_pollables.notify_child_state(),
         }
     }
 
@@ -211,9 +210,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
                     BrokerNotification::Readiness(notification) => {
                         broker_pollables
                             .notify_readiness(notification.handle, notification.readiness);
-                    }
-                    BrokerNotification::ChildStateChanged => {
-                        broker_pollables.notify_child_state();
                     }
                 }
             }

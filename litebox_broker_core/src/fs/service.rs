@@ -674,9 +674,10 @@ fn file(
     let object = object.read();
     match &*object {
         ObjectEntry::File(file) => Ok(file.clone()),
-        ObjectEntry::Event(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
+        ObjectEntry::Event(_)
+        | ObjectEntry::Pipe(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }
@@ -690,9 +691,10 @@ fn file_with_any_rights(
     let object = object.read();
     match &*object {
         ObjectEntry::File(file) => Ok(file.clone()),
-        ObjectEntry::Event(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
+        ObjectEntry::Event(_)
+        | ObjectEntry::Pipe(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }

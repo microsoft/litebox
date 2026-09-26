@@ -1216,7 +1216,7 @@ struct Task<Platform: ShimPlatform> {
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
-    vfork: RefCell<Option<VforkState>>,
+    vfork: RefCell<Option<VforkState<Platform>>>,
     /// Process ID
     pid: i32,
     /// Parent Process ID
@@ -1234,8 +1234,8 @@ struct Task<Platform: ShimPlatform> {
     signals: syscalls::signal::SignalState<Platform>,
 }
 
-struct VforkState {
-    child_process_id: litebox_broker_protocol::ProcessId,
+struct VforkState<Platform: ShimPlatform> {
+    child: litebox::process::ChildProcess<Platform>,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
 }

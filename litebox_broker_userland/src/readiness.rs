@@ -92,12 +92,6 @@ impl ReadinessPublisherRuntime {
         self.publisher.retire(handle);
     }
 
-    fn publish_child_state(&self) {
-        if self.publisher.publish_child_state() == PublishOutcome::Queued {
-            self.signal();
-        }
-    }
-
     /// Publishes readiness notifications until the runtime is closed.
     ///
     /// The caller must be the only owner of `channel`. Sending blocks while the
@@ -183,10 +177,6 @@ impl ReadinessSink for ReadinessPublisherRuntime {
     fn retire(&self, handle: ObjectHandle) {
         Self::retire(self, handle);
     }
-
-    fn child_state_changed(&self) {
-        self.publish_child_state();
-    }
 }
 
 #[cfg(test)]
@@ -214,9 +204,7 @@ mod tests {
             &mut self,
             notification: &BrokerNotification,
         ) -> Result<(), Self::Error> {
-            let BrokerNotification::Readiness(readiness) = notification else {
-                return Err("unexpected notification");
-            };
+            let BrokerNotification::Readiness(readiness) = notification;
             self.sent.send(*readiness).map_err(|_| "receiver dropped")
         }
     }

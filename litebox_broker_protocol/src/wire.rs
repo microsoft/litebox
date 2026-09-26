@@ -23,8 +23,9 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    ChildExit, CreateThreadRequest, CreateThreadResponse, ProcessExitStatus, ProcessIdentity,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource, WaitChildTarget,
+    ChildProcess, CreateThreadRequest, CreateThreadResponse, ProcessExitStatus, ProcessIdentity,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
+    StartedChildProcess,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -49,14 +50,12 @@ const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
-const REQUEST_TAG_WAIT_CHILD: u8 = 12;
+const REQUEST_TAG_GET_PROCESS_EXIT_STATUS: u8 = 12;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
 const START_CHILD_PROCESS_TAG_BOOTSTRAP: u8 = 0;
 const START_CHILD_PROCESS_TAG_DUPLICATE: u8 = 1;
-const WAIT_CHILD_TARGET_TAG_ANY: u8 = 0;
-const WAIT_CHILD_TARGET_TAG_PROCESS: u8 = 1;
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
 const PROCESS_EXIT_STATUS_TAG_UNKNOWN: u8 = 2;
@@ -74,7 +73,7 @@ const RESPONSE_TAG_FILE: u8 = 8;
 const RESPONSE_TAG_CREATE_THREAD: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
-const RESPONSE_TAG_CHILD_EXITED: u8 = 12;
+const RESPONSE_TAG_PROCESS_EXIT_STATUS: u8 = 12;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -82,7 +81,6 @@ const RESPONSE_TAG_HANDSHAKE_ERROR: u8 = 254;
 const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 
 const NOTIFICATION_TAG_READINESS: u8 = 0;
-const NOTIFICATION_TAG_CHILD_STATE_CHANGED: u8 = 1;
 
 /// Maximum byte length of any encoded active request or response.
 pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 67;
@@ -136,7 +134,7 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_CHILD_PROCESS
-        | REQUEST_TAG_WAIT_CHILD => {
+        | REQUEST_TAG_GET_PROCESS_EXIT_STATUS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -230,16 +228,10 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
                 }
             }
         }
-        BrokerOperation::WaitChild(target) => {
-            encoder.u8(REQUEST_TAG_WAIT_CHILD);
+        BrokerOperation::GetProcessExitStatus(handle) => {
+            encoder.u8(REQUEST_TAG_GET_PROCESS_EXIT_STATUS);
             encoder.request_id(request_id);
-            match target {
-                WaitChildTarget::Any => encoder.u8(WAIT_CHILD_TARGET_TAG_ANY),
-                WaitChildTarget::Process(process_id) => {
-                    encoder.u8(WAIT_CHILD_TARGET_TAG_PROCESS);
-                    encoder.process_id(process_id);
-                }
-            }
+            encoder.handle(handle);
         }
     }
     encoder.finish()
@@ -262,7 +254,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_CHILD_PROCESS
-        | REQUEST_TAG_WAIT_CHILD => {}
+        | REQUEST_TAG_GET_PROCESS_EXIT_STATUS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -303,11 +295,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                 source,
             })
         }
-        REQUEST_TAG_WAIT_CHILD => BrokerOperation::WaitChild(match decoder.u8()? {
-            WAIT_CHILD_TARGET_TAG_ANY => WaitChildTarget::Any,
-            WAIT_CHILD_TARGET_TAG_PROCESS => WaitChildTarget::Process(decoder.process_id()?),
-            _ => return Err(WireError::InvalidTag),
-        }),
+        REQUEST_TAG_GET_PROCESS_EXIT_STATUS => {
+            BrokerOperation::GetProcessExitStatus(decoder.handle()?)
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -385,7 +375,7 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_CHILD_EXITED => {
+        | RESPONSE_TAG_PROCESS_EXIT_STATUS => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -416,9 +406,10 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
                     encoder.u8(CREATE_THREAD_TAG_THREAD);
                     encoder.thread_id(thread_id);
                 }
-                CreateThreadResponse::Process(process_id) => {
+                CreateThreadResponse::Process(ChildProcess { process_id, handle }) => {
                     encoder.u8(CREATE_THREAD_TAG_PROCESS);
                     encoder.process_id(process_id);
+                    encoder.handle(handle);
                 }
             }
         }
@@ -464,19 +455,29 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             fs::encode_fs_response(&mut encoder, response);
         }
-        BrokerResult::ProcessStarted(ProcessIdentity {
-            process_id,
-            initial_thread_id,
+        BrokerResult::ProcessStarted(StartedChildProcess {
+            identity:
+                ProcessIdentity {
+                    process_id,
+                    initial_thread_id,
+                },
+            handle,
         }) => {
             encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
             encoder.request_id(request_id);
             encoder.process_id(process_id);
             encoder.thread_id(initial_thread_id);
+            match handle {
+                None => encoder.u8(0),
+                Some(handle) => {
+                    encoder.u8(1);
+                    encoder.handle(handle);
+                }
+            }
         }
-        BrokerResult::ChildExited(ChildExit { process_id, status }) => {
-            encoder.u8(RESPONSE_TAG_CHILD_EXITED);
+        BrokerResult::ProcessExitStatus(status) => {
+            encoder.u8(RESPONSE_TAG_PROCESS_EXIT_STATUS);
             encoder.request_id(request_id);
-            encoder.process_id(process_id);
             encode_process_exit_status(&mut encoder, status);
         }
         BrokerResult::Error(error) => {
@@ -508,7 +509,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_CHILD_EXITED => {}
+        | RESPONSE_TAG_PROCESS_EXIT_STATUS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -519,7 +520,10 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_ERROR => BrokerResult::Error(decode_error_code(&mut decoder)?),
         RESPONSE_TAG_CREATE_THREAD => BrokerResult::CreateThread(match decoder.u8()? {
             CREATE_THREAD_TAG_THREAD => CreateThreadResponse::Thread(decoder.thread_id()?),
-            CREATE_THREAD_TAG_PROCESS => CreateThreadResponse::Process(decoder.process_id()?),
+            CREATE_THREAD_TAG_PROCESS => CreateThreadResponse::Process(ChildProcess {
+                process_id: decoder.process_id()?,
+                handle: decoder.handle()?,
+            }),
             _ => return Err(WireError::InvalidTag),
         }),
         RESPONSE_TAG_THREAD_EXITED => BrokerResult::ThreadExited,
@@ -528,14 +532,20 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
-        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(ProcessIdentity {
-            process_id: decoder.process_id()?,
-            initial_thread_id: decoder.thread_id()?,
+        RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted(StartedChildProcess {
+            identity: ProcessIdentity {
+                process_id: decoder.process_id()?,
+                initial_thread_id: decoder.thread_id()?,
+            },
+            handle: match decoder.u8()? {
+                0 => None,
+                1 => Some(decoder.handle()?),
+                _ => return Err(WireError::InvalidTag),
+            },
         }),
-        RESPONSE_TAG_CHILD_EXITED => BrokerResult::ChildExited(ChildExit {
-            process_id: decoder.process_id()?,
-            status: decode_process_exit_status(&mut decoder)?,
-        }),
+        RESPONSE_TAG_PROCESS_EXIT_STATUS => {
+            BrokerResult::ProcessExitStatus(decode_process_exit_status(&mut decoder)?)
+        }
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -616,9 +626,6 @@ pub fn encode_notification(notification: BrokerNotification) -> Vec<u8> {
             encoder.handle(notification.handle);
             encoder.u32(notification.readiness.0);
         }
-        BrokerNotification::ChildStateChanged => {
-            encoder.u8(NOTIFICATION_TAG_CHILD_STATE_CHANGED);
-        }
     }
     encoder.finish()
 }
@@ -632,7 +639,6 @@ pub fn decode_notification(frame: &[u8]) -> Result<BrokerNotification, WireError
             handle: decoder.handle()?,
             readiness: ReadinessFlags(decoder.u32()?),
         }),
-        NOTIFICATION_TAG_CHILD_STATE_CHANGED => BrokerNotification::ChildStateChanged,
         _ => return Err(WireError::InvalidTag),
     };
     decoder.finish()?;
@@ -663,8 +669,9 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        CreateThreadRequest, CreateThreadResponse, ProcessIdentity, ProcessStartupDescriptor,
-        StartChildProcessRequest, StartChildProcessSource,
+        ChildProcess, CreateThreadRequest, CreateThreadResponse, ProcessExitStatus,
+        ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
+        StartChildProcessSource, StartedChildProcess,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -1017,8 +1024,7 @@ mod tests {
                 child_process_id: None,
                 source: StartChildProcessSource::Duplicate(sequence(0, 2)),
             }),
-            BrokerOperation::WaitChild(WaitChildTarget::Any),
-            BrokerOperation::WaitChild(WaitChildTarget::Process(process_id(u32::MAX))),
+            BrokerOperation::GetProcessExitStatus(ObjectHandle(u64::MAX)),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1223,7 +1229,10 @@ mod tests {
         let handle = ObjectHandle(13);
         let results = [
             BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id(17))),
-            BrokerResult::CreateThread(CreateThreadResponse::Process(process_id(19))),
+            BrokerResult::CreateThread(CreateThreadResponse::Process(ChildProcess {
+                process_id: process_id(19),
+                handle: ObjectHandle(u64::MAX),
+            })),
             BrokerResult::ThreadExited,
             BrokerResult::ObjectClosed,
             BrokerResult::Readiness(ReadinessFlags::READ),
@@ -1358,26 +1367,23 @@ mod tests {
             BrokerResult::File(FileResponse::Mkdir),
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
-            BrokerResult::ProcessStarted(ProcessIdentity {
-                process_id: process_id(u32::MAX),
-                initial_thread_id: thread_id(u32::MAX - 1),
+            BrokerResult::ProcessStarted(StartedChildProcess {
+                identity: ProcessIdentity {
+                    process_id: process_id(u32::MAX),
+                    initial_thread_id: thread_id(u32::MAX - 1),
+                },
+                handle: Some(ObjectHandle(u64::MAX)),
             }),
-            BrokerResult::ProcessStarted(ProcessIdentity {
-                process_id: process_id(9),
-                initial_thread_id: thread_id(11),
+            BrokerResult::ProcessStarted(StartedChildProcess {
+                identity: ProcessIdentity {
+                    process_id: process_id(9),
+                    initial_thread_id: thread_id(11),
+                },
+                handle: None,
             }),
-            BrokerResult::ChildExited(ChildExit {
-                process_id: process_id(u32::MAX),
-                status: ProcessExitStatus::Exited { code: u32::MAX },
-            }),
-            BrokerResult::ChildExited(ChildExit {
-                process_id: process_id(9),
-                status: ProcessExitStatus::Signaled { signal: 11 },
-            }),
-            BrokerResult::ChildExited(ChildExit {
-                process_id: process_id(9),
-                status: ProcessExitStatus::Unknown,
-            }),
+            BrokerResult::ProcessExitStatus(ProcessExitStatus::Exited { code: u32::MAX }),
+            BrokerResult::ProcessExitStatus(ProcessExitStatus::Signaled { signal: 11 }),
+            BrokerResult::ProcessExitStatus(ProcessExitStatus::Unknown),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
@@ -1428,7 +1434,10 @@ mod tests {
         for process_id in [ProcessId(0), ProcessId(u32::MAX)] {
             let response = BrokerResponse {
                 request_id: TEST_REQUEST_ID,
-                result: BrokerResult::CreateThread(CreateThreadResponse::Process(process_id)),
+                result: BrokerResult::CreateThread(CreateThreadResponse::Process(ChildProcess {
+                    process_id,
+                    handle: ObjectHandle(0),
+                })),
             };
             assert_eq!(
                 decode_response(&encode_response(response.clone())).unwrap(),
@@ -1440,13 +1449,10 @@ mod tests {
     #[test]
     fn notification_codec_round_trips_all_variants() {
         let handle = ObjectHandle(13);
-        let notifications = [
-            BrokerNotification::Readiness(ReadinessNotification {
-                handle,
-                readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
-            }),
-            BrokerNotification::ChildStateChanged,
-        ];
+        let notifications = [BrokerNotification::Readiness(ReadinessNotification {
+            handle,
+            readiness: ReadinessFlags::READ | ReadinessFlags::HANGUP,
+        })];
         let mut maximum_encoded_size = 0;
 
         for notification in notifications {
@@ -2037,10 +2043,6 @@ mod tests {
         trailing.push(0xff);
         assert_eq!(
             decode_notification(&trailing),
-            Err(WireError::TrailingBytes)
-        );
-        assert_eq!(
-            decode_notification(&[NOTIFICATION_TAG_CHILD_STATE_CHANGED, 0]),
             Err(WireError::TrailingBytes)
         );
     }

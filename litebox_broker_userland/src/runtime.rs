@@ -261,7 +261,6 @@ where
             }
         };
     Ok(dispatch_requests(
-        broker.clone(),
         association,
         readiness,
         request_source,
@@ -445,7 +444,6 @@ impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, Memory> {
 /// reactor is currently its production source.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
-    broker: BrokerCore,
     association: BrokerHostAssociation<Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
     mut request_source: RequestSource,
@@ -519,12 +517,10 @@ where
             let response_sink = response_sink.clone();
             let worker_failure_coordinator = Arc::clone(&failure_coordinator);
             let launcher_for_worker = launcher.clone();
-            let broker_for_worker = broker.clone();
             match std::thread::Builder::new()
                 .name(format!("litebox-broker-worker-{worker_id}"))
                 .spawn_scoped(scope, move || {
                     run_worker(
-                        &broker_for_worker,
                         &association,
                         &request_receiver,
                         &response_sink,
@@ -659,7 +655,6 @@ where
 }
 
 fn run_worker<Memory, ResponseSink, Shutdown>(
-    broker: &BrokerCore,
     association: &BrokerHostAssociation<Memory>,
     request_receiver: &Mutex<Receiver<BrokerRequest>>,
     response_sink: &ResponseSink,
@@ -684,14 +679,14 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             association.execute_request_with(
                 request,
-                |process, operation, shared_buffers| {
+                |process, operation, shared_buffers, readiness_sink| {
                     launcher.and_then(|launcher| {
                         handle_process_operation(
-                            broker,
                             launcher,
                             process,
                             operation,
                             shared_buffers,
+                            readiness_sink,
                         )
                     })
                 },
@@ -932,7 +927,6 @@ mod tests {
             outcome_sender
                 .send(
                     dispatch_requests(
-                        broker.clone(),
                         association,
                         readiness,
                         request_source,
