@@ -44,8 +44,9 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, ExitChildProcessRequest, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -502,6 +503,13 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::GetProcessExitStatus(handle) => process
             .process_exit_status(handle)
             .map(BrokerResult::ProcessExitStatus)
+            .map_err(RequestFailure::from),
+        BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
+            child_process_id,
+            exit_status,
+        }) => process
+            .exit_child_process(child_process_id, exit_status)
+            .map(|()| BrokerResult::ProcessExited)
             .map_err(RequestFailure::from),
         BrokerOperation::Event(request) => {
             handle_event_request(process, request).map(BrokerResult::Event)
@@ -1256,6 +1264,7 @@ mod tests {
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
+    use litebox_broker_protocol::process::ProcessExitStatus;
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
@@ -1597,6 +1606,7 @@ mod tests {
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
+        active_request_exits_pending_child_process(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
@@ -2319,6 +2329,42 @@ mod tests {
                 BrokerOperation::CloseObject(ObjectHandle(handle.0 + 1))
             ),
             BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+    }
+
+    fn active_request_exits_pending_child_process(broker: &BrokerCore) {
+        const EXITED: ProcessExitStatus = ProcessExitStatus::Exited { code: 7 };
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let response = handle_test_request(
+            &parent,
+            BrokerOperation::CreateThread(CreateThreadRequest::Process),
+        );
+        let BrokerResult::CreateThread(CreateThreadResponse::Process(child)) = response else {
+            panic!("unexpected child allocation response: {response:?}");
+        };
+        let exit = BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
+            child_process_id: child.identity.process_id,
+            exit_status: EXITED,
+        });
+
+        assert_eq!(
+            handle_test_request(&parent, exit.clone()),
+            BrokerResult::ProcessExited
+        );
+        assert_eq!(
+            handle_test_request(&parent, BrokerOperation::GetProcessExitStatus(child.handle)),
+            BrokerResult::ProcessExitStatus(EXITED)
+        );
+        assert_eq!(
+            handle_test_request(&parent, exit),
+            BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+        assert_eq!(
+            handle_test_request(&parent, BrokerOperation::CloseObject(child.handle)),
+            BrokerResult::ObjectClosed
         );
     }
 

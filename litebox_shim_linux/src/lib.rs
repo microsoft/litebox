@@ -550,8 +550,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let result = self.do_syscall(ctx);
         if self.vfork.borrow().is_some() && result.is_err() {
             // The current constrained vfork scope cannot return an error to a child running in the
-            // parent's runner while leaving the parent suspended. Only a successful exec transfer
-            // can complete the shared-runner window.
+            // parent's runner while leaving the parent suspended. Only child exit or a successful
+            // exec transfer can complete the shared-runner window.
             self.sys_exit_group(127);
             return;
         }
@@ -583,13 +583,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
-        // The constrained vfork child may only inspect its temporary identity or complete the
-        // transfer with execve. The caller terminates the shared runner when this rejection is
+        // The constrained vfork child may only inspect its temporary identity, exit, or complete
+        // the transfer with execve. The caller terminates the shared runner when this rejection is
         // returned.
-        if self.vfork.borrow().is_some()
+        let is_vfork_child = self.vfork.borrow().is_some();
+        if is_vfork_child
             && !matches!(
                 &request,
-                SyscallRequest::Execve { .. }
+                SyscallRequest::Exit { .. }
+                    | SyscallRequest::ExitGroup { .. }
+                    | SyscallRequest::Execve { .. }
                     | SyscallRequest::Getpid
                     | SyscallRequest::Getppid
                     | SyscallRequest::Gettid
@@ -599,6 +602,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         match request {
+            // The vfork child is the only thread of its process, so `exit` also ends the process.
+            SyscallRequest::Exit { status } | SyscallRequest::ExitGroup { status }
+                if is_vfork_child =>
+            {
+                self.exit_vfork_child(status, ctx)
+            }
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
                 Ok(0)

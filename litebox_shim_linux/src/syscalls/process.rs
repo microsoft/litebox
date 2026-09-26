@@ -692,6 +692,42 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Tear down occurs similarly to `sys_exit`.
         self.exit_group(ExitStatus::Exit(status.trunc()));
     }
+
+    /// Ends the constrained `vfork` child with `exit` or `exit_group`.
+    ///
+    /// No runner is launched: the child becomes a zombie reporting `status`, and
+    /// the suspended parent resumes with the child's PID. The child shares the
+    /// parent's thread state, so the parent's `clear_child_tid` and robust
+    /// futex list are left untouched.
+    pub(crate) fn exit_vfork_child(
+        &self,
+        status: i32,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> Result<usize, Errno> {
+        // Like Linux, only the low byte of the status is reported.
+        let code = status.cast_unsigned() & 0xff;
+        self.vfork
+            .borrow()
+            .as_ref()
+            .expect("vfork child exit lost its child")
+            .child
+            .exit(ProcessExitStatus::Exited { code })
+            .map_err(Errno::from)?;
+        Ok(self.resume_vfork_parent(ctx))
+    }
+
+    /// Ends the `vfork` window after the child exits or starts its own runner,
+    /// restoring the parent's context and returning the child's PID to it.
+    fn resume_vfork_parent(&self, ctx: &mut litebox_common_linux::PtRegs) -> usize {
+        let state = self
+            .vfork
+            .borrow_mut()
+            .take()
+            .expect("completed vfork window lost its parent context");
+        self.thread.process.add_child(state.child_pid, state.child);
+        *ctx = state.parent_context;
+        state.child_pid.cast_unsigned() as usize
+    }
 }
 
 /// A descriptor for thread-local storage (TLS).
@@ -762,7 +798,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Only single-threaded processes with default filesystem, signal, resource-limit, alarm, and
     /// transferable descriptor state are admitted. The parent remains suspended until the child
-    /// successfully transfers to a fresh runner through `execve`. The child must not change
+    /// exits or successfully transfers to a fresh runner through `execve`. The child must not change
     /// standard descriptor mappings or flags, or platform-managed architectural state outside
     /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that state.
     #[cfg(target_arch = "x86_64")]
@@ -1873,14 +1909,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .child
                 .start(&payload)
                 .map_err(Errno::from)?;
-            let state = self
-                .vfork
-                .borrow_mut()
-                .take()
-                .expect("successful vfork transfer lost its parent context");
-            self.thread.process.add_child(state.child_pid, state.child);
-            *ctx = state.parent_context;
-            return Ok(state.child_pid.cast_unsigned() as usize);
+            return Ok(self.resume_vfork_parent(ctx));
         }
 
         // After this point, the old program is torn down and failures must terminate the process.

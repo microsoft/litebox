@@ -60,6 +60,12 @@ pub(crate) trait BrokerControl: Send + Sync {
         payload: &[u8],
     ) -> core::result::Result<(), BrokerControlError>;
 
+    fn exit_child_process(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        exit_status: ProcessExitStatus,
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn process_exit_status(
         &self,
         handle: ObjectHandle,
@@ -469,6 +475,14 @@ where
         self.request(|local| {
             local.start_child_process(child_process_id, shared_buffer_lease.sequence(), payload)
         })
+    }
+
+    fn exit_child_process(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        exit_status: ProcessExitStatus,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.exit_child_process(child_process_id, exit_status))
     }
 
     fn process_exit_status(

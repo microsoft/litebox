@@ -18,8 +18,8 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    CreateThreadRequest, CreateThreadResponse, ProcessExitStatus, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, ExitChildProcessRequest, ProcessExitStatus,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -75,6 +75,8 @@ pub enum BrokerOperation {
     ///
     /// The broker returns `WouldBlock` while the process is live.
     GetProcessExitStatus(ObjectHandle),
+    /// Record the exit of one pending child process that never started.
+    ExitChildProcess(ExitChildProcessRequest),
 }
 
 impl BrokerOperation {
@@ -118,6 +120,7 @@ impl BrokerOperation {
             Self::CreateThread(_)
             | Self::ExitThread(_)
             | Self::CloseObject(_)
+            | Self::ExitChildProcess(_)
             | Self::GetProcessExitStatus(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
@@ -260,6 +263,8 @@ pub enum BrokerResult {
     ProcessStarted,
     /// Termination status of a child process.
     ProcessExitStatus(ProcessExitStatus),
+    /// A pending child's exit was recorded.
+    ProcessExited,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
