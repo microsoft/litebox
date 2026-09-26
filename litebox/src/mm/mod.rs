@@ -492,13 +492,13 @@ where
 
     /// Reset pages without removing its mapping.
     ///
-    /// If `anonymous_only` is true and any part of the range is non-anonymous (i.e., file-backed),
+    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
     /// returns `Err(VmemResetError::FileBacked)`.
     ///
-    /// After calling this function, the memory region remains mapped, but its contents are
-    /// discarded. Subsequent accesses to the region will result in repopulating the memory
-    /// contents, either from the underlying mapped file (for file-backed mappings) or as
-    /// zero-filled pages (for anonymous mappings).
+    /// After calling this function, the memory region remains mapped, but its contents are invalidated.
+    /// Subsequent accesses to the region will result in repopulating the memory contents, either from
+    /// the underlying mapped file (for file-backed mappings, which is supported) or as zero-filled pages
+    /// (for anonymous mappings).
     ///
     /// # Safety
     ///

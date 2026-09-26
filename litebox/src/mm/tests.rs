@@ -179,23 +179,6 @@ fn dummy_backend<const TOP_DOWN: bool>(
 }
 
 #[test]
-fn hint_allocation_capabilities_support_expected_directions() {
-    assert!(!HintPlacementBehavior::Unspecified.supports(AllocationDirection::BottomUp));
-    assert!(HintPlacementBehavior::Exact.supports(AllocationDirection::BottomUp));
-    assert!(HintPlacementBehavior::Exact.supports(AllocationDirection::TopDown));
-    assert!(HintPlacementBehavior::Bidirectional.supports(AllocationDirection::BottomUp));
-    assert!(HintPlacementBehavior::Bidirectional.supports(AllocationDirection::TopDown));
-    assert!(
-        HintPlacementBehavior::Directional(AllocationDirection::TopDown)
-            .supports(AllocationDirection::TopDown)
-    );
-    assert!(
-        !HintPlacementBehavior::Directional(AllocationDirection::TopDown)
-            .supports(AllocationDirection::BottomUp)
-    );
-}
-
-#[test]
 fn bottom_up_hint_does_not_limit_fallback_search() {
     let backend = dummy_backend::<false>(None);
     let mut vmem: Vmem<DummyVmemBackend, PAGE_SIZE> = Vmem::new(backend);

@@ -482,7 +482,7 @@ where
     /// Reset pages without removing its mapping (similar to Linux `madvise` with
     /// `MADV_DONTNEED` or `MADV_FREE`).
     ///
-    /// If `anonymous_only` is true and any part of the range is non-anonymous (i.e., file-backed),
+    /// If `anonymous_only` is true and any part of the range is non‑anonymous (i.e., file‑backed),
     /// returns `Err(VmemResetError::FileBacked)`.
     ///
     /// The current implementation effectively re-inserts the mapping with the same
