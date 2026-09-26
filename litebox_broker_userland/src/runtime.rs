@@ -679,15 +679,9 @@ fn run_worker<Memory, ResponseSink, Shutdown>(
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             association.execute_request_with(
                 request,
-                |process, operation, shared_buffers, readiness_sink| {
+                |process, operation, shared_buffers| {
                     launcher.and_then(|launcher| {
-                        handle_process_operation(
-                            launcher,
-                            process,
-                            operation,
-                            shared_buffers,
-                            readiness_sink,
-                        )
+                        handle_process_operation(launcher, process, operation, shared_buffers)
                     })
                 },
                 |response| response_sink.send_response(response),

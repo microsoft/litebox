@@ -200,56 +200,21 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         buffer: SharedBufferSequence,
         bootstrap: &[u8],
     ) -> Result<(), Channel::Error> {
-        let source = self.bootstrap_source(buffer, bootstrap)?;
+        if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+
+        self.write_shared_buffer(buffer, bootstrap);
         match self.request(BrokerOperation::StartChildProcess(
             StartChildProcessRequest {
                 child_process_id,
-                source,
+                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }),
             },
         ))? {
             BrokerResult::ProcessStarted => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
         }
-    }
-
-    /// Creates and starts one child process, returning its parent-owned handle.
-    ///
-    /// This call blocks until the child's broker association is active or
-    /// launch fails. The caller must retain exclusive ownership of the
-    /// bootstrap sequence until this method returns.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the bootstrap length differs from the shared-buffer sequence
-    /// or the broker returns a response for another operation.
-    pub fn create_child_process(
-        &self,
-        buffer: SharedBufferSequence,
-        bootstrap: &[u8],
-    ) -> Result<CreatedProcess, Channel::Error> {
-        let source = self.bootstrap_source(buffer, bootstrap)?;
-        match self.request(BrokerOperation::CreateChildProcess(source))? {
-            BrokerResult::ProcessCreated(created) => Ok(created),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected process-create response: {response:?}")
-            }
-        }
-    }
-
-    fn bootstrap_source(
-        &self,
-        buffer: SharedBufferSequence,
-        bootstrap: &[u8],
-    ) -> Result<StartChildProcessSource, Channel::Error> {
-        if buffer.length() > MAX_PROCESS_BOOTSTRAP_SIZE {
-            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
-        }
-        self.write_shared_buffer(buffer, bootstrap);
-        Ok(StartChildProcessSource::Bootstrap(
-            ProcessStartupDescriptor { buffer },
-        ))
     }
 
     /// Allocates one pending child process and its parent-owned handle.

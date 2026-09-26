@@ -436,7 +436,7 @@ impl BrokerProcess {
     /// The handle publishes readiness through `readiness_sink` once the child
     /// terminates, and keeps the child's exit status available until it
     /// closes. The child is retired if handle creation fails.
-    pub fn create_child_process(
+    fn create_child_process(
         &self,
         readiness_sink: Arc<dyn ReadinessSink>,
     ) -> Result<(Arc<BrokerProcess>, ObjectHandle)> {
