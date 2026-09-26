@@ -23,6 +23,7 @@ const BASE: usize = 0x10000;
 #[derive(Clone, Debug, PartialEq)]
 enum Event {
     Invalidate(u64, usize),
+    Domain(u64),
     Complete,
     Free(u64),
 }
@@ -40,22 +41,25 @@ fn take_events() -> Vec<Event> {
     EVENTS.with_borrow_mut(core::mem::take)
 }
 
-struct RecordingTlb;
+struct RecordingTlb<const OFFSET: u64 = 0>;
 
 // SAFETY: this backend is only paired with tables that are never loaded in CR3.
 // There are no hardware translations; returning models completed invalidation.
-unsafe impl TlbInvalidation for RecordingTlb {
+unsafe impl<const OFFSET: u64> TlbInvalidation for RecordingTlb<OFFSET> {
     fn invalidate(start: Page<Size4KiB>, count: usize) {
+        if OFFSET != 0 {
+            record(Event::Domain(OFFSET));
+        }
         record(Event::Invalidate(start.start_address().as_u64(), count));
         assert!(!FAIL_INVALIDATION.get(), "simulated shootdown failure");
         record(Event::Complete);
     }
 }
 
-struct TestMemory;
+struct TestMemory<const OFFSET: u64 = 0>;
 
-impl MemoryProvider for TestMemory {
-    type Tlb = RecordingTlb;
+impl<const OFFSET: u64> MemoryProvider for TestMemory<OFFSET> {
+    type Tlb = RecordingTlb<OFFSET>;
     const GVA_OFFSET: VirtAddr = VirtAddr::zero();
     const PRIVATE_PTE_MASK: u64 = 0;
 
@@ -84,10 +88,10 @@ impl MemoryProvider for TestMemory {
     }
 
     fn va_to_pa(va: VirtAddr) -> PhysAddr {
-        PhysAddr::new(va.as_u64())
+        PhysAddr::new(va.as_u64() + OFFSET)
     }
     fn pa_to_va(pa: PhysAddr) -> VirtAddr {
-        VirtAddr::new(pa.as_u64())
+        VirtAddr::new(pa.as_u64() - OFFSET)
     }
 }
 
@@ -176,7 +180,7 @@ fn foreign_frame_unmap_invalidates_without_freeing_frames() {
     );
     for frame in frames {
         // SAFETY: invalidation completed, and unmap did not free these frames.
-        unsafe { TestMemory::mem_free_pages(frame as *mut u8, 0) };
+        unsafe { TestMemory::<0>::mem_free_pages(frame as *mut u8, 0) };
     }
 }
 
@@ -202,7 +206,7 @@ fn failed_invalidation_does_not_release_unmapped_frames() {
     // The PTE is gone but its frame was deliberately retained. Only this test
     // can reclaim it without a successful shootdown: no hardware used the table.
     for frame in frames {
-        unsafe { TestMemory::mem_free_pages(frame as *mut u8, 0) };
+        unsafe { TestMemory::<0>::mem_free_pages(frame as *mut u8, 0) };
     }
 }
 
@@ -227,4 +231,80 @@ fn permission_updates_use_the_selected_invalidator() {
         };
         assert!(!flags.contains(PageTableFlags::WRITABLE));
     }
+}
+
+#[test]
+fn managers_and_retained_handles_keep_their_selected_memory_domain() {
+    use crate::{PageTableHandle, PageTableManager, mm::active::ActivePageTable};
+    use alloc::sync::Arc;
+
+    fn exercise<const OFFSET: u64>() {
+        take_events();
+        // SAFETY: host allocations back these software-only tables; neither
+        // manager loads CR3 or exposes its simulated VAs to hardware.
+        let base =
+            unsafe { crate::mm::PageTable::<TestMemory<OFFSET>, PAGE_SIZE>::new_top_level() };
+        let manager = PageTableManager::new(base);
+        let task_id = manager.create_task_page_table().unwrap();
+        let base_handle = PageTableHandle::base(&manager.base_page_table);
+        let task = Arc::clone(manager.task_page_tables.read().get(&task_id).unwrap());
+        assert_ne!(
+            task_id as u64,
+            base_handle.get_physical_frame().start_address().as_u64()
+        );
+        let backing_va = TestMemory::<OFFSET>::pa_to_va(task.get_physical_frame().start_address());
+        assert_eq!(task_id as u64, backing_va.as_u64() + OFFSET);
+
+        let retained = ActivePageTable::new(task_id, Arc::clone(&task));
+        let recovered = retained
+            .get::<crate::mm::PageTable<TestMemory<OFFSET>, PAGE_SIZE>>(task_id)
+            .unwrap();
+        assert!(Arc::ptr_eq(&task, &recovered));
+        // A same-ID request through a different provider must not reinterpret
+        // the table using different translations or a different allocator.
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                retained.get::<crate::mm::PageTable<TestMemory<8192>, PAGE_SIZE>>(task_id);
+            }))
+            .is_err()
+        );
+
+        let handle = PageTableHandle::task(recovered);
+        let range = PageRange::new(BASE, BASE + PAGE_SIZE).unwrap();
+        handle.map_pages(range, VmFlags::VM_READ | VmFlags::VM_WRITE, true);
+        take_events();
+        // SAFETY: fixture-owned, software-only mappings.
+        unsafe {
+            handle.mprotect_pages(range, VmFlags::VM_READ).unwrap();
+        }
+        let mut expected = Vec::new();
+        if OFFSET != 0 {
+            expected.push(Event::Domain(OFFSET));
+        }
+        expected.extend([Event::Invalidate(BASE as u64, 1), Event::Complete]);
+        assert_eq!(take_events(), expected);
+        unsafe {
+            handle.unmap_pages(range, true, true, true).unwrap();
+        }
+        take_events();
+
+        // Same ownership rule used by delete_task_page_table: active/borrowed
+        // tables cannot be unwrapped. Avoid the CR3 check in that method here.
+        let owned = manager.task_page_tables.write().remove(&task_id).unwrap();
+        let owned = Arc::try_unwrap(owned)
+            .err()
+            .expect("live handles retain the table");
+        drop(task);
+        drop(handle);
+        drop(retained);
+        let table = Arc::try_unwrap(owned).unwrap_or_else(|_| panic!("unexpected remaining owner"));
+        drop(table);
+        assert_eq!(take_events(), [Event::Free(backing_va.as_u64())]);
+    }
+
+    // Both providers coexist in one build; cfg(test) does not choose a global
+    // memory backend. Allocation, PA translation, invalidation and destruction
+    // all use the provider selected by each manager.
+    exercise::<0>();
+    exercise::<4096>();
 }

@@ -55,8 +55,9 @@ impl LvbsLinuxKernel {
         #[cfg(not(test))]
         {
             use crate::mm::MemoryProvider;
-            let hypercall =
-                Self::va_to_pa(x86_64::VirtAddr::new(super::hv_hypercall_page_address()));
+            let hypercall = super::memory::LvbsMemory::va_to_pa(x86_64::VirtAddr::new(
+                super::hv_hypercall_page_address(),
+            ));
             exec_ranges.push(hypercall..hypercall + Size4KiB::SIZE);
         }
         let host = HostLvbsInterface {

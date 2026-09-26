@@ -5,15 +5,25 @@
 
 use crate::arch::{PhysAddr, VirtAddr};
 
+pub(crate) mod active;
 pub(crate) mod pgtable;
 pub mod tlb;
+// The foreign-memory VA allocator currently serves only LVBS. Keep its
+// software tests available without enabling the concrete platform.
+#[cfg(any(feature = "lvbs", test))]
 pub(crate) mod vmap;
 
 #[cfg(test)]
 pub mod tests;
 
 /// Memory and translation-coherence resources used by the kernel page tables.
-pub trait MemoryProvider {
+///
+/// A provider type identifies one stable allocation/translation domain. All
+/// tables using it must return frames to the same allocator that supplied them;
+/// changing an allocator or address translation while frames are live is invalid.
+/// Providers are independent of the kernel object so allocation works during
+/// early boot, before a kernel has been constructed.
+pub trait MemoryProvider: Send + Sync + 'static {
     /// Platform-selected synchronous invalidation. No implicit local-only
     /// default: a backend must account for every CPU that can use its mappings.
     type Tlb: tlb::TlbInvalidation;
@@ -65,9 +75,7 @@ pub trait MemoryProvider {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", not(test)))]
-pub type PageTable<const ALIGN: usize> =
-    crate::arch::mm::paging::X64PageTable<'static, crate::host::lvbs::LvbsLinuxKernel, ALIGN>;
-#[cfg(all(target_arch = "x86_64", test))]
-pub type PageTable<const ALIGN: usize> =
-    crate::arch::mm::paging::X64PageTable<'static, crate::host::mock::MockKernel, ALIGN>;
+/// Architecture page table using the memory resources selected by its owner.
+/// Tests and production use the same type; there is no crate-wide backend alias.
+pub type PageTable<M, const ALIGN: usize> =
+    crate::arch::mm::paging::X64PageTable<'static, M, ALIGN>;

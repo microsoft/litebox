@@ -8,6 +8,7 @@
 //! that extension. All assembly offsets are derived from the Rust layout.
 
 use crate::arch::{gdt, mm::PAGE_SIZE};
+use crate::mm::active::ActivePageTable;
 use aligned_vec::avec;
 use alloc::{boxed::Box, sync::Arc};
 use core::cell::{Cell, UnsafeCell};
@@ -35,7 +36,7 @@ pub struct PerCpuVariables {
     _guard_page_1: [u8; PAGE_SIZE],
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<VirtAddr>,
-    active_page_table: UnsafeCell<Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
+    active_page_table: UnsafeCell<Option<ActivePageTable>>,
 }
 
 const _: () = assert!(offset_of!(PerCpuVariables, asm) == 0);
@@ -46,10 +47,10 @@ impl PerCpuVariables {
     ///
     /// # Safety
     /// `ptr` must be aligned, writable, uninitialized storage for `Self`.
-    pub(crate) unsafe fn initialize_at(ptr: *mut Self) {
+    pub unsafe fn initialize_at(ptr: *mut Self) {
         // SAFETY: the caller owns the storage. Zero is valid for all numeric,
         // byte-array and Cell fields. Initialize the Option fields explicitly
-        // rather than relying on the layout of Option<(usize, Arc<_>)>.
+        // rather than relying on the layout of the retained Arc wrapper.
         unsafe {
             ptr.write_bytes(0, 1);
             core::ptr::addr_of_mut!((*ptr).gdt).write(Cell::new(None));
@@ -59,7 +60,7 @@ impl PerCpuVariables {
 
     /// Initialize stack pointers after the per-CPU allocation has reached its
     /// permanent address. Must run before loading the GDT or using these stacks.
-    pub(crate) fn init_stacks(&self) {
+    pub fn init_stacks(&self) {
         const STACK_ALIGNMENT: usize = 16;
         let top = |base: *const u8, len: usize| (base as usize + len - 1) & !(STACK_ALIGNMENT - 1);
         self.asm
@@ -80,7 +81,10 @@ impl PerCpuVariables {
 
     /// Allocate kernel/user XSAVE buffers. The platform must first configure
     /// or verify XCR0 to include [`XSAVE_MASK`]. Run on the full kernel stack.
-    pub(crate) fn allocate_xsave_areas(&self) {
+    ///
+    /// # Panics
+    /// Panics if the buffers were already allocated. Allocation failure aborts.
+    pub fn allocate_xsave_areas(&self) {
         assert_eq!(
             self.asm.kernel_xsave_area_addr.get(),
             0,
@@ -104,24 +108,20 @@ impl PerCpuVariables {
         self.asm.xsave_mask_hi.set((XSAVE_MASK >> 32).trunc());
     }
 
-    pub(crate) fn active_page_table(
+    pub(crate) fn active_page_table<M: crate::mm::MemoryProvider>(
         &self,
         page_table_id: usize,
-    ) -> Option<Arc<crate::mm::PageTable<PAGE_SIZE>>> {
+    ) -> Option<Arc<crate::mm::PageTable<M, PAGE_SIZE>>> {
         // SAFETY: this field is private to the current core.
         unsafe { &*self.active_page_table.get() }
             .as_ref()
-            .filter(|(id, _)| *id == page_table_id)
-            .map(|(_, page_table)| Arc::clone(page_table))
+            .and_then(|active| active.get(page_table_id))
     }
 
     /// # Safety
     /// CR3 must no longer reference the previous table. A new ID must match
     /// CR3. Interrupts must be disabled; do not call from exception context.
-    pub(crate) unsafe fn set_active_page_table(
-        &self,
-        page_table: Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>,
-    ) {
+    pub(crate) unsafe fn set_active_page_table(&self, page_table: Option<ActivePageTable>) {
         // SAFETY: only this core accesses the field, interrupts are disabled,
         // and the update cannot fault.
         unsafe { *self.active_page_table.get() = page_table }
@@ -269,7 +269,10 @@ mod tests {
             cpu.asm.get_exception_stack_ptr(),
             (cpu.exception_stack.as_ptr() as usize + EXCEPTION_STACK_SIZE - 1) & !15
         );
-        assert!(cpu.active_page_table(0).is_none());
+        assert!(
+            cpu.active_page_table::<crate::host::mock::MockMemory>(0)
+                .is_none()
+        );
         assert!(cpu.gdt.get().is_none());
         assert_eq!(cpu.tls.get(), VirtAddr::zero());
         cpu.asm.kernel_xsaved.set(2);

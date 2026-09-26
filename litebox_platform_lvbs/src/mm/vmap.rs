@@ -172,6 +172,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn global_allocator_returns_addresses_inside_the_reserved_window() {
+        assert!(!is_vmap_address(VirtAddr::new(
+            (VMAP_START - PAGE_SIZE) as u64
+        )));
+        assert!(is_vmap_address(VirtAddr::new(VMAP_START as u64)));
+        assert!(!is_vmap_address(VirtAddr::new(VMAP_END as u64)));
+        let allocator = vmap_allocator();
+        let address = allocator.allocate_va(1).unwrap();
+        assert!(is_vmap_address(address));
+        allocator.free_va(address, 1);
+    }
+
+    #[test]
     fn test_allocate_va_range() {
         let mut allocator = VmapRegionAllocatorInner::new();
 

@@ -38,7 +38,10 @@ x86_64 = { version = "0.15.2", default-features = false, features = ["instructio
 libc = "0.2.177"
 
 [features]
-default = []
+default = ["lvbs"]
+# Concrete LVBS boot, Hyper-V/VSM, and platform providers. Debug VM runners can
+# disable defaults and supply their own providers without VTL linker symbols.
+lvbs = []
 linux_syscall = []
 devbox = []
 # Tighten the preemption timer quantum so runaway-TA preemption can be tested

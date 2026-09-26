@@ -3,6 +3,7 @@
 
 //! Concrete platform implementations.
 
+#[cfg(feature = "lvbs")]
 pub mod lvbs;
 
 #[cfg(test)]

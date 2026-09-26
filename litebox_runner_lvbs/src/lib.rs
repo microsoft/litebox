@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+mod allocator;
+
 use alloc::{boxed::Box, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
@@ -23,7 +25,9 @@ use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, L
 use litebox_platform_lvbs::{
     arch::{gdt, instrs::hlt_loop},
     debug_serial_println,
-    host::lvbs::{bootparam::get_vtl1_memory_info, interrupts, per_cpu_variables, timer},
+    host::lvbs::{
+        bootparam::get_vtl1_memory_info, interrupts, memory::LvbsMemory, per_cpu_variables, timer,
+    },
     mm::MemoryProvider,
     mshv::{
         hvcall,
@@ -54,13 +58,14 @@ fn session_manager() -> &'static SessionManager<Platform> {
 /// Seed the initial heap regions so the global allocator has enough memory
 /// for slab-backed allocations (the slab needs >= 2 MB backing pages).
 pub fn seed_initial_heap() {
+    allocator::install();
     let vtl1_base_va = get_memory_base_address();
-    let vtl1_start = Platform::va_to_pa(x86_64::VirtAddr::new(vtl1_base_va));
+    let vtl1_start = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(vtl1_base_va));
 
     let mem_fill_start =
         TruncateExt::<usize>::trunc(vtl1_base_va) + VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE;
     unsafe {
-        Platform::mem_fill_pages(mem_fill_start, VTL1_INIT_HEAP_SIZE);
+        LvbsMemory::mem_fill_pages(mem_fill_start, VTL1_INIT_HEAP_SIZE);
     }
     debug_serial_println!(
         "heap: seed init region (pages {}..+{:#x}): VA {:#x}, size {:#x}",
@@ -73,11 +78,11 @@ pub fn seed_initial_heap() {
     // Add pre-populated region (_heap_start .. end of Phase 1 mapping).
     let heap_va = get_heap_start_address();
     let mem_fill_start: usize = heap_va.trunc();
-    let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
+    let heap_phys = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
     let heap_offset: usize = TruncateExt::<usize>::trunc(heap_phys - vtl1_start.as_u64());
     let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
     unsafe {
-        Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
+        LvbsMemory::mem_fill_pages(mem_fill_start, mem_fill_size);
     }
     debug_serial_println!(
         "heap: add pre-populated region (_heap_start..Phase 1 end): VA {:#x}, size {:#x}",
@@ -124,7 +129,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         // remaining-memory add after `Platform::new()` below.
         let heap_va = get_heap_start_address();
         let mem_fill_start: usize = heap_va.trunc();
-        let heap_phys = Platform::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
+        let heap_phys = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(heap_va)).as_u64();
         let heap_offset: usize = TruncateExt::<usize>::trunc(heap_phys - start);
         let mem_fill_size = VTL1_PRE_POPULATED_MEMORY_SIZE - heap_offset;
 
@@ -132,8 +137,8 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         // code pages executable and everything else NO_EXECUTE (DEP).
         // After two-phase relocation, linker symbols return
         // high-canonical VAs; convert to PA for the page table mapper.
-        let text_phys_start = Platform::va_to_pa(x86_64::VirtAddr::new(get_text_start_address()));
-        let text_phys_end = Platform::va_to_pa(x86_64::VirtAddr::new(get_text_end_address()));
+        let text_phys_start = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(get_text_start_address()));
+        let text_phys_end = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(get_text_end_address()));
 
         // Reclaim .rela.dyn section memory now that relocations have been applied
         // and we are running at high-canonical addresses.
@@ -144,7 +149,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         if rela_size > 0 {
             let rela_virt: usize = rela_va.trunc();
             unsafe {
-                Platform::mem_fill_pages(rela_virt, rela_size);
+                LvbsMemory::mem_fill_pages(rela_virt, rela_size);
             }
             debug_serial_println!(
                 "heap: reclaim .rela.dyn section: VA {:#x}, size {:#x}",
@@ -169,13 +174,13 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             // Reclaim pages 2–12 (PML4, PDPT, PDE, 8 PTE pages)
             let early_pt_pa = vtl1_start + (VTL1_PML4E_PAGE * PAGE_SIZE) as u64;
             let early_pt_start: usize =
-                TruncateExt::<usize>::trunc(Platform::pa_to_va(early_pt_pa).as_u64());
+                TruncateExt::<usize>::trunc(LvbsMemory::pa_to_va(early_pt_pa).as_u64());
             let early_pt_size: usize =
                 (VTL1_PTE_0_PAGE + VSM_SK_PTE_PAGES_COUNT - VTL1_PML4E_PAGE) * PAGE_SIZE;
             // Safety: the early page table frames are no longer referenced
             // (CR3 now points to the Phase 2 base page table).
             unsafe {
-                Platform::mem_fill_pages(early_pt_start, early_pt_size);
+                LvbsMemory::mem_fill_pages(early_pt_start, early_pt_size);
             }
             debug_serial_println!(
                 "heap: reclaim early page table frames (pages {}..{}): VA {:#x}, size {:#x}",
@@ -192,10 +197,10 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             // Reclaim Phase 1 PDPT and PDE pages
             let remap_pt_pa = vtl1_start + (VTL1_REMAP_PDPT_PAGE * PAGE_SIZE) as u64;
             let remap_pt_start: usize =
-                TruncateExt::<usize>::trunc(Platform::pa_to_va(remap_pt_pa).as_u64());
+                TruncateExt::<usize>::trunc(LvbsMemory::pa_to_va(remap_pt_pa).as_u64());
             let remap_pt_size: usize = (VTL1_REMAP_PDE_PAGE - VTL1_REMAP_PDPT_PAGE + 1) * PAGE_SIZE;
             unsafe {
-                Platform::mem_fill_pages(remap_pt_start, remap_pt_size);
+                LvbsMemory::mem_fill_pages(remap_pt_start, remap_pt_size);
             }
             debug_serial_println!(
                 "heap: reclaim Phase 1 remap PT frames (pages {}..{}): VA {:#x}, size {:#x}",
@@ -208,13 +213,13 @@ pub fn init(is_bsp: bool) -> &'static Platform {
 
         // Add the rest of the VTL1 memory to the global allocator once they are mapped to the base page table.
         let mem_fill_start = mem_fill_start + mem_fill_size;
-        let vtl1_base_va = Platform::pa_to_va(vtl1_start).as_u64();
+        let vtl1_base_va = LvbsMemory::pa_to_va(vtl1_start).as_u64();
         let mem_fill_size = TruncateExt::<usize>::trunc(
             size.checked_sub((mem_fill_start as u64) - vtl1_base_va)
                 .expect("remaining VTL1 memory size underflow in init()"),
         );
         unsafe {
-            Platform::mem_fill_pages(mem_fill_start, mem_fill_size);
+            LvbsMemory::mem_fill_pages(mem_fill_start, mem_fill_size);
         }
         debug_serial_println!(
             "heap: add remaining VTL1 memory (post Phase 2): VA {:#x}, size {:#x}",

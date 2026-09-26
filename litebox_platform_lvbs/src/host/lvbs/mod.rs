@@ -14,6 +14,7 @@ pub mod clock;
 pub mod console;
 pub mod interrupts;
 pub mod linux;
+pub mod memory;
 pub mod per_cpu_variables;
 pub mod phys_memory;
 pub mod timer;
@@ -41,71 +42,6 @@ use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;
-
-#[cfg(not(test))]
-mod alloc {
-    use crate::HostInterface;
-
-    const HEAP_ORDER: usize = 25;
-
-    #[global_allocator]
-    static LVBS_ALLOCATOR: litebox::mm::allocator::SafeZoneAllocator<
-        'static,
-        HEAP_ORDER,
-        super::LvbsLinuxKernel,
-    > = litebox::mm::allocator::SafeZoneAllocator::new();
-
-    impl litebox::mm::allocator::MemoryProvider for super::LvbsLinuxKernel {
-        fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
-            super::HostLvbsInterface::alloc(layout)
-        }
-
-        unsafe fn free(addr: usize) {
-            unsafe { super::HostLvbsInterface::free(addr) }
-        }
-    }
-
-    impl crate::mm::MemoryProvider for super::LvbsLinuxKernel {
-        type Tlb = super::tlb::LvbsTlb;
-
-        const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
-        const PRIVATE_PTE_MASK: u64 = 0;
-
-        fn mem_allocate_pages(order: u32) -> Option<*mut u8> {
-            LVBS_ALLOCATOR.allocate_pages(order)
-        }
-
-        unsafe fn mem_free_pages(ptr: *mut u8, order: u32) {
-            unsafe {
-                LVBS_ALLOCATOR.free_pages(ptr, order);
-            }
-        }
-
-        unsafe fn mem_fill_pages(start: usize, size: usize) {
-            unsafe { LVBS_ALLOCATOR.fill_pages(start, size) };
-        }
-    }
-}
-
-#[cfg(test)]
-impl crate::mm::MemoryProvider for LvbsLinuxKernel {
-    type Tlb = crate::host::mock::MockTlb;
-
-    const GVA_OFFSET: x86_64::VirtAddr = x86_64::VirtAddr::new(crate::GVA_OFFSET);
-    const PRIVATE_PTE_MASK: u64 = 0;
-
-    fn mem_allocate_pages(_order: u32) -> Option<*mut u8> {
-        unimplemented!("not used in tests")
-    }
-
-    unsafe fn mem_free_pages(_ptr: *mut u8, _order: u32) {
-        unimplemented!("not used in tests")
-    }
-
-    unsafe fn mem_fill_pages(_start: usize, _size: usize) {
-        unimplemented!("not used in tests")
-    }
-}
 
 impl LvbsLinuxKernel {
     // TODO: replace it with actual implementation (e.g., atomically increment PID/TID)
@@ -278,6 +214,8 @@ pub struct HostLvbsInterface {
 }
 
 impl HostInterface for HostLvbsInterface {
+    type Memory = memory::LvbsMemory;
+
     fn send_ip_packet(_packet: &[u8]) -> Result<usize, Errno> {
         unimplemented!()
     }

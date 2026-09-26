@@ -7,7 +7,7 @@ use crate::{
     arch::instrs::{rdmsr, wrmsr},
     debug_serial_println,
     host::lvbs::{
-        LvbsLinuxKernel, hv_hypercall_page_address, per_cpu_variables::with_per_cpu_variables,
+        hv_hypercall_page_address, memory::LvbsMemory, per_cpu_variables::with_per_cpu_variables,
     },
     mm::MemoryProvider,
     mshv::{
@@ -79,7 +79,7 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
     debug_serial_println!("HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
     with_per_cpu_variables(|per_cpu_variables| {
-        let vp_assist_gpa = LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(
+        let vp_assist_gpa = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(
             per_cpu_variables.hv_vp_assist_page_as_u64(),
         ))
         .as_u64();
@@ -119,7 +119,7 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
     // because it reads a linker symbol. At this point two-phase relocation is complete, so it
     // returns a VTL1 kernel VA.
     let hvcall_gpa =
-        LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(hv_hypercall_page_address())).as_u64();
+        LvbsMemory::va_to_pa(x86_64::VirtAddr::new(hv_hypercall_page_address())).as_u64();
     wrmsr(
         HV_X64_MSR_HYPERCALL,
         hvcall_gpa | u64::from(HV_X64_MSR_HYPERCALL_ENABLE),
@@ -129,7 +129,7 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
     }
 
     with_per_cpu_variables(|per_cpu_variables| {
-        let simp_gpa = LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(
+        let simp_gpa = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(
             per_cpu_variables.hv_simp_page_as_u64(),
         ))
         .as_u64();
@@ -184,7 +184,7 @@ fn ptr_to_gpa(ptr: *const core::ffi::c_void) -> u64 {
     if va == 0 {
         0
     } else {
-        LvbsLinuxKernel::va_to_pa(x86_64::VirtAddr::new(va)).as_u64()
+        LvbsMemory::va_to_pa(x86_64::VirtAddr::new(va)).as_u64()
     }
 }
 

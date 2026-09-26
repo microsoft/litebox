@@ -11,6 +11,9 @@ pub struct MockHostInterface {}
 
 pub type MockKernel = crate::LinuxKernel<MockHostInterface>;
 
+/// Memory backing for the software-only mock kernel.
+pub struct MockMemory;
+
 /// Invalidator for test-only page tables that are never installed in CR3.
 pub struct MockTlb;
 
@@ -34,6 +37,8 @@ macro_rules! mock_log_println {
 }
 
 impl HostInterface for MockHostInterface {
+    type Memory = MockMemory;
+
     fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         todo!()
     }

@@ -616,6 +616,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     /// # Behavior
     /// - Any existing mapping is treated as an error
     /// - On error, all pages mapped by this call are unmapped (atomic)
+    #[cfg(feature = "lvbs")]
     pub(crate) fn map_non_contiguous_phys_frames(
         &self,
         frames: &[PhysFrame<Size4KiB>],
@@ -690,6 +691,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     ///
     /// Note: The caller must already hold the page table lock (`self.inner`).
     /// This function accepts the locked `MappedPageTable` directly.
+    #[cfg(feature = "lvbs")]
     fn rollback_mapped_pages(
         inner: &mut MappedPageTable<'_, FrameMapping<M>>,
         pages: x86_64::structures::paging::page::PageRangeInclusive<Size4KiB>,

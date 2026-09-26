@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
-litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false }
+litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false, features = ["lvbs"] }
 litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_common_lvbs = { path = "../litebox_common_lvbs/", version = "0.1.0" }

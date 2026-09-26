@@ -36,6 +36,7 @@ pub mod console;
 pub mod execution;
 pub mod host;
 pub mod mm;
+#[cfg(feature = "lvbs")]
 pub mod mshv;
 pub mod per_cpu_variables;
 
@@ -92,10 +93,12 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 pub const GVA_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
 /// Start of the vmap virtual address region.
+#[cfg(any(feature = "lvbs", test))]
 pub(crate) const VMAP_START: usize = 0xFFFF_C100_0000_0000;
 
 /// End of the vmap virtual address region (exclusive).
 /// Provides 32 TiB of virtual address space for vmap allocations.
+#[cfg(any(feature = "lvbs", test))]
 pub(crate) const VMAP_END: usize = 0xFFFF_E0FF_FFFF_F000;
 
 /// Offset added to any physical address to obtain the corresponding
@@ -116,27 +119,27 @@ const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
 const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
 
 /// Provide access to a page table
-pub struct PageTableHandle<'a>(PageTableHandleInner<'a>);
+pub struct PageTableHandle<'a, M: mm::MemoryProvider>(PageTableHandleInner<'a, M>);
 
-enum PageTableHandleInner<'a> {
-    Base(&'a mm::PageTable<PAGE_SIZE>),
-    Task(Arc<mm::PageTable<PAGE_SIZE>>),
+enum PageTableHandleInner<'a, M: mm::MemoryProvider> {
+    Base(&'a mm::PageTable<M, PAGE_SIZE>),
+    Task(Arc<mm::PageTable<M, PAGE_SIZE>>),
 }
 
-impl<'a> PageTableHandle<'a> {
+impl<'a, M: mm::MemoryProvider> PageTableHandle<'a, M> {
     #[inline]
-    fn base(page_table: &'a mm::PageTable<PAGE_SIZE>) -> Self {
+    fn base(page_table: &'a mm::PageTable<M, PAGE_SIZE>) -> Self {
         Self(PageTableHandleInner::Base(page_table))
     }
 
     #[inline]
-    fn task(page_table: Arc<mm::PageTable<PAGE_SIZE>>) -> Self {
+    fn task(page_table: Arc<mm::PageTable<M, PAGE_SIZE>>) -> Self {
         Self(PageTableHandleInner::Task(page_table))
     }
 }
 
-impl core::ops::Deref for PageTableHandle<'_> {
-    type Target = mm::PageTable<PAGE_SIZE>;
+impl<M: mm::MemoryProvider> core::ops::Deref for PageTableHandle<'_, M> {
+    type Target = mm::PageTable<M, PAGE_SIZE>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
@@ -164,23 +167,23 @@ impl core::ops::Deref for PageTableHandle<'_> {
 ///
 /// Future work could implement KPTI-style isolation to reduce the kernel attack surface
 /// exposed to user TAs, mitigating potential side-channel attacks.
-pub struct PageTableManager {
-    /// The base page table, containing only VTL1 kernel mappings (no user-space).
-    base_page_table: mm::PageTable<PAGE_SIZE>,
+pub struct PageTableManager<M: mm::MemoryProvider> {
+    /// The base page table, containing only kernel mappings (no user-space).
+    base_page_table: mm::PageTable<M, PAGE_SIZE>,
     /// Cached physical frame of the base page table (for fast CR3 comparison).
     base_page_table_frame: PhysFrame<Size4KiB>,
     /// Task page tables keyed by their P4 frame start address (the page table ID).
-    task_page_tables: spin::RwLock<HashMap<usize, Arc<mm::PageTable<PAGE_SIZE>>>>,
+    task_page_tables: spin::RwLock<HashMap<usize, Arc<mm::PageTable<M, PAGE_SIZE>>>>,
 }
 
-impl PageTableManager {
+impl<M: mm::MemoryProvider> PageTableManager<M> {
     /// The minimum virtual address for user-space allocations.
     pub const USER_ADDR_MIN: usize = USER_ADDR_MIN;
     /// The maximum virtual address (exclusive) for user-space allocations.
     pub const USER_ADDR_MAX: usize = USER_ADDR_MAX;
 
     /// Creates a new page table manager with the given base page table.
-    fn new(base_pt: mm::PageTable<PAGE_SIZE>) -> Self {
+    fn new(base_pt: mm::PageTable<M, PAGE_SIZE>) -> Self {
         let base_frame = base_pt.get_physical_frame();
         Self {
             base_page_table: base_pt,
@@ -198,7 +201,7 @@ impl PageTableManager {
     ///
     /// Panics if CR3 does not match the current core's retained page table.
     #[inline]
-    pub fn current_page_table(&self) -> PageTableHandle<'_> {
+    pub fn current_page_table(&self) -> PageTableHandle<'_, M> {
         let (cr3_frame, _) = x86_64::registers::control::Cr3::read();
 
         if self.base_page_table_frame == cr3_frame {
@@ -206,7 +209,7 @@ impl PageTableManager {
         }
 
         let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
-        if let Some(pt) = with_per_cpu_variables(|pcv| pcv.active_page_table(cr3_id)) {
+        if let Some(pt) = with_per_cpu_variables(|pcv| pcv.active_page_table::<M>(cr3_id)) {
             return PageTableHandle::task(pt);
         }
 
@@ -296,7 +299,11 @@ impl PageTableManager {
             pt.load();
             with_per_cpu_variables(|pcv| {
                 // Safety: CR3 now references `pt` and interrupts are disabled.
-                unsafe { pcv.set_active_page_table(Some((task_pt_id, pt))) }
+                unsafe {
+                    pcv.set_active_page_table(Some(mm::active::ActivePageTable::new(
+                        task_pt_id, pt,
+                    )));
+                }
             });
         });
         Ok(())
@@ -314,7 +321,7 @@ impl PageTableManager {
     /// The ID of the newly created task page table (its P4 frame start address),
     /// or `Err(Errno::ENOMEM)` if the P4 frame allocation fails.
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
-        let pt = unsafe { mm::PageTable::new_top_level() };
+        let pt = unsafe { mm::PageTable::<M, PAGE_SIZE>::new_top_level() };
 
         // Share the base page table's kernel intermediate tables (kernel PML4
         // slots only). This is safe because the kernel mapping structure is
@@ -394,7 +401,7 @@ impl PageTableManager {
 /// It requires a host that implements the [`HostInterface`] trait.
 pub struct LinuxKernel<Host: HostInterface> {
     host: Host,
-    page_table_manager: PageTableManager,
+    page_table_manager: PageTableManager<Host::Memory>,
 }
 
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
@@ -526,12 +533,17 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// must cover all live code, data, stacks and allocator memory at
     /// `PA + KERNEL_OFFSET`. `exec_ranges` must include every required code
     /// page. The active boot mappings must permit constructing the new tables.
-    pub(crate) unsafe fn from_memory(
+    /// The memory provider's translations must remain stable for every live
+    /// frame, and its allocator binding must be installed before this call.
+    ///
+    /// # Panics
+    /// Panics if page-table allocation or mapping fails, or DEP is unavailable.
+    pub unsafe fn from_memory(
         host: Host,
         memory: PhysFrameRange<Size4KiB>,
         exec_ranges: &[core::ops::Range<x86_64::PhysAddr>],
     ) -> &'static Self {
-        let base_pt = unsafe { mm::PageTable::new_top_level() };
+        let base_pt = unsafe { mm::PageTable::<Host::Memory, PAGE_SIZE>::new_top_level() };
         if base_pt
             .map_phys_frame_range(
                 memory,
@@ -632,7 +644,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     }
 
     /// Returns a reference to the page table manager.
-    pub fn page_table_manager(&self) -> &PageTableManager {
+    pub fn page_table_manager(&self) -> &PageTableManager<Host::Memory> {
         &self.page_table_manager
     }
 
@@ -764,6 +776,10 @@ impl<Host: HostInterface> IPInterfaceProvider for LinuxKernel<Host> {
 
 /// Platform-Host Interface
 pub trait HostInterface: 'static {
+    /// Page allocation, address translation, and TLB completion for this host.
+    /// The same provider owns base and task tables for the kernel's lifetime.
+    type Memory: mm::MemoryProvider;
+
     /// Page allocation from host.
     ///
     /// It can return more than requested size. On success, it returns the start address
@@ -926,7 +942,7 @@ impl<Host: HostInterface> litebox::mm::vmem::VmemPageFaultHandler for LinuxKerne
     }
 
     fn access_error(error_code: u64, flags: litebox::mm::vmem::VmFlags) -> bool {
-        mm::PageTable::<PAGE_SIZE>::access_error(error_code, flags)
+        mm::PageTable::<Host::Memory, PAGE_SIZE>::access_error(error_code, flags)
     }
 }
 

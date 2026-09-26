@@ -25,7 +25,7 @@ use crate::{
         VirtAddr,
         mm::paging::{X64PageTable, vmflags_to_pteflags},
     },
-    host::mock::{MockHostInterface, MockKernel},
+    host::mock::{MockHostInterface, MockKernel, MockMemory},
     mm::{MemoryProvider, pgtable::PageTableAllocator},
 };
 
@@ -33,11 +33,11 @@ use super::pgtable::PageTableImpl;
 
 const MAX_ORDER: usize = 23;
 
-static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockKernel> = SafeZoneAllocator::new();
+static ALLOCATOR: SafeZoneAllocator<'static, MAX_ORDER, MockMemory> = SafeZoneAllocator::new();
 /// const Array for VA to PA mapping
 static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::new_const());
 
-impl litebox::mm::allocator::MemoryProvider for MockKernel {
+impl litebox::mm::allocator::MemoryProvider for MockMemory {
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         let mut mapping = MAPPING.lock();
         let (start, len) = MockHostInterface::alloc(layout)?;
@@ -58,7 +58,7 @@ impl litebox::mm::allocator::MemoryProvider for MockKernel {
     }
 }
 
-impl super::MemoryProvider for MockKernel {
+impl super::MemoryProvider for MockMemory {
     type Tlb = crate::host::mock::MockTlb;
 
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
@@ -99,10 +99,10 @@ impl super::MemoryProvider for MockKernel {
 #[ignore = "test code is not ready"]
 #[test]
 fn test_buddy() {
-    let ptr = MockKernel::mem_allocate_pages(1);
+    let ptr = MockMemory::mem_allocate_pages(1);
     assert!(ptr.is_some_and(|p| p as usize != 0));
     unsafe {
-        MockKernel::mem_free_pages(ptr.unwrap(), 1);
+        MockMemory::mem_free_pages(ptr.unwrap(), 1);
     }
 }
 
@@ -120,7 +120,7 @@ fn test_slab() {
 }
 
 fn check_flags(
-    pgtable: &X64PageTable<'_, MockKernel, PAGE_SIZE>,
+    pgtable: &X64PageTable<'_, MockMemory, PAGE_SIZE>,
     addr: usize,
     flags: PageTableFlags,
 ) {
@@ -141,9 +141,9 @@ fn check_flags(
 fn get_test_pgtable<'a>(
     range: PageRange<PAGE_SIZE>,
     fault_flags: PageTableFlags,
-) -> X64PageTable<'a, MockKernel, PAGE_SIZE> {
-    let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
-    let pgtable = unsafe { X64PageTable::<MockKernel, PAGE_SIZE>::init(p4.start_address()) };
+) -> X64PageTable<'a, MockMemory, PAGE_SIZE> {
+    let p4 = PageTableAllocator::<MockMemory>::allocate_frame(true).unwrap();
+    let pgtable = unsafe { X64PageTable::<MockMemory, PAGE_SIZE>::init(p4.start_address()) };
 
     for page in range {
         unsafe {
