@@ -17,46 +17,6 @@ pub trait PageReservation {
     fn range(&self) -> Range<usize>;
 }
 
-/// Define an opaque page-reservation handle with a private constructor.
-#[macro_export]
-macro_rules! define_page_reservation {
-    ($name:ident) => {
-        #[doc(hidden)]
-        pub struct $name<const ALIGN: usize> {
-            range: ::core::ops::Range<usize>,
-        }
-
-        impl<const ALIGN: usize> $name<ALIGN> {
-            unsafe fn new(range: ::core::ops::Range<usize>) -> Self {
-                assert!(!range.is_empty());
-                assert!(range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN));
-                Self { range }
-            }
-        }
-
-        impl<const ALIGN: usize> $crate::platform::page_mgmt::PageReservation for $name<ALIGN> {
-            fn range(&self) -> ::core::ops::Range<usize> {
-                self.range.clone()
-            }
-        }
-
-        // Reservation handles must remain non-Clone and non-Copy to preserve exclusive ownership.
-        // The inferred marker below resolves to `()` only in that case; either trait adds another
-        // matching implementation, making trait selection ambiguous and compilation fail.
-        const _: fn() = || {
-            trait AmbiguousIfCloneOrCopy<Marker> {
-                fn assert_not_impl() {}
-            }
-            struct Invalid;
-            impl<T: ?Sized> AmbiguousIfCloneOrCopy<()> for T {}
-            impl<T: ?Sized + Clone> AmbiguousIfCloneOrCopy<Invalid> for T {}
-            impl<T: ?Sized + Copy> AmbiguousIfCloneOrCopy<(Invalid, Invalid)> for T {}
-
-            let _ = <$name<4096> as AmbiguousIfCloneOrCopy<_>>::assert_not_impl;
-        };
-    };
-}
-
 /// Storage for reservations indexed by their starting address.
 pub trait ReservationStore {
     /// Reservation value retained by the store.

@@ -6,7 +6,7 @@ use super::{
     MemoryRegionPermissions, PrefetchVirtualMemory, UserMutPtr, VirtualAlloc2, VirtualFree,
     VirtualProtect, Win32_Memory, WindowsUserland, c_void,
 };
-use litebox::mm::vmem::TrackedReservations;
+use litebox::platform::common_providers::reservations::TrackedReservations;
 use litebox::platform::page_mgmt::{PageReservation as _, ReservationStore as _};
 
 litebox::define_page_reservation!(WindowsUserlandReservation);

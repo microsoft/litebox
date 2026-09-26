@@ -7,7 +7,7 @@
 
 use core::ops::Range;
 
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
@@ -16,91 +16,6 @@ use crate::platform::RawConstPointer;
 use crate::platform::page_mgmt::AllocationError;
 use crate::platform::page_mgmt::FixedAddressBehavior;
 use crate::platform::page_mgmt::MemoryRegionPermissions;
-use crate::platform::page_mgmt::{PageReservation, ReservationStore};
-
-/// Reservations indexed by their starting address.
-pub struct TrackedReservations<Reservation>(BTreeMap<usize, Reservation>);
-
-impl<Reservation> Default for TrackedReservations<Reservation> {
-    fn default() -> Self {
-        Self(BTreeMap::new())
-    }
-}
-
-impl<Reservation: PageReservation> TrackedReservations<Reservation> {
-    /// Snapshot a range by reservation boundaries; `None` denotes an unreserved gap.
-    pub fn segments(&self, range: Range<usize>) -> Vec<(Range<usize>, Option<usize>)> {
-        let mut segments = Vec::new();
-        if range.is_empty() {
-            return segments;
-        }
-        let mut cursor = range.start;
-        for (base, reservation) in self.overlapping(range.clone()) {
-            let extent = reservation.range();
-            if cursor < extent.start {
-                segments.push((cursor..extent.start, None));
-                cursor = extent.start;
-            }
-            let end = extent.end.min(range.end);
-            segments.push((cursor..end, Some(base)));
-            cursor = end;
-        }
-        if cursor < range.end {
-            segments.push((cursor..range.end, None));
-        }
-        segments
-    }
-}
-
-impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Reservation> {
-    type Reservation = Reservation;
-
-    fn insert(&mut self, base: usize, reservation: Reservation) -> Option<Reservation> {
-        let replaced = self.0.insert(base, reservation);
-        debug_assert!(
-            replaced.is_none(),
-            "reservation already exists at base {base:#x}"
-        );
-        replaced
-    }
-
-    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Reservation)> {
-        self.0.iter()
-    }
-
-    fn overlapping(
-        &self,
-        range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Reservation)> {
-        let first = self
-            .0
-            .range(..=range.start)
-            .next_back()
-            .filter(|(_, reservation)| reservation.range().end > range.start)
-            .map_or(range.start, |(&base, _)| base);
-        self.0
-            .range(first..range.end)
-            .filter(move |(_, reservation)| {
-                !range.is_empty() && reservation.range().end > range.start
-            })
-            .map(|(&base, reservation)| (base, reservation))
-    }
-
-    fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Reservation> {
-        let first = self
-            .0
-            .range(..=range.start)
-            .next_back()
-            .filter(|(_, reservation)| reservation.range().end > range.start)
-            .map_or(range.start, |(&base, _)| base);
-        self.0
-            .extract_if(first..range.end, |_, reservation| {
-                !range.is_empty() && reservation.range().end > range.start
-            })
-            .map(|(_, reservation)| reservation)
-            .collect()
-    }
-}
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
