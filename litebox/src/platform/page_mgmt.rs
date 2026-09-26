@@ -3,11 +3,40 @@
 
 //! Page-management related types and traits
 
+use alloc::vec::Vec;
+
 use crate::platform::{RawConstPointer as _, RawMutPointer as _};
 
 use super::RawPointerProvider;
 use core::ops::Range;
 use thiserror::Error;
+
+/// Exclusive ownership of a reserved virtual-address extent.
+pub trait PageReservation {
+    /// Return the owned address range.
+    fn range(&self) -> Range<usize>;
+}
+
+/// Storage for reservations indexed by their starting address.
+pub trait ReservationStore {
+    /// Reservation value retained by the store.
+    type Reservation: PageReservation;
+
+    /// Insert a reservation at `base`.
+    fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
+
+    /// Iterate over reservation bases and values in ascending address order.
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Self::Reservation)>;
+
+    /// Iterate over every reservation overlapping `range` in ascending address order.
+    fn overlapping(
+        &self,
+        range: Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)>;
+
+    /// Remove and return every reservation overlapping `range` in ascending address order.
+    fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Self::Reservation>;
+}
 
 bitflags::bitflags! {
     /// Permissions for a memory region
