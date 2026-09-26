@@ -1,10 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Experimental QEMU runner policy. Intentionally UP, no scheduler, no device
-//! interrupts, no services yet. Boot checks run in ring 0, followed by finite
-//! ring-3 payloads in `user_smoke` using the shared execution machinery.
+//! Experimental QEMU runner policy. Intentionally UP, no scheduler or device
+//! interrupts. Boot checks and finite ring-3 payloads precede real OP-TEE TA
+//! lifecycle tests. Service transport and arbitrary TA loading are not provided.
 
+mod optee_platform;
+mod optee_test;
 mod user_smoke;
 
 use alloc::{boxed::Box, vec::Vec};
@@ -315,6 +317,7 @@ extern "C" fn kernel_main(ram_start: u64, ram_end: u64) -> ! {
     serial_println!(console; "QEMU-BOOT: shared kernel initialized");
     smoke(platform);
     user_smoke::run(platform);
+    optee_test::run(platform);
     serial_println!(console; "QEMU-BOOT: PASS");
     exit(true)
 }

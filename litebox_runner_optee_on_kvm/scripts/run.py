@@ -3,7 +3,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT license.
 
-"""Build and smoke-test the PVH debugging runner (no OP-TEE dispatch yet).
+"""Build and test OP-TEE TA lifecycles plus shared kernel smoke tests in QEMU.
 
 Default: portable TCG, 128 MiB, one CPU. KVM is opt-in and requires /dev/kvm
 access; there is no silent fallback. The script requires both the guest PASS
@@ -59,7 +59,8 @@ def run_guest(args, image, memory, cpus=1, initrd=None, expected=None):
     ]
     if initrd:
         command.extend(["-initrd", str(initrd)])
-    print(f"Running {args.accel}, {memory} MiB, {cpus} CPU(s)", flush=True)
+    expectation = f"REJECT ({expected})" if expected else "OP-TEE + kernel PASS"
+    print(f"Running {args.accel}, {memory} MiB, {cpus} CPU(s), initrd={bool(initrd)}; expect {expectation}", flush=True)
     try:
         result = subprocess.run(command, cwd=ROOT, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, timeout=args.timeout)
@@ -75,14 +76,28 @@ def run_guest(args, image, memory, cpus=1, initrd=None, expected=None):
                    "QEMU-BOOT: allocation paging protection fault-recovery OK",
                    "QEMU-USER: syscall reentry registers XSAVE OK",
                    "QEMU-USER: faults isolation teardown OK",
+                   "OPTEE-TEST: hello PASS",
+                   "OPTEE-TEST: hello3seg PASS",
+                   "OPTEE-TEST: PASS",
                    "QEMU-BOOT: PASS"]
+        for ta in ["hello", "hello3seg"]:
+            markers.extend([
+                f"OPTEE-TEST: {ta} ldelf OK syscalls=",
+                f"OPTEE-TEST: {ta} open-session OK",
+                f"OPTEE-TEST: {ta} invoke cmd=0 input=100 output=101 OK",
+                f"OPTEE-TEST: {ta} invoke cmd=1 input=200 output=199 OK",
+                f"OPTEE-TEST: {ta} invoke cmd=0 input=41 output=42 OK",
+                f"OPTEE-TEST: {ta} invalid-command rejected OK",
+                f"OPTEE-TEST: {ta} close-session OK syscalls=",
+            ])
         ok = (result.returncode == 33 and all(m in result.stdout for m in markers)
               and "QEMU-BOOT: FAIL" not in result.stdout)
     else:
         ok = (result.returncode == 35 and "QEMU-BOOT: FAIL" in result.stdout
               and expected in result.stdout and "QEMU-BOOT: PASS" not in result.stdout)
     if not ok:
-        raise RuntimeError(f"unexpected QEMU result: status={result.returncode}, expected={expected or 'PASS'}")
+        raise RuntimeError(f"unexpected QEMU result: status={result.returncode}, expected={expected or 'OP-TEE PASS'}")
+    print(f"Verified {expectation}; guest exit={result.returncode}", flush=True)
 
 
 def main():

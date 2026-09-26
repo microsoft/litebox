@@ -8,6 +8,9 @@ publish = false
 arrayvec = { version = "0.7.6", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
+litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
+litebox_shim_optee = { version = "0.1.0", path = "../litebox_shim_optee" }
+zerocopy = { version = "0.8", default-features = false }
 litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false }
 spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "once"] }
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }

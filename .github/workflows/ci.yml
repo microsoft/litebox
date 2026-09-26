@@ -160,7 +160,7 @@ jobs:
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
 
   qemu_guest_boot:
-    name: QEMU guest-kernel smoke test (TCG)
+    name: OP-TEE TA lifecycle and guest-kernel tests (QEMU TCG)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -175,12 +175,17 @@ jobs:
       - name: Host tests and lint
         run: |
           cargo test --locked -p litebox_runner_optee_on_kvm --lib
+          python3 -m unittest discover -s litebox_runner_optee_on_kvm/scripts -p 'test_*.py'
           cargo clippy --locked -p litebox_runner_optee_on_kvm --all-targets -- -D warnings
           cargo +nightly-2025-12-31 clippy --locked -p litebox_runner_optee_on_kvm --bin litebox_runner_optee_on_kvm --target litebox_runner_optee_on_kvm/x86_64_kvm.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem -- -D warnings
       - name: Confirm guest no_std with its SSE-capable custom target
         run: cargo +nightly-2025-12-31 build --locked -p litebox_runner_optee_on_kvm --bin litebox_runner_optee_on_kvm --target litebox_runner_optee_on_kvm/x86_64_kvm.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
-      - name: Boot and validate shared kernel paths without /dev/kvm
+      - name: Execute real OP-TEE TAs in debug and release (TCG)
         run: |
+          # run.py requires ldelf, OpenSession, verified InvokeCommand outputs,
+          # CloseSession and teardown for BOTH hello TA ELF fixtures. Kernel
+          # smoke markers alone cannot pass this job. Host timeout is mandatory
+          # because this finite-workload debugging runner has no scheduler.
           python3 litebox_runner_optee_on_kvm/scripts/run.py --negative-tests
           python3 litebox_runner_optee_on_kvm/scripts/run.py --release --memory 64 --negative-tests
 
