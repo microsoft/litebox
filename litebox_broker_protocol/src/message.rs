@@ -18,8 +18,8 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    CreateThreadRequest, CreateThreadResponse, ProcessExitStatus, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildProcessSource, StartedProcess,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, ProcessExitStatus,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -68,7 +68,9 @@ pub enum BrokerOperation {
     Stdio(StdioRequest),
     /// File request family.
     File(FileRequest),
-    /// Start one child process.
+    /// Create and start one child process.
+    CreateChildProcess(StartChildProcessSource),
+    /// Start one pending child process.
     StartChildProcess(StartChildProcessRequest),
     /// Read a process's termination status through a process handle without
     /// blocking.
@@ -108,6 +110,10 @@ impl BrokerOperation {
                 | FileRequest::Unlink(UnlinkFileRequest { path: buffer, .. })
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
+            )
+            | Self::CreateChildProcess(
+                StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer, .. })
+                | StartChildProcessSource::Duplicate(buffer),
             )
             | Self::StartChildProcess(StartChildProcessRequest {
                 source:
@@ -256,8 +262,10 @@ pub enum BrokerResult {
     Stdio(StdioResponse),
     /// File response family.
     File(FileResponse),
-    /// A child established its broker association.
-    ProcessStarted(StartedProcess),
+    /// A child was created and established its broker association.
+    ProcessCreated(CreatedProcess),
+    /// A pending child established its broker association.
+    ProcessStarted,
     /// Termination status of a child process.
     ProcessExitStatus(ProcessExitStatus),
     /// Operation failed with an ABI-neutral broker error.
