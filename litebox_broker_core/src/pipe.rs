@@ -73,6 +73,15 @@ pub fn write(process: &BrokerProcess, handle: ObjectHandle, data: &[u8]) -> Resu
     object.as_pipe()?.write(data)
 }
 
+impl ObjectEntry {
+    fn as_pipe(&self) -> Result<&PipeObject> {
+        match self {
+            Self::Pipe(pipe) => Ok(pipe),
+            _ => Err(BrokerError::InvalidRights),
+        }
+    }
+}
+
 pub(crate) struct PipeObject {
     state: Arc<RwLock<PipeState>>,
     endpoint: PipeEndpoint,

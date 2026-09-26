@@ -41,6 +41,15 @@ impl File {
     }
 }
 
+impl ObjectEntry {
+    fn as_file(&self) -> Result<&File> {
+        match self {
+            Self::File(file) => Ok(file),
+            _ => Err(BrokerError::InvalidRights),
+        }
+    }
+}
+
 mod private {
     use super::{
         BrokerError, BrokerProcess, File, FileAccessMode, FileDirectoryEntry, FileMode,

@@ -38,6 +38,15 @@ pub fn consume(
     object.as_event_mut()?.consume(mode)
 }
 
+impl ObjectEntry {
+    fn as_event_mut(&mut self) -> Result<&mut EventObject> {
+        match self {
+            Self::Event(event) => Ok(event),
+            _ => Err(BrokerError::InvalidRights),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EventObject {
     count: u64,

@@ -86,30 +86,10 @@ pub(crate) enum ObjectEntry {
     Process(ProcessObject),
 }
 
-// Operations for one object kind use these accessors, so adding a kind does
-// not touch them. Only operations that depend on every kind match exhaustively.
+// Each object kind's module defines its own accessor in an `impl ObjectEntry`
+// block, so adding a kind does not touch other kinds' operations. Only
+// operations that depend on every kind match exhaustively here.
 impl ObjectEntry {
-    pub(crate) fn as_event_mut(&mut self) -> Result<&mut EventObject> {
-        match self {
-            Self::Event(event) => Ok(event),
-            _ => Err(BrokerError::InvalidRights),
-        }
-    }
-
-    pub(crate) fn as_file(&self) -> Result<&File> {
-        match self {
-            Self::File(file) => Ok(file),
-            _ => Err(BrokerError::InvalidRights),
-        }
-    }
-
-    pub(crate) fn as_pipe(&self) -> Result<&PipeObject> {
-        match self {
-            Self::Pipe(pipe) => Ok(pipe),
-            _ => Err(BrokerError::InvalidRights),
-        }
-    }
-
     fn as_process(&self) -> Result<&ProcessObject> {
         match self {
             Self::Process(process) => Ok(process),
