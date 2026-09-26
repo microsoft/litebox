@@ -60,14 +60,7 @@ pub fn read(process: &BrokerProcess, handle: ObjectHandle, length: u32) -> Resul
     }
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
-        ObjectEntry::Event(_)
-        | ObjectEntry::File(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_pipe()?.read(length as usize)
 }
 
 /// Writes bytes to a broker-owned pipe.
@@ -77,14 +70,7 @@ pub fn write(process: &BrokerProcess, handle: ObjectHandle, data: &[u8]) -> Resu
     }
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::Pipe(pipe) => pipe.write(data),
-        ObjectEntry::Event(_)
-        | ObjectEntry::File(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_pipe()?.write(data)
 }
 
 pub(crate) struct PipeObject {

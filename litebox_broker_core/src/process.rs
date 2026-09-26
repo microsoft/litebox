@@ -28,9 +28,6 @@ pub trait ProcessLifecycleSink: Send + Sync {
 /// Host runner shutdown action installed into a broker process.
 pub type ProcessShutdown = Arc<dyn Fn() + Send + Sync>;
 
-/// Identity shared by every process in one process tree.
-pub(crate) struct ProcessRoot;
-
 /// Caller identity information supplied by the broker entry layer.
 ///
 /// The first userland proof of concept does not authenticate Unix-socket peers,
@@ -82,12 +79,52 @@ pub(crate) struct ObjectReference {
 }
 
 pub(crate) enum ObjectEntry {
-    Reserved,
     Event(EventObject),
     File(File),
     Pipe(PipeObject),
     Socket(SocketObject),
     Process(ProcessObject),
+}
+
+// Operations for one object kind use these accessors, so adding a kind does
+// not touch them. Only operations that depend on every kind match exhaustively.
+impl ObjectEntry {
+    pub(crate) fn as_event_mut(&mut self) -> Result<&mut EventObject> {
+        match self {
+            Self::Event(event) => Ok(event),
+            _ => Err(BrokerError::InvalidRights),
+        }
+    }
+
+    pub(crate) fn as_file(&self) -> Result<&File> {
+        match self {
+            Self::File(file) => Ok(file),
+            _ => Err(BrokerError::InvalidRights),
+        }
+    }
+
+    pub(crate) fn as_pipe(&self) -> Result<&PipeObject> {
+        match self {
+            Self::Pipe(pipe) => Ok(pipe),
+            _ => Err(BrokerError::InvalidRights),
+        }
+    }
+
+    fn as_process(&self) -> Result<&ProcessObject> {
+        match self {
+            Self::Process(process) => Ok(process),
+            _ => Err(BrokerError::InvalidRights),
+        }
+    }
+
+    /// Returns whether references to this object may be duplicated into
+    /// another process.
+    fn is_duplicable(&self) -> bool {
+        match self {
+            Self::Event(_) | Self::File(_) | Self::Pipe(_) => true,
+            Self::Socket(_) | Self::Process(_) => false,
+        }
+    }
 }
 
 /// Reference to one process.
@@ -139,7 +176,8 @@ pub struct BrokerProcess {
     pub(crate) id: ProcessId,
     /// ID assigned to the initial thread when process creation completes.
     initial_thread_id: Once<ThreadId>,
-    root: Arc<ProcessRoot>,
+    /// Creating parent process.
+    parent: Option<Weak<BrokerProcess>>,
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
@@ -157,15 +195,13 @@ pub struct BrokerProcess {
 
 struct BrokerProcessState {
     status: ProcessStatus,
-    /// Creating parent, cleared when the parent's owner dies.
-    parent: Option<Weak<BrokerProcess>>,
     /// Parent handle readiness published once this process terminates.
     exit_readiness: Option<ReadinessRegistration>,
     owner_alive: bool,
     /// Child retained until this process requests startup.
     pending_child_process: Option<Arc<BrokerProcess>>,
     /// Whether a starting child continues after its parent dies.
-    reparent_startup_on_parent_death: bool,
+    continue_startup_on_parent_death: bool,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
     shutdown: Option<ProcessShutdown>,
@@ -250,7 +286,6 @@ impl BrokerProcess {
     pub(crate) fn new(
         core: BrokerCore,
         id: ProcessId,
-        root: Arc<ProcessRoot>,
         parent: Option<Weak<BrokerProcess>>,
         caller_credential: CallerCredential,
     ) -> Self {
@@ -258,14 +293,13 @@ impl BrokerProcess {
             core,
             id,
             initial_thread_id: Once::new(),
-            root,
+            parent,
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
-                parent,
                 exit_readiness: None,
                 owner_alive: true,
                 pending_child_process: None,
-                reparent_startup_on_parent_death: false,
+                continue_startup_on_parent_death: false,
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
@@ -323,7 +357,7 @@ impl BrokerProcess {
     ///
     /// The child must have been created directly from this running process.
     /// Holding the parent state lock while marking the child ensures parent
-    /// death either rejects ordinary startup or reparents prepared startup.
+    /// death either rejects ordinary startup or lets prepared startup continue.
     pub fn prepare_duplication_child(&self, child: &BrokerProcess) -> Result<()> {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
@@ -345,17 +379,13 @@ impl BrokerProcess {
         let mut child_state = child.state.lock();
         if !child_state.owner_alive
             || !matches!(child_state.status, ProcessStatus::Starting)
-            || !child_state
-                .parent
-                .as_ref()
-                .and_then(Weak::upgrade)
-                .is_some_and(|parent| core::ptr::eq(parent.as_ref(), self))
-            || child_state.reparent_startup_on_parent_death
+            || !child.is_child_of(self)
+            || child_state.continue_startup_on_parent_death
             || !matches!(child_state.retirement, ProcessRetirement::Active { .. })
         {
             return Err(BrokerError::Internal);
         }
-        child_state.reparent_startup_on_parent_death = true;
+        child_state.continue_startup_on_parent_death = true;
         Ok(())
     }
 
@@ -401,11 +431,7 @@ impl BrokerProcess {
                 if !child_state.owner_alive
                     || !matches!(child_state.status, ProcessStatus::Starting)
                     || !matches!(child_state.retirement, ProcessRetirement::Active { .. })
-                    || !child_state
-                        .parent
-                        .as_ref()
-                        .and_then(Weak::upgrade)
-                        .is_some_and(|parent| core::ptr::eq(parent.as_ref(), self))
+                    || !child.is_child_of(self)
                 {
                     Err(BrokerError::Internal)
                 } else {
@@ -531,7 +557,7 @@ impl BrokerProcess {
                 ProcessStatus::Zombie(_) => return Err(BrokerError::PeerClosed),
             }
             state.status.transition(ProcessStatus::Running)?;
-            state.reparent_startup_on_parent_death = false;
+            state.continue_startup_on_parent_death = false;
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -602,7 +628,7 @@ impl BrokerProcess {
                 state.retirement.mark_abnormal();
             }
             state.status.transition(ProcessStatus::Failed(error))?;
-            state.reparent_startup_on_parent_death = false;
+            state.continue_startup_on_parent_death = false;
             if state.shutdown_request == ProcessShutdownRequest::None {
                 state.shutdown_request = if expected_shutdown {
                     ProcessShutdownRequest::Expected
@@ -638,7 +664,7 @@ impl BrokerProcess {
     /// Ordinary startup fails and prepared duplication startup continues.
     /// Children become orphans; their exit status remains only while this
     /// process still holds their handles.
-    pub fn handle_owner_death(self: &Arc<Self>) {
+    pub fn handle_owner_death(&self) {
         let pending_child_process = {
             let mut state = self.state.lock();
             if !state.owner_alive {
@@ -647,20 +673,20 @@ impl BrokerProcess {
             state.owner_alive = false;
             state.pending_child_process.take()
         };
+        // Drop non-children only after releasing the registry lock, because a
+        // final process drop removes itself from the registry.
         let processes = {
             let processes = self.core.processes.read();
             processes
                 .values()
                 .filter_map(Weak::upgrade)
-                .filter(|process| Arc::ptr_eq(&process.root, &self.root))
                 .collect::<Vec<_>>()
         };
 
-        let owner = Arc::downgrade(self);
         let mut changed = false;
         let mut shutdowns = Vec::new();
-        for child in &processes {
-            let (child_changed, shutdown) = child.handle_parent_death(&owner);
+        for child in processes.iter().filter(|process| process.is_child_of(self)) {
+            let (child_changed, shutdown) = child.handle_parent_death();
             changed |= child_changed;
             if let Some(shutdown) = shutdown {
                 shutdowns.push(shutdown);
@@ -679,40 +705,36 @@ impl BrokerProcess {
         }
     }
 
-    pub(crate) fn with_live_owner<T>(
-        &self,
-        operation: impl FnOnce(Arc<ProcessRoot>) -> T,
-    ) -> Result<T> {
+    pub(crate) fn with_live_owner<T>(&self, operation: impl FnOnce() -> T) -> Result<T> {
         let state = self.state.lock();
         if !state.owner_alive || !matches!(state.retirement, ProcessRetirement::Active { .. }) {
             return Err(BrokerError::PeerClosed);
         }
-        Ok(operation(Arc::clone(&self.root)))
+        Ok(operation())
     }
 
-    fn handle_parent_death(&self, owner: &Weak<BrokerProcess>) -> (bool, Option<ProcessShutdown>) {
-        let mut state = self.state.lock();
-        if !state
-            .parent
+    fn is_child_of(&self, parent: &BrokerProcess) -> bool {
+        // The weak reference keeps the parent's allocation, so its address
+        // cannot be reused by another process.
+        self.parent
             .as_ref()
-            .is_some_and(|parent| Weak::ptr_eq(parent, owner))
-        {
+            .is_some_and(|own_parent| core::ptr::eq(own_parent.as_ptr(), parent))
+    }
+
+    /// Fails ordinary startup after the parent's owner dies.
+    fn handle_parent_death(&self) -> (bool, Option<ProcessShutdown>) {
+        let mut state = self.state.lock();
+        if state.status != ProcessStatus::Starting || state.continue_startup_on_parent_death {
             return (false, None);
         }
-        state.parent = None;
-
-        let mut shutdown = None;
-        if state.status == ProcessStatus::Starting && !state.reparent_startup_on_parent_death {
-            state
-                .status
-                .transition(ProcessStatus::Failed(BrokerError::PeerClosed))
-                .expect("starting child rejection must be a valid transition");
-            if state.shutdown_request == ProcessShutdownRequest::None {
-                state.shutdown_request = ProcessShutdownRequest::Expected;
-            }
-            shutdown.clone_from(&state.shutdown);
+        state
+            .status
+            .transition(ProcessStatus::Failed(BrokerError::PeerClosed))
+            .expect("starting child rejection must be a valid transition");
+        if state.shutdown_request == ProcessShutdownRequest::None {
+            state.shutdown_request = ProcessShutdownRequest::Expected;
         }
-        (true, shutdown)
+        (true, state.shutdown.clone())
     }
 
     /// Duplicates object references into another process.
@@ -904,15 +926,8 @@ impl BrokerProcess {
             Arc::clone(&reference.object)
         };
 
-        {
-            let object = object.read();
-            match &*object {
-                ObjectEntry::Event(_) | ObjectEntry::File(_) | ObjectEntry::Pipe(_) => {}
-                ObjectEntry::Socket(_) | ObjectEntry::Process(_) => {
-                    return Err(BrokerError::UnsupportedOperation);
-                }
-                ObjectEntry::Reserved => return Err(BrokerError::Internal),
-            }
+        if !object.read().is_duplicable() {
+            return Err(BrokerError::UnsupportedOperation);
         }
 
         let target_rights = target
@@ -998,7 +1013,6 @@ impl BrokerProcess {
         &self,
         rights: ObjectRights,
     ) -> Result<PendingObjectReference<'_>> {
-        let object = Arc::new(RwLock::new(ObjectEntry::Reserved));
         let mut process_references = self.references.lock();
         let next_process_pending = self.prepare_process_references(&mut process_references, 1)?;
         let mut references = self.core.references.write();
@@ -1032,7 +1046,6 @@ impl BrokerProcess {
             process: self,
             handle,
             rights,
-            object,
             active: true,
         })
     }
@@ -1132,7 +1145,6 @@ impl BrokerProcess {
                 ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
                 ObjectEntry::Process(process) => return Ok(process.readiness()),
                 ObjectEntry::Socket(socket) => socket.resource(),
-                ObjectEntry::Reserved => return Err(BrokerError::Internal),
             }
         };
         Ok(socket.readiness())
@@ -1145,14 +1157,7 @@ impl BrokerProcess {
     pub fn process_exit_status(&self, handle: ObjectHandle) -> Result<ProcessExitStatus> {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
         let object = object.read();
-        match &*object {
-            ObjectEntry::Process(process) => process.exit_status(),
-            ObjectEntry::Event(_)
-            | ObjectEntry::File(_)
-            | ObjectEntry::Pipe(_)
-            | ObjectEntry::Socket(_) => Err(BrokerError::InvalidRights),
-            ObjectEntry::Reserved => Err(BrokerError::Internal),
-        }
+        object.as_process()?.exit_status()
     }
 
     /// Closes one object reference owned by this process.
@@ -1329,7 +1334,6 @@ pub(crate) struct PendingObjectReference<'process> {
     process: &'process BrokerProcess,
     handle: ObjectHandle,
     rights: ObjectRights,
-    object: Arc<RwLock<ObjectEntry>>,
     active: bool,
 }
 
@@ -1339,9 +1343,6 @@ impl PendingObjectReference<'_> {
     }
 
     pub(crate) fn commit(mut self, object: ObjectEntry) -> Result<ObjectHandle> {
-        if !matches!(&*self.object.read(), ObjectEntry::Reserved) {
-            return Err(BrokerError::Internal);
-        }
         let mut process_references = self.process.references.lock();
         let mut references = self.process.core.references.write();
         if references.contains_key(&self.handle) {
@@ -1359,12 +1360,11 @@ impl PendingObjectReference<'_> {
             return Err(BrokerError::Internal);
         }
         self.active = false;
-        *self.object.write() = object;
         self.process.insert_object_reference(
             &mut references,
             &mut process_references.handles,
             self.handle,
-            Arc::clone(&self.object),
+            Arc::new(RwLock::new(object)),
             self.rights,
         );
         Ok(self.handle)
@@ -1462,8 +1462,6 @@ mod tests {
 
     fn parent_id(process: &BrokerProcess) -> Option<ProcessId> {
         process
-            .state
-            .lock()
             .parent
             .as_ref()
             .and_then(alloc::sync::Weak::upgrade)
@@ -1614,7 +1612,6 @@ mod tests {
             [running_handle, zombie_handle]
         );
         assert!(!broker.processes.read().contains_key(&zombie_id));
-        assert_eq!(parent_id(&running), None);
         running.retire(true);
         running.complete_exit(EXITED).unwrap();
         drop(running);
@@ -1874,7 +1871,6 @@ mod tests {
 
         dead_child.complete_start().unwrap();
         assert_eq!(dead_child.state.lock().status, ProcessStatus::Running);
-        assert_eq!(parent_id(&dead_child), None);
 
         let live_parent = broker
             .allocate_process(CallerCredential::Unauthenticated, None)
@@ -1930,7 +1926,6 @@ mod tests {
 
         parent.handle_owner_death();
 
-        assert_eq!(parent_id(&child), None);
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert_eq!(child.complete_start(), Err(BrokerError::PeerClosed));
         assert_eq!(shutdowns.load(Ordering::Relaxed), 1);
@@ -1964,9 +1959,7 @@ mod tests {
         parent.handle_owner_death();
 
         assert!(!parent.state.lock().owner_alive);
-        assert_eq!(parent_id(&running), None);
         assert_eq!(running.state.lock().status, ProcessStatus::Running);
-        assert_eq!(parent_id(&zombie), None);
         assert_eq!(zombie.state.lock().status, ProcessStatus::Zombie(EXITED));
         assert_eq!(parent_id(&parent), Some(root.id()));
         assert!(matches!(
@@ -1976,7 +1969,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_death_does_not_lock_processes_from_other_trees() {
+    fn owner_death_locks_only_direct_children() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
@@ -1990,14 +1983,10 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
         parent.complete_start().unwrap();
-        let other_root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        other_root.complete_start().unwrap();
 
         let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
         let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
-        let locked_root = Arc::clone(&other_root);
+        let locked_root = Arc::clone(&root);
         let lock_thread = std::thread::spawn(move || {
             let _state = locked_root.state.lock();
             locked_sender.send(()).unwrap();
@@ -2011,14 +2000,14 @@ mod tests {
             dying_parent.handle_owner_death();
             done_sender.send(()).unwrap();
         });
-        let completed_without_other_tree = done_receiver
+        let completed_without_non_child = done_receiver
             .recv_timeout(std::time::Duration::from_secs(1))
             .is_ok();
 
         release_sender.send(()).unwrap();
         lock_thread.join().unwrap();
         owner_death_thread.join().unwrap();
-        assert!(completed_without_other_tree);
+        assert!(completed_without_non_child);
     }
 
     #[test]

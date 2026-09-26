@@ -672,14 +672,7 @@ fn file(
 ) -> Result<File> {
     let object = process.authorized_object(handle, required_rights)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::File(file) => Ok(file.clone()),
-        ObjectEntry::Event(_)
-        | ObjectEntry::Pipe(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_file().cloned()
 }
 
 fn file_with_any_rights(
@@ -689,14 +682,7 @@ fn file_with_any_rights(
 ) -> Result<File> {
     let object = process.authorized_object_with_any_rights(handle, allowed_rights)?;
     let object = object.read();
-    match &*object {
-        ObjectEntry::File(file) => Ok(file.clone()),
-        ObjectEntry::Event(_)
-        | ObjectEntry::Pipe(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_file().cloned()
 }
 
 fn open_flags(access: FileAccessMode, flags: FileOpenFlags) -> Result<OFlags> {

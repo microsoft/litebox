@@ -24,14 +24,7 @@ pub fn create(process: &BrokerProcess, initial_count: u64) -> Result<ObjectHandl
 pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let mut object = object.write();
-    match &mut *object {
-        ObjectEntry::Event(event) => event.add(value),
-        ObjectEntry::File(_)
-        | ObjectEntry::Pipe(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_event_mut()?.add(value)
 }
 
 /// Consumes readiness credits from a broker-owned event object.
@@ -42,14 +35,7 @@ pub fn consume(
 ) -> Result<EventConsumption> {
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let mut object = object.write();
-    match &mut *object {
-        ObjectEntry::Event(event) => event.consume(mode),
-        ObjectEntry::File(_)
-        | ObjectEntry::Pipe(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
-        ObjectEntry::Reserved => Err(BrokerError::Internal),
-    }
+    object.as_event_mut()?.consume(mode)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
