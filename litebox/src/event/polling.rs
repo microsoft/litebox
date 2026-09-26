@@ -85,22 +85,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'_, Platfor
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Default for Pollee<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Default for Pollee<Platform> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> Pollee<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Create a new pollee.
     pub fn new() -> Self {
         Self {
             subject: Subject::new(),
         }
     }
-}
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pollee<Platform> {
     /// Run `try_op` until it returns a non-`TryAgain` result, waiting after
     /// each `TryAgain`.
     ///

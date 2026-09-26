@@ -19,7 +19,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    ChildExit, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessIdentity, WaitChildTarget,
+    ChildProcess, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, StartedChildProcess,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -52,20 +52,18 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn allocate_child_process(
-        &self,
-    ) -> core::result::Result<litebox_broker_protocol::ProcessId, BrokerControlError>;
+    fn allocate_child_process(&self) -> core::result::Result<ChildProcess, BrokerControlError>;
 
     fn start_child_process(
         &self,
         child_process_id: Option<litebox_broker_protocol::ProcessId>,
         payload: &[u8],
-    ) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+    ) -> core::result::Result<StartedChildProcess, BrokerControlError>;
 
-    fn wait_child(
+    fn process_exit_status(
         &self,
-        target: WaitChildTarget,
-    ) -> core::result::Result<ChildExit, BrokerControlError>;
+        handle: ObjectHandle,
+    ) -> core::result::Result<ProcessExitStatus, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -305,27 +303,13 @@ pub(crate) trait BrokerControl: Send + Sync {
 
 pub(crate) struct BrokerPollableRegistry<Platform: RawSyncPrimitivesProvider> {
     pollables: Mutex<Platform, HashMap<ObjectHandle, Weak<Pollee<Platform>>>>,
-    child_state: Pollee<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
     pub(crate) fn new() -> Self {
         Self {
             pollables: Mutex::new(HashMap::new()),
-            child_state: Pollee::new(),
         }
-    }
-
-    /// Pollee woken whenever a direct child process may have changed state.
-    pub(crate) fn child_state(&self) -> &Pollee<Platform> {
-        &self.child_state
-    }
-
-    pub(crate) fn notify_child_state(&self)
-    where
-        Platform: TimeProvider,
-    {
-        self.child_state.notify_observers(Events::IN);
     }
 
     pub(crate) fn register_pollable(&self, handle: ObjectHandle, pollee: &Arc<Pollee<Platform>>) {
@@ -380,7 +364,6 @@ impl<Platform: RawSyncPrimitivesProvider> BrokerPollableRegistry<Platform> {
         for pollee in pollables {
             pollee.notify_observers(events);
         }
-        self.child_state.notify_observers(events);
     }
 }
 
@@ -470,9 +453,7 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn allocate_child_process(
-        &self,
-    ) -> core::result::Result<litebox_broker_protocol::ProcessId, BrokerControlError> {
+    fn allocate_child_process(&self) -> core::result::Result<ChildProcess, BrokerControlError> {
         self.request(BrokerLocal::allocate_child_process)
     }
 
@@ -480,7 +461,7 @@ where
         &self,
         child_process_id: Option<litebox_broker_protocol::ProcessId>,
         payload: &[u8],
-    ) -> core::result::Result<ProcessIdentity, BrokerControlError> {
+    ) -> core::result::Result<StartedChildProcess, BrokerControlError> {
         if payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
             return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
         }
@@ -490,11 +471,11 @@ where
         })
     }
 
-    fn wait_child(
+    fn process_exit_status(
         &self,
-        target: WaitChildTarget,
-    ) -> core::result::Result<ChildExit, BrokerControlError> {
-        self.request(|local| local.wait_child(target))
+        handle: ObjectHandle,
+    ) -> core::result::Result<ProcessExitStatus, BrokerControlError> {
+        self.request(|local| local.process_exit_status(handle))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

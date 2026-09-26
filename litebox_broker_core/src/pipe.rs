@@ -62,9 +62,10 @@ pub fn read(process: &BrokerProcess, handle: ObjectHandle, length: u32) -> Resul
     let object = object.read();
     match &*object {
         ObjectEntry::Pipe(pipe) => pipe.read(length as usize),
-        ObjectEntry::Event(_) | ObjectEntry::File(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
+        ObjectEntry::Event(_)
+        | ObjectEntry::File(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }
@@ -78,9 +79,10 @@ pub fn write(process: &BrokerProcess, handle: ObjectHandle, data: &[u8]) -> Resu
     let object = object.read();
     match &*object {
         ObjectEntry::Pipe(pipe) => pipe.write(data),
-        ObjectEntry::Event(_) | ObjectEntry::File(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
+        ObjectEntry::Event(_)
+        | ObjectEntry::File(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }

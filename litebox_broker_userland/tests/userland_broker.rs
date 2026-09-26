@@ -236,6 +236,8 @@ fn run_fake_runner(args: &[OsString]) {
                 &[],
             )
             .unwrap();
+        assert!(failed.handle.is_some());
+        let failed = failed.identity;
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
         let started = local
             .start_child_process(
@@ -248,6 +250,8 @@ fn run_fake_runner(args: &[OsString]) {
                 bootstrap,
             )
             .unwrap();
+        assert!(started.handle.is_some());
+        let started = started.identity;
         assert_ne!(started.process_id.0, started.initial_thread_id.0);
         wait_for_marker(
             marker,

@@ -187,11 +187,7 @@ impl UserlandProcessLauncher {
         self.lifecycle.wait_for_start(&process, setup_deadline)
     }
 
-    fn runner_finished(
-        process: &Arc<BrokerProcess>,
-        exit_status: ProcessExitStatus,
-        abnormal: bool,
-    ) {
+    fn runner_finished(process: &BrokerProcess, exit_status: ProcessExitStatus, abnormal: bool) {
         let _ = process.fail_start(BrokerError::PeerClosed, abnormal, false);
         process.retire(!abnormal);
         let _ = process.complete_exit(exit_status);

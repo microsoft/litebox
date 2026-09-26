@@ -18,8 +18,8 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    ChildExit, CreateThreadRequest, CreateThreadResponse, ProcessIdentity,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource, WaitChildTarget,
+    CreateThreadRequest, CreateThreadResponse, ProcessExitStatus, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource, StartedChildProcess,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -70,11 +70,11 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one child process.
     StartChildProcess(StartChildProcessRequest),
-    /// Consume one terminated direct child without blocking.
+    /// Read a child process's termination status through its parent-owned
+    /// handle without blocking.
     ///
-    /// The broker returns `WouldBlock` while matching children are still live,
-    /// and `UnknownObject` when no direct child matches.
-    WaitChild(WaitChildTarget),
+    /// The broker returns `WouldBlock` while the child is live.
+    GetProcessExitStatus(ObjectHandle),
 }
 
 impl BrokerOperation {
@@ -118,7 +118,7 @@ impl BrokerOperation {
             Self::CreateThread(_)
             | Self::ExitThread(_)
             | Self::CloseObject(_)
-            | Self::WaitChild(_)
+            | Self::GetProcessExitStatus(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
             | Self::Pipe(PipeRequest::Create(_))
@@ -257,9 +257,9 @@ pub enum BrokerResult {
     /// File response family.
     File(FileResponse),
     /// A child established its broker association.
-    ProcessStarted(ProcessIdentity),
-    /// A terminated direct child was reaped.
-    ChildExited(ChildExit),
+    ProcessStarted(StartedChildProcess),
+    /// Termination status of a child process.
+    ProcessExitStatus(ProcessExitStatus),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -430,9 +430,6 @@ pub enum FileResponse {
 pub enum BrokerNotification {
     /// Readiness changed or should be re-checked for a broker-owned object.
     Readiness(ReadinessNotification),
-    /// A direct child changed state, so waiters should re-check
-    /// [`BrokerOperation::WaitChild`].
-    ChildStateChanged,
 }
 
 /// Readiness notification for a broker-owned object.

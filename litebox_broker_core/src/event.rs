@@ -26,9 +26,10 @@ pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<
     let mut object = object.write();
     match &mut *object {
         ObjectEntry::Event(event) => event.add(value),
-        ObjectEntry::File(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
+        ObjectEntry::File(_)
+        | ObjectEntry::Pipe(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }
@@ -43,9 +44,10 @@ pub fn consume(
     let mut object = object.write();
     match &mut *object {
         ObjectEntry::Event(event) => event.consume(mode),
-        ObjectEntry::File(_) | ObjectEntry::Pipe(_) | ObjectEntry::Socket(_) => {
-            Err(BrokerError::InvalidRights)
-        }
+        ObjectEntry::File(_)
+        | ObjectEntry::Pipe(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_) => Err(BrokerError::InvalidRights),
         ObjectEntry::Reserved => Err(BrokerError::Internal),
     }
 }

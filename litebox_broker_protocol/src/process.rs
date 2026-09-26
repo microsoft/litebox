@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::shared_buffer::SharedBufferSequence;
-use crate::{ProcessId, ThreadId};
+use crate::{ObjectHandle, ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
 pub const MAX_PROCESS_BOOTSTRAP_SIZE: u32 = 64 * 1024;
@@ -47,22 +47,29 @@ pub enum ProcessExitStatus {
     Unknown,
 }
 
-/// Selects the direct children a wait may consume.
+/// Parent-owned handle to one newly created child process.
+///
+/// The handle reports [`ReadinessFlags::READ`](crate::readiness::ReadinessFlags::READ)
+/// once the child terminates. Closing it releases the child's retained exit
+/// status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WaitChildTarget {
-    /// Any direct child of the caller.
-    Any,
-    /// One direct child of the caller.
-    Process(ProcessId),
+pub struct ChildProcess {
+    /// Broker-assigned child process ID.
+    pub process_id: ProcessId,
+    /// Parent-owned handle used to observe child termination.
+    pub handle: ObjectHandle,
 }
 
-/// Exit status consumed from one direct child.
+/// Result of starting one child process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ChildExit {
-    /// Reaped child process ID.
-    pub process_id: ProcessId,
-    /// Child termination status.
-    pub status: ProcessExitStatus,
+pub struct StartedChildProcess {
+    /// Started child identity.
+    pub identity: ProcessIdentity,
+    /// Parent-owned child handle when this start request created the child.
+    ///
+    /// Starting a pending child returns `None` because allocation already
+    /// returned its handle.
+    pub handle: Option<ObjectHandle>,
 }
 
 /// Selects whether thread creation extends the current process or creates a child process.
@@ -80,7 +87,7 @@ pub enum CreateThreadResponse {
     /// A thread was created in the requesting process.
     Thread(ThreadId),
     /// A pending child process was created.
-    Process(ProcessId),
+    Process(ChildProcess),
 }
 
 /// Source used to start one child process.
