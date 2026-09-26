@@ -1711,6 +1711,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_optee_on_kvm"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_platform_lvbs",
+ "spin 0.10.0",
+ "x86_64",
+]
+
+[[package]]
 name = "litebox_runner_optee_on_linux_userland"
 version = "0.1.0"
 dependencies = [

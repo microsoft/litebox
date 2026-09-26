@@ -159,6 +159,29 @@ jobs:
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
 
+  qemu_guest_boot:
+    name: QEMU guest-kernel smoke test (TCG)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust and QEMU
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup toolchain install nightly-2025-12-31 --profile minimal --component rust-src,clippy
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Host tests and lint
+        run: |
+          cargo test --locked -p litebox_runner_optee_on_kvm --lib
+          cargo clippy --locked -p litebox_runner_optee_on_kvm --all-targets -- -D warnings
+          cargo +nightly-2025-12-31 clippy --locked -p litebox_runner_optee_on_kvm --bin litebox_runner_optee_on_kvm --target litebox_runner_optee_on_kvm/x86_64_kvm.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem -- -D warnings
+      - name: Boot and validate shared kernel paths without /dev/kvm
+        run: |
+          python3 litebox_runner_optee_on_kvm/scripts/run.py --negative-tests
+          python3 litebox_runner_optee_on_kvm/scripts/run.py --release --memory 64 --negative-tests
+
   build_and_test_windows:
     name: Build and Test Windows
     runs-on: windows-latest

@@ -12,6 +12,7 @@ members = [
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_lvbs",
+    "litebox_runner_optee_on_kvm",
     "litebox_runner_optee_on_linux_userland",
     "litebox_shim_linux",
     "litebox_service_heki",
@@ -46,8 +47,8 @@ default-members = [
     "dev_tests",
     "dev_bench",
 ]
-# We exclude `litebox_runner_lvbs` from `default-members` because it requires
-# a custom target and `-Z build-std`, which requires a nightly toolchain.
+# The LVBS and QEMU/KVM guest runners are excluded from `default-members`:
+# their VM binaries require custom targets and nightly `-Z build-std`.
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy

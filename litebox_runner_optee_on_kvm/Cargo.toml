@@ -1,0 +1,22 @@
+[package]
+name = "litebox_runner_optee_on_kvm"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
+litebox = { version = "0.1.0", path = "../litebox" }
+litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
+litebox_platform_lvbs = { version = "0.1.0", path = "../litebox_platform_lvbs", default-features = false }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex", "once"] }
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
+
+[[bin]]
+name = "litebox_runner_optee_on_kvm"
+path = "src/main.rs"
+test = false
+bench = false
+
+[lints]
+workspace = true
