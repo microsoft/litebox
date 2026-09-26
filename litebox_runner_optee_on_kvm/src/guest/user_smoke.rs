@@ -35,6 +35,13 @@ const SYSCALL_REPLY: usize = 0x1234;
 const BREAKPOINT_REPLY: usize = 0x5678;
 const DONE: usize = 0xfeed;
 
+// All exceptions remain masked. Kernel rounding modes (up/toward-zero) differ
+// from both the user's down mode (0x3f80/0x077f) and the handler's defaults
+// (0x1f80/0x037f). The last x87 seed also changes precision to 53 bits. Varying
+// seeds on successive entries detects stale saves as well as missing restores.
+const KERNEL_CONTROL_SEEDS: [(u32, u16); 3] =
+    [(0x5f80, 0x0b7f), (0x7f80, 0x0f7f), (0x5f80, 0x0a7f)];
+
 core::arch::global_asm!(
     include_str!("user_smoke.S"),
     data = const DATA,
@@ -340,6 +347,29 @@ fn control_words() -> (u32, u16) {
     (mxcsr, fcw)
 }
 
+fn set_control_words((mxcsr, fcw): (u32, u16)) {
+    // SAFETY: callers supply either the valid masked seeds above or values
+    // previously read from this CPU. No reserved MXCSR bits are introduced.
+    unsafe {
+        core::arch::asm!("ldmxcsr [{mxcsr}]", "fldcw [{fcw}]",
+            mxcsr = in(reg) &raw const mxcsr, fcw = in(reg) &raw const fcw,
+            options(nostack, preserves_flags));
+    }
+}
+
+fn check_kernel_fp_restore(seed: (u32, u16), run: impl FnOnce()) {
+    let original = control_words();
+    set_control_words(seed);
+    assert_eq!(control_words(), seed, "kernel FP seed was not installed");
+    run();
+    // Capture immediately on return, before checks or formatting can obscure
+    // the observed state. Restore the runner's environment even if the test
+    // comparison fails, so diagnostics run with its original control words.
+    let restored = control_words();
+    set_control_words(original);
+    assert_eq!(restored, seed, "kernel FP control state was not restored");
+}
+
 fn map_and_copy(platform: &Platform, address: usize, bytes: &[u8], permissions: Perms) {
     assert!(bytes.len() <= PAGE);
     let pointer = <Platform as PageManagementProvider<PAGE>>::allocate_pages(
@@ -387,24 +417,18 @@ pub(super) fn run(platform: &Platform) {
     let roundtrip = TestShim::new(Case::RoundTrip, platform);
     // The primary test exercises first save/restore and subsequent XSAVEOPT
     // paths across syscalls, exceptions and repeated reentry on the same CPU.
-    for entry in 0..3 {
-        let before = control_words();
-        unsafe {
+    for (entry, seed) in KERNEL_CONTROL_SEEDS.into_iter().enumerate() {
+        check_kernel_fp_restore(seed, || unsafe {
             if entry == 0 {
                 litebox_platform_lvbs::run_thread_ref(&roundtrip, &mut regs, &timer);
             } else {
                 litebox_platform_lvbs::reenter_thread_ref(&roundtrip, &mut regs, &timer);
             }
-        }
+        });
         assert_eq!(regs.rax, DONE);
         assert_eq!(roundtrip.syscalls.get(), 2);
         assert_eq!(roundtrip.user_faults.get(), 1);
         assert_eq!(roundtrip.kernel_faults.get(), 1);
-        assert_eq!(
-            control_words(),
-            before,
-            "kernel FP control state was not restored"
-        );
         assert_eq!(
             unsafe { litebox_common_linux::rdgsbase() },
             roundtrip.kernel_gs
@@ -421,7 +445,7 @@ pub(super) fn run(platform: &Platform) {
     );
     serial_println!("QEMU-USER: syscall reentry registers XSAVE OK");
 
-    for case in [
+    for (entry, case) in [
         Case::InvalidOpcode,
         Case::PrivilegedInstruction,
         Case::WriteCode,
@@ -429,13 +453,17 @@ pub(super) fn run(platform: &Platform) {
         Case::ReadKernel,
         Case::ReadUnmapped,
         Case::InvalidReturn,
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let shim = TestShim::new(case, platform);
-        let before = control_words();
-        unsafe {
-            litebox_platform_lvbs::run_thread_ref(&shim, &mut regs, &timer);
-        }
-        assert_eq!(control_words(), before);
+        check_kernel_fp_restore(
+            KERNEL_CONTROL_SEEDS[entry % KERNEL_CONTROL_SEEDS.len()],
+            || unsafe {
+                litebox_platform_lvbs::run_thread_ref(&shim, &mut regs, &timer);
+            },
+        );
         assert_eq!(shim.init_calls.get(), 1);
         assert_eq!(
             shim.syscalls.get(),
