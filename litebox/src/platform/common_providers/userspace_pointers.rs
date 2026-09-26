@@ -380,6 +380,21 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
         .ok()
     }
 
+    fn compare_exchange_u32(self, current: u32, new: u32) -> Option<Result<u32, u32>>
+    where
+        Self: RawMutPointer<u32>,
+    {
+        let dst = self.as_ptr().cast::<u32>();
+        if dst.is_null() || !dst.is_aligned() {
+            return None;
+        }
+        let dst = V::validate(dst)?;
+        V::with_user_memory_access(|| unsafe {
+            crate::mm::exception_table::compare_exchange_u32_fallible(dst, current, new)
+        })
+        .ok()
+    }
+
     fn mutate_subslice_with<R>(
         self,
         _range: impl core::ops::RangeBounds<isize>,

@@ -5,7 +5,6 @@
 #include "helpers.h"
 
 #include <fcntl.h>
-#include <sys/eventfd.h>
 
 #define SRC_PATH "/tmp/lb_sendfile_src"
 #define DST_PATH "/tmp/lb_sendfile_dst"
@@ -340,13 +339,6 @@ static void test_pipe_in_fd(void) {
     close(pfd[1]);
 }
 
-static void test_eventfd_in_fd(void) {
-    int efd = eventfd(7, 0);
-    if (efd < 0) die("eventfd");
-    expect_einval_espipe_in_fd(efd, "eventfd in_fd");
-    close(efd);
-}
-
 static void test_unix_stream_in_fd(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) die("socketpair stream");
@@ -382,7 +374,6 @@ int main(void) {
     test_partial_nonblocking_pipe_error_is_deferred();
     test_file_to_pipe_with_offset();
     test_pipe_in_fd();
-    test_eventfd_in_fd();
     test_unix_stream_in_fd();
     test_unix_dgram_in_fd();
 

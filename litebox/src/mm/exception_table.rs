@@ -34,6 +34,19 @@ macro_rules! ex_table_section {
     };
 }
 
+#[cfg(target_vendor = "apple")]
+macro_rules! ex_table_section {
+    () => {
+        // Mach-O spells a section as `segment,section[,type[,attributes]]`.
+        // `__TEXT` keeps the table read-only (the entries are link-time-resolved
+        // relative offsets, so no runtime relocation is needed), matching where
+        // the platform ABI already puts `__gcc_except_tab`. `no_dead_strip` is
+        // the Mach-O counterpart of ELF's `R` (retain) flag: the entries carry
+        // no symbol of their own, so without it the linker would drop them.
+        "__TEXT,__ex_table,regular,no_dead_strip"
+    };
+}
+
 macro_rules! ex_table_entry {
     ($start:tt, $stop:tt, $recover:tt) => {
         concat!(
@@ -291,6 +304,107 @@ write_fn!(
     core::convert::identity
 );
 
+/// Atomically compares and conditionally exchanges a `u32` in fallible guest memory.
+///
+/// The outer `Result` reports a memory fault. The inner result matches
+/// [`core::sync::atomic::AtomicU32::compare_exchange`]: `Ok(previous)` on exchange and
+/// `Err(actual)` on comparison failure.
+///
+/// # Safety
+/// `dest` must be aligned and valid for a `u32` atomic access, or point into non-Rust memory whose
+/// faults are handled through this module's exception table.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn compare_exchange_u32_fallible(
+    dest: *mut u32,
+    current: u32,
+    new: u32,
+) -> Result<Result<u32, u32>, Fault> {
+    let mut observed = current;
+    let mut exchanged = 0u8;
+    let mut faulted = 0u8;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "lock cmpxchg dword ptr [{dest}], {new:e}",
+            "sete {exchanged}",
+            "jmp 4f",
+            "3:",
+            "mov {faulted}, 1",
+            "4:",
+            ex_table_entry!("2b", "3b", "3b"),
+            dest = in(reg) dest,
+            new = in(reg) new,
+            inout("eax") observed,
+            exchanged = inout(reg_byte) exchanged,
+            faulted = inout(reg_byte) faulted,
+        }
+    }
+    if faulted != 0 {
+        return Err(Fault);
+    }
+    Ok(if exchanged != 0 {
+        Ok(observed)
+    } else {
+        Err(observed)
+    })
+}
+
+/// Atomically compares and conditionally exchanges a `u32` in fallible guest memory.
+///
+/// See the x86-64 implementation for the contract.
+///
+/// # Safety
+/// Same requirements as the x86-64 implementation.
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn compare_exchange_u32_fallible(
+    dest: *mut u32,
+    current: u32,
+    new: u32,
+) -> Result<Result<u32, u32>, Fault> {
+    let mut observed = current;
+    let mut exchanged = 0u32;
+    let mut status = 0u32;
+    let mut faulted = 0u32;
+    unsafe {
+        core::arch::asm! {
+            "2:",
+            "ldaxr {observed:w}, [{dest}]",
+            "cmp {observed:w}, {current:w}",
+            "b.ne 4f",
+            "stlxr {status:w}, {new:w}, [{dest}]",
+            "cbnz {status:w}, 2b",
+            "mov {exchanged:w}, #1",
+            "b 3f",
+            "4:",
+            "clrex",
+            "mov {exchanged:w}, wzr",
+            "3:",
+            "b 6f",
+            "5:",
+            "clrex",
+            "mov {faulted:w}, #1",
+            "6:",
+            ex_table_entry!("2b", "3b", "5b"),
+            dest = in(reg) dest,
+            current = in(reg) current,
+            new = in(reg) new,
+            observed = inout(reg) observed,
+            exchanged = inout(reg) exchanged,
+            status = inout(reg) status,
+            faulted = inout(reg) faulted,
+        }
+    }
+    let _ = status;
+    if faulted != 0 {
+        return Err(Fault);
+    }
+    Ok(if exchanged != 0 {
+        Ok(observed)
+    } else {
+        Err(observed)
+    })
+}
+
 /// Exception table entry with relative offsets
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -333,6 +447,80 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
             STOP_EX_TABLE
                 .as_ptr()
                 .offset_from_unsigned(START_EX_TABLE.as_ptr()),
+        )
+    }
+}
+
+/// Returns the exception table, found by locating the Mach-O section through
+/// the current image's load commands.
+///
+/// Mach-O has no linker-synthesized `__start_`/`__stop_` pair for an arbitrary
+/// section, so the table is located the same way the Windows path locates its
+/// PE section: from the image headers at runtime. `__dso_handle` is the Mach-O
+/// header of the image this code was linked into, and `getsectiondata` walks
+/// its load commands and applies the slide.
+#[cfg(target_vendor = "apple")]
+#[expect(clippy::cast_ptr_alignment)]
+fn exception_table() -> &'static [ExceptionTableEntry] {
+    unsafe extern "C" {
+        /// This image's Mach-O header. Rust prefixes Mach-O symbols with `_`,
+        /// so this resolves to `___dso_handle`, the symbol the linker
+        /// synthesizes for every image.
+        static __dso_handle: u8;
+
+        /// `<mach-o/getsect.h>`: yields the in-memory address (slide applied)
+        /// and size of `segname,sectname` within the image at `mhp`, or null
+        /// when the image has no such section.
+        ///
+        /// The real signature takes `mhp: *const mach_header_64`; it is opaque
+        /// here (never dereferenced, only its address is taken and passed
+        /// through) since a pointer is a single machine word at the FFI
+        /// boundary regardless of pointee type, and this crate has no need to
+        /// otherwise model the Mach-O header layout.
+        fn getsectiondata(
+            mhp: *const core::ffi::c_void,
+            segname: *const core::ffi::c_char,
+            sectname: *const core::ffi::c_char,
+            size: *mut core::ffi::c_ulong,
+        ) -> *mut u8;
+    }
+
+    // Ensure the section exists even if no recovery descriptors get generated.
+    //
+    // SAFETY: just a no-op asm block to force the section to be created.
+    unsafe {
+        core::arch::asm!(concat!(
+            ".pushsection ",
+            ex_table_section!(),
+            "\n",
+            ".popsection"
+        ));
+    }
+
+    let mut size: core::ffi::c_ulong = 0;
+    // SAFETY: `__dso_handle` is this image's Mach-O header, both names are
+    // NUL-terminated, and `getsectiondata` only reads the image's load
+    // commands. It reports a null base for an absent section.
+    let start = unsafe {
+        getsectiondata(
+            (&raw const __dso_handle).cast::<core::ffi::c_void>(),
+            c"__TEXT".as_ptr(),
+            c"__ex_table".as_ptr(),
+            &raw mut size,
+        )
+    };
+    if start.is_null() {
+        // No recovery descriptors.
+        return &[];
+    }
+    let size = usize::try_from(size).expect("a section is never larger than the address space");
+    assert_eq!(size % size_of::<ExceptionTableEntry>(), 0);
+    // SAFETY: this section is made up solely of `ExceptionTableEntry` entries,
+    // each `.balign 4`-ed by `ex_table_entry!` to the type's alignment.
+    unsafe {
+        core::slice::from_raw_parts(
+            start.cast::<ExceptionTableEntry>(),
+            size / size_of::<ExceptionTableEntry>(),
         )
     }
 }
@@ -410,7 +598,18 @@ fn exception_table() -> &'static [ExceptionTableEntry] {
 /// Search the exception table for a matching instruction address.
 /// If found, returns the corresponding recovery address.
 pub fn search_exception_tables(addr: usize) -> Option<usize> {
-    let table = exception_table();
+    search_in(exception_table(), addr)
+}
+
+/// The pure relocation/interval-comparison logic behind
+/// [`search_exception_tables`], parameterized on the table instead of reading
+/// it from the linker-defined section.
+///
+/// Split out so it can be exercised against a synthetic table in tests: the
+/// real [`exception_table`] involves an inline-asm section lookup that has no
+/// meaning outside a real process image, but the relocation arithmetic here is
+/// ordinary integer math with no such dependency.
+fn search_in(table: &[ExceptionTableEntry], addr: usize) -> Option<usize> {
     let reloc = |addr: &i32| -> usize {
         let base = &raw const *addr as usize;
         base.wrapping_add_signed(*addr as isize)
@@ -423,4 +622,97 @@ pub fn search_exception_tables(addr: usize) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod search_in_tests {
+    use super::{ExceptionTableEntry, search_in};
+
+    const ZERO_ENTRY: ExceptionTableEntry = ExceptionTableEntry {
+        start: 0,
+        stop: 0,
+        fixup: 0,
+    };
+
+    /// Rewrites `table[index]` in place to cover `[fault_addr, fault_addr + 1)`
+    /// with fixup `recovery_addr`, using the same self-relative encoding real
+    /// entries use (an `i32` offset from each field's own address).
+    ///
+    /// Must be called on a table that has already settled into its final
+    /// storage location and will not be moved again afterward -- the encoded
+    /// offsets are only valid relative to where the entry actually lives when
+    /// [`search_in`] later decodes them, exactly as for a real entry emitted by
+    /// the assembly macro into a fixed section.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "test helper: callers keep fault_addr/recovery_addr within i32 range of the \
+                  table's own address, exactly as the real PC-relative encoding requires"
+    )]
+    fn encode_entry(
+        table: &mut [ExceptionTableEntry],
+        index: usize,
+        fault_addr: usize,
+        recovery_addr: usize,
+    ) {
+        let start_addr = core::ptr::addr_of!(table[index].start) as usize;
+        let stop_addr = core::ptr::addr_of!(table[index].stop) as usize;
+        let fixup_addr = core::ptr::addr_of!(table[index].fixup) as usize;
+        table[index].start = (fault_addr as isize - start_addr as isize) as i32;
+        // A one-instruction-wide range: [fault_addr, fault_addr + 1).
+        table[index].stop = (fault_addr as isize + 1 - stop_addr as isize) as i32;
+        table[index].fixup = (recovery_addr as isize - fixup_addr as isize) as i32;
+    }
+
+    // The real encoding is PC-relative with an `i32` (roughly +-2 GiB) range,
+    // which is always satisfied in a real binary (an entry and the code/data
+    // it refers to live in the same image). Synthetic fault/recovery
+    // addresses must respect the same constraint, so every test derives them
+    // as small offsets from the table's own real address rather than
+    // arbitrary constants -- an arbitrary constant like `0x1000` can be
+    // billions of bytes away from a real stack address and silently overflow
+    // the `i32` encoding.
+    fn addr_of_table(table: &[ExceptionTableEntry]) -> usize {
+        table.as_ptr() as usize
+    }
+
+    #[test]
+    fn finds_recovery_address_inside_range() {
+        let mut table = [ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0x200);
+        assert_eq!(search_in(&table, base + 0x100), Some(base + 0x200));
+    }
+
+    #[test]
+    fn misses_just_below_range() {
+        let mut table = [ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0x200);
+        assert_eq!(search_in(&table, base + 0x0ff), None);
+    }
+
+    #[test]
+    fn misses_at_the_exclusive_upper_bound() {
+        // The range is [start, stop), so stop itself (fault_addr + 1 here) is
+        // not covered.
+        let mut table = [ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0x200);
+        assert_eq!(search_in(&table, base + 0x101), None);
+    }
+
+    #[test]
+    fn empty_table_never_matches() {
+        assert_eq!(search_in(&[], 0x1000), None);
+    }
+
+    #[test]
+    fn later_entry_matches_when_earlier_entries_miss() {
+        let mut table = [ZERO_ENTRY, ZERO_ENTRY];
+        let base = addr_of_table(&table);
+        encode_entry(&mut table, 0, base + 0x100, base + 0xa000);
+        encode_entry(&mut table, 1, base + 0x200, base + 0xb000);
+        assert_eq!(search_in(&table, base + 0x200), Some(base + 0xb000));
+    }
 }

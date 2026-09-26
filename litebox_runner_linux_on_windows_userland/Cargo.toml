@@ -12,5 +12,9 @@ litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_plat
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux", default-features = false }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[dev-dependencies]
+tar = "0.4"
+
 [lints]
 workspace = true

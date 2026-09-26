@@ -10,6 +10,7 @@
 mod arch;
 pub mod common_providers;
 pub mod page_mgmt;
+pub mod stdin_pump;
 pub mod trivial_providers;
 
 #[cfg(test)]
@@ -18,8 +19,11 @@ pub(crate) mod mock;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+#[cfg(target_arch = "aarch64")]
+pub use arch::FpSimdState64;
 pub use arch::{ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister};
 pub use page_mgmt::PageManagementProvider;
+pub use stdin_pump::StdinPump;
 
 /// A provider of a platform upon which LiteBox can execute.
 ///
@@ -91,6 +95,33 @@ pub trait ThreadProvider: RawPointerProvider {
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
         f()
     }
+
+    /// Reads the current guest thread's FP/SIMD register file, in the shape a
+    /// delivered signal frame's vector-state area needs.
+    ///
+    /// The default reports an all-zero file: a platform with no FP-state
+    /// plumbing wired up leaves a delivered guest signal frame's vector-state
+    /// area zeroed -- a well-formed but inaccurate empty record (the same
+    /// zeroed-but-valid shape the frame already used before any platform
+    /// implemented this), never a memory-safety issue. Override once the
+    /// platform can report the guest's real vector state.
+    #[cfg(target_arch = "aarch64")]
+    fn get_fp_state(&self) -> crate::platform::arch::FpSimdState64 {
+        crate::platform::arch::FpSimdState64::default()
+    }
+
+    /// Writes the guest thread's FP/SIMD register file back, e.g. restoring
+    /// whatever a signal handler left in its frame on `rt_sigreturn`.
+    ///
+    /// The default does nothing, matching [`Self::get_fp_state`]'s default: a
+    /// platform that never reports real vector state has nothing meaningful to
+    /// restore either.
+    #[cfg(target_arch = "aarch64")]
+    #[expect(
+        unused_variables,
+        reason = "no-op by default; a real implementation consumes `state`"
+    )]
+    fn set_fp_state(&self, state: &crate::platform::arch::FpSimdState64) {}
 }
 
 #[non_exhaustive]
@@ -247,6 +278,15 @@ pub trait IPInterfaceProvider {
     /// Returns size of packet received, or a [`ReceiveError`] if unable to receive an entire
     /// packet.
     fn receive_ip_packet(&self, packet: &mut [u8]) -> Result<usize, ReceiveError>;
+
+    /// Whether a packet handed to [`Self::send_ip_packet`] can reach anything outside this
+    /// process. `true` by default; a platform with no external interface attached (one that
+    /// silently drops everything it is asked to send) reports `false`, so the network stack
+    /// can fail a connect to a non-local destination immediately (`ENETUNREACH`) instead of
+    /// waiting on a SYN that can never be answered.
+    fn has_external_interface(&self) -> bool {
+        true
+    }
 }
 
 /// A non-exhaustive list of errors that can be thrown by [`IPInterfaceProvider::send_ip_packet`].
@@ -270,6 +310,19 @@ pub trait TimeProvider {
     fn now(&self) -> Self::Instant;
     /// Returns the current system time.
     fn current_time(&self) -> Self::SystemTime;
+    /// Returns the total CPU time (user + system) consumed so far by the thread calling this
+    /// method, corresponding to `CLOCK_THREAD_CPUTIME_ID` on Linux.
+    ///
+    /// This must be genuine CPU-time accounting (i.e. it should stop advancing while the thread
+    /// is blocked/asleep and not scheduled on a CPU), not wall-clock time mislabeled as CPU time.
+    /// Implementations that cannot source real per-thread CPU time from their host must document
+    /// their fallback explicitly rather than silently returning elapsed wall-clock time.
+    fn thread_cpu_time(&self) -> core::time::Duration;
+    /// Returns the total CPU time (user + system) consumed so far by every thread that has ever
+    /// run as part of the current process, corresponding to `CLOCK_PROCESS_CPUTIME_ID` on Linux.
+    ///
+    /// See [`Self::thread_cpu_time`] for the same real-vs-fallback expectation.
+    fn process_cpu_time(&self) -> core::time::Duration;
 }
 
 /// An opaque measurement of a monotonically nondecreasing clock.
@@ -403,6 +456,15 @@ where
     #[must_use]
     fn write_at_offset(self, count: isize, value: T) -> Option<()>;
 
+    /// Atomically replaces a `u32` when its current value equals `current`.
+    ///
+    /// `None` reports an invalid, faulting, or misaligned pointer. The inner result is `Ok` with
+    /// the previous value when the exchange succeeds and `Err` with the observed value when the
+    /// comparison fails. The operation has sequentially consistent ordering.
+    fn compare_exchange_u32(self, current: u32, new: u32) -> Option<Result<u32, u32>>
+    where
+        Self: RawMutPointer<u32>;
+
     /// Write a slice of values at the given offset.
     ///
     /// Returns `None` if the provided pointer is invalid, or if the specified offset is known (in
@@ -497,6 +559,18 @@ pub enum StdioStream {
     Stderr = 2,
 }
 
+/// When a new terminal attribute value takes effect, mirroring POSIX
+/// `tcsetattr(3)`'s `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSetAction {
+    /// Apply immediately.
+    Now,
+    /// Apply after all pending output has been written.
+    Drain,
+    /// Apply after pending output is written, discarding unread input first.
+    Flush,
+}
+
 /// A provider of standard input/output functionality.
 pub trait StdioProvider {
     /// Read from standard input. Returns number of bytes read.
@@ -507,6 +581,61 @@ pub trait StdioProvider {
 
     /// Check if a stream is connected to a TTY.
     fn is_a_tty(&self, stream: StdioStream) -> bool;
+
+    /// Returns a real, epoll-observable readiness handle for stdin, for platforms that track it
+    /// via a background [`StdinPump`]. `None` means this platform cannot distinguish real stdin
+    /// readiness; callers should then treat stdin as always ready (the pre-existing behavior),
+    /// which is a safe, if imprecise, fallback.
+    fn stdin_pollable(&self) -> Option<&dyn crate::event::IOPollable> {
+        None
+    }
+
+    /// Best-effort: mirror the guest's raw/cooked-mode and echo settings onto the real host
+    /// terminal backing `stream`, so that when the guest disables canonical mode (`ICANON`) via
+    /// `TCSETS`, real host keystrokes actually start arriving byte-at-a-time instead of being
+    /// line-buffered by the host tty driver until Enter is pressed.
+    ///
+    /// Only meaningful (and only ever called) when [`Self::is_a_tty`] is true for `stream`.
+    /// Platforms without a real host terminal (or without host-level termios access) may leave
+    /// this a no-op -- the guest-visible termios state is tracked independently regardless.
+    fn set_terminal_raw_mode(&self, stream: StdioStream, raw: bool, echo: bool) {
+        let _ = (stream, raw, echo);
+    }
+
+    /// Like [`Self::set_terminal_raw_mode`], but additionally honors when the change takes
+    /// effect: [`TerminalSetAction::Drain`] must not apply the change until pending output has
+    /// been written to the terminal, and [`TerminalSetAction::Flush`] must additionally discard
+    /// any input the guest has not yet read -- including bytes already buffered by a background
+    /// [`StdinPump`], not only the host tty's own input
+    /// queue.
+    ///
+    /// The default implementation ignores `action` and delegates to
+    /// [`Self::set_terminal_raw_mode`], matching every platform's pre-existing `TCSANOW`-only
+    /// behavior until a platform opts into the finer distinction.
+    fn set_terminal_raw_mode_with_action(
+        &self,
+        stream: StdioStream,
+        raw: bool,
+        echo: bool,
+        action: TerminalSetAction,
+    ) {
+        let _ = action;
+        self.set_terminal_raw_mode(stream, raw, echo);
+    }
+
+    /// Best-effort: returns the real terminal's current `(rows, cols)`, for platforms that can
+    /// query it (e.g. `TIOCGWINSZ` on the real host fd, or `GetConsoleScreenBufferInfo` on
+    /// Windows). `None` means this platform has no real terminal to query (headless, redirected,
+    /// or a platform without host-level tty access) -- callers should then fall back to a
+    /// reasonable default `Winsize` rather than treating `None` as an error.
+    ///
+    /// Backing `TIOCGWINSZ`: guests (notably `ash`'s line editor) use this to decide the column
+    /// width at which to wrap their own echoed-input redisplay, so a fake, too-narrow size here
+    /// causes the guest to insert spurious wraps well before the real terminal would ever need
+    /// to.
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        None
+    }
 }
 
 /// A provider for system information.
@@ -522,6 +651,53 @@ pub trait SystemInfoProvider {
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`
     /// if the platform does not support or provide a VDSO.
     fn get_vdso_address(&self) -> Option<usize>;
+
+    /// The byte offset from this host's per-thread anchor register at which the
+    /// runtime keeps the guest thread pointer.
+    ///
+    /// Returns `None` on a host whose rewritten guest images already carry that
+    /// offset as an immediate, which is every host that can decide the number
+    /// when the image is packaged. A host returns `Some` only when the number is
+    /// a property of the running process rather than of the image -- macOS, where
+    /// the slot is a pthread TSD key whose value depends on the runner binary's
+    /// own startup sequence. A loader writes it into the trampoline so the gates
+    /// read the slot the runtime actually reserved.
+    fn get_guest_tp_slot_offset(&self) -> Option<usize> {
+        None
+    }
+
+    /// The address of a runtime-owned trampoline the shim can install as a
+    /// guest signal handler's return address when the guest registered the
+    /// handler without `SA_RESTORER`.
+    ///
+    /// Real Linux falls back to a vDSO-resident `sigtramp` for this case; a
+    /// host with no vDSO ([`Self::get_vdso_address`] returns `None`) has
+    /// nothing at a guest-reachable address to fall back to unless it builds
+    /// one itself. Returns `None` by default, matching every platform's
+    /// current behavior: a handler registered without `SA_RESTORER` has
+    /// nowhere to return to, so signal delivery is refused rather than
+    /// entering the handler with a wild return address. A platform that
+    /// implements the trampoline overrides this to report its address --
+    /// exactly the pattern [`Self::get_syscall_entry_point`] already
+    /// establishes for handing a host code address to guest-reachable
+    /// register state.
+    fn get_sigreturn_trampoline_address(&self) -> Option<usize> {
+        None
+    }
+
+    /// The `(AT_HWCAP, AT_HWCAP2)` values a real Linux kernel on this host's CPU would report.
+    ///
+    /// A guest's instructions execute directly on the host CPU (this is a syscall-translation
+    /// layer, not an instruction-level emulator), so any bit reported here is safe exactly when
+    /// the host CPU genuinely implements that feature -- there is no emulation gap to bridge.
+    /// Returns `(0, 0)` by default, matching every platform's current behavior (no host queries
+    /// its own CPU features yet): userspace software reading `getauxval(AT_HWCAP)` sees no
+    /// optional features and falls back to a baseline code path, which is always correct, only
+    /// potentially slower than reporting the host's real capabilities. A platform overrides this
+    /// to report accurately once it has a way to query its own CPU's feature set.
+    fn get_hwcap(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// A provider for thread-local storage.

@@ -25,6 +25,12 @@ fn copyright_header() -> Result<()> {
         if skipped_files.contains(file.as_os_str()) {
             continue;
         }
+        if SKIP_DIRS
+            .iter()
+            .any(|dir| file.to_string_lossy().starts_with(dir))
+        {
+            continue;
+        }
         let Some(ext) = file.extension() else {
             errors.push(format!("extension-less file {file:?}"));
             continue;
@@ -91,6 +97,10 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
         "#! /bin/bash\n\n# Copyright (c) Microsoft Corporation.\n# Licensed under the MIT license.\n\n",
     ),
     (
+        "awk",
+        "# Copyright (c) Microsoft Corporation.\n# Licensed under the MIT license.\n\n",
+    ),
+    (
         "S",
         "/* Copyright (c) Microsoft Corporation.\n   Licensed under the MIT license. */\n\n",
     ),
@@ -117,6 +127,7 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
     ("json", ""),
     ("ld", ""),
     ("lock", ""),
+    ("macho", ""),
     ("md", ""),
     ("png", ""),
     ("snap", ""),
@@ -131,6 +142,11 @@ const HEADERS_REQUIRED_PREFIX: &[(&str, &str)] = &[
 // tests. Please do NOT modify this unless you have a very compelling reason to.
 const SKIP_FILES: &[&str] = &[
     "LICENSE",
+    // An `npm` `bin` entry must start with a `#!` line for the shim npm
+    // generates on Unix to work, and the header rule requires the copyright to
+    // be the very first bytes of the file. The two cannot both hold, so the
+    // copyright sits immediately below the shebang instead.
+    "npm/bin/litebox.js",
     "litebox/src/sync/mutex.rs",
     "litebox/src/sync/rwlock.rs",
     "litebox_runner_linux_on_windows_userland/tests/test-bins/hello_exec_nolibc",
@@ -141,4 +157,31 @@ const SKIP_FILES: &[&str] = &[
     "litebox_runner_linux_on_windows_userland/tests/test-bins/thread_static",
     "litebox_syscall_rewriter/tests/hello",
     "litebox_syscall_rewriter/tests/hello-32",
+    "litebox_syscall_rewriter/tests/hello-aarch64",
+    // An Xcode/`codesign` entitlements property list: the header rule requires
+    // the copyright to be the very first bytes, but a `.plist` must begin with
+    // the literal `<?xml version="1.0" ...?>` declaration for `codesign` to
+    // accept it.
+    "litebox_runner_linux_on_macos_userland/entitlements.plist",
+];
+
+/// Directory prefixes holding source that is not LiteBox's to license.
+///
+/// LiteBox's header rule says every source file carries the Microsoft copyright.
+/// That is a claim about authorship, so it can only be applied to trees this
+/// repository actually owns; stamping it across vendored third-party source
+/// would assert something untrue. Skipping by prefix rather than by listing each
+/// file keeps a vendored tree from having to be re-enumerated whenever it gains
+/// a file.
+const SKIP_DIRS: &[&str] = &[
+    // A separate Next.js/TypeScript application that lives in this repository
+    // but is not part of LiteBox: no LiteBox crate builds, links, or tests
+    // against it. Its ~135 files are TypeScript, TSX and JavaScript, none of
+    // which the header table above describes.
+    "tencent-bd-dashboard/",
+    // A locally-patched copy of the `tar-no-std` crate (MIT-licensed, upstream
+    // https://github.com/phip1611/tar-no-std), vendored via `[patch.crates-io]`
+    // in the workspace `Cargo.toml` to fix a real end-of-archive parsing bug.
+    // Its own LICENSE file already names its actual copyright holder.
+    "vendor/",
 ];

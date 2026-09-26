@@ -185,6 +185,16 @@ impl<T: FromBytes + IntoBytes> RawMutPointer<T> for TransparentMutPtr<T> {
         }
         Some(())
     }
+    fn compare_exchange_u32(self, current: u32, new: u32) -> Option<Result<u32, u32>>
+    where
+        Self: RawMutPointer<u32>,
+    {
+        let ptr = self.as_ptr().cast::<u32>();
+        if ptr.is_null() || !ptr.is_aligned() {
+            return None;
+        }
+        unsafe { crate::mm::exception_table::compare_exchange_u32_fallible(ptr, current, new).ok() }
+    }
     fn mutate_subslice_with<R>(
         self,
         range: impl core::ops::RangeBounds<isize>,

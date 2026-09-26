@@ -264,6 +264,17 @@ impl TimeProvider for MockPlatform {
             time: self.current_time.load(Ordering::SeqCst),
         }
     }
+
+    fn thread_cpu_time(&self) -> core::time::Duration {
+        // This deterministic test mock has no real CPU scheduler underneath it to source
+        // genuine CPU-time accounting from, so -- rather than silently mislabeling wall-clock
+        // time as CPU time -- it explicitly reports zero.
+        core::time::Duration::ZERO
+    }
+
+    fn process_cpu_time(&self) -> core::time::Duration {
+        core::time::Duration::ZERO
+    }
 }
 
 impl ArchSpecificProvider for MockPlatform {

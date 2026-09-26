@@ -1,0 +1,15 @@
+[package]
+name = "litebox_broker_host"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+hashbrown = "0.15.2"
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
+thiserror = { version = "2.0.6", default-features = false }
+
+[lints]
+workspace = true

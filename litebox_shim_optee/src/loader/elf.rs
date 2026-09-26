@@ -222,7 +222,11 @@ impl<'a, Platform: crate::OpteeShimPlatform> FileAndParsed<'a, Platform> {
         let file = ElfFileInMemory::new(task, elf_buf);
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
-        match parsed.parse_trampoline(&mut &file, task.global.platform.get_syscall_entry_point()) {
+        match parsed.parse_trampoline(
+            &mut &file,
+            task.global.platform.get_syscall_entry_point(),
+            task.global.platform.get_guest_tp_slot_offset(),
+        ) {
             Ok(()) | Err(ElfParseError::UnpatchedBinary) => {}
             Err(e) => return Err(e.into()),
         }

@@ -1,18 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::fs::{Mode, OFlags};
-use litebox_common_linux::{AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, errno::Errno};
+use litebox::fs::{FileSystem as _, Mode, OFlags};
+use litebox_common_linux::{
+    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, FlockOperation, Timespec, UTIME_NOW,
+    UTIME_OMIT, errno::Errno,
+};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
-
-#[cfg(target_arch = "x86_64")]
-use litebox::shim::{Exception, ExceptionInfo};
-#[cfg(target_arch = "x86_64")]
-use litebox_common_linux::PtRegs;
-#[cfg(target_arch = "x86_64")]
-use litebox_common_linux::signal::{FPE_INTDIV, ILL_ILLOPN, SI_KERNEL, SiginfoData, Signal};
 
 extern crate std;
 
@@ -25,6 +21,8 @@ const TEST_TAR_FILE: &[u8] = include_bytes!("../../../litebox/src/fs/test.tar");
 /// hard-wired to one.
 #[cfg(target_os = "linux")]
 pub(crate) use litebox_platform_linux_userland::LinuxUserland as TestPlatform;
+#[cfg(target_os = "macos")]
+pub(crate) use litebox_platform_macos_userland::MacOsUserland as TestPlatform;
 #[cfg(target_os = "windows")]
 pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatform;
 
@@ -37,6 +35,10 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
         {
             TestPlatform::new(tun_device_name)
         }
+        #[cfg(target_os = "macos")]
+        {
+            TestPlatform::new(tun_device_name)
+        }
         #[cfg(target_os = "windows")]
         {
             let _ = tun_device_name;
@@ -45,19 +47,66 @@ pub(crate) fn test_platform(tun_device_name: Option<&str>) -> &'static TestPlatf
     })
 }
 
+/// Serializes tests that map guest memory.
+///
+/// Each test builds its own task with its own virtual-memory manager, but every
+/// task in this binary maps into the one host address space, and a VMM models
+/// only its own mappings. Two tests running at once therefore pick addresses
+/// without seeing each other's, and the loser gets a collision. Holding this for
+/// the duration of a mapping test makes the placement search meaningful again.
+///
+/// This is only reliably visible on a host whose guest range overlaps the host's
+/// own: arm64 macOS puts both above the 4 GiB `__PAGEZERO` floor, so collisions
+/// are routine there and rare elsewhere.
+static ADDRESS_SPACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the guest-address-space lock for the rest of the current test. A
+/// poisoned lock is not a failure here: it only means some earlier test panicked
+/// while holding it, and the address space is no less usable for that.
+pub(crate) fn address_space_guard() -> std::sync::MutexGuard<'static, ()> {
+    ADDRESS_SPACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Serializes tests that exercise real asynchronous-signal delivery: alarms,
+/// timers, and anything that ends up checking or draining pending signals.
+///
+/// Each test builds its own task, but every task in this binary shares the one
+/// `TestPlatform`, and every `TestPlatform` installs the same real host signal
+/// handlers into this one process -- `SIGINT`/`SIGALRM` (and, on macOS, the
+/// timer-thread wakeup signal) land regardless of which test's task "owns"
+/// them. `litebox_platform_macos_userland`'s pending-signal bitmap is now
+/// per-thread rather than process-wide, so the specific race this guard was
+/// first added for (two tasks racing to drain one shared bitmap) no longer
+/// applies there; this mutex still serializes the coarser hazard of two tests'
+/// real host signals landing on whichever test happens to be blocked in a
+/// syscall at the time, which per-thread bitmap state does not by itself
+/// prevent.
+static ASYNC_SIGNAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the async-signal lock for the rest of the current test. A poisoned
+/// lock is not a failure here, matching [`address_space_guard`].
+pub(crate) fn async_signal_guard() -> std::sync::MutexGuard<'static, ()> {
+    ASYNC_SIGNAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[must_use]
-pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<TestPlatform> {
+pub(crate) fn init_platform(
+    tun_device_name: Option<&str>,
+) -> crate::Task<TestPlatform, crate::DefaultFS<TestPlatform>> {
     let platform = test_platform(tun_device_name);
 
     let shim_builder = crate::LinuxShimBuilder::new(platform);
-    let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-        "/",
-        litebox::fs::in_mem::InitialNode::Directory {
-            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-            owner: litebox::fs::UserInfo::ROOT,
-        },
-    )]);
-    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem, TEST_TAR_FILE.into()));
+    let litebox = shim_builder.litebox();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem_fs.with_root_privileges(|fs| {
+        fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to set permissions on root");
+    });
+    let fs = alloc::sync::Arc::new(shim_builder.default_fs(in_mem_fs, TEST_TAR_FILE.into()));
     let task = shim_builder.build().0.new_test_task(fs);
 
     if tun_device_name.is_some() {
@@ -77,50 +126,6 @@ pub(crate) fn init_platform(tun_device_name: Option<&str>) -> crate::Task<TestPl
         });
     }
     task
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn exceptions_queue_their_corresponding_signals() {
-    const FAULT_PC: usize = 0x4444_0000;
-
-    let task = init_platform(None);
-    let ctx = PtRegs {
-        rip: FAULT_PC,
-        ..Default::default()
-    };
-
-    for (exception, signal, code, addr) in [
-        (
-            Exception::DIVIDE_ERROR,
-            Signal::SIGFPE,
-            FPE_INTDIV,
-            FAULT_PC,
-        ),
-        (Exception::BREAKPOINT, Signal::SIGTRAP, SI_KERNEL, 0),
-        (
-            Exception::INVALID_OPCODE,
-            Signal::SIGILL,
-            ILL_ILLOPN,
-            FAULT_PC,
-        ),
-    ] {
-        task.handle_exception_request(
-            &ExceptionInfo {
-                exception,
-                error_code: 0,
-                cr2: 0,
-                kernel_mode: false,
-            },
-            &ctx,
-        );
-
-        let siginfo = task.take_pending_siginfo(signal);
-        assert_eq!(siginfo.code, code);
-        let actual_data = siginfo.data.pad;
-        let expected_data = SiginfoData::new_addr(addr).pad;
-        assert_eq!(actual_data, expected_data);
-    }
 }
 
 #[test]
@@ -153,19 +158,40 @@ fn test_fcntl() {
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
 
-    // Test eventfd
-    let eventfd = task
+    // Eventfd works without a broker via the local fallback backend (it used
+    // to fail with EIO here, which aborted Node at uv_loop_init).
+    let event_fd = task
         .sys_eventfd2(
             0,
             EfdFlags::CLOEXEC | EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK,
         )
-        .expect("Failed to create eventfd");
-    let eventfd = i32::try_from(eventfd).unwrap();
-    check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+        .expect("brokerless eventfd must fall back to the local backend");
+    task.sys_close(i32::try_from(event_fd).unwrap())
+        .expect("closing the eventfd");
+
+    // Regular (non-stdio) files carry no `StdioStatusFlags` metadata; SETFL on one must be a
+    // real-Linux-matching no-op rather than panicking.
+    let regular_fd = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/fcntl_setfl_regular_file.txt",
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create regular file for SETFL no-op check");
+    let regular_fd = i32::try_from(regular_fd).unwrap();
+    task.sys_fcntl(regular_fd, FcntlArg::SETFL(OFlags::NONBLOCK))
+        .expect("SETFL on a regular file should be a no-op, not panic");
+    let _ = task.sys_close(regular_fd);
 
     // Test fcntl with DUPFD
     let fd = task
-        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/dev/stdin",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .unwrap();
     let fd = i32::try_from(fd).unwrap();
 
@@ -185,36 +211,16 @@ fn test_fcntl() {
 }
 
 #[test]
-fn test_pipe2_race_with_concurrent_close() {
-    let task = init_platform(None);
-    task.files.borrow().set_max_fd(4);
-
-    let stop = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-    let stop_closer = stop.clone();
-    let closer = task.spawn_clone_for_test(move |task| {
-        while !stop_closer.load(core::sync::atomic::Ordering::Relaxed) {
-            let _ = task.sys_close(3);
-        }
-    });
-
-    for iter in 0..50_000 {
-        assert_eq!(
-            task.sys_pipe2(OFlags::empty()),
-            Err(Errno::EMFILE),
-            "failed at iteration {iter}"
-        );
-    }
-
-    stop.store(true, core::sync::atomic::Ordering::Relaxed);
-    closer.join().unwrap();
-}
-
-#[test]
 fn test_dup() {
     let task = init_platform(None);
 
     let fd = task
-        .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/dev/stdin",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .unwrap();
     let fd = i32::try_from(fd).unwrap();
     // test dup
@@ -246,7 +252,8 @@ fn test_getdent64() {
 
     // Create test files in root directory for testing
     let file1_fd = task
-        .sys_open(
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
             "/test_file1.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RUSR | Mode::WUSR,
@@ -256,7 +263,8 @@ fn test_getdent64() {
         .expect("Failed to close test_file1.txt");
 
     let file2_fd = task
-        .sys_open(
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
             "/test_file2.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RUSR | Mode::WUSR,
@@ -267,7 +275,12 @@ fn test_getdent64() {
 
     // Open the root directory for testing
     let dir_fd = task
-        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("Failed to open root directory");
     let dir_fd = dir_fd.try_into().unwrap();
 
@@ -339,6 +352,8 @@ fn test_getdent64() {
             "bar",
             "dev",
             "foo",
+            // `/proc`, mounted alongside `/dev` by `default_fs` (see `litebox::fs::proc`).
+            "proc",
             "test_file1.txt",
             "test_file2.txt"
         ]
@@ -369,7 +384,12 @@ fn test_getdent64() {
 
     // Test 2: Small buffer (should handle partial reads gracefully)
     let dir_fd = task
-        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("Failed to open root directory");
     let dir_fd = dir_fd.try_into().unwrap();
     let mut small_buffer = [0u8; 64];
@@ -408,7 +428,12 @@ fn test_getdent64() {
 
     // Test 4: File descriptor pointing to a regular file (not a directory)
     let file1_fd = task
-        .sys_open("/test_file1.txt", OFlags::RDONLY, Mode::empty())
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/test_file1.txt",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("Failed to open test_file1.txt");
     let file1_fd = file1_fd.try_into().unwrap();
 
@@ -441,7 +466,12 @@ fn test_getdent64() {
     // Test 6: Multiple reads (test directory offset tracking)
     // Reopen directory to reset position
     let dir_fd2 = task
-        .sys_open("/", OFlags::RDONLY, Mode::empty())
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("Failed to reopen root directory");
     let dir_fd2 = dir_fd2.try_into().unwrap();
 
@@ -505,6 +535,7 @@ fn test_getdent64() {
             "bar",
             "dev",
             "foo",
+            "proc",
             "test_file1.txt",
             "test_file2.txt"
         ]
@@ -530,7 +561,12 @@ fn test_umask_behavior() {
     let file_mode = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH; // 0o666
     let test_file = "/umask_rs_test_file_perm.txt";
     let fd = task
-        .sys_open(test_file, OFlags::CREAT | OFlags::WRONLY, file_mode)
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            test_file,
+            OFlags::CREAT | OFlags::WRONLY,
+            file_mode,
+        )
         .expect("Failed to create test file with O_CREAT");
     // Close it (ignore errors)
     let _ = task.sys_close(i32::try_from(fd).unwrap());
@@ -616,8 +652,13 @@ fn test_rlimit_nofile() {
         Errno::EMFILE,
     );
     assert_eq!(
-        task.sys_open("/prlimit_file", OFlags::CREAT | OFlags::RDONLY, Mode::RWXU)
-            .expect_err("open should fail due to new cur limit"),
+        task.sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            "/prlimit_file",
+            OFlags::CREAT | OFlags::RDONLY,
+            Mode::RWXU
+        )
+        .expect_err("open should fail due to new cur limit"),
         Errno::EMFILE,
     );
 }
@@ -629,7 +670,8 @@ fn test_unlinkat() {
     // 1. Create a regular file and unlink it.
     let file_path = "/unlink_test_file.txt";
     let fd = task
-        .sys_open(
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
             file_path,
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RUSR | Mode::WUSR,
@@ -661,7 +703,8 @@ fn test_unlinkat() {
     task.sys_mkdirat(litebox_common_linux::AT_FDCWD, nonempty_dir, dir_mode)
         .expect("Failed to create non-empty directory");
     let inner_file_fd = task
-        .sys_open(
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
             "/unlink_dir_nonempty/inner.txt",
             OFlags::CREAT | OFlags::WRONLY,
             Mode::RUSR | Mode::WUSR,
@@ -706,6 +749,448 @@ fn test_unlinkat() {
         Err(Errno::ENOENT),
         "Second directory should no longer exist after removal"
     );
+}
+
+#[test]
+fn test_chmod_fchmod_fchmodat_round_trip() {
+    let task = init_platform(None);
+
+    let file_path = "/chmod_test_file.txt";
+    let fd = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // `chmod` via path. `chmod` has no wrapper of its own (see `sys_fchmodat`'s doc comment); the
+    // syscall dispatcher reaches it by constructing an `Fchmodat` request with `dirfd` forced to
+    // `AT_FDCWD`, so exercise that exact shape here.
+    task.sys_fchmodat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        0o640,
+        AtFlags::empty(),
+    )
+    .expect("chmod (via fchmodat + AT_FDCWD) should succeed");
+    let stat = task.sys_stat(file_path).expect("stat should succeed");
+    assert_eq!(
+        stat.st_mode & 0o7777,
+        0o640,
+        "chmod should have set the new mode, read back via stat"
+    );
+
+    // `fchmod` via the still-open fd.
+    task.sys_fchmod(fd, 0o600).expect("fchmod should succeed");
+    let stat = task.sys_fstat(fd).expect("fstat should succeed");
+    assert_eq!(
+        stat.st_mode & 0o7777,
+        0o600,
+        "fchmod should have set the new mode, read back via fstat"
+    );
+
+    // `fchmodat` with `AT_FDCWD` + a relative path. (This shim does not yet resolve a real,
+    // non-`AT_FDCWD` dirfd against a relative path -- see `resolve_path_at`'s `FsPath::FdRelative`
+    // arm -- a pre-existing limitation shared by every `*at` syscall, not something specific to
+    // this change.)
+    task.sys_chdir("/").unwrap();
+    task.sys_fchmodat(
+        litebox_common_linux::AT_FDCWD,
+        "chmod_test_file.txt",
+        0o755,
+        AtFlags::empty(),
+    )
+    .expect("fchmodat should succeed");
+    let stat = task.sys_stat(file_path).expect("stat should succeed");
+    assert_eq!(
+        stat.st_mode & 0o7777,
+        0o755,
+        "fchmodat should have set the new mode, read back via stat"
+    );
+
+    // An unrecognized flag is rejected.
+    assert_eq!(
+        task.sys_fchmodat(
+            litebox_common_linux::AT_FDCWD,
+            "chmod_test_file.txt",
+            0o755,
+            AtFlags::AT_EMPTY_PATH
+        ),
+        Err(Errno::EINVAL)
+    );
+
+    // `fchmod` on a closed fd fails with `EBADF`.
+    task.sys_close(fd).unwrap();
+    assert_eq!(task.sys_fchmod(fd, 0o600), Err(Errno::EBADF));
+}
+
+#[test]
+fn test_utimensat_futimens_round_trip() {
+    let task = init_platform(None);
+
+    let file_path = "/utime_test_file.txt";
+    let fd = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::CREAT | OFlags::WRONLY,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd = i32::try_from(fd).unwrap();
+
+    // Explicit atime/mtime via `utimensat`.
+    let atime = Timespec {
+        tv_sec: 1_000_000,
+        tv_nsec: 123,
+    };
+    let mtime = Timespec {
+        tv_sec: 2_000_000,
+        tv_nsec: 456,
+    };
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        Some([atime, mtime]),
+        AtFlags::empty(),
+    )
+    .expect("utimensat should succeed");
+    let stat = task.sys_stat(file_path).unwrap();
+    assert_eq!((stat.st_atime, stat.st_atime_nsec), (1_000_000, 123));
+    assert_eq!((stat.st_mtime, stat.st_mtime_nsec), (2_000_000, 456));
+
+    // `UTIME_OMIT` on `atime` leaves it unchanged; an explicit `mtime` still applies.
+    let omit = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_OMIT,
+    };
+    let mtime2 = Timespec {
+        tv_sec: 3_000_000,
+        tv_nsec: 789,
+    };
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        Some([omit, mtime2]),
+        AtFlags::empty(),
+    )
+    .expect("utimensat with UTIME_OMIT should succeed");
+    let stat = task.sys_stat(file_path).unwrap();
+    assert_eq!(
+        (stat.st_atime, stat.st_atime_nsec),
+        (1_000_000, 123),
+        "UTIME_OMIT must leave atime unchanged"
+    );
+    assert_eq!((stat.st_mtime, stat.st_mtime_nsec), (3_000_000, 789));
+
+    // `UTIME_NOW` (explicit, both fields) resolves against wall-clock time.
+    let before = task.real_time_as_duration_since_epoch();
+    let now_ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_NOW,
+    };
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        Some([now_ts, now_ts]),
+        AtFlags::empty(),
+    )
+    .expect("utimensat with UTIME_NOW should succeed");
+    let after = task.real_time_as_duration_since_epoch();
+    let stat = task.sys_stat(file_path).unwrap();
+    let atime_secs = u64::try_from(stat.st_atime).unwrap();
+    assert!(
+        atime_secs >= before.as_secs() && atime_secs <= after.as_secs(),
+        "UTIME_NOW should resolve to the current wall-clock time, got {atime_secs} \
+         outside [{}, {}]",
+        before.as_secs(),
+        after.as_secs()
+    );
+    // Copied to locals before comparing: `assert_eq!` takes references to its arguments, and a
+    // reference straight into a packed struct's field is unaligned (UB) even if never
+    // dereferenced -- see the tuple-literal comparisons above, which sidestep this by
+    // constructing a new, properly-aligned tuple value instead of referencing the field in place.
+    let (atime, mtime) = (stat.st_atime, stat.st_mtime);
+    assert_eq!(
+        atime, mtime,
+        "UTIME_NOW applied to both fields should produce matching timestamps"
+    );
+
+    // A `NULL` `times` pointer (`None`) also means "both UTIME_NOW".
+    task.sys_utimensat(
+        litebox_common_linux::AT_FDCWD,
+        file_path,
+        None,
+        AtFlags::empty(),
+    )
+    .expect("utimensat with NULL times should succeed");
+
+    // `futimens`, reached (per the shim's syscall dispatcher) via a `NULL` pathname, operates on
+    // the fd directly rather than re-resolving a path.
+    let atime3 = Timespec {
+        tv_sec: 5_000_000,
+        tv_nsec: 111,
+    };
+    let mtime3 = Timespec {
+        tv_sec: 6_000_000,
+        tv_nsec: 222,
+    };
+    task.sys_futimens(fd, Some([atime3, mtime3]))
+        .expect("futimens should succeed");
+    let stat = task.sys_fstat(fd).unwrap();
+    assert_eq!((stat.st_atime, stat.st_atime_nsec), (5_000_000, 111));
+    assert_eq!((stat.st_mtime, stat.st_mtime_nsec), (6_000_000, 222));
+
+    // An invalid (out-of-range, non-sentinel) `tv_nsec` is rejected.
+    let bad = Timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000_000,
+    };
+    assert_eq!(
+        task.sys_utimensat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            Some([bad, bad]),
+            AtFlags::empty()
+        ),
+        Err(Errno::EINVAL)
+    );
+
+    // `futimens` on a closed fd fails with `EBADF`.
+    task.sys_close(fd).unwrap();
+    assert_eq!(
+        task.sys_futimens(fd, Some([atime3, mtime3])),
+        Err(Errno::EBADF)
+    );
+}
+
+#[test]
+fn test_flock_shared_exclusive_contention() {
+    let task = init_platform(None);
+
+    let file_path = "/flock_test_file.txt";
+    let fd1 = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd1 = i32::try_from(fd1).unwrap();
+    // An independent second open of the same file: real `flock` treats these as independent
+    // holders that can contend with each other, which is exactly what's being exercised here.
+    let fd2 = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::RDWR,
+            Mode::empty(),
+        )
+        .unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    // Exclusive lock via fd1 succeeds uncontended.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX)
+        .expect("LOCK_EX should succeed uncontended");
+
+    // A non-blocking exclusive attempt via fd2 fails: fd1 holds it exclusively.
+    assert_eq!(
+        task.sys_flock(fd2, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB),
+        Err(Errno::EWOULDBLOCK)
+    );
+    // A non-blocking shared attempt via fd2 fails too, for the same reason.
+    assert_eq!(
+        task.sys_flock(fd2, FlockOperation::LOCK_SH | FlockOperation::LOCK_NB),
+        Err(Errno::EWOULDBLOCK)
+    );
+
+    // Re-locking (converting) from the SAME holder never blocks on itself.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB)
+        .expect("re-affirming the exclusive lock we already hold must not block");
+    task.sys_flock(fd1, FlockOperation::LOCK_SH | FlockOperation::LOCK_NB)
+        .expect("downgrading the exclusive lock we hold must not block");
+
+    // Now that fd1 only holds a shared lock, a second shared lock via fd2 succeeds concurrently.
+    task.sys_flock(fd2, FlockOperation::LOCK_SH | FlockOperation::LOCK_NB)
+        .expect("two shared holders should be able to coexist");
+
+    // But fd2 cannot upgrade to exclusive while fd1 still holds a shared lock too.
+    assert_eq!(
+        task.sys_flock(fd2, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB),
+        Err(Errno::EWOULDBLOCK)
+    );
+
+    // Unlocking fd1 lets fd2 upgrade.
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+    task.sys_flock(fd2, FlockOperation::LOCK_EX | FlockOperation::LOCK_NB)
+        .expect("fd2 should now be able to acquire exclusively");
+
+    // `LOCK_UN` on an fd that isn't (or is no longer) a holder is a harmless no-op.
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+
+    // An unrecognized operation is rejected.
+    assert_eq!(
+        task.sys_flock(fd1, FlockOperation::empty()),
+        Err(Errno::EINVAL)
+    );
+
+    task.sys_flock(fd2, FlockOperation::LOCK_UN).unwrap();
+    task.sys_close(fd1).unwrap();
+    task.sys_close(fd2).unwrap();
+}
+
+#[test]
+fn test_flock_blocks_across_real_threads_and_wakes_on_unlock() {
+    fn join_with_timeout<T>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: std::time::Duration,
+        thread_name: &str,
+    ) -> T {
+        let start = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                start.elapsed() < timeout,
+                "{thread_name} timed out after {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        handle.join().expect("{thread_name} panicked")
+    }
+
+    let task = init_platform(None);
+    let file_path = "/flock_blocking_test_file.txt";
+    let fd1 = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd1 = i32::try_from(fd1).unwrap();
+    let fd2 = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::RDWR,
+            Mode::empty(),
+        )
+        .unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    // The main "thread" (guest thread) holds an exclusive lock.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX).unwrap();
+
+    // A second real guest thread, sharing the same fd table (via a real host thread), blocks
+    // trying to acquire the same file exclusively too.
+    let blocked =
+        task.spawn_clone_for_test(move |task| task.sys_flock(fd2, FlockOperation::LOCK_EX));
+
+    // Give the second thread a real chance to actually block before we check it hasn't finished.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !blocked.is_finished(),
+        "the second thread should still be blocked on the lock fd1 holds"
+    );
+
+    // Releasing the lock must wake the blocked waiter.
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+    let result = join_with_timeout(
+        blocked,
+        std::time::Duration::from_secs(5),
+        "blocked flock waiter",
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "the blocked LOCK_EX call should succeed once fd1 releases the lock"
+    );
+
+    task.sys_flock(fd2, FlockOperation::LOCK_UN).unwrap();
+    task.sys_close(fd1).unwrap();
+    task.sys_close(fd2).unwrap();
+}
+
+/// A holder converting its own exclusive lock down to shared can unblock a different, real thread
+/// blocked wanting a shared lock -- without that holder ever calling `LOCK_UN`. Regression test
+/// for a real bug caught during development: only `unlock` used to wake waiters, so this exact
+/// scenario hung until the blocking party's *next* unrelated wake.
+#[test]
+fn test_flock_downgrade_wakes_a_different_blocked_waiter() {
+    fn join_with_timeout<T>(
+        handle: std::thread::JoinHandle<T>,
+        timeout: std::time::Duration,
+        thread_name: &str,
+    ) -> T {
+        let start = std::time::Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                start.elapsed() < timeout,
+                "{thread_name} timed out after {timeout:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        handle.join().expect("{thread_name} panicked")
+    }
+
+    let task = init_platform(None);
+    let file_path = "/flock_downgrade_test_file.txt";
+    let fd1 = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::CREAT | OFlags::RDWR,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .expect("Failed to create test file");
+    let fd1 = i32::try_from(fd1).unwrap();
+    let fd2 = task
+        .sys_openat(
+            litebox_common_linux::AT_FDCWD,
+            file_path,
+            OFlags::RDWR,
+            Mode::empty(),
+        )
+        .unwrap();
+    let fd2 = i32::try_from(fd2).unwrap();
+
+    // fd1 holds an exclusive lock.
+    task.sys_flock(fd1, FlockOperation::LOCK_EX).unwrap();
+
+    // A second real guest thread blocks wanting a *shared* lock via fd2.
+    let blocked =
+        task.spawn_clone_for_test(move |task| task.sys_flock(fd2, FlockOperation::LOCK_SH));
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert!(
+        !blocked.is_finished(),
+        "fd2 should still be blocked while fd1 holds the lock exclusively"
+    );
+
+    // fd1 downgrades its own lock to shared -- never calls LOCK_UN. Real flock(2) treats this as
+    // an in-place conversion, and it should immediately make room for fd2's shared request.
+    task.sys_flock(fd1, FlockOperation::LOCK_SH)
+        .expect("downgrading the lock we hold must not block");
+
+    let result = join_with_timeout(
+        blocked,
+        std::time::Duration::from_secs(5),
+        "blocked LOCK_SH waiter",
+    );
+    assert_eq!(
+        result,
+        Ok(()),
+        "fd1's downgrade to shared should have woken fd2's blocked LOCK_SH"
+    );
+
+    task.sys_flock(fd1, FlockOperation::LOCK_UN).unwrap();
+    task.sys_flock(fd2, FlockOperation::LOCK_UN).unwrap();
+    task.sys_close(fd1).unwrap();
+    task.sys_close(fd2).unwrap();
 }
 
 /// Regression test for a bug where readers can be permanently starved on

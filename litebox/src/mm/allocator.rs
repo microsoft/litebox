@@ -162,18 +162,14 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
             Self::BASE_PAGE_SIZE => {
                 // Best to use the underlying backend directly to allocate pages
                 // to avoid fragmentation
-                let Some(ptr) = self.allocate_pages(Self::BASE_PAGE_SIZE_ORDER) else {
-                    return core::ptr::null_mut();
-                };
-                ptr
+                self.allocate_pages(Self::BASE_PAGE_SIZE_ORDER)
+                    .expect("allocate page")
             }
             Self::LARGE_PAGE_SIZE => {
                 // Best to use the underlying backend directly to allocate large pages
                 // to avoid fragmentation
-                let Some(ptr) = self.allocate_pages(Self::LARGE_PAGE_SIZE_ORDER) else {
-                    return core::ptr::null_mut();
-                };
-                ptr
+                self.allocate_pages(Self::LARGE_PAGE_SIZE_ORDER)
+                    .expect("allocate large page")
             }
             0..=ZoneAllocator::MAX_ALLOC_SIZE => {
                 let mut zone_allocator = self.slab_allocator.lock();

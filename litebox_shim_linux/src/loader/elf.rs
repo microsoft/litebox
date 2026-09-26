@@ -5,13 +5,22 @@
 
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
-    fs::{Mode, OFlags},
+    fs::{AccessCredentials, FileStatus},
     mm::vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmFlags},
-    platform::PageManagementProvider,
-    utils::{ReinterpretSignedExt, TruncateExt},
+    utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, errno::Errno, loader::ElfParsedFile};
 use thiserror::Error;
+
+/// The loader and the rewriter must name the same word for the guest
+/// thread-pointer offset. `litebox_common_linux` cannot depend on the rewriter,
+/// so this crate -- which depends on both -- is where the two are held together.
+/// A drift here would make the loader publish the offset into the middle of an
+/// instruction instead of into the slot the gates read.
+const _: () = assert!(
+    litebox_common_linux::loader::TRAMPOLINE_GUEST_TP_SLOT_OFFSET
+        == litebox_syscall_rewriter::TRAMPOLINE_GUEST_TP_SLOT_OFFSET
+);
 
 use crate::{
     UserPtrMut,
@@ -19,19 +28,20 @@ use crate::{
 };
 
 use super::stack::UserStack;
-use crate::{ShimPlatform, Task};
+use crate::{ShimFS, ShimPlatform, Task};
 
 // Match the guard gap used by LiteBox's private Vmem allocator.
 const STACK_GUARD_GAP: usize = 256 << 12;
 
-fn find_bottom_up_gap<Platform: ShimPlatform>(
-    task: &Task<Platform>,
+fn find_bottom_up_gap<Platform: ShimPlatform, FS: ShimFS>(
+    task: &Task<Platform, FS>,
     low_limit: usize,
     len: usize,
 ) -> Option<usize> {
     debug_assert!(low_limit.is_multiple_of(PAGE_SIZE));
     debug_assert!(len.is_multiple_of(PAGE_SIZE));
-    let high_limit = <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX;
+    let high_limit =
+        <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX;
     let mut candidate = low_limit..low_limit.checked_add(len)?;
     if candidate.end > high_limit {
         return None;
@@ -57,8 +67,8 @@ fn find_bottom_up_gap<Platform: ShimPlatform>(
     Some(candidate.start)
 }
 
-fn claim_bottom_up<Platform: ShimPlatform>(
-    task: &Task<Platform>,
+fn claim_bottom_up<Platform: ShimPlatform, FS: ShimFS>(
+    task: &Task<Platform, FS>,
     mut low_limit: usize,
     len: usize,
     mut claim: impl FnMut(usize) -> Result<usize, MappingError>,
@@ -83,34 +93,57 @@ fn claim_bottom_up<Platform: ShimPlatform>(
 }
 
 // An opened elf file
-struct ElfFile<'a, Platform: ShimPlatform> {
-    task: &'a Task<Platform>,
+struct ElfFile<'a, Platform: ShimPlatform, FS: ShimFS> {
+    task: &'a Task<Platform, FS>,
     fd: i32,
+    status: FileStatus,
     load_high: bool,
     reserve_runtime_trampoline: bool,
 }
 
-impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
-    fn new(task: &'a Task<Platform>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
-        let fd = task
-            .sys_open(path, OFlags::RDONLY, Mode::empty())?
-            .reinterpret_as_signed();
-        Ok(ElfFile {
+impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfFile<'a, Platform, FS> {
+    fn new(task: &'a Task<Platform, FS>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
+        let credentials = task.credentials.borrow().clone();
+        let access = AccessCredentials::new(
+            credentials.euid,
+            credentials.egid,
+            credentials.supplementary_groups(),
+        );
+        let files = task.files.borrow();
+        let (fd, status) = files.fs.open_executable_as(access, path)?;
+        let fd = files.insert_raw_fd(fd).map_err(|fd| {
+            let _ = files.fs.close(&fd);
+            Errno::EMFILE
+        })?;
+        let fd = i32::try_from(fd).expect("RLIMIT_NOFILE keeps guest descriptors within i32");
+        Ok(Self {
             task,
             fd,
+            status,
             load_high: false,
             reserve_runtime_trampoline: false,
         })
     }
 }
 
-impl<Platform: ShimPlatform> Drop for ElfFile<'_, Platform> {
+pub(crate) fn read_executable_header<Platform: ShimPlatform, FS: ShimFS>(
+    task: &Task<Platform, FS>,
+    path: impl litebox::path::Arg,
+    header: &mut [u8],
+) -> Result<usize, Errno> {
+    let file = ElfFile::new(task, path)?;
+    task.sys_read(file.fd, header, Some(0))
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Drop for ElfFile<'_, Platform, FS> {
     fn drop(&mut self) {
         self.task.sys_close(self.fd).expect("failed to close fd");
     }
 }
 
-impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFile<'_, Platform> {
+impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::ReadAt
+    for &'_ ElfFile<'_, Platform, FS>
+{
     type Error = Errno;
 
     fn read_at(&mut self, mut offset: u64, mut buf: &mut [u8]) -> Result<(), Self::Error> {
@@ -132,11 +165,17 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
     }
 
     fn size(&mut self) -> Result<u64, Self::Error> {
-        Ok(self.task.sys_fstat(self.fd)?.st_size as u64)
+        // `st_size` is unsigned and pointer-width in the x86-64 `struct stat`
+        // and a signed 64-bit field in the generic layout aarch64 uses; a
+        // negative file size is not representable either way.
+        let size = self.task.sys_fstat(self.fd)?.st_size;
+        u64::try_from(size).map_err(|_| Errno::EINVAL)
     }
 }
 
-impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile<'_, Platform> {
+impl<Platform: ShimPlatform, FS: ShimFS> litebox_common_linux::loader::MapMemory
+    for ElfFile<'_, Platform, FS>
+{
     type Error = Errno;
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
@@ -170,6 +209,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
                     litebox_common_linux::ProtFlags::PROT_NONE,
                     flags,
                     false,
+                    None,
                     |_| Ok(0),
                 )
                 .map(|address| address.as_usize())
@@ -181,11 +221,14 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
             // upward-growing brk heap.
             reserve(None).map_err(Errno::from)?
         } else {
-            // Place the main PIE in the first gap at or above DEFAULT_LOW_ADDR,
-            // preserving the low executable and upward-growing brk layout.
-            claim_bottom_up(self.task, super::DEFAULT_LOW_ADDR, aligned_len, |address| {
-                reserve(Some(address))
-            })
+            // Place the main PIE in the first gap at or above the default low
+            // address, preserving the low executable and upward-growing brk layout.
+            claim_bottom_up(
+                self.task,
+                super::default_low_addr::<Platform>(),
+                aligned_len,
+                |address| reserve(Some(address)),
+            )
             .map_err(Errno::from)?
         };
 
@@ -262,22 +305,32 @@ pub struct ElfLoadInfo {
 }
 
 /// Loader for ELF files
-pub(crate) struct ElfLoader<'a, Platform: ShimPlatform> {
+pub(crate) struct ElfLoader<'a, Platform: ShimPlatform, FS: ShimFS> {
     path: &'a str,
-    main: FileAndParsed<'a, Platform>,
-    interp: Option<FileAndParsed<'a, Platform>>,
+    main: FileAndParsed<'a, Platform, FS>,
+    interp: Option<FileAndParsed<'a, Platform, FS>>,
 }
 
-struct FileAndParsed<'a, Platform: ShimPlatform> {
-    file: ElfFile<'a, Platform>,
+struct FileAndParsed<'a, Platform: ShimPlatform, FS: ShimFS> {
+    file: ElfFile<'a, Platform, FS>,
     parsed: ElfParsedFile,
+    /// The path the image was opened with, kept for fault symbolization.
+    path: alloc::string::String,
 }
 
-impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
+/// The `PT_LOAD` span of an ELF, in page-aligned vaddrs relative to its load
+/// bias: `lo..hi` covers every loadable segment.
+struct LoadSpan {
+    lo: usize,
+    hi: usize,
+}
+
+impl<'a, Platform: ShimPlatform, FS: ShimFS> FileAndParsed<'a, Platform, FS> {
     fn new(
-        task: &'a Task<Platform>,
+        task: &'a Task<Platform, FS>,
         path: impl litebox::path::Arg,
     ) -> Result<Self, ElfLoaderError> {
+        let path_name = path.to_rust_str_lossy().into_owned();
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
@@ -289,7 +342,8 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // (UnpatchedBinary error), the runtime patching during mmap will patch
         // code segments as they are mapped.
         if syscall_entry_point != 0 {
-            match parsed.parse_trampoline(&mut &file, syscall_entry_point) {
+            let guest_tp_slot_offset = task.global.platform.get_guest_tp_slot_offset();
+            match parsed.parse_trampoline(&mut &file, syscall_entry_point, guest_tp_slot_offset) {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.
@@ -298,7 +352,71 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
             }
         }
 
-        Ok(Self { file, parsed })
+        Ok(Self {
+            file,
+            parsed,
+            path: path_name,
+        })
+    }
+
+    /// The image's `PT_LOAD` span, read back from its program headers.
+    ///
+    /// `ElfParsedFile` keeps its headers private and `MappingInfo` reports
+    /// only the bias, so the span is re-derived from the file the same way the
+    /// `mmap` path derives it for shared libraries (`init_elf_patch_state`).
+    /// Best-effort: an unreadable or degenerate table simply leaves the image
+    /// unnamed in a fault line.
+    fn load_span(&self) -> Option<LoadSpan> {
+        use litebox_common_linux::loader::ReadAt as _;
+        use object::elf::{FileHeader64, PT_LOAD, ProgramHeader64};
+        use object::endian::LittleEndian;
+        const ENDIAN: LittleEndian = LittleEndian;
+
+        let mut file = &self.file;
+        let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
+        file.read_at(0, &mut ehdr_buf).ok()?;
+        let (ehdr, _) = object::from_bytes::<FileHeader64<LittleEndian>>(&ehdr_buf).ok()?;
+        let e_phoff = ehdr.e_phoff.get(ENDIAN);
+        let e_phentsize = usize::from(ehdr.e_phentsize.get(ENDIAN));
+        let e_phnum = usize::from(ehdr.e_phnum.get(ENDIAN));
+        if e_phentsize < core::mem::size_of::<ProgramHeader64<LittleEndian>>() {
+            return None;
+        }
+        let phdrs_size = e_phentsize.checked_mul(e_phnum)?;
+        if phdrs_size == 0 || phdrs_size > 0x10000 {
+            return None;
+        }
+        let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
+        file.read_at(e_phoff, &mut phdrs_buf).ok()?;
+
+        let mut lo = usize::MAX;
+        let mut hi = 0usize;
+        for chunk in phdrs_buf.chunks_exact(e_phentsize) {
+            let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LittleEndian>>(chunk) else {
+                continue;
+            };
+            if ph.p_type.get(ENDIAN) != PT_LOAD {
+                continue;
+            }
+            let start: usize = ph.p_vaddr.get(ENDIAN).trunc();
+            let end = start.checked_add(ph.p_memsz.get(ENDIAN).trunc())?;
+            lo = lo.min(start & !(PAGE_SIZE - 1));
+            hi = hi.max(end.checked_next_multiple_of(PAGE_SIZE)?);
+        }
+        (lo < hi).then_some(LoadSpan { lo, hi })
+    }
+
+    /// Publish where this image landed for fault symbolization.
+    fn record_loaded(&self, info: &litebox_common_linux::loader::MappingInfo) {
+        if let Some(span) = self.load_span() {
+            let base = info.base_addr;
+            self.file.task.record_loaded_image(
+                &self.path,
+                base,
+                base.wrapping_add(span.lo),
+                base.wrapping_add(span.hi),
+            );
+        }
     }
 
     /// Load the ELF into guest memory.
@@ -321,16 +439,25 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
     }
 }
 
-impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
+impl<'a, Platform: ShimPlatform, FS: ShimFS> ElfLoader<'a, Platform, FS> {
     /// Parses an ELF file from the given path.
-    pub fn new(task: &'a Task<Platform>, path: &'a str) -> Result<Self, ElfLoaderError> {
+    pub fn new(task: &'a Task<Platform, FS>, path: &'a str) -> Result<Self, ElfLoaderError> {
         // Parse the main ELF file.
         let main = FileAndParsed::new(task, path)?;
 
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
-            // e.g., /lib64/ld-linux-x86-64.so.2
-            let mut interp = FileAndParsed::new(task, interp_name)?;
+            // e.g., /lib64/ld-linux-x86-64.so.2 -- a guest-visible path, which `execve`'s own
+            // path was too before `resolve_shebang` resolved it. Resolve it the same way: beneath
+            // the process's `chroot` root, following symlinks with an absolute target restarting
+            // from that root (Linux's `open_exec` walks `nd->root` for the interpreter exactly as
+            // for the main image), so a jail loads its own `ld.so` or fails with `ENOENT`, and
+            // never reaches the interpreter outside it.
+            let interp_path = task
+                .resolve_path(interp_name.as_c_str())
+                .and_then(|path| task.follow_open_path(path, litebox::fs::OFlags::RDONLY))
+                .map_err(ElfLoaderError::OpenError)?;
+            let mut interp = FileAndParsed::new(task, interp_path)?;
             // Linux places the ET_EXEC interpreter high so brk can grow above
             // the fixed-address main image without hitting ld.so.
             interp.file.load_high = true;
@@ -342,6 +469,10 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         Ok(Self { path, main, interp })
     }
 
+    pub(crate) fn main_status(&self) -> &FileStatus {
+        &self.main.file.status
+    }
+
     /// Load an ELF file and prepare the stack for the new process.
     pub fn load(
         &mut self,
@@ -351,12 +482,19 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
 
+        // This load replaces the address space, so anything recorded for the
+        // previous image of this process is stale from here on.
+        self.main.file.task.forget_loaded_images();
+
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self.main.load_mapped(global.platform)?;
+        self.main.record_loaded(&info);
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
-            Some(interp.load_mapped(global.platform)?)
+            let interp_info = interp.load_mapped(global.platform)?;
+            interp.record_loaded(&interp_info);
+            Some(interp_info)
         } else {
             None
         };
@@ -382,13 +520,29 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
+        // Mapped directly through the page manager rather than through `sys_mmap`, so record it
+        // as this process's the same way `sys_mmap` would (see `Process::owned_ranges`).
+        self.main.file.task.record_mapped(
+            litebox::platform::RawConstPointer::as_usize(&sp),
+            super::DEFAULT_STACK_SIZE,
+        );
+        // Where each image landed, and where the stack landed: exactly the
+        // placements a cross-process teardown investigation needs, and
+        // invisible in the syscall trace (these are shim-internal mappings).
+        litebox_util_log::debug!(
+            main_base:? = info.base_addr,
+            interp_base:? = interp.as_ref().map(|i| i.base_addr),
+            stack:? = litebox::platform::RawConstPointer::as_usize(&sp),
+            stack_size:? = super::DEFAULT_STACK_SIZE;
+            "loaded program image"
+        );
         let mut stack = UserStack::<Platform>::new(
             UserPtrMut::from_platform_ptr::<Platform>(sp),
             super::DEFAULT_STACK_SIZE,
         )
         .ok_or(ElfLoaderError::InvalidStackAddr)?;
         stack
-            .init(argv, envp, aux)
+            .init(argv, envp, aux, global.platform)
             .ok_or(ElfLoaderError::InvalidStackAddr)?;
 
         Ok(ElfLoadInfo {
@@ -449,12 +603,32 @@ mod tests {
     const PROGRAM_HEADER_SIZE_U16: u16 = 56;
     const ET_EXEC: u16 = 2;
     const ET_DYN: u16 = 3;
-    const EM_X86_64: u16 = 62;
+    /// The synthetic ELFs below must claim the host's own machine, because the
+    /// loader rejects any other with `UnsupportedType` before it reaches the
+    /// placement logic under test.
+    const EM_HOST: u16 = if cfg!(target_arch = "x86_64") {
+        62 // EM_X86_64
+    } else {
+        183 // EM_AARCH64
+    };
     const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
     const PF_X: u32 = 1;
     const PF_R: u32 = 4;
-    const EXEC_LOAD_ADDR: u64 = 0x400000;
+    /// Where the synthetic `ET_EXEC` asks to be loaded.
+    ///
+    /// Linux's customary `0x400000` is not usable on every host: an arm64 Mach-O
+    /// process reserves the first 4 GiB as `__PAGEZERO`, so a fixed mapping
+    /// there is refused outright. Anchoring to the host's own floor is still not
+    /// enough, because the host binary is itself mapped just above that floor --
+    /// this test process's own code sits within the first few MiB of it -- so a
+    /// small offset lands inside the running image and the fixed mapping fails.
+    /// The gap below is therefore large enough to clear any plausible host
+    /// image, while staying far below `TASK_ADDR_MAX` on every host, since what
+    /// this test asserts is that the *interpreter* lands in the high half.
+    const EXEC_LOAD_ADDR: u64 =
+        <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MIN as u64
+            + 0x8_0000_0000;
     const INTERP_PATH_OFFSET: usize = 0x200;
     const INTERP_PATH: &[u8] = b"/ld.so\0";
 
@@ -486,7 +660,7 @@ mod tests {
         buf.extend_from_slice(&[2, 1, 1, 0]);
         buf.extend_from_slice(&[0; 8]);
         push_u16(buf, elf_type);
-        push_u16(buf, EM_X86_64);
+        push_u16(buf, EM_HOST);
         push_u32(buf, 1);
         push_u64(buf, entry);
         push_u64(buf, u64::from(ELF_HEADER_SIZE_U16));
@@ -559,9 +733,18 @@ mod tests {
         buf
     }
 
-    fn write_file(task: &Task<TestPlatform>, path: &str, data: &[u8]) {
+    fn write_file(
+        task: &Task<TestPlatform, crate::DefaultFS<TestPlatform>>,
+        path: &str,
+        data: &[u8],
+    ) {
         let fd = task
-            .sys_open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                path,
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RWXU,
+            )
             .expect("failed to create test ELF");
         let fd = i32::try_from(fd).expect("fd fits i32");
         task.sys_write(fd, data, None)
@@ -571,11 +754,12 @@ mod tests {
 
     #[test]
     fn elf_placement_keeps_main_low_and_interpreter_high() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = crate::syscalls::tests::init_platform(None);
 
         // Occupy exactly one page at the preferred address. The first
         // bottom-up gap must be the immediately following page.
-        let hint = crate::loader::DEFAULT_LOW_ADDR;
+        let hint = crate::loader::default_low_addr::<TestPlatform>();
         let occupied = task
             .sys_mmap(
                 hint,
@@ -682,7 +866,7 @@ mod tests {
         // low ET_EXEC brk heap below it is not capped. The exact address is
         // not asserted: `get_unmmaped_area` returns the highest free gap, and
         // host mappings seeded into the userland VMA tree can sit near the top
-        // and push that gap below the very top slot (see `mm/linux.rs`). Assert
+        // and push that gap below the very top slot (see `mm/vmem.rs`). Assert
         // the invariant that matters — placement in the high half of the
         // address space, far above the low-heap region — not one exact slot.
         let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
@@ -693,5 +877,27 @@ mod tests {
             crate::loader::DEFAULT_LOW_ADDR,
             addr_max / 2,
         );
+
+        // Release both images before returning. Every test in this binary shares
+        // one host address space, but each builds its own task with its own VMM,
+        // and a VMM models only its own mappings -- so anything this test leaves
+        // mapped is invisible to the next test's placement search and collides
+        // with whatever it picks. That is easy to miss on a host whose guest
+        // range sits well clear of the host's own image; on arm64 macOS both
+        // live above the 4 GiB `__PAGEZERO` floor, so the collision is routine.
+        // Each synthetic image maps exactly one PT_LOAD page (`minimal_elf`
+        // sets filesz == memsz == PAGE_SIZE). Do NOT derive the length from
+        // `brk`: on a platform that requires syscall rewriting, `load_mapped`
+        // pushes brk DEFAULT_RESERVED_SPACE_SIZE (16 MiB) past the image
+        // without mapping that space, so a brk-derived munmap overshoots --
+        // the top-down interpreter ends exactly at TASK_ADDR_MAX, which on
+        // Linux x86-64 is the host TASK_SIZE (munmap EINVAL panics
+        // deallocate_pages), and Windows' region walk asserts on the
+        // never-committed tail.
+        let exec_start = usize::try_from(EXEC_LOAD_ADDR).expect("load address fits usize");
+        task.sys_munmap(UserPtrMut::from_usize(exec_start), PAGE_SIZE)
+            .expect("main image should unmap");
+        task.sys_munmap(UserPtrMut::from_usize(interp.base_addr), PAGE_SIZE)
+            .expect("interpreter image should unmap");
     }
 }

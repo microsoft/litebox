@@ -14,98 +14,32 @@ fn tar_ro_fs(
     )
 }
 
-type InMemFs = crate::fs::resolver::Resolver<
-    crate::platform::mock::MockPlatform,
-    crate::fs::in_mem::InMem<crate::platform::mock::MockPlatform>,
->;
-
-fn in_mem_fs(litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>) -> InMemFs {
-    crate::fs::resolver::Resolver::new(
-        litebox,
-        crate::fs::in_mem::InMem::new(crate::fs::inode_allocator::InodeAllocator::standalone()),
-    )
-}
-
-/// Run `f` with the acting user set to root.
-fn with_root_privileges<
-    Platform: crate::sync::RawSyncPrimitivesProvider,
-    B: crate::fs::backend::Backend,
->(
-    fs: &mut crate::fs::resolver::Resolver<Platform, B>,
-    context: &crate::fs::resolver::Context,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform, B>, &crate::fs::resolver::Context),
-) {
-    let root = crate::fs::UserInfo::ROOT;
-    with_user(fs, context, root.user, root.group, f);
-}
-
-/// Run `f` with the acting user set to `user`/`group`, so that tests can exercise operations
-/// whose outcome depends on the acting user.
-fn with_user<Platform: crate::sync::RawSyncPrimitivesProvider, B: crate::fs::backend::Backend>(
-    fs: &mut crate::fs::resolver::Resolver<Platform, B>,
-    context: &crate::fs::resolver::Context,
-    user: u16,
-    group: u16,
-    f: impl FnOnce(&mut crate::fs::resolver::Resolver<Platform, B>, &crate::fs::resolver::Context),
-) {
-    let mut context = context.clone();
-    context.set_acting_user(crate::fs::UserInfo { user, group });
-    f(fs, &context);
-}
-
-type OverlayFs = crate::fs::resolver::Resolver<
-    crate::platform::mock::MockPlatform,
-    crate::fs::overlay::Overlay<crate::platform::mock::MockPlatform>,
->;
-
-/// An overlay of `upper` over a tar-backed lower layer.
-fn overlay_fs(
-    litebox: &crate::LiteBox<crate::platform::mock::MockPlatform>,
-    upper: crate::fs::in_mem::InMem<crate::platform::mock::MockPlatform>,
-    tar_data: alloc::borrow::Cow<'static, [u8]>,
-) -> OverlayFs {
-    crate::fs::resolver::Resolver::new(
-        litebox,
-        crate::fs::overlay::Overlay::new(
-            litebox,
-            upper,
-            crate::fs::tar_ro::TarRo::new(
-                tar_data,
-                crate::fs::inode_allocator::InodeAllocator::standalone(),
-            ),
-            crate::fs::inode_allocator::InodeAllocator::standalone(),
-        ),
-    )
-}
-
 mod in_mem {
     use crate::LiteBox;
-    use crate::fs::{Mode, OFlags};
+    use crate::fs::in_mem;
+    use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
     extern crate std;
 
-    use super::{with_root_privileges, with_user};
-
     #[test]
     fn root_file_creation_and_deletion() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Test file creation
             let path = "/testfile";
             let fd = fs
-                .open(ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
 
             fs.close(&fd).expect("Failed to close file");
 
             // Test file deletion
-            fs.unlink(ctx, path).expect("Failed to unlink file");
+            fs.unlink(path).expect("Failed to unlink file");
             assert!(
-                fs.open(ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+                fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
                 "File should not exist"
             );
         });
@@ -113,14 +47,13 @@ mod in_mem {
 
     #[test]
     fn root_file_read_write() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Create and write to a file
             let path = "/testfile";
             let fd = fs
-                .open(ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
             let data = b"Hello, world!";
             fs.write(&fd, data, None).expect("Failed to write to file");
@@ -128,7 +61,7 @@ mod in_mem {
 
             // Read from the file
             let fd = fs
-                .open(ctx, path, OFlags::RDONLY, Mode::RWXU)
+                .open(path, OFlags::RDONLY, Mode::RWXU)
                 .expect("Failed to open file");
             let mut buffer = vec![0; data.len()];
             let bytes_read = fs
@@ -142,17 +75,16 @@ mod in_mem {
 
     #[test]
     fn write_only_open_does_not_require_read_permission() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
         });
 
         let path = "/tmp/write_only";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
             .expect("Failed to create write-only file");
         fs.write(&fd, b"x", None).expect("Failed to write file");
 
@@ -164,51 +96,49 @@ mod in_mem {
         fs.close(&fd).expect("Failed to close file");
 
         assert!(matches!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::empty()),
+            fs.open(path, OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::AccessNotAllowed)
         ));
     }
 
     #[test]
     fn newly_created_file_does_not_require_its_own_permissions() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
         });
 
         let path = "/tmp/zero_mode";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
             .expect("Failed to create zero-mode file");
         fs.write(&fd, b"x", None).expect("Failed to write file");
         fs.close(&fd).expect("Failed to close file");
 
-        let status = fs.file_status(&ctx, path).expect("Failed to stat file");
+        let status = fs.file_status(path).expect("Failed to stat file");
         assert_eq!(status.mode, Mode::empty());
         assert!(matches!(
-            fs.open(&ctx, path, OFlags::WRONLY, Mode::empty()),
+            fs.open(path, OFlags::WRONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::AccessNotAllowed)
         ));
     }
 
     #[test]
     fn root_directory_creation_and_removal() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Test directory creation
             let path = "/testdir";
-            fs.mkdir(ctx, path, Mode::RWXU)
+            fs.mkdir(path, Mode::RWXU)
                 .expect("Failed to create directory");
 
             // Test directory removal
-            fs.rmdir(ctx, path).expect("Failed to remove directory");
+            fs.rmdir(path).expect("Failed to remove directory");
             assert!(
-                fs.open(ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+                fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
                 "Directory should not exist"
             );
         });
@@ -216,46 +146,44 @@ mod in_mem {
 
     #[test]
     fn file_creation_and_deletion() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
         });
 
         // Test file creation
         let path = "/tmp/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
 
         fs.close(&fd).expect("Failed to close file");
 
         // Test file deletion
-        fs.unlink(&ctx, path).expect("Failed to unlink file");
+        fs.unlink(path).expect("Failed to unlink file");
         assert!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "File should not exist"
         );
     }
 
     #[test]
     fn file_read_write() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
         });
 
         // Create and write to a file
         let path = "/tmp/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let data = b"Hello, world!";
         fs.write(&fd, data, None).expect("Failed to write to file");
@@ -265,7 +193,7 @@ mod in_mem {
 
         // Read from the file
         let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::RWXU)
+            .open(path, OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
         let bytes_read = fs
@@ -282,36 +210,34 @@ mod in_mem {
 
     #[test]
     fn directory_creation_and_removal() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
             // Make `/tmp` and set up with reasonable privs so normal users can do things in there.
-            fs.mkdir(ctx, "/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            fs.mkdir("/tmp", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to create /tmp");
         });
 
         // Test directory creation
         let path = "/tmp/testdir";
-        fs.mkdir(&ctx, path, Mode::RWXU)
+        fs.mkdir(path, Mode::RWXU)
             .expect("Failed to create directory");
 
         // Test directory removal
-        fs.rmdir(&ctx, path).expect("Failed to remove directory");
+        fs.rmdir(path).expect("Failed to remove directory");
         assert!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "Directory should not exist"
         );
     }
 
     #[test]
     fn read_dir_empty() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             let fd = fs
-                .open(ctx, "/", OFlags::RDONLY, Mode::empty())
+                .open("/", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open root directory");
             let entries = fs
                 .read_dir(&fd)
@@ -330,35 +256,24 @@ mod in_mem {
 
     #[test]
     fn read_dir_with_files_and_dirs() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Create a directory structure
-            fs.mkdir(ctx, "/testdir", Mode::RWXU)
+            fs.mkdir("/testdir", Mode::RWXU)
                 .expect("Failed to create directory");
             let fd1 = fs
-                .open(
-                    ctx,
-                    "/testfile1",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
+                .open("/testfile1", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file1");
             fs.close(&fd1).expect("Failed to close file1");
             let fd2 = fs
-                .open(
-                    ctx,
-                    "/testfile2",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
+                .open("/testfile2", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file2");
             fs.close(&fd2).expect("Failed to close file2");
 
             // Read root directory
             let fd = fs
-                .open(ctx, "/", OFlags::RDONLY, Mode::empty())
+                .open("/", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open root directory");
             let entries = fs.read_dir(&fd).expect("Failed to read directory");
             fs.close(&fd).expect("Failed to close directory");
@@ -381,17 +296,12 @@ mod in_mem {
                     }
                     _ => panic!("Unexpected entry: {}", entry.name),
                 }
-                if entry.name != "." && entry.name != ".." {
-                    assert!(entry.ino_info.is_some(), "Inode info should be present");
-                } else {
-                    // TODO(jayb): Re-enable this assertion once the resolver fills in
-                    // inode information for the synthesized `.` and `..` entries.
-                }
+                assert!(entry.ino_info.is_some(), "Inode info should be present");
             }
 
             // Read the subdirectory (should be empty)
             let fd = fs
-                .open(ctx, "/testdir", OFlags::RDONLY, Mode::empty())
+                .open("/testdir", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open subdirectory");
             let entries = fs
                 .read_dir(&fd)
@@ -406,19 +316,18 @@ mod in_mem {
 
     #[test]
     fn read_dir_file_not_directory() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
 
-        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+        in_mem::FileSystem::new(&litebox).with_root_privileges(|fs| {
             // Create a file
             let fd = fs
-                .open(ctx, "/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .open("/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
             fs.close(&fd).expect("Failed to close file");
 
             // Try to read_dir on the file (should fail)
             let fd = fs
-                .open(ctx, "/testfile", OFlags::RDONLY, Mode::empty())
+                .open("/testfile", OFlags::RDONLY, Mode::empty())
                 .expect("Failed to open file");
             let result = fs.read_dir(&fd);
             fs.close(&fd).expect("Failed to close file");
@@ -431,107 +340,36 @@ mod in_mem {
     }
 
     #[test]
-    fn parent_dir_write_permissions_are_enforced() {
-        let ctx = crate::fs::resolver::Context::new();
-        let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            // A root-owned 0755 directory, holding a file and a directory to try to remove.
-            fs.mkdir(
-                ctx,
-                "/rootdir",
-                Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-            )
-            .expect("Failed to create directory");
-            let fd = fs
-                .open(
-                    ctx,
-                    "/rootdir/file",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file");
-            fs.close(&fd).expect("Failed to close file");
-            fs.mkdir(ctx, "/rootdir/sub", Mode::RWXU)
-                .expect("Failed to create subdirectory");
-
-            // A world-writable directory, for the positive case.
-            fs.mkdir(ctx, "/opendir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
-                .expect("Failed to create directory");
-        });
-
-        with_user(&mut fs, &ctx, 1000, 1000, |fs, ctx| {
-            assert!(matches!(
-                fs.open(
-                    ctx,
-                    "/rootdir/new",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU
-                ),
-                Err(crate::fs::errors::OpenError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.mkdir(ctx, "/rootdir/newdir", Mode::RWXU),
-                Err(crate::fs::errors::MkdirError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.unlink(ctx, "/rootdir/file"),
-                Err(crate::fs::errors::UnlinkError::NoWritePerms)
-            ));
-            assert!(matches!(
-                fs.rmdir(ctx, "/rootdir/sub"),
-                Err(crate::fs::errors::RmdirError::NoWritePerms)
-            ));
-
-            // The same operations succeed in a directory the user may write.
-            let fd = fs
-                .open(
-                    ctx,
-                    "/opendir/new",
-                    OFlags::CREAT | OFlags::WRONLY,
-                    Mode::RWXU,
-                )
-                .expect("Failed to create file");
-            fs.close(&fd).expect("Failed to close file");
-            fs.mkdir(ctx, "/opendir/newdir", Mode::RWXU)
-                .expect("Failed to create directory");
-            fs.unlink(ctx, "/opendir/new")
-                .expect("Failed to unlink file");
-            fs.rmdir(ctx, "/opendir/newdir")
-                .expect("Failed to remove directory");
-        });
-    }
-
-    #[test]
     fn chown_test() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
         // Create a test file as root
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
+        fs.with_root_privileges(|fs| {
             let path = "/testfile";
             let fd = fs
-                .open(ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to create file");
             fs.close(&fd).expect("Failed to close file");
 
             // First chown to 1000:1000 as root (should succeed)
-            fs.chown(ctx, path, Some(1000), Some(1000))
+            fs.chown(path, Some(1000), Some(1000))
                 .expect("Failed to chown as root");
         });
 
-        // Switch to user 1000 and test that owner can chown (should succeed)
+        // Switch to user 1000 and test that owner can chown (should succeed). Real chown(2)
+        // semantics: an unprivileged owner may confirm/no-op their own user id and change the
+        // group to one they belong to, but may never reassign the file to a *different* user --
+        // only root can do that (see the next block).
         let path = "/testfile";
-        with_user(&mut fs, &ctx, 1000, 1000, |fs, ctx| {
-            fs.chown(ctx, path, Some(123), Some(456))
+        fs.with_user(1000, 1000, |fs| {
+            fs.chown(path, Some(1000), Some(1000))
                 .expect("Failed to chown as owner");
         });
 
         // Switch to a different user and test that non-owner cannot chown (should fail)
-        with_user(&mut fs, &ctx, 500, 500, |fs, ctx| {
-            match fs.chown(ctx, path, Some(789), Some(101)) {
+        fs.with_user(500, 500, |fs| {
+            match fs.chown(path, Some(789), Some(101)) {
                 Err(crate::fs::errors::ChownError::NotTheOwner) => {
                     // Expected behavior
                 }
@@ -541,7 +379,7 @@ mod in_mem {
         });
 
         // Test chown on non-existent file (should fail)
-        match fs.chown(&ctx, "/nonexistent", Some(123), Some(456)) {
+        match fs.chown("/nonexistent", Some(123), Some(456)) {
             Err(crate::fs::errors::ChownError::PathError(
                 crate::fs::errors::PathError::NoSuchFileOrDirectory,
             )) => {
@@ -552,46 +390,112 @@ mod in_mem {
         }
 
         // Test partial chown (change only user, leave group unchanged)
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chown(ctx, path, Some(999), None)
+        fs.with_root_privileges(|fs| {
+            fs.chown(path, Some(999), None)
                 .expect("Failed to chown user only");
         });
 
         // Test partial chown (change only group, leave user unchanged)
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chown(ctx, path, None, Some(888))
+        fs.with_root_privileges(|fs| {
+            fs.chown(path, None, Some(888))
                 .expect("Failed to chown group only");
         });
     }
 
     #[test]
-    fn o_directory_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn utimensat_test() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        let path = "/testfile";
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            let fd = fs
+                .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create file");
+            fs.close(&fd).expect("Failed to close file");
+        });
+
+        // A freshly created file has no real timestamps yet.
+        let status = fs.file_status(path).expect("Failed to stat file");
+        assert_eq!(status.atime, crate::fs::Timestamp::default());
+        assert_eq!(status.mtime, crate::fs::Timestamp::default());
+        assert_eq!(status.ctime, crate::fs::Timestamp::default());
+
+        // Round-trip: write a timestamp via utimensat, and read it back via stat.
+        let atime = crate::fs::Timestamp {
+            sec: 1_000_000,
+            nsec: 111,
+        };
+        let mtime = crate::fs::Timestamp {
+            sec: 2_000_000,
+            nsec: 222,
+        };
+        fs.with_root_privileges(|fs| {
+            fs.utimensat(path, Some(atime), Some(mtime))
+                .expect("Failed to set times as root");
+        });
+        let status = fs.file_status(path).expect("Failed to stat file");
+        assert_eq!(status.atime, atime);
+        assert_eq!(status.mtime, mtime);
+        assert_eq!(status.ctime, mtime);
+
+        // `None` leaves the corresponding timestamp untouched.
+        let new_atime = crate::fs::Timestamp {
+            sec: 3_000_000,
+            nsec: 333,
+        };
+        fs.with_root_privileges(|fs| {
+            fs.utimensat(path, Some(new_atime), None)
+                .expect("Failed to set atime only");
+        });
+        let status = fs.file_status(path).expect("Failed to stat file");
+        assert_eq!(status.atime, new_atime);
+        assert_eq!(status.mtime, mtime);
+
+        // A user without write permission cannot update timestamps.
+        fs.with_user(500, 500, |fs| {
+            match fs.utimensat(path, Some(atime), Some(mtime)) {
+                Err(crate::fs::errors::UtimeError::NoWritePerms) => {
+                    // Expected behavior
+                }
+                Ok(()) => panic!("User without write perms should not be able to utimensat"),
+                Err(e) => panic!("Unexpected error: {e:?}"),
+            }
+        });
+
+        // Test utimensat on non-existent file (should fail)
+        match fs.utimensat("/nonexistent", Some(atime), Some(mtime)) {
+            Err(crate::fs::errors::UtimeError::PathError(
+                crate::fs::errors::PathError::NoSuchFileOrDirectory,
+            )) => {
+                // Expected behavior
+            }
+            Ok(()) => panic!("Should not be able to utimensat non-existent file"),
+            Err(e) => panic!("Unexpected error: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn o_directory_flag_tests() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let mut fs = in_mem::FileSystem::new(&litebox);
+
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
         // Create test directory and file
-        fs.mkdir(&ctx, "/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir("/testdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create directory");
 
         let fd = fs
-            .open(
-                &ctx,
-                "/testfile",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
+            .open("/testfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         fs.close(&fd).expect("Failed to close file");
 
         // Test O_DIRECTORY on a directory (should succeed)
         let fd = fs
             .open(
-                &ctx,
                 "/testdir",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -602,7 +506,6 @@ mod in_mem {
         // Test O_DIRECTORY on a regular file (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "/testfile",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
@@ -615,7 +518,6 @@ mod in_mem {
         // Test O_DIRECTORY on non-existent path (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "/nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
@@ -629,7 +531,6 @@ mod in_mem {
         // According to the implementation, O_DIRECTORY should be ignored when O_CREAT is specified
         let fd = fs
             .open(
-                &ctx,
                 "/newfile",
                 OFlags::CREAT | OFlags::WRONLY | OFlags::DIRECTORY,
                 Mode::RWXU,
@@ -639,30 +540,30 @@ mod in_mem {
 
         // Verify it created a regular file, not a directory
         let stat = fs
-            .file_status(&ctx, "/newfile")
+            .file_status("/newfile")
             .expect("Failed to get file status");
         assert_eq!(stat.file_type, crate::fs::FileType::RegularFile);
 
-        // TODO(jayb): Restore coverage of `O_RDWR | O_DIRECTORY` once `OpenError` can report
-        // `EISDIR`; see the matching TODO in `InMem::owned_dir_at`. The legacy in-memory file
-        // system used to accept such an open, which Linux rejects.
+        // Test O_DIRECTORY with various access modes
+        let fd = fs
+            .open("/testdir", OFlags::RDWR | OFlags::DIRECTORY, Mode::empty())
+            .expect("Failed to open directory with O_RDWR | O_DIRECTORY");
+        fs.close(&fd).expect("Failed to close directory");
     }
 
     #[test]
     fn o_excl_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
 
         // Test O_CREAT | O_EXCL on non-existent file (should succeed)
         let fd = fs
             .open(
-                &ctx,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -677,7 +578,6 @@ mod in_mem {
         // Test O_CREAT | O_EXCL on existing file (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -687,12 +587,7 @@ mod in_mem {
 
         // Test O_EXCL without O_CREAT (should be ignored and succeed)
         let fd = fs
-            .open(
-                &ctx,
-                "/newfile",
-                OFlags::EXCL | OFlags::RDONLY,
-                Mode::empty(),
-            )
+            .open("/newfile", OFlags::EXCL | OFlags::RDONLY, Mode::empty())
             .expect("Failed to open existing file with O_EXCL (without O_CREAT)");
 
         // Verify we can read the data
@@ -705,16 +600,15 @@ mod in_mem {
 
         // Test O_CREAT without O_EXCL on existing file (should succeed)
         let fd = fs
-            .open(&ctx, "/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open("/newfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open existing file with O_CREAT (without O_EXCL)");
         fs.close(&fd).expect("Failed to close file");
 
         // Test O_CREAT | O_EXCL on directory (should fail)
-        fs.mkdir(&ctx, "/testdir", Mode::RWXU)
+        fs.mkdir("/testdir", Mode::RWXU)
             .expect("Failed to create directory");
         assert!(matches!(
             fs.open(
-                &ctx,
                 "/testdir",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -725,19 +619,18 @@ mod in_mem {
 
     #[test]
     fn open_with_trunc() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
 
         // Create a file and write some initial content
         let path = "/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let initial_data = b"Hello, world! This is initial content.";
         fs.write(&fd, initial_data, None)
@@ -746,7 +639,7 @@ mod in_mem {
 
         // Verify initial content was written
         let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
+            .open(path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -758,7 +651,7 @@ mod in_mem {
 
         // Test O_TRUNC with O_WRONLY - should truncate file
         let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
+            .open(path, OFlags::WRONLY | OFlags::TRUNC, Mode::empty())
             .expect("Failed to open file with O_TRUNC | O_WRONLY");
 
         // Write new content to the truncated file
@@ -769,7 +662,7 @@ mod in_mem {
 
         // Verify the file was truncated and contains only new content
         let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
+            .open(path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for verification");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
@@ -781,16 +674,16 @@ mod in_mem {
 
         // Test O_TRUNC with O_RDWR - should also truncate
         fs.write(
-            &fs.open(&ctx, path, OFlags::WRONLY, Mode::empty()).unwrap(),
+            &fs.open(path, OFlags::WRONLY, Mode::empty()).unwrap(),
             b"More content to truncate",
             None,
         )
         .unwrap();
-        fs.close(&fs.open(&ctx, path, OFlags::WRONLY, Mode::empty()).unwrap())
+        fs.close(&fs.open(path, OFlags::WRONLY, Mode::empty()).unwrap())
             .unwrap();
 
         let fd = fs
-            .open(&ctx, path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open(path, OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .expect("Failed to open file with O_TRUNC | O_RDWR");
 
         // File should be empty after truncation
@@ -819,19 +712,16 @@ mod in_mem {
     fn write_position_after_seek() {
         use crate::fs::SeekWhence;
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
+        let mut fs = in_mem::FileSystem::new(&litebox);
+        fs.with_root_privileges(|fs| {
             // Allow regular user to create in root for this focused test
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("chmod / failed");
         });
 
         let fd = fs
             .open(
-                &ctx,
                 "/posfile",
                 OFlags::CREAT | OFlags::RDWR,
                 Mode::RWXU | Mode::RWXG | Mode::RWXO,
@@ -877,19 +767,18 @@ mod in_mem {
 
     #[test]
     fn o_append_flag_basic() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
 
         // Create a file and write some initial content
         let path = "/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let initial_data = b"Hello";
         fs.write(&fd, initial_data, None)
@@ -898,7 +787,7 @@ mod in_mem {
 
         // Re-open with O_APPEND and write more data
         let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_APPEND");
         let append_data = b" World";
         fs.write(&fd, append_data, None)
@@ -907,7 +796,7 @@ mod in_mem {
 
         // Verify the file contains both pieces of data concatenated
         let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
+            .open(path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; 11];
         let bytes_read = fs
@@ -922,20 +811,18 @@ mod in_mem {
     fn o_append_flag_seek_ignored_for_write() {
         use crate::fs::SeekWhence;
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
 
         // Create a file and write some initial content
         let path = "/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         fs.write(&fd, b"ABCDEF", None)
             .expect("Failed to write initial content");
@@ -943,7 +830,7 @@ mod in_mem {
 
         // Re-open with O_APPEND
         let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_APPEND");
 
         // Seek to beginning - this should succeed but writes should still append
@@ -957,7 +844,7 @@ mod in_mem {
 
         // Verify the file content: original data followed by appended data
         let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
+            .open(path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; 20];
         let bytes_read = fs
@@ -972,20 +859,18 @@ mod in_mem {
     fn o_append_flag_with_rdwr() {
         use crate::fs::SeekWhence;
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
 
         // Create a file with initial content
         let path = "/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         fs.write(&fd, b"Hello", None)
             .expect("Failed to write initial content");
@@ -993,7 +878,7 @@ mod in_mem {
 
         // Re-open with O_RDWR | O_APPEND
         let fd = fs
-            .open(&ctx, path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
+            .open(path, OFlags::RDWR | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_RDWR | O_APPEND");
 
         // Read should work normally from the beginning
@@ -1026,19 +911,18 @@ mod in_mem {
 
     #[test]
     fn o_append_pwrite_ignores_append_mode() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
 
         // Create a file with initial content
         let path = "/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         fs.write(&fd, b"ABCDEF", None)
             .expect("Failed to write initial content");
@@ -1046,7 +930,7 @@ mod in_mem {
 
         // Re-open with O_APPEND
         let fd = fs
-            .open(&ctx, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
+            .open(path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_APPEND");
 
         // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
@@ -1055,7 +939,7 @@ mod in_mem {
 
         // Verify the file content: XX should be at position 2, not appended
         let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
+            .open(path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; 10];
         let bytes_read = fs
@@ -1068,19 +952,18 @@ mod in_mem {
 
     #[test]
     fn o_append_with_trunc() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let mut fs = super::in_mem_fs(&litebox);
+        let mut fs = in_mem::FileSystem::new(&litebox);
 
-        with_root_privileges(&mut fs, &ctx, |fs, ctx| {
-            fs.chmod(ctx, "/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
                 .expect("Failed to chmod /");
         });
 
         // Create a file with initial content
         let path = "/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         fs.write(&fd, b"Original content", None)
             .expect("Failed to write initial content");
@@ -1089,7 +972,6 @@ mod in_mem {
         // Re-open with O_TRUNC | O_APPEND
         let fd = fs
             .open(
-                &ctx,
                 path,
                 OFlags::WRONLY | OFlags::TRUNC | OFlags::APPEND,
                 Mode::empty(),
@@ -1105,7 +987,7 @@ mod in_mem {
 
         // Verify the file content
         let fd = fs
-            .open(&ctx, path, OFlags::RDONLY, Mode::empty())
+            .open(path, OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; 20];
         let bytes_read = fs
@@ -1119,7 +1001,7 @@ mod in_mem {
 
 mod tar_ro {
     use crate::LiteBox;
-    use crate::fs::{Mode, OFlags};
+    use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1129,11 +1011,10 @@ mod tar_ro {
 
     #[test]
     fn file_read() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1142,7 +1023,7 @@ mod tar_ro {
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
         fs.close(&fd).expect("Failed to close file");
         let fd = fs
-            .open(&ctx, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open("bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1154,46 +1035,34 @@ mod tar_ro {
 
     #[test]
     fn dir_and_nonexist_checks() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         assert!(matches!(
-            fs.open(&ctx, "bar/ba", OFlags::RDONLY, Mode::empty()),
+            fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::NoSuchFileOrDirectory
             )),
         ));
         let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
+            .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
         fs.close(&fd).expect("Failed to close dir");
     }
 
     #[test]
     fn o_directory_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
 
         // Test O_DIRECTORY on a directory (should succeed)
         let fd = fs
-            .open(
-                &ctx,
-                "bar",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
+            .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
             .expect("Failed to open directory with O_DIRECTORY");
         fs.close(&fd).expect("Failed to close directory");
 
         // Test O_DIRECTORY on a regular file (should fail)
         assert!(matches!(
-            fs.open(
-                &ctx,
-                "foo",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
+            fs.open("foo", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::ComponentNotADirectory
             ))
@@ -1202,7 +1071,6 @@ mod tar_ro {
         // Test O_DIRECTORY on non-existent path (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
@@ -1214,12 +1082,7 @@ mod tar_ro {
 
         // Test O_DIRECTORY on nested file (should fail)
         assert!(matches!(
-            fs.open(
-                &ctx,
-                "bar/baz",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
+            fs.open("bar/baz", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::ComponentNotADirectory
             ))
@@ -1228,13 +1091,12 @@ mod tar_ro {
 
     #[test]
     fn write_or_truncate_open_of_directory_fails() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
 
         for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::TRUNC] {
             assert!(matches!(
-                fs.open(&ctx, "bar", flags, Mode::empty()),
+                fs.open("bar", flags, Mode::empty()),
                 Err(crate::fs::errors::OpenError::ReadOnlyFileSystem)
             ));
         }
@@ -1242,13 +1104,12 @@ mod tar_ro {
 
     #[test]
     fn read_dir_subdirectory() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
 
         // Read root directory
         let fd = fs
-            .open(&ctx, "/", OFlags::RDONLY, Mode::empty())
+            .open("/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         fs.close(&fd).expect("Failed to close root directory");
@@ -1279,7 +1140,7 @@ mod tar_ro {
 
         // Read `bar` directory
         let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
+            .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
         fs.close(&fd).expect("Failed to close bar directory");
@@ -1292,12 +1153,11 @@ mod tar_ro {
 
     #[test]
     fn read_dir_file_not_directory() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
 
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::empty())
+            .open("foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open foo file");
         let result = fs.read_dir(&fd);
         fs.close(&fd).expect("Failed to close foo file");
@@ -1309,10 +1169,10 @@ mod tar_ro {
     }
 }
 
-mod overlay {
+mod layered {
     use crate::LiteBox;
-    use crate::fs::in_mem::{InMem, InitialNode};
-    use crate::fs::{FileType, Mode, OFlags, UserInfo};
+    use crate::fs::{FileSystem as _, FileType, Mode, OFlags};
+    use crate::fs::{in_mem, layered};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -1320,44 +1180,17 @@ mod overlay {
 
     const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
 
-    /// The user these tests act as, and so the owner of anything they are set up as having created.
-    const ACTING_USER: UserInfo = UserInfo {
-        user: 1000,
-        group: 1000,
-    };
-    const ALL_PERMS: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
-
-    /// An upper backend whose root is writable by the acting user, holding `entries`.
-    ///
-    /// The overlay directs every mutation to the upper backend, so its root has to allow writes for
-    /// anything to be created.
-    fn upper(
-        entries: impl IntoIterator<Item = (&'static str, InitialNode)>,
-    ) -> InMem<MockPlatform> {
-        InMem::new_initialized(
-            [(
-                "/",
-                InitialNode::Directory {
-                    mode: ALL_PERMS,
-                    owner: UserInfo::ROOT,
-                },
-            )]
-            .into_iter()
-            .chain(entries),
-        )
-    }
-
-    fn overlay_fs(litebox: &LiteBox<MockPlatform>, upper: InMem<MockPlatform>) -> super::OverlayFs {
-        super::overlay_fs(litebox, upper, TEST_TAR_FILE.into())
-    }
-
     #[test]
     fn file_read_from_lower() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1369,12 +1202,13 @@ mod overlay {
         assert_eq!(stat.mode, Mode::from_bits(0o644).unwrap());
         fs.close(&fd).expect("Failed to close file");
 
-        let stat = fs.file_status(&ctx, "bar").expect("Failed to file stat");
+        let stat = fs.file_status("bar").expect("Failed to file stat");
         assert_eq!(stat.file_type, FileType::Directory);
-        assert_eq!(stat.mode, Mode::from_bits(0o777).unwrap());
+        // `bar/` is `drwxr-xr-x` (0o755) in test.tar, not 0o777.
+        assert_eq!(stat.mode, Mode::from_bits(0o755).unwrap());
 
         let fd = fs
-            .open(&ctx, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open("bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1389,33 +1223,54 @@ mod overlay {
 
     #[test]
     fn dir_and_nonexist_checks() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
         assert!(matches!(
-            fs.open(&ctx, "bar/ba", OFlags::RDONLY, Mode::empty()),
+            fs.open("bar/ba", OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::NoSuchFileOrDirectory
             )),
         ));
         let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
+            .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open dir");
         fs.close(&fd).expect("Failed to close dir");
     }
 
-    /// Check that for the same file, even though it started as a lower file, writing to it copies
-    /// it up and redirects handles already open on it, so every descriptor sees the update.
+    /// Check that for the same file, even though it started as a lower-level file, writing to it
+    /// successfully migrated it to an upper-level file, and converted the internal descriptors
+    /// over, such that the expected semantics of being able to see the updated file are held.
     #[test]
-    fn file_read_write_copy_up() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn file_read_write_sync_up() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            // Change the permissions for `/` to allow file creation
+            //
+            // TODO: We might need to force-allow file creation in cases where the lower level
+            // already has the file in the correct mode. This would likely require `stat` as well as
+            // some internal-only force-creation API.
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
         let fd1 = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let fd2 = fs
-            .open(&ctx, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open("foo", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 1024];
@@ -1439,18 +1294,34 @@ mod overlay {
         fs.close(&fd2).expect("Failed to close file");
     }
 
-    /// Similar to [`file_read_write_copy_up`] but also confirm that file positions have been
+    /// Similar to [`file_read_write_sync_up`] but also confirm that file positions have been
     /// maintained.
     #[test]
-    fn file_read_write_copy_up_keeps_position() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn file_read_write_seek_sync() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            // Change the permissions for `/` to allow file creation
+            //
+            // TODO: We might need to force-allow file creation in cases where the lower level
+            // already has the file in the correct mode. This would likely require `stat` as well as
+            // some internal-only force-creation API.
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
         let fd1 = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
         let fd2 = fs
-            .open(&ctx, "foo", OFlags::WRONLY, Mode::RWXU)
+            .open("foo", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -1474,11 +1345,21 @@ mod overlay {
 
     #[test]
     fn file_deletion() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU)
+            .open("foo", OFlags::RDONLY, Mode::RWXU)
             .expect("Failed to open file");
 
         let mut buffer = vec![0; 4];
@@ -1490,7 +1371,7 @@ mod overlay {
         assert_eq!(&buffer[..bytes_read], b"test");
 
         // Then we delete it
-        fs.unlink(&ctx, "foo").unwrap();
+        fs.unlink("foo").unwrap();
 
         // This should not really impact the readability; file is fine.
         let bytes_read = fs
@@ -1501,7 +1382,7 @@ mod overlay {
         // But if we close and attempt to re-open, it should not exist
         fs.close(&fd).expect("Failed to close file");
         assert!(matches!(
-            fs.open(&ctx, "foo", OFlags::RDONLY, Mode::empty()),
+            fs.open("foo", OFlags::RDONLY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::NoSuchFileOrDirectory
             )),
@@ -1510,44 +1391,40 @@ mod overlay {
 
     #[test]
     fn o_directory_flag_tests() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        // Create a test directory in the upper layer
+        in_mem_fs
+            .mkdir("/upperdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .expect("Failed to create directory");
+
+        // Create a test file in the upper layer
+        let fd = in_mem_fs
+            .open("/upperfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .expect("Failed to create file");
+        in_mem_fs.close(&fd).expect("Failed to close file");
+
+        let fs = layered::FileSystem::new(
             &litebox,
-            upper([
-                (
-                    "/upperdir",
-                    InitialNode::Directory {
-                        mode: ALL_PERMS,
-                        owner: ACTING_USER,
-                    },
-                ),
-                (
-                    "/upperfile",
-                    InitialNode::File {
-                        mode: Mode::RWXU,
-                        owner: ACTING_USER,
-                        data: alloc::borrow::Cow::Borrowed(b""),
-                    },
-                ),
-            ]),
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
         // Test O_DIRECTORY on directory from lower layer (tar)
         let fd = fs
-            .open(
-                &ctx,
-                "bar",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty(),
-            )
+            .open("bar", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
             .expect("Failed to open lower layer directory with O_DIRECTORY");
         fs.close(&fd).expect("Failed to close directory");
 
         // Test O_DIRECTORY on directory from upper layer (in_mem)
         let fd = fs
             .open(
-                &ctx,
                 "/upperdir",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),
@@ -1557,12 +1434,7 @@ mod overlay {
 
         // Test O_DIRECTORY on file from lower layer (should fail)
         assert!(matches!(
-            fs.open(
-                &ctx,
-                "foo",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
+            fs.open("foo", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::ComponentNotADirectory
             ))
@@ -1571,7 +1443,6 @@ mod overlay {
         // Test O_DIRECTORY on file from upper layer (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "/upperfile",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
@@ -1583,12 +1454,7 @@ mod overlay {
 
         // Test O_DIRECTORY on nested file from lower layer (should fail)
         assert!(matches!(
-            fs.open(
-                &ctx,
-                "bar/baz",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                Mode::empty()
-            ),
+            fs.open("bar/baz", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()),
             Err(crate::fs::errors::OpenError::PathError(
                 crate::fs::errors::PathError::ComponentNotADirectory
             ))
@@ -1597,7 +1463,6 @@ mod overlay {
         // Test O_DIRECTORY on non-existent path (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "nonexistent",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
@@ -1612,11 +1477,21 @@ mod overlay {
     // Regression test for #250: a file that already exists in the lower layer should not be
     // shadowed by an attempt to create a file.
     fn file_create_exist_in_lower() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .open("foo", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
             .expect("Failed to open file");
         let mut buffer = vec![0; 4];
 
@@ -1629,13 +1504,17 @@ mod overlay {
 
     #[test]
     fn read_dir_from_lower_layer() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // Read bar subdirectory
         let fd = fs
-            .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
+            .open("bar", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar directory");
         let entries = fs.read_dir(&fd).expect("Failed to read bar directory");
         fs.close(&fd).expect("Failed to close bar directory");
@@ -1652,32 +1531,33 @@ mod overlay {
 
     #[test]
     fn read_dir_from_upper_layer() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            // Set up root directory permissions to allow access
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+
+            // Create some files in the upper layer
+            fs.mkdir("/upperdir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to create upperdir");
+            let fd = fs
+                .open("/upperfile", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+                .expect("Failed to create upperfile");
+            fs.close(&fd).expect("Failed to close upperfile");
+        });
+
+        let fs = layered::FileSystem::new(
             &litebox,
-            upper([
-                (
-                    "/upperdir",
-                    InitialNode::Directory {
-                        mode: ALL_PERMS,
-                        owner: ACTING_USER,
-                    },
-                ),
-                (
-                    "/upperfile",
-                    InitialNode::File {
-                        mode: Mode::RWXU,
-                        owner: ACTING_USER,
-                        data: alloc::borrow::Cow::Borrowed(b""),
-                    },
-                ),
-            ]),
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
         );
 
         // Read root directory (should contain entries from both layers)
         let fd = fs
-            .open(&ctx, "/", OFlags::RDONLY, Mode::empty())
+            .open("/", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open root directory");
         let entries = fs.read_dir(&fd).expect("Failed to read root directory");
         fs.close(&fd).expect("Failed to close root directory");
@@ -1703,17 +1583,12 @@ mod overlay {
                 }
                 _ => panic!("Unexpected entry: {}", entry.name),
             }
-            if entry.name != "." && entry.name != ".." {
-                assert!(entry.ino_info.is_some(), "Inode info should be present");
-            } else {
-                // TODO(jayb): Re-enable this assertion once the resolver fills in
-                // inode information for the synthesized `.` and `..` entries.
-            }
+            assert!(entry.ino_info.is_some(), "Inode info should be present");
         }
 
         // Read upperdir directory (should be from upper layer)
         let fd = fs
-            .open(&ctx, "/upperdir", OFlags::RDONLY, Mode::empty())
+            .open("/upperdir", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open upperdir");
         let entries = fs.read_dir(&fd).expect("Failed to read upperdir");
         fs.close(&fd).expect("Failed to close upperdir");
@@ -1723,16 +1598,26 @@ mod overlay {
     }
 
     #[test]
-    fn o_excl_tests() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn o_excl_layered_tests() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // Test O_CREAT | O_EXCL on file that exists in lower layer (should fail)
         // "foo" exists in the tar file
         assert!(matches!(
             fs.open(
-                &ctx,
                 "foo",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1743,21 +1628,19 @@ mod overlay {
         // Test O_CREAT | O_EXCL on file that doesn't exist anywhere (should succeed)
         let fd = fs
             .open(
-                &ctx,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             )
             .expect("Failed to create new file with O_CREAT | O_EXCL");
 
-        fs.write(&fd, b"overlay test", None)
+        fs.write(&fd, b"layered test", None)
             .expect("Failed to write to new file");
         fs.close(&fd).expect("Failed to close new file");
 
         // Test O_CREAT | O_EXCL on file that now exists in upper layer (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "/newfile",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1769,7 +1652,6 @@ mod overlay {
         // "bar" is a directory in the tar file
         assert!(matches!(
             fs.open(
-                &ctx,
                 "bar",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1779,13 +1661,11 @@ mod overlay {
 
         // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
         // First delete a file from lower layer
-        fs.unlink(&ctx, "foo")
-            .expect("Failed to unlink lower layer file");
+        fs.unlink("foo").expect("Failed to unlink lower layer file");
 
         // Now try to create it with O_EXCL (should succeed since it's tombstoned)
         let fd = fs
             .open(
-                &ctx,
                 "foo",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1798,7 +1678,7 @@ mod overlay {
 
         // Verify the new content
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::empty())
+            .open("foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open recreated file");
         let mut buffer = vec![0; 15];
         let bytes_read = fs
@@ -1811,7 +1691,6 @@ mod overlay {
         // Create a file in upper layer first
         let fd = fs
             .open(
-                &ctx,
                 "/upper_only_file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1824,7 +1703,6 @@ mod overlay {
         // Now try O_CREAT | O_EXCL on the same file (should fail)
         assert!(matches!(
             fs.open(
-                &ctx,
                 "/upper_only_file",
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
@@ -1835,23 +1713,35 @@ mod overlay {
 
     #[test]
     fn dir_creation_inside_lower_existing_dir() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // Create the directory /bar/test (where /bar already exists inside the tar file)
-        fs.mkdir(&ctx, "/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir("/bar/test", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create /bar/test directory");
 
         // Verify the directory was created
         let stat = fs
-            .file_status(&ctx, "/bar/test")
+            .file_status("/bar/test")
             .expect("Failed to get status of /bar/test");
         assert_eq!(stat.file_type, FileType::Directory);
 
         // Verify we can open the directory
         let fd = fs
-            .open(&ctx, "/bar/test", OFlags::RDONLY, Mode::empty())
+            .open("/bar/test", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /bar/test directory");
         let entries = fs
             .read_dir(&fd)
@@ -1866,15 +1756,27 @@ mod overlay {
     }
 
     #[test]
-    fn file_creation_materializes_ancestor_dirs() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn file_creation_with_ancestor_dir_migration() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // Open bar/test for writing (where bar exists in lower layer but test doesn't exist)
         // This should create ancestor directories and allow file creation
         let fd = fs
-            .open(&ctx, "bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open("bar/test", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open bar/test for writing");
 
         // Write data to the file
@@ -1885,7 +1787,7 @@ mod overlay {
 
         // Read the file back
         let fd = fs
-            .open(&ctx, "bar/test", OFlags::RDONLY, Mode::empty())
+            .open("bar/test", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar/test for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1896,21 +1798,33 @@ mod overlay {
 
         // Verify the file exists and has correct type
         let stat = fs
-            .file_status(&ctx, "bar/test")
+            .file_status("bar/test")
             .expect("Failed to get status of bar/test");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
 
     #[test]
-    fn file_modification_materializes_ancestor_dirs() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn file_modification_with_ancestor_dir_migration() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // Open bar/baz for writing (both bar and baz exist in lower layer)
-        // This copies up the ancestor directories and allows the file to be modified
+        // This should migrate ancestor directories and allow file modification
         let fd = fs
-            .open(&ctx, "bar/baz", OFlags::WRONLY, Mode::RWXU)
+            .open("bar/baz", OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to open bar/baz for writing");
 
         // Write new data to the file (overwriting existing content)
@@ -1921,7 +1835,7 @@ mod overlay {
 
         // Read the file back to verify it was modified
         let fd = fs
-            .open(&ctx, "bar/baz", OFlags::RDONLY, Mode::empty())
+            .open("bar/baz", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open bar/baz for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1933,20 +1847,33 @@ mod overlay {
 
         // Verify the file still exists and has correct type
         let stat = fs
-            .file_status(&ctx, "bar/baz")
+            .file_status("bar/baz")
             .expect("Failed to get status of bar/baz");
         assert_eq!(stat.file_type, FileType::RegularFile);
     }
 
     #[test]
     fn open_with_trunc() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
 
-        // Open with O_TRUNC should copy the file up into the upper backend, empty
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        // Set up write permissions on the upper layer
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod / in upper layer");
+        });
+
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        // Open with O_TRUNC should create a shadow file in upper layer
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
+            .open("foo", OFlags::RDWR | OFlags::TRUNC, Mode::empty())
             .expect("Failed to open file with O_TRUNC");
 
         // File should be truncated (empty)
@@ -1963,7 +1890,7 @@ mod overlay {
 
         // Verify the content persists
         let fd = fs
-            .open(&ctx, "foo", OFlags::RDONLY, Mode::empty())
+            .open("foo", OFlags::RDONLY, Mode::empty())
             .expect("Failed to reopen file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
@@ -1977,22 +1904,34 @@ mod overlay {
     fn rmdir_upper_only_directory() {
         use crate::fs::errors::{PathError, RmdirError};
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        // Prepare upper with permissive root
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("chmod / failed");
+        });
+
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // Create an empty directory only in upper layer
-        fs.mkdir(&ctx, "/upper_empty", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        fs.mkdir("/upper_empty", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("mkdir upper_empty failed");
 
         // Remove it
-        fs.rmdir(&ctx, "/upper_empty")
+        fs.rmdir("/upper_empty")
             .expect("rmdir upper_empty should succeed");
 
         // Verify it no longer exists
         assert!(matches!(
-            fs.file_status(&ctx, "/upper_empty"),
+            fs.file_status("/upper_empty"),
             Err(crate::fs::errors::FileStatusError::PathError(
                 PathError::NoSuchFileOrDirectory
             ))
@@ -2000,7 +1939,7 @@ mod overlay {
 
         // Second removal should yield NoSuchFileOrDirectory (path error)
         assert!(matches!(
-            fs.rmdir(&ctx, "/upper_empty"),
+            fs.rmdir("/upper_empty"),
             Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
         ));
     }
@@ -2009,18 +1948,26 @@ mod overlay {
     fn rmdir_upper_directory_not_empty_then_empty() {
         use crate::fs::errors::{PathError, RmdirError};
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
 
-        fs.mkdir(&ctx, "/upper_dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+        });
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        fs.mkdir("/upper_dir", Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("mkdir upper_dir failed");
 
         // Create a file inside making directory non-empty
         let fd = fs
             .open(
-                &ctx,
                 "/upper_dir/file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU | Mode::RWXG,
@@ -2029,22 +1976,18 @@ mod overlay {
         fs.close(&fd).unwrap();
 
         // Attempt to remove while non-empty
-        assert!(matches!(
-            fs.rmdir(&ctx, "/upper_dir"),
-            Err(RmdirError::NotEmpty)
-        ));
+        assert!(matches!(fs.rmdir("/upper_dir"), Err(RmdirError::NotEmpty)));
 
         // Remove inner file
-        fs.unlink(&ctx, "/upper_dir/file")
-            .expect("unlink inner failed");
+        fs.unlink("/upper_dir/file").expect("unlink inner failed");
 
         // Now should succeed
-        fs.rmdir(&ctx, "/upper_dir")
+        fs.rmdir("/upper_dir")
             .expect("rmdir upper_dir should succeed");
 
         // Confirm gone
         assert!(matches!(
-            fs.file_status(&ctx, "/upper_dir"),
+            fs.file_status("/upper_dir"),
             Err(crate::fs::errors::FileStatusError::PathError(
                 PathError::NoSuchFileOrDirectory
             ))
@@ -2055,28 +1998,45 @@ mod overlay {
     fn rmdir_lower_directory_non_empty() {
         use crate::fs::errors::RmdirError;
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+        let mut upper = in_mem::FileSystem::new(&litebox); // empty
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // "bar" exists in lower layer and contains "baz" (non-empty)
-        assert!(matches!(fs.rmdir(&ctx, "bar"), Err(RmdirError::NotEmpty)));
+        assert!(matches!(fs.rmdir("bar"), Err(RmdirError::NotEmpty)));
     }
 
     #[test]
     fn rmdir_not_a_directory() {
         use crate::fs::errors::RmdirError;
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
+
+        let mut upper = in_mem::FileSystem::new(&litebox);
+        upper.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+        });
+        let lower = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fs = layered::FileSystem::new(
+            &litebox,
+            upper,
+            lower,
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
 
         // Create a regular file (upper only)
         let fd = fs
             .open(
-                &ctx,
                 "/regular_file",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU | Mode::RWXG,
@@ -2086,29 +2046,40 @@ mod overlay {
 
         // rmdir should fail with NotADirectory
         assert!(matches!(
-            fs.rmdir(&ctx, "/regular_file"),
+            fs.rmdir("/regular_file"),
             Err(RmdirError::NotADirectory)
         ));
     }
 
     #[test]
-    fn copy_up_does_not_deadlock() {
+    fn migrate_file_up_does_not_deadlock() {
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
 
-        let ctx = crate::fs::resolver::Context::new();
-
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = overlay_fs(&litebox, upper([]));
 
-        fs.file_status(&ctx, "foo").expect("Failed to stat foo");
+        let mut in_mem_fs = in_mem::FileSystem::new(&litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to chmod /");
+        });
 
-        // Writing to the lower-layer file triggers copy-up. Run it on a worker thread.
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem_fs,
+            super::tar_ro_fs(&litebox, TEST_TAR_FILE.into()),
+            layered::LayeringSemantics::LowerLayerReadOnly,
+        );
+
+        fs.file_status("foo").expect("Failed to stat foo");
+
+        // Writing to the lower-layer file triggers copy-on-write migration via
+        // `migrate_file_up`. Run it on a worker thread.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let fd = fs
-                .open(&ctx, "foo", OFlags::WRONLY, Mode::RWXU)
+                .open("foo", OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to open file for writing");
             fs.write(&fd, b"x", None).expect("Failed to write to file");
             fs.close(&fd).expect("Failed to close file");
@@ -2116,7 +2087,7 @@ mod overlay {
         });
 
         rx.recv_timeout(Duration::from_secs(2))
-            .expect("copy-up deadlocked");
+            .expect("migrate_file_up deadlocked");
     }
 }
 
@@ -2124,14 +2095,13 @@ mod stdio {
     use crate::LiteBox;
     use crate::fs::devices::Devices;
     use crate::fs::resolver::Resolver;
-    use crate::fs::{Mode, OFlags};
+    use crate::fs::{FileSystem as _, Mode, OFlags};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;
 
     #[test]
     fn stdio_open_read_write() {
-        let ctx = crate::fs::resolver::Context::new();
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
         let fs = Resolver::new(
@@ -2144,7 +2114,7 @@ mod stdio {
 
         // Test opening and writing to /dev/stdout
         let fd_stdout = fs
-            .open(&ctx, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
         let data = b"Hello, stdout!";
         fs.write(&fd_stdout, data, None)
@@ -2155,7 +2125,7 @@ mod stdio {
 
         // Test opening and writing to /dev/stderr
         let fd_stderr = fs
-            .open(&ctx, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
         let data = b"Hello, stderr!";
         fs.write(&fd_stderr, data, None)
@@ -2171,7 +2141,7 @@ mod stdio {
             .unwrap()
             .push_back(b"Hello, stdin!".to_vec());
         let fd_stdin = fs
-            .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
         let mut buffer = vec![0; 13];
         let bytes_read = fs
@@ -2184,7 +2154,6 @@ mod stdio {
 
     #[test]
     fn non_dev_path_fails() {
-        let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
         let fs = Resolver::new(
             &litebox,
@@ -2195,7 +2164,7 @@ mod stdio {
         );
 
         // Attempt to open a non-/dev/* path
-        let result = fs.open(&ctx, "foo", OFlags::RDONLY, Mode::empty());
+        let result = fs.open("foo", OFlags::RDONLY, Mode::empty());
         assert!(matches!(
             result,
             Err(crate::fs::errors::OpenError::PathError(
@@ -2205,64 +2174,59 @@ mod stdio {
     }
 }
 
-mod composed_stdio {
+mod layered_stdio {
     use crate::LiteBox;
-    use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
-    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::layered::LayeringSemantics;
     use crate::fs::resolver::Resolver;
-    use crate::fs::{Mode, OFlags, UserInfo};
+    use crate::fs::{FileSystem as _, Mode, OFlags};
+    use crate::fs::{in_mem, layered};
     use crate::platform::mock::MockPlatform;
     use alloc::vec;
     extern crate std;
 
-    type ComposedFs = Resolver<MockPlatform, Composer>;
-
-    fn composed_fs(litebox: &LiteBox<MockPlatform>) -> ComposedFs {
-        Resolver::new(
-            litebox,
-            Composer::builder()
-                .mount("/", |_| {
-                    InMem::<MockPlatform>::new_initialized([(
-                        "/",
-                        InitialNode::Directory {
-                            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                            owner: UserInfo::ROOT,
-                        },
-                    )])
-                })
-                .mount("/dev", |allocator| Devices::new(litebox, allocator))
-                .build()
-                .unwrap(),
-        )
-    }
-
     #[test]
-    fn stdio_open_read_write() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn layered_stdio_open_read_write() {
         let platform = MockPlatform::new();
         let litebox = LiteBox::new(platform);
-        let fs = composed_fs(&litebox);
+        let layered_fs = layered::FileSystem::new(
+            &litebox,
+            in_mem::FileSystem::new(&litebox),
+            Resolver::new(
+                &litebox,
+                crate::fs::composer::Composer::builder()
+                    .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                    .build()
+                    .unwrap(),
+            ),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
 
         // Test opening and writing to /dev/stdout
-        let fd_stdout = fs
-            .open(&ctx, "/dev/stdout", OFlags::WRONLY, Mode::empty())
+        let fd_stdout = layered_fs
+            .open("/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        let data = b"Hello, composed stdout!";
-        fs.write(&fd_stdout, data, None)
+        let data = b"Hello, layered stdout!";
+        layered_fs
+            .write(&fd_stdout, data, None)
             .expect("Failed to write to /dev/stdout");
-        fs.close(&fd_stdout).expect("Failed to close /dev/stdout");
+        layered_fs
+            .close(&fd_stdout)
+            .expect("Failed to close /dev/stdout");
         assert_eq!(platform.stdout_queue.read().unwrap().len(), 1);
         assert_eq!(platform.stdout_queue.read().unwrap()[0], data);
 
         // Test opening and writing to /dev/stderr
-        let fd_stderr = fs
-            .open(&ctx, "/dev/stderr", OFlags::WRONLY, Mode::empty())
+        let fd_stderr = layered_fs
+            .open("/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
-        let data = b"Hello, composed stderr!";
-        fs.write(&fd_stderr, data, None)
+        let data = b"Hello, layered stderr!";
+        layered_fs
+            .write(&fd_stderr, data, None)
             .expect("Failed to write to /dev/stderr");
-        fs.close(&fd_stderr).expect("Failed to close /dev/stderr");
+        layered_fs
+            .close(&fd_stderr)
+            .expect("Failed to close /dev/stderr");
         assert_eq!(platform.stderr_queue.read().unwrap().len(), 1);
         assert_eq!(platform.stderr_queue.read().unwrap()[0], data);
 
@@ -2271,37 +2235,136 @@ mod composed_stdio {
             .stdin_queue
             .write()
             .unwrap()
-            .push_back(b"Hello, composed stdin!".to_vec());
-        let fd_stdin = fs
-            .open(&ctx, "/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .push_back(b"Hello, layered stdin!".to_vec());
+        let fd_stdin = layered_fs
+            .open("/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
         let mut buffer = vec![0; 1024];
-        let bytes_read = fs
+        let bytes_read = layered_fs
             .read(&fd_stdin, &mut buffer, None)
             .expect("Failed to read from /dev/stdin");
-        assert_eq!(&buffer[..bytes_read], b"Hello, composed stdin!");
-        fs.close(&fd_stdin).expect("Failed to close /dev/stdin");
+        assert_eq!(&buffer[..bytes_read], b"Hello, layered stdin!");
+        layered_fs
+            .close(&fd_stdin)
+            .expect("Failed to close /dev/stdin");
     }
 
     #[test]
-    fn write_to_non_dev() {
-        let ctx = crate::fs::resolver::Context::new();
+    fn layered_write_to_non_dev() {
         let litebox = LiteBox::new(MockPlatform::new());
-        let fs = composed_fs(&litebox);
+        let in_mem = {
+            let mut in_mem = in_mem::FileSystem::new(&litebox);
+            in_mem.with_root_privileges(|fs| {
+                fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+            });
+            in_mem
+        };
+        let fs = layered::FileSystem::new(
+            &litebox,
+            in_mem,
+            Resolver::new(
+                &litebox,
+                crate::fs::composer::Composer::builder()
+                    .mount("/dev", |allocator| Devices::new(&litebox, allocator))
+                    .build()
+                    .unwrap(),
+            ),
+            LayeringSemantics::LowerLayerWritableFiles,
+        );
 
         // Test file creation
         let path = "/testfile";
         let fd = fs
-            .open(&ctx, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
+            .open(path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
 
         fs.close(&fd).expect("Failed to close file");
 
         // Test file deletion
-        fs.unlink(&ctx, path).expect("Failed to unlink file");
+        fs.unlink(path).expect("Failed to unlink file");
         assert!(
-            fs.open(&ctx, path, OFlags::RDONLY, Mode::RWXU).is_err(),
+            fs.open(path, OFlags::RDONLY, Mode::RWXU).is_err(),
             "File should not exist"
         );
+    }
+
+    // Regression test: under `LowerLayerWritableFiles` (used by every real Linux guest's
+    // rootfs, e.g. `litebox_shim_linux`), `chmod`/`chown`/`utimensat` on a file that exists
+    // only in the lower layer (i.e. any unmodified file straight from the OCI image) used to
+    // unconditionally call `migrate_file_up`, which panics under this semantics -- crashing
+    // the whole guest. Reproduced live on real hardware via `busybox chmod` on a stock Alpine
+    // image file. These metadata calls must instead apply directly to the lower layer, exactly
+    // like `write`/`truncate` already do.
+    #[test]
+    fn layered_chmod_chown_utimensat_on_lower_only_file_does_not_panic() {
+        // Each op gets its own lower-only file so chmod/chown changing the caller's effective
+        // permissions on one file can't spuriously break a later assertion on another.
+        fn build_fs_with_lower_only_file(
+            path: &str,
+        ) -> layered::FileSystem<
+            MockPlatform,
+            in_mem::FileSystem<MockPlatform>,
+            in_mem::FileSystem<MockPlatform>,
+        > {
+            let litebox = LiteBox::new(MockPlatform::new());
+            let lower = {
+                let mut lower = in_mem::FileSystem::new(&litebox);
+                lower.with_root_privileges(|fs| {
+                    fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+                });
+                // Populate the lower layer directly, exactly as an OCI image's rootfs is
+                // already fully populated before the layered FS (and thus the guest) ever
+                // touches it.
+                let fd = lower
+                    .open(
+                        path,
+                        OFlags::CREAT | OFlags::WRONLY,
+                        Mode::RUSR | Mode::WUSR,
+                    )
+                    .expect("Failed to create lower-layer file");
+                lower.close(&fd).expect("Failed to close lower-layer file");
+                lower
+            };
+            let upper = {
+                let mut upper = in_mem::FileSystem::new(&litebox);
+                upper.with_root_privileges(|fs| {
+                    fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO).unwrap();
+                });
+                upper
+            };
+            layered::FileSystem::new(
+                &litebox,
+                upper,
+                lower,
+                LayeringSemantics::LowerLayerWritableFiles,
+            )
+        }
+
+        let fs = build_fs_with_lower_only_file("/motd");
+        fs.chmod("/motd", Mode::RUSR)
+            .expect("chmod on a lower-only file must not panic under LowerLayerWritableFiles");
+        assert_eq!(
+            fs.file_status("/motd").unwrap().mode,
+            Mode::RUSR,
+            "chmod must actually take effect"
+        );
+
+        let fs = build_fs_with_lower_only_file("/motd");
+        // Reassigning to a wholly different user requires root, exactly like real chown(2); the
+        // regression under test is the migrate-up panic, not unprivileged chown authorization.
+        fs.chown_as(
+            crate::fs::AccessCredentials::root(),
+            "/motd",
+            Some(42),
+            Some(43),
+        )
+        .expect("chown on a lower-only file must not panic under LowerLayerWritableFiles");
+        let status = fs.file_status("/motd").unwrap();
+        assert_eq!(status.owner.user, 42);
+        assert_eq!(status.owner.group, 43);
+
+        let fs = build_fs_with_lower_only_file("/motd");
+        fs.utimensat("/motd", None, None)
+            .expect("utimensat on a lower-only file must not panic under LowerLayerWritableFiles");
     }
 }

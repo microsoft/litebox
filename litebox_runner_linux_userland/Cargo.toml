@@ -8,6 +8,10 @@ anyhow = "1.0.97"
 clap = { version = "4.5.33", features = ["derive"] }
 libc = { version = "0.2.169", default-features = false }
 litebox = { version = "0.1.0", path = "../litebox" }
+litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local" }
+litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
+litebox_broker_transport = { version = "0.1.0", path = "../litebox_broker_transport" }
+litebox_broker_transport_linux_userland = { version = "0.1.0", path = "../litebox_broker_transport_linux_userland" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_platform_linux_userland = { version = "0.1.0", path = "../litebox_platform_linux_userland" }
 litebox_shim_linux = { version = "0.1.0", path = "../litebox_shim_linux" }
@@ -20,6 +24,8 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features =
 sha2 = "0.10"
 walkdir = "2.0"
 glob = "0.3"
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
+litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host" }
 
 [features]
 lock_tracing = ["litebox/lock_tracing"]

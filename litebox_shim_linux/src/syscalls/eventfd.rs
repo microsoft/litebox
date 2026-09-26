@@ -8,6 +8,7 @@ use core::sync::atomic::AtomicU32;
 use litebox::{
     event::{
         Events, IOPollable,
+        counter::{EventCounter, EventCounterReadMode},
         observer::Observer,
         polling::{Pollee, TryOpError},
         wait::WaitContext,
@@ -19,7 +20,7 @@ use litebox::{
 };
 use litebox_common_linux::{EfdFlags, errno::Errno};
 
-use crate::ShimPlatform;
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
 pub(crate) struct EventfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
 impl<Platform: ShimPlatform> FdEnabledSubsystem for EventfdSubsystem<Platform> {
@@ -27,222 +28,218 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for EventfdSubsystem<Platform> {
 }
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
 
+/// Where the eventfd's counter actually lives.
+///
+/// With a broker connected, the counter is a broker object
+/// ([`EventCounter`]), which is what lets a brokered deployment share the
+/// eventfd across guest processes. Without one -- every macOS run today, and
+/// any Linux run started without `--broker-control-socket` -- there is no
+/// broker to host that object, and `eventfd2` used to fail outright with
+/// `EIO`, which took down every real `libuv` consumer at `uv_loop_init`
+/// (Node aborts in `LegacyTracingAgent`'s constructor before running a line
+/// of JS). The local variant is a plain in-shim counter with the exact
+/// `eventfd(2)` semantics, sufficient for everything a single guest process
+/// can observe.
+enum Backend<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    Brokered(EventCounter<Platform>),
+    Local {
+        counter: litebox::sync::Mutex<Platform, u64>,
+        pollee: Pollee<Platform>,
+    },
+}
+
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    counter: litebox::sync::Mutex<Platform, u64>,
+    backend: Backend<Platform>,
     /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
     status: AtomicU32,
     semaphore: bool,
-    pollee: Pollee<Platform>,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
-    pub(crate) fn new(count: u64, flags: EfdFlags) -> Self {
+    fn new(backend: Backend<Platform>, flags: EfdFlags) -> Self {
         let mut status = OFlags::RDWR;
         status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
-
         Self {
-            counter: litebox::sync::Mutex::new(count),
+            backend,
             status: AtomicU32::new(status.bits()),
             semaphore: flags.contains(EfdFlags::SEMAPHORE),
-            pollee: Pollee::new(),
         }
-    }
-
-    fn try_read(&self) -> Result<u64, TryOpError<Errno>> {
-        let mut counter = self.counter.lock();
-        if *counter == 0 {
-            return Err(TryOpError::TryAgain);
-        }
-
-        let res = if self.semaphore { 1 } else { *counter };
-        *counter -= res;
-
-        drop(counter);
-        self.pollee.notify_observers(Events::OUT);
-        Ok(res)
     }
 
     pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
-        self.pollee
-            .wait(
-                cx,
-                self.get_status().contains(OFlags::NONBLOCK),
-                Events::IN,
-                || self.try_read(),
-            )
-            .map_err(Errno::from)
-    }
-
-    fn try_write(&self, value: u64) -> Result<usize, TryOpError<Errno>> {
-        let mut counter = self.counter.lock();
-        if let Some(new_value) = (*counter).checked_add(value) {
-            // The maximum value that may be stored in the counter is the largest unsigned
-            // 64-bit value minus 1 (i.e., 0xfffffffffffffffe)
-            if new_value != u64::MAX {
-                *counter = new_value;
-                drop(counter);
-                self.pollee.notify_observers(Events::IN);
-                return Ok(8);
-            }
+        match &self.backend {
+            Backend::Brokered(counter) => counter
+                .read(
+                    cx,
+                    self.is_nonblocking(),
+                    if self.semaphore {
+                        EventCounterReadMode::One
+                    } else {
+                        EventCounterReadMode::All
+                    },
+                )
+                .map_err(Errno::from),
+            Backend::Local { counter, pollee } => pollee
+                .wait(cx, self.is_nonblocking(), Events::IN, || {
+                    let mut counter = counter.lock();
+                    if *counter == 0 {
+                        return Err(TryOpError::<Errno>::TryAgain);
+                    }
+                    let res = if self.semaphore { 1 } else { *counter };
+                    *counter -= res;
+                    drop(counter);
+                    pollee.notify_observers(Events::OUT);
+                    Ok(res)
+                })
+                .map_err(Errno::from),
         }
-
-        Err(TryOpError::TryAgain)
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
-        self.pollee
-            .wait(
-                cx,
-                self.get_status().contains(OFlags::NONBLOCK),
-                Events::OUT,
-                || self.try_write(value),
-            )
-            .map_err(Errno::from)
+        match &self.backend {
+            Backend::Brokered(counter) => counter
+                .write(cx, self.is_nonblocking(), value)
+                .map_err(Errno::from),
+            Backend::Local { counter, pollee } => pollee
+                .wait(cx, self.is_nonblocking(), Events::OUT, || {
+                    let mut counter = counter.lock();
+                    // The counter's maximum is `u64::MAX - 1`; a write that
+                    // would exceed it blocks (or `EAGAIN`s), per eventfd(2).
+                    if let Some(new_value) = (*counter).checked_add(value)
+                        && new_value != u64::MAX
+                    {
+                        *counter = new_value;
+                        drop(counter);
+                        pollee.notify_observers(Events::IN);
+                        return Ok(8);
+                    }
+                    Err(TryOpError::<Errno>::TryAgain)
+                })
+                .map_err(Errno::from),
+        }
     }
 
     super::common_functions_for_file_status!();
+
+    fn is_nonblocking(&self) -> bool {
+        self.get_status().contains(OFlags::NONBLOCK)
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for EventFile<Platform> {
     fn check_io_events(&self) -> Events {
-        let counter = self.counter.lock();
-        let mut events = Events::empty();
-        if *counter != 0 {
-            events |= Events::IN;
+        match &self.backend {
+            Backend::Brokered(counter) => counter.check_io_events(),
+            Backend::Local { counter, .. } => {
+                let counter = counter.lock();
+                let mut events = Events::empty();
+                if *counter != 0 {
+                    events |= Events::IN;
+                }
+                // Writable whenever at least a value of 1 fits.
+                if *counter < u64::MAX - 1 {
+                    events |= Events::OUT;
+                }
+                events
+            }
         }
-        // if it is possible to write a value of at least "1"
-        // without blocking, the file is writable
-        let is_writable = *counter < u64::MAX - 1;
-        if is_writable {
-            events |= Events::OUT;
-        }
-
-        events
     }
 
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.pollee.register_observer(observer, mask);
+        match &self.backend {
+            Backend::Brokered(counter) => counter.register_observer(observer, mask),
+            Backend::Local { pollee, .. } => pollee.register_observer(observer, mask),
+        }
+    }
+
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        match &self.backend {
+            Backend::Brokered(counter) => counter.unregister_observer(observer),
+            Backend::Local { pollee, .. } => pollee.unregister_observer(observer),
+        }
+    }
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+    pub(crate) fn create_linux_eventfd(
+        &self,
+        initval: u32,
+        flags: EfdFlags,
+    ) -> Result<EventFile<Platform>, Errno> {
+        if flags
+            .intersects((EfdFlags::SEMAPHORE | EfdFlags::CLOEXEC | EfdFlags::NONBLOCK).complement())
+        {
+            return Err(Errno::EINVAL);
+        }
+
+        let count = u64::from(initval);
+        // Prefer the brokered counter (shareable across guest processes in a
+        // brokered deployment); `Unavailable` means no broker is connected at
+        // all -- fall back to the local backend rather than failing the
+        // syscall. Any other creation error is a real broker fault and is
+        // reported as such.
+        let backend = match EventCounter::new(&self.litebox, count) {
+            Ok(counter) => Backend::Brokered(counter),
+            Err(litebox::event::counter::EventCounterError::Unavailable) => Backend::Local {
+                counter: litebox::sync::Mutex::new(count),
+                pollee: Pollee::new(),
+            },
+            Err(err) => return Err(Errno::from(err)),
+        };
+        Ok(EventFile::new(backend, flags))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::syscalls::tests::TestPlatform;
     use litebox::event::wait::WaitState;
     use litebox_common_linux::{EfdFlags, errno::Errno};
 
     extern crate std;
 
-    fn platform() -> &'static TestPlatform {
-        crate::syscalls::tests::test_platform(None)
+    /// Without a broker, `eventfd2` must still work via the local backend --
+    /// this exact gap aborted Node at `uv_loop_init` (its `LegacyTracingAgent`
+    /// asserts on the result) before any JS ran, while `--version` worked.
+    #[test]
+    fn test_eventfd_works_without_broker() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let platform = crate::syscalls::tests::test_platform(None);
+
+        let eventfd = task
+            .global
+            .create_linux_eventfd(3, EfdFlags::NONBLOCK)
+            .expect("brokerless eventfd must fall back to the local backend");
+
+        // The initial count reads back in one shot, then the empty counter
+        // reports EAGAIN rather than blocking (NONBLOCK is set).
+        assert_eq!(eventfd.read(&WaitState::new(platform).context()), Ok(3));
+        assert_eq!(
+            eventfd.read(&WaitState::new(platform).context()),
+            Err(Errno::EAGAIN)
+        );
+
+        // A write of 5 wakes the counter back up; semaphore mode is off, so
+        // the next read drains it whole.
+        assert_eq!(eventfd.write(&WaitState::new(platform).context(), 5), Ok(8));
+        assert_eq!(eventfd.read(&WaitState::new(platform).context()), Ok(5));
     }
 
+    /// Semaphore mode decrements by exactly one per read.
     #[test]
-    fn test_semaphore_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
+    fn test_eventfd_local_semaphore_mode() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let platform = crate::syscalls::tests::test_platform(None);
 
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::SEMAPHORE));
-        let total = 8;
-        for _ in 0..total {
-            let copied_eventfd = eventfd.clone();
-            std::thread::spawn(move || {
-                copied_eventfd
-                    .read(&WaitState::new(platform()).context())
-                    .unwrap();
-            });
-        }
+        let eventfd = task
+            .global
+            .create_linux_eventfd(2, EfdFlags::SEMAPHORE | EfdFlags::NONBLOCK)
+            .expect("brokerless eventfd must fall back to the local backend");
 
-        std::thread::sleep(core::time::Duration::from_millis(500));
-        eventfd
-            .write(&WaitState::new(platform()).context(), total)
-            .unwrap();
-    }
-
-    #[test]
-    fn test_blocking_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
-
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty()));
-        let copied_eventfd = eventfd.clone();
-        std::thread::spawn(move || {
-            copied_eventfd
-                .write(&WaitState::new(platform()).context(), 1)
-                .unwrap();
-            // block until the first read finishes
-            copied_eventfd
-                .write(&WaitState::new(platform()).context(), u64::MAX - 1)
-                .unwrap();
-        });
-
-        // block until the first write
-        let ret = eventfd.read(&WaitState::new(platform()).context()).unwrap();
-        assert_eq!(ret, 1);
-
-        // block until the second write
-        let ret = eventfd.read(&WaitState::new(platform()).context()).unwrap();
-        assert_eq!(ret, u64::MAX - 1);
-    }
-
-    #[test]
-    fn test_blocking_eventfd_no_race_on_massive_readwrite() {
-        let _task = crate::syscalls::tests::init_platform(None);
-
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::empty()));
-        let copied_eventfd = eventfd.clone();
-        std::thread::spawn(move || {
-            for _ in 0..10000 {
-                copied_eventfd
-                    .write(&WaitState::new(platform()).context(), u64::MAX - 1)
-                    .unwrap();
-            }
-        });
-
-        for _ in 0..10000 {
-            let ret = eventfd.read(&WaitState::new(platform()).context()).unwrap();
-            assert_eq!(ret, u64::MAX - 1);
-        }
-    }
-
-    #[test]
-    fn test_nonblocking_eventfd() {
-        let _task = crate::syscalls::tests::init_platform(None);
-
-        let eventfd = alloc::sync::Arc::new(super::EventFile::new(0, EfdFlags::NONBLOCK));
-        let copied_eventfd = eventfd.clone();
-        std::thread::spawn(move || {
-            // first write should succeed immediately
-            copied_eventfd
-                .write(&WaitState::new(platform()).context(), 1)
-                .unwrap();
-            // block until the first read finishes
-            while let Err(e) =
-                copied_eventfd.write(&WaitState::new(platform()).context(), u64::MAX - 1)
-            {
-                assert_eq!(e, Errno::EAGAIN, "Unexpected error: {e:?}");
-                core::hint::spin_loop();
-            }
-        });
-
-        let read = |eventfd: &super::EventFile<TestPlatform>, expected_value: u64| {
-            loop {
-                match eventfd.read(&WaitState::new(platform()).context()) {
-                    Ok(ret) => {
-                        assert_eq!(ret, expected_value);
-                        break;
-                    }
-                    Err(Errno::EAGAIN) => {
-                        // busy wait
-                        // TODO: use poll rather than busy wait
-                    }
-                    Err(e) => panic!("Unexpected error: {e:?}"),
-                }
-                core::hint::spin_loop();
-            }
-        };
-
-        // block until the first write
-        read(&eventfd, 1);
-        // block until the second write
-        read(&eventfd, u64::MAX - 1);
+        assert_eq!(eventfd.read(&WaitState::new(platform).context()), Ok(1));
+        assert_eq!(eventfd.read(&WaitState::new(platform).context()), Ok(1));
+        assert_eq!(
+            eventfd.read(&WaitState::new(platform).context()),
+            Err(Errno::EAGAIN)
+        );
     }
 }

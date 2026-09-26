@@ -442,8 +442,8 @@ Serializer! {
     /// Time structure
     #[derive(Clone, Debug, Copy, Default)]
     pub(super) struct Time {
-        sec: u64,
-        nsec: u64,
+        pub(super) sec: u64,
+        pub(super) nsec: u64,
     }
 }
 

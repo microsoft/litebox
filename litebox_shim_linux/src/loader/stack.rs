@@ -119,12 +119,22 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
     /// Returns the offsets of the strings in the stack.
     /// Returns `None` if the stack has insufficient space.
     fn push_cstrings(&mut self, vals: &[CString]) -> Option<Vec<usize>> {
-        let mut envp = Vec::with_capacity(vals.len());
-        for val in vals {
+        // Push in reverse so that -- with the stack growing down -- `vals[0]`
+        // lands at the LOWEST address and the whole block is contiguous in
+        // increasing address order. That is the exact layout the Linux kernel
+        // produces, and the one libuv's `uv_setup_args` relies on: it walks
+        // `argv[0]..argv[n]` then `environ[0]..` requiring each string to abut
+        // the previous at a higher address, and sizes the process-title buffer
+        // from that contiguous span. Pushing forward reversed each block, so the
+        // walk broke immediately and libuv computed a garbage `process_title.len`
+        // -- and the first `process.title = ...` (which `npm` does at startup)
+        // then `memset`s that bogus length and SIGSEGVs.
+        let mut ptrs = alloc::vec![0usize; vals.len()];
+        for (i, val) in vals.iter().enumerate().rev() {
             self.push_cstring(val)?;
-            envp.push(self.pos);
+            ptrs[i] = self.pos;
         }
-        Some(envp)
+        Some(ptrs)
     }
 
     /// Push a vector of stack pointers to the stack.
@@ -165,6 +175,7 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         argv: Vec<CString>,
         env: Vec<CString>,
         mut aux: BTreeMap<AuxKey, usize>,
+        platform: &impl litebox::platform::CrngProvider,
     ) -> Option<()> {
         // end markers
         self.pos = self.pos.checked_sub(size_of::<usize>())?;
@@ -174,11 +185,10 @@ impl<Platform: ShimPlatform> UserStack<Platform> {
         let envp = self.push_cstrings(&env)?;
         let argvp = self.push_cstrings(&argv)?;
 
-        // TODO: generate a random value
-        self.push_bytes(&[
-            0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD, 0xBE, 0xEF, 0xDE, 0xAD,
-            0xBE, 0xEF,
-        ])?;
+        // AT_RANDOM: 16 bytes of real randomness (libc's stack-canary seed).
+        let mut random_bytes = [0u8; 16];
+        <_ as litebox::platform::CrngProvider>::fill_bytes_crng(platform, &mut random_bytes);
+        self.push_bytes(&random_bytes)?;
         aux.insert(AuxKey::AT_RANDOM, self.stack_top.as_usize() + self.pos);
 
         let align_down = |pos: usize, alignment: usize| -> usize {

@@ -3,7 +3,7 @@
 
 //! Unix-y devices [`super::backend::Backend`].
 //!
-//! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
+//! Provides `{stdin,stdout,null,urandom,fb0,...}` entries, intended to be mounted at `/dev`.
 
 use alloc::string::String;
 use alloc::vec;
@@ -13,15 +13,23 @@ use crate::LiteBox;
 use crate::sync::RawSyncPrimitivesProvider;
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+    Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
+    WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
+
+pub use self::framebuffer::{FbFixScreeninfo, FbVarScreeninfo, Framebuffer, FramebufferGeometry};
+pub use self::input::{
+    ABS_RANGE_MAX, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EVENT_MINOR_BASE, EvdevIoctlReply,
+    INPUT_EVENT_SIZE, INPUT_MAJOR, InputDevices, InputRegistry, MICE_MINOR,
+};
+mod framebuffer;
+mod input;
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: usize = 1024;
@@ -29,6 +37,17 @@ const STDIO_BLOCK_SIZE: usize = 1024;
 const NULL_BLOCK_SIZE: usize = 0x1000;
 /// Block size for /dev/urandom
 const URANDOM_BLOCK_SIZE: usize = 0x1000;
+/// `/dev/fb0`'s major device number, matching real Linux's `fb` major
+/// (<https://www.kernel.org/doc/Documentation/admin-guide/devices.txt>). Public so callers
+/// outside this crate (the shim's `sys_ioctl`) can recognize an fb0 fd by its `rdev` major, the
+/// same way a tty is recognized by its own major-number range.
+pub const FB_MAJOR: usize = 29;
+/// Block size for /dev/fb0
+const FB_BLOCK_SIZE: usize = 0x1000;
+/// `/dev/tty`'s major device number, matching real Linux's `TTYAUX_MAJOR` (minor 0 is
+/// `/dev/tty`). Public so the shim's `sys_ioctl` can recognize the controlling-terminal alias
+/// by its `rdev`, the same way it recognizes the stdio devices by theirs.
+pub const TTYAUX_MAJOR: usize = 5;
 
 /// Constant node information for all 3 stdio devices:
 /// ```console
@@ -57,6 +76,22 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
     // major=1, minor=9
     rdev: core::num::NonZeroUsize::new(0x109),
 };
+/// Node info for /dev/fb0. Major 29 matches real Linux's `fb` major
+/// (<https://www.kernel.org/doc/Documentation/admin-guide/devices.txt>); minor 0 is the first
+/// (and here, only) framebuffer device.
+const FB0_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 10,
+    rdev: core::num::NonZeroUsize::new(FB_MAJOR << 8), // | minor 0
+};
+/// Node info for `/dev/tty`: the host stdio terminal under the name every CLI that wants "the
+/// terminal, whatever stdin/stdout are redirected to" opens. A process with a controlling
+/// pseudoterminal never reaches this node -- the shim aliases `/dev/tty` to its pty slave first.
+const TTY_NODE_INFO: NodeInfo = NodeInfo {
+    dev: 5,
+    ino: 11,
+    rdev: core::num::NonZeroUsize::new(TTYAUX_MAJOR << 8), // | minor 0
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Device {
@@ -65,6 +100,8 @@ enum Device {
     Stderr,
     Null,
     URandom,
+    Fb0,
+    Tty,
 }
 
 impl Device {
@@ -74,13 +111,15 @@ impl Device {
         ("stderr", Device::Stderr),
         ("null", Device::Null),
         ("urandom", Device::URandom),
+        ("fb0", Device::Fb0),
+        ("tty", Device::Tty),
     ];
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
     }
 
-    fn file_status(self) -> FileStatus {
+    fn file_status(self, fb_size: u32) -> FileStatus {
         match self {
             Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -89,6 +128,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: STDIO_NODE_INFO,
                 blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
             },
             Device::Null => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -97,6 +139,9 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: NULL_NODE_INFO,
                 blksize: NULL_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
             },
             Device::URandom => FileStatus {
                 file_type: FileType::CharacterDevice,
@@ -105,6 +150,34 @@ impl Device {
                 owner: UserInfo::ROOT,
                 node_info: URANDOM_NODE_INFO,
                 blksize: URANDOM_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+            },
+            Device::Fb0 => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP,
+                // Real fbdev reports `smem_len` as the file's `st_size`; some readers (notably
+                // x11vnc's `-rawfb` mmap-failure fallback) size their `lseek`+`read` loop off
+                // this rather than `FBIOGET_FSCREENINFO`.
+                size: fb_size as usize,
+                owner: UserInfo::ROOT,
+                node_info: FB0_NODE_INFO,
+                blksize: FB_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
+            },
+            Device::Tty => FileStatus {
+                file_type: FileType::CharacterDevice,
+                mode: Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+                size: 0,
+                owner: UserInfo::ROOT,
+                node_info: TTY_NODE_INFO,
+                blksize: STDIO_BLOCK_SIZE,
+                atime: Timestamp::default(),
+                mtime: Timestamp::default(),
+                ctime: Timestamp::default(),
             },
         }
     }
@@ -122,6 +195,7 @@ where
     /// Stable inode info for this backend's root directory.
     root_inode: NodeInfo,
     _alloc: InodeAllocator,
+    framebuffer: Framebuffer<Platform>,
 }
 
 impl<Platform> Devices<Platform>
@@ -139,7 +213,15 @@ where
             litebox: litebox.clone(),
             root_inode,
             _alloc: allocator,
+            framebuffer: Framebuffer::new(),
         }
+    }
+
+    /// A cheap handle to this backend's `/dev/fb0` state, for a runner-side reader (e.g. an RFB
+    /// server) to read guest-painted pixels from independently of any guest fd.
+    #[must_use]
+    pub fn framebuffer(&self) -> Framebuffer<Platform> {
+        self.framebuffer.clone()
     }
 }
 
@@ -237,14 +319,10 @@ where
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if flags.contains(OFlags::NONBLOCK)
-            && matches!(
-                device,
-                Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
-            )
-        {
-            unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
-        }
+        // Note: `O_NONBLOCK` at open time is otherwise a no-op here -- actual non-blocking
+        // enforcement for stdin happens above this layer, in the shim's syscall dispatch, which
+        // has access to the per-fd status flags this `Backend` trait does not. See
+        // `litebox_shim_linux`'s `do_read` and the `StdioProvider::stdin_pollable` platform hook.
 
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
@@ -271,22 +349,23 @@ where
             .map(|(n, d)| DirEntry {
                 name: String::from(*n),
                 file_type: FileType::CharacterDevice,
-                ino_info: Some(d.file_status().node_info),
+                ino_info: Some(d.file_status(self.framebuffer.smem_len()).node_info),
             })
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin => self
-                .litebox
-                .x
-                .platform
-                .read_from_stdin(buf)
-                .map_err(|e| match e {
-                    crate::platform::StdioReadError::Closed => ReadError::Io,
-                }),
+            Device::Stdin | Device::Tty => {
+                self.litebox
+                    .x
+                    .platform
+                    .read_from_stdin(buf)
+                    .map_err(|e| match e {
+                        crate::platform::StdioReadError::Closed => ReadError::Io,
+                    })
+            }
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => {
                 // /dev/null read returns EOF
@@ -296,14 +375,15 @@ where
                 self.litebox.x.platform.fill_bytes_crng(buf);
                 Ok(buf.len())
             }
+            Device::Fb0 => Ok(self.framebuffer.read_at(buf, offset)),
         }
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
-            Device::Stdout => crate::platform::StdioOutStream::Stdout,
+            Device::Stdout | Device::Tty => crate::platform::StdioOutStream::Stdout,
             Device::Stderr => crate::platform::StdioOutStream::Stderr,
             Device::Null | Device::URandom => {
                 // /dev/null discards data: report as if written fully
@@ -316,6 +396,7 @@ where
                 // /dev/urandom here.
                 return Ok(buf.len());
             }
+            Device::Fb0 => return Ok(self.framebuffer.write_at(buf, offset)),
         };
         self.litebox
             .x
@@ -333,43 +414,49 @@ where
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         let h = h.get_typed::<Self>();
         match h.device {
-            Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
+            Device::Stdin | Device::Stdout | Device::Stderr | Device::Tty => {
+                SeekBehavior::NonSeekable
+            }
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
+            // Real position tracking: a plain `cp /dev/fb0 snapshot` (sequential reads with no
+            // explicit offset) must advance through the whole pixel store, and `FBIOPAN_DISPLAY`
+            // callers rely on `lseek`+`read`/`write` at an explicit byte offset behaving like a
+            // normal seekable file.
+            Device::Fb0 => SeekBehavior::PositionBased,
         }
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        match h {
-            HandleRef::File(h) => Ok(h.get_typed::<Self>().device.file_status()),
-            HandleRef::Dir(h) => {
-                let _h = h.get_typed::<Self>();
-                Ok(FileStatus {
-                    file_type: FileType::Directory,
-                    mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
-                    size: super::DEFAULT_DIRECTORY_SIZE,
-                    owner: UserInfo::ROOT,
-                    node_info: self.root_inode.clone(),
-                    blksize: super::DEFAULT_DIRECTORY_SIZE,
-                })
-            }
-        }
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        Ok(h.get_typed::<Self>()
+            .device
+            .file_status(self.framebuffer.smem_len()))
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let _h = h.get_typed::<Self>();
+        Ok(FileStatus {
+            file_type: FileType::Directory,
+            mode: Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
+            size: super::DEFAULT_DIRECTORY_SIZE,
+            owner: UserInfo::ROOT,
+            node_info: self.root_inode.clone(),
+            blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+            ctime: Timestamp::default(),
+        })
     }
 
     fn create_file_at(
         &self,
         _dir: DirHandle,
         _name: &str,
-        _metadata: CreationMetadata,
+        _mode: Mode,
     ) -> Result<FileHandle, OpenError> {
         Err(OpenError::ReadOnlyFileSystem)
     }
 
-    fn mkdir_at(
-        &self,
-        _dir: DirHandle,
-        _name: &str,
-        _metadata: CreationMetadata,
-    ) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<DirHandle, MkdirError> {
         Err(MkdirError::ReadOnlyFileSystem)
     }
 
@@ -381,16 +468,53 @@ where
         Err(RmdirError::ReadOnlyFileSystem)
     }
 
-    fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
+    fn chmod_at(&self, _dir: DirHandle, _name: &str, _mode: Mode) -> Result<(), ChmodError> {
         Err(ChmodError::ReadOnlyFileSystem)
     }
 
-    fn chown(
+    fn chmod_file(&self, _h: &FileHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chmod_dir(&self, _h: &DirHandle, _mode: Mode) -> Result<(), ChmodError> {
+        Err(ChmodError::ReadOnlyFileSystem)
+    }
+
+    fn chown_at(
         &self,
-        _h: HandleRef<'_>,
+        _dir: DirHandle,
+        _name: &str,
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn utimensat_at(
+        &self,
+        _dir: DirHandle,
+        _name: &str,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        Err(UtimeError::ReadOnlyFileSystem)
+    }
+
+    fn utimensat_file(
+        &self,
+        _h: &FileHandle,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        Err(UtimeError::ReadOnlyFileSystem)
+    }
+
+    fn utimensat_dir(
+        &self,
+        _h: &DirHandle,
+        _atime: Option<Timestamp>,
+        _mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        Err(UtimeError::ReadOnlyFileSystem)
     }
 }

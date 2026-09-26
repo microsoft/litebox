@@ -1,0 +1,1312 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+pub(crate) mod apphelp;
+pub(crate) mod condrv;
+pub(crate) mod event;
+pub(crate) mod file;
+pub(crate) mod file_path;
+pub(crate) mod iocp;
+pub(crate) mod lpc;
+pub(crate) mod mm;
+pub(crate) mod nls;
+pub(crate) mod object_manager;
+pub(crate) mod process;
+pub(crate) mod registry;
+pub(crate) mod section;
+pub(crate) mod symlink;
+pub(crate) mod sysinfo;
+pub(crate) mod thread;
+pub(crate) mod timer;
+pub(crate) mod token;
+pub(crate) mod wait_completion_packet;
+pub(crate) mod wnf;
+pub(crate) mod worker_factory;
+
+use litebox::platform::{RawConstPointer as _, RawPointerProvider};
+use litebox::utils::TruncateExt as _;
+use litebox_common_windows::NtSysno;
+use litebox_common_windows::nt_status::NtStatus;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+use crate::nt_types;
+
+const FIRST_STACK_ARGUMENT_OFFSET: usize = 0x28;
+const HANDLE_SHIFT: u32 = 2;
+const HANDLE_TAG_MASK: usize = (1usize << HANDLE_SHIFT) - 1;
+
+#[repr(transparent)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, PartialEq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub(crate) struct Handle(usize);
+
+impl Handle {
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(raw)
+    }
+
+    #[must_use]
+    pub(crate) fn from_raw_fd(raw_fd: usize) -> Option<Self> {
+        raw_fd
+            .checked_add(1)?
+            .checked_mul(1usize << HANDLE_SHIFT)
+            .map(Self)
+    }
+
+    #[must_use]
+    pub(crate) fn raw_fd(self) -> Option<usize> {
+        if self.0 & HANDLE_TAG_MASK != 0 {
+            return None;
+        }
+        (self.0 >> HANDLE_SHIFT).checked_sub(1)
+    }
+
+    #[must_use]
+    pub(crate) const fn as_raw(self) -> usize {
+        self.0
+    }
+
+    #[must_use]
+    pub(crate) const fn is_null(self) -> bool {
+        self.as_raw() == 0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProcessHandle(Handle);
+
+impl ProcessHandle {
+    pub(crate) const CURRENT: Self = Self::from_raw(usize::MAX);
+
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(Handle::from_raw(raw))
+    }
+
+    #[must_use]
+    pub(crate) const fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(self) -> bool {
+        self == Self::CURRENT
+    }
+
+    #[must_use]
+    pub(crate) const fn as_handle(self) -> Handle {
+        self.0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ThreadHandle(Handle);
+
+impl ThreadHandle {
+    pub(crate) const CURRENT: Self = Self::from_raw(usize::MAX - 1);
+
+    #[must_use]
+    pub(crate) const fn from_raw(raw: usize) -> Self {
+        Self(Handle::from_raw(raw))
+    }
+
+    #[must_use]
+    pub(crate) fn is_current(self) -> bool {
+        self == Self::CURRENT
+    }
+}
+
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug)]
+pub(crate) enum SyscallRequest<Platform: RawPointerProvider> {
+    NtClose {
+        handle: Handle,
+    },
+    NtDuplicateObject {
+        source_process_handle: ProcessHandle,
+        source_handle: Handle,
+        target_process_handle: ProcessHandle,
+        target_handle: Option<Platform::RawMutPointer<Handle>>,
+        desired_access: u32,
+        handle_attributes: u32,
+        options: u32,
+    },
+    NtCreateEvent {
+        event_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        event_type: u32,
+        initial_state: u8,
+    },
+    NtCreateDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtCreateDirectoryObjectEx {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        shadow_directory_handle: Handle,
+        flags: u32,
+    },
+    NtOpenDirectoryObject {
+        directory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtOpenSection {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQueryDirectoryObject {
+        directory_handle: Handle,
+        buffer: Platform::RawMutPointer<u8>,
+        buffer_length: u32,
+        return_single_entry: u8,
+        restart_scan: u8,
+        context: Platform::RawMutPointer<u32>,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtCreateSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        link_target: Platform::RawConstPointer<nt_types::UnicodeString>,
+    },
+    NtOpenSymbolicLinkObject {
+        link_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQuerySymbolicLinkObject {
+        link_handle: Handle,
+        link_target: Platform::RawMutPointer<nt_types::UnicodeString>,
+        returned_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtCreateIoCompletion {
+        io_completion_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        number_of_concurrent_threads: u32,
+    },
+    NtConnectPort {
+        port_handle: Platform::RawMutPointer<Handle>,
+        port_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        security_qos: Platform::RawConstPointer<lpc::SecurityQualityOfService>,
+        client_view: Option<Platform::RawMutPointer<lpc::PortView>>,
+        server_view: Option<Platform::RawMutPointer<lpc::RemotePortView>>,
+        max_message_length: Option<Platform::RawMutPointer<u32>>,
+        connection_information: Option<Platform::RawMutPointer<u8>>,
+        connection_information_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    /// `NtSecureConnectPort` carries SID and server-view semantics that are
+    /// deliberately outside the current CSR `NtConnectPort` subset.
+    NtSecureConnectPort,
+    NtCreateSection {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        maximum_size: Option<Platform::RawConstPointer<i64>>,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
+    },
+    NtCreateSectionEx {
+        section_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        maximum_size: Option<Platform::RawConstPointer<i64>>,
+        section_page_protection: u32,
+        allocation_attributes: u32,
+        file_handle: Handle,
+        extended_parameters: Option<Platform::RawConstPointer<u8>>,
+        extended_parameter_count: u32,
+    },
+    NtCreateWaitCompletionPacket {
+        wait_completion_packet_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtAssociateWaitCompletionPacket {
+        wait_completion_packet_handle: Handle,
+        io_completion_handle: Handle,
+        target_object_handle: Handle,
+        key_context: usize,
+        apc_context: usize,
+        io_status: i32,
+        io_status_information: usize,
+        already_signaled: Option<Platform::RawMutPointer<u8>>,
+    },
+    NtCancelWaitCompletionPacket {
+        wait_completion_packet_handle: Handle,
+        remove_signaled_packet: u8,
+    },
+    NtCreateWorkerFactory {
+        worker_factory_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        completion_port_handle: Handle,
+        worker_process_handle: ProcessHandle,
+        start_routine: usize,
+        start_parameter: usize,
+        max_thread_count: u32,
+        stack_reserve: usize,
+        stack_commit: usize,
+    },
+    NtSetInformationWorkerFactory {
+        worker_factory_handle: Handle,
+        worker_factory_information_class: u32,
+        worker_factory_information: Platform::RawConstPointer<u8>,
+        worker_factory_information_length: u32,
+    },
+    NtShutdownWorkerFactory {
+        worker_factory_handle: Handle,
+        pending_worker_count: Platform::RawMutPointer<i32>,
+    },
+    NtCreateTimer2 {
+        timer_handle: Platform::RawMutPointer<Handle>,
+        timer_id: Option<Platform::RawConstPointer<u32>>,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        attributes: u32,
+        desired_access: u32,
+    },
+    NtSetTimer2 {
+        timer_handle: Handle,
+        due_time: Option<Platform::RawConstPointer<i64>>,
+        period: Option<Platform::RawConstPointer<i64>>,
+        parameters: Option<Platform::RawConstPointer<u8>>,
+    },
+    NtOpenEvent {
+        event_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtSetEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
+    NtResetEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
+    NtClearEvent {
+        event_handle: Handle,
+    },
+    NtPulseEvent {
+        event_handle: Handle,
+        previous_state: Option<Platform::RawMutPointer<i32>>,
+    },
+    NtQueryEvent {
+        event_handle: Handle,
+        event_information_class: u32,
+        event_information: Platform::RawMutPointer<event::EventBasicInformation>,
+        event_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtSetEventBoostPriority {
+        event_handle: Handle,
+    },
+    NtOpenFile {
+        file_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        share_access: u32,
+        open_options: u32,
+    },
+    NtCreateFile {
+        file_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        allocation_size: Option<Platform::RawConstPointer<i64>>,
+        file_attributes: u32,
+        share_access: u32,
+        create_disposition: u32,
+        create_options: u32,
+        ea_buffer: Option<Platform::RawConstPointer<u8>>,
+        ea_length: u32,
+    },
+    NtWriteFile {
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<Platform::RawConstPointer<u8>>,
+        apc_context: Option<Platform::RawConstPointer<u8>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        buffer: Platform::RawConstPointer<u8>,
+        length: u32,
+        byte_offset: Option<Platform::RawConstPointer<i64>>,
+        key: Option<Platform::RawConstPointer<u32>>,
+    },
+    NtQueryVolumeInformationFile {
+        file_handle: Handle,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        fs_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        fs_information_class: u32,
+    },
+    NtDeviceIoControlFile {
+        file_handle: Handle,
+        event: Handle,
+        apc_routine: Option<Platform::RawConstPointer<u8>>,
+        apc_context: Option<Platform::RawConstPointer<u8>>,
+        io_status_block: Platform::RawMutPointer<nt_types::IoStatusBlock>,
+        io_control_code: u32,
+        input_buffer: Option<Platform::RawConstPointer<u8>>,
+        input_buffer_length: u32,
+        output_buffer: Option<Platform::RawMutPointer<u8>>,
+        output_buffer_length: u32,
+    },
+    NtApphelpCacheControl {
+        service_class: u32,
+        service_data: Option<Platform::RawMutPointer<nt_types::AhcServiceData>>,
+    },
+    NtOpenKey {
+        key_handle: Platform::RawMutPointer<Handle>,
+        desired_access: u32,
+        object_attributes: Option<Platform::RawConstPointer<nt_types::ObjectAttributes>>,
+    },
+    NtQueryValueKey {
+        key_handle: Handle,
+        value_name: Platform::RawConstPointer<nt_types::UnicodeString>,
+        key_value_information_class: u32,
+        key_value_information: Platform::RawMutPointer<u8>,
+        length: u32,
+        result_length: Platform::RawMutPointer<u32>,
+    },
+    NtGetNlsSectionPtr {
+        section_type: u32,
+        section_data: u32,
+        context_data: usize,
+        section_pointer: Platform::RawMutPointer<usize>,
+        section_size: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtInitializeNlsFiles {
+        base_address: Platform::RawMutPointer<usize>,
+        default_locale_id: Platform::RawMutPointer<u32>,
+        default_casing_table_size: Platform::RawMutPointer<i64>,
+    },
+    NtQueryDefaultLocale {
+        user_profile: u8,
+        default_locale_id: Platform::RawMutPointer<u32>,
+    },
+    NtSetDefaultLocale {
+        user_profile: u8,
+        default_locale_id: u32,
+    },
+    NtQueryDefaultUILanguage {
+        default_ui_language: Platform::RawMutPointer<u16>,
+    },
+    NtSetDefaultUILanguage {
+        default_ui_language: u16,
+    },
+    NtQueryInstallUILanguage {
+        install_ui_language: Platform::RawMutPointer<u16>,
+    },
+    NtQueryPerformanceCounter {
+        performance_counter: Platform::RawMutPointer<i64>,
+        performance_frequency: Option<Platform::RawMutPointer<i64>>,
+    },
+    NtQuerySystemInformation {
+        system_information_class: u32,
+        system_information: Platform::RawMutPointer<u8>,
+        system_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQuerySystemInformationEx {
+        system_information_class: u32,
+        input_buffer: Option<Platform::RawConstPointer<u8>>,
+        input_buffer_length: u32,
+        system_information: Platform::RawMutPointer<u8>,
+        system_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtQueryWnfStateData {
+        state_name: Platform::RawConstPointer<u64>,
+        type_id: Option<Platform::RawConstPointer<nt_types::Guid>>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        change_stamp: Platform::RawMutPointer<u32>,
+        buffer: Platform::RawMutPointer<u8>,
+        buffer_size: Platform::RawMutPointer<u32>,
+    },
+    NtCreateWnfStateName {
+        state_name: Platform::RawMutPointer<u64>,
+        name_lifetime: u32,
+        data_scope: u32,
+        persist_data: u8,
+        type_id: Option<Platform::RawConstPointer<nt_types::Guid>>,
+        maximum_state_size: u32,
+        security_descriptor: Platform::RawConstPointer<u8>,
+    },
+    NtUpdateWnfStateData {
+        state_name: Platform::RawConstPointer<u64>,
+        buffer: Option<Platform::RawConstPointer<u8>>,
+        buffer_size: u32,
+        type_id: Option<Platform::RawConstPointer<nt_types::Guid>>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        matching_change_stamp: u32,
+        check_stamp: i32,
+    },
+    NtDeleteWnfStateData {
+        state_name: Platform::RawConstPointer<u64>,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+    },
+    NtDeleteWnfStateName {
+        state_name: Platform::RawConstPointer<u64>,
+    },
+    NtQueryWnfStateNameInformation {
+        state_name: Platform::RawConstPointer<u64>,
+        name_information_class: u32,
+        explicit_scope: Option<Platform::RawConstPointer<u8>>,
+        buffer: Platform::RawMutPointer<u32>,
+        buffer_size: u32,
+    },
+    NtQuerySection {
+        section_handle: Handle,
+        section_information_class: u32,
+        section_information: Platform::RawMutPointer<u8>,
+        section_information_length: usize,
+        return_length: Option<Platform::RawMutPointer<usize>>,
+    },
+    NtQueryInformationProcess {
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: Platform::RawMutPointer<u8>,
+        process_information_length: u32,
+        return_length: Option<Platform::RawMutPointer<u32>>,
+    },
+    NtSetInformationProcess {
+        process_handle: ProcessHandle,
+        process_information_class: u32,
+        process_information: Platform::RawMutPointer<u8>,
+        process_information_length: u32,
+    },
+    NtSetInformationThread {
+        thread_handle: ThreadHandle,
+        thread_information_class: u32,
+        thread_information: Platform::RawConstPointer<u8>,
+        thread_information_length: u32,
+    },
+    NtOpenThreadToken {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenThreadTokenEx {
+        thread_handle: ThreadHandle,
+        desired_access: u32,
+        open_as_self: u32,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessToken {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtOpenProcessTokenEx {
+        process_handle: ProcessHandle,
+        desired_access: u32,
+        handle_attributes: u32,
+        token_handle: Platform::RawMutPointer<Handle>,
+    },
+    NtQueryInformationToken {
+        token_handle: Handle,
+        token_information_class: u32,
+        token_information: Platform::RawMutPointer<u8>,
+        token_information_length: u32,
+        return_length: Platform::RawMutPointer<u32>,
+    },
+    NtQuerySecurityAttributesToken {
+        token_handle: Handle,
+        attributes: Platform::RawConstPointer<nt_types::UnicodeString>,
+        number_of_attributes: u32,
+        buffer: Platform::RawMutPointer<u8>,
+        length: u32,
+        return_length: Platform::RawMutPointer<u32>,
+    },
+    NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
+        flag: u32,
+        source: Platform::RawConstPointer<u64>,
+        destination: Platform::RawMutPointer<u64>,
+        conversion_error: Option<Platform::RawMutPointer<u64>>,
+    },
+    NtAllocateVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        zero_bits: usize,
+        region_size: Platform::RawMutPointer<usize>,
+        allocation_type: u32,
+        protect: u32,
+    },
+    NtAllocateVirtualMemoryEx {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        region_size: Platform::RawMutPointer<usize>,
+        allocation_type: u32,
+        protect: u32,
+        extended_parameters: Option<Platform::RawConstPointer<mm::MemoryExtendedParameter>>,
+        extended_parameter_count: u32,
+    },
+    NtFreeVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        region_size: Platform::RawMutPointer<usize>,
+        free_type: u32,
+    },
+    NtProtectVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        region_size: Platform::RawMutPointer<usize>,
+        new_protect: u32,
+        old_protect: Platform::RawMutPointer<u32>,
+    },
+    NtQueryVirtualMemory {
+        process_handle: ProcessHandle,
+        base_address: usize,
+        memory_information_class: u32,
+        memory_information: Platform::RawMutPointer<u8>,
+        memory_information_length: usize,
+        return_length: Option<Platform::RawMutPointer<usize>>,
+    },
+    NtMapViewOfSection {
+        section_handle: Handle,
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        zero_bits: usize,
+        commit_size: usize,
+        section_offset: Option<Platform::RawConstPointer<i64>>,
+        view_size: Platform::RawMutPointer<usize>,
+        inherit_disposition: u32,
+        allocation_type: u32,
+        page_protection: u32,
+    },
+    NtMapViewOfSectionEx {
+        section_handle: Handle,
+        process_handle: ProcessHandle,
+        base_address: Platform::RawMutPointer<usize>,
+        zero_bits: usize,
+        commit_size: usize,
+        section_offset: Option<Platform::RawConstPointer<i64>>,
+        view_size: Platform::RawMutPointer<usize>,
+        inherit_disposition: u32,
+        allocation_type: u32,
+        page_protection: u32,
+        extended_parameters: Option<Platform::RawConstPointer<u8>>,
+        extended_parameter_count: u32,
+    },
+    NtUnmapViewOfSection {
+        process_handle: ProcessHandle,
+        base_address: usize,
+    },
+    NtUnmapViewOfSectionEx {
+        process_handle: ProcessHandle,
+        base_address: usize,
+        flags: u32,
+    },
+    /// Restores the selected portions of a thread context and resumes execution.
+    NtContinue {
+        context: Platform::RawConstPointer<nt_types::X64Context>,
+        test_alert: bool,
+    },
+    NtTerminateProcess {
+        process_handle: ProcessHandle,
+        exit_status: i32,
+    },
+    NtTestAlert,
+    /// TODO: not supported yet
+    NtManageHotPatch,
+}
+
+impl<Platform: RawPointerProvider> SyscallRequest<Platform> {
+    pub(crate) fn try_from_raw(pt_regs: &litebox_common_linux::PtRegs) -> Option<Self> {
+        macro_rules! sys_req {
+            ($id:ident { $( $field:ident $(:$star:tt)? ),* $(,)? }) => {
+                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 ] [ ])
+            };
+            (@[$id:ident] [ $f:ident $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: win_sys_req_arg::<Platform, _>(pt_regs, $n)?, ])
+            };
+            (@[$id:ident] [ $f:ident : * $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: win_sys_req_ptr::<Platform, _, _>(pt_regs, $n)?, ])
+            };
+            (@[$id:ident] [ $f:ident : { $expr:expr } $(,)? $($field:ident $(:$star:tt)?),* ] [ $n:literal $(,)? $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                sys_req!(@[$id] [ $( $field $(:$star)? ),* ] [ $($ns),* ] [ $($tail)* $f: ($expr)(win_sys_req_arg::<Platform, _>(pt_regs, $n)?), ])
+            };
+            (@[$id:ident] [ ] [ $($ns:literal),* ] [ $($tail:tt)* ]) => {
+                SyscallRequest::$id { $($tail)* }
+            };
+        }
+
+        match NtSysno::from_raw(pt_regs.orig_rax)? {
+            NtSysno::NtClose => Some(sys_req!(NtClose {
+                handle: { Handle::from_raw },
+            })),
+            NtSysno::NtDuplicateObject => Some(sys_req!(NtDuplicateObject {
+                source_process_handle: { ProcessHandle::from_raw },
+                source_handle: { Handle::from_raw },
+                target_process_handle: { ProcessHandle::from_raw },
+                target_handle:*,
+                desired_access,
+                handle_attributes,
+                options,
+            })),
+            NtSysno::NtCreateEvent => Some(sys_req!(NtCreateEvent {
+                event_handle:*,
+                desired_access,
+                object_attributes:*,
+                event_type,
+                initial_state,
+            })),
+            NtSysno::NtCreateDirectoryObject => Some(sys_req!(NtCreateDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtCreateDirectoryObjectEx => Some(sys_req!(NtCreateDirectoryObjectEx {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+                shadow_directory_handle:{Handle::from_raw},
+                flags,
+            })),
+            NtSysno::NtOpenDirectoryObject => Some(sys_req!(NtOpenDirectoryObject {
+                directory_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtOpenSection => Some(sys_req!(NtOpenSection {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQueryDirectoryObject => Some(sys_req!(NtQueryDirectoryObject {
+                directory_handle:{ Handle::from_raw },
+                buffer:*,
+                buffer_length,
+                return_single_entry,
+                restart_scan,
+                context:*,
+                return_length:*,
+            })),
+            NtSysno::NtCreateSymbolicLinkObject => Some(sys_req!(NtCreateSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+                link_target:*,
+            })),
+            NtSysno::NtOpenSymbolicLinkObject => Some(sys_req!(NtOpenSymbolicLinkObject {
+                link_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQuerySymbolicLinkObject => Some(sys_req!(NtQuerySymbolicLinkObject {
+                link_handle:{Handle::from_raw},
+                link_target:*,
+                returned_length:*,
+            })),
+            NtSysno::NtCreateIoCompletion => Some(sys_req!(NtCreateIoCompletion {
+                io_completion_handle:*,
+                desired_access,
+                object_attributes:*,
+                number_of_concurrent_threads,
+            })),
+            NtSysno::NtConnectPort => Some(sys_req!(NtConnectPort {
+                port_handle:*,
+                port_name:*,
+                security_qos:*,
+                client_view:*,
+                server_view:*,
+                max_message_length:*,
+                connection_information:*,
+                connection_information_length:*,
+            })),
+            NtSysno::NtSecureConnectPort => Some(SyscallRequest::NtSecureConnectPort),
+            NtSysno::NtCreateSection => Some(sys_req!(NtCreateSection {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
+                maximum_size:*,
+                section_page_protection,
+                allocation_attributes,
+                file_handle:{ Handle::from_raw },
+            })),
+            NtSysno::NtCreateSectionEx => Some(sys_req!(NtCreateSectionEx {
+                section_handle:*,
+                desired_access,
+                object_attributes:*,
+                maximum_size:*,
+                section_page_protection,
+                allocation_attributes,
+                file_handle:{ Handle::from_raw },
+                extended_parameters:*,
+                extended_parameter_count,
+            })),
+            NtSysno::NtCreateWaitCompletionPacket => Some(sys_req!(
+                NtCreateWaitCompletionPacket {
+                    wait_completion_packet_handle:*,
+                    desired_access,
+                    object_attributes:*,
+                }
+            )),
+            NtSysno::NtAssociateWaitCompletionPacket => Some(sys_req!(
+                NtAssociateWaitCompletionPacket {
+                    wait_completion_packet_handle:{Handle::from_raw},
+                    io_completion_handle:{Handle::from_raw},
+                    target_object_handle:{Handle::from_raw},
+                    key_context,
+                    apc_context,
+                    io_status,
+                    io_status_information,
+                    already_signaled:*,
+                }
+            )),
+            NtSysno::NtCancelWaitCompletionPacket => Some(sys_req!(NtCancelWaitCompletionPacket {
+                wait_completion_packet_handle: { Handle::from_raw },
+                remove_signaled_packet,
+            })),
+            NtSysno::NtCreateWorkerFactory => Some(sys_req!(NtCreateWorkerFactory {
+                worker_factory_handle:*,
+                desired_access,
+                object_attributes:*,
+                completion_port_handle:{Handle::from_raw},
+                worker_process_handle:{ProcessHandle::from_raw},
+                start_routine,
+                start_parameter,
+                max_thread_count,
+                stack_reserve,
+                stack_commit,
+            })),
+            NtSysno::NtSetInformationWorkerFactory => Some(sys_req!(
+                NtSetInformationWorkerFactory {
+                    worker_factory_handle:{Handle::from_raw},
+                    worker_factory_information_class,
+                    worker_factory_information:*,
+                    worker_factory_information_length,
+                }
+            )),
+            NtSysno::NtShutdownWorkerFactory => Some(sys_req!(NtShutdownWorkerFactory {
+                worker_factory_handle:{Handle::from_raw},
+                pending_worker_count:*,
+            })),
+            NtSysno::NtCreateTimer2 => Some(sys_req!(NtCreateTimer2 {
+                timer_handle:*,
+                timer_id:*,
+                object_attributes:*,
+                attributes,
+                desired_access,
+            })),
+            NtSysno::NtSetTimer2 => Some(sys_req!(NtSetTimer2 {
+                timer_handle:{Handle::from_raw},
+                due_time:*,
+                period:*,
+                parameters:*,
+            })),
+            NtSysno::NtOpenEvent => Some(sys_req!(NtOpenEvent {
+                event_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtSetEvent => Some(sys_req!(NtSetEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
+            })),
+            NtSysno::NtResetEvent => Some(sys_req!(NtResetEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
+            })),
+            NtSysno::NtClearEvent => Some(sys_req!(NtClearEvent {
+                event_handle: { Handle::from_raw },
+            })),
+            NtSysno::NtPulseEvent => Some(sys_req!(NtPulseEvent {
+                event_handle:{Handle::from_raw},
+                previous_state:*,
+            })),
+            NtSysno::NtQueryEvent => Some(sys_req!(NtQueryEvent {
+                event_handle:{Handle::from_raw},
+                event_information_class,
+                event_information:*,
+                event_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtSetEventBoostPriority => Some(sys_req!(NtSetEventBoostPriority {
+                event_handle: { Handle::from_raw },
+            })),
+            NtSysno::NtOpenFile => Some(sys_req!(NtOpenFile {
+                file_handle:*,
+                desired_access,
+                object_attributes:*,
+                io_status_block:*,
+                share_access,
+                open_options,
+            })),
+            NtSysno::NtCreateFile => Some(sys_req!(NtCreateFile {
+                file_handle:*,
+                desired_access,
+                object_attributes:*,
+                io_status_block:*,
+                allocation_size:*,
+                file_attributes,
+                share_access,
+                create_disposition,
+                create_options,
+                ea_buffer:*,
+                ea_length,
+            })),
+            NtSysno::NtWriteFile => Some(sys_req!(NtWriteFile {
+                file_handle:{Handle::from_raw},
+                event:{Handle::from_raw},
+                apc_routine:*,
+                apc_context:*,
+                io_status_block:*,
+                buffer:*,
+                length,
+                byte_offset:*,
+                key:*,
+            })),
+            NtSysno::NtQueryVolumeInformationFile => Some(sys_req!(NtQueryVolumeInformationFile {
+                file_handle:{Handle::from_raw},
+                io_status_block:*,
+                fs_information:*,
+                length,
+                fs_information_class,
+            })),
+            NtSysno::NtDeviceIoControlFile => Some(sys_req!(NtDeviceIoControlFile {
+                file_handle:{Handle::from_raw},
+                event:{Handle::from_raw},
+                apc_routine:*,
+                apc_context:*,
+                io_status_block:*,
+                io_control_code,
+                input_buffer:*,
+                input_buffer_length,
+                output_buffer:*,
+                output_buffer_length,
+            })),
+            NtSysno::NtApphelpCacheControl => Some(sys_req!(NtApphelpCacheControl {
+                service_class,
+                service_data:*,
+            })),
+            NtSysno::NtOpenKey => Some(sys_req!(NtOpenKey {
+                key_handle:*,
+                desired_access,
+                object_attributes:*,
+            })),
+            NtSysno::NtQueryValueKey => Some(sys_req!(NtQueryValueKey {
+                key_handle:{Handle::from_raw},
+                value_name:*,
+                key_value_information_class,
+                key_value_information:*,
+                length,
+                result_length:*,
+            })),
+            NtSysno::NtGetNlsSectionPtr => Some(sys_req!(NtGetNlsSectionPtr {
+                section_type,
+                section_data,
+                context_data,
+                section_pointer:*,
+                section_size:*,
+            })),
+            NtSysno::NtInitializeNlsFiles => Some(sys_req!(NtInitializeNlsFiles {
+                base_address:*,
+                default_locale_id:*,
+                default_casing_table_size:*,
+            })),
+            NtSysno::NtQueryDefaultLocale => Some(sys_req!(NtQueryDefaultLocale {
+                user_profile,
+                default_locale_id:*,
+            })),
+            NtSysno::NtSetDefaultLocale => Some(sys_req!(NtSetDefaultLocale {
+                user_profile,
+                default_locale_id,
+            })),
+            NtSysno::NtQueryDefaultUILanguage => Some(sys_req!(NtQueryDefaultUILanguage {
+                default_ui_language:*,
+            })),
+            NtSysno::NtSetDefaultUILanguage => Some(sys_req!(NtSetDefaultUILanguage {
+                default_ui_language,
+            })),
+            NtSysno::NtQueryInstallUILanguage => Some(sys_req!(NtQueryInstallUILanguage {
+                install_ui_language:*,
+            })),
+            NtSysno::NtQueryPerformanceCounter => Some(sys_req!(NtQueryPerformanceCounter {
+                performance_counter:*,
+                performance_frequency:*,
+            })),
+            NtSysno::NtQuerySystemInformation => Some(sys_req!(NtQuerySystemInformation {
+                system_information_class,
+                system_information:*,
+                system_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySystemInformationEx => Some(sys_req!(NtQuerySystemInformationEx {
+                system_information_class,
+                input_buffer:*,
+                input_buffer_length,
+                system_information:*,
+                system_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQueryWnfStateData => Some(sys_req!(NtQueryWnfStateData {
+                state_name:*,
+                type_id:*,
+                explicit_scope:*,
+                change_stamp:*,
+                buffer:*,
+                buffer_size:*,
+            })),
+            NtSysno::NtCreateWnfStateName => Some(sys_req!(NtCreateWnfStateName {
+                state_name:*,
+                name_lifetime,
+                data_scope,
+                persist_data,
+                type_id:*,
+                maximum_state_size,
+                security_descriptor:*,
+            })),
+            NtSysno::NtUpdateWnfStateData => Some(sys_req!(NtUpdateWnfStateData {
+                state_name:*,
+                buffer:*,
+                buffer_size,
+                type_id:*,
+                explicit_scope:*,
+                matching_change_stamp,
+                check_stamp,
+            })),
+            NtSysno::NtDeleteWnfStateData => Some(sys_req!(NtDeleteWnfStateData {
+                state_name:*,
+                explicit_scope:*,
+            })),
+            NtSysno::NtDeleteWnfStateName => Some(sys_req!(NtDeleteWnfStateName {
+                state_name:*,
+            })),
+            NtSysno::NtQueryWnfStateNameInformation => {
+                Some(sys_req!(NtQueryWnfStateNameInformation {
+                    state_name:*,
+                    name_information_class,
+                    explicit_scope:*,
+                    buffer:*,
+                    buffer_size,
+                }))
+            }
+            NtSysno::NtQuerySection => Some(sys_req!(NtQuerySection {
+                section_handle: { Handle::from_raw },
+                section_information_class,
+                section_information:*,
+                section_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQueryInformationProcess => Some(sys_req!(NtQueryInformationProcess {
+                process_handle: { ProcessHandle::from_raw },
+                process_information_class,
+                process_information:*,
+                process_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtSetInformationProcess => Some(sys_req!(NtSetInformationProcess {
+                process_handle: { ProcessHandle::from_raw },
+                process_information_class,
+                process_information:*,
+                process_information_length,
+            })),
+            NtSysno::NtSetInformationThread => Some(sys_req!(NtSetInformationThread {
+                thread_handle: { ThreadHandle::from_raw },
+                thread_information_class,
+                thread_information:*,
+                thread_information_length,
+            })),
+            NtSysno::NtOpenThreadToken => Some(sys_req!(NtOpenThreadToken {
+                thread_handle: { ThreadHandle::from_raw },
+                desired_access,
+                open_as_self,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenThreadTokenEx => Some(sys_req!(NtOpenThreadTokenEx {
+                thread_handle: { ThreadHandle::from_raw },
+                desired_access,
+                open_as_self,
+                handle_attributes,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenProcessToken => Some(sys_req!(NtOpenProcessToken {
+                process_handle: { ProcessHandle::from_raw },
+                desired_access,
+                token_handle:*,
+            })),
+            NtSysno::NtOpenProcessTokenEx => Some(sys_req!(NtOpenProcessTokenEx {
+                process_handle: { ProcessHandle::from_raw },
+                desired_access,
+                handle_attributes,
+                token_handle:*,
+            })),
+            NtSysno::NtQueryInformationToken => Some(sys_req!(NtQueryInformationToken {
+                token_handle: { Handle::from_raw },
+                token_information_class,
+                token_information:*,
+                token_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtQuerySecurityAttributesToken => {
+                Some(sys_req!(NtQuerySecurityAttributesToken {
+                    token_handle: { Handle::from_raw },
+                    attributes:*,
+                    number_of_attributes,
+                    buffer:*,
+                    length,
+                    return_length:*,
+                }))
+            }
+            NtSysno::NtConvertBetweenAuxiliaryCounterAndPerformanceCounter => Some(
+                sys_req!(NtConvertBetweenAuxiliaryCounterAndPerformanceCounter {
+                    flag,
+                    source:*,
+                    destination:*,
+                    conversion_error:*,
+                }),
+            ),
+            NtSysno::NtAllocateVirtualMemory => Some(sys_req!(NtAllocateVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                zero_bits,
+                region_size:*,
+                allocation_type,
+                protect,
+            })),
+            NtSysno::NtAllocateVirtualMemoryEx => Some(sys_req!(NtAllocateVirtualMemoryEx {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                region_size:*,
+                allocation_type,
+                protect,
+                extended_parameters:*,
+                extended_parameter_count,
+            })),
+            NtSysno::NtFreeVirtualMemory => Some(sys_req!(NtFreeVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                region_size:*,
+                free_type,
+            })),
+            NtSysno::NtProtectVirtualMemory => Some(sys_req!(NtProtectVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                region_size:*,
+                new_protect,
+                old_protect:*,
+            })),
+            NtSysno::NtQueryVirtualMemory => Some(sys_req!(NtQueryVirtualMemory {
+                process_handle: { ProcessHandle::from_raw },
+                base_address,
+                memory_information_class,
+                memory_information:*,
+                memory_information_length,
+                return_length:*,
+            })),
+            NtSysno::NtMapViewOfSection => Some(sys_req!(NtMapViewOfSection {
+                section_handle: { Handle::from_raw },
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                zero_bits,
+                commit_size,
+                section_offset:*,
+                view_size:*,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+            })),
+            NtSysno::NtMapViewOfSectionEx => Some(sys_req!(NtMapViewOfSectionEx {
+                section_handle: { Handle::from_raw },
+                process_handle: { ProcessHandle::from_raw },
+                base_address:*,
+                zero_bits,
+                commit_size,
+                section_offset:*,
+                view_size:*,
+                inherit_disposition,
+                allocation_type,
+                page_protection,
+                extended_parameters:*,
+                extended_parameter_count,
+            })),
+            NtSysno::NtUnmapViewOfSection => Some(sys_req!(NtUnmapViewOfSection {
+                process_handle: { ProcessHandle::from_raw },
+                base_address,
+            })),
+            NtSysno::NtUnmapViewOfSectionEx => Some(sys_req!(NtUnmapViewOfSectionEx {
+                process_handle: { ProcessHandle::from_raw },
+                base_address,
+                flags,
+            })),
+            NtSysno::NtContinue => Some(sys_req!(NtContinue {
+                context:*,
+                test_alert: { |value: u8| value != 0 },
+            })),
+            NtSysno::NtTerminateProcess => Some(sys_req!(NtTerminateProcess {
+                process_handle: { ProcessHandle::from_raw },
+                exit_status,
+            })),
+            NtSysno::NtTestAlert => Some(SyscallRequest::NtTestAlert),
+            NtSysno::NtManageHotPatch => Some(SyscallRequest::NtManageHotPatch),
+            _ => None,
+        }
+    }
+}
+
+fn win_syscall_arg<Platform: RawPointerProvider>(
+    pt_regs: &litebox_common_linux::PtRegs,
+    idx: usize,
+) -> Option<usize> {
+    match idx {
+        0 => Some(pt_regs.r10),
+        1 => Some(pt_regs.rdx),
+        2 => Some(pt_regs.r8),
+        3 => Some(pt_regs.r9),
+        idx => {
+            // The first stack argument sits after the return address and x64 shadow space.
+            let stack_offset = FIRST_STACK_ARGUMENT_OFFSET
+                .checked_add((idx - 4).checked_mul(size_of::<usize>())?)?;
+            let stack_address = pt_regs.rsp.checked_add(stack_offset)?;
+            let stack_arg = Platform::RawConstPointer::<usize>::from_usize(stack_address);
+            stack_arg.read_at_offset(0)
+        }
+    }
+}
+
+fn win_sys_req_arg<Platform: RawPointerProvider, T: ReinterpretTruncatedFromUsize>(
+    pt_regs: &litebox_common_linux::PtRegs,
+    idx: usize,
+) -> Option<T> {
+    Some(T::reinterpret_truncated_from_usize(win_syscall_arg::<
+        Platform,
+    >(pt_regs, idx)?))
+}
+
+fn win_sys_req_ptr<
+    Platform: RawPointerProvider,
+    T: zerocopy::FromBytes,
+    P: ReinterpretUsizeAsPtr<T>,
+>(
+    pt_regs: &litebox_common_linux::PtRegs,
+    idx: usize,
+) -> Option<P> {
+    Some(P::reinterpret_usize_as_ptr(win_syscall_arg::<Platform>(
+        pt_regs, idx,
+    )?))
+}
+
+trait ReinterpretTruncatedFromUsize: Sized {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self;
+}
+
+impl ReinterpretTruncatedFromUsize for usize {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        value
+    }
+}
+
+impl ReinterpretTruncatedFromUsize for u64 {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        value as u64
+    }
+}
+
+impl ReinterpretTruncatedFromUsize for isize {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        value.cast_signed()
+    }
+}
+
+impl ReinterpretTruncatedFromUsize for NtStatus {
+    fn reinterpret_truncated_from_usize(value: usize) -> Self {
+        Self::from_raw(value.trunc())
+    }
+}
+
+macro_rules! reinterpret_truncated_unsigned {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl ReinterpretTruncatedFromUsize for $ty {
+                fn reinterpret_truncated_from_usize(value: usize) -> Self {
+                    value.trunc()
+                }
+            }
+        )*
+    };
+}
+
+macro_rules! reinterpret_truncated_signed {
+    ($($sty:ty),* $(,)?) => {
+        $(
+            impl ReinterpretTruncatedFromUsize for $sty {
+                fn reinterpret_truncated_from_usize(value: usize) -> Self {
+                    value.cast_signed().trunc()
+                }
+            }
+        )*
+    };
+}
+
+reinterpret_truncated_unsigned!(u8, u16, u32);
+reinterpret_truncated_signed!(i8, i16, i32);
+
+trait ReinterpretUsizeAsPtr<T>: Sized {
+    fn reinterpret_usize_as_ptr(value: usize) -> Self;
+}
+
+impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
+    ReinterpretUsizeAsPtr<core::marker::PhantomData<((), T)>> for P
+{
+    fn reinterpret_usize_as_ptr(value: usize) -> Self {
+        P::from_usize(value)
+    }
+}
+
+impl<T: zerocopy::FromBytes, P: litebox::platform::RawConstPointer<T>>
+    ReinterpretUsizeAsPtr<core::marker::PhantomData<(bool, T)>> for Option<P>
+{
+    fn reinterpret_usize_as_ptr(value: usize) -> Self {
+        if value == 0 {
+            None
+        } else {
+            Some(P::from_usize(value))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_encodes_raw_fds_and_rejects_invalid_values() {
+        let first_handle = Handle::from_raw_fd(0).expect("raw fd 0 should encode");
+        assert_eq!(first_handle, Handle::from_raw(1usize << HANDLE_SHIFT));
+        assert_eq!(first_handle.raw_fd(), Some(0));
+
+        let max_raw_fd = (usize::MAX >> HANDLE_SHIFT) - 1;
+        for raw_fd in [1, 42, max_raw_fd] {
+            let handle = Handle::from_raw_fd(raw_fd).expect("raw fd should encode");
+            assert_eq!(handle.raw_fd(), Some(raw_fd));
+        }
+
+        assert_eq!(Handle::from_raw(0).raw_fd(), None);
+
+        for tag in 1..=HANDLE_TAG_MASK {
+            assert_eq!(Handle::from_raw(tag).raw_fd(), None);
+            assert_eq!(
+                Handle::from_raw((2usize << HANDLE_SHIFT) | tag).raw_fd(),
+                None
+            );
+        }
+
+        assert_eq!(Handle::from_raw_fd(usize::MAX >> HANDLE_SHIFT), None);
+        assert_eq!(Handle::from_raw_fd(usize::MAX), None);
+    }
+}

@@ -49,6 +49,9 @@ jobs:
       - name: Install diod
         run: |
           sudo apt install -y diod
+      - name: Install AArch64 binutils
+        run: |
+          sudo apt install -y binutils-aarch64-linux-gnu
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Cache custom out directories
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -56,6 +59,9 @@ jobs:
           path: |
             target/*/build/litebox_runner_linux_userland-*/out
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
+      - name: Remove restored transient guest staging
+        timeout-minutes: 5
+        run: rm -rf target/tmp/tar_files_*
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_snp
@@ -77,6 +83,19 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+      # rust-cache's post-step cleanup walks target/ and takes rustdoc's page
+      # directory for any module named `tests` (target/doc/<crate>/tests) for a
+      # build profile, then reports ENOENT for the nested build directories it
+      # probes for there. The docs are rebuilt on every run anyway, so drop
+      # them before the cache is saved.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
+      - name: Remove transient guest staging before cache save
+        if: always()
+        timeout-minutes: 5
+        run: rm -rf target/tmp/tar_files_*
 
   build_and_test_arm64:
     name: Build and Test (AArch64)
@@ -102,6 +121,79 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox -p litebox_common_linux
           ./.github/tools/github_actions_run_cargo build -p litebox -p litebox_common_linux
           ./.github/tools/github_actions_run_cargo nextest -p litebox -p litebox_common_linux
+      - name: Build the Linux shim for AArch64
+        run: |
+          ./.github/tools/github_actions_run_cargo clippy --all-features -p litebox_shim_linux --lib
+          ./.github/tools/github_actions_run_cargo build -p litebox_shim_linux --lib
+          # Only the library: the shim's unit tests need a concrete platform, and
+          # `litebox_platform_linux_userland` is still x86-64 only.
+
+  build_and_test_macos:
+    name: Build and Test macOS (Apple Silicon)
+    # `macos-14` and later are AArch64 runners. LiteBox runs guest instructions
+    # natively, so an Apple Silicon host is only useful to an AArch64 guest --
+    # there is deliberately no x86-64 macOS configuration. The image must ship
+    # the macOS 26 SDK: litebox_platform_macos_userland's Hypervisor.framework
+    # shim (`src/hvf_sdk.c`) refuses to build against anything older.
+    runs-on: macos-26
+    env:
+      RUSTFLAGS: -Dwarnings
+      RUSTDOCFLAGS: -Dwarnings
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Rust
+        run: |
+          rustup toolchain install $(awk -F'"' '/channel/{print $2}' rust-toolchain.toml) --profile minimal --no-self-update --component rustfmt,clippy --target aarch64-apple-darwin
+      - name: Set up Nextest
+        uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # `litebox_runner_lvbs` and `litebox_runner_snp` are freestanding images
+      # built for custom targets; they are not built for a hosted target on any
+      # platform.
+      - run: cargo clippy --locked --verbose --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland
+      - run: cargo build --locked --verbose --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland
+      # The 9p tests need `diod`, which has no macOS package.
+      - run: cargo nextest run --locked --profile ci -p litebox -p litebox_common_linux -E 'not test(nine_p)'
+      - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
+      - run: cargo test --locked --verbose --doc -p litebox -p litebox_common_linux -p litebox_platform_macos_userland
+      - name: Build documentation (fail on warnings)
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_snp
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
+      # Verifies litebox_platform_macos_userland's hand-written Mach/BSD struct
+      # layouts against the real SDK headers on this runner -- see the probe
+      # file for why this matters and what a failure here means.
+      - name: Verify hand-written Darwin struct layouts against the SDK
+        run: |
+          cc -Wall -Wextra -Werror -o /tmp/darwin_abi_probe litebox_platform_macos_userland/tests/darwin_abi_probe.c
+          /tmp/darwin_abi_probe
+
+  miri:
+    name: Miri (litebox core, asm-free logic)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Miri
+        run: |
+          rustup toolchain install nightly --profile minimal --no-self-update --component miri
+          rustup +nightly component add rust-src
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Miri interprets Rust; it cannot execute the x86_64/aarch64 inline asm
+      # in litebox/src/mm/exception_table.rs, or any FFI call into a real host
+      # (litebox_platform_macos_userland's Darwin bindings, or any other
+      # platform crate). It covers exactly the platform-agnostic logic that
+      # doesn't touch either -- currently litebox's own mm module, including
+      # exception_table.rs's `search_in` (the exception-table lookup's pure
+      # relocation/interval-comparison logic, split out from the asm-based
+      # section lookup precisely so it has somewhere Miri-reachable to live).
+      - run: cargo +nightly miri test -p litebox --lib "mm::"
 
   build_and_test_lvbs:
     name: Build and Test LVBS
@@ -158,6 +250,11 @@ jobs:
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
 
   build_and_test_windows:
     name: Build and Test Windows
@@ -176,17 +273,23 @@ jobs:
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland
-      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland
-      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland
+      - run: cargo clippy --locked --verbose --all-targets --all-features -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_runner_darwin_on_windows_userland
+      - run: cargo build --locked --verbose -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_runner_darwin_on_windows_userland
+      - run: cargo nextest run --locked --profile ci -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_runner_darwin_on_windows_userland
       - run: cargo nextest run --locked --profile ci -p litebox_shim_linux
+      - run: cargo nextest run --locked --profile ci -p litebox_shim_windows
       - run: |
-          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland
+          cargo test --locked --verbose --doc -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_runner_darwin_on_windows_userland
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland
+        run: cargo doc --locked --verbose --no-deps --all-features --document-private-items -p litebox_runner_linux_on_windows_userland -p litebox_runner_windows_userland -p litebox_runner_darwin_on_windows_userland
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
 
   build_and_test_snp:
     name: Build and Test SNP
@@ -210,6 +313,11 @@ jobs:
           ./.github/tools/github_actions_run_cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
+      # See build_and_test: keeps rust-cache's cleanup out of rustdoc output.
+      - name: Remove rustdoc output before cache save
+        if: always()
+        shell: bash
+        run: rm -rf target/doc
 
   confirm_no_std:
     name: Confirm no_std
@@ -258,6 +366,14 @@ jobs:
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
+          # - `litebox_runner_windows_on_linux_userland` and
+          #   `litebox_runner_windows_userland` are allowed to have `std` access
+          #   for the same reason, with Windows guests.
+          #
+          # - `litebox_runner_darwin_on_linux_userland` and
+          #   `litebox_runner_darwin_on_windows_userland` are allowed to have
+          #   `std` access for the same reason, with macOS guests.
+          #
           # - `litebox_runner_linux_userland` is allowed to have `std` access
           #   since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
@@ -275,6 +391,9 @@ jobs:
           #   `litebox_runner_lvbs/x86_64_vtl1.json`, satisfies that
           #   requirement.
           #
+          # - `litebox_service_heki` is excluded for the same reason as
+          #   `litebox_shim_optee` above; it also pulls in crypto dependencies.
+          #
           # - `litebox_syscall_rewriter` is allowed to have `std` access since
           #   it is a helper binary that runs in userland to AOT "compile" ELFs.
           #
@@ -283,29 +402,59 @@ jobs:
           #
           # - `litebox_runner_snp` is `no_std` but requires custom target to build
           #
-          # - `litebox_service_heki` is excluded for the same reason as
-          #   `litebox_shim_optee` above; it also pulls in crypto dependencies.
-          #
           # - `dev_tests` is meant to only be used for tests, and thus can
           #   safely use std.
           #
           # - `dev_bench` is meant to only be used for benchmarking, and thus
           #   can safely use std.
+          #
+          # - `litebox_platform_macos_userland` is allowed to have `std` access,
+          #   since it is a purely-userland implementation (HVF/Hypervisor.framework
+          #   bindings are only reachable from userland on macOS).
+          #
+          # - `litebox_runner_linux_on_macos_userland` is allowed to have `std`
+          #   access since it needs to actually access the file-system, pull in
+          #   relevant files, and then actually trigger LiteBox itself.
+          #
+          # - `litebox_rfb` is allowed to have `std` access since it is a
+          #   userland RFB (VNC) server used to expose the macOS runner's
+          #   framebuffer over TCP.
+          #
+          # - `litebox_broker_transport_linux_userland` is allowed to have `std`
+          #   access, since it is a purely-userland implementation of the broker
+          #   transport (real sockets/pipes).
+          #
+          # - `litebox_broker_userland` is allowed to have `std` access since it
+          #   is a userland CLI tool.
+          #
+          # - `litebox_platform_multiplex` pulls in `litebox_platform_macos_userland`
+          #   (one of the platforms it multiplexes over), which is itself allowed
+          #   `std` access above.
           find . -type f -name 'Cargo.toml' \
             -not -path './Cargo.toml' \
             -not -path './litebox_platform_linux_userland/Cargo.toml' \
             -not -path './litebox_platform_windows_userland/Cargo.toml' \
             -not -path './litebox_runner_linux_on_windows_userland/Cargo.toml' \
+            -not -path './litebox_runner_windows_on_linux_userland/Cargo.toml' \
+            -not -path './litebox_runner_windows_userland/Cargo.toml' \
+            -not -path './litebox_runner_darwin_on_linux_userland/Cargo.toml' \
+            -not -path './litebox_runner_darwin_on_windows_userland/Cargo.toml' \
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
+            -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
             -not -path './litebox_runner_snp/Cargo.toml' \
-            -not -path './litebox_service_heki/Cargo.toml' \
             -not -path './dev_tests/Cargo.toml' \
             -not -path './dev_bench/Cargo.toml' \
+            -not -path './litebox_platform_macos_userland/Cargo.toml' \
+            -not -path './litebox_runner_linux_on_macos_userland/Cargo.toml' \
+            -not -path './litebox_rfb/Cargo.toml' \
+            -not -path './litebox_broker_transport_linux_userland/Cargo.toml' \
+            -not -path './litebox_broker_userland/Cargo.toml' \
+            -not -path './litebox_platform_multiplex/Cargo.toml' \
             -print0 | \
               xargs -0 -I '{}' sh -c 'cd "$(dirname "{}")"; pwd; cargo build --locked --target x86_64-unknown-none || exit 1; echo; echo'

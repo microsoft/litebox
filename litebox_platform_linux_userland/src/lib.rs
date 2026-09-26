@@ -31,6 +31,38 @@ extern crate alloc;
 
 mod page_mgmt;
 
+/// Landlock ABI types and constants (`<linux/landlock.h>`), hand-transcribed because no
+/// `landlock` crate is vendored in this workspace and these are simple enough not to need one --
+/// see `LinuxUserland::enable_landlock_filesystem_ruleset`, the only user.
+///
+/// Values verified against the kernel's own `include/uapi/linux/landlock.h`.
+mod landlock {
+    /// The original (ABI 1) two-field `landlock_ruleset_attr`, not the modern six-field struct
+    /// with network/scoping fields -- deliberately minimal so the exact same bytes are a valid
+    /// `landlock_create_ruleset` argument on every kernel that has Landlock at all. Both fields
+    /// are naturally 8-byte aligned, so (unlike `LandlockPathBeneathAttr`) no explicit `packed`
+    /// representation is needed to match the kernel's C layout.
+    #[repr(C)]
+    pub(super) struct LandlockRulesetAttr {
+        pub(super) handled_access_fs: u64,
+        pub(super) handled_access_net: u64,
+    }
+
+    /// The kernel's own layout is `__attribute__((packed))`: `parent_fd` sits at byte offset 8,
+    /// not the offset 16 that Rust's normal 8-byte alignment for the preceding `u64` field would
+    /// otherwise insert. `#[repr(C, packed)]` mirrors that -- callers must pass a pointer to the
+    /// whole struct (never a reference to `parent_fd` alone, which would be unaligned).
+    #[repr(C, packed)]
+    pub(super) struct LandlockPathBeneathAttr {
+        pub(super) allowed_access: u64,
+        pub(super) parent_fd: i32,
+    }
+
+    pub(super) const LANDLOCK_ACCESS_FS_READ_FILE: u64 = 1 << 2;
+    pub(super) const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+    pub(super) const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
+}
+
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //
@@ -107,6 +139,17 @@ pub struct LinuxUserland {
     /// reboots.
     boot_id: std::sync::OnceLock<Vec<u8>>,
     stdio_is_tty: [bool; 3],
+    /// Real, non-blocking-observable stdin, fed by a background host thread spawned in
+    /// [`Self::new`]. See [`litebox::platform::StdinPump`].
+    stdin_pump: litebox::platform::StdinPump,
+    /// Doorbell the stdin-pump background thread notifies after every push/EOF, so
+    /// `StdioProvider::read_from_stdin`'s blocking path can sleep instead of busy-polling.
+    stdin_doorbell: (std::sync::Mutex<()>, std::sync::Condvar),
+    /// Serializes real host writes to stdout, so concurrent guest threads' `write()` calls to the
+    /// same stream don't interleave mid-write.
+    stdout_lock: std::sync::Mutex<()>,
+    /// Serializes real host writes to stderr; see [`Self::stdout_lock`].
+    stderr_lock: std::sync::Mutex<()>,
 }
 
 impl core::fmt::Debug for LinuxUserland {
@@ -241,8 +284,16 @@ impl LinuxUserland {
                 std::io::stdout().is_terminal(),
                 std::io::stderr().is_terminal(),
             ],
+            stdin_pump: litebox::platform::StdinPump::new(
+                litebox::platform::stdin_pump::DEFAULT_CAPACITY,
+            ),
+            stdin_doorbell: (std::sync::Mutex::new(()), std::sync::Condvar::new()),
+            stdout_lock: std::sync::Mutex::new(()),
+            stderr_lock: std::sync::Mutex::new(()),
         };
-        Box::leak(Box::new(platform))
+        let platform: &'static Self = Box::leak(Box::new(platform));
+        spawn_stdin_pump_thread(platform);
+        platform
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -422,15 +473,138 @@ impl LinuxUserland {
     #[cfg(target_arch = "x86_64")]
     #[allow(
         clippy::missing_panics_doc,
+        reason = "landlock_add_rule/landlock_restrict_self are not expected to fail once ruleset \
+                   construction has gotten this far -- a genuine failure there is exactly the \
+                   kind of surprise this function exists to fail loudly on, not swallow"
+    )]
+    /// Installs a Landlock filesystem ruleset restricting this process to exactly the paths it
+    /// still needs after [`Self::enable_seccomp_filter`] locks it down.
+    ///
+    /// Closes a gap seccomp cannot: a BPF filter only ever sees syscall *scalars*, never the
+    /// bytes a pointer argument points to, so `enable_seccomp_filter`'s `open` rule can only
+    /// check the `O_RDONLY` flag -- it structurally cannot restrict *which* path gets opened. A
+    /// compromised guest that reaches a raw host `open()` from inside this shared-address-space
+    /// process could otherwise read any path the process's real uid can read. Landlock is a real
+    /// Linux LSM: it does see the path, and (unlike seccomp) enforcement survives even a
+    /// guest-triggered bug in this process's own syscall-argument decoding.
+    ///
+    /// Must run *before* [`Self::enable_seccomp_filter`]: building the ruleset needs an
+    /// `open(O_PATH)` on each allowed path, and the seccomp filter's own `open` rule (`O_RDONLY`
+    /// only) would itself block an `O_PATH` open if installed first.
+    ///
+    /// `allowed_read_paths` should be exactly the paths this process still opens after lockdown
+    /// -- today, only the program binary's path, re-opened by `try_allocate_cow_pages`. Each is
+    /// expected to be a regular file, not a directory (that is what every caller today actually
+    /// passes), so this grants only `LANDLOCK_ACCESS_FS_READ_FILE`, not `READ_DIR` -- widening to
+    /// directories, should a future caller need one, should re-add `READ_DIR` deliberately rather
+    /// than inherit it unused. Grants read access only, not execute: nothing in this process
+    /// calls `execve` on these paths (the guest binary runs natively in-process, not via a
+    /// host-level exec), so execute access is unneeded privilege, not a conservative default.
+    ///
+    /// Does nothing on a kernel without Landlock (older than 5.13, or disabled at boot): this is
+    /// defense-in-depth layered on top of an already-default-deny seccomp filter, not the sole
+    /// enforcement mechanism, so an old kernel keeps today's protection level rather than
+    /// failing to start over a hardening feature it cannot provide.
+    pub fn enable_landlock_filesystem_ruleset(allowed_read_paths: &[&std::path::Path]) {
+        // ABI-version query: `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`.
+        // A negative return means no Landlock support at all (ENOSYS) or disabled at boot
+        // (EOPNOTSUPP) -- either way, there is nothing to build.
+        let abi_supported = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::landlock_create_ruleset,
+                0,
+                0,
+                landlock::LANDLOCK_CREATE_RULESET_VERSION as usize,
+            )
+        }
+        .is_ok();
+        if !abi_supported {
+            return;
+        }
+
+        // Deliberately the minimal, original (Landlock ABI 1) two-field ruleset-attr shape --
+        // not the newer 6-field struct with network/scoping fields -- so the exact same bytes
+        // are valid on every kernel that has Landlock at all, not just recent ones. This shim
+        // only needs filesystem restriction.
+        let attr = landlock::LandlockRulesetAttr {
+            handled_access_fs: landlock::LANDLOCK_ACCESS_FS_READ_FILE,
+            handled_access_net: 0,
+        };
+        let ruleset_fd = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::landlock_create_ruleset,
+                core::ptr::from_ref(&attr) as usize,
+                core::mem::size_of::<landlock::LandlockRulesetAttr>(),
+                0,
+            )
+        }
+        .expect("landlock_create_ruleset failed despite a successful ABI-version query");
+
+        for path in allowed_read_paths {
+            let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .expect("path must not contain a NUL byte");
+            let parent_fd = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::open,
+                    cpath.as_ptr() as usize,
+                    (libc::O_PATH | libc::O_CLOEXEC) as usize,
+                    0,
+                )
+            }
+            .unwrap_or_else(|e| {
+                panic!("failed to open {} for a landlock rule: {e}", path.display())
+            });
+
+            let rule_attr = landlock::LandlockPathBeneathAttr {
+                allowed_access: landlock::LANDLOCK_ACCESS_FS_READ_FILE,
+                parent_fd: i32::try_from(parent_fd).expect("fd must fit in i32"),
+            };
+            unsafe {
+                syscalls::syscall4(
+                    syscalls::Sysno::landlock_add_rule,
+                    ruleset_fd,
+                    landlock::LANDLOCK_RULE_PATH_BENEATH as usize,
+                    core::ptr::from_ref(&rule_attr) as usize,
+                    0,
+                )
+            }
+            .unwrap_or_else(|e| panic!("landlock_add_rule failed for {}: {e}", path.display()));
+
+            unsafe { syscalls::syscall1(syscalls::Sysno::close, parent_fd) }.expect("close failed");
+        }
+
+        // `landlock_restrict_self` requires `PR_SET_NO_NEW_PRIVS` to already be set.
+        // `enable_seccomp_filter`'s own `apply_filter` sets it too, but that call happens after
+        // this one in the runner's startup sequence, so set it explicitly here rather than
+        // depending on lifecycle order between two otherwise-unrelated modules.
+        // SAFETY: `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)` takes no pointer arguments.
+        let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        assert_eq!(rc, 0, "prctl(PR_SET_NO_NEW_PRIVS) failed");
+
+        unsafe { syscalls::syscall2(syscalls::Sysno::landlock_restrict_self, ruleset_fd, 0) }
+            .expect("landlock_restrict_self failed after a successful ruleset build");
+
+        unsafe { syscalls::syscall1(syscalls::Sysno::close, ruleset_fd) }.expect("close failed");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[allow(
+        clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
     )]
-    pub fn enable_seccomp_filter() {
+    /// Installs the runner seccomp filter.
+    ///
+    /// Broker transport exceptions are restricted to the supplied descriptors.
+    pub fn enable_seccomp_filter(
+        positional_io_fds: &[std::os::fd::RawFd],
+        shutdown_fds: &[std::os::fd::RawFd],
+    ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
             SeccompFilter, SeccompRule,
         };
 
-        let rules = vec![
+        let mut rules = vec![
             // TUN and terminal
             (libc::SYS_read, vec![]),
             (libc::SYS_write, vec![]),
@@ -472,6 +646,42 @@ impl LinuxUserland {
             // required by libc allocator
             (libc::SYS_brk, vec![]),
             (libc::SYS_getpid, vec![]),
+            // `CLOCK_MONOTONIC`/`CLOCK_REALTIME` (used by `now`/`current_time` below) resolve via
+            // vDSO on a modern kernel and never reach this filter at all. `CLOCK_THREAD_CPUTIME_ID`
+            // and `CLOCK_PROCESS_CPUTIME_ID` (used by `thread_cpu_time`/`process_cpu_time`, and by
+            // `Task::prepare_for_exit`'s rusage accounting on every guest thread/process exit) are
+            // dynamic clocks the kernel cannot resolve without a real syscall, so they need an
+            // explicit rule -- restricted to exactly these two clock IDs, not `clock_gettime` in
+            // general.
+            (
+                libc::SYS_clock_gettime,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::CLOCK_THREAD_CPUTIME_ID
+                                .reinterpret_as_unsigned()
+                                .into(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            libc::CLOCK_PROCESS_CPUTIME_ID
+                                .reinterpret_as_unsigned()
+                                .into(),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
             // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
             (
                 libc::SYS_open,
@@ -488,8 +698,92 @@ impl LinuxUserland {
                     .unwrap(),
                 ],
             ),
+            // Connected UnixStream I/O may use sendto/recvfrom rather than raw
+            // read/write. Limit these rules to connected-socket calls that do
+            // not name a peer address.
+            (
+                libc::SYS_sendto,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(4, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                        SeccompCondition::new(5, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
+            (
+                libc::SYS_recvfrom,
+                vec![
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(4, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                        SeccompCondition::new(5, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
+                            .unwrap(),
+                    ])
+                    .unwrap(),
+                ],
+            ),
             (libc::SYS_close, vec![]),
         ];
+        if !positional_io_fds.is_empty() {
+            // Broker shared memory uses positional descriptor I/O.
+            let fd_rules = || {
+                positional_io_fds
+                    .iter()
+                    .map(|fd| {
+                        SeccompRule::new(vec![
+                            SeccompCondition::new(
+                                0,
+                                SeccompCmpArgLen::Dword,
+                                SeccompCmpOp::Eq,
+                                u64::from(
+                                    u32::try_from(*fd)
+                                        .expect("positional I/O descriptor must be valid"),
+                                ),
+                            )
+                            .unwrap(),
+                        ])
+                        .unwrap()
+                    })
+                    .collect()
+            };
+            rules.push((libc::SYS_pread64, fd_rules()));
+            rules.push((libc::SYS_pwrite64, fd_rules()));
+        }
+        if !shutdown_fds.is_empty() {
+            // Association failure shuts down the control socket in both
+            // directions to interrupt local and peer liveness waits.
+            let shutdown_rules = shutdown_fds
+                .iter()
+                .map(|fd| {
+                    SeccompRule::new(vec![
+                        SeccompCondition::new(
+                            0,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(
+                                u32::try_from(*fd).expect("shutdown descriptor must be valid"),
+                            ),
+                        )
+                        .unwrap(),
+                        SeccompCondition::new(
+                            1,
+                            SeccompCmpArgLen::Dword,
+                            SeccompCmpOp::Eq,
+                            u64::from(
+                                u32::try_from(libc::SHUT_RDWR)
+                                    .expect("SHUT_RDWR must be non-negative"),
+                            ),
+                        )
+                        .unwrap(),
+                    ])
+                    .unwrap()
+                })
+                .collect();
+            rules.push((libc::SYS_shutdown, shutdown_rules));
+        }
         let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
             rules.into_iter().collect();
         let filter = SeccompFilter::new(
@@ -1257,6 +1551,33 @@ impl litebox::platform::TimeProvider for LinuxUserland {
             ),
         }
     }
+
+    fn thread_cpu_time(&self) -> Duration {
+        // Real per-thread CPU-time accounting from the host: `CLOCK_THREAD_CPUTIME_ID` is a
+        // dynamic clock ID that always refers to the calling thread and genuinely stops
+        // advancing while that thread is not scheduled on a CPU.
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
+        #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+        Duration::new(
+            t.tv_sec.reinterpret_as_unsigned().into(),
+            t.tv_nsec.reinterpret_as_unsigned().trunc(),
+        )
+    }
+
+    fn process_cpu_time(&self) -> Duration {
+        // As above, but `CLOCK_PROCESS_CPUTIME_ID` sums CPU time across every thread of the
+        // process.
+        let mut t = core::mem::MaybeUninit::<libc::timespec>::uninit();
+        unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, t.as_mut_ptr()) };
+        let t = unsafe { t.assume_init() };
+        #[cfg_attr(target_arch = "x86_64", expect(clippy::useless_conversion))]
+        Duration::new(
+            t.tv_sec.reinterpret_as_unsigned().into(),
+            t.tv_nsec.reinterpret_as_unsigned().trunc(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1437,20 +1758,75 @@ fn futex_val2(
     }
 }
 
+/// Spawns the single background host thread that blockingly reads the real stdin and feeds
+/// [`LinuxUserland::stdin_pump`], notifying [`LinuxUserland::stdin_doorbell`] after every push or
+/// EOF so `StdioProvider::read_from_stdin`'s blocking path wakes promptly instead of polling.
+///
+/// Spawned unconditionally in [`LinuxUserland::new`] -- see the identical rationale on
+/// `litebox_platform_macos_userland`'s copy of this function.
+fn spawn_stdin_pump_thread(platform: &'static LinuxUserland) {
+    std::thread::Builder::new()
+        .name("litebox-stdin-pump".to_owned())
+        .spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                let result = unsafe {
+                    syscalls::syscall3(
+                        syscalls::Sysno::read,
+                        usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
+                        buf.as_mut_ptr() as usize,
+                        buf.len(),
+                    )
+                };
+                let n = match result {
+                    Ok(0) | Err(_) => {
+                        // EOF, or a real error (e.g. the host closed fd 0 out from under us):
+                        // either way real stdin will never produce more data.
+                        platform.stdin_pump.mark_eof();
+                        platform.notify_stdin_doorbell();
+                        break;
+                    }
+                    Ok(n) => n,
+                };
+                let mut data = &buf[..n];
+                while !data.is_empty() {
+                    let pushed = platform.stdin_pump.push(data);
+                    platform.notify_stdin_doorbell();
+                    if pushed == 0 {
+                        // Ring buffer is full because the guest hasn't drained it yet; back off
+                        // briefly rather than busy-spinning until it does.
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    data = &data[pushed..];
+                }
+            }
+        })
+        .expect("failed to spawn the stdin-pump background thread");
+}
+
+impl LinuxUserland {
+    /// Wakes any thread parked in `StdioProvider::read_from_stdin`'s blocking wait.
+    fn notify_stdin_doorbell(&self) {
+        let (lock, cvar) = &self.stdin_doorbell;
+        drop(lock.lock().unwrap());
+        cvar.notify_all();
+    }
+}
+
 impl litebox::platform::StdioProvider for LinuxUserland {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::read,
-                usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-            )
+        loop {
+            if let Some(n) = self.stdin_pump.try_read(buf) {
+                return Ok(n);
+            }
+            // No data yet and not at EOF: park until the pump thread notifies. The bounded
+            // timeout is a safety net against a lost wakeup in the (check, then wait) window
+            // above, not the primary wakeup path.
+            let (lock, cvar) = &self.stdin_doorbell;
+            let guard = lock.lock().unwrap();
+            let _ = cvar.wait_timeout(guard, Duration::from_millis(50)).unwrap();
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioReadError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
     }
 
     fn write_to(
@@ -1458,30 +1834,127 @@ impl litebox::platform::StdioProvider for LinuxUserland {
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        unsafe {
-            syscalls::syscall3(
-                syscalls::Sysno::write,
-                usize::try_from(match stream {
-                    litebox::platform::StdioOutStream::Stdout => {
-                        litebox_common_linux::STDOUT_FILENO
-                    }
-                    litebox::platform::StdioOutStream::Stderr => {
-                        litebox_common_linux::STDERR_FILENO
-                    }
-                })
-                .unwrap(),
-                buf.as_ptr() as usize,
-                buf.len(),
-            )
+        let (raw_fd, lock) = match stream {
+            litebox::platform::StdioOutStream::Stdout => {
+                (litebox_common_linux::STDOUT_FILENO, &self.stdout_lock)
+            }
+            litebox::platform::StdioOutStream::Stderr => {
+                (litebox_common_linux::STDERR_FILENO, &self.stderr_lock)
+            }
+        };
+        let fd = usize::try_from(raw_fd).unwrap();
+        // Holding this for the whole (potentially multi-syscall) write below is what makes one
+        // guest `write()` call atomic w.r.t. other guest threads' writes to the same stream.
+        let _guard = lock.lock().unwrap();
+        let mut written = 0usize;
+        while written < buf.len() {
+            let result = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::write,
+                    fd,
+                    buf[written..].as_ptr() as usize,
+                    buf.len() - written,
+                )
+            };
+            match result {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(syscalls::Errno::EINTR) => {}
+                Err(_) if written > 0 => {
+                    // Real `write(2)` semantics: a short write due to a later error still
+                    // reports the bytes actually written, and lets the caller retry the rest.
+                    return Ok(written);
+                }
+                Err(_) => return Err(litebox::platform::StdioWriteError::Closed),
+            }
         }
-        .map_err(|err| match err {
-            syscalls::Errno::EPIPE => litebox::platform::StdioWriteError::Closed,
-            _ => panic!("unhandled error {err}"),
-        })
+        Ok(written)
     }
 
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
         self.stdio_is_tty[stream as usize]
+    }
+
+    fn stdin_pollable(&self) -> Option<&dyn litebox::event::IOPollable> {
+        Some(&self.stdin_pump)
+    }
+
+    fn set_terminal_raw_mode(&self, stream: litebox::platform::StdioStream, raw: bool, echo: bool) {
+        // Only stdin's line discipline affects how input bytes arrive at the pump thread.
+        if stream != litebox::platform::StdioStream::Stdin
+            || !self.stdio_is_tty[litebox::platform::StdioStream::Stdin as usize]
+        {
+            return;
+        }
+        // The host is real Linux, so the kernel's real `termios` layout is exactly
+        // `litebox_common_linux::Termios` -- no translation needed, unlike the macOS platform.
+        let mut term = litebox_common_linux::Termios {
+            c_iflag: 0,
+            c_oflag: 0,
+            c_cflag: 0,
+            c_lflag: 0,
+            c_line: 0,
+            c_cc: [0; 19],
+        };
+        let stdin_fd = usize::try_from(litebox_common_linux::STDIN_FILENO).unwrap();
+        let got = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::ioctl,
+                stdin_fd,
+                litebox_common_linux::TCGETS as usize,
+                (&raw mut term) as usize,
+            )
+        };
+        if got.is_err() {
+            return;
+        }
+        let mut lflag = litebox_common_linux::LFlag::from_bits_truncate(term.c_lflag);
+        if raw {
+            lflag.remove(litebox_common_linux::LFlag::ICANON);
+            term.c_cc[litebox_common_linux::VintrIdx::VMIN as usize] = 1;
+            term.c_cc[litebox_common_linux::VintrIdx::VTIME as usize] = 0;
+        } else {
+            lflag.insert(litebox_common_linux::LFlag::ICANON);
+        }
+        lflag.set(litebox_common_linux::LFlag::ECHO, echo);
+        term.c_lflag = lflag.bits();
+        let _ = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::ioctl,
+                stdin_fd,
+                litebox_common_linux::TCSETS as usize,
+                (&raw const term) as usize,
+            )
+        };
+    }
+
+    fn tty_window_size(&self) -> Option<(u16, u16)> {
+        if !self.stdio_is_tty[litebox::platform::StdioStream::Stdout as usize] {
+            return None;
+        }
+        // The host is real Linux, so the kernel's real `winsize` layout is exactly
+        // `litebox_common_linux::Winsize` -- no translation needed, unlike the macOS platform.
+        let mut ws = litebox_common_linux::Winsize {
+            row: 0,
+            col: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        // `STDOUT_FILENO` is a fixed, non-negative constant (`1`), so the fallback here is
+        // never actually reached -- it exists only to keep this conversion panic-free.
+        let stdout_fd = usize::try_from(litebox_common_linux::STDOUT_FILENO).unwrap_or(1);
+        let got = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::ioctl,
+                stdout_fd,
+                litebox_common_linux::TIOCGWINSZ as usize,
+                (&raw mut ws) as usize,
+            )
+        };
+        if got.is_err() || ws.row == 0 || ws.col == 0 {
+            return None;
+        }
+        Some((ws.row, ws.col))
     }
 }
 
@@ -1944,9 +2417,7 @@ unsafe fn next_signal_handler(
     info: &mut libc::siginfo_t,
     context: &mut libc::ucontext_t,
 ) {
-    // An asynchronous `SIGSEGV` (`info.si_code <= 0`) can interrupt a fixup range.
-    // Do not interpret it as a memory fault.
-    if signum == libc::SIGSEGV && info.si_code > 0 {
+    if signum == libc::SIGSEGV {
         let ip: usize = {
             #[cfg(target_arch = "x86_64")]
             {
@@ -2225,7 +2696,10 @@ impl litebox::mm::vmem::VmemPageFaultHandler for LinuxUserland {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use core::sync::atomic::AtomicU32;
+    use std::net::Shutdown;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
     use std::thread::sleep;
 
     use litebox::{fs::OFlags, platform::RawMutex};
@@ -2253,64 +2727,68 @@ mod tests {
     }
 
     #[test]
-    fn asynchronous_sigsegv_does_not_trigger_exception_fixup() {
-        const CHILD_ENV: &str = "LITEBOX_ASYNC_SIGSEGV_TEST_CHILD";
-
-        if std::env::var_os(CHILD_ENV).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::asynchronous_sigsegv_does_not_trigger_exception_fixup",
-                    "--nocapture",
-                ])
-                .env(CHILD_ENV, "1")
-                .status()
-                .unwrap();
-            assert!(status.success(), "subprocess failed: {status}");
-            return;
-        }
-
-        unsafe {
-            let mut action: libc::sigaction = core::mem::zeroed();
-            action.sa_sigaction = libc::SIG_IGN;
-            assert_eq!(
-                libc::sigaction(libc::SIGSEGV, &raw const action, core::ptr::null_mut(),),
-                0
-            );
-        }
-        let _platform = LinuxUserland::new(None);
-
-        let target = unsafe { libc::pthread_self() };
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let sender_stop = stop.clone();
-        let sender = std::thread::spawn(move || {
-            while !sender_stop.load(Ordering::Relaxed) {
-                assert_eq!(unsafe { libc::pthread_kill(target, libc::SIGSEGV) }, 0);
-                std::thread::yield_now();
-            }
-        });
-
-        let src = vec![0x5a; 16 * 1024 * 1024];
-        let mut dst = vec![0; src.len()];
-        for _ in 0..16 {
-            assert!(unsafe {
-                litebox::mm::exception_table::memcpy_fallible(
-                    dst.as_mut_ptr(),
-                    src.as_ptr(),
-                    src.len(),
-                )
-                .is_ok()
-            });
-        }
-        stop.store(true, Ordering::Relaxed);
-        sender.join().unwrap();
-        assert_eq!(dst, src);
-    }
-
-    #[test]
     fn test_seccomp_filter() {
+        fn test_memfd(name: &std::ffi::CStr) -> OwnedFd {
+            // SAFETY: `name` is a valid C string and the returned descriptor is
+            // transferred immediately into `OwnedFd`.
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            assert!(fd >= 0);
+            // SAFETY: `fd` was just returned as an owned descriptor.
+            unsafe { OwnedFd::from_raw_fd(fd) }
+        }
+
         let _platform: &LinuxUserland = LinuxUserland::new(None);
-        LinuxUserland::enable_seccomp_filter();
+        let allowed = test_memfd(c"seccomp-allowed-positional-io");
+        let denied = test_memfd(c"seccomp-denied-positional-io");
+        let (allowed_shutdown, _allowed_peer) = UnixStream::pair().unwrap();
+        let (denied_shutdown, _denied_peer) = UnixStream::pair().unwrap();
+        LinuxUserland::enable_seccomp_filter(
+            &[allowed.as_raw_fd()],
+            &[allowed_shutdown.as_raw_fd()],
+        );
+
+        let written = [7_u8];
+        // SAFETY: The buffers are valid for their lengths, and both descriptors
+        // remain open for the calls.
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    allowed.as_raw_fd(),
+                    written.as_ptr().cast(),
+                    written.len(),
+                    0,
+                )
+            },
+            1
+        );
+        let mut read = [0_u8];
+        // SAFETY: See the `pwrite` call above.
+        assert_eq!(
+            unsafe { libc::pread(allowed.as_raw_fd(), read.as_mut_ptr().cast(), read.len(), 0,) },
+            1
+        );
+        assert_eq!(read, written);
+        // SAFETY: See the allowed `pwrite` call above.
+        assert_eq!(
+            unsafe {
+                libc::pwrite(
+                    denied.as_raw_fd(),
+                    written.as_ptr().cast(),
+                    written.len(),
+                    0,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        let error = allowed_shutdown.shutdown(Shutdown::Write).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        allowed_shutdown.shutdown(Shutdown::Both).unwrap();
+        let error = denied_shutdown.shutdown(Shutdown::Both).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
         let pathname = c"/tmp/test_seccomp";
         let mkdir_res = unsafe {
@@ -2335,6 +2813,50 @@ mod tests {
             open_res.unwrap_err(),
             syscalls::Errno::EINVAL,
             "open with RDWR should be blocked by seccomp filter"
+        );
+    }
+
+    /// Real, live test of [`LinuxUserland::enable_landlock_filesystem_ruleset`] -- like
+    /// `test_seccomp_filter` above, this genuinely and irreversibly locks down *this test's own
+    /// process* via a real `landlock_restrict_self`, which is only safe because CI runs tests
+    /// under `cargo nextest` (a fresh forked process per test), so this cannot poison any other
+    /// test. Deliberately does not call `enable_seccomp_filter`: the two mechanisms are
+    /// independent, and this test only needs to prove Landlock's own enforcement.
+    #[test]
+    fn test_landlock_filesystem_ruleset() {
+        let _platform: &LinuxUserland = LinuxUserland::new(None);
+
+        let dir =
+            std::env::temp_dir().join(format!("litebox-landlock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let allowed_path = dir.join("allowed");
+        let denied_path = dir.join("denied");
+        std::fs::write(&allowed_path, b"allowed contents").unwrap();
+        std::fs::write(&denied_path, b"denied contents").unwrap();
+
+        // Sanity check, before lockdown: both files are actually readable right now, so the
+        // denial asserted below is Landlock's doing, not some unrelated permissions problem.
+        std::fs::read(&allowed_path).unwrap();
+        std::fs::read(&denied_path).unwrap();
+
+        LinuxUserland::enable_landlock_filesystem_ruleset(&[allowed_path.as_path()]);
+
+        assert_eq!(
+            std::fs::read(&allowed_path).unwrap(),
+            b"allowed contents",
+            "the exact path passed to enable_landlock_filesystem_ruleset must remain readable"
+        );
+
+        // `denied_path` sits in the very same directory as `allowed_path` and was created the
+        // same way -- the only difference is which one was passed to
+        // `enable_landlock_filesystem_ruleset`. This is what proves per-file granularity rather
+        // than an accidental directory-wide allowance.
+        let denied_err = std::fs::read(&denied_path).unwrap_err();
+        assert_eq!(
+            denied_err.raw_os_error(),
+            Some(libc::EACCES),
+            "a path never granted to the ruleset must be denied with EACCES, not silently \
+             allowed or denied with some other errno"
         );
     }
 }

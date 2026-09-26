@@ -1,0 +1,11 @@
+[package]
+name = "litebox_rfb"
+version = "0.1.0"
+edition = "2024"
+description = "A minimal RFB (VNC, RFC 6143) server for presenting a litebox guest framebuffer to a remote viewer"
+
+[dependencies]
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
+
+[lints]
+workspace = true

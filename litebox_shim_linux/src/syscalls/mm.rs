@@ -5,9 +5,8 @@
 //! Most of these syscalls which are not backed by files are implemented in [`litebox_common_linux::mm`].
 
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::Arc;
-use litebox::fs::errors::ReadError;
 use litebox::{
+    fd::EntryHandle,
     mm::vmem::{MappingError, PAGE_SIZE, PageRange},
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -15,33 +14,147 @@ use litebox::{
     },
 };
 use litebox_common_linux::{
-    MRemapFlags, MapFlags, ProtFlags,
-    errno::Errno,
-    loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
+    MRemapFlags, MapFlags, ProtFlags, errno::Errno, loader::TRAMPOLINE_GUEST_TP_SLOT_OFFSET,
 };
 
-use crate::FileFd;
-use crate::ShimPlatform;
-use crate::Task;
-use crate::UserPtrMut;
-use crate::syscalls::file::AnyTypedFd;
+use crate::{ShimFS, ShimPlatform, Task, UserPtr, UserPtrMut};
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
-use zerocopy::FromBytes as _;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
+/// This module publishes the guest thread-pointer offset into the same
+/// trampoline word the rewriter's gates read. Mirrors the identical assertion
+/// in `crate::loader::elf`, which holds the loader path to the same constant:
+/// drift here would make the mmap path write the offset into the middle of an
+/// instruction instead of into the slot the gates read.
+const _: () = assert!(
+    TRAMPOLINE_GUEST_TP_SLOT_OFFSET == litebox_syscall_rewriter::TRAMPOLINE_GUEST_TP_SLOT_OFFSET
+);
+
 const ENDIAN: LittleEndian = LittleEndian;
 
-/// Per-descriptor state for the shim's runtime ELF syscall rewriter.
+/// Makes freshly-written code visible to instruction fetch before it is
+/// executed.
+///
+/// x86-64 guarantees instruction/data cache coherency in hardware, so this is
+/// a no-op there. AArch64 does not: a core that just wrote through the data
+/// cache is not guaranteed to see those bytes if it (or another core) fetches
+/// the same address as an instruction, until the corresponding cache lines are
+/// explicitly cleaned and invalidated. Every write this module makes into
+/// guest-executed memory -- the rewriter's patched code, the trampoline stubs,
+/// the trap-fallback bytes -- needs this called over the written range before
+/// the mapping goes back to executable, or the guest can intermittently
+/// execute stale (pre-patch, or partially-written) instructions.
+///
+/// This runs the same `dc cvau`/`ic ivau`/barrier sequence
+/// `__builtin___clear_cache` generates on AArch64 (see LLVM compiler-rt's
+/// `clear_cache.c`), reading the actual cache line sizes from `CTR_EL0` rather
+/// than assuming a fixed one. These instructions are permitted from EL0
+/// (unprivileged) code on Linux, which sets `SCTLR_EL1.UCI` for exactly this
+/// purpose -- every userspace AArch64 JIT relies on the same permission.
+///
+/// Darwin is the exception, and it is not a matter of degree: `SCTLR_EL1.UCI`
+/// is set there too, so `dc cvau`/`ic ivau` run fine, but `SCTLR_EL1.UCT` is
+/// *not*, so reading `CTR_EL0` raises an illegal-instruction trap. Measured on
+/// an Apple M3 Pro: a bare C program doing `mrs x0, ctr_el0` dies with `SIGILL`,
+/// while the same program's `dc cvau`/`ic ivau` sequence returns normally.
+/// Since this function is the choke point every transition to `PROT_EXEC`
+/// passes through, that trap made it impossible to give a guest an executable
+/// page at all. Darwin therefore goes through `sys_icache_invalidate`, Apple's
+/// own supported entry point for this, which performs the same sequence (plus
+/// any chip-specific work) without needing the line sizes in userspace.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn clear_icache_range(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    // SAFETY: `start` addresses `len` bytes of the caller's own mapping, which
+    // is what this call requires; invalidation cannot fault or alter contents.
+    unsafe { sys_icache_invalidate(start as *mut core::ffi::c_void, len) };
+}
+
+// Instruction-cache invalidation from Darwin's `libkern/OSCacheControl.h`.
+// Declared here rather than reused from the macOS platform crate because that
+// crate is a dev-dependency of this one, reachable only from tests.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+unsafe extern "C" {
+    fn sys_icache_invalidate(start: *mut core::ffi::c_void, len: usize);
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+fn clear_icache_range(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = start + len;
+
+    // SAFETY: `ctr_el0` is readable from EL0 on every host reaching this arm;
+    // the one that traps instead (Darwin) is handled above.
+    let ctr_el0: u64;
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr_el0, options(nomem, nostack, preserves_flags));
+    }
+    // CTR_EL0.DminLine (bits [19:16]) / IminLine (bits [3:0]): log2 of the
+    // minimum cache line, in words. A line is therefore `4 << field` bytes.
+    let dcache_line = 4usize << ((ctr_el0 >> 16) & 0xF);
+    let icache_line = 4usize << (ctr_el0 & 0xF);
+
+    // Clean each dirty D-cache line covering the range to the point of
+    // unification, so the I-cache fetch below can see the new bytes.
+    let mut addr = start & !(dcache_line - 1);
+    while addr < end {
+        // SAFETY: `addr` is a valid address within the caller's own writable
+        // mapping (the range just written); `dc cvau` only cleans a cache
+        // line, it cannot fault or corrupt memory.
+        unsafe {
+            core::arch::asm!("dc cvau, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += dcache_line;
+    }
+    // SAFETY: a data synchronization barrier with no other preconditions.
+    unsafe {
+        core::arch::asm!("dsb ish", options(nostack, preserves_flags));
+    }
+
+    // Invalidate each I-cache line covering the range to the point of
+    // unification, forcing the next fetch to reload from memory.
+    let mut addr = start & !(icache_line - 1);
+    while addr < end {
+        // SAFETY: as above, for the instruction cache.
+        unsafe {
+            core::arch::asm!("ic ivau, {addr}", addr = in(reg) addr, options(nostack, preserves_flags));
+        }
+        addr += icache_line;
+    }
+    // SAFETY: a data synchronization barrier followed by an instruction
+    // synchronization barrier, ensuring the invalidation is complete and any
+    // speculatively-fetched stale instructions are discarded before this
+    // function returns.
+    unsafe {
+        core::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn clear_icache_range(_start: usize, _len: usize) {}
+
+/// Per-fd state for the shim's runtime ELF syscall rewriter.
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
+#[derive(Clone)]
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pre_patched: bool,
+    /// `e_machine` from the ELF header. The runtime rewriter
+    /// (`patch_code_segment` / `trap_all_syscalls_in_code`) decodes x86-64
+    /// instructions only; recording the machine lets the patching path refuse
+    /// to run that decoder over any other architecture's code instead of
+    /// silently reinterpreting (and corrupting) it.
+    machine: u16,
     /// For pre-patched binaries: file offset and size of the trampoline data.
     trampoline_file_offset: u64,
     trampoline_file_size: usize,
@@ -67,43 +180,52 @@ pub(crate) struct ElfPatchState {
     patched_ranges: BTreeSet<(usize, usize)>,
 }
 
-/// Identity of a resolved filesystem descriptor.
-pub(crate) struct ElfPatchKey<Platform: ShimPlatform>(Arc<FileFd<Platform>>);
+/// Per-process collection of ELF patching state, keyed by fd number.
+pub(crate) type ElfPatchCache = BTreeMap<i32, ElfPatchState>;
 
-impl<Platform: ShimPlatform> Clone for ElfPatchKey<Platform> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-impl<Platform: ShimPlatform> PartialEq for ElfPatchKey<Platform> {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl<Platform: ShimPlatform> Eq for ElfPatchKey<Platform> {}
-
-impl<Platform: ShimPlatform> PartialOrd for ElfPatchKey<Platform> {
-    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
-    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
-        Arc::as_ptr(&self.0).cmp(&Arc::as_ptr(&other.0))
-    }
-}
-
-/// Per-process ELF patching state, keyed by retained descriptor identity.
+/// A guest ELF image recorded at first-map time, for fault symbolization.
 ///
-/// TODO: Deferred patching currently assumes the descriptor remains open until its
-/// mappings gain `PROT_EXEC`. Closing the descriptor removes its entry even if
-/// mappings survive, so `mmap -> close -> mprotect(PROT_EXEC)` can skip patching.
-/// Supporting that sequence requires patch state to follow mapping lifetime,
-/// independently of descriptor lifetime.
-pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, ElfPatchState>;
+/// Deliberately not part of [`ElfPatchState`]: that cache is keyed by a
+/// reusable raw fd and dropped when the fd closes, while a dynamic linker
+/// closes each library's fd as soon as its segments are mapped -- long before
+/// any fault that needs symbolizing. Entries here live for the process.
+pub(crate) struct GuestImage {
+    /// Lowest mapped guest address covered by the image's PT_LOAD segments.
+    lo: usize,
+    /// One past the highest mapped guest address covered by the image.
+    hi: usize,
+    /// The load bias: guest address minus ELF vaddr. `addr - base` is the
+    /// image-relative address `llvm-symbolizer` resolves against the file.
+    base: usize,
+    /// The absolute guest path the image was opened with.
+    path: alloc::string::String,
+}
+
+/// A shared file mapping retained for copy-back and remap bookkeeping.
+pub(crate) struct SharedFileMapping<Platform: ShimPlatform, FS: ShimFS> {
+    start: usize,
+    len: usize,
+    offset: usize,
+    writable: bool,
+    /// Whether the fd the mapping was created from was open for writing. A `MAP_SHARED`
+    /// mapping of a read-only fd can never become `PROT_WRITE` (Linux never gives such a
+    /// mapping `VM_MAYWRITE`), so `mprotect` must keep refusing it after the fact.
+    fd_writable: bool,
+    file: EntryHandle<Platform, FS>,
+}
+
+impl<Platform: ShimPlatform, FS: ShimFS> Clone for SharedFileMapping<Platform, FS> {
+    fn clone(&self) -> Self {
+        Self {
+            start: self.start,
+            len: self.len,
+            offset: self.offset,
+            writable: self.writable,
+            fd_writable: self.fd_writable,
+            file: self.file.clone(),
+        }
+    }
+}
 
 #[inline]
 fn align_up(addr: usize, align: usize) -> usize {
@@ -117,8 +239,12 @@ fn align_down(addr: usize, align: usize) -> usize {
     addr & !(align - 1)
 }
 
-impl<Platform: ShimPlatform> Task<Platform> {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
     #[inline]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each parameter is independently required by the platform allocation contract"
+    )]
     pub(crate) fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -126,6 +252,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         prot: ProtFlags,
         flags: MapFlags,
         ensure_space_after: bool,
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         litebox_common_linux::mm::do_mmap(
@@ -135,6 +262,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             prot,
             flags,
             ensure_space_after,
+            shared_futex_backing,
             op,
         )
     }
@@ -146,12 +274,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-    ) -> Result<UserPtrMut<u8>, Errno> {
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |_| Ok(0);
-        self.do_mmap(suggested_addr, len, prot, flags, false, op)
-            .map_err(Errno::from)
+        let shared_futex_backing = flags
+            .contains(MapFlags::MAP_SHARED)
+            .then(|| (litebox::mm::vmem::SharedFutexBacking::new(), 0));
+        self.do_mmap(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            false,
+            shared_futex_backing,
+            op,
+        )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each parameter is independently required by the platform allocation contract"
+    )]
     fn do_mmap_file(
         &self,
         suggested_addr: Option<usize>,
@@ -160,46 +302,53 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-    ) -> Result<UserPtrMut<u8>, Errno> {
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
-        let AnyTypedFd::Fs(typed_fd) = self.typed_fd(fd)? else {
-            return Err(Errno::ENODEV);
-        };
 
         // Perform the normal mmap first (CoW or memcpy fallback).
-        let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, &typed_fd, offset)
-        {
+        let result = if let Some(cow_result) = self.try_cow_mmap_file(
+            suggested_addr,
+            len,
+            &prot,
+            &flags,
+            fd,
+            offset,
+            shared_futex_backing,
+        ) {
             cow_result?
         } else {
-            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?
+            self.do_mmap_file_memcpy(
+                suggested_addr,
+                len,
+                prot,
+                flags,
+                fd,
+                offset,
+                shared_futex_backing,
+            )?
         };
-
-        let syscall_entry = self.global.platform.get_syscall_entry_point();
-        if syscall_entry == 0 {
-            return Ok(result);
-        }
-
-        let patch_key = ElfPatchKey(typed_fd);
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
-            if !self.maybe_patch_exec_segment(result, len, &patch_key, syscall_entry, Some(offset))
+            let syscall_entry = self.global.platform.get_syscall_entry_point();
+            if syscall_entry != 0
+                && !self.maybe_patch_exec_segment(result, len, fd, syscall_entry, Some(offset))
             {
                 // Trampoline setup failed for a pre-patched binary whose
                 // .text already contains JMPs to the trampoline address.
                 // Continuing would guarantee a SIGSEGV on the first
                 // rewritten syscall, so fail the mmap instead.
                 let _ = self.sys_munmap(result, len);
-                return Err(Errno::ENOMEM);
+                return Err(MappingError::OutOfMemory);
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
-            self.init_elf_patch_state(&patch_key, result.as_usize(), offset);
+            self.init_elf_patch_state(fd, result.as_usize(), offset);
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
-            let mut cache = self.global.elf_patch_cache.lock();
-            if let Some(state) = cache.get_mut(&patch_key) {
+            let mut cache = self.process().elf_patch_cache.lock();
+            if let Some(state) = cache.get_mut(&fd) {
                 let mapping_key = (result.as_usize(), len);
                 // Overlapping entries are safe here: file_mappings is only used
                 // to know which (addr, len) ranges belong to this fd so we can
@@ -217,21 +366,46 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns `Some(result)` if CoW was attempted (success or failure),
     /// `None` if CoW is not applicable (fall back to memcpy).
     // TODO(jb): does this need to be Option-Result or can it just be Option?
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each parameter is independently required by the platform allocation contract"
+    )]
     fn try_cow_mmap_file(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: &ProtFlags,
         flags: &MapFlags,
-        fd: &FileFd<Platform>,
+        fd: i32,
         offset: usize,
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
+        if shared_futex_backing.is_some() {
+            return None;
+        }
         if !len.is_multiple_of(PAGE_SIZE) {
             return None;
         }
 
+        let Ok(fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return None;
+        };
+
         let files = self.files.borrow();
-        let static_data = files.fs.get_static_backing_data(fd)?;
+        let raw_fd = fd;
+
+        let static_data = files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| files.fs.get_static_backing_data(typed_fd),
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+                |_| None,
+            )
+            .ok()??;
 
         if offset > static_data.len() {
             return None;
@@ -302,49 +476,105 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
+    /// Reads backing-file bytes for mmap initialization without consulting canonical shared pages.
+    /// The initialization protocol itself serializes and publishes those pages; routing this read
+    /// through `sys_read` would recurse into the canonical overlay and wait on its own claim.
+    fn read_file_for_mmap(
+        &self,
+        fd: i32,
+        buffer: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, Errno> {
+        let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed| {
+                    files
+                        .fs
+                        .read(typed, buffer, Some(offset))
+                        .map_err(Errno::from)
+                },
+                |_| Err(Errno::EINVAL),
+                |_| Err(Errno::EINVAL),
+                |_| Err(Errno::EINVAL),
+                |_| Err(Errno::EINVAL),
+                |_| Err(Errno::EINVAL),
+                |_| Err(Errno::EINVAL),
+            )
+            .flatten()
+    }
+
     /// Fallback mmap implementation using page-by-page memcpy, for files where the CoW attempt
     /// fails (either due to lack of support on platform, or non-static-backed data, etc.)
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each parameter is independently required by the platform allocation contract"
+    )]
     fn do_mmap_file_memcpy(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        fd: &FileFd<Platform>,
+        fd: i32,
         offset: usize,
+        shared_futex_backing: Option<(litebox::mm::vmem::SharedFutexBacking, usize)>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
             // Note a malicious user may unmap ptr while we are reading.
             // `sys_read` does not handle page faults, so we need to use a
             // temporary buffer to read the data from fs (without worrying page
             // faults) and write it to the user buffer with page fault handling.
-            let mut file_offset = offset;
-            let mut buffer = [0; PAGE_SIZE];
-            let mut copied = 0;
-            while copied < len {
-                let size = self
-                    .files
-                    .borrow()
-                    .fs
-                    .read(fd, &mut buffer, Some(file_offset))
-                    .map_err(|e| match e {
-                        // The raw fd was resolved once at syscall entry and is intentionally
-                        // not retained; this payload is discarded when converted to EBADF.
-                        ReadError::ClosedFd => MappingError::BadFD(-1),
-                        ReadError::NotAFile => MappingError::NotAFile,
-                        ReadError::NotForReading => MappingError::NotForReading,
-                        _ => unimplemented!(),
-                    })?;
-                if size == 0 {
-                    break;
+            let mut initialize = |relative: core::ops::Range<usize>| -> Result<(), MappingError> {
+                // A canonical backing extent can survive a failed first mmap. Clear the claimed
+                // initialization gap before reading so bytes beyond EOF cannot retain a partial
+                // earlier attempt.
+                let zeroes = [0; PAGE_SIZE];
+                let mut cleared = 0;
+                while cleared < relative.len() {
+                    let size = (relative.len() - cleared).min(PAGE_SIZE);
+                    ptr.copy_from_slice::<Platform>(relative.start + cleared, &zeroes[..size])
+                        .ok_or(MappingError::Io(Errno::EFAULT.into()))?;
+                    cleared += size;
                 }
-                // ptr is a valid pointer returned by do_mmap.
-                ptr.copy_from_slice::<Platform>(copied, &buffer[..size])
-                    .unwrap();
-                copied += size;
-                file_offset += size;
+
+                let mut file_offset = offset + relative.start;
+                let mut buffer = [0; PAGE_SIZE];
+                let mut copied = 0;
+                while copied < relative.len() {
+                    let requested = (relative.len() - copied).min(PAGE_SIZE);
+                    let size = self
+                        .read_file_for_mmap(fd, &mut buffer[..requested], file_offset)
+                        .map_err(|e| match e {
+                            Errno::EBADF => MappingError::BadFD(fd),
+                            Errno::EISDIR => MappingError::NotAFile,
+                            Errno::EACCES => MappingError::NotForReading,
+                            other => MappingError::Io(other.into()),
+                        })?;
+                    if size == 0 {
+                        break;
+                    }
+                    ptr.copy_from_slice::<Platform>(relative.start + copied, &buffer[..size])
+                        .ok_or(MappingError::Io(Errno::EFAULT.into()))?;
+                    copied += size;
+                    file_offset += size;
+                }
+                Ok(())
+            };
+
+            if let Some((backing, backing_offset)) = shared_futex_backing {
+                self.global.platform.initialize_shared_pages(
+                    backing.identity(),
+                    backing_offset,
+                    len,
+                    &mut initialize,
+                )?;
+            } else {
+                initialize(0..len)?;
             }
-            Ok(copied)
+            Ok(len)
         };
         let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
         self.do_mmap(
@@ -355,6 +585,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Note we need to ensure that the space after the mapping is available
             // so that we could load trampoline code right after the mapping.
             offset == 0 && !fixed_addr,
+            shared_futex_backing,
             op,
         )
     }
@@ -374,18 +605,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
-        // MAP_SHARED is partially supported:
-        // - Anonymous shared mappings are fully supported (no backing file concerns).
-        //   Note: since fork is not yet supported, shared anonymous mappings behave
-        //   identically to private ones (no cross-process sharing occurs).
-        // - File-backed shared mappings are read-only: writable permission is rejected
-        //   upfront and cannot be added later via mprotect, because writes cannot be
-        //   propagated back to the underlying file.
-        if flags.contains(MapFlags::MAP_SHARED)
+        // MAP_SHARED file mappings use one stable device/inode backing identity. On platforms with
+        // canonical shared pages, simultaneous aliases therefore observe the same bytes; writable
+        // mappings are retained for copy-back on platforms that still use the default allocator.
+        // `/dev/fb0` remains a specialized live-pixel-store mapping handled separately below.
+        let writable_shared_file = flags.contains(MapFlags::MAP_SHARED)
             && prot.contains(ProtFlags::PROT_WRITE)
+            && !flags.contains(MapFlags::MAP_ANONYMOUS);
+        let fb0_shared_mapping = writable_shared_file && self.raw_fd_is_fb0(fd);
+        let shared_file_mapping_handle = if flags.contains(MapFlags::MAP_SHARED)
             && !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && !fb0_shared_mapping
         {
-            todo!("MAP_SHARED with PROT_WRITE on file-backed mappings is not supported");
+            self.raw_fd_file_handle(fd)
+        } else {
+            None
+        };
+        if writable_shared_file && !fb0_shared_mapping && shared_file_mapping_handle.is_none() {
+            return Err(Errno::EINVAL);
+        }
+        // `MAP_SHARED | PROT_WRITE` needs an fd open for writing: writes through the mapping
+        // land in the file, so an `O_RDONLY` fd must not be able to smuggle them in.
+        let shared_file_fd_writable =
+            shared_file_mapping_handle.is_none() || self.raw_fd_open_for_writing(fd);
+        if writable_shared_file && !shared_file_fd_writable {
+            return Err(Errno::EACCES);
         }
 
         if flags.intersects(
@@ -398,7 +642,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 | MapFlags::MAP_HUGE_2MB
                 | MapFlags::MAP_HUGE_1GB,
         ) {
-            todo!("Unsupported flags {:?}", flags);
+            log_unsupported!("mmap flags {:?}", flags);
+            return Err(Errno::EINVAL);
         }
 
         let aligned_len = align_up(len, PAGE_SIZE);
@@ -410,19 +655,411 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
-        if flags.contains(MapFlags::MAP_ANONYMOUS) {
-            self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
+        let fixed_replace =
+            flags.contains(MapFlags::MAP_FIXED) && !flags.contains(MapFlags::MAP_FIXED_NOREPLACE);
+        if fixed_replace {
+            self.flush_shared_file_mappings(addr, aligned_len)?;
+            if let Some(fb) = self.global.framebuffer.as_ref() {
+                fb.clear_guest_mapping_overlapping(addr, aligned_len);
+            }
+        }
+        let shared_file_futex_backing = if flags.contains(MapFlags::MAP_SHARED)
+            && !flags.contains(MapFlags::MAP_ANONYMOUS)
+            && !fb0_shared_mapping
+        {
+            self.raw_fd_shared_futex_backing(fd)
+                .map(|backing| (backing, offset))
         } else {
-            self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
+            None
+        };
+        let result = if flags.contains(MapFlags::MAP_ANONYMOUS) {
+            self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
+        } else if fb0_shared_mapping {
+            self.do_mmap_framebuffer(suggested_addr, aligned_len, prot, flags, offset)
+        } else {
+            self.do_mmap_file(
+                suggested_addr,
+                aligned_len,
+                prot,
+                flags,
+                fd,
+                offset,
+                shared_file_futex_backing,
+            )
+        }
+        .map_err(Errno::from)?;
+
+        self.record_mapped(result.as_usize(), aligned_len);
+        if let (Some(file), Some((_, _))) = (shared_file_mapping_handle, shared_file_futex_backing)
+        {
+            self.files
+                .borrow()
+                .shared_file_mappings
+                .lock()
+                .push(SharedFileMapping {
+                    start: result.as_usize(),
+                    len: aligned_len,
+                    offset,
+                    writable: writable_shared_file,
+                    fd_writable: shared_file_fd_writable,
+                    file,
+                });
+        }
+        Ok(result)
+    }
+
+    /// Whether raw fd `fd` names `/dev/fb0` (see [`Self::is_fb0`]); `false` for anything that
+    /// isn't an open fs-backend fd.
+    fn raw_fd_is_fb0(&self, fd: i32) -> bool {
+        let Ok(raw_fd) = u32::try_from(fd).and_then(usize::try_from) else {
+            return false;
+        };
+        let files = self.files.borrow();
+        files
+            .run_on_raw_fd(
+                raw_fd,
+                |typed_fd| self.is_fb0(&files.fs, typed_fd).unwrap_or(false),
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+                |_| false,
+            )
+            .unwrap_or(false)
+    }
+
+    fn raw_fd_shared_futex_backing(
+        &self,
+        fd: i32,
+    ) -> Option<litebox::mm::vmem::SharedFutexBacking> {
+        let raw_fd = usize::try_from(fd).ok()?;
+        let files = self.files.borrow();
+        let typed = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<FS>(raw_fd)
+            .ok()?;
+        self.shared_file_backing(&typed, true)
+    }
+
+    fn raw_fd_file_handle(&self, fd: i32) -> Option<EntryHandle<Platform, FS>> {
+        let raw_fd = usize::try_from(fd).ok()?;
+        let files = self.files.borrow();
+        let typed = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<FS>(raw_fd)
+            .ok()?;
+        self.global.litebox.descriptor_table().entry_handle(&typed)
+    }
+
+    /// Whether raw fd `fd` was opened with write access (`O_WRONLY` or `O_RDWR`), per the
+    /// open-time `FdOpenFlags` record. An fd without that record (nothing `insert_raw_file_fd`
+    /// created) is treated as writable so this check never rejects more than it can prove.
+    fn raw_fd_open_for_writing(&self, fd: i32) -> bool {
+        let Ok(raw_fd) = usize::try_from(fd) else {
+            return true;
+        };
+        let files = self.files.borrow();
+        let Ok(typed) = files
+            .raw_descriptor_store
+            .read()
+            .fd_from_raw_integer::<FS>(raw_fd)
+        else {
+            return true;
+        };
+        self.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(&typed, |super::file::FdOpenFlags(flags)| {
+                flags.intersects(litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::RDWR)
+            })
+            .unwrap_or(true)
+    }
+
+    /// Whether any shared file mapping overlapping `[range_start, range_start + range_len)` was
+    /// created from an fd that lacks write access, in which case `PROT_WRITE` must be refused.
+    fn shared_file_mapping_denies_write(&self, range_start: usize, range_len: usize) -> bool {
+        let range_end = range_start.saturating_add(range_len);
+        let files = self.files.borrow();
+        let mappings = files.shared_file_mappings.lock();
+        mappings.iter().any(|mapping| {
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            !mapping.fd_writable && mapping.start < range_end && mapping_end > range_start
+        })
+    }
+
+    /// `mmap(MAP_SHARED | PROT_WRITE)` of `/dev/fb0`: allocate ordinary anonymous pages in the
+    /// (shared shim/guest) address space, then register them with the
+    /// [`litebox::fs::devices::Framebuffer`] as its
+    /// live pixel store -- pre-filled with the current contents, adopted until munmap. Guest
+    /// stores through the mapping are immediately visible to the runner's RFB snapshot with no
+    /// flush step, which is the coherence contract every fbdev graphics client assumes.
+    ///
+    /// `MAP_SHARED` (kept on the anonymous mapping) also keeps `Task::save_address_space` from
+    /// private-copying the pages out on a fork handoff, so the registration stays valid across
+    /// guest process switches.
+    fn do_mmap_framebuffer(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        // A nonzero-offset fbdev mmap is legal on Linux but no real client uses it; only the
+        // offset-0 mapping can become the pixel store.
+        if offset != 0 {
+            log_unsupported!("mmap of /dev/fb0 at nonzero offset");
+            return Err(MappingError::Io(Errno::EINVAL.into()));
+        }
+        // A framebuffer-typed fd only exists when `default_fs` mounted one (the sole source of
+        // an fb0 rdev major), so `None` would mean an fd recognized as fb0 by a filesystem this
+        // shim never built.
+        let Some(fb) = self.global.framebuffer.as_ref() else {
+            return Err(MappingError::Io(Errno::ENODEV.into()));
+        };
+        // Replace any previous registration first (a client that mmaps fb0 twice): copy-back
+        // deregistration keeps the old mapping's last-drawn content.
+        if let Some((old_addr, old_len)) = fb.guest_mapping() {
+            fb.clear_guest_mapping_overlapping(old_addr, old_len);
+        }
+        let ptr =
+            self.do_mmap_anonymous(suggested_addr, len, prot, flags | MapFlags::MAP_ANONYMOUS)?;
+        // SAFETY: `ptr` addresses `len` readable+writable bytes in this same address space;
+        // `sys_munmap`, `sys_mremap`, and the execve bulk-release all clear the registration
+        // before those pages can go away.
+        unsafe { fb.set_guest_mapping(ptr.as_usize(), len) };
+        Ok(ptr)
+    }
+
+    /// Copy every byte covered by `range` from a writable guest memfd mapping
+    /// back into its retained open file description.
+    fn flush_shared_file_mappings(
+        &self,
+        range_start: usize,
+        range_len: usize,
+    ) -> Result<(), Errno> {
+        let range_end = range_start.checked_add(range_len).ok_or(Errno::EINVAL)?;
+        let mappings = self.files.borrow().shared_file_mappings.lock().clone();
+
+        for mapping in mappings {
+            if !mapping.writable {
+                continue;
+            }
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            let overlap_start = mapping.start.max(range_start);
+            let overlap_end = mapping_end.min(range_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let temporary_fd = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .insert_handle(mapping.file.clone());
+            let write_result = (|| {
+                let file_offset = mapping
+                    .offset
+                    .checked_add(overlap_start - mapping.start)
+                    .ok_or(Errno::EOVERFLOW)?;
+                let files = self.files.borrow();
+                let file_size = files
+                    .fs
+                    .fd_file_status(&temporary_fd)
+                    .map_err(Errno::from)?
+                    .size;
+                let len = (overlap_end - overlap_start).min(file_size.saturating_sub(file_offset));
+                if len == 0 {
+                    return Ok(());
+                }
+                let bytes = UserPtr::<u8>::from_usize(overlap_start)
+                    .to_owned_slice::<Platform>(len)
+                    .ok_or(Errno::EFAULT)?;
+                let mut written = 0;
+                while written < bytes.len() {
+                    let size = files
+                        .fs
+                        .write(
+                            &temporary_fd,
+                            &bytes[written..],
+                            Some(file_offset + written),
+                        )
+                        .map_err(Errno::from)?;
+                    if size == 0 || size > bytes.len() - written {
+                        return Err(Errno::EIO);
+                    }
+                    written += size;
+                }
+                Ok(())
+            })();
+            let _ = self
+                .global
+                .litebox
+                .descriptor_table_mut()
+                .remove(&temporary_fd);
+            write_result?;
+        }
+        Ok(())
+    }
+
+    /// Forget the unmapped portions of writable memfd mappings while retaining
+    /// correctly-offset records for any pages on either side of a partial unmap.
+    fn clear_shared_file_mappings_for_range(&self, range_start: usize, range_len: usize) {
+        let range_end = range_start.saturating_add(range_len);
+        let files = self.files.borrow();
+        let mut mappings = files.shared_file_mappings.lock();
+        let old = core::mem::take(&mut *mappings);
+
+        for mapping in old {
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            if mapping_end <= range_start || mapping.start >= range_end {
+                mappings.push(mapping);
+                continue;
+            }
+            if mapping.start < range_start {
+                mappings.push(SharedFileMapping {
+                    start: mapping.start,
+                    len: range_start - mapping.start,
+                    offset: mapping.offset,
+                    writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
+                    file: mapping.file.clone(),
+                });
+            }
+            if mapping_end > range_end {
+                mappings.push(SharedFileMapping {
+                    start: range_end,
+                    len: mapping_end - range_end,
+                    offset: mapping.offset + (range_end - mapping.start),
+                    writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
+                    file: mapping.file,
+                });
+            }
+        }
+    }
+
+    fn remap_shared_file_mapping(
+        &self,
+        old_start: usize,
+        old_len: usize,
+        new_start: usize,
+        new_len: usize,
+    ) {
+        let old_end = old_start.saturating_add(old_len);
+        let files = self.files.borrow();
+        let mut mappings = files.shared_file_mappings.lock();
+        let old = core::mem::take(&mut *mappings);
+        let mut moved = false;
+        for mapping in old {
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            if moved || mapping.start > old_start || mapping_end < old_end {
+                mappings.push(mapping);
+                continue;
+            }
+            let moved_offset = mapping.offset + (old_start - mapping.start);
+            if mapping.start < old_start {
+                mappings.push(SharedFileMapping {
+                    start: mapping.start,
+                    len: old_start - mapping.start,
+                    offset: mapping.offset,
+                    writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
+                    file: mapping.file.clone(),
+                });
+            }
+            if mapping_end > old_end {
+                mappings.push(SharedFileMapping {
+                    start: old_end,
+                    len: mapping_end - old_end,
+                    offset: mapping.offset + (old_end - mapping.start),
+                    writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
+                    file: mapping.file.clone(),
+                });
+            }
+            mappings.push(SharedFileMapping {
+                start: new_start,
+                len: new_len,
+                offset: moved_offset,
+                writable: mapping.writable,
+                fd_writable: mapping.fd_writable,
+                file: mapping.file,
+            });
+            moved = true;
+        }
+    }
+
+    fn set_shared_file_mapping_writable(
+        &self,
+        range_start: usize,
+        range_len: usize,
+        writable: bool,
+    ) {
+        let range_end = range_start.saturating_add(range_len);
+        let files = self.files.borrow();
+        let mut mappings = files.shared_file_mappings.lock();
+        let old = core::mem::take(&mut *mappings);
+        for mapping in old {
+            let mapping_end = mapping.start.saturating_add(mapping.len);
+            let start = mapping.start.max(range_start);
+            let end = mapping_end.min(range_end);
+            if start >= end {
+                mappings.push(mapping);
+                continue;
+            }
+            if mapping.start < start {
+                mappings.push(SharedFileMapping {
+                    start: mapping.start,
+                    len: start - mapping.start,
+                    offset: mapping.offset,
+                    writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
+                    file: mapping.file.clone(),
+                });
+            }
+            mappings.push(SharedFileMapping {
+                start,
+                len: end - start,
+                offset: mapping.offset + (start - mapping.start),
+                writable,
+                fd_writable: mapping.fd_writable,
+                file: mapping.file.clone(),
+            });
+            if mapping_end > end {
+                mappings.push(SharedFileMapping {
+                    start: end,
+                    len: mapping_end - end,
+                    offset: mapping.offset + (end - mapping.start),
+                    writable: mapping.writable,
+                    fd_writable: mapping.fd_writable,
+                    file: mapping.file,
+                });
+            }
         }
     }
 
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+        let aligned_len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
+        self.flush_shared_file_mappings(addr.as_usize(), aligned_len)?;
+        if let Some(fb) = self.global.framebuffer.as_ref() {
+            // Copy-back + deregister BEFORE the pages go away. On the (guest-bug) path where
+            // the munmap itself then fails, this degrades the framebuffer to snapshot mode
+            // spuriously, which is safe.
+            fb.clear_guest_mapping_overlapping(addr.as_usize(), aligned_len);
+        }
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
+            self.clear_shared_file_mappings_for_range(addr.as_usize(), aligned_len);
             self.clear_file_mappings_for_range(addr.as_usize(), len);
+            self.record_unmapped(addr.as_usize(), aligned_len);
         }
         result
     }
@@ -438,12 +1075,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// unmapped range, so that re-mapping the same file region will be
     /// re-patched instead of skipped.
     fn clear_file_mappings_for_range(&self, unmap_start: usize, unmap_len: usize) {
-        if self.global.platform.get_syscall_entry_point() == 0 {
-            return;
-        }
-
         let unmap_end = unmap_start.saturating_add(unmap_len);
-        let mut cache = self.global.elf_patch_cache.lock();
+        let mut cache = self.process().elf_patch_cache.lock();
         for state in cache.values_mut() {
             state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
@@ -464,6 +1097,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
+        let aligned_len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
+        let writable = prot.contains(ProtFlags::PROT_WRITE);
+        if writable && self.shared_file_mapping_denies_write(addr.as_usize(), aligned_len) {
+            return Err(Errno::EACCES);
+        }
+        if !writable {
+            self.flush_shared_file_mappings(addr.as_usize(), aligned_len)?;
+        }
         // Intercept transitions to PROT_EXEC: patch unpatched file mappings.
         if prot.contains(ProtFlags::PROT_EXEC) {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
@@ -471,11 +1114,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.maybe_patch_on_mprotect_exec(addr, len, syscall_entry);
             }
         }
-        self.sys_mprotect_raw(addr, len, prot)
+        let result = self.sys_mprotect_raw(addr, len, prot);
+        if result.is_ok() {
+            self.set_shared_file_mapping_writable(addr.as_usize(), aligned_len, writable);
+        }
+        result
     }
 
     /// Raw mprotect without exec interception — used internally by the
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
+    ///
+    /// This is the single choke point every transition to `PROT_EXEC` passes
+    /// through — the public [`Self::sys_mprotect`] included, via the call at
+    /// the end of that function — so it is also where instruction-cache
+    /// maintenance belongs: whatever was just written (loaded segments, the
+    /// rewriter's patches) has to be flushed to the point where the CPU's
+    /// instruction fetch path can see it before anything branches into the
+    /// range.
     #[inline]
     fn sys_mprotect_raw(
         &self,
@@ -483,7 +1138,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot)
+        let is_exec = prot.contains(ProtFlags::PROT_EXEC);
+        let result = litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot);
+        if result.is_ok() && is_exec {
+            clear_icache_range(addr.as_usize(), len);
+        }
+        result
     }
 
     #[inline]
@@ -495,23 +1155,79 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        litebox_common_linux::mm::sys_mremap(
+        let old_len = old_size
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
+        let new_len = new_size
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
+        self.flush_shared_file_mappings(old_addr.as_usize(), old_len)?;
+        if let Some(fb) = self.global.framebuffer.as_ref() {
+            // A remap can move or shrink the pages backing a live fb0 registration; deregister
+            // (with copy-back) first rather than track the move -- no fbdev client remaps its
+            // framebuffer mapping.
+            fb.clear_guest_mapping_overlapping(old_addr.as_usize(), old_len);
+        }
+        let result = litebox_common_linux::mm::sys_mremap(
             &self.global.pm,
             old_addr,
             old_size,
             new_size,
             flags,
             new_addr,
-        )
+        )?;
+        self.remap_shared_file_mapping(old_addr.as_usize(), old_len, result.as_usize(), new_len);
+        self.record_unmapped(old_addr.as_usize(), old_len);
+        self.record_mapped(result.as_usize(), new_len);
+        Ok(result)
     }
 
-    /// Handle syscall `brk`
-    #[inline]
+    /// Handle syscall `brk`.
+    ///
+    /// The page manager is shared by every guest process in this shim but tracks only one program
+    /// break, so this swaps in the calling process's own break for the duration of the call and
+    /// takes the updated value back out afterwards, under a lock that keeps two processes from
+    /// interleaving. See [`crate::syscalls::process::Process::brk`].
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.global.pm, addr)
+        use core::sync::atomic::Ordering;
+
+        let _guard = self.global.brk_lock.lock();
+        let process = self.process();
+        let old_brk = process.brk.load(Ordering::Relaxed);
+        let stashed = self.global.pm.swap_brk(old_brk);
+        debug_assert_eq!(stashed, 0, "the page manager's break is only live in here");
+        let result = litebox_common_linux::mm::sys_brk(&self.global.pm, addr);
+        let new_brk = self.global.pm.swap_brk(0);
+        // The full swap protocol per call: `stashed` non-zero here means some
+        // other path left its break live in the manager (a protocol breach
+        // this per-process model depends on never happening), and
+        // old->new shows exactly what range a grow/shrink walked -- the
+        // evidence needed when a break operation touches memory it should
+        // not (a cross-process brk was one observed way a forked child
+        // destroyed its suspended parent's heap).
+        litebox_util_log::trace!(
+            pid:? = self.pid, requested:? = addr.as_usize(), old_brk:? = old_brk,
+            stashed:? = stashed, new_brk:? = new_brk;
+            "brk"
+        );
+        process.brk.store(new_brk, Ordering::Relaxed);
+        // The break's backing pages are this process's mappings like any other.
+        let (old_page, new_page) = (align_up(old_brk, PAGE_SIZE), align_up(new_brk, PAGE_SIZE));
+        if new_page > old_page {
+            self.record_mapped(old_page, new_page - old_page);
+        } else if new_page < old_page {
+            self.record_unmapped(new_page, old_page - new_page);
+        }
+        result
     }
 
-    /// Handle syscall `madvise`
+    /// Handle syscall `madvise`.
+    ///
+    /// Every advice value returns to the guest: what the page manager cannot honour is
+    /// logged (once per advice, see `log_unsupported!`) and refused with `EINVAL`, and a
+    /// pure hint is accepted as the no-op it is on Linux. `MADV_WIPEONFORK` marks the range
+    /// in the shared page manager; the child-side zeroing is `PageManager::wipe_on_fork_child`,
+    /// run by the fork hand-off after the parent has copied its own image out.
     #[inline]
     pub(crate) fn sys_madvise(
         &self,
@@ -519,6 +1235,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
+        use litebox_common_linux::mm::{MadviseSupport, madvise_support};
+        match madvise_support(&advice) {
+            MadviseSupport::Implemented => {}
+            MadviseSupport::AdvisoryNoop => {
+                litebox_util_log::trace!(
+                    pid:? = self.pid, addr:? = addr.as_usize(), len:? = len, advice:? = advice;
+                    "madvise hint accepted as a no-op"
+                );
+            }
+            MadviseSupport::Unsupported => {
+                log_unsupported!("madvise({advice:?}) is not supported; returning EINVAL");
+            }
+        }
         litebox_common_linux::mm::sys_madvise(&self.global.pm, addr, len, advice)
     }
 
@@ -532,12 +1261,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mprotect_end = mprotect_start.saturating_add(len);
 
         // Find unpatched file mappings that overlap this mprotect range.
-        // We collect (descriptor identity, vaddr, seg_len) to avoid holding
+        // We collect (fd, vaddr, seg_len, file_offset) to avoid holding
         // the lock while patching.
-        let to_patch: alloc::vec::Vec<(ElfPatchKey<Platform>, usize, usize)> = {
-            let cache = self.global.elf_patch_cache.lock();
+        let to_patch: alloc::vec::Vec<(i32, usize, usize)> = {
+            let cache = self.process().elf_patch_cache.lock();
             let mut result = alloc::vec::Vec::new();
-            for (fd, state) in cache.iter() {
+            for (&fd, state) in cache.iter() {
                 if state.pre_patched {
                     continue;
                 }
@@ -545,7 +1274,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let seg_end = seg_start.saturating_add(seg_len);
                     // Check overlap with the mprotect range.
                     if seg_start < mprotect_end && seg_end > mprotect_start {
-                        result.push((fd.clone(), seg_start, seg_len));
+                        result.push((fd, seg_start, seg_len));
                     }
                 }
             }
@@ -555,13 +1284,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // A single mprotect range should only overlap mappings from one fd
         // (a given vaddr range is backed by at most one file at a time).
         if to_patch.len() > 1 {
-            let fds: BTreeSet<_> = to_patch
-                .iter()
-                .map(|(fd, _, _)| Arc::as_ptr(&fd.0) as usize)
-                .collect();
+            let fds: BTreeSet<i32> = to_patch.iter().map(|(fd, _, _)| *fd).collect();
             if fds.len() > 1 {
                 litebox_util_log::warn!(
-                    addr:? = mprotect_start, len:? = len, count:? = fds.len();
+                    addr:? = mprotect_start, len:? = len, fds:? = fds;
                     "mprotect +EXEC range overlaps file mappings from multiple fds"
                 );
             }
@@ -580,7 +1306,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 continue;
             }
             let mapped_addr = UserPtrMut::<u8>::from_usize(patch_start);
-            self.maybe_patch_exec_segment(mapped_addr, patch_len, &fd, syscall_entry, None);
+            self.maybe_patch_exec_segment(mapped_addr, patch_len, fd, syscall_entry, None);
         }
     }
 
@@ -597,21 +1323,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// segment is being mapped so we can look up its `p_vaddr`.
     ///
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
-    fn init_elf_patch_state(
-        &self,
-        fd: &ElfPatchKey<Platform>,
-        mapped_addr: usize,
-        file_offset: usize,
-    ) {
+    fn init_elf_patch_state(&self, fd: i32, mapped_addr: usize, file_offset: usize) {
         // Quick check: skip if already initialized.
-        let mut cache = self.global.elf_patch_cache.lock();
-        if cache.contains_key(fd) {
+        if self.process().elf_patch_cache.lock().contains_key(&fd) {
             return;
         }
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
-        match self.files.borrow().fs.read(&fd.0, &mut ehdr_buf, Some(0)) {
+        match self.sys_read(fd, &mut ehdr_buf, Some(0)) {
             Ok(n) if n == ehdr_buf.len() => {}
             _ => return, // Not readable or short read, skip
         }
@@ -627,6 +1347,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         let e_type = ehdr.e_type.get(ENDIAN);
+        let e_machine = ehdr.e_machine.get(ENDIAN);
         let e_phoff: usize = ehdr.e_phoff.get(ENDIAN).trunc();
         let e_phentsize = ehdr.e_phentsize.get(ENDIAN) as usize;
         let e_phnum = ehdr.e_phnum.get(ENDIAN) as usize;
@@ -644,12 +1365,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return; // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
-        match self
-            .files
-            .borrow()
-            .fs
-            .read(&fd.0, &mut phdrs_buf, Some(e_phoff))
-        {
+        match self.sys_read(fd, &mut phdrs_buf, Some(e_phoff)) {
             Ok(n) if n == phdrs_buf.len() => {}
             _ => return,
         }
@@ -657,6 +1373,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
         // by matching the segment whose p_offset corresponds to file_offset.
         let mut max_load_end: u64 = 0;
+        let mut min_load_start: u64 = u64::MAX;
         let mut base_addr: Option<usize> = None;
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
@@ -679,6 +1396,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if end > max_load_end {
                 max_load_end = end;
             }
+            if p_vaddr < min_load_start {
+                min_load_start = p_vaddr;
+            }
             // Match segment by page-aligned file offset to derive base address.
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
@@ -691,9 +1411,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return; // No PT_LOAD segments
         }
 
+        // Record the image span for fault symbolization. This must happen at
+        // map time: the dynamic linker closes the fd (dropping the patch-state
+        // entry below) as soon as the library is mapped, long before any fault
+        // that needs a `path+offset`. Best-effort -- an fd without a recorded
+        // path (memfd, inherited fd) simply is not symbolizable later.
+        let image_base = if e_type == ET_DYN { base_addr } else { Some(0) };
+        if let Some(base) = image_base
+            && let Some(path) = self.fd_abs_path(fd)
+        {
+            let lo = base + align_down(min_load_start.trunc(), PAGE_SIZE);
+            let hi = base + align_up(max_load_end.trunc(), PAGE_SIZE);
+            self.global.guest_images.lock().push(GuestImage {
+                lo,
+                hi,
+                base,
+                path: alloc::string::String::from_utf8_lossy(path.as_bytes()).into_owned(),
+            });
+        }
+
         // Check if file is pre-patched by reading the last 32 bytes for magic
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
-            self.check_trampoline_magic(&fd.0);
+            self.check_trampoline_magic(fd);
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
@@ -723,54 +1462,74 @@ impl<Platform: ShimPlatform> Task<Platform> {
             base + max_end.next_multiple_of(PAGE_SIZE)
         };
 
-        cache.insert(
-            fd.clone(),
-            ElfPatchState {
-                pre_patched,
-                trampoline_file_offset: tramp_file_offset,
-                trampoline_file_size: tramp_file_size.trunc(),
-                trampoline_addr: trampoline_vaddr,
-                trampoline_cursor: 0,
-                trampoline_mapped: false,
-                trampoline_mapped_len: 0,
-                runtime_patches_committed: false,
-                file_mappings: BTreeSet::new(),
-                patched_ranges: BTreeSet::new(),
-            },
-        );
+        // Insert under lock (re-check for races).
+        let mut cache = self.process().elf_patch_cache.lock();
+        cache.entry(fd).or_insert(ElfPatchState {
+            pre_patched,
+            machine: e_machine,
+            trampoline_file_offset: tramp_file_offset,
+            trampoline_file_size: tramp_file_size.trunc(),
+            trampoline_addr: trampoline_vaddr,
+            trampoline_cursor: 0,
+            trampoline_mapped: false,
+            trampoline_mapped_len: 0,
+            runtime_patches_committed: false,
+            file_mappings: BTreeSet::new(),
+            patched_ranges: BTreeSet::new(),
+        });
     }
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
-    fn check_trampoline_magic(&self, fd: &FileFd<Platform>) -> (bool, u64, u64, u64) {
-        let files = self.files.borrow();
-        let Ok(stat) = files.fs.fd_file_status(fd) else {
+    fn check_trampoline_magic(&self, fd: i32) -> (bool, u64, u64, u64) {
+        const HEADER_SIZE: usize = 32; // TrampolineHeader64: magic(8) + file_offset(8) + vaddr(8) + size(8)
+        let Ok(stat) = self.sys_fstat(fd) else {
             return (false, 0, 0, 0);
         };
-        let file_size = stat.size;
-        if file_size < TRAMPOLINE_HEADER_SIZE {
+        // `st_size` is pointer-width and unsigned in the x86-64 `struct stat`,
+        // and a signed 64-bit field in the generic layout aarch64 uses.
+        #[cfg(target_arch = "x86_64")]
+        let file_size = stat.st_size;
+        #[cfg(target_arch = "aarch64")]
+        let Ok(file_size) = usize::try_from(stat.st_size) else {
+            return (false, 0, 0, 0);
+        };
+        if file_size < HEADER_SIZE {
             return (false, 0, 0, 0);
         }
-        let mut tail = [0u8; TRAMPOLINE_HEADER_SIZE];
-        match files
-            .fs
-            .read(fd, &mut tail, Some(file_size - TRAMPOLINE_HEADER_SIZE))
-        {
-            Ok(n) if n == TRAMPOLINE_HEADER_SIZE => {}
+        let mut tail = [0u8; HEADER_SIZE];
+        match self.sys_read(fd, &mut tail, Some(file_size - HEADER_SIZE)) {
+            Ok(n) if n == HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
         }
-        let Ok(header) = TrampolineHeader64::read_from_bytes(&tail) else {
-            return (false, 0, 0, 0);
-        };
-        if !header.has_valid_magic() {
+        if &tail[0..8] != litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
             return (false, 0, 0, 0);
         }
-        (
-            true,
-            header.file_offset,
-            header.vaddr,
-            header.trampoline_size,
-        )
+        let file_offset = u64::from_le_bytes(tail[8..16].try_into().unwrap());
+        let vaddr = u64::from_le_bytes(tail[16..24].try_into().unwrap());
+        let trampoline_size = u64::from_le_bytes(tail[24..32].try_into().unwrap());
+        (true, file_offset, vaddr, trampoline_size)
+    }
+
+    /// Write `bytes` at `ptr`, which points into a mapping that is — or is
+    /// about to become — executable.
+    ///
+    /// On hosts with per-thread code write protection (Darwin's `MAP_JIT`), a
+    /// write into such a mapping faults unless this thread first enables write
+    /// access, page permissions notwithstanding; see
+    /// `litebox::platform::PageManagementProvider::jit_write_protect`. This
+    /// helper brackets the copy accordingly; on every other host the bracket
+    /// is a no-op, so all code writes in this module go through it
+    /// unconditionally.
+    fn write_code_bytes(&self, ptr: UserPtrMut<u8>, bytes: &[u8]) -> Option<()> {
+        // SAFETY: nothing on this thread executes out of a JIT mapping
+        // between the toggles — the copy below is ordinary host code, and
+        // guest code is only re-entered long after the closing toggle.
+        unsafe { self.global.platform.jit_write_protect(false) };
+        let result = ptr.copy_from_slice::<Platform>(0, bytes);
+        // SAFETY: restores the executable state guest code requires.
+        unsafe { self.global.platform.jit_write_protect(true) };
+        result
     }
 
     /// Apply the trap fallback to a mapped code segment: replace all `syscall`
@@ -807,9 +1566,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             );
         }
         assert!(
-            mapped_addr
-                .copy_from_slice::<Platform>(0, &code_buf)
-                .is_some(),
+            self.write_code_bytes(mapped_addr, &code_buf).is_some(),
             "fatal: failed to write trap bytes back to code segment"
         );
 
@@ -837,22 +1594,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         mapped_addr: UserPtrMut<u8>,
         len: usize,
-        fd: &ElfPatchKey<Platform>,
+        fd: i32,
         syscall_entry: usize,
         file_offset: Option<usize>,
     ) -> bool {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
-        if let Some(file_offset) = file_offset {
-            self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset);
+        if !self.process().elf_patch_cache.lock().contains_key(&fd) {
+            self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset.unwrap_or(0));
         }
 
         // This lock guards the elf_patch_cache and is held for the entire
         // patching operation. In practice this is fine because the dynamic
         // linker loads shared libraries sequentially.
-        let mut cache = self.global.elf_patch_cache.lock();
-        let Some(state) = cache.get_mut(fd) else {
+        let mut cache = self.process().elf_patch_cache.lock();
+        let Some(state) = cache.get_mut(&fd) else {
             return true; // No patch state — not an ELF we're tracking
         };
 
@@ -887,12 +1644,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let mut tramp_data = alloc::vec![0u8; state.trampoline_file_size];
                 let file_off = state.trampoline_file_offset.trunc();
                 let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
-                match self
-                    .files
-                    .borrow()
-                    .fs
-                    .read(&fd.0, &mut tramp_data, Some(file_off))
-                {
+                match self.sys_read(fd, &mut tramp_data, Some(file_off)) {
                     Ok(n) if n == tramp_data.len() => {}
                     _ => {
                         let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
@@ -905,11 +1657,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
                 }
 
+                // Publish the guest thread-pointer offset the runtime actually
+                // reserved, mirroring `ElfParsedFile::load_trampoline` in
+                // `litebox_common_linux::loader`. The loader path only covers
+                // the main executable and its interpreter; libraries mapped by
+                // the in-guest dynamic linker arrive here instead, and leaving
+                // the packager-seeded default in place would make this
+                // module's gates read the guest TP from a different slot than
+                // every loader-published module writes it to. Skipped when the
+                // platform bakes the offset into the gates as an immediate.
+                if let Some(offset) = self.global.platform.get_guest_tp_slot_offset() {
+                    let end = TRAMPOLINE_GUEST_TP_SLOT_OFFSET + size_of::<usize>();
+                    if tramp_data.len() < end {
+                        // The gates in this image read this word; a trampoline
+                        // too short to hold it means every rewritten syscall
+                        // would compute a garbage thread pointer. Fail the
+                        // mapping rather than continuing silently.
+                        let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
+                        return false;
+                    }
+                    tramp_data[TRAMPOLINE_GUEST_TP_SLOT_OFFSET..end]
+                        .copy_from_slice(&offset.to_ne_bytes());
+                }
+
                 // Write to the mapped region.
-                if tramp_ptr
-                    .copy_from_slice::<Platform>(0, &tramp_data)
-                    .is_none()
-                {
+                if self.write_code_bytes(tramp_ptr, &tramp_data).is_none() {
                     let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
                     return false;
                 }
@@ -934,6 +1706,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // ── Runtime patching path (unpatched binaries) ───────────────
+
+        // The runtime rewriter is an x86-64 instruction decoder. Running it
+        // (or the trap fallback, which shares that decoder) over another
+        // architecture's code would reinterpret arbitrary instruction words as
+        // x86 and corrupt the segment, so refuse and leave the code untouched.
+        // On such hosts every shipped image is expected to be pre-patched
+        // (carrying the `LITEBOX0` trailer) and never reaches this arm.
+        if state.machine != object::elf::EM_X86_64 {
+            litebox_util_log::warn!(
+                machine:? = state.machine, addr:? = mapped_addr.as_usize(), len:? = len;
+                "unpatched non-x86-64 image: runtime syscall patching skipped"
+            );
+            return true;
+        }
 
         // Allocate the trampoline region if not yet done.
         let addr_usize = mapped_addr.as_usize();
@@ -986,8 +1772,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
             // Write the 8-byte syscall entry point at the start.
             let entry_ptr = UserPtrMut::<u8>::from_usize(actual_addr);
-            if entry_ptr
-                .copy_from_slice::<Platform>(0, &syscall_entry.to_le_bytes())
+            if self
+                .write_code_bytes(entry_ptr, &syscall_entry.to_le_bytes())
                 .is_none()
             {
                 litebox_util_log::warn!("failed to write syscall entry point to trampoline");
@@ -1111,10 +1897,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // never target an uninitialized trampoline.
                 let tramp_write_ptr =
                     UserPtrMut::<u8>::from_usize(state.trampoline_addr + state.trampoline_cursor);
-                if tramp_write_ptr
-                    .copy_from_slice::<Platform>(0, &stubs)
-                    .is_none()
-                {
+                if self.write_code_bytes(tramp_write_ptr, &stubs).is_none() {
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
@@ -1125,11 +1908,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
 
                 // Write patched code back to the mapped region.
-                if mapped_addr
-                    .copy_from_slice::<Platform>(0, &code_buf)
-                    .is_none()
-                {
-                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
+                if self.write_code_bytes(mapped_addr, &code_buf).is_none() {
+                    let _ = self.write_code_bytes(mapped_addr, &original_code);
                     let _ = self.sys_mprotect_raw(
                         mapped_addr,
                         len,
@@ -1146,11 +1926,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // have replaced unpatchable syscalls with trap instructions.
                 // Write back the modified code if it changed.
                 if code_buf != original_code
-                    && mapped_addr
-                        .copy_from_slice::<Platform>(0, &code_buf)
-                        .is_none()
+                    && self.write_code_bytes(mapped_addr, &code_buf).is_none()
                 {
-                    let _ = mapped_addr.copy_from_slice::<Platform>(0, &original_code);
+                    let _ = self.write_code_bytes(mapped_addr, &original_code);
                     panic!("fatal: failed to write trap bytes back to code segment");
                 }
                 // Fall through to restore RX protections below.
@@ -1173,11 +1951,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         true
     }
 
+    /// Find the guest ELF image containing `addr`, returning its guest path
+    /// and the image-relative offset (`addr - load bias`) -- the pair
+    /// `llvm-symbolizer` needs to resolve the address against the guest's own
+    /// (debug-info-carrying) ELF. Latest mapping wins so an address reused
+    /// after an image is replaced resolves to the live image.
+    pub(crate) fn find_guest_image(&self, addr: usize) -> Option<(alloc::string::String, usize)> {
+        let images = self.global.guest_images.lock();
+        images
+            .iter()
+            .rev()
+            .find(|img| (img.lo..img.hi).contains(&addr))
+            .map(|img| (img.path.clone(), addr - img.base))
+    }
+
     /// Finalize the ELF patching state for `fd`.
     ///
-    /// Removes the cache entry and unmaps any trampoline that was allocated but never used.
-    pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd<Platform>>) {
-        let state = self.global.elf_patch_cache.lock().remove(&ElfPatchKey(fd));
+    /// Removes the cache entry (preventing stale state if the fd is reused)
+    /// and unmaps any trampoline that was allocated but never used.
+    pub(crate) fn finalize_elf_patch(&self, fd: i32) {
+        let state = self.process().elf_patch_cache.lock().remove(&fd);
         if let Some(state) = state
             && state.trampoline_mapped
             && !state.pre_patched
@@ -1196,17 +1989,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 #[cfg(test)]
 mod tests {
-    use litebox::{
-        fs::{Mode, OFlags},
-        platform::PageManagementProvider,
-    };
-    use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, errno::Errno};
+    use litebox::fs::{Mode, OFlags};
+    // Only `test_collision_with_global_allocator` needs these, and it is gated to
+    // the hosts whose allocator layout it knows.
+    use litebox::platform::PageManagementProvider;
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    use litebox_common_linux::MRemapFlags;
+    use litebox_common_linux::{FcntlArg, MapFlags, ProtFlags, errno::Errno};
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
 
+    /// The host's page size. Sizes and addresses below are written as multiples
+    /// of this rather than as literals: `mmap`/`mprotect`/`mremap` reject a
+    /// length that is not a whole number of pages, and Apple Silicon's page is
+    /// 16 KiB, so a literal `0x1000` is not a page there and every such call
+    /// fails before reaching the behaviour under test.
+    use super::PAGE_SIZE;
+
     #[test]
     fn test_anonymous_mmap() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let addr = task
@@ -1227,11 +2030,17 @@ mod tests {
 
     #[test]
     fn test_file_backed_mmap() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let content = b"Hello, world!";
         let fd = task
-            .sys_open("test.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "test.txt",
+                OFlags::RDWR | OFlags::CREAT,
+                Mode::RWXU,
+            )
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
         assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
@@ -1257,12 +2066,13 @@ mod tests {
 
     #[test]
     fn test_mremap() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let addr = task
             .sys_mmap(
                 0,
-                0x2000,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
                 -1,
@@ -1270,11 +2080,13 @@ mod tests {
             )
             .unwrap();
 
+        // Growing the first page in place would run into the second, which this
+        // same mapping already occupies, so it fails without `MREMAP_MAYMOVE`.
         assert!(matches!(
             task.sys_mremap(
                 addr,
-                0x1000,
-                0x2000,
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
                 litebox_common_linux::MRemapFlags::empty(),
                 0
             ),
@@ -1283,26 +2095,32 @@ mod tests {
         let new_addr = task
             .sys_mremap(
                 addr,
-                0x1000,
-                0x2000,
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
                 litebox_common_linux::MRemapFlags::MREMAP_MAYMOVE,
                 0,
             )
             .unwrap();
-        task.sys_munmap(addr, 0x2000).unwrap();
-        task.sys_munmap(new_addr, 0x2000).unwrap();
+        task.sys_munmap(addr, 2 * PAGE_SIZE).unwrap();
+        task.sys_munmap(new_addr, 2 * PAGE_SIZE).unwrap();
     }
 
     #[test]
     fn test_mmap_fixed_noreplace() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         // First, create an initial mapping at a specific address away from boundaries
-        let base_addr = 0x1000_0000usize; // 256 MiB - safe middle ground
+        // Well clear of the host's lowest mappable address: an arm64 Mach-O
+        // process reserves the first 4 GiB as `__PAGEZERO`, so a literal low
+        // address is not mappable there. Test 5 maps one page below this, so
+        // leave room for that too.
+        let base_addr =
+            <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN + 0x1000_0000usize;
         let addr1 = task
             .sys_mmap(
                 base_addr,
-                0x2000,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1319,7 +2137,7 @@ mod tests {
         let err = task
             .sys_mmap(
                 addr1.as_usize(),
-                0x1000,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1329,11 +2147,11 @@ mod tests {
         assert_eq!(err, Errno::EEXIST);
 
         // Test 2: Partial overlap at end - should fail with EEXIST
-        // Existing: [addr1, addr1 + 0x2000), New: [addr1 + 0x1000, addr1 + 0x3000)
+        // Existing: [addr1, addr1 + 2 * PAGE_SIZE), New: [addr1 + PAGE_SIZE, addr1 + 0x3000)
         let err = task
             .sys_mmap(
-                addr1.as_usize() + 0x1000,
-                0x2000,
+                addr1.as_usize() + PAGE_SIZE,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1343,11 +2161,11 @@ mod tests {
         assert_eq!(err, Errno::EEXIST);
 
         // Test 3: Partial overlap at start - should fail with EEXIST
-        // Existing: [addr1, addr1 + 0x2000), New: [addr1 - 0x1000, addr1 + 0x1000)
+        // Existing: [addr1, addr1 + 2 * PAGE_SIZE), New: [addr1 - PAGE_SIZE, addr1 + PAGE_SIZE)
         let err = task
             .sys_mmap(
-                addr1.as_usize() - 0x1000,
-                0x2000,
+                addr1.as_usize() - PAGE_SIZE,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1359,35 +2177,35 @@ mod tests {
         // Test 4: Adjacent mapping (right after) - should succeed
         let addr2 = task
             .sys_mmap(
-                addr1.as_usize() + 0x2000,
-                0x1000,
+                addr1.as_usize() + 2 * PAGE_SIZE,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
                 0,
             )
             .unwrap();
-        assert_eq!(addr2.as_usize(), addr1.as_usize() + 0x2000);
+        assert_eq!(addr2.as_usize(), addr1.as_usize() + 2 * PAGE_SIZE);
 
         // Test 5: Adjacent mapping (right before) - should succeed
         let addr3 = task
             .sys_mmap(
-                addr1.as_usize() - 0x1000,
-                0x1000,
+                addr1.as_usize() - PAGE_SIZE,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
                 0,
             )
             .unwrap();
-        assert_eq!(addr3.as_usize(), addr1.as_usize() - 0x1000);
+        assert_eq!(addr3.as_usize(), addr1.as_usize() - PAGE_SIZE);
 
         // Test 6: Zero address with MAP_FIXED_NOREPLACE - should fail with EPERM
         // (matches Linux behavior where vm.mmap_min_addr prevents mapping at address 0)
         let err = task
             .sys_mmap(
                 0,
-                0x1000,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
                 -1,
@@ -1397,14 +2215,20 @@ mod tests {
         assert_eq!(err, Errno::EPERM);
 
         // Clean up
-        task.sys_munmap(addr3, 0x1000).unwrap();
-        task.sys_munmap(addr1, 0x2000).unwrap();
-        task.sys_munmap(addr2, 0x1000).unwrap();
+        task.sys_munmap(addr3, PAGE_SIZE).unwrap();
+        task.sys_munmap(addr1, 2 * PAGE_SIZE).unwrap();
+        task.sys_munmap(addr2, PAGE_SIZE).unwrap();
     }
 
+    // Not on macOS: `MacOsUserland::GUEST_ADDR_MIN` is 1 TiB (8a65efa), so a
+    // Darwin host allocation (~4-39 GiB) can never satisfy the in-guest-range
+    // mmap this loop searches for -- the collision under test is impossible by
+    // construction and the search spins forever (witnessed as the CI macOS
+    // job's 420 s slow-timeout SIGKILL).
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn test_collision_with_global_allocator() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
         let platform = task.global.platform;
         let mut data = alloc::vec::Vec::new();
@@ -1439,6 +2263,33 @@ mod tests {
                 }));
                 addr
             };
+            // Darwin's non-fixed `mmap(NULL, ...)` packs consecutive anonymous
+            // requests back to back rather than scattering them the way Linux's
+            // ASLR does, so a bare `mmap(NULL, 0x10_000, ...)` here would make
+            // `addr - PAGE_SIZE` land inside the previous iteration's (still
+            // mapped) block every time, and the loop below would never find the
+            // free page it needs. Map one extra leading page and free just that
+            // one instead, so `[addr - PAGE_SIZE, addr)` is available by
+            // construction rather than by chance.
+            #[cfg(target_os = "macos")]
+            let addr = {
+                let base = unsafe {
+                    libc::mmap(
+                        core::ptr::null_mut(),
+                        0x10_000 + PAGE_SIZE,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                } as usize;
+                unsafe { libc::munmap(base as *mut libc::c_void, PAGE_SIZE) };
+                let addr = base + PAGE_SIZE;
+                data.push(alloc::vec::Vec::<u8>::from(unsafe {
+                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
+                }));
+                addr
+            };
 
             let mut included = false;
             for r in <crate::syscalls::tests::TestPlatform as PageManagementProvider<
@@ -1452,17 +2303,20 @@ mod tests {
             }
 
             if !included {
-                // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
+                // Also ensure that [addr - PAGE_SIZE, addr) is available, which is needed in the test below.
+                // `MAP_FIXED_NOREPLACE` rather than a plain hint: a non-fixed `mmap` is free to place
+                // the mapping wherever it likes regardless of the hint, so only a fixed request can
+                // guarantee landing exactly at `addr - PAGE_SIZE`.
                 if let Ok(ptr) = task.sys_mmap(
-                    addr - 0x1000,
-                    0x1000,
+                    addr - PAGE_SIZE,
+                    PAGE_SIZE,
                     ProtFlags::PROT_READ,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON | MapFlags::MAP_FIXED_NOREPLACE,
                     -1,
                     0,
                 ) {
-                    if ptr.as_usize() != addr - 0x1000 {
-                        task.sys_munmap(ptr, 0x1000).unwrap();
+                    if ptr.as_usize() != addr - PAGE_SIZE {
+                        task.sys_munmap(ptr, PAGE_SIZE).unwrap();
                         continue;
                     }
                     break addr;
@@ -1474,7 +2328,7 @@ mod tests {
         let res = task
             .sys_mmap(
                 addr,
-                0x1000,
+                PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
                 -1,
@@ -1487,11 +2341,11 @@ mod tests {
         // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
         let err = task
             .sys_mremap(
-                UserPtrMut::from_usize(addr - 0x1000),
-                0x1000,
-                0x2000,
+                UserPtrMut::from_usize(addr - PAGE_SIZE),
+                PAGE_SIZE,
+                2 * PAGE_SIZE,
                 MRemapFlags::empty(),
-                addr - 0x1000,
+                addr - PAGE_SIZE,
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
@@ -1499,13 +2353,14 @@ mod tests {
 
     #[test]
     fn test_map_shared_anonymous() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         // MAP_SHARED | MAP_ANON with PROT_READ should succeed
         let addr = task
             .sys_mmap(
                 0,
-                0x2000,
+                2 * PAGE_SIZE,
                 ProtFlags::PROT_READ,
                 MapFlags::MAP_ANON | MapFlags::MAP_SHARED,
                 -1,
@@ -1517,23 +2372,28 @@ mod tests {
         let _val: u8 = addr.read_at_offset::<Platform>(0).unwrap();
 
         // Anonymous shared mappings allow permission changes including write
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-            .unwrap();
+        task.sys_mprotect(
+            addr,
+            2 * PAGE_SIZE,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+        )
+        .unwrap();
         addr.write_slice_at_offset::<Platform>(0, &[0xab; 0x10])
             .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0).unwrap(), 0xab_u8);
 
         // mprotect to read-only or read-exec should also succeed
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ)
+        task.sys_mprotect(addr, 2 * PAGE_SIZE, ProtFlags::PROT_READ)
             .unwrap();
-        task.sys_mprotect(addr, 0x2000, ProtFlags::PROT_READ_EXEC)
+        task.sys_mprotect(addr, 2 * PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
             .unwrap();
 
-        task.sys_munmap(addr, 0x2000).unwrap();
+        task.sys_munmap(addr, 2 * PAGE_SIZE).unwrap();
     }
 
     #[test]
     fn test_map_shared_anonymous_writable() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         // MAP_SHARED | MAP_ANON with PROT_WRITE should succeed
@@ -1557,18 +2417,62 @@ mod tests {
 
     #[test]
     fn test_map_shared_readonly_file() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let content = b"Hello, shared!";
+        let write_fd = task
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "shared.txt",
+                OFlags::RDWR | OFlags::CREAT,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let write_fd = i32::try_from(write_fd).unwrap();
+        assert_eq!(
+            task.sys_write(write_fd, content, None).unwrap(),
+            content.len()
+        );
+        task.sys_close(write_fd).unwrap();
+
+        // Re-open read-only: `mprotect` adding PROT_WRITE below must be rejected because the fd
+        // backing the mapping lacks write access, not because the mapping started PROT_READ-only
+        // (mmap'ing PROT_READ then mprotect'ing in PROT_WRITE later is legal on a MAP_SHARED
+        // mapping whose fd *does* have write access).
         let fd = task
-            .sys_open("shared.txt", OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "shared.txt",
+                OFlags::RDONLY,
+                Mode::empty(),
+            )
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
-        assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+
+        // MAP_SHARED | PROT_WRITE on a read-only fd is refused up front.
+        assert!(matches!(
+            task.sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            ),
+            Err(Errno::EACCES)
+        ));
 
         // MAP_SHARED with PROT_READ on a file should succeed
         let addr = task
-            .sys_mmap(0, 0x1000, ProtFlags::PROT_READ, MapFlags::MAP_SHARED, fd, 0)
+            .sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
             .unwrap();
 
         // Data should match
@@ -1581,16 +2485,61 @@ mod tests {
 
         // mprotect to add write permission should fail
         let err = task
-            .sys_mprotect(addr, 0x1000, ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+            .sys_mprotect(
+                addr,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            )
             .unwrap_err();
         assert_eq!(err, Errno::EACCES);
 
-        task.sys_munmap(addr, 0x1000).unwrap();
+        task.sys_munmap(addr, PAGE_SIZE).unwrap();
         task.sys_close(fd).unwrap();
     }
 
     #[test]
+    fn writable_shared_memfd_copies_back_before_descriptor_transfer() {
+        let _guard = crate::syscalls::tests::address_space_guard();
+        let task = init_platform(None);
+        task.sys_mkdirat(litebox_common_linux::AT_FDCWD, "/tmp", 0o700)
+            .unwrap();
+        let len = 2304;
+        let fd = i32::try_from(task.sys_memfd_create(c"glycin-texture", 0x3).unwrap()).unwrap();
+        task.sys_ftruncate(fd, len).unwrap();
+
+        let addr = task
+            .sys_mmap(
+                0,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                MapFlags::MAP_SHARED,
+                fd,
+                0,
+            )
+            .unwrap();
+        let expected = (0..len)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<alloc::vec::Vec<_>>();
+        addr.copy_from_slice::<Platform>(0, &expected).unwrap();
+        task.sys_munmap(addr, len).unwrap();
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GET_SEALS).unwrap(), 0);
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::ADD_SEALS(0x0e)).unwrap(), 0);
+        assert_eq!(task.sys_fcntl(fd, FcntlArg::GET_SEALS).unwrap(), 0x0e);
+
+        let transferred = task.transfer_fd(fd).unwrap();
+        task.sys_close(fd).unwrap();
+        let received_fd =
+            i32::try_from(task.install_transferred_fd(transferred, false).unwrap()).unwrap();
+        let mut actual = alloc::vec![0; len + 1];
+        let size = task.sys_read(received_fd, &mut actual, Some(0)).unwrap();
+        assert_eq!(size, len, "copy-back must not extend to the page boundary");
+        assert_eq!(&actual[..size], expected);
+        task.sys_close(received_fd).unwrap();
+    }
+
+    #[test]
     fn test_madvise() {
+        let _guard = crate::syscalls::tests::address_space_guard();
         let task = init_platform(None);
 
         let addr = task
@@ -1642,5 +2591,219 @@ mod tests {
         let ptr = UserPtrMut::<u8>::from_usize(0xdeadbeef);
         let result = ptr.read_at_offset::<Platform>(0);
         assert!(result.is_none());
+    }
+
+    /// Regression test: mapping a pre-patched ET_DYN's executable segment must
+    /// rewrite BOTH runtime-variable trampoline header words -- the syscall
+    /// entry point (word 0) and, on a platform whose gates read the guest
+    /// thread-pointer offset from the trampoline, that offset (word 1).
+    ///
+    /// The loader path (`ElfParsedFile::load_trampoline`) always published
+    /// both, but the mmap path used by an in-guest dynamic linker mapping a
+    /// pre-patched library only published word 0, leaving the packager-seeded
+    /// default in word 1. On macOS that made every gate in an ld.so-mapped
+    /// library read the guest TP from the wrong TSD slot, sending node's
+    /// cross-module `std::call_once` through host-heap garbage to a PC=0
+    /// instruction abort.
+    #[test]
+    fn test_prepatched_mmap_publishes_trampoline_header() {
+        use litebox::platform::SystemInfoProvider as _;
+
+        // Values the packager might have seeded; the runtime must replace them.
+        const SEED_ENTRY: u64 = 0x1111_1111_1111_1111;
+        const SEED_TP_OFFSET: u64 = 0x2222_2222_2222_2222;
+        const TRAMP_SIZE: usize = 32;
+
+        let _guard = crate::syscalls::tests::address_space_guard();
+        let task = init_platform(None);
+
+        // Synthetic pre-patched ET_DYN:
+        // [ELF header + one PT_LOAD phdr | pad to PAGE_SIZE]
+        // [trampoline code (TRAMP_SIZE bytes)] [32-byte LITEBOX0 trailer]
+        let mut file = alloc::vec![0u8; PAGE_SIZE + TRAMP_SIZE + 32];
+        file[0..4].copy_from_slice(b"\x7fELF");
+        file[4] = 2; // ELFCLASS64
+        file[5] = 1; // ELFDATA2LSB
+        file[6] = 1; // EV_CURRENT
+        file[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type = ET_DYN
+        #[cfg(target_arch = "x86_64")]
+        let e_machine: u16 = 62; // EM_X86_64
+        #[cfg(target_arch = "aarch64")]
+        let e_machine: u16 = 183; // EM_AARCH64
+        file[18..20].copy_from_slice(&e_machine.to_le_bytes());
+        file[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        file[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        file[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        file[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        file[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        // PT_LOAD at p_offset 0, p_vaddr 0, R+X, one page.
+        let ph = 64;
+        file[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes()); // p_type
+        file[ph + 4..ph + 8].copy_from_slice(&5u32.to_le_bytes()); // p_flags R|X
+        file[ph + 32..ph + 40].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_filesz
+        file[ph + 40..ph + 48].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_memsz
+        file[ph + 48..ph + 56].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes()); // p_align
+        // Trampoline code, seeded like the packager leaves it.
+        file[PAGE_SIZE..PAGE_SIZE + 8].copy_from_slice(&SEED_ENTRY.to_le_bytes());
+        file[PAGE_SIZE + 8..PAGE_SIZE + 16].copy_from_slice(&SEED_TP_OFFSET.to_le_bytes());
+        // Trailer: magic, trampoline file offset, vaddr (just past PT_LOAD), size.
+        let t = PAGE_SIZE + TRAMP_SIZE;
+        file[t..t + 8].copy_from_slice(b"LITEBOX0");
+        file[t + 8..t + 16].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+        file[t + 16..t + 24].copy_from_slice(&(PAGE_SIZE as u64).to_le_bytes());
+        file[t + 24..t + 32].copy_from_slice(&(TRAMP_SIZE as u64).to_le_bytes());
+
+        let fd = task
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "prepatched_test.so",
+                OFlags::RDWR | OFlags::CREAT,
+                Mode::RWXU,
+            )
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(task.sys_write(fd, &file, None).unwrap(), file.len());
+
+        // Map two pages so the trampoline's MAP_FIXED landing zone (page 1,
+        // per the trailer's vaddr) is this test's own mapping, not whatever
+        // else the harness put there.
+        let addr = task
+            .sys_mmap(
+                0,
+                2 * PAGE_SIZE,
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
+
+        let tramp = UserPtrMut::<u8>::from_usize(addr.as_usize() + PAGE_SIZE);
+        let header = tramp.to_owned_slice::<Platform>(16).unwrap();
+        let platform = task.global.platform;
+
+        let entry = platform.get_syscall_entry_point();
+        assert_ne!(entry, 0, "test platform must expose a syscall entry point");
+        assert_eq!(
+            header[..8],
+            entry.to_le_bytes(),
+            "mmap path must publish the runtime syscall entry into trampoline word 0"
+        );
+
+        match platform.get_guest_tp_slot_offset() {
+            Some(offset) => assert_eq!(
+                header[8..16],
+                offset.to_ne_bytes(),
+                "mmap path must publish the runtime guest TP slot offset into trampoline word 1"
+            ),
+            None => assert_eq!(
+                header[8..16],
+                SEED_TP_OFFSET.to_le_bytes(),
+                "platforms that bake the TP offset into gates must leave the seeded word alone"
+            ),
+        }
+
+        task.sys_munmap(addr, 2 * PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    /// Regression test: `PageManager::release_memory` must release exactly the
+    /// address ranges the caller names, never the whole tracked mapping those
+    /// ranges happen to fall inside.
+    ///
+    /// The VMA tree coalesces adjacent ranges with identical properties into
+    /// one entry, so two separate `mmap`s that abut are reported as a single
+    /// mapping. That is not an exotic shape here: `Vmem::get_unmmaped_area`
+    /// hands out the address immediately below an existing range, so a guest's
+    /// next anonymous `mmap` routinely lands flush against the previous one --
+    /// and every guest process in this shim shares one page manager, so the
+    /// previous one can belong to a *different* process. `execve`'s teardown
+    /// (`sys_execve`, the `leave_address_space_if_alone` branch) scopes itself
+    /// to the calling process's `owned_ranges` for exactly that reason; before
+    /// this, it still released the whole coalesced entry each owned range
+    /// touched. Observed live as `node -e 'execSync("/bin/sh -c ...")'`: the
+    /// forked child's post-exec `mmap`s abutted 208 KiB of its suspended
+    /// parent's musl heap, the child's second `execve` unmapped all of it, and
+    /// the parent `SIGSEGV`ed on the first libc global it read after taking its
+    /// address space back.
+    #[test]
+    fn release_memory_releases_only_the_named_ranges_of_a_coalesced_mapping() {
+        use litebox::mm::vmem::VmFlags;
+
+        let _guard = crate::syscalls::tests::address_space_guard();
+        let task = init_platform(None);
+        let prot = || ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let flags = || MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
+
+        // Two *separate* mappings that end up adjacent: take two pages, give
+        // the second back, then claim it again at that exact address. The
+        // second `mmap` is a mapping of its own, but carries the same
+        // properties as the first, so the tree merges them.
+        let mine = task
+            .sys_mmap(0, 2 * PAGE_SIZE, prot(), flags(), -1, 0)
+            .unwrap();
+        let neighbour_addr = mine.as_usize() + PAGE_SIZE;
+        task.sys_munmap(UserPtrMut::from_usize(neighbour_addr), PAGE_SIZE)
+            .unwrap();
+        let neighbour = task
+            .sys_mmap(
+                neighbour_addr,
+                PAGE_SIZE,
+                prot(),
+                flags() | MapFlags::MAP_FIXED,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(neighbour.as_usize(), neighbour_addr);
+
+        let entry = |addr: usize| {
+            task.global
+                .pm
+                .mappings()
+                .into_iter()
+                .find(|(r, _)| r.contains(&addr))
+        };
+        let (merged, _) = entry(mine.as_usize()).expect("the first mapping should be tracked");
+        assert!(
+            merged.contains(&neighbour_addr),
+            "precondition: the two adjacent mappings should be tracked as one entry \
+             ({merged:?} should cover {neighbour_addr:#x}). If they no longer coalesce, the \
+             cross-owner teardown this test pins cannot happen -- revisit the test, not the fix."
+        );
+
+        // Release only the first page, exactly as `execve` names the calling
+        // process's own ranges out of a mapping it may share with a sibling.
+        let mine_range = mine.as_usize()..mine.as_usize() + PAGE_SIZE;
+        // SAFETY: nothing holds references into the first page; the test does
+        // not touch it again.
+        unsafe {
+            task.global
+                .pm
+                .release_memory(|r: core::ops::Range<usize>, _: VmFlags| {
+                    let start = r.start.max(mine_range.start);
+                    let end = r.end.min(mine_range.end);
+                    (start < end).then_some(start..end)
+                })
+        }
+        .unwrap();
+
+        assert!(
+            entry(mine.as_usize()).is_none(),
+            "the named range should have been released"
+        );
+        let (survivor, flags) = entry(neighbour_addr)
+            .expect("the neighbour's page must survive a release that did not name it");
+        assert_eq!(survivor, neighbour_addr..neighbour_addr + PAGE_SIZE);
+        assert!(flags.contains(VmFlags::VM_READ | VmFlags::VM_WRITE));
+        // Still really mapped, not merely still tracked: this is the failure
+        // that killed the parent process, since `remove_mapping` unmaps at the
+        // host before it forgets the range.
+        neighbour
+            .write_slice_at_offset::<Platform>(0, &[0xab; 8])
+            .expect("the surviving page must still be writable");
+        assert_eq!(neighbour.read_at_offset::<Platform>(0).unwrap(), 0xab);
+
+        task.sys_munmap(neighbour, PAGE_SIZE).unwrap();
     }
 }

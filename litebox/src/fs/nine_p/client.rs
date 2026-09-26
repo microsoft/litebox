@@ -83,24 +83,6 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for FidInner<Platform> {
     }
 }
 
-/// The outcome of a [`Client::walk`].
-pub(super) struct WalkResult<Platform: RawSyncPrimitivesProvider> {
-    /// The qids of the components that were walked, in order.
-    pub(super) wqids: Vec<fcall::Qid>,
-    /// The fid for the final location.
-    ///
-    /// `Some` iff `wqids.len() == wnames.len()`: per 9P2000.L, a short walk does not establish a
-    /// new fid, so a partial walk yields qids but nothing to address them with.
-    pub(super) fid: Option<Fid<Platform>>,
-}
-
-impl<Platform: RawSyncPrimitivesProvider> WalkResult<Platform> {
-    /// The fid for a walk that reached the requested path, treating a short walk as `ENOENT`.
-    pub(super) fn into_complete_fid(self) -> Result<Fid<Platform>, Error> {
-        self.fid.ok_or(Error::Remote(super::ENOENT))
-    }
-}
-
 /// 9P client state for writing to the connection
 struct ClientWriteState<T> {
     /// The underlying transport
@@ -325,19 +307,14 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
 
     /// Walks the path from the given fid, handling paths longer than fcall::MAXWELEM by walking in chunks.
     ///
-    /// Returns the qids for each walked path component, along with a new fid for the final
-    /// location if the whole path was walked.
+    /// Returns the qids for each path component and a new fid for the final location on success.
     fn walk_chunked(
         &self,
         fid: &Fid<Platform>,
         wnames: &[FcallStr],
-    ) -> Result<WalkResult<Platform>, Error> {
+    ) -> Result<(Vec<fcall::Qid>, Fid<Platform>), Error> {
         if wnames.is_empty() {
-            let (wqids, fid) = self.walk_once(fid, wnames)?;
-            return Ok(WalkResult {
-                wqids,
-                fid: Some(fid),
-            });
+            return self.walk_once(fid, wnames);
         }
         let mut wqids = Vec::with_capacity(fcall::MAXWELEM);
         let mut prev: Option<Fid<Platform>> = None;
@@ -359,26 +336,22 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
             }
             // It means that the walk failed at the nwqid-th element
             if new_len < chunk.len() {
-                // XXX: Per 9P2000.L the server does not establish `new_f` on a short walk, so not
-                // sure why we have a clunk here; it does lead to a round-trip cost (and a
-                // swallowed `Rlerror`) on every short walk, so might be good to clean up?
                 self.clunk(new_f);
-                return Ok(WalkResult { wqids, fid: None });
+                return Err(Error::Remote(super::ENOENT));
             }
             prev = Some(new_f);
         }
-        Ok(WalkResult {
-            wqids,
-            fid: Some(prev.unwrap()),
-        })
+        Ok((wqids, prev.unwrap()))
     }
 
     /// Walk to a path from a given fid.
+    ///
+    /// Returns the qids for each path component and a new fid for the final location.
     pub(super) fn walk<S: AsRef<[u8]>>(
         &self,
         fid: &Fid<Platform>,
         wnames: &[S],
-    ) -> Result<WalkResult<Platform>, Error> {
+    ) -> Result<(Vec<fcall::Qid>, Fid<Platform>), Error> {
         let wnames: Vec<fcall::FcallStr<'_>> = wnames
             .iter()
             .map(|s| fcall::FcallStr::Borrowed(s.as_ref()))
@@ -714,6 +687,7 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
     /// Clone a fid (walk with empty path)
     pub(super) fn clone_fid(&self, fid: &Fid<Platform>) -> Result<Fid<Platform>, Error> {
         let empty: [&str; 0] = [];
-        self.walk(fid, &empty)?.into_complete_fid()
+        let (_, new_fid) = self.walk(fid, &empty)?;
+        Ok(new_fid)
     }
 }

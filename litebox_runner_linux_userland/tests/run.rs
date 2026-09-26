@@ -1,13 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 mod cache;
 mod common;
 
 use std::{
     ffi::OsString,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
 };
+
+const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const BROKER_ONLY_C_TESTS: &[&str] = &["eventfd.c", "pipe_broker.c"];
 
 #[must_use]
 struct Runner {
@@ -115,6 +121,14 @@ impl Runner {
         self
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    fn broker_socket(&mut self, control_socket_path: &Path) -> &mut Self {
+        self.command
+            .arg("--broker-control-socket")
+            .arg(control_socket_path);
+        self
+    }
+
     #[cfg_attr(not(target_arch = "x86_64"), expect(dead_code))]
     fn with_fs_path(&mut self, f: impl FnOnce(&Path)) -> &mut Self {
         f(&self.tar_dir);
@@ -152,6 +166,9 @@ impl Runner {
 
     fn run_inner(&mut self, capture_stdout: bool) -> Vec<u8> {
         self.prepare_command();
+        // Surface the runner's error-level diagnostics (e.g. the shim's
+        // guest-hardware-exception report) in captured test output.
+        self.command.env("LITEBOX_LOG", "error");
         self.command.stderr(std::process::Stdio::inherit());
         if !capture_stdout {
             self.command.stdout(std::process::Stdio::inherit());
@@ -201,9 +218,18 @@ fn find_c_test_files(dir: &str) -> Vec<PathBuf> {
     files
 }
 
+fn is_broker_only_c_test(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| BROKER_ONLY_C_TESTS.contains(&name))
+}
+
 #[test]
 fn test_dynamic_lib_with_rewriter() {
     for path in find_c_test_files("./tests") {
+        if is_broker_only_c_test(&path) {
+            continue;
+        }
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -217,6 +243,9 @@ fn test_dynamic_lib_with_rewriter() {
 #[test]
 fn test_static_exec_with_rewriter() {
     for path in find_c_test_files("./tests") {
+        if is_broker_only_c_test(&path) {
+            continue;
+        }
         let stem = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -264,9 +293,181 @@ fn run_which(prog: &str) -> std::path::PathBuf {
     prog_path
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn unique_test_socket_path(name: &str) -> PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "litebox-{name}-{}-{nonce}.sock",
+        std::process::id()
+    ))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+struct TestBroker {
+    thread: Option<std::thread::JoinHandle<()>>,
+    done_rx: std::sync::mpsc::Receiver<()>,
+    close_object_count_rx: std::sync::mpsc::Receiver<usize>,
+    control_socket_path: PathBuf,
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl TestBroker {
+    fn next_close_object_count(&self) -> usize {
+        self.close_object_count_rx
+            .recv_timeout(BROKER_HELPER_TIMEOUT)
+            .expect("broker test host did not report close-object count")
+    }
+
+    fn join(mut self) {
+        self.done_rx
+            .recv_timeout(BROKER_HELPER_TIMEOUT)
+            .expect("broker test host did not finish");
+        self.thread
+            .take()
+            .expect("broker test host thread missing")
+            .join()
+            .expect("broker test host panicked");
+        let _ = std::fs::remove_file(&self.control_socket_path);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+impl Drop for TestBroker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.control_socket_path);
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn spawn_test_broker(
+    control_socket_path: &Path,
+    policy: litebox_broker_core::PolicyEngine,
+    connection_count: usize,
+) -> TestBroker {
+    let _ = std::fs::remove_file(control_socket_path);
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (close_object_count_tx, close_object_count_rx) = std::sync::mpsc::channel();
+    let server_control_socket_path = control_socket_path.to_path_buf();
+    let cleanup_control_socket_path = control_socket_path.to_path_buf();
+    let broker_thread = std::thread::spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let control_listener =
+                std::os::unix::net::UnixListener::bind(&server_control_socket_path)
+                    .expect("failed to bind broker test control socket");
+            let broker =
+                litebox_broker_core::BrokerCore::new(policy).expect("failed to create broker core");
+            ready_tx.send(()).expect("failed to report broker ready");
+
+            for _ in 0..connection_count {
+                let (control_stream, _) = control_listener
+                    .accept()
+                    .expect("failed to accept broker local control connection");
+                let shared_memory =
+                    litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create(
+                        litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE,
+                    )
+                    .expect("failed to create broker test shared memory");
+                let shared_buffers =
+                    litebox_broker_transport::shared_memory::SharedBufferPool::new(
+                        shared_memory,
+                        litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT,
+                    )
+                    .expect("failed to attach broker test shared-buffer layout");
+                let control_memory =
+                    litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory::create(
+                        litebox_broker_transport::control_ring::CONTROL_RING_MEMORY_SIZE,
+                    )
+                    .expect("failed to create broker test control ring");
+                let control_ring =
+                    litebox_broker_transport::control_ring::ControlRing::new(control_memory)
+                        .expect("failed to attach broker test control ring");
+                control_stream
+                    .set_read_timeout(Some(BROKER_HELPER_TIMEOUT))
+                    .expect("failed to configure broker test read timeout");
+                control_stream
+                    .set_write_timeout(Some(BROKER_HELPER_TIMEOUT))
+                    .expect("failed to configure broker test write timeout");
+                let mut channel =
+                    litebox_broker_transport_linux_userland::unix_socket::UnixStreamHostSetupChannel::from_host_guaranteed(
+                        control_stream,
+                        std::time::Instant::now() + BROKER_HELPER_TIMEOUT,
+                    );
+                let association = litebox_broker_host::setup_connection(
+                    &broker,
+                    &mut channel,
+                    &shared_buffers,
+                    |channel| {
+                        channel.send_memfd(shared_buffers.memory(), None)?;
+                        channel.send_memfd(control_ring.memory(), None)
+                    },
+                )
+                .expect("broker host setup failed")
+                .expect("broker setup terminated before activation");
+                let (mut request_source, response_sink, _notifications, _shutdown) = channel
+                    .into_active(control_ring)
+                    .expect("failed to activate broker test control ring");
+                let mut close_object_count = 0;
+                let termination = loop {
+                    match request_source
+                        .recv_request()
+                        .expect("failed to receive broker test request")
+                    {
+                        litebox_broker_transport::channel::HostReceive::Message(request) => {
+                            if matches!(
+                                &request.operation,
+                                litebox_broker_protocol::message::BrokerOperation::CloseObject(_)
+                            ) {
+                                close_object_count += 1;
+                            }
+                            association
+                                .execute_request(request, |response| {
+                                    response_sink.send_response(response)
+                                })
+                                .expect("failed to execute broker test request");
+                        }
+                        litebox_broker_transport::channel::HostReceive::PeerClosed => {
+                            break litebox_broker_host::ConnectionTermination::PeerClosed;
+                        }
+                        litebox_broker_transport::channel::HostReceive::ProtocolViolation => {
+                            break litebox_broker_host::ConnectionTermination::ProtocolViolation;
+                        }
+                    }
+                };
+                assert_eq!(
+                    termination,
+                    litebox_broker_host::ConnectionTermination::PeerClosed
+                );
+                close_object_count_tx
+                    .send(close_object_count)
+                    .expect("failed to report broker close-object count");
+            }
+        }));
+        let _ = std::fs::remove_file(&server_control_socket_path);
+        let _ = done_tx.send(());
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    });
+
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("broker test host did not start");
+    TestBroker {
+        thread: Some(broker_thread),
+        done_rx,
+        close_object_count_rx,
+        control_socket_path: cleanup_control_socket_path,
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn test_node_with_rewriter() {
+fn test_runner_broker_integration_with_rewriter() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
 
@@ -274,14 +475,51 @@ const content = 'Hello World!';
 console.log(content);
 ";
 
+    let true_path = run_which("true");
     let node_path = run_which("node");
-    Runner::new(&node_path, "hello_node_rewriter")
+    let target = common::compile("./tests/eventfd.c", "broker_eventfd_rewriter", false, false);
+    let pipe_target = common::compile(
+        "./tests/pipe_broker.c",
+        "broker_pipe_rewriter",
+        false,
+        false,
+    );
+    let control_socket_path = unique_test_socket_path("runner-broker-control");
+    let broker_thread = spawn_test_broker(
+        &control_socket_path,
+        litebox_broker_core::PolicyEngine::with_host_guaranteed_rights(
+            litebox_broker_core::ObjectRights::all(),
+        ),
+        4,
+    );
+
+    Runner::new(&true_path, "broker_true_rewriter")
+        .broker_socket(&control_socket_path)
+        .run();
+    assert_eq!(broker_thread.next_close_object_count(), 0);
+
+    Runner::new(&target, "broker_eventfd_rewriter")
+        .broker_socket(&control_socket_path)
+        .run();
+    // eventfd.c creates thirteen eventfd objects; each should release one broker object.
+    assert_eq!(broker_thread.next_close_object_count(), 13);
+
+    Runner::new(&pipe_target, "broker_pipe_rewriter")
+        .broker_socket(&control_socket_path)
+        .run();
+    // pipe_broker.c creates five pipes; each endpoint owns one broker object.
+    assert_eq!(broker_thread.next_close_object_count(), 10);
+
+    Runner::new(&node_path, "hello_node_broker_rewriter")
+        .broker_socket(&control_socket_path)
         .arg("/out/hello_world.js")
         .with_fs_path(|out_dir| {
-            // write the test js file to the output directory
             std::fs::write(out_dir.join("out/hello_world.js"), HELLO_WORLD_JS).unwrap();
         })
         .run();
+    assert!(broker_thread.next_close_object_count() > 0);
+
+    broker_thread.join();
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -384,8 +622,7 @@ fn python_runner(unique_name: &str) -> Runner {
 
                 if source_path.is_dir() {
                     let python_lib_dst = out_dir.join(source_path.strip_prefix("/").unwrap());
-                    let stage_marker = python_lib_dst.join(".stage-complete.cache-checksum");
-                    if !stage_marker.exists() {
+                    if !python_lib_dst.exists() {
                         std::fs::create_dir_all(&python_lib_dst).unwrap();
                         println!(
                             "Copying python3 lib from {} to {}",
@@ -409,7 +646,6 @@ fn python_runner(unique_name: &str) -> Runner {
                                 std::str::from_utf8(output.stderr.as_slice()).unwrap_or("");
                             eprintln!("Warning: cp finished with errors (non-critical):\n{stderr}");
                         }
-                        std::fs::write(&stage_marker, b"").unwrap();
                     }
 
                     // Rewrite shared objects (.so, .so.1, .so.1.2.3, etc.) under the python lib directory.
@@ -627,11 +863,17 @@ fn test_shebang() {
     let output = Runner::new(&bash_path, "shebang_rewriter")
         .with_fs_path(|out_dir| {
             // Create a shebang script pointing to the staged bash.
+            let script_path = out_dir.join("out/script.sh");
             std::fs::write(
-                out_dir.join("out/script.sh"),
+                &script_path,
                 format!("#!{}\necho shebang_test_passed\n", bash_path.display()),
             )
             .unwrap();
+            // `guest_program_path` below execve()s this file directly (relying on shebang
+            // resolution to find bash), which -- like any execve(2) target, script or not --
+            // requires the executable bit; `std::fs::write`'s default mode (0o644) doesn't
+            // have it.
+            std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         })
         .guest_program_path("/out/script.sh")
         .output();

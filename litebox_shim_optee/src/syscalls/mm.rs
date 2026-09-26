@@ -68,6 +68,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             prot,
             flags,
             false,
+            None,
             op,
         )
         .map(UserPtrMut::to_platform_ptr::<Platform>)

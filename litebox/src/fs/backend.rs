@@ -12,9 +12,9 @@ use crate::utilities::anymap::AnyCloneSendSync;
 
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
-    RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadlinkError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, Mode, OFlags, Timestamp, UserInfo};
 
 /// How a backend file handle participates in seek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,24 +126,30 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     /// Describe seek behavior for an open file handle.
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior;
 
-    /// Status of an open file or directory handle.
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
+    /// Status of an open file handle.
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError>;
 
-    /// Create a new file at `parent` with the given `name` and metadata.
+    /// Status of an open directory handle.
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError>;
+
+    /// Read the target of an open symbolic-link handle (opened with `O_PATH`,
+    /// since a symlink is not followed on open). The default rejects any handle
+    /// as not-a-symlink, which is correct for a backend that stores no symlinks.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn read_link(&self, h: &FileHandle) -> Result<alloc::string::String, ReadlinkError> {
+        Err(ReadlinkError::NotASymlink)
+    }
+
+    /// Create a new file at `parent` with the given `name` and `mode`.
     fn create_file_at(
         &self,
         dir: DirHandle,
         name: &str,
-        metadata: CreationMetadata,
+        mode: Mode,
     ) -> Result<FileHandle, OpenError>;
 
-    /// Create a new directory at `parent` with the given `name` and metadata.
-    fn mkdir_at(
-        &self,
-        dir: DirHandle,
-        name: &str,
-        metadata: CreationMetadata,
-    ) -> Result<DirHandle, MkdirError>;
+    /// Create a new directory at `parent` with the given `name` and `mode`.
+    fn mkdir_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<DirHandle, MkdirError>;
 
     /// Remove the file `name` at `parent`.
     fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError>;
@@ -152,16 +158,56 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     // XXX(jayb): I don't like that unlink and rmdir exist separately, we should probably merge them.
     fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError>;
 
-    /// Update the permissions for the file/dir `h` refers to.
-    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError>;
+    /// Update the permissions for the file/dir `name` at `parent`.
+    fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError>;
 
-    /// Update the owner/group for the file/dir `h` refers to.
-    fn chown(
+    /// Update the permissions for an already-open file handle directly (no name lookup).
+    ///
+    /// See [`super::FileSystem::fd_chmod`].
+    fn chmod_file(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError>;
+
+    /// Update the permissions for an already-open directory handle directly (no name lookup).
+    ///
+    /// See [`super::FileSystem::fd_chmod`].
+    fn chmod_dir(&self, h: &DirHandle, mode: Mode) -> Result<(), ChmodError>;
+
+    /// Update the owner/group for the file/dir `name` at `parent`.
+    fn chown_at(
         &self,
-        h: HandleRef<'_>,
+        dir: DirHandle,
+        name: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError>;
+
+    /// Update the access/modification time for the file/dir `name` at `parent`.
+    ///
+    /// `None` for either parameter leaves that timestamp unchanged.
+    fn utimensat_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError>;
+
+    /// Update the access/modification time for an already-open file handle directly (no name
+    /// lookup). See [`super::FileSystem::fd_utimensat`].
+    fn utimensat_file(
+        &self,
+        h: &FileHandle,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError>;
+
+    /// Update the access/modification time for an already-open directory handle directly (no name
+    /// lookup). See [`super::FileSystem::fd_utimensat`].
+    fn utimensat_dir(
+        &self,
+        h: &DirHandle,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError>;
 }
 
 /// Concrete handle types used by a backend.
@@ -195,35 +241,6 @@ pub struct FileHandle {
 #[derive(Clone)]
 pub struct DirHandle {
     raw: Box<dyn AnyCloneSendSync>,
-}
-
-/// An owned handle to an open file or directory.
-#[derive(Clone)]
-pub enum Handle {
-    /// A handle to an open file
-    File(FileHandle),
-    /// A handle to an open directory
-    Dir(DirHandle),
-}
-
-impl Handle {
-    /// Borrow this handle, for passing to the object-addressed [`Backend`] operations.
-    #[must_use]
-    pub fn as_ref(&self) -> HandleRef<'_> {
-        match self {
-            Handle::File(handle) => HandleRef::File(handle),
-            Handle::Dir(handle) => HandleRef::Dir(handle),
-        }
-    }
-}
-
-/// A borrowed handle to an open file or directory.
-#[derive(Clone, Copy)]
-pub enum HandleRef<'a> {
-    /// A handle to an open file
-    File(&'a FileHandle),
-    /// A handle to an open directory
-    Dir(&'a DirHandle),
 }
 
 trait ErasedWalkingDirHandle {
@@ -337,16 +354,6 @@ pub(super) enum WalkStopReason {
     /// The backend stopped early; the resolver should continue walking from `last`.
     #[expect(dead_code, reason = "no backend currently returns partial walks")]
     Continue,
-}
-
-/// The metadata a backend stamps onto a newly created file or directory.
-#[derive(Clone, Copy, Debug)]
-#[non_exhaustive]
-pub struct CreationMetadata {
-    /// Permission bits for the new node.
-    pub mode: Mode,
-    /// Owner of the new node.
-    pub owner: UserInfo,
 }
 
 /// A backend item plus permission metadata for resolver-side checks.

@@ -235,6 +235,19 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
             inner: self.boot_system_time + elapsed,
         }
     }
+
+    fn thread_cpu_time(&self) -> core::time::Duration {
+        // This kernel-mode platform has no separate host OS underneath it to source genuine
+        // per-thread CPU-time accounting from (unlike the userland platforms, which delegate to
+        // a real host `clock_gettime`/`GetThreadTimes`), and does not itself track per-thread
+        // scheduler runtime today. Rather than silently mislabeling wall-clock time as CPU time,
+        // this explicitly reports zero until real scheduler-level accounting is built.
+        core::time::Duration::ZERO
+    }
+
+    fn process_cpu_time(&self) -> core::time::Duration {
+        core::time::Duration::ZERO
+    }
 }
 
 impl litebox::platform::Instant for Instant {

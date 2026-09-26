@@ -1,45 +1,51 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Possible errors from [`Resolver`]
+//! Possible errors from [`FileSystem`]
 
 #[expect(
     unused_imports,
     reason = "used for doc string links to work out, but not for code"
 )]
-use super::resolver::Resolver;
+use super::FileSystem;
 
 use thiserror::Error;
 
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
-/// Possible errors from [`Resolver::open`]
+/// Possible errors from [`FileSystem::open`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum OpenError {
     #[error("requested access to the file is not allowed")]
     AccessNotAllowed,
+    #[error("the requested operation is not permitted")]
+    OperationNotPermitted,
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
     #[error("write access requested for a file on a read-only filesystem")]
     ReadOnlyFileSystem,
     #[error("file already exists")]
     AlreadyExists,
+    #[error("the final path component is a symbolic link and O_NOFOLLOW was set")]
+    TooManySymbolicLinks,
     #[error("error when truncating: {0}")]
     TruncateError(#[from] TruncateError),
     #[error("I/O error")]
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
+    #[error("open flags not yet supported by this filesystem")]
+    UnsupportedFlags,
 }
 
-/// Possible errors from [`Resolver::close`]
+/// Possible errors from [`FileSystem::close`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum CloseError {}
 
-/// Possible errors from [`Resolver::read`]
+/// Possible errors from [`FileSystem::read`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadError {
@@ -53,7 +59,7 @@ pub enum ReadError {
     Io,
 }
 
-/// Possible errors from [`Resolver::write`]
+/// Possible errors from [`FileSystem::write`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum WriteError {
@@ -63,11 +69,13 @@ pub enum WriteError {
     NotAFile,
     #[error("file not open for writing")]
     NotForWriting,
+    #[error("write would require copy-up into a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error("I/O error")]
     Io,
 }
 
-/// Possible errors from [`Resolver::seek`]
+/// Possible errors from [`FileSystem::seek`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum SeekError {
@@ -79,13 +87,11 @@ pub enum SeekError {
     InvalidOffset,
     #[error("non-seekable file")]
     NonSeekable,
-    #[error("file descriptor is not open for seeking")]
-    NotOpenForSeeking,
     #[error("I/O error")]
     Io,
 }
 
-/// Possible errors from [`Resolver::truncate`]
+/// Possible errors from [`FileSystem::truncate`]
 #[derive(Error, Debug)]
 pub enum TruncateError {
     #[error("fd has been closed already")]
@@ -94,15 +100,17 @@ pub enum TruncateError {
     IsDirectory,
     #[error("file is not opened for writing")]
     NotForWriting,
-    #[error("file descriptor is not open for writing")]
-    NotOpenForWriting,
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
     #[error("file descriptor points to a terminal device")]
     IsTerminalDevice,
+    #[error("truncate would require copy-up into a read-only filesystem")]
+    ReadOnlyFileSystem,
     #[error("I/O error")]
     Io,
 }
 
-/// Possible errors from [`Resolver::chmod`]
+/// Possible errors from [`FileSystem::chmod`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChmodError {
@@ -117,9 +125,15 @@ pub enum ChmodError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
+    /// Only relevant to [`FileSystem::fd_chmod`].
+    #[error("fd has been closed already")]
+    ClosedFd,
+    /// Only relevant to [`FileSystem::fd_chmod`].
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
 }
 
-/// Possible errors from [`Resolver::chown`]
+/// Possible errors from [`FileSystem::chown`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ChownError {
@@ -134,14 +148,42 @@ pub enum ChownError {
     Io,
     #[error(transparent)]
     PathError(#[from] PathError),
+    /// Only relevant to [`FileSystem::fd_chown`].
+    #[error("fd has been closed already")]
+    ClosedFd,
+    /// Only relevant to [`FileSystem::fd_chown`].
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
 }
 
-/// Possible errors from [`Resolver::unlink`]
+/// Possible errors from [`FileSystem::utimensat`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum UtimeError {
+    #[error("the file does not allow write permission for the current user")]
+    NoWritePerms,
+    #[error("the named file resides on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+    /// Only relevant to [`FileSystem::fd_utimensat`].
+    #[error("fd has been closed already")]
+    ClosedFd,
+    /// Only relevant to [`FileSystem::fd_utimensat`].
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
+}
+
+/// Possible errors from [`FileSystem::unlink`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum UnlinkError {
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
+    #[error("the sticky-directory ownership rule forbids removal")]
+    OperationNotPermitted,
     #[error("pathname is a directory")]
     IsADirectory,
     #[error("the named file resides on a read-only filesystem")]
@@ -152,7 +194,7 @@ pub enum UnlinkError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::mkdir`]
+/// Possible errors from [`FileSystem::mkdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum MkdirError {
@@ -168,12 +210,70 @@ pub enum MkdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::rmdir`]
+/// Possible errors from [`FileSystem::symlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum SymlinkError {
+    #[error("the parent directory does not allow write permission")]
+    NoWritePerms,
+    #[error("pathname already exists")]
+    AlreadyExists,
+    #[error("the link would reside on a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::readlink`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ReadlinkError {
+    #[error("the named file is not a symbolic link")]
+    NotASymlink,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::rename`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum RenameError {
+    #[error("a directory in the rename does not allow write permission")]
+    NoWritePerms,
+    #[error("the sticky-directory ownership rule forbids the rename")]
+    OperationNotPermitted,
+    #[error("newpath is a non-empty directory")]
+    NotEmpty,
+    #[error("newpath is an existing directory but oldpath is not")]
+    IsADirectory,
+    #[error("oldpath is a directory but newpath is an existing non-directory")]
+    NotADirectory,
+    #[error("newpath already exists and RENAME_NOREPLACE was requested")]
+    AlreadyExists,
+    #[error("the rename would cross a filesystem/mount boundary")]
+    CrossDevice,
+    #[error("oldpath is a prefix of newpath, or another invalid-argument case")]
+    InvalidArgument,
+    #[error("the rename targets a read-only filesystem")]
+    ReadOnlyFileSystem,
+    #[error("I/O error")]
+    Io,
+    #[error(transparent)]
+    PathError(#[from] PathError),
+}
+
+/// Possible errors from [`FileSystem::rmdir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum RmdirError {
     #[error("the parent directory does not allow write permission")]
     NoWritePerms,
+    #[error("the sticky-directory ownership rule forbids removal")]
+    OperationNotPermitted,
     #[error(
         "currently in use by the system, or something prevents its removal (e.g., is the root directory)"
     )]
@@ -190,21 +290,21 @@ pub enum RmdirError {
     PathError(#[from] PathError),
 }
 
-/// Possible errors from [`Resolver::read_dir`]
+/// Possible errors from [`FileSystem::read_dir`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum ReadDirError {
     #[error("fd has been closed already")]
     ClosedFd,
+    #[error("operation not permitted on an `O_PATH` fd")]
+    PathOnlyFd,
     #[error("fd does not point to a directory")]
     NotADirectory,
-    #[error("file descriptor is not open for reading")]
-    NotOpenForReading,
     #[error("I/O error")]
     Io,
 }
 
-/// Possible errors from [`Resolver::file_status`]
+/// Possible errors from [`FileSystem::file_status`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum FileStatusError {

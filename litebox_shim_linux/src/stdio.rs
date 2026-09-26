@@ -23,13 +23,28 @@ mod tests {
 
         // Check that the stdio stat are consistent
         let stdin = task
-            .sys_open("/dev/stdin", OFlags::RDONLY, Mode::empty())
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "/dev/stdin",
+                OFlags::RDONLY,
+                Mode::empty(),
+            )
             .unwrap();
         let stdout = task
-            .sys_open("/dev/stdout", OFlags::WRONLY, Mode::empty())
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "/dev/stdout",
+                OFlags::WRONLY,
+                Mode::empty(),
+            )
             .unwrap();
         let stderr = task
-            .sys_open("/dev/stderr", OFlags::WRONLY, Mode::empty())
+            .sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                "/dev/stderr",
+                OFlags::WRONLY,
+                Mode::empty(),
+            )
             .unwrap();
         assert_eq!(
             stdin_stat,
@@ -74,8 +89,13 @@ mod tests {
         let path =
             CStr::from_bytes_until_nul(stdio_path.as_slice()).expect("Failed to convert to CStr");
         let stdin3 = i32::try_from(
-            task.sys_open(path.to_str().unwrap(), OFlags::RDONLY, Mode::empty())
-                .expect("Failed to open stdin"),
+            task.sys_openat(
+                litebox_common_linux::AT_FDCWD,
+                path.to_str().unwrap(),
+                OFlags::RDONLY,
+                Mode::empty(),
+            )
+            .expect("Failed to open stdin"),
         )
         .expect("Failed to convert to i32");
         let stdin3_flags = task.sys_fcntl(stdin3, FcntlArg::GETFL).unwrap();

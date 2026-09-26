@@ -3,7 +3,7 @@
 
 //! Auxiliary vector support.
 
-use crate::{ShimPlatform, Task};
+use crate::{ShimFS, ShimPlatform, Task, syscalls::process::Credentials};
 
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -66,19 +66,30 @@ pub enum AuxKey {
 
 pub type AuxVec = alloc::collections::btree_map::BTreeMap<AuxKey, usize>;
 
-impl<Platform: ShimPlatform> Task<Platform> {
-    /// Initialize the auxiliary vector with user information and VDSO address.
-    pub fn init_auxv(&self) -> AuxVec {
+impl<Platform: ShimPlatform, FS: ShimFS> Task<Platform, FS> {
+    /// Initialize the auxiliary vector with the credentials that will be published with this image.
+    pub fn init_auxv(&self, credentials: &Credentials, secure: bool) -> AuxVec {
         let mut aux = AuxVec::new();
 
-        let user_info = &self.credentials;
-        aux.insert(AuxKey::AT_UID, user_info.uid as usize);
-        aux.insert(AuxKey::AT_EUID, user_info.euid as usize);
-        aux.insert(AuxKey::AT_GID, user_info.gid as usize);
-        aux.insert(AuxKey::AT_EGID, user_info.egid as usize);
+        aux.insert(AuxKey::AT_UID, credentials.uid as usize);
+        aux.insert(AuxKey::AT_EUID, credentials.euid as usize);
+        aux.insert(AuxKey::AT_GID, credentials.gid as usize);
+        aux.insert(AuxKey::AT_EGID, credentials.egid as usize);
+        aux.insert(AuxKey::AT_SECURE, usize::from(secure));
 
         if let Some(vdso_base) = self.global.platform.get_vdso_address() {
             aux.insert(AuxKey::AT_SYSINFO_EHDR, vdso_base);
+        }
+
+        let (hwcap, hwcap2) = self.global.platform.get_hwcap();
+        // `AT_HWCAP`/`AT_HWCAP2` are each a 32-bit-wide Linux kernel ABI concept (the value a
+        // 32-bit ARM `getauxval` caller would also see); every bit `SystemInfoProvider::get_hwcap`
+        // implementations set is below bit 32, so this never actually truncates even on a
+        // 32-bit-`usize` target.
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            aux.insert(AuxKey::AT_HWCAP, hwcap as usize);
+            aux.insert(AuxKey::AT_HWCAP2, hwcap2 as usize);
         }
 
         aux

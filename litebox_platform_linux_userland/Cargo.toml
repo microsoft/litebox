@@ -3,7 +3,12 @@ name = "litebox_platform_linux_userland"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+# The crate body is `#![cfg(target_os = "linux")]`, so on every other host it
+# compiles to nothing and needs none of these. Keeping them in a target table
+# (as `litebox_platform_windows_userland` already does for its Windows-only
+# dependencies) stops Linux-only crates such as `seccompiler` from being built
+# for a macOS or Windows host that only wants the rest of the workspace.
+[target.'cfg(target_os = "linux")'.dependencies]
 arrayvec = { version = "0.7.6", default-features = false }
 cfg-if = "1.0.0"
 getrandom = "0.3.4"

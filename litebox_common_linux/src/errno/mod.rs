@@ -127,12 +127,16 @@ impl From<litebox::fs::errors::OpenError> for Errno {
     fn from(value: litebox::fs::errors::OpenError) -> Self {
         match value {
             litebox::fs::errors::OpenError::AccessNotAllowed => Errno::EACCES,
+            litebox::fs::errors::OpenError::OperationNotPermitted => Errno::EPERM,
             litebox::fs::errors::OpenError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
             litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::OpenError::TooManySymbolicLinks => Errno::ELOOP,
+            litebox::fs::errors::OpenError::TruncateError(error) => error.into(),
             litebox::fs::errors::OpenError::Io => Errno::EIO,
-            _ => unimplemented!(),
+            litebox::fs::errors::OpenError::UnsupportedFlags => Errno::EINVAL,
+            _ => Errno::EIO,
         }
     }
 }
@@ -141,6 +145,7 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
     fn from(value: litebox::fs::errors::UnlinkError) -> Self {
         match value {
             litebox::fs::errors::UnlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::UnlinkError::OperationNotPermitted => Errno::EPERM,
             litebox::fs::errors::UnlinkError::IsADirectory => Errno::EISDIR,
             litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::UnlinkError::Io => Errno::EIO,
@@ -150,10 +155,30 @@ impl From<litebox::fs::errors::UnlinkError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::RenameError> for Errno {
+    fn from(value: litebox::fs::errors::RenameError) -> Self {
+        match value {
+            litebox::fs::errors::RenameError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RenameError::OperationNotPermitted => Errno::EPERM,
+            litebox::fs::errors::RenameError::NotEmpty => Errno::ENOTEMPTY,
+            litebox::fs::errors::RenameError::IsADirectory => Errno::EISDIR,
+            litebox::fs::errors::RenameError::NotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::RenameError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::RenameError::CrossDevice => Errno::EXDEV,
+            litebox::fs::errors::RenameError::InvalidArgument => Errno::EINVAL,
+            litebox::fs::errors::RenameError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::RenameError::Io => Errno::EIO,
+            litebox::fs::errors::RenameError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::RmdirError> for Errno {
     fn from(value: litebox::fs::errors::RmdirError) -> Self {
         match value {
             litebox::fs::errors::RmdirError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::RmdirError::OperationNotPermitted => Errno::EPERM,
             litebox::fs::errors::RmdirError::Busy => Errno::EBUSY,
             litebox::fs::errors::RmdirError::NotEmpty => Errno::ENOTEMPTY,
             litebox::fs::errors::RmdirError::NotADirectory => Errno::ENOTDIR,
@@ -186,7 +211,6 @@ impl From<litebox::net::errors::CloseError> for Errno {
 impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
         match value {
-            litebox::fs::errors::ReadError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::fs::errors::ReadError::Io => Errno::EIO,
@@ -200,6 +224,7 @@ impl From<litebox::fs::errors::WriteError> for Errno {
         match value {
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
+            litebox::fs::errors::WriteError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
@@ -214,7 +239,6 @@ impl From<litebox::fs::errors::SeekError> for Errno {
             }
             litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
             litebox::fs::errors::SeekError::NonSeekable => Errno::ESPIPE,
-            litebox::fs::errors::SeekError::NotOpenForSeeking => Errno::EBADF,
             litebox::fs::errors::SeekError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
@@ -229,6 +253,73 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
             litebox::fs::errors::MkdirError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::MkdirError::NoWritePerms => Errno::EACCES,
             litebox::fs::errors::MkdirError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::SymlinkError> for Errno {
+    fn from(value: litebox::fs::errors::SymlinkError) -> Self {
+        match value {
+            litebox::fs::errors::SymlinkError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::SymlinkError::AlreadyExists => Errno::EEXIST,
+            litebox::fs::errors::SymlinkError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::SymlinkError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::SymlinkError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::ReadlinkError> for Errno {
+    fn from(value: litebox::fs::errors::ReadlinkError) -> Self {
+        match value {
+            litebox::fs::errors::ReadlinkError::PathError(path_error) => path_error.into(),
+            // readlink(2) on a non-symlink is EINVAL.
+            litebox::fs::errors::ReadlinkError::NotASymlink => Errno::EINVAL,
+            litebox::fs::errors::ReadlinkError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::ChmodError> for Errno {
+    fn from(value: litebox::fs::errors::ChmodError) -> Self {
+        match value {
+            litebox::fs::errors::ChmodError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChmodError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::ChmodError::Io => Errno::EIO,
+            litebox::fs::errors::ChmodError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::ChmodError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ChmodError::PathOnlyFd => Errno::EBADF,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::ChownError> for Errno {
+    fn from(value: litebox::fs::errors::ChownError) -> Self {
+        match value {
+            litebox::fs::errors::ChownError::NotTheOwner => Errno::EPERM,
+            litebox::fs::errors::ChownError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::ChownError::Io => Errno::EIO,
+            litebox::fs::errors::ChownError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::ChownError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::ChownError::PathOnlyFd => Errno::EBADF,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::fs::errors::UtimeError> for Errno {
+    fn from(value: litebox::fs::errors::UtimeError) -> Self {
+        match value {
+            litebox::fs::errors::UtimeError::NoWritePerms => Errno::EACCES,
+            litebox::fs::errors::UtimeError::ReadOnlyFileSystem => Errno::EROFS,
+            litebox::fs::errors::UtimeError::Io => Errno::EIO,
+            litebox::fs::errors::UtimeError::PathError(path_error) => path_error.into(),
+            litebox::fs::errors::UtimeError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::UtimeError::PathOnlyFd => Errno::EBADF,
             _ => unimplemented!(),
         }
     }
@@ -288,8 +379,17 @@ impl From<litebox::mm::vmem::MappingError> for Errno {
             litebox::mm::vmem::MappingError::BadFD(_) => Errno::EBADF,
             litebox::mm::vmem::MappingError::NotAFile => Errno::EISDIR,
             litebox::mm::vmem::MappingError::NotForReading => Errno::EACCES,
+            litebox::mm::vmem::MappingError::Io(errno) => {
+                Errno::try_from(errno).unwrap_or(Errno::EIO)
+            }
             litebox::mm::vmem::MappingError::MapError(e) => e.into(),
-            _ => unimplemented!(),
+            // Real Linux returns `ENOMEM` for the analogous "another thread raced this mmap"
+            // case (e.g. `MAP_FIXED` colliding with a concurrent unmap of the same range).
+            litebox::mm::vmem::MappingError::ConcurrentlyRemoved
+            | litebox::mm::vmem::MappingError::InitializationIdentityExhausted => Errno::ENOMEM,
+            litebox::mm::vmem::MappingError::FinalizeProtection(error) => error.into(),
+            litebox::mm::vmem::MappingError::Cleanup { primary, .. } => (*primary).into(),
+            _ => Errno::EIO,
         }
     }
 }
@@ -324,6 +424,7 @@ impl From<litebox::mm::vmem::VmemProtectError> for Errno {
             litebox::mm::vmem::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
             litebox::mm::vmem::VmemProtectError::NoAccess { .. } => Errno::EACCES,
             litebox::mm::vmem::VmemProtectError::ProtectError(e) => e.into(),
+            litebox::mm::vmem::VmemProtectError::DeferredAllocate(_) => Errno::ENOMEM,
         }
     }
 }
@@ -340,8 +441,9 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     fn from(value: litebox::fs::errors::FileStatusError) -> Self {
         match value {
             litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FileStatusError::Io => Errno::EIO,
             litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
-            _ => unimplemented!(),
+            _ => Errno::EIO,
         }
     }
 }
@@ -539,12 +641,28 @@ where
     }
 }
 
+impl From<litebox::event::counter::EventCounterError> for Errno {
+    fn from(value: litebox::event::counter::EventCounterError) -> Self {
+        match value {
+            litebox::event::counter::EventCounterError::InvalidInput => Errno::EINVAL,
+            litebox::event::counter::EventCounterError::WouldBlock
+            | litebox::event::counter::EventCounterError::ResourceExhausted => Errno::EAGAIN,
+            litebox::event::counter::EventCounterError::PermissionDenied => Errno::EACCES,
+            litebox::event::counter::EventCounterError::Io
+            | litebox::event::counter::EventCounterError::Unavailable => Errno::EIO,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {
+            litebox::fs::errors::ReadDirError::ClosedFd
+            | litebox::fs::errors::ReadDirError::PathOnlyFd => Errno::EBADF,
             litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
-            litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
-            _ => unimplemented!(),
+            litebox::fs::errors::ReadDirError::Io => Errno::EIO,
+            _ => Errno::EIO,
         }
     }
 }
@@ -552,7 +670,8 @@ impl From<litebox::fs::errors::ReadDirError> for Errno {
 impl From<litebox::sync::futex::FutexError> for Errno {
     fn from(value: litebox::sync::futex::FutexError) -> Self {
         match value {
-            litebox::sync::futex::FutexError::NotAligned => Errno::EINVAL,
+            litebox::sync::futex::FutexError::NotAligned
+            | litebox::sync::futex::FutexError::SameKey => Errno::EINVAL,
             litebox::sync::futex::FutexError::ImmediatelyWokenBecauseValueMismatch => Errno::EAGAIN,
             litebox::sync::futex::FutexError::WaitError(e) => match e {
                 litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
@@ -566,9 +685,14 @@ impl From<litebox::sync::futex::FutexError> for Errno {
 impl From<litebox::pipes::errors::ReadError> for Errno {
     fn from(value: litebox::pipes::errors::ReadError) -> Self {
         match value {
-            litebox::pipes::errors::ReadError::ClosedFd => Errno::EBADFD,
-            litebox::pipes::errors::ReadError::NotForReading => Errno::EINVAL,
+            litebox::pipes::errors::ReadError::ClosedFd
+            | litebox::pipes::errors::ReadError::NotForReading => Errno::EBADF,
             litebox::pipes::errors::ReadError::WouldBlock => Errno::EWOULDBLOCK,
+            litebox::pipes::errors::ReadError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
+            litebox::pipes::errors::ReadError::Io => Errno::EIO,
             _ => todo!(),
         }
     }
@@ -579,8 +703,25 @@ impl From<litebox::pipes::errors::WriteError> for Errno {
         match value {
             litebox::pipes::errors::WriteError::ClosedFd => Errno::EBADF,
             litebox::pipes::errors::WriteError::ReadEndClosed => Errno::EPIPE,
-            litebox::pipes::errors::WriteError::NotForWriting => Errno::EINVAL,
+            litebox::pipes::errors::WriteError::NotForWriting => Errno::EBADF,
             litebox::pipes::errors::WriteError::WouldBlock => Errno::EWOULDBLOCK,
+            litebox::pipes::errors::WriteError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::EINTR,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
+            litebox::pipes::errors::WriteError::Io => Errno::EIO,
+            _ => todo!(),
+        }
+    }
+}
+
+impl From<litebox::pipes::errors::CreateError> for Errno {
+    fn from(value: litebox::pipes::errors::CreateError) -> Self {
+        match value {
+            litebox::pipes::errors::CreateError::ResourceExhausted => Errno::ENFILE,
+            litebox::pipes::errors::CreateError::OutOfMemory => Errno::ENOMEM,
+            litebox::pipes::errors::CreateError::PermissionDenied => Errno::EACCES,
+            litebox::pipes::errors::CreateError::Io => Errno::EIO,
             _ => todo!(),
         }
     }
@@ -604,10 +745,11 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
     fn from(value: litebox::fs::errors::TruncateError) -> Self {
         match value {
             litebox::fs::errors::TruncateError::IsDirectory => Errno::EISDIR,
-            litebox::fs::errors::TruncateError::NotForWriting => Errno::EACCES,
-            litebox::fs::errors::TruncateError::NotOpenForWriting => Errno::EBADF,
+            litebox::fs::errors::TruncateError::NotForWriting => Errno::EINVAL,
+            litebox::fs::errors::TruncateError::PathOnlyFd => Errno::EBADF,
             litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
             litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::TruncateError::ReadOnlyFileSystem => Errno::EROFS,
             litebox::fs::errors::TruncateError::Io => Errno::EIO,
         }
     }

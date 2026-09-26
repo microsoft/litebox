@@ -12,27 +12,23 @@ use litebox::net::{ReceiveFlags, SendFlags};
 use litebox_common_linux::{SockFlags, SockType, errno::Errno};
 
 use crate::syscalls::net::SocketFd;
-use crate::{GlobalState, ShimPlatform};
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
-/// Handles socket cleanup on drop without exposing the concrete socket/global-state types.
+/// Handles socket cleanup on drop without exposing the `FS` generic.
 ///
 /// This is stored as `Box<dyn DropGuard>` inside [`ShimTransport`] so that the
-/// transport itself does not need to name them.
-// XXX: this erasure only existed to hide the old `FS` generic. Now that `SocketDropGuard`'s fields
-// are nameable from `Platform` alone, we could inline them into [`ShimTransport`] and drop this
-// trait. However, this `DropGuard` _may_ be worth keeping if a future non-socket backing (shared
-// memory, ...) needs to share `ShimTransport`.
+/// transport itself does not need to be generic over `FS`.
 trait DropGuard: Send + Sync {
     fn close(&mut self);
 }
 
 /// Concrete, generic implementation of [`DropGuard`].
-struct SocketDropGuard<Platform: ShimPlatform> {
-    global: Arc<GlobalState<Platform>>,
+struct SocketDropGuard<Platform: ShimPlatform, FS: ShimFS> {
+    global: Arc<GlobalState<Platform, FS>>,
     sockfd: SocketFd<Platform>,
 }
 
-impl<Platform: ShimPlatform> DropGuard for SocketDropGuard<Platform> {
+impl<Platform: ShimPlatform, FS: ShimFS> DropGuard for SocketDropGuard<Platform, FS> {
     fn close(&mut self) {
         let _ = self
             .global
@@ -66,8 +62,8 @@ impl<Platform: ShimPlatform> ShimTransport<Platform> {
     ///
     /// Connection and all subsequent I/O use the [`NetworkProxy`] directly,
     /// spin-polling when the operation cannot complete immediately.
-    pub(crate) fn connect(
-        global: Arc<GlobalState<Platform>>,
+    pub(crate) fn connect<FS: ShimFS>(
+        global: Arc<GlobalState<Platform, FS>>,
         addr: core::net::SocketAddr,
     ) -> Result<Self, Errno> {
         // 1. Create the raw socket.
@@ -145,9 +141,8 @@ mod tests {
     use std::net::TcpListener;
     use std::path::Path;
 
-    use litebox::fs::nine_p::NineP;
-    use litebox::fs::resolver::Resolver;
-    use litebox::fs::{Mode, OFlags};
+    use litebox::fs::nine_p;
+    use litebox::fs::{FileSystem as _, Mode, OFlags};
 
     use crate::syscalls::tests::init_platform;
 
@@ -263,9 +258,15 @@ mod tests {
     }
 
     fn connect_9p(
-        task: &crate::Task<crate::syscalls::tests::TestPlatform>,
+        task: &crate::Task<
+            crate::syscalls::tests::TestPlatform,
+            crate::DefaultFS<crate::syscalls::tests::TestPlatform>,
+        >,
         server: &DiodServer,
-    ) -> Resolver<crate::syscalls::tests::TestPlatform, litebox::fs::composer::Composer> {
+    ) -> nine_p::FileSystem<
+        crate::syscalls::tests::TestPlatform,
+        ShimTransport<crate::syscalls::tests::TestPlatform>,
+    > {
         let addr = socket_addr([10, 0, 0, 1], server.port);
         let transport = ShimTransport::connect(task.global.clone(), addr)
             .expect("failed to connect to 9P server via shim network");
@@ -275,16 +276,8 @@ mod tests {
             .or_else(|_| std::env::var("LOGNAME"))
             .unwrap_or_else(|_| std::string::String::from("nobody"));
 
-        let composer = litebox::fs::composer::Composer::builder()
-            .mount("/", |allocator| {
-                NineP::<crate::syscalls::tests::TestPlatform, _>::new(
-                    transport, 65536, &username, aname, allocator,
-                )
-                .expect("failed to create 9P filesystem")
-            })
-            .build()
-            .expect("a single mount at `/`");
-        Resolver::new(&task.global.litebox, composer)
+        nine_p::FileSystem::new(&task.global.litebox, transport, 65536, &username, aname)
+            .expect("failed to create 9P filesystem")
     }
 
     // -----------------------------------------------------------------------
@@ -293,7 +286,6 @@ mod tests {
 
     #[test]
     fn test_tun_nine_p_create_and_read_file() {
-        let ctx = litebox::fs::resolver::Context::new();
         let task = init_platform(Some(TUN_DEVICE_NAME));
 
         let server = DiodServer::start();
@@ -301,12 +293,7 @@ mod tests {
 
         // Create a file and write to it.
         let fd = fs
-            .open(
-                &ctx,
-                "/hello.txt",
-                OFlags::CREAT | OFlags::WRONLY,
-                Mode::RWXU,
-            )
+            .open("/hello.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("failed to create file via 9P");
 
         let data = b"Hello from litebox shim 9P!";
@@ -322,7 +309,7 @@ mod tests {
 
         // Read back through 9P.
         let fd = fs
-            .open(&ctx, "/hello.txt", OFlags::RDONLY, Mode::empty())
+            .open("/hello.txt", OFlags::RDONLY, Mode::empty())
             .expect("failed to open file for reading");
 
         let mut buf = alloc::vec![0u8; 256];
@@ -333,7 +320,6 @@ mod tests {
 
     #[test]
     fn test_tun_nine_p_host_files_visible() {
-        let ctx = litebox::fs::resolver::Context::new();
         let task = init_platform(Some(TUN_DEVICE_NAME));
 
         let server = DiodServer::start();
@@ -351,7 +337,7 @@ mod tests {
 
         // Read file created on the host through 9P.
         let fd = fs
-            .open(&ctx, "/host_file.txt", OFlags::RDONLY, Mode::empty())
+            .open("/host_file.txt", OFlags::RDONLY, Mode::empty())
             .expect("failed to open host file via 9P");
         let mut buf = alloc::vec![0u8; 256];
         let n = fs.read(&fd, &mut buf, None).unwrap();
@@ -361,7 +347,6 @@ mod tests {
         // List host directory through 9P.
         let fd = fs
             .open(
-                &ctx,
                 "/host_dir",
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty(),

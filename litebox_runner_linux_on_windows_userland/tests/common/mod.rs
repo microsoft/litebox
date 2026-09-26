@@ -5,14 +5,13 @@
 
 use std::ffi::CString;
 
-use litebox::fs::{Mode, OFlags};
+use litebox::fs::{FileSystem as _, Mode, OFlags};
 use litebox_platform_windows_userland::WindowsUserland as Platform;
 
 pub struct TestLauncher {
     platform: &'static Platform,
     shim_builder: litebox_shim_linux::LinuxShimBuilder<Platform>,
     fs: litebox_shim_linux::DefaultFS<Platform>,
-    context: litebox::fs::resolver::Context,
 }
 
 impl TestLauncher {
@@ -23,25 +22,23 @@ impl TestLauncher {
     ) -> Self {
         let platform = Platform::new();
         let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+        let litebox = shim_builder.litebox();
 
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
-                owner: litebox::fs::UserInfo::ROOT,
-            },
-        )]);
+        let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+        in_mem_fs.with_root_privileges(|fs| {
+            fs.chmod("/", Mode::RWXU | Mode::RWXG | Mode::RWXO)
+                .expect("Failed to set permissions on root");
+        });
         let tar_data = if tar_data.is_empty() {
             litebox::fs::tar_ro::EMPTY_TAR_FILE.into()
         } else {
             tar_data.into()
         };
-        let fs = shim_builder.default_fs(in_mem, tar_data);
+        let fs = shim_builder.default_fs(in_mem_fs, tar_data);
         let mut this = Self {
             platform,
             shim_builder,
             fs,
-            context: litebox::fs::resolver::Context::new(),
         };
 
         for each in initial_dirs {
@@ -57,7 +54,7 @@ impl TestLauncher {
 
     pub fn install_dir(&mut self, path: &str) {
         self.fs
-            .mkdir(&self.context, path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
+            .mkdir(path, Mode::RWXU | Mode::RWXG | Mode::RWXO)
             .expect("Failed to create directory");
     }
 
@@ -65,7 +62,6 @@ impl TestLauncher {
         let fd = self
             .fs
             .open(
-                &self.context,
                 out,
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXG | Mode::RWXO | Mode::RWXU,

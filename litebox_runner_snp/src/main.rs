@@ -11,7 +11,10 @@ mod globals;
 extern crate alloc;
 
 use alloc::{borrow::ToOwned, boxed::Box};
-use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
+use litebox::{
+    fs::FileSystem as _,
+    utils::{ReinterpretUnsignedExt as _, TruncateExt as _},
+};
 use litebox_platform_linux_kernel::{HostInterface, host::snp::ghcb::ghcb_prints};
 
 /// `log` backend that forwards to the GHCB serial console.
@@ -34,7 +37,20 @@ impl log::Log for HostLogger {
 static HOST_LOGGER: HostLogger = HostLogger;
 
 type Platform = litebox_platform_linux_kernel::host::snp::snp_impl::SnpLinuxKernel;
-type Shim = litebox_shim_linux::LinuxShim<Platform>;
+type DefaultFS = litebox::fs::layered::FileSystem<
+    Platform,
+    litebox::fs::in_mem::FileSystem<Platform>,
+    litebox::fs::layered::FileSystem<
+        Platform,
+        litebox::fs::resolver::Resolver<Platform, litebox::fs::composer::Composer>,
+        litebox::fs::nine_p::FileSystem<
+            Platform,
+            litebox_shim_linux::transport::ShimTransport<Platform>,
+        >,
+    >,
+>;
+
+type Shim = litebox_shim_linux::LinuxShim<Platform, DefaultFS>;
 
 // FUTURE: eliminate this entirely (ideal).
 static SHIM: once_cell::race::OnceBox<Shim> = once_cell::race::OnceBox::new();
@@ -197,6 +213,13 @@ pub extern "C" fn sandbox_process_init(
     #[allow(clippy::missing_panics_doc)]
     let shim = SHIM.get().expect("initialized");
     let litebox = shim.litebox();
+    let mut in_mem_fs = litebox::fs::in_mem::FileSystem::new(litebox);
+    in_mem_fs.with_root_privileges(|fs| {
+        let mode = litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO;
+        if let Err(litebox::fs::errors::MkdirError::AlreadyExists) = fs.mkdir("/tmp", mode) {
+            let _ = fs.chmod("/tmp", mode);
+        }
+    });
 
     let socket_addr = core::net::SocketAddr::V4(core::net::SocketAddrV4::new(
         core::net::Ipv4Addr::new(10, 0, 0, 1),
@@ -209,36 +232,16 @@ pub extern "C" fn sandbox_process_init(
             globals::SM_TERM_GENERAL,
         );
     };
-    let composer = litebox::fs::composer::Composer::builder()
-        .mount_nestable("/", |allocators| {
-            let Ok(nine_p) = litebox::fs::nine_p::NineP::<Platform, _>::new(
-                transport,
-                65536,
-                "root",
-                "/tmp",
-                allocators.next(),
-            ) else {
-                ghcb_prints("failed to create 9P filesystem");
-                litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
-                    globals::SM_SEV_TERM_SET,
-                    globals::SM_TERM_GENERAL,
-                );
-            };
-            litebox::fs::overlay::Overlay::new(
-                litebox,
-                litebox::fs::in_mem::InMem::<Platform>::new_initialized([(
-                    "/tmp",
-                    litebox::fs::in_mem::InitialNode::Directory {
-                        mode: litebox::fs::Mode::RWXU
-                            | litebox::fs::Mode::RWXG
-                            | litebox::fs::Mode::RWXO,
-                        owner: litebox::fs::UserInfo::ROOT,
-                    },
-                )]),
-                nine_p,
-                allocators.next(),
-            )
-        })
+    let Ok(nine_p) =
+        litebox::fs::nine_p::FileSystem::new(litebox, transport, 65536, "root", "/tmp")
+    else {
+        ghcb_prints("failed to create 9P filesystem");
+        litebox_platform_linux_kernel::host::snp::snp_impl::HostSnpInterface::terminate(
+            globals::SM_SEV_TERM_SET,
+            globals::SM_TERM_GENERAL,
+        );
+    };
+    let dev_stdio_composer = litebox::fs::composer::Composer::builder()
         .mount("/dev", |allocator| {
             litebox::fs::devices::Devices::new(litebox, allocator)
         })
@@ -248,7 +251,19 @@ pub extern "C" fn sandbox_process_init(
              | litebox::fs::composer::BuildError::InvalidMountPath
              | litebox::fs::composer::BuildError::DuplicateMountPath)| unreachable!(),
         );
-    let fs = alloc::sync::Arc::new(litebox::fs::resolver::Resolver::new(litebox, composer));
+    let dev_stdio = litebox::fs::resolver::Resolver::new(litebox, dev_stdio_composer);
+    let default_fs = litebox::fs::layered::FileSystem::new(
+        litebox,
+        in_mem_fs,
+        litebox::fs::layered::FileSystem::new(
+            litebox,
+            dev_stdio,
+            nine_p,
+            litebox::fs::layered::LayeringSemantics::LowerLayerReadOnly,
+        ),
+        litebox::fs::layered::LayeringSemantics::LowerLayerWritableFiles,
+    );
+    let fs = alloc::sync::Arc::new(default_fs);
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.
     let program = match shim.load_program(fs, platform.init_task(boot_params), &program, argv, envp)

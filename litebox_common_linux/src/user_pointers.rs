@@ -228,3 +228,15 @@ impl<T: FromBytes + IntoBytes> UserPtrMut<T> {
             .copy_from_slice(start_offset, buf)
     }
 }
+
+impl UserPtrMut<u32> {
+    /// See [`RawMutPointer::compare_exchange_u32`].
+    pub fn compare_exchange<P: RawPointerProvider>(
+        self,
+        current: u32,
+        new: u32,
+    ) -> Option<Result<u32, u32>> {
+        self.to_platform_ptr::<P>()
+            .compare_exchange_u32(current, new)
+    }
+}

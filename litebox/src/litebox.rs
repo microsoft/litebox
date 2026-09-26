@@ -5,8 +5,15 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::message::BrokerNotification;
+use litebox_broker_transport::channel::LocalCallChannel;
+
 use crate::{
+    broker,
     fd::Descriptors,
+    fs::flock::FlockTable,
+    platform::TimeProvider,
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
 
@@ -30,6 +37,35 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// If the `enforce_singleton_litebox_instance` compilation feature has been enabled, and more
     /// than one instance is made, will panic.
     pub fn new(platform: &'static Platform) -> Self {
+        Self::new_inner(
+            platform,
+            None,
+            Arc::new(broker::BrokerPollableRegistry::new()),
+        )
+    }
+
+    /// Create a new [`LiteBox`] instance with a negotiated broker-local control adapter installed.
+    pub fn new_with_broker_local<Channel>(
+        platform: &'static Platform,
+        broker_local: BrokerLocal<Channel>,
+    ) -> Self
+    where
+        Platform: TimeProvider,
+        Channel: LocalCallChannel + Send + Sync + 'static,
+    {
+        let broker_pollables = Arc::new(broker::BrokerPollableRegistry::new());
+        let broker_control = Arc::new(broker::BrokerLocalControl::<Platform, Channel>::new(
+            broker_local,
+            Arc::clone(&broker_pollables),
+        ));
+        Self::new_inner(platform, Some(broker_control), broker_pollables)
+    }
+
+    fn new_inner(
+        platform: &'static Platform,
+        broker_control: Option<Arc<dyn broker::BrokerControl>>,
+        broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
+    ) -> Self {
         // This check ensures that there is exactly one `LiteBox` instance in the process.
         //
         // LiteBox itself supports having multiple instances (and subsystems correctly make any
@@ -63,8 +99,8 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         // prints, if the feature is enabled.
         #[cfg(feature = "lock_tracing")]
         crate::sync::lock_tracing::LockTracker::init(platform);
-
-        let descriptors = RwLock::new(Descriptors::new_from_litebox_creation());
+        let descriptors: RwLock<Platform, Descriptors<Platform>> =
+            RwLock::new(Descriptors::new_from_litebox_creation());
 
         litebox_util_log::trace!("LiteBox instance initialized");
 
@@ -72,12 +108,13 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
             x: Arc::new(LiteBoxX {
                 platform,
                 descriptors,
+                broker: broker_control,
+                broker_pollables,
+                flock_table: FlockTable::new(),
             }),
         }
     }
-}
 
-impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     /// An explicitly-crate-internal clone method to prevent outside users from cloning the
     /// [`LiteBox`] object, which could cause confusion as to the intended use. External users must
     /// only create it via [`Self::new`].
@@ -106,10 +143,69 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
     ) -> impl core::ops::DerefMut<Target = Descriptors<Platform>> + use<'_, Platform> {
         self.x.descriptors.write()
     }
+
+    /// Access to the whole-file (`flock(2)`-style) advisory lock table.
+    ///
+    /// See [`FlockTable`] for exactly what is (and isn't) modeled.
+    pub fn flock_table(&self) -> &FlockTable<Platform> {
+        &self.x.flock_table
+    }
+
+    pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
+        self.x.broker.clone()
+    }
+
+    pub(crate) fn broker_pollable_registry(&self) -> Arc<broker::BrokerPollableRegistry<Platform>> {
+        Arc::clone(&self.x.broker_pollables)
+    }
+
+    /// Dispatches one broker notification to the matching local-core object.
+    pub fn dispatch_broker_notification(&self, notification: BrokerNotification)
+    where
+        Platform: TimeProvider,
+    {
+        match notification {
+            BrokerNotification::Readiness(notification) => self
+                .x
+                .broker_pollables
+                .notify_readiness(notification.handle, notification.readiness),
+        }
+    }
+
+    /// Returns a narrow dispatcher for moving broker notification handling into deployment code.
+    pub fn broker_notification_dispatcher(&self) -> impl Fn(BrokerNotification) + Send + 'static
+    where
+        Platform: TimeProvider + 'static,
+    {
+        let broker_pollables = Arc::downgrade(&self.x.broker_pollables);
+        move |notification| {
+            if let Some(broker_pollables) = broker_pollables.upgrade() {
+                match notification {
+                    BrokerNotification::Readiness(notification) => {
+                        broker_pollables
+                            .notify_readiness(notification.handle, notification.readiness);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Returns a dispatcher that fails all broker-backed objects when the association closes.
+    pub fn broker_failure_dispatcher(&self) -> impl Fn() + Send + 'static {
+        let broker = self.x.broker.as_ref().map(Arc::downgrade);
+        move || {
+            if let Some(broker) = broker.as_ref().and_then(alloc::sync::Weak::upgrade) {
+                broker.fail_connection();
+            }
+        }
+    }
 }
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
     pub(crate) platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
+    broker: Option<Arc<dyn broker::BrokerControl>>,
+    broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,
+    flock_table: FlockTable<Platform>,
 }

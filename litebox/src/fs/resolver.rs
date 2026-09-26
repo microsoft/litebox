@@ -4,109 +4,117 @@
 //! The path-management/permissions/... layer, that sits above [`super::backend`].
 
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::fs::UserInfo;
+use crate::fs::{AccessCredentials, DacAccessKind, UserInfo};
 use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    ReadDirError, ReadError, ReadlinkError, RmdirError, SeekError, TruncateError, UnlinkError,
+    UtimeError, WalkError, WriteError,
 };
 use super::{
-    FileType, Mode, OFlags,
+    FileType, Mode, OFlags, Timestamp,
     backend::{
-        CreationMetadata, DirHandle, Handle, HandleRef, PermissionCheck, PermissionInfo,
-        Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
+        DirHandle, FileHandle, PermissionCheck, PermissionInfo, SeekBehavior, WalkOutcome,
+        WalkStopReason, WalkingDirHandle,
     },
 };
 
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
+///
+/// The resolver _itself_ maintains no state; all state is maintained either by the backend or the
+/// [`Context`]. The user may choose to store the [`Context`] as they wish.
+// NOTE(jayb): the `Context` separation is in preparation for multi-process support; specifically,
+// each guest process would have their own `Context` but would share the resolver. Currently, since
+// we are using the `FileSystem` trait for migration, the interfaces do not show the full actual
+// separated context support (yet!). Nonetheless, future changes will separate this out.
 pub struct Resolver<
     Platform: sync::RawSyncPrimitivesProvider,
     Backend: super::backend::Backend + 'static,
 > {
     litebox: LiteBox<Platform>,
     backend: Backend,
+    user_info: UserInfo,
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
-    /// Construct a new resolver over a `backend`.
+    /// Construct a new resolver over a `backend` for the default 1000/1000 identity.
     #[must_use]
     pub fn new(litebox: &LiteBox<Platform>, backend: Backend) -> Self {
+        Self::new_with_user(
+            litebox,
+            backend,
+            UserInfo {
+                user: 1000,
+                group: 1000,
+            },
+        )
+    }
+
+    /// Construct a new resolver over a `backend` for `user_info`.
+    #[must_use]
+    pub fn new_with_user(
+        litebox: &LiteBox<Platform>,
+        backend: Backend,
+        user_info: UserInfo,
+    ) -> Self {
         Self {
             litebox: litebox.clone(),
             backend,
+            user_info,
+        }
+    }
+
+    #[allow(
+        clippy::unused_self,
+        reason = "instance method for API symmetry with other *_as helpers"
+    )]
+    fn context_as<'a>(&self, credentials: AccessCredentials<'a>) -> Context<'a> {
+        Context {
+            cwd: vec![],
+            credentials,
         }
     }
 }
 
 /// Per-call resolution context.  The user may hold and mutate this as they wish.
-///
-/// This struct is deliberately cheap to clone.
-// NOTE(jayb): I generally dislike getters/setters for fields of a data-like struct (e.g., see
-// acting_user and set_acting_user here), but I'm putting these here since I am not yet convinced
-// that we won't need more things in the context, nor am I convinced that we might not need the
-// ability to lock down how contexts are made/used. In some sense, I am forcing some chokepoints
-// here. In the future, we might flatten these out and just allow access to the fields directly.
 #[derive(Clone, Debug)]
-pub struct Context {
+pub struct Context<'a> {
     /// Current working directory.
-    cwd: Arc<ResolvedPath>,
+    ///
+    /// An empty list is equivalent to `/`. Guaranteed to never have `.` or `..`.
+    cwd: Vec<String>,
     /// Effective user for permission checks.
-    user_info: UserInfo,
+    credentials: AccessCredentials<'a>,
 }
 
-impl Context {
-    /// The user that operations on this context act as.
-    #[must_use]
-    pub fn acting_user(&self) -> UserInfo {
-        self.user_info
-    }
-
-    /// Set the user that operations on this context act as.
-    pub fn set_acting_user(&mut self, user: UserInfo) {
-        self.user_info = user;
-    }
-
-    /// The current working directory.
-    #[must_use]
-    pub fn cwd(&self) -> &ResolvedPath {
-        &self.cwd
-    }
-
-    /// Set the current working directory.
-    pub fn set_cwd(&mut self, cwd: ResolvedPath) {
-        self.cwd = Arc::new(cwd);
-    }
-
+impl Context<'static> {
     /// A new default context, anchored at `/` for a non-root user.
-    pub fn new() -> Context {
+    pub fn new() -> Context<'static> {
         Self {
-            cwd: Arc::new(ResolvedPath { components: vec![] }),
-            user_info: UserInfo {
-                user: 1000,
-                group: 1000,
-            },
+            cwd: vec![],
+            credentials: AccessCredentials::new(1000, 1000, &[]),
         }
     }
+}
 
+impl Context<'_> {
     /// Resolve `path` against the current context.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
     // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
     // `Arg` anymore, so could get rid of it in the future.
-    pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
+    fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
         let mut components = if path.as_rust_str()?.starts_with('/') {
             vec![]
         } else {
-            self.cwd.components.clone()
+            self.cwd.clone()
         };
         for component in path.components()? {
             match component {
@@ -122,63 +130,20 @@ impl Context {
         Ok(ResolvedPath { components })
     }
 
-    fn can_execute(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
-            permissions.mode.contains(Mode::XUSR)
-        } else if self.user_info.group == permissions.owner.group {
-            permissions.mode.contains(Mode::XGRP)
-        } else {
-            permissions.mode.contains(Mode::XOTH)
-        }
-    }
-
-    fn can_read(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
-            permissions.mode.contains(Mode::RUSR)
-        } else if self.user_info.group == permissions.owner.group {
-            permissions.mode.contains(Mode::RGRP)
-        } else {
-            permissions.mode.contains(Mode::ROTH)
-        }
-    }
-
-    fn can_write(&self, permissions: &PermissionInfo) -> bool {
-        if self.user_info.user == permissions.owner.user {
-            permissions.mode.contains(Mode::WUSR)
-        } else if self.user_info.group == permissions.owner.group {
-            permissions.mode.contains(Mode::WGRP)
-        } else {
-            permissions.mode.contains(Mode::WOTH)
-        }
+    fn can_use_noatime(&self, permissions: &PermissionInfo) -> bool {
+        self.credentials.user() == 0 || self.credentials.owns(permissions.owner)
     }
 }
 
-impl Default for Context {
+impl Default for Context<'static> {
     fn default() -> Self {
         Self::new()
     }
 }
 
 /// Absolute normalized path, must only be created from [`Context::resolve`].
-///
-/// Note that a resolved path does not imply that it exists within the file system, merely that it
-/// is an absolute normalized path.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedPath {
-    // Note: an empty path is equivalent to `/`.
+struct ResolvedPath {
     components: Vec<String>,
-}
-
-impl core::fmt::Display for ResolvedPath {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        for component in &self.components {
-            write!(f, "/{component}")?;
-        }
-        if self.components.is_empty() {
-            f.write_str("/")?;
-        }
-        Ok(())
-    }
 }
 
 impl ResolvedPath {
@@ -188,24 +153,9 @@ impl ResolvedPath {
     }
 }
 
-/// A directory reached by a walk, plus the permission metadata to check against it.
-struct WalkedDir<'a> {
-    handle: WalkingDirHandle<'a>,
-    /// `None` when the walk ended at the backend root, which reports no permission metadata.
-    permissions: Option<PermissionCheck>,
-}
-
-/// Which directories along a walk must grant search (execute) permission.
-#[derive(Clone, Copy)]
-enum SearchScope {
-    /// Every walked directory, including a final directory component, must be searchable.
-    AllComponents,
-    /// The directories leading to the object the path names must be searchable; target is not
-    /// checked.
-    ParentsOnly,
-    /// Like [`SearchScope::ParentsOnly`], but the final directory component is checked to be
-    /// readable.
-    AndReadableTarget,
+impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
+    super::private::Sealed for Resolver<Platform, Backend>
+{
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
@@ -213,9 +163,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 {
     fn parent_dir_and_name<'a>(
         &self,
-        context: &Context,
+        context: &Context<'_>,
         path: &'a ResolvedPath,
-    ) -> Result<Option<(WalkedDir<'_>, &'a str)>, WalkError> {
+    ) -> Result<Option<(WalkingDirHandle<'_>, &'a str)>, WalkError> {
         // Return the walking handle rather than an owned directory handle so backends can keep any
         // locks acquired during path resolution held across the final operation. This lets e.g.
         // "walk parent + mutate child" stay atomic.
@@ -232,21 +182,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(Some((parent, name)))
     }
 
-    /// Whether `context` may add or remove entries in `dir`.
-    ///
-    /// A `dir` without permission metadata is the backend root, which the backend does not report
-    /// permissions for; such directories are currently left unchecked.
-    // TODO(jayb): Check write permission on the root directory too. That needs the backend to
-    // report permissions for [`super::backend::Backend::root`].
-    // TODO(jayb): Prioritize `EROFS` before this permission check runs; currently not an issue due
-    // to 0777 from read-only backends, but needs an update then.
-    fn can_change_entries_in_dir(context: &Context, dir: &WalkedDir<'_>) -> bool {
-        match &dir.permissions {
-            None | Some(PermissionCheck::ByBackend) => true,
-            Some(PermissionCheck::ByResolver(permissions)) => context.can_write(permissions),
-        }
-    }
-
     fn owned_parent_dir(&self, dir: WalkingDirHandle<'_>) -> Result<DirHandle, WalkError> {
         self.backend
             .owned_dir_at(dir, OFlags::PATH)
@@ -259,216 +194,134 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             })
     }
 
-    /// Resolve `path` to an owned handle on the file or directory it names, plus how permissions
-    /// on it are to be checked.
-    ///
-    /// The handle is taken with [`OFlags::PATH`], as it addresses the object for operations that
-    /// do not read or write its contents, and thus needs no access permissions on it.
-    fn path_handle(
-        &self,
-        context: &Context,
-        path: &ResolvedPath,
-    ) -> Result<Permissioned<Handle>, WalkError> {
-        let map_open_error = |error| match error {
-            OpenError::PathError(error) => WalkError::PathError(error),
-            _ => WalkError::Io,
-        };
-        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        if components.is_empty() {
-            let root = self
-                .backend
-                .owned_dir_at(self.backend.root(), OFlags::PATH)
-                .map_err(map_open_error)?;
-            // A backend root reports no permission metadata, so the backend is left to enforce
-            // whatever it wants on it.
-            return Ok(Permissioned {
-                item: Handle::Dir(root),
-                permissions: PermissionCheck::ByBackend,
-            });
-        }
-        let (outcome, walked) = self.walk_path(
-            context,
-            self.backend.root(),
-            &components,
-            #[cfg(debug_assertions)]
-            &components,
-            SearchScope::ParentsOnly,
-        )?;
-        match outcome.stop_reason {
-            WalkStopReason::CompleteDirectory => {
-                let permissions = outcome
-                    .components
-                    .last()
-                    .map_or(PermissionCheck::ByBackend, |component| {
-                        component.permissions.clone()
-                    });
-                let dir = self
-                    .backend
-                    .owned_dir_at(outcome.last, OFlags::PATH)
-                    .map_err(map_open_error)?;
-                Ok(Permissioned {
-                    item: Handle::Dir(dir),
-                    permissions,
-                })
-            }
-            WalkStopReason::StoppedAtNonDirectory => {
-                let file = self
-                    .backend
-                    .open_file_at(outcome.last, components[walked], OFlags::PATH)
-                    .map_err(map_open_error)?;
-                Ok(Permissioned {
-                    item: Handle::File(file.item),
-                    permissions: file.permissions,
-                })
-            }
-            WalkStopReason::Continue => {
-                // `walk_path` validates stop reasons before returning.
-                unreachable!()
-            }
-        }
-    }
-
     fn walk_to_directory<'a>(
         &'a self,
-        context: &Context,
+        context: &Context<'_>,
         from: WalkingDirHandle<'a>,
         components: &[&str],
         #[cfg(debug_assertions)] absolute_components: &[&str],
-    ) -> Result<WalkedDir<'a>, WalkError> {
+    ) -> Result<WalkingDirHandle<'a>, WalkError> {
         if components.is_empty() {
             // TODO(jayb): Decide whether empty walks from a non-root handle need permission checks.
-            return Ok(WalkedDir {
-                handle: from,
-                permissions: None,
-            });
+            return Ok(from);
         }
 
-        let mut from = from;
-        let mut offset = 0;
-        loop {
-            let outcome = self
-                .backend
-                .walk_directories(from, &components[offset..])
+        let outcome =
+            self.backend
+                .walk_directories(from, components)
                 .map_err(|error| match error {
                     WalkError::PathError(PathError::NoSuchFileOrDirectory) => {
                         PathError::MissingComponent.into()
                     }
                     error => error,
                 })?;
-            let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
-            Self::check_walk_permissions(
-                context,
-                #[cfg(debug_assertions)]
-                &absolute_components[offset..],
-                &outcome,
-                SearchScope::AllComponents,
-            )?;
-            let walked = outcome.components.len();
-            offset += walked;
+        Self::check_walk_permissions(
+            context,
+            #[cfg(debug_assertions)]
+            absolute_components,
+            &outcome,
+            outcome.components.len(),
+        )?;
 
-            match outcome.stop_reason {
-                WalkStopReason::CompleteDirectory => {
-                    assert_eq!(walked, components.len() - (offset - walked));
-                    let permissions = outcome
-                        .components
-                        .last()
-                        .map(|component| component.permissions.clone());
-                    return Ok(WalkedDir {
-                        handle: outcome.last,
-                        permissions,
-                    });
-                }
-                WalkStopReason::StoppedAtNonDirectory => {
-                    return Err(WalkError::PathError(PathError::ComponentNotADirectory));
-                }
-                WalkStopReason::Continue => {
-                    assert!(continuing && walked > 0 && offset < components.len());
-                    from = outcome.last;
-                }
+        match outcome.stop_reason {
+            WalkStopReason::CompleteDirectory => {
+                assert_eq!(outcome.components.len(), components.len());
+                Ok(outcome.last)
+            }
+            WalkStopReason::StoppedAtNonDirectory => {
+                Err(WalkError::PathError(PathError::ComponentNotADirectory))
+            }
+            WalkStopReason::Continue => {
+                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
+                // supported by the resolver.
+                unimplemented!("partial backend walks are not supported yet")
             }
         }
     }
 
     fn walk_path<'a>(
         &'a self,
-        context: &Context,
+        context: &Context<'_>,
         from: WalkingDirHandle<'a>,
         components: &[&str],
+        skip_terminal_directory_permission: bool,
         #[cfg(debug_assertions)] absolute_components: &[&str],
-        scope: SearchScope,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         assert!(!components.is_empty());
-        let mut from = from;
-        let mut offset = 0;
-        loop {
-            let outcome = self.backend.walk_directories(from, &components[offset..])?;
-            let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
-            Self::check_walk_permissions(
-                context,
-                #[cfg(debug_assertions)]
-                &absolute_components[offset..],
-                &outcome,
-                if continuing {
-                    SearchScope::AllComponents
-                } else {
-                    scope
-                },
-            )?;
+        let outcome = self.backend.walk_directories(from, components)?;
+        let checked_components = if skip_terminal_directory_permission
+            && outcome.stop_reason == WalkStopReason::CompleteDirectory
+        {
+            outcome.components.len().saturating_sub(1)
+        } else {
+            outcome.components.len()
+        };
+        Self::check_walk_permissions(
+            context,
+            #[cfg(debug_assertions)]
+            absolute_components,
+            &outcome,
+            checked_components,
+        )?;
 
-            let walked = outcome.components.len();
-            offset += walked;
-            match outcome.stop_reason {
-                WalkStopReason::CompleteDirectory => {
-                    assert_eq!(walked, components.len() - (offset - walked));
-                    return Ok((outcome, offset));
-                }
-                WalkStopReason::StoppedAtNonDirectory if offset == components.len() - 1 => {
-                    return Ok((outcome, offset));
-                }
-                WalkStopReason::StoppedAtNonDirectory => {
-                    return Err(WalkError::PathError(PathError::ComponentNotADirectory));
-                }
-                WalkStopReason::Continue => {
-                    assert!(continuing && walked > 0 && offset < components.len());
-                    from = outcome.last;
-                }
+        let walked = outcome.components.len();
+        match outcome.stop_reason {
+            WalkStopReason::CompleteDirectory => {
+                assert_eq!(walked, components.len());
+                Ok((outcome, walked))
+            }
+            WalkStopReason::StoppedAtNonDirectory if walked + 1 == components.len() => {
+                Ok((outcome, walked))
+            }
+            WalkStopReason::StoppedAtNonDirectory => {
+                Err(WalkError::PathError(PathError::ComponentNotADirectory))
+            }
+            WalkStopReason::Continue => {
+                // TODO(jayb): Continue walking from `outcome.last` once partial backend walks are
+                // supported by the resolver.
+                unimplemented!("partial backend walks are not supported yet")
             }
         }
     }
 
     fn check_walk_permissions(
-        context: &Context,
+        context: &Context<'_>,
         #[cfg(debug_assertions)] absolute_components: &[&str],
         outcome: &WalkOutcome<WalkingDirHandle<'_>>,
-        scope: SearchScope,
+        checked_components: usize,
     ) -> Result<(), PathError> {
-        for (idx, walked) in outcome.components.iter().enumerate() {
-            let PermissionCheck::ByResolver(permissions) = &walked.permissions else {
-                continue;
-            };
-            let is_target_dir = idx + 1 == outcome.components.len()
-                && matches!(outcome.stop_reason, WalkStopReason::CompleteDirectory);
-            let allowed = match (is_target_dir, scope) {
-                (true, SearchScope::ParentsOnly) => continue,
-                (true, SearchScope::AndReadableTarget) => context.can_read(permissions),
-                _ => context.can_execute(permissions),
-            };
-            if !allowed {
-                // TODO(jayb): a [`SearchScope::AndReadableTarget`] target denying *read* permission
-                // reports `NoSearchPerms` too. Clean up during filesystem errors overhaul.
-                return Err(PathError::NoSearchPerms {
-                    #[cfg(debug_assertions)]
-                    dir: {
-                        let mut path = String::new();
-                        for component in &absolute_components[..=idx] {
-                            path.push('/');
-                            path.push_str(component);
-                        }
-                        path
-                    },
-                    #[cfg(debug_assertions)]
-                    perms: permissions.mode,
-                });
+        for (idx, walked) in outcome
+            .components
+            .iter()
+            .take(checked_components)
+            .enumerate()
+        {
+            #[cfg(not(debug_assertions))]
+            let _ = idx;
+            match &walked.permissions {
+                PermissionCheck::ByBackend => {}
+                PermissionCheck::ByResolver(permissions) => {
+                    if !super::dac_allows_as(
+                        context.credentials,
+                        permissions.owner,
+                        permissions.mode,
+                        DacAccessKind::DirectorySearch,
+                    ) {
+                        return Err(PathError::NoSearchPerms {
+                            #[cfg(debug_assertions)]
+                            dir: {
+                                let mut path = String::new();
+                                for component in &absolute_components[..=idx] {
+                                    path.push('/');
+                                    path.push_str(component);
+                                }
+                                path
+                            },
+                            #[cfg(debug_assertions)]
+                            perms: permissions.mode,
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -476,16 +329,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 }
 
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
-    Resolver<Platform, Backend>
+    super::FileSystem for Resolver<Platform, Backend>
 {
-    /// Opens a file
-    ///
-    /// The `mode` is only significant when creating a file
-    pub fn open(
+    fn open(&self, path: impl Arg, flags: OFlags, mode: Mode) -> Result<TypedFd<Self>, OpenError> {
+        self.open_as(self.user_info.into(), path, flags, mode)
+    }
+
+    fn open_as(
         &self,
-        context: &Context,
+        credentials: AccessCredentials<'_>,
         path: impl Arg,
-        mut flags: OFlags,
+        flags: OFlags,
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError> {
         const CURRENTLY_SUPPORTED_OFLAGS: OFlags = OFlags::CREAT
@@ -498,24 +352,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .union(OFlags::DIRECTORY)
             .union(OFlags::NONBLOCK)
             .union(OFlags::LARGEFILE)
+            .union(OFlags::NOATIME)
             .union(OFlags::NOFOLLOW)
             .union(OFlags::APPEND)
             .union(OFlags::PATH);
 
+        let flags = flags.normalized_for_open();
         if flags.intersects(CURRENTLY_SUPPORTED_OFLAGS.complement()) {
-            unimplemented!("{flags:?}")
+            return Err(OpenError::UnsupportedFlags);
         }
         let path_only = flags.contains(OFlags::PATH);
-        if path_only {
-            // For `PATH`, we restrict what other flags are allowed, so a missing path cannot lead
-            // to a creation, etc.
-            flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        }
 
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
-        let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
-        let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
+        let read_allowed =
+            !path_only && (access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR);
+        let write_allowed =
+            !path_only && (access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR);
         let append_mode = flags.contains(OFlags::APPEND);
         let insert = |handle, seek_behavior| {
             self.litebox.descriptor_table_mut().insert(ResolverEntry {
@@ -535,23 +389,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 return Err(OpenError::AlreadyExists);
             }
             return Ok(insert(
-                Handle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
+                OwnedHandle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
                 SeekBehavior::NonSeekable,
             ));
         }
 
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         let walk = self.walk_path(
-            context,
+            &context,
             self.backend.root(),
             &components,
+            path_only,
             #[cfg(debug_assertions)]
             &components,
-            if path_only {
-                SearchScope::ParentsOnly
-            } else {
-                SearchScope::AndReadableTarget
-            },
         );
         match walk {
             Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
@@ -559,7 +409,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AlreadyExists);
                 }
                 Ok(insert(
-                    Handle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
+                    OwnedHandle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
                     SeekBehavior::NonSeekable,
                 ))
             }
@@ -574,14 +424,33 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Err(OpenError::AlreadyExists);
                 }
                 if !path_only
+                    && flags.contains(OFlags::NOATIME)
                     && let PermissionCheck::ByResolver(permissions) = &file.permissions
-                    && ((read_allowed && !context.can_read(permissions))
-                        || (write_allowed && !context.can_write(permissions)))
+                    && !context.can_use_noatime(permissions)
+                {
+                    return Err(OpenError::OperationNotPermitted);
+                }
+                if !path_only
+                    && let PermissionCheck::ByResolver(permissions) = &file.permissions
+                    && ((read_allowed
+                        && !super::dac_allows_as(
+                            context.credentials,
+                            permissions.owner,
+                            permissions.mode,
+                            DacAccessKind::Read,
+                        ))
+                        || (write_allowed
+                            && !super::dac_allows_as(
+                                context.credentials,
+                                permissions.owner,
+                                permissions.mode,
+                                DacAccessKind::Write,
+                            )))
                 {
                     return Err(OpenError::AccessNotAllowed);
                 }
                 let seek_behavior = self.backend.seek_behavior(&file.item);
-                Ok(insert(Handle::File(file.item), seek_behavior))
+                Ok(insert(OwnedHandle::File(file.item), seek_behavior))
             }
             Ok(_) => {
                 // `walk_path` validates stop reasons before returning.
@@ -595,7 +464,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 };
                 let parent = self
                     .walk_to_directory(
-                        context,
+                        &context,
                         self.backend.root(),
                         &parent_components,
                         #[cfg(debug_assertions)]
@@ -605,25 +474,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         WalkError::Io => OpenError::Io,
                         WalkError::PathError(error) => error.into(),
                     })?;
-                if !Self::can_change_entries_in_dir(context, &parent) {
-                    return Err(OpenError::NoWritePerms);
-                }
-                let parent = self
-                    .owned_parent_dir(parent.handle)
-                    .map_err(|error| match error {
-                        WalkError::Io => OpenError::Io,
-                        WalkError::PathError(error) => error.into(),
-                    })?;
-                let file = self.backend.create_file_at(
-                    parent,
-                    name,
-                    CreationMetadata {
-                        mode,
-                        owner: context.acting_user(),
-                    },
-                )?;
+                let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+                    WalkError::Io => OpenError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?;
+                let file = self.backend.create_file_at(parent, name, mode)?;
                 let seek_behavior = self.backend.seek_behavior(&file);
-                Ok(insert(Handle::File(file), seek_behavior))
+                Ok(insert(OwnedHandle::File(file), seek_behavior))
             }
             Err(error) => match error {
                 WalkError::Io => Err(OpenError::Io),
@@ -632,29 +489,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         }
     }
 
-    /// Close the file at `fd`.
-    ///
-    /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
-        let mut dt = self.litebox.descriptor_table_mut();
-        let removed = dt.remove(fd);
-        drop(dt);
-        // some backends might block while closing an fd, so we've released the descriptor table
-        // lock _before_ we let the backend handle the close.
-        drop(removed);
+    fn close(&self, fd: &TypedFd<Self>) -> Result<(), CloseError> {
+        self.litebox.descriptor_table_mut().remove(fd);
         Ok(())
     }
 
-    /// Read from a file descriptor at `offset` into a buffer
-    ///
-    /// If `offset` is None, the read will start at the current file offset and update the file
-    /// offset to the end of the read.
-    /// If `offset` is Some, the file offset is not changed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the updated file offset would overflow `usize`.
-    pub fn read(
+    fn read(
         &self,
         fd: &TypedFd<Self>,
         buf: &mut [u8],
@@ -666,20 +506,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(ReadError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
-        if entry.entry.path_only {
-            return Err(ReadError::NotForReading);
-        }
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
-        let file = match &entry.entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(ReadError::NotAFile),
-        };
-        let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.read_allowed {
             return Err(ReadError::NotForReading);
         }
+        let file = match &entry.entry.handle {
+            OwnedHandle::File(file) => file,
+            OwnedHandle::Dir(_) => return Err(ReadError::NotAFile),
+        };
+        let seek_behavior = entry.entry.seek_behavior;
 
         let read_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
@@ -692,16 +529,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(read)
     }
 
-    /// Write from a buffer to a file descriptor at `offset`
-    ///
-    /// If `offset` is None, the write will start at the current file offset and update the file
-    /// offset to the end of the write.
-    /// If `offset` is Some, the file offset is not changed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the updated file offset would overflow `usize`.
-    pub fn write(
+    fn write(
         &self,
         fd: &TypedFd<Self>,
         buf: &[u8],
@@ -713,26 +541,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(WriteError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
-        if entry.entry.path_only {
-            return Err(WriteError::NotForWriting);
-        }
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
-        let file = match &entry.entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(WriteError::NotAFile),
-        };
-        let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.write_allowed {
             return Err(WriteError::NotForWriting);
         }
+        let file = match &entry.entry.handle {
+            OwnedHandle::File(file) => file,
+            OwnedHandle::Dir(_) => return Err(WriteError::NotAFile),
+        };
+        let seek_behavior = entry.entry.seek_behavior;
 
         let write_offset = match seek_behavior {
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
                 self.backend
-                    .status(HandleRef::File(file))
+                    .file_status(file)
                     .map_err(|_| WriteError::Io)?
                     .size
             }
@@ -745,10 +570,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(written)
     }
 
-    /// Reposition read/write file offset, by changing it to `offset` relative to `whence`.
-    ///
-    /// Returns the resulting offset (in bytes from start of file) on success.
-    pub fn seek(
+    fn seek(
         &self,
         fd: &TypedFd<Self>,
         offset: isize,
@@ -760,13 +582,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(SeekError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
-        let file = match &entry.entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(SeekError::NotAFile),
-        };
         if entry.entry.path_only {
-            return Err(SeekError::NotOpenForSeeking);
+            return Err(SeekError::NotAFile);
         }
+        if matches!(&entry.entry.handle, OwnedHandle::Dir(_)) {
+            let base = match whence {
+                super::SeekWhence::RelativeToBeginning => 0,
+                super::SeekWhence::RelativeToCurrentOffset => entry.entry.position,
+                super::SeekWhence::RelativeToEnd => return Err(SeekError::InvalidOffset),
+            };
+            let new_position = base
+                .checked_add_signed(offset)
+                .ok_or(SeekError::InvalidOffset)?;
+            if isize::try_from(new_position).is_err() {
+                return Err(SeekError::InvalidOffset);
+            }
+            entry.entry.position = new_position;
+            return Ok(new_position);
+        }
+        let OwnedHandle::File(file) = &entry.entry.handle else {
+            unreachable!()
+        };
 
         match entry.entry.seek_behavior {
             SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
@@ -774,7 +610,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SeekBehavior::PositionBased => {
                 let file_len = self
                     .backend
-                    .status(HandleRef::File(file))
+                    .file_status(file)
                     .map_err(|_| SeekError::Io)?
                     .size;
                 let base = match whence {
@@ -785,6 +621,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let new_position = base
                     .checked_add_signed(offset)
                     .ok_or(SeekError::InvalidOffset)?;
+                if isize::try_from(new_position).is_err() {
+                    return Err(SeekError::InvalidOffset);
+                }
                 // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
                 // file types may not. Model that distinction instead of using one resolver rule.
                 if new_position > file_len {
@@ -796,13 +635,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         }
     }
 
-    /// Truncate the file to the specified length.
-    ///
-    /// If shorter than existing size, extra data is lost. If longer than existing size, resize by
-    /// adding `\0`s.
-    ///
-    /// If `reset_offset` is true, the offset is reset to zero; otherwise, it remains unchanged.
-    pub fn truncate(
+    fn truncate(
         &self,
         fd: &TypedFd<Self>,
         length: usize,
@@ -814,13 +647,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .entry_handle(fd)
             .ok_or(TruncateError::ClosedFd)?;
         let mut entry = entry.get_entry_mut();
-        let file = match &entry.entry.handle {
-            Handle::File(file) => file,
-            Handle::Dir(_) => return Err(TruncateError::IsDirectory),
-        };
         if entry.entry.path_only {
-            return Err(TruncateError::NotOpenForWriting);
+            return Err(TruncateError::PathOnlyFd);
         }
+        let file = match &entry.entry.handle {
+            OwnedHandle::File(file) => file,
+            OwnedHandle::Dir(_) => return Err(TruncateError::IsDirectory),
+        };
         if !entry.entry.write_allowed {
             return Err(TruncateError::NotForWriting);
         }
@@ -832,55 +665,177 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(())
     }
 
-    fn may_change_metadata(context: &Context, permissions: &PermissionCheck) -> bool {
-        let PermissionCheck::ByResolver(permissions) = permissions else {
-            return true;
-        };
-        let acting = context.acting_user();
-        acting.user == UserInfo::ROOT.user || acting.user == permissions.owner.user
+    fn chmod(&self, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
+        self.chmod_as(self.user_info.into(), path, mode)
     }
 
-    /// Change the permissions of a file
-    pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let path = context.resolve(path)?;
-        let handle = self
-            .path_handle(context, &path)
-            .map_err(|error| match error {
-                WalkError::Io => ChmodError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
-        if !Self::may_change_metadata(context, &handle.permissions) {
-            return Err(ChmodError::NotTheOwner);
-        }
-        self.backend.chmod(handle.item.as_ref(), mode)
-    }
-
-    /// Change the owner of a file
-    pub fn chown(
+    fn chmod_as(
         &self,
-        context: &Context,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        let context = self.context_as(credentials);
+        let path = context.resolve(path)?;
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &path)
+                .map_err(|error| match error {
+                    WalkError::Io => ChmodError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
+        else {
+            // TODO(jayb): Add backend support for mutating the root directory itself.
+            unimplemented!("chmod root directory")
+        };
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => ChmodError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.chmod_at(parent, name, mode)
+    }
+
+    fn fd_chmod(&self, fd: &TypedFd<Self>, mode: Mode) -> Result<(), ChmodError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ChmodError::ClosedFd)?;
+        let entry = entry.get_entry();
+        if entry.entry.path_only {
+            return Err(ChmodError::PathOnlyFd);
+        }
+        match &entry.entry.handle {
+            OwnedHandle::File(file) => self.backend.chmod_file(file, mode),
+            OwnedHandle::Dir(dir) => self.backend.chmod_dir(dir, mode),
+        }
+    }
+
+    fn chown(
+        &self,
         path: impl Arg,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = context.resolve(path)?;
-        let handle = self
-            .path_handle(context, &path)
-            .map_err(|error| match error {
-                WalkError::Io => ChownError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
-        if !Self::may_change_metadata(context, &handle.permissions) {
-            return Err(ChownError::NotTheOwner);
-        }
-        self.backend.chown(handle.item.as_ref(), user, group)
+        self.chown_as(self.user_info.into(), path, user, group)
     }
 
-    /// Unlink a file
-    pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
+    fn chown_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
+            self.parent_dir_and_name(&context, &path)
+                .map_err(|error| match error {
+                    WalkError::Io => ChownError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
+        else {
+            // TODO(jayb): Add backend support for mutating the root directory itself.
+            unimplemented!("chown root directory")
+        };
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => ChownError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.chown_at(parent, name, user, group)
+    }
+
+    fn fd_chown(
+        &self,
+        fd: &TypedFd<Self>,
+        _user: Option<u16>,
+        _group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ChownError::ClosedFd)?;
+        let entry = entry.get_entry();
+        if entry.entry.path_only {
+            return Err(ChownError::PathOnlyFd);
+        }
+        // The resolver's backends do not support changing ownership through an open handle
+        // (there is no `chown`-by-handle in the `Backend` trait, only the path-based
+        // `chown_at`). In the layered stack a writable file is migrated to the upper layer
+        // before it is chowned, so the resolver only ever holds read-only descriptors here.
+        Err(ChownError::ReadOnlyFileSystem)
+    }
+
+    fn utimensat(
+        &self,
+        path: impl Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        self.utimensat_as(self.user_info.into(), path, atime, mtime)
+    }
+
+    fn utimensat_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let context = self.context_as(credentials);
+        let path = context.resolve(path)?;
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &path)
+                .map_err(|error| match error {
+                    WalkError::Io => UtimeError::Io,
+                    WalkError::PathError(error) => error.into(),
+                })?
+        else {
+            // TODO(jayb): Add backend support for mutating the root directory itself.
+            unimplemented!("utimensat root directory")
+        };
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => UtimeError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.utimensat_at(parent, name, atime, mtime)
+    }
+
+    fn fd_utimensat(
+        &self,
+        fd: &TypedFd<Self>,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(UtimeError::ClosedFd)?;
+        let entry = entry.get_entry();
+        if entry.entry.path_only {
+            return Err(UtimeError::PathOnlyFd);
+        }
+        match &entry.entry.handle {
+            OwnedHandle::File(file) => self.backend.utimensat_file(file, atime, mtime),
+            OwnedHandle::Dir(dir) => self.backend.utimensat_dir(dir, atime, mtime),
+        }
+    }
+
+    fn unlink(&self, path: impl Arg) -> Result<(), UnlinkError> {
+        self.unlink_as(self.user_info.into(), path)
+    }
+
+    fn unlink_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+    ) -> Result<(), UnlinkError> {
+        let context = self.context_as(credentials);
+        let path = context.resolve(path)?;
+        let Some((parent, name)) =
+            self.parent_dir_and_name(&context, &path)
                 .map_err(|error| match error {
                     WalkError::Io => UnlinkError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -888,23 +843,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(UnlinkError::IsADirectory);
         };
-        if !Self::can_change_entries_in_dir(context, &parent) {
-            return Err(UnlinkError::NoWritePerms);
-        }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => UnlinkError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => UnlinkError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
         self.backend.unlink_at(parent, name)
     }
 
-    /// Create a new directory
-    pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+    fn mkdir(&self, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
+        self.mkdir_as(self.user_info.into(), path, mode)
+    }
+
+    fn mkdir_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
+            self.parent_dir_and_name(&context, &path)
                 .map_err(|error| match error {
                     WalkError::Io => MkdirError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -912,32 +871,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(MkdirError::AlreadyExists);
         };
-        if !Self::can_change_entries_in_dir(context, &parent) {
-            return Err(MkdirError::NoWritePerms);
-        }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => MkdirError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
-        self.backend
-            .mkdir_at(
-                parent,
-                name,
-                CreationMetadata {
-                    mode,
-                    owner: context.acting_user(),
-                },
-            )
-            .map(|_| ())
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => MkdirError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
+        self.backend.mkdir_at(parent, name, mode).map(|_| ())
     }
 
-    /// Remove a directory
-    pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
+    fn rmdir(&self, path: impl Arg) -> Result<(), RmdirError> {
+        self.rmdir_as(self.user_info.into(), path)
+    }
+
+    fn rmdir_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+    ) -> Result<(), RmdirError> {
+        let context = self.context_as(credentials);
         let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
+            self.parent_dir_and_name(&context, &path)
                 .map_err(|error| match error {
                     WalkError::Io => RmdirError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -945,22 +898,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(RmdirError::Busy);
         };
-        if !Self::can_change_entries_in_dir(context, &parent) {
-            return Err(RmdirError::NoWritePerms);
-        }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => RmdirError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+        let parent = self.owned_parent_dir(parent).map_err(|error| match error {
+            WalkError::Io => RmdirError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
         self.backend.rmdir_at(parent, name)
     }
 
-    /// Read directory entries from a directory file descriptor.
-    ///
-    /// Returns a list of file/directory names (explicitly _not_ including `.` or `..`).
-    pub fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<super::DirEntry>, ReadDirError> {
+    fn read_dir(&self, fd: &TypedFd<Self>) -> Result<Vec<super::DirEntry>, ReadDirError> {
         let entry = self
             .litebox
             .descriptor_table()
@@ -968,11 +913,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .ok_or(ReadDirError::ClosedFd)?;
         let entry = entry.get_entry();
         if entry.entry.path_only {
-            return Err(ReadDirError::NotOpenForReading);
+            return Err(ReadDirError::PathOnlyFd);
         }
         let dir = match &entry.entry.handle {
-            Handle::File(_) => return Err(ReadDirError::NotADirectory),
-            Handle::Dir(dir) => dir,
+            OwnedHandle::File(_) => return Err(ReadDirError::NotADirectory),
+            OwnedHandle::Dir(dir) => dir,
         };
 
         let mut entries = Vec::new();
@@ -991,57 +936,121 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(entries)
     }
 
-    /// Obtain the status of a file/directory/... on the file-system.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "`CloseError` is uninhabited, so the internal close cannot fail"
-    )]
-    pub fn file_status(
+    fn with_dir_position<T>(
         &self,
-        context: &Context,
+        fd: &TypedFd<Self>,
+        f: impl FnOnce(&mut usize) -> T,
+    ) -> Result<T, ReadDirError> {
+        let entry = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(ReadDirError::ClosedFd)?;
+        let mut entry = entry.get_entry_mut();
+        if entry.entry.path_only {
+            return Err(ReadDirError::PathOnlyFd);
+        }
+        if !matches!(&entry.entry.handle, OwnedHandle::Dir(_)) {
+            return Err(ReadDirError::NotADirectory);
+        }
+        Ok(f(&mut entry.entry.position))
+    }
+
+    fn file_status(&self, path: impl Arg) -> Result<super::FileStatus, FileStatusError> {
+        self.file_status_as(self.user_info.into(), path)
+    }
+
+    fn file_status_as(
+        &self,
+        credentials: AccessCredentials<'_>,
         path: impl Arg,
     ) -> Result<super::FileStatus, FileStatusError> {
         let fd = self
-            .open(context, path, OFlags::PATH, Mode::empty())
+            .open_as(credentials, path, OFlags::PATH, Mode::empty())
             .map_err(|error| match error {
                 OpenError::PathError(error) => error.into(),
                 OpenError::Io
                 | OpenError::AccessNotAllowed
+                | OpenError::OperationNotPermitted
                 | OpenError::NoWritePerms
                 | OpenError::ReadOnlyFileSystem
                 | OpenError::AlreadyExists
-                | OpenError::TruncateError(_) => FileStatusError::Io,
+                | OpenError::TooManySymbolicLinks
+                | OpenError::TruncateError(_)
+                // Called above with OFlags::PATH only, always within Resolver::open's
+                // supported set.
+                | OpenError::UnsupportedFlags => FileStatusError::Io,
             })?;
         let status = self.fd_file_status(&fd);
         self.close(&fd).unwrap();
         status
     }
 
-    /// Equivalent to [`Self::file_status`], but on an open `fd` instead.
-    pub fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<super::FileStatus, FileStatusError> {
+    fn fd_file_status(&self, fd: &TypedFd<Self>) -> Result<super::FileStatus, FileStatusError> {
         let entry = self
             .litebox
             .descriptor_table()
             .entry_handle(fd)
             .ok_or(FileStatusError::ClosedFd)?;
         let entry = entry.get_entry();
-        self.backend.status(entry.entry.handle.as_ref())
-    }
-
-    /// Get static backing data for a file, if available and supported.
-    ///
-    /// This method returns the (entire) underlying static byte slice if the file's contents are
-    /// backed by borrowed static data (e.g., set up via [`super::in_mem::InitialNode::File`]).
-    ///
-    /// Returns `None` if no static backing data is available/supported.
-    pub fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
-        let entry = self.litebox.descriptor_table().entry_handle(fd)?;
-        let entry = entry.get_entry();
         match &entry.entry.handle {
-            Handle::File(file) => self.backend.get_static_backing_data(file),
-            Handle::Dir(_) => None,
+            OwnedHandle::File(file) => self.backend.file_status(file),
+            OwnedHandle::Dir(dir) => self.backend.dir_status(dir),
         }
     }
+
+    fn readlink(&self, path: impl Arg) -> Result<alloc::string::String, ReadlinkError> {
+        self.readlink_as(self.user_info.into(), path)
+    }
+
+    fn readlink_as(
+        &self,
+        credentials: AccessCredentials<'_>,
+        path: impl Arg,
+    ) -> Result<alloc::string::String, ReadlinkError> {
+        // Open the link itself (`O_PATH` never follows a symlink), then read its
+        // target from the backend. `open_as` does not follow symlinks here -- the
+        // shim's leaf-following runs above this layer -- so a symlink resolves to
+        // its own handle.
+        let fd = self
+            .open_as(credentials, path, OFlags::PATH, Mode::empty())
+            .map_err(|error| match error {
+                OpenError::PathError(error) => error.into(),
+                _ => ReadlinkError::Io,
+            })?;
+        let result = {
+            let entry = self
+                .litebox
+                .descriptor_table()
+                .entry_handle(&fd)
+                .ok_or(ReadlinkError::Io)?;
+            let entry = entry.get_entry();
+            match &entry.entry.handle {
+                OwnedHandle::File(file) => self.backend.read_link(file),
+                OwnedHandle::Dir(_) => Err(ReadlinkError::NotASymlink),
+            }
+        };
+        self.close(&fd).unwrap();
+        result
+    }
+
+    fn get_static_backing_data(&self, fd: &TypedFd<Self>) -> Option<&'static [u8]> {
+        let entry = self.litebox.descriptor_table().entry_handle(fd)?;
+        let entry = entry.get_entry();
+        if !entry.entry.read_allowed {
+            return None;
+        }
+        match &entry.entry.handle {
+            OwnedHandle::File(file) => self.backend.get_static_backing_data(file),
+            OwnedHandle::Dir(_) => None,
+        }
+    }
+}
+
+/// A file or a directory handle
+enum OwnedHandle {
+    File(FileHandle),
+    Dir(DirHandle),
 }
 
 #[expect(
@@ -1049,7 +1058,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     reason = "resolver fd entries carry independent descriptor flags"
 )]
 struct ResolverEntry<Backend: super::backend::Backend> {
-    handle: Handle,
+    handle: OwnedHandle,
     _backend: core::marker::PhantomData<Backend>,
     read_allowed: bool,
     write_allowed: bool,

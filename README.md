@@ -18,6 +18,7 @@ Example use cases include:
 - Sandboxing Linux applications on Linux
 - Run programs on top of SEV SNP
 - Running OP-TEE programs on Linux
+- Running x86-64 macOS programs that need no dynamic linker on Linux and Windows
 - Running on LVBS
 
 ![LiteBox and related projects](./.figures/litebox.svg)

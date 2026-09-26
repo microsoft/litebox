@@ -1,8 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! A bounded, poll-integrated SPSC message channel: the transport under unix sockets (and any
+//! other in-shim byte/message stream that pairs a writer with a reader).
+//!
+//! The queue is one `Mutex<VecDeque<T>>` shared by both ends. This deliberately replaced a
+//! `ringbuf::HeapRb` split into that crate's *caching* producer/consumer handles: each caching
+//! handle trusts a locally cached copy of the opposite index, which is only refreshed by the
+//! handle's own push/pop operations. This module's peek-first consumption
+//! ([`ReadEnd::peek_and_consume_one`]) observed the cached view without refreshing it, so a
+//! consumer could see "empty" forever while the producer's side of the very same ring held
+//! queued items -- observed live as an X client waiting on events the X server had already
+//! written (the desktop-wide stall). One shared deque under one lock has no index caching to
+//! go stale, and none of these paths are hot enough for the lock to matter.
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use litebox::{
     event::{Events, observer::Observer, polling::Pollee},
@@ -10,7 +24,6 @@ use litebox::{
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
 use litebox_common_linux::errno::Errno;
-use ringbuf::traits::{Consumer as _, Observer as _, Producer as _};
 
 use crate::ShimPlatform;
 
@@ -46,16 +59,21 @@ macro_rules! common_functions_for_channel {
     };
 }
 
-struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
-    rb: Mutex<Platform, T>,
+/// The queue both ends share, with its capacity bound.
+struct SharedQueue<Platform: RawSyncPrimitivesProvider + TimeProvider, T> {
+    items: Mutex<Platform, VecDeque<T>>,
+    capacity: usize,
+}
+
+/// One end's identity: its pollee (what the *other* end notifies) and its shutdown flag.
+struct EndPointer<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     pollee: Arc<Pollee<Platform>>,
     is_shutdown: AtomicBool,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform, T> {
-    fn new(rb: T, pollee: Arc<Pollee<Platform>>) -> Self {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EndPointer<Platform> {
+    fn new(pollee: Arc<Pollee<Platform>>) -> Self {
         Self {
-            rb: Mutex::new(rb),
             pollee,
             is_shutdown: AtomicBool::new(false),
         }
@@ -75,8 +93,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider, T> EndPointer<Platform,
 }
 
 pub(crate) struct ReadEnd<Platform: ShimPlatform, T> {
-    endpoint: alloc::sync::Arc<EndPointer<Platform, ringbuf::HeapCons<T>>>,
-    peer: alloc::sync::Weak<EndPointer<Platform, ringbuf::HeapProd<T>>>,
+    queue: Arc<SharedQueue<Platform, T>>,
+    endpoint: Arc<EndPointer<Platform>>,
+    peer: Weak<EndPointer<Platform>>,
 }
 
 impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
@@ -87,7 +106,7 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.endpoint.rb.lock().is_empty()
+        self.queue.items.lock().is_empty()
     }
 
     /// Peeks at the first item in the channel and conditionally consumes it.
@@ -103,13 +122,14 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
         // (via shutdown(SHUT_RD) or peer close), so consult the buffer before
         // returning ESHUTDOWN; the caller observes EOF only once the queue drains.
         let is_shutdown = self.is_shutdown() || self.is_peer_shutdown();
-        let mut guard = self.endpoint.rb.lock();
-        if let Some(item) = guard.first_mut() {
+        let mut guard = self.queue.items.lock();
+        if let Some(item) = guard.front_mut() {
             let (should_consume, ret) = f(item)?;
             if should_consume {
                 guard
-                    .try_pop()
+                    .pop_front()
                     .expect("Guaranteed to have an element to consume");
+                drop(guard);
                 self.update_pollee();
             }
             return Ok(ret);
@@ -125,13 +145,15 @@ impl<Platform: ShimPlatform, T> ReadEnd<Platform, T> {
 }
 
 pub(crate) struct WriteEnd<Platform: ShimPlatform, T> {
-    endpoint: alloc::sync::Arc<EndPointer<Platform, ringbuf::HeapProd<T>>>,
-    peer: alloc::sync::Weak<EndPointer<Platform, ringbuf::HeapCons<T>>>,
+    queue: Arc<SharedQueue<Platform, T>>,
+    endpoint: Arc<EndPointer<Platform>>,
+    peer: Weak<EndPointer<Platform>>,
 }
 
 impl<Platform: ShimPlatform, T> Clone for WriteEnd<Platform, T> {
     fn clone(&self) -> Self {
         Self {
+            queue: self.queue.clone(),
             endpoint: self.endpoint.clone(),
             peer: self.peer.clone(),
         }
@@ -144,28 +166,25 @@ impl<Platform: ShimPlatform, T> WriteEnd<Platform, T> {
             return Err((elem, Errno::EPIPE));
         }
 
-        let ret = self.endpoint.rb.lock().try_push(elem);
-        match ret {
-            Ok(()) => {
-                if let Some(peer) = self.peer.upgrade() {
-                    peer.pollee.notify_observers(litebox::event::Events::IN);
-                }
-                Ok(())
+        {
+            let mut guard = self.queue.items.lock();
+            if guard.len() >= self.queue.capacity {
+                return Err((elem, Errno::EAGAIN));
             }
-            Err(e) => Err((e, Errno::EAGAIN)),
+            guard.push_back(elem);
         }
+        if let Some(peer) = self.peer.upgrade() {
+            peer.pollee.notify_observers(litebox::event::Events::IN);
+        }
+        Ok(())
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.endpoint.rb.lock().is_full()
+        self.queue.items.lock().len() >= self.queue.capacity
     }
 
     pub(crate) fn is_pair(&self, reader: &ReadEnd<Platform, T>) -> bool {
-        if let Some(peer) = self.peer.upgrade() {
-            Arc::ptr_eq(&peer, &reader.endpoint)
-        } else {
-            false
-        }
+        Arc::ptr_eq(&self.queue, &reader.queue)
     }
 
     pub(crate) fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
@@ -186,21 +205,23 @@ impl<Platform: ShimPlatform, T> Channel<Platform, T> {
         writer_pollee: Arc<Pollee<Platform>>,
         reader_pollee: Arc<Pollee<Platform>>,
     ) -> Self {
-        use ringbuf::traits::Split as _;
-        let rb: ringbuf::HeapRb<T> = ringbuf::HeapRb::new(capacity);
-        let (rb_prod, rb_cons) = rb.split();
+        let queue = Arc::new(SharedQueue {
+            items: Mutex::new(VecDeque::new()),
+            capacity,
+        });
+        let writer_end = Arc::new(EndPointer::new(writer_pollee));
+        let reader_end = Arc::new(EndPointer::new(reader_pollee));
 
-        let mut writer = WriteEnd {
-            endpoint: Arc::new(EndPointer::new(rb_prod, writer_pollee)),
-            peer: alloc::sync::Weak::new(),
+        let writer = WriteEnd {
+            queue: queue.clone(),
+            endpoint: writer_end.clone(),
+            peer: Arc::downgrade(&reader_end),
         };
-        let mut reader = ReadEnd {
-            endpoint: Arc::new(EndPointer::new(rb_cons, reader_pollee)),
-            peer: alloc::sync::Weak::new(),
+        let reader = ReadEnd {
+            queue,
+            endpoint: reader_end,
+            peer: Arc::downgrade(&writer_end),
         };
-
-        writer.peer = Arc::downgrade(&reader.endpoint);
-        reader.peer = Arc::downgrade(&writer.endpoint);
 
         Self { writer, reader }
     }
@@ -286,6 +307,31 @@ mod tests {
         reader.shutdown();
         let (_val, err) = writer.try_write_one(1).unwrap_err();
         assert_eq!(err, Errno::EPIPE);
+    }
+
+    /// The regression this module's rewrite exists for: an item pushed through the write end
+    /// must be immediately visible to the read end's *peek* path (the ringbuf caching handles
+    /// this replaced could report empty forever here).
+    #[test]
+    fn peek_sees_push_immediately() {
+        let (writer, reader) = split_pair::<u32>();
+        for i in 0..100u32 {
+            writer.try_write_one(i).unwrap();
+            let got = reader
+                .peek_and_consume_one(|x| Ok((true, *x)))
+                .expect("pushed item must be immediately peekable");
+            assert_eq!(got, i);
+        }
+    }
+
+    #[test]
+    fn try_write_one_returns_eagain_when_full() {
+        let (writer, _reader) = split_pair::<u32>();
+        for i in 0..4 {
+            writer.try_write_one(i).unwrap();
+        }
+        let (_val, err) = writer.try_write_one(99).unwrap_err();
+        assert_eq!(err, Errno::EAGAIN);
     }
 
     /// Regression: `shutdown()` must wake observers on the peer's pollee so a peer blocked

@@ -195,6 +195,63 @@ fn test_static_linked_prog_with_rewriter() {
     launcher.test_load_exec_common(&executable_path);
 }
 
+/// Archive `dirs` (relative to `root`) into `out` with every entry mode `0o755`.
+///
+/// Windows has no execute bit for its `tar` to record, so it archives these files as `0o644`,
+/// and the shim, like Linux `execve`, refuses to execute a program or load an interpreter that
+/// lacks one. Everything archived here is an executable or a shared library, which a Linux root
+/// filesystem ships as `0o755`.
+fn create_rootfs_tar(root: &std::path::Path, dirs: &[&str], out: &std::path::Path) {
+    fn append(
+        builder: &mut tar::Builder<std::fs::File>,
+        host_path: &std::path::Path,
+        tar_path: &str,
+    ) {
+        let metadata = std::fs::metadata(host_path).unwrap();
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o755);
+        // litebox's tar reader parses these numerically, so they cannot be left blank.
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        if metadata.is_dir() {
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            builder
+                .append_data(&mut header, format!("{tar_path}/"), std::io::empty())
+                .unwrap();
+            let mut children: Vec<_> = std::fs::read_dir(host_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            children.sort();
+            for child in children {
+                append(
+                    builder,
+                    &host_path.join(&child),
+                    &format!("{tar_path}/{child}"),
+                );
+            }
+        } else {
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(metadata.len());
+            builder
+                .append_data(
+                    &mut header,
+                    tar_path,
+                    std::fs::File::open(host_path).unwrap(),
+                )
+                .unwrap();
+        }
+    }
+
+    let mut builder = tar::Builder::new(std::fs::File::create(out).unwrap());
+    for dir in dirs {
+        append(&mut builder, &root.join(dir), dir);
+    }
+    builder.finish().unwrap();
+}
+
 fn run_dynamic_linked_prog_with_rewriter(
     libs_to_rewrite: &[(&str, &str)],
     exec_name: &str,
@@ -284,22 +341,10 @@ fn run_dynamic_linked_prog_with_rewriter(
 
     // tar
     let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
-    let tar_data = std::process::Command::new("tar")
-        .args([
-            "-cvf",
-            tar_target_file.to_str().unwrap(),
-            "bin",
-            "lib",
-            "lib64",
-            "out",
-        ])
-        .current_dir(&tar_src_path)
-        .output()
-        .expect("Failed to create tar file");
-    assert!(
-        tar_data.status.success(),
-        "failed to create tar file {:?}",
-        std::str::from_utf8(tar_data.stderr.as_slice()).unwrap()
+    create_rootfs_tar(
+        &tar_src_path,
+        &["bin", "lib", "lib64", "out"],
+        &tar_target_file,
     );
     println!("Tar file created at: {}", tar_target_file.to_str().unwrap());
 

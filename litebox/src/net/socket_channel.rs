@@ -271,6 +271,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkP
         }
     }
 
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.unregister_observer(observer),
+            NetworkProxy::Datagram(channel) => channel.unregister_observer(observer),
+            NetworkProxy::Raw => {}
+        }
+    }
+
     fn check_io_events(&self) -> Events {
         match self {
             NetworkProxy::Stream(channel) => channel.check_io_events(),
@@ -328,6 +336,13 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     read_shutdown: AtomicBool,
     /// Whether the write side is shut down (SHUT_WR)
     write_shutdown: AtomicBool,
+    /// Whether the peer's FIN has been observed, independent of `read_shutdown`: Linux's
+    /// `tcp_fin()` sets `RCV_SHUTDOWN` (and so reports `POLLRDHUP`) the moment the FIN arrives,
+    /// even while there is still unread data queued -- `read_shutdown` only flips once this
+    /// channel's ring buffer has been fully drained (see the caller in `net/mod.rs`'s poll loop),
+    /// which is the correct trigger for `read()` returning 0 but the wrong one for `POLLRDHUP`,
+    /// which a caller may legitimately check before it has finished draining.
+    peer_fin: AtomicBool,
     /// Bytes available in RX buffer (for quick poll checks)
     rx_available: AtomicUsize,
     /// Space available in TX buffer (for quick poll checks)
@@ -358,6 +373,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             state: AtomicU32::new(SocketState::Initial as u32),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
+            peer_fin: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
 
@@ -420,7 +436,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
 
         let mut rx_cons = self.inner.rx_cons.lock();
-        let n = if flags.contains(super::ReceiveFlags::DISCARD) {
+        let n = if flags.contains(super::ReceiveFlags::PEEK) {
+            // `MSG_PEEK`: copy out without consuming, so the next read sees the same bytes.
+            let (first, second) = rx_cons.as_slices();
+            let n1 = first.len().min(buf.len());
+            buf[..n1].copy_from_slice(&first[..n1]);
+            let n2 = second.len().min(buf.len() - n1);
+            buf[n1..n1 + n2].copy_from_slice(&second[..n2]);
+            n1 + n2
+        } else if flags.contains(super::ReceiveFlags::DISCARD) {
             rx_cons.clear()
         } else if flags.contains(super::ReceiveFlags::TRUNC) {
             let n1 = rx_cons.pop_slice(buf);
@@ -435,8 +459,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             *source_addr = None;
         }
 
-        // Update available count
-        self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        // Update available count (a peek leaves the bytes, and the count, in place)
+        if !flags.contains(super::ReceiveFlags::PEEK) {
+            self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        }
 
         if n > 0 {
             return Ok(n);
@@ -490,6 +516,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.read_shutdown.store(true, Ordering::Release);
     }
 
+    /// Record that the peer's FIN has been observed, without otherwise shutting the read side
+    /// down: unlike [`Self::shutdown_read`], this does not make `read()` return 0 early, only
+    /// makes `POLLRDHUP` visible immediately, matching Linux (`tcp_fin()` sets `RCV_SHUTDOWN` the
+    /// instant the FIN arrives, before the application has necessarily drained queued data).
+    pub fn notify_peer_fin(&self) {
+        self.inner.peer_fin.store(true, Ordering::Release);
+    }
+
     /// Shutdown the write side of the socket.
     pub fn shutdown_write(&self) {
         self.inner.write_shutdown.store(true, Ordering::Release);
@@ -503,11 +537,36 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
         self.inner.pollee.register_observer(observer, mask);
     }
 
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.inner.pollee.unregister_observer(observer);
+    }
+
     fn check_io_events(&self) -> Events {
         let mut events = Events::empty();
 
         if self.is_readable() {
             events |= Events::IN;
+        }
+
+        // Linux `tcp_poll`: a receive half that is shut down -- by `shutdown(SHUT_RD)` or by
+        // the peer's FIN (`RCV_SHUTDOWN`) -- is always readable (the read returns 0) and
+        // carries `POLLRDHUP`; a send half shut down by `shutdown(SHUT_WR)` is always
+        // "writable" (the write fails with `EPIPE` at once); both halves down is `POLLHUP`.
+        let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
+        let write_shutdown = self.inner.write_shutdown.load(Ordering::Acquire);
+        let peer_fin = self.inner.peer_fin.load(Ordering::Acquire);
+        if read_shutdown {
+            events |= Events::IN | Events::RDHUP;
+        } else if peer_fin {
+            // The peer is done sending, but there may still be unread data ahead of the FIN;
+            // `IN` already reflects that correctly above, this only adds the early `RDHUP`.
+            events |= Events::RDHUP;
+        }
+        if write_shutdown {
+            events |= Events::OUT;
+        }
+        if (read_shutdown || peer_fin) && write_shutdown {
+            events |= Events::HUP;
         }
 
         match self.inner.state() {
@@ -912,6 +971,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         self.inner.pollee.register_observer(observer, mask);
+    }
+
+    fn unregister_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>) {
+        self.inner.pollee.unregister_observer(observer);
     }
 
     fn check_io_events(&self) -> Events {

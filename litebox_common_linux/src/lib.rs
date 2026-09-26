@@ -45,6 +45,7 @@ pub const STDERR_FILENO: i32 = 2;
 pub const FUTEX_WAIT: i32 = 0;
 pub const FUTEX_WAKE: i32 = 1;
 pub const FUTEX_REQUEUE: i32 = 3;
+pub const FUTEX_CMP_REQUEUE: i32 = 4;
 
 // linux/time.h
 pub const CLOCK_REALTIME: i32 = 0;
@@ -55,6 +56,13 @@ pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
 /// Special value `libc::AT_FDCWD` used to indicate openat should use
 /// the current working directory.
 pub const AT_FDCWD: i32 = -100;
+
+/// Special value for `utimensat(2)`/`futimens(3)`'s `tv_nsec` field: set the corresponding
+/// timestamp to the current time.
+pub const UTIME_NOW: u64 = 0x3fff_ffff;
+/// Special value for `utimensat(2)`/`futimens(3)`'s `tv_nsec` field: leave the corresponding
+/// timestamp unchanged.
+pub const UTIME_OMIT: u64 = 0x3fff_fffe;
 
 /// Encoding for ioctl commands.
 pub mod ioctl {
@@ -252,6 +260,7 @@ impl From<litebox::fs::FileType> for InodeType {
             litebox::fs::FileType::RegularFile => InodeType::File,
             litebox::fs::FileType::Directory => InodeType::Dir,
             litebox::fs::FileType::CharacterDevice => InodeType::CharDevice,
+            litebox::fs::FileType::SymLink => InodeType::SymLink,
             _ => unimplemented!(),
         }
     }
@@ -283,6 +292,7 @@ impl From<litebox::fs::FileType> for DirentType {
             litebox::fs::FileType::RegularFile => DirentType::Regular,
             litebox::fs::FileType::Directory => DirentType::Directory,
             litebox::fs::FileType::CharacterDevice => DirentType::CharDevice,
+            litebox::fs::FileType::SymLink => DirentType::SymLink,
             _ => unimplemented!(),
         }
     }
@@ -374,6 +384,9 @@ impl From<litebox::fs::FileStatus> for FileStat {
             owner: litebox::fs::UserInfo { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
+            atime,
+            mtime,
+            ctime,
             ..
         } = value;
         Self {
@@ -398,6 +411,12 @@ impl From<litebox::fs::FileStatus> for FileStat {
             #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
             st_blksize: blksize as i32,
             st_blocks: 0,
+            st_atime: atime.sec,
+            st_atime_nsec: atime.nsec,
+            st_mtime: mtime.sec,
+            st_mtime_nsec: mtime.nsec,
+            st_ctime: ctime.sec,
+            st_ctime_nsec: ctime.nsec,
             ..Default::default()
         }
     }
@@ -433,10 +452,6 @@ bitflags::bitflags! {
             | Self::STATX_INO.bits()
             | Self::STATX_SIZE.bits()
             | Self::STATX_BLOCKS.bits();
-        /// The basic-stats fields LiteBox actually fills. Excludes the
-        /// time bits because `FileStatus` doesn't carry timestamps.
-        const STATX_BASIC_FILLED = Self::STATX_BASIC_STATS.bits()
-            & !(Self::STATX_ATIME.bits() | Self::STATX_MTIME.bits() | Self::STATX_CTIME.bits());
         const STATX_BTIME = 0x0000_0800;
         const STATX_MNT_ID = 0x0000_1000;
         const STATX_DIOALIGN = 0x0000_2000;
@@ -514,12 +529,15 @@ impl From<litebox::fs::FileStatus> for Statx {
             owner: litebox::fs::UserInfo { user, group },
             node_info: litebox::fs::NodeInfo { dev, ino, rdev },
             blksize,
+            atime,
+            mtime,
+            ctime,
             ..
         } = value;
         let dev = dev as u64;
         let rdev = rdev.map_or(0u64, |r| r.get() as u64);
         Self {
-            stx_mask: StatxMask::STATX_BASIC_FILLED.bits(),
+            stx_mask: StatxMask::STATX_BASIC_STATS.bits(),
             stx_blksize: blksize.trunc(),
             stx_nlink: 1,
             stx_uid: u32::from(user),
@@ -527,6 +545,9 @@ impl From<litebox::fs::FileStatus> for Statx {
             stx_mode: (mode.bits() | InodeType::from(file_type) as u32).trunc(),
             stx_ino: ino as u64,
             stx_size: size as u64,
+            stx_atime: statx_timestamp(atime.sec, atime.nsec),
+            stx_mtime: statx_timestamp(mtime.sec, mtime.nsec),
+            stx_ctime: statx_timestamp(ctime.sec, ctime.nsec),
             stx_blocks: 0,
             stx_rdev_major: dev_major(rdev),
             stx_rdev_minor: dev_minor(rdev),
@@ -593,6 +614,10 @@ pub enum FcntlArg {
     SETLK(UserPtr<Flock>),
     /// Set a file lock and wait if blocked
     SETLKW(UserPtr<Flock>),
+    /// Add seals to a memfd
+    ADD_SEALS(u32),
+    /// Get seals from a memfd
+    GET_SEALS,
     /// Duplicate file descriptor
     DUPFD { cloexec: bool, min_fd: u32 },
 }
@@ -629,6 +654,22 @@ pub struct Flock {
     pub __pad1: u32,
 }
 
+bitflags::bitflags! {
+    /// The `operation` argument to `flock(2)`: a lock kind (`LOCK_SH`/`LOCK_EX`/`LOCK_UN`,
+    /// mutually exclusive) optionally combined with `LOCK_NB`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FlockOperation: core::ffi::c_int {
+        /// Place a shared lock.
+        const LOCK_SH = 1;
+        /// Place an exclusive lock.
+        const LOCK_EX = 2;
+        /// Don't block when locking.
+        const LOCK_NB = 4;
+        /// Remove an existing lock.
+        const LOCK_UN = 8;
+    }
+}
+
 const F_DUPFD: i32 = 0;
 const F_DUPFD_CLOEXEC: i32 = 1030;
 const F_GETFD: i32 = 1;
@@ -638,6 +679,8 @@ const F_SETFL: i32 = 4;
 const F_GETLK: i32 = 5;
 const F_SETLK: i32 = 6;
 const F_SETLKW: i32 = 7;
+const F_ADD_SEALS: i32 = 1033;
+const F_GET_SEALS: i32 = 1034;
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
@@ -659,6 +702,8 @@ impl FcntlArg {
             F_GETLK => Self::GETLK(UserPtrMut::from_usize(arg)),
             F_SETLK => Self::SETLK(UserPtr::from_usize(arg)),
             F_SETLKW => Self::SETLKW(UserPtr::from_usize(arg)),
+            F_ADD_SEALS => Self::ADD_SEALS(arg.trunc()),
+            F_GET_SEALS => Self::GET_SEALS,
             F_DUPFD => Self::DUPFD {
                 cloexec: false,
                 min_fd: arg.trunc(),
@@ -696,6 +741,164 @@ pub struct Termios {
     pub c_cc: [cc_t; 19usize],
 }
 
+impl Termios {
+    /// A sensible "cooked" (canonical) mode default, matching what a typical Linux pty session
+    /// starts in: canonical line editing, echo, signal-generating control characters, and
+    /// `\n` -> `\r\n` translation on output. Real values from
+    /// `include/uapi/asm-generic/termbits.h`.
+    #[must_use]
+    pub const fn default_cooked() -> Self {
+        let mut c_cc = [0u8; 19];
+        c_cc[VintrIdx::VINTR as usize] = 3; // ^C
+        c_cc[VintrIdx::VQUIT as usize] = 28; // ^\
+        c_cc[VintrIdx::VERASE as usize] = 127; // DEL
+        c_cc[VintrIdx::VKILL as usize] = 21; // ^U
+        c_cc[VintrIdx::VEOF as usize] = 4; // ^D
+        c_cc[VintrIdx::VTIME as usize] = 0;
+        c_cc[VintrIdx::VMIN as usize] = 1;
+        c_cc[VintrIdx::VSTART as usize] = 17; // ^Q
+        c_cc[VintrIdx::VSTOP as usize] = 19; // ^S
+        c_cc[VintrIdx::VSUSP as usize] = 26; // ^Z
+        c_cc[VintrIdx::VREPRINT as usize] = 18; // ^R
+        c_cc[VintrIdx::VDISCARD as usize] = 15; // ^O
+        c_cc[VintrIdx::VWERASE as usize] = 23; // ^W
+        c_cc[VintrIdx::VLNEXT as usize] = 22; // ^V
+        Self {
+            c_iflag: IFlag::ICRNL.bits() | IFlag::IXON.bits(),
+            c_oflag: OFlag::OPOST.bits() | OFlag::ONLCR.bits(),
+            c_cflag: CFlag::CS8.bits() | CFlag::CREAD.bits(),
+            c_lflag: LFlag::ISIG.bits()
+                | LFlag::ICANON.bits()
+                | LFlag::ECHO.bits()
+                | LFlag::ECHOE.bits()
+                | LFlag::ECHOK.bits()
+                | LFlag::ECHOCTL.bits()
+                | LFlag::ECHOKE.bits()
+                | LFlag::IEXTEN.bits(),
+            c_line: 0,
+            c_cc,
+        }
+    }
+
+    /// Whether canonical (line-buffered, editable) input mode is enabled.
+    #[must_use]
+    pub fn is_canonical(&self) -> bool {
+        LFlag::from_bits_truncate(self.c_lflag).contains(LFlag::ICANON)
+    }
+
+    /// Whether the terminal driver is echoing typed input back.
+    #[must_use]
+    pub fn is_echoing(&self) -> bool {
+        LFlag::from_bits_truncate(self.c_lflag).contains(LFlag::ECHO)
+    }
+}
+
+impl Default for Termios {
+    fn default() -> Self {
+        Self::default_cooked()
+    }
+}
+
+/// Indices into [`Termios::c_cc`], from `include/uapi/asm-generic/termbits.h`.
+#[non_exhaustive]
+#[repr(u8)]
+pub enum VintrIdx {
+    VINTR = 0,
+    VQUIT = 1,
+    VERASE = 2,
+    VKILL = 3,
+    VEOF = 4,
+    VTIME = 5,
+    VMIN = 6,
+    VSWTC = 7,
+    VSTART = 8,
+    VSTOP = 9,
+    VSUSP = 10,
+    VEOL = 11,
+    VREPRINT = 12,
+    VDISCARD = 13,
+    VWERASE = 14,
+    VLNEXT = 15,
+    VEOL2 = 16,
+}
+
+bitflags::bitflags! {
+    /// `c_iflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct IFlag: tcflag_t {
+        const IGNBRK = 0o000001;
+        const BRKINT = 0o000002;
+        const IGNPAR = 0o000004;
+        const PARMRK = 0o000010;
+        const INPCK  = 0o000020;
+        const ISTRIP = 0o000040;
+        const INLCR  = 0o000100;
+        const IGNCR  = 0o000200;
+        const ICRNL  = 0o000400;
+        const IXON   = 0o002000;
+        const IXANY  = 0o004000;
+        const IXOFF  = 0o010000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_oflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OFlag: tcflag_t {
+        const OPOST  = 0o000001;
+        const ONLCR  = 0o000004;
+        const OCRNL  = 0o000010;
+        const ONOCR  = 0o000020;
+        const ONLRET = 0o000040;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_cflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CFlag: tcflag_t {
+        const CS5    = 0o000000;
+        const CS6    = 0o000020;
+        const CS7    = 0o000040;
+        const CS8    = 0o000060;
+        const CSTOPB = 0o000100;
+        const CREAD  = 0o000200;
+        const PARENB = 0o000400;
+        const PARODD = 0o001000;
+        const HUPCL  = 0o002000;
+        const CLOCAL = 0o004000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `c_lflag` bits, from `include/uapi/asm-generic/termbits.h`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LFlag: tcflag_t {
+        const ISIG    = 0o000001;
+        const ICANON  = 0o000002;
+        const ECHO    = 0o000010;
+        const ECHOE   = 0o000020;
+        const ECHOK   = 0o000040;
+        const ECHONL  = 0o000100;
+        const NOFLSH  = 0o000200;
+        const TOSTOP  = 0o000400;
+        const ECHOCTL = 0o001000;
+        const ECHOPRT = 0o002000;
+        const ECHOKE  = 0o004000;
+        const FLUSHO  = 0o010000;
+        const PENDIN  = 0o040000;
+        const IEXTEN  = 0o100000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 #[derive(Debug, Clone, FromBytes, IntoBytes)]
 #[repr(C)]
 pub struct Winsize {
@@ -707,10 +910,65 @@ pub struct Winsize {
 
 pub const TCGETS: u32 = 0x5401;
 pub const TCSETS: u32 = 0x5402;
+pub const TCSETSW: u32 = 0x5403;
+pub const TCSETSF: u32 = 0x5404;
+pub const TIOCSCTTY: u32 = 0x540E;
+pub const TIOCGPGRP: u32 = 0x540F;
+pub const TIOCSPGRP: u32 = 0x5410;
 pub const TIOCGWINSZ: u32 = 0x5413;
+pub const TIOCSWINSZ: u32 = 0x5414;
 pub const FIONBIO: u32 = 0x5421;
 pub const FIOCLEX: u32 = 0x5451;
 pub const TIOCGPTN: u32 = 0x80045430;
+pub const TIOCSPTLCK: u32 = 0x40045431;
+pub const FBIOGET_VSCREENINFO: u32 = 0x4600;
+pub const FBIOPUT_VSCREENINFO: u32 = 0x4601;
+pub const FBIOGET_FSCREENINFO: u32 = 0x4602;
+pub const FBIOPAN_DISPLAY: u32 = 0x4606;
+pub const FBIOBLANK: u32 = 0x4611;
+
+/// `IFNAMSIZ` (`linux/if.h`): the fixed size of `ifr_name`/`ifc_ifcu.ifcu_req[].ifr_name`.
+pub const IFNAMSIZ: usize = 16;
+
+// Legacy socket ioctls (`linux/sockios.h`), the interface-enumeration path
+// `getifaddrs(3)`/rtnetlink bypasses but tools built directly against BSD-style
+// `ifreq`/`ifconf` (busybox `ifconfig`, `route`, ...) still use.
+pub const SIOCGIFCONF: u32 = 0x8912;
+pub const SIOCGIFFLAGS: u32 = 0x8913;
+pub const SIOCGIFADDR: u32 = 0x8915;
+pub const SIOCGIFNETMASK: u32 = 0x891b;
+pub const SIOCGIFBRDADDR: u32 = 0x8919;
+pub const SIOCGIFHWADDR: u32 = 0x8927;
+pub const SIOCGIFMTU: u32 = 0x8921;
+pub const SIOCGIFINDEX: u32 = 0x8933;
+pub const SIOCGIFTXQLEN: u32 = 0x8942;
+
+bitflags::bitflags! {
+    /// `ifr_flags` bits this shim reports (`linux/if.h`).
+    #[derive(Debug, Clone, Copy)]
+    pub struct IfrFlags: u16 {
+        const IFF_UP = 0x1;
+        const IFF_BROADCAST = 0x2;
+        const IFF_LOOPBACK = 0x8;
+        const IFF_RUNNING = 0x40;
+        const IFF_MULTICAST = 0x1000;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+/// When a new terminal attribute value takes effect, per `tcsetattr(3)`'s
+/// `TCSANOW`/`TCSADRAIN`/`TCSAFLUSH` distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSetAction {
+    /// Apply immediately (`TCSETS`/`TCSANOW`).
+    Now,
+    /// Apply after all pending output has been written (`TCSETSW`/`TCSADRAIN`).
+    Drain,
+    /// Apply after pending output is written, discarding unread input first
+    /// (`TCSETSF`/`TCSAFLUSH`).
+    Flush,
+}
 
 /// Commands for use with `ioctl`.
 #[non_exhaustive]
@@ -719,16 +977,40 @@ pub enum IoctlArg {
     /// Get the current serial port settings.
     TCGETS(UserPtrMut<Termios>),
     /// Set the current serial port settings.
-    TCSETS(UserPtr<Termios>),
+    TCSETS(UserPtr<Termios>, TerminalSetAction),
+    /// Set this terminal as the calling session's controlling terminal.
+    TIOCSCTTY(u32),
+    /// Get the foreground process group ID of the controlling terminal.
+    TIOCGPGRP(UserPtrMut<i32>),
+    /// Set the foreground process group ID of the controlling terminal.
+    TIOCSPGRP(UserPtr<i32>),
     /// Get window size.
     TIOCGWINSZ(UserPtrMut<Winsize>),
+    /// Set window size.
+    TIOCSWINSZ(UserPtr<Winsize>),
     /// Obtain device unit number, which can be used to generate
     /// the filename of the pseudo-terminal slave device.
     TIOCGPTN(UserPtrMut<u32>),
+    /// Lock or unlock a Unix98 pseudo-terminal slave device.
+    TIOCSPTLCK(UserPtr<i32>),
     /// Enables or disables non-blocking mode
     FIONBIO(UserPtr<i32>),
     /// Set close on exec
     FIOCLEX,
+    /// Get the framebuffer's variable (mode) screen info.
+    FBIOGET_VSCREENINFO(UserPtrMut<litebox::fs::devices::FbVarScreeninfo>),
+    /// Set the framebuffer's variable (mode) screen info. litebox clamps rather than rejects a
+    /// request it cannot satisfy exactly -- see
+    /// [`litebox::fs::devices::Framebuffer::put_var_screeninfo`]'s doc comment.
+    FBIOPUT_VSCREENINFO(UserPtr<litebox::fs::devices::FbVarScreeninfo>),
+    /// Get the framebuffer's fixed (hardware) screen info.
+    FBIOGET_FSCREENINFO(UserPtrMut<litebox::fs::devices::FbFixScreeninfo>),
+    /// Pan the framebuffer's visible window to a new offset within the virtual screen (double
+    /// buffering / page flip).
+    FBIOPAN_DISPLAY(UserPtr<litebox::fs::devices::FbVarScreeninfo>),
+    /// Blank/unblank the display. litebox has no real hardware to blank; treated as a no-op that
+    /// always succeeds, matching how a real fbdev driver treats an unsupported blank mode.
+    FBIOBLANK,
     Raw {
         cmd: u32,
         arg: UserPtrMut<u8>,
@@ -767,6 +1049,7 @@ pub enum SockType {
     Stream = 1,
     Datagram = 2,
     Raw = 3,
+    SeqPacket = 5,
 }
 
 bitflags::bitflags! {
@@ -810,6 +1093,8 @@ pub enum UnixProtocol {
 #[derive(Debug, IntEnum, Clone, Copy)]
 pub enum IpOption {
     TOS = 1,
+    RETOPTS = 7,
+    RECVTTL = 12,
 }
 
 #[repr(u32)]
@@ -827,6 +1112,9 @@ pub enum SocketOption {
     /// shall block the process during close() until it can transmit the data
     /// or until the time expires.
     LINGER = 13,
+    /// `SO_PASSCRED`: deliver an `SCM_CREDENTIALS` control message (the
+    /// sender's `struct ucred`) with every `recvmsg` on an `AF_UNIX` socket.
+    PASSCRED = 16,
     PEERCRED = 17,
     RCVTIMEO = 20,
     SNDTIMEO = 21,
@@ -876,7 +1164,7 @@ impl SocketOptionName {
     }
 }
 
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
 #[repr(C)]
 pub struct Ucred {
     pub pid: u32,
@@ -974,6 +1262,40 @@ pub struct TimeVal {
     tv_sec: time_t,
     tv_usec: suseconds_t,
 }
+/// Linux's `struct rusage` (`resource.h`), padded to musl's LP64 layout, which reserves 16 extra
+/// `long`s past the POSIX-visible fields. `#[repr(C)]` is load-bearing here for the same reason
+/// as `Sysinfo`: this is written into guest memory as raw bytes for the guest's libc to read back
+/// as the real ABI struct. Only `ru_utime`/`ru_stime` currently carry a real, host-measured value
+/// (see `Task::sys_wait4`); every other field is explicitly zeroed rather than left as
+/// guest-visible uninitialized memory.
+///
+/// Exactly the 144-byte kernel ABI, deliberately WITHOUT musl's trailing
+/// `__reserved[16]`: musl reserves that space in its own definition, but the
+/// kernel never writes it, and glibc's `struct rusage` is only these 144
+/// bytes -- copying a 272-byte musl-shaped struct into a glibc guest's stack
+/// buffer overruns it by 128 bytes (witnessed: iperf3's `cpu_util()` canary
+/// trip, "*** stack smashing detected ***", on the Linux CI runner).
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, IntoBytes, Immutable)]
+pub struct Rusage {
+    pub ru_utime: TimeVal,
+    pub ru_stime: TimeVal,
+    pub ru_maxrss: i64,
+    pub ru_ixrss: i64,
+    pub ru_idrss: i64,
+    pub ru_isrss: i64,
+    pub ru_minflt: i64,
+    pub ru_majflt: i64,
+    pub ru_nswap: i64,
+    pub ru_inblock: i64,
+    pub ru_oublock: i64,
+    pub ru_msgsnd: i64,
+    pub ru_msgrcv: i64,
+    pub ru_nsignals: i64,
+    pub ru_nvcsw: i64,
+    pub ru_nivcsw: i64,
+}
+
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]
 pub struct ItimerVal {
@@ -1287,7 +1609,7 @@ pub type rlim_t = usize;
 
 /// Used by getrlimit and setrlimit syscalls
 #[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[derive(Clone, Debug, FromBytes, IntoBytes)]
 pub struct Rlimit {
     pub rlim_cur: rlim_t,
     pub rlim_max: rlim_t,
@@ -1295,7 +1617,7 @@ pub struct Rlimit {
 
 /// Used by prlimit64 syscall
 #[repr(C)]
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Clone, FromBytes, IntoBytes)]
 pub struct Rlimit64 {
     pub rlim_cur: u64,
     pub rlim_max: u64,
@@ -1413,7 +1735,7 @@ pub struct RobustListHead {
     /// the relative position of the futex field to examine. This way
     /// we keep userspace flexible, to freely shape its data-structure,
     /// without hardcoding any particular offset into the kernel.
-    pub futex_offset: usize,
+    pub futex_offset: isize,
     /// The death of the thread may race with userspace setting
     /// up a lock's links. So to handle this race, userspace first
     /// sets this field to the address of the to-be-taken lock,
@@ -1442,11 +1764,55 @@ pub enum EpollOp {
     EpollCtlMod = 3,
 }
 
+/// The kernel's `struct epoll_event`.
+///
+/// x86-64 Linux declares it `__attribute__((packed))` (12 bytes, `data` at
+/// offset 4); every other architecture -- aarch64 included -- uses natural
+/// alignment (16 bytes, 4 padding bytes after `events`, `data` at offset 8).
+/// Handing a packed layout to an aarch64 guest made it misparse every event
+/// array `epoll_wait` returned: single events happened to read a `data` of
+/// ~0 and misdispatched harmlessly, but a multi-event wakeup straddled the
+/// 12-vs-16-byte stride into garbage fds -- observed live as libuv's
+/// `uv__io_poll` aborting on `Assertion failed: fd >= 0` the first time a
+/// spawned child's stdio produced three simultaneous events.
+///
+/// Construct via [`EpollEvent::new`]; the aarch64 variant carries the padding
+/// as an explicit field so `IntoBytes` stays derivable (zerocopy rejects
+/// implicit padding).
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
 #[repr(C, packed)]
 pub struct EpollEvent {
     pub events: u32,
     pub data: u64,
+}
+
+/// See the x86-64 variant's doc comment for why the layout is per-arch.
+#[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
+#[repr(C)]
+pub struct EpollEvent {
+    pub events: u32,
+    _pad: u32,
+    pub data: u64,
+}
+
+impl EpollEvent {
+    #[must_use]
+    pub fn new(events: u32, data: u64) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Self { events, data }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self {
+                events,
+                _pad: 0,
+                data,
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes)]
@@ -1519,6 +1885,13 @@ pub enum MadviseBehavior {
     DontNeedLocked = 24,
 }
 
+// `#[repr(C)]` is load-bearing, not decoration: this struct is written into guest memory as raw
+// bytes (`write_at_offset`) for the guest's libc to read back as the real Linux ABI `struct
+// sysinfo`. Without it, `repr(Rust)`'s free field-reordering silently scrambled the layout --
+// `busybox free`, which reads `totalram`/`freeram` straight out of this syscall, printed
+// nonsensical multi-exabyte figures on real hardware (previously unobserved, since `free` always
+// died at the missing `/proc/meminfo` open before reaching the `printf` that would have shown it).
+#[repr(C)]
 #[derive(Clone, Debug, Default, FromBytes, IntoBytes)]
 pub struct Sysinfo {
     /// Seconds since boot
@@ -1541,6 +1914,12 @@ pub struct Sysinfo {
     pub procs: u16,
     /// Explicit padding for m68k
     pub pad: u16,
+    /// Explicit padding so `totalhigh` lands on its natural 8-byte alignment, matching the real
+    /// ABI's implicit compiler-inserted padding here. `IntoBytes` refuses a type with implicit
+    /// padding (it would write uninitialized bytes into guest memory), so this has to be a real,
+    /// zeroed field rather than a gap.
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad2: u32,
     /// Total high memory size
     pub totalhigh: usize,
     /// Available high memory size
@@ -1550,6 +1929,41 @@ pub struct Sysinfo {
     /// Padding: libc5 uses this..
     #[allow(clippy::pub_underscore_fields)]
     pub _f: [u8; 20 - 2 * core::mem::size_of::<usize>() - core::mem::size_of::<u32>()],
+    /// Trailing padding rounding the struct up to `usize`'s alignment (the real ABI struct gets
+    /// this from the compiler implicitly; see `_pad2` above on why it must be explicit here).
+    #[allow(clippy::pub_underscore_fields)]
+    pub _pad3: u32,
+}
+
+/// Linux's `statfs` struct (the generic `<asm-generic/statfs.h>` layout `statfs`/`fstatfs` use on
+/// both x86-64 and aarch64 -- unlike `stat`, the 64-bit `statfs` ABI does not diverge per-arch).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes)]
+pub struct Statfs {
+    /// Filesystem magic number (e.g. a `*_MAGIC` constant from `<linux/magic.h>`).
+    pub f_type: i64,
+    /// Optimal transfer block size.
+    pub f_bsize: i64,
+    /// Total data blocks in the filesystem.
+    pub f_blocks: u64,
+    /// Free blocks.
+    pub f_bfree: u64,
+    /// Free blocks available to unprivileged users.
+    pub f_bavail: u64,
+    /// Total file nodes.
+    pub f_files: u64,
+    /// Free file nodes.
+    pub f_ffree: u64,
+    /// Filesystem ID.
+    pub f_fsid: [i32; 2],
+    /// Maximum length of filenames.
+    pub f_namelen: i64,
+    /// Fragment size.
+    pub f_frsize: i64,
+    /// Mount flags (`ST_*`).
+    pub f_flags: i64,
+    /// Reserved for future use.
+    pub f_spare: [i64; 4],
 }
 
 bitflags::bitflags! {
@@ -1641,11 +2055,77 @@ pub struct LinuxDirent64 {
 
 #[non_exhaustive]
 #[repr(i32)]
-#[derive(Debug, IntEnum)]
+#[derive(Debug, Clone, Copy, IntEnum)]
 pub enum ClockId {
     RealTime = 0,
     Monotonic = 1,
+    /// `CLOCK_PROCESS_CPUTIME_ID`: CPU time consumed so far by all threads of the calling
+    /// process. Unlike the other clocks here, this is *not* wall-clock time -- it only
+    /// advances while the process is actually running on a CPU.
+    ProcessCpuTime = 2,
+    /// `CLOCK_THREAD_CPUTIME_ID`: CPU time consumed so far by the calling thread only. Also not
+    /// wall-clock time.
+    ThreadCpuTime = 3,
+    /// `CLOCK_MONOTONIC_RAW`: like `CLOCK_MONOTONIC`, but on real Linux specifically excludes any
+    /// NTP frequency slewing, giving raw hardware-derived elapsed time.
+    ///
+    /// Simplification: LiteBox maps this onto the same value as [`ClockId::Monotonic`]. This is
+    /// legitimate for macOS, whose `Monotonic` is already sourced from the host's
+    /// `CLOCK_MONOTONIC_RAW`; on other hosts it means we don't distinguish NTP-slewed monotonic
+    /// time from raw monotonic time, which is a real (if minor) semantic difference from Linux.
+    MonotonicRaw = 4,
+    /// `CLOCK_REALTIME_COARSE`: a faster, lower-resolution version of `CLOCK_REALTIME`, intended
+    /// to trade precision for speed.
+    ///
+    /// Simplification: LiteBox maps this onto the same (full-precision) value as
+    /// [`ClockId::RealTime`]. We have no separate, cheaper-to-read coarse clock source, so callers
+    /// get a more precise answer than real Linux would give, never a less precise one.
+    RealTimeCoarse = 5,
+    /// `CLOCK_MONOTONIC_COARSE`: a faster, lower-resolution version of `CLOCK_MONOTONIC`.
+    ///
+    /// Simplification: as with [`ClockId::RealTimeCoarse`], LiteBox maps this onto the full
+    /// precision [`ClockId::Monotonic`] value.
     MonotonicCoarse = 6,
+    /// `CLOCK_BOOTTIME`: like `CLOCK_MONOTONIC`, but on real Linux also includes time the system
+    /// spent suspended.
+    ///
+    /// Simplification: LiteBox has no notion of the guest (or host) being suspended -- there is
+    /// no way for wall-clock time to elapse without [`ClockId::Monotonic`] also elapsing -- so
+    /// this is mapped onto the exact same value as [`ClockId::Monotonic`].
+    Boottime = 7,
+}
+
+/// The `struct sched_param` argument of `sched_setparam`/`sched_getparam`/`sched_setscheduler`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes)]
+pub struct SchedParam {
+    pub sched_priority: i32,
+}
+
+/// Scheduling policy values accepted by `sched_setscheduler`, and reported by
+/// `sched_getscheduler`.
+///
+/// LiteBox's process model has no real scheduling-class enforcement to expose (there is a single
+/// cooperative/host-scheduled pool of threads, not a configurable in-guest scheduler), so these
+/// are recognized only so `sched_setscheduler`/`sched_getscheduler`/`sched_setparam`/
+/// `sched_getparam` can give believable, inert answers: the non-real-time policies are accepted
+/// as no-ops (matching what an unprivileged real Linux process seeing a plain `SCHED_OTHER`
+/// system would experience), while the real-time policies are recognized only so they can be
+/// correctly rejected with `EPERM` -- matching real Linux's behavior for a process without
+/// `CAP_SYS_NICE`, which is a real, accurate constraint on LiteBox guests (they never have that
+/// capability), not a shortcut.
+pub mod sched_policy {
+    pub const SCHED_OTHER: i32 = 0;
+    pub const SCHED_FIFO: i32 = 1;
+    pub const SCHED_RR: i32 = 2;
+    pub const SCHED_BATCH: i32 = 3;
+    pub const SCHED_IDLE: i32 = 5;
+    pub const SCHED_DEADLINE: i32 = 6;
+    /// May be OR'd into the `policy` argument of `sched_setscheduler` to request that the
+    /// policy revert to `SCHED_OTHER` across `fork()`. LiteBox has no `fork()` (see
+    /// `litebox_shim_linux`'s `do_clone`), so this bit is accepted, to avoid spuriously
+    /// rejecting an otherwise well-formed call, but has no effect.
+    pub const SCHED_RESET_ON_FORK: i32 = 0x4000_0000;
 }
 
 bitflags::bitflags! {
@@ -1663,7 +2143,10 @@ bitflags::bitflags! {
 pub enum FutexOperation {
     Wait = 0,
     Wake = 1,
+    Requeue = 3,
+    CmpRequeue = 4,
     WaitBitset = 9,
+    WakeBitset = 10,
 }
 
 bitflags::bitflags! {
@@ -1701,6 +2184,37 @@ pub enum FutexArgs {
         addr: UserPtrMut<u32>,
         flags: FutexFlags,
         count: u32,
+    },
+    WakeBitset {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        count: u32,
+        bitmask: u32,
+    },
+    /// `FUTEX_REQUEUE`: wake up to `num_to_wake` waiters on `addr`, then move up to
+    /// `num_to_requeue` of the *remaining* waiters on `addr` onto `addr2`'s wait queue, without
+    /// waking them.
+    ///
+    /// Note the raw syscall ABI quirk this is parsed from: for this operation, the argument slot
+    /// normally used for `WAIT`'s `timeout` pointer is instead a plain integer (`num_to_requeue`),
+    /// not a `timespec*` -- see `man 2 futex`.
+    Requeue {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        num_to_wake: u32,
+        num_to_requeue: u32,
+        addr2: UserPtrMut<u32>,
+    },
+    /// `FUTEX_CMP_REQUEUE`: identical to `Requeue`, but first atomically checks that the word at
+    /// `addr` still equals `expected_value`, failing with `EAGAIN` otherwise (closes the race
+    /// where the value changed between userspace's check and this syscall).
+    CmpRequeue {
+        addr: UserPtrMut<u32>,
+        flags: FutexFlags,
+        num_to_wake: u32,
+        num_to_requeue: u32,
+        addr2: UserPtrMut<u32>,
+        expected_value: u32,
     },
 }
 
@@ -1756,14 +2270,47 @@ pub enum PrctlOption {
     SetFpMode = 45,
     GetFpMode = 46,
     CapAmbient = 47,
+    /// `PR_SET_VMA` (`0x53564d41`, the ASCII "SVMA"): name an anonymous
+    /// mapping (`PR_SET_VMA_ANON_NAME`). Emitted by PartitionAlloc for every
+    /// large allocation, so it must decode (and be visible in a syscall
+    /// trace) even though the shim answers it with `EINVAL` like a kernel
+    /// built without `CONFIG_ANON_VMA_NAME`.
+    SetVma = 0x5356_4d41,
 }
 
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum PrctlArg {
+    SetPDeathSig(Option<signal::Signal>),
+    GetPDeathSig(UserPtrMut<i32>),
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
+    GetDumpable,
+    /// `PR_SET_DUMPABLE`: the decoder has already checked the value is
+    /// `SUID_DUMP_DISABLE` (0) or `SUID_DUMP_USER` (1), as Linux does.
+    SetDumpable(u64),
+    /// `PR_SET_VMA`: `opcode` is `PR_SET_VMA_ANON_NAME` (0) on every kernel
+    /// so far; `addr`/`len` bound the mapping and `arg` is the name pointer.
+    SetVma {
+        opcode: u64,
+        addr: usize,
+        len: usize,
+        arg: usize,
+    },
     CapBSetRead(usize),
+    SetNoNewPrivs,
+    GetNoNewPrivs,
+    /// `PR_SET_KEEPCAPS`: whether the permitted capability set is cleared on
+    /// a UID switch away from 0. LiteBox does not model capabilities at all
+    /// (`CapBSetRead` above always reports none held), so this is accepted
+    /// as a no-op rather than rejected -- real callers (e.g. `setpriv
+    /// --reuid`/`--regid`, which sets this before dropping privileges so
+    /// the subsequent explicit `capset` isn't undone by the kernel's
+    /// default clear-on-UID-change behavior) only need the call to
+    /// succeed, not to observe any actual capability state change.
+    SetKeepCaps(bool),
+    /// `PR_GET_KEEPCAPS`: see `SetKeepCaps`.
+    GetKeepCaps,
 }
 
 #[repr(i32)]
@@ -1786,6 +2333,8 @@ pub struct ReceiveFlags(u32);
 
 bitflags::bitflags! {
     impl ReceiveFlags: u32 {
+        /// `MSG_CTRUNC`: ancillary data was truncated
+        const CTRUNC = 0x8;
         /// `MSG_CMSG_CLOEXEC`: close-on-exec for the associated file descriptor
         const CMSG_CLOEXEC = 0x40000000;
         /// `MSG_DONTWAIT`: non-blocking operation
@@ -1932,6 +2481,66 @@ impl ShutdownHow {
     }
 }
 
+/// Flags accepted by `inotify_init1(2)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct InotifyInitFlags(u32);
+
+bitflags::bitflags! {
+    impl InotifyInitFlags: u32 {
+        const NONBLOCK = 0x0000_0800;
+        const CLOEXEC = 0x0008_0000;
+    }
+}
+
+/// Event-selection and behavior flags accepted by `inotify_add_watch(2)`.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct InotifyMask(u32);
+
+bitflags::bitflags! {
+    impl InotifyMask: u32 {
+        const ACCESS = 0x0000_0001;
+        const MODIFY = 0x0000_0002;
+        const ATTRIB = 0x0000_0004;
+        const CLOSE_WRITE = 0x0000_0008;
+        const CLOSE_NOWRITE = 0x0000_0010;
+        const OPEN = 0x0000_0020;
+        const MOVED_FROM = 0x0000_0040;
+        const MOVED_TO = 0x0000_0080;
+        const CREATE = 0x0000_0100;
+        const DELETE = 0x0000_0200;
+        const DELETE_SELF = 0x0000_0400;
+        const MOVE_SELF = 0x0000_0800;
+        const UNMOUNT = 0x0000_2000;
+        const Q_OVERFLOW = 0x0000_4000;
+        const IGNORED = 0x0000_8000;
+        const ONLYDIR = 0x0100_0000;
+        const DONT_FOLLOW = 0x0200_0000;
+        const EXCL_UNLINK = 0x0400_0000;
+        const MASK_CREATE = 0x1000_0000;
+        const MASK_ADD = 0x2000_0000;
+        const ISDIR = 0x4000_0000;
+        const ONESHOT = 0x8000_0000;
+    }
+}
+
+impl InotifyMask {
+    pub const CLOSE: Self = Self::CLOSE_WRITE.union(Self::CLOSE_NOWRITE);
+    pub const MOVE: Self = Self::MOVED_FROM.union(Self::MOVED_TO);
+    pub const ALL_EVENTS: Self = Self::from_bits_retain(0x0000_0fff);
+}
+
+/// Fixed header of one variable-length inotify queue record.
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
+#[repr(C)]
+pub struct InotifyEvent {
+    pub wd: i32,
+    pub mask: u32,
+    pub cookie: u32,
+    pub len: u32,
+}
+
 /// Request to syscall handler
 #[non_exhaustive]
 #[derive(Debug)]
@@ -1980,6 +2589,33 @@ pub enum SyscallRequest {
     Chdir {
         pathname: UserPtr<c_char>,
     },
+    Fchdir {
+        fd: i32,
+    },
+    /// `chroot(2)`: make `path` the calling process's root directory.
+    Chroot {
+        path: UserPtr<c_char>,
+    },
+    /// `seccomp(2)`: `operation` is one of `SECCOMP_SET_MODE_STRICT` (0),
+    /// `SECCOMP_SET_MODE_FILTER` (1), `SECCOMP_GET_ACTION_AVAIL` (2) or
+    /// `SECCOMP_GET_NOTIF_SIZES` (3); `args` points at an operation-specific
+    /// structure (a `struct sock_fprog` for `SET_MODE_FILTER`).
+    /// `prctl(PR_SET_SECCOMP, mode, filter)` decodes to the equivalent
+    /// request (`flags == 0`), exactly as Linux's `prctl_set_seccomp` does.
+    Seccomp {
+        operation: u32,
+        flags: u32,
+        args: UserPtr<u8>,
+    },
+    /// `mseal(2)` (Linux 6.10+, syscall 462 on every architecture): seal the
+    /// mappings in `[addr, addr + len)` against further changes. Decoded so
+    /// that it appears in the syscall trace even though nothing implements
+    /// sealing yet (the shim answers `ENOSYS`, like an older kernel).
+    Mseal {
+        addr: usize,
+        len: usize,
+        flags: usize,
+    },
     Mmap {
         addr: usize,
         length: usize,
@@ -2020,6 +2656,10 @@ pub enum SyscallRequest {
         sigsetsize: usize,
     },
     RtSigreturn,
+    RtSigsuspend {
+        mask: Option<UserPtr<SigSet>>,
+        sigsetsize: usize,
+    },
     Kill {
         pid: i32,
         sig: i32,
@@ -2204,6 +2844,10 @@ pub enum SyscallRequest {
         fd: i32,
         arg: FcntlArg,
     },
+    Flock {
+        fd: i32,
+        operation: FlockOperation,
+    },
     Getcwd {
         buf: UserPtrMut<u8>,
         size: usize,
@@ -2265,6 +2909,82 @@ pub enum SyscallRequest {
         fd: i32,
         length: usize,
     },
+    /// `fadvise64(2)` (`posix_fadvise`): `advice` is one of the `POSIX_FADV_*` values.
+    Fadvise64 {
+        fd: i32,
+        offset: usize,
+        len: usize,
+        advice: i32,
+    },
+    /// `fallocate(2)`: `mode` is the `FALLOC_FL_*` bit set; `offset`/`len` are the raw
+    /// (sign-bearing) `off_t` arguments, range-checked by the handler.
+    Fallocate {
+        fd: i32,
+        mode: i32,
+        offset: usize,
+        len: usize,
+    },
+    /// `preadv2(2)`: `preadv` plus the `RWF_*` flag word; `pos_l`/`pos_h` of `-1` means
+    /// "the file offset" (`readv` semantics).
+    Preadv2 {
+        fd: i32,
+        iovec: UserPtr<IoReadVec>,
+        iovcnt: usize,
+        pos_l: usize,
+        pos_h: usize,
+        flags: u32,
+    },
+    /// `pwritev2(2)`: `pwritev` plus the `RWF_*` flag word (see [`Self::Preadv2`]).
+    Pwritev2 {
+        fd: i32,
+        iovec: UserPtr<IoWriteVec>,
+        iovcnt: usize,
+        pos_l: usize,
+        pos_h: usize,
+        flags: u32,
+    },
+    /// `rt_sigtimedwait(2)`: dequeue one signal from `set`, waiting up to `timeout`.
+    RtSigtimedwait {
+        set: Option<UserPtr<SigSet>>,
+        info: Option<UserPtrMut<signal::Siginfo>>,
+        timeout: TimeParam,
+        sigsetsize: usize,
+    },
+    /// `rt_sigqueueinfo(2)`: send `sig` with a caller-supplied `siginfo` to process `pid`.
+    RtSigqueueinfo {
+        pid: i32,
+        sig: i32,
+        info: Option<UserPtr<signal::Siginfo>>,
+    },
+    /// `rt_tgsigqueueinfo(2)`: send `sig` with a caller-supplied `siginfo` to thread `tid` of
+    /// thread group `tgid`.
+    RtTgsigqueueinfo {
+        tgid: i32,
+        tid: i32,
+        sig: i32,
+        info: Option<UserPtr<signal::Siginfo>>,
+    },
+    /// `getpriority(2)`: `which` is `PRIO_PROCESS`/`PRIO_PGRP`/`PRIO_USER`.
+    Getpriority {
+        which: i32,
+        who: i32,
+    },
+    /// `setpriority(2)`: `niceval` is the requested nice value, clamped by the handler.
+    Setpriority {
+        which: i32,
+        who: i32,
+        niceval: i32,
+    },
+    /// `membarrier(2)`.
+    Membarrier {
+        cmd: i32,
+        flags: u32,
+        cpu_id: i32,
+    },
+    MemfdCreate {
+        name: UserPtr<c_char>,
+        flags: u32,
+    },
     Mknodat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
@@ -2274,6 +2994,81 @@ pub enum SyscallRequest {
     Unlinkat {
         dirfd: i32,
         pathname: UserPtr<c_char>,
+        flags: AtFlags,
+    },
+    /// Reached through both `symlink` (with `newdirfd` forced to `AT_FDCWD`) and
+    /// `symlinkat`. `target` is the link's verbatim contents, `linkpath` is where
+    /// the link is created (resolved against `newdirfd`).
+    Symlinkat {
+        target: UserPtr<c_char>,
+        newdirfd: i32,
+        linkpath: UserPtr<c_char>,
+    },
+    /// Reached through both `link` (both dirfds forced to `AT_FDCWD`, `flags` 0)
+    /// and `linkat`. `flags` carries the raw `AT_*` bits (`AT_SYMLINK_FOLLOW`,
+    /// `AT_EMPTY_PATH`); the shim interprets them.
+    Linkat {
+        olddirfd: i32,
+        oldpath: UserPtr<c_char>,
+        newdirfd: i32,
+        newpath: UserPtr<c_char>,
+        flags: u32,
+    },
+    /// Reached through `rename` (both dirfds forced to `AT_FDCWD`, `flags` 0),
+    /// `renameat` (both dirfds real, `flags` 0), and `renameat2` (all fields as
+    /// passed). `flags` carries the raw `RENAME_*` bits (`NOREPLACE`/`EXCHANGE`/
+    /// `WHITEOUT`); the shim interprets them.
+    Renameat2 {
+        olddirfd: i32,
+        oldpath: UserPtr<c_char>,
+        newdirfd: i32,
+        newpath: UserPtr<c_char>,
+        flags: u32,
+    },
+    /// Reached through `chmod`, `fchmodat`, and `fchmodat2`.
+    ///
+    /// `flags` is empty for `chmod`/`fchmodat`, since the raw `fchmodat(2)` syscall (unlike
+    /// `fchmodat2(2)`) takes no `flags` argument.
+    Fchmodat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        mode: u32,
+        flags: AtFlags,
+    },
+    Fchmod {
+        fd: i32,
+        mode: u32,
+    },
+    /// Reached through `fsync`, `fdatasync`, and `syncfs`: every LiteBox filesystem is
+    /// memory-resident, so the three collapse into one "is this fd open" request.
+    Fsync {
+        fd: i32,
+    },
+    /// Reached through `fchown`. `owner`/`group` carry the raw `uid_t`/`gid_t`; a value of
+    /// `(uid_t)-1` (`u32::MAX`) means "leave unchanged", which the shim maps to `None`.
+    Fchown {
+        fd: i32,
+        owner: u32,
+        group: u32,
+    },
+    /// Reached through `chown` (dirfd `AT_FDCWD`, flags empty), `lchown` (dirfd
+    /// `AT_FDCWD`, flags `AT_SYMLINK_NOFOLLOW`), and `fchownat`. `owner`/`group`
+    /// carry the raw `uid_t`/`gid_t`; a value of `(uid_t)-1` (`u32::MAX`) means
+    /// "leave unchanged", which the shim maps to `None`.
+    Fchownat {
+        dirfd: i32,
+        pathname: UserPtr<c_char>,
+        owner: u32,
+        group: u32,
+        flags: AtFlags,
+    },
+    /// Reached through `utimensat`. Also covers `futimens`, which has no syscall of its own:
+    /// glibc implements it as `utimensat(fd, NULL, times, 0)`, signaled here by `pathname` being
+    /// `None`.
+    Utimensat {
+        dirfd: i32,
+        pathname: Option<UserPtr<c_char>>,
+        times: Option<UserPtr<Timespec>>,
         flags: AtFlags,
     },
     Newfstatat {
@@ -2286,6 +3081,18 @@ pub enum SyscallRequest {
         initval: u32,
         flags: EfdFlags,
     },
+    InotifyInit1 {
+        flags: InotifyInitFlags,
+    },
+    InotifyAddWatch {
+        fd: i32,
+        pathname: UserPtr<c_char>,
+        mask: InotifyMask,
+    },
+    InotifyRmWatch {
+        fd: i32,
+        wd: i32,
+    },
     Pipe2 {
         pipefd: UserPtrMut<u32>,
         flags: litebox::fs::OFlags,
@@ -2295,6 +3102,9 @@ pub enum SyscallRequest {
     },
     Clone3 {
         args: UserPtr<CloneArgs>,
+    },
+    Unshare {
+        flags: CloneFlags,
     },
     /// Manipulate thread-local storage information.
     /// Returns `ENOSYS` on x86_64.
@@ -2360,16 +3170,87 @@ pub enum SyscallRequest {
     },
     Getpid,
     Getppid,
+    /// `getpgid(pid)`. `pid == 0` means "the calling process".
+    Getpgid {
+        pid: i32,
+    },
+    /// `setpgid(pid, pgid)`. `pid == 0` means "the calling process"; `pgid == 0` means "use
+    /// `pid`'s own value as the new group id".
+    Setpgid {
+        pid: i32,
+        pgid: i32,
+    },
+    /// `setsid()`: create a new session with the caller as its leader.
+    Setsid,
+    /// `wait4(pid, wstatus, options, rusage)`.
+    ///
+    /// This is the only wait syscall aarch64 offers besides `waitid`; libc's
+    /// `wait`/`waitpid`/`wait3` all funnel into it. `rusage` is carried as a raw
+    /// address rather than a typed pointer because the shim has no `struct
+    /// rusage` accounting to report -- see `Task::sys_wait4`.
+    Wait4 {
+        pid: i32,
+        wstatus: Option<UserPtrMut<i32>>,
+        options: i32,
+        rusage: usize,
+    },
     Getuid,
     Geteuid,
     Getgid,
     Getegid,
+    Getgroups {
+        size: i32,
+        list: UserPtrMut<u32>,
+    },
+    Setgroups {
+        size: usize,
+        list: UserPtr<u32>,
+    },
+    Setuid {
+        uid: u32,
+    },
+    Setgid {
+        gid: u32,
+    },
+    /// Reached through `setresuid`; also the syscall libc's `seteuid(2)` wrapper
+    /// makes (`setresuid(-1, euid, -1)`). `u32::MAX` (-1) leaves a field unchanged.
+    Setresuid {
+        ruid: u32,
+        euid: u32,
+        suid: u32,
+    },
+    /// See [`Self::Setresuid`]; `setresgid` / libc `setegid`.
+    Setresgid {
+        rgid: u32,
+        egid: u32,
+        sgid: u32,
+    },
+    /// `getresuid`: read back the real/effective/saved uid set by `Setresuid`.
+    Getresuid {
+        ruid: UserPtrMut<u32>,
+        euid: UserPtrMut<u32>,
+        suid: UserPtrMut<u32>,
+    },
+    /// See [`Self::Getresuid`]; `getresgid`, with group IDs.
+    Getresgid {
+        rgid: UserPtrMut<u32>,
+        egid: UserPtrMut<u32>,
+        sgid: UserPtrMut<u32>,
+    },
     Sysinfo {
         buf: UserPtrMut<Sysinfo>,
+    },
+    Getrusage {
+        who: i32,
+        usage: UserPtrMut<Rusage>,
     },
     CapGet {
         header: UserPtrMut<CapHeader>,
         data: Option<UserPtrMut<CapData>>,
+    },
+    CapSet {
+        header: UserPtr<CapHeader>,
+        data: Option<UserPtr<CapData>>,
     },
     GetDirent64 {
         fd: i32,
@@ -2382,6 +3263,22 @@ pub enum SyscallRequest {
         mask: UserPtrMut<u8>,
     },
     SchedYield,
+    SchedGetParam {
+        pid: Option<i32>,
+        param: UserPtrMut<SchedParam>,
+    },
+    SchedSetParam {
+        pid: Option<i32>,
+        param: UserPtr<SchedParam>,
+    },
+    SchedGetScheduler {
+        pid: Option<i32>,
+    },
+    SchedSetScheduler {
+        pid: Option<i32>,
+        policy: i32,
+        param: UserPtr<SchedParam>,
+    },
     Futex {
         args: FutexArgs,
     },
@@ -2416,6 +3313,25 @@ pub enum SyscallRequest {
         mask: StatxMask,
         statxbuf: UserPtrMut<Statx>,
     },
+    Statfs {
+        pathname: UserPtr<c_char>,
+        buf: UserPtrMut<Statfs>,
+    },
+    Fstatfs {
+        fd: i32,
+        buf: UserPtrMut<Statfs>,
+    },
+    /// `ptrace(request, pid, addr, data)`. `addr`/`data` are decoded generically here (as a raw
+    /// address and a raw machine word, matching the real syscall's `void *`/`long` signature) --
+    /// `request` determines how they are actually used (e.g. `PTRACE_GETREGSET`'s `data` is a
+    /// `struct iovec *`), so that per-request interpretation happens in
+    /// `syscalls::ptrace::Task::sys_ptrace`, not here.
+    Ptrace {
+        request: i64,
+        pid: i32,
+        addr: usize,
+        data: usize,
+    },
 }
 
 impl SyscallRequest {
@@ -2436,6 +3352,11 @@ impl SyscallRequest {
     // `ReinterpretTruncatedFromUsize` in order to support stronger types (especially if one desires
     // a fail-free parse), but also quite helpful is to define a `TryFrom<i32>` and use the `:?`
     // combinator (which will return `EINVAL` upon parse failure).
+    /// `mseal` (Linux 6.10) is number 462 on every architecture but is absent from the
+    /// `syscalls` 0.6.18 table, so `Sysno::new` cannot name it; `try_from_raw` decodes it by
+    /// raw number so it is a visible request rather than an anonymous "unknown syscall".
+    const SYS_MSEAL: usize = 462;
+
     pub fn try_from_raw(
         syscall_number: usize,
         ctx: &PtRegs,
@@ -2502,6 +3423,9 @@ impl SyscallRequest {
             };
         }
 
+        if syscall_number == Self::SYS_MSEAL {
+            return Ok(sys_req!(Mseal { addr, len, flags }));
+        }
         let sysno = Sysno::new(syscall_number).ok_or_else(|| {
             log_unsupported(format_args!("unknown syscall {syscall_number}"));
             errno::Errno::ENOSYS
@@ -2523,7 +3447,50 @@ impl SyscallRequest {
                 mode: ctx.sys_req_arg(1),
             },
             Sysno::mkdirat => sys_req!(Mkdirat { dirfd, pathname:*, mode }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chmod => SyscallRequest::Fchmodat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                mode: ctx.sys_req_arg(1),
+                flags: AtFlags::empty(),
+            },
+            Sysno::fchmod => sys_req!(Fchmod { fd, mode }),
+            Sysno::fchown => sys_req!(Fchown { fd, owner, group }),
+            Sysno::fchmodat => sys_req!(Fchmodat {
+                dirfd,
+                pathname:*,
+                mode,
+                flags: { AtFlags::empty() },
+            }),
+            Sysno::fchmodat2 => sys_req!(Fchmodat { dirfd, pathname:*, mode, flags }),
+            Sysno::fsync | Sysno::fdatasync | Sysno::syncfs => sys_req!(Fsync { fd }),
+            Sysno::fchownat => sys_req!(Fchownat { dirfd, pathname:*, owner, group, flags }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::chown => SyscallRequest::Fchownat {
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+                flags: AtFlags::empty(),
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::lchown => SyscallRequest::Fchownat {
+                // `lchown` acts on the link itself, i.e. `fchownat(.., AT_SYMLINK_NOFOLLOW)`.
+                dirfd: AT_FDCWD,
+                pathname: ctx.sys_req_ptr(0),
+                owner: ctx.sys_req_arg(1),
+                group: ctx.sys_req_arg(2),
+                flags: AtFlags::AT_SYMLINK_NOFOLLOW,
+            },
+            Sysno::utimensat => sys_req!(Utimensat { dirfd, pathname:*, times:*, flags }),
             Sysno::chdir => sys_req!(Chdir { pathname:* }),
+            Sysno::chroot => sys_req!(Chroot { path:* }),
+            Sysno::seccomp => sys_req!(Seccomp {
+                operation,
+                flags,
+                args:*
+            }),
+            Sysno::fchdir => sys_req!(Fchdir { fd }),
             Sysno::mmap => sys_req!(Mmap {
                 addr,
                 length,
@@ -2549,9 +3516,22 @@ impl SyscallRequest {
                 sigsetsize,
             }),
             Sysno::rt_sigreturn => SyscallRequest::RtSigreturn,
+            Sysno::rt_sigsuspend => sys_req!(RtSigsuspend { mask:*, sigsetsize }),
             Sysno::kill => sys_req!(Kill { pid, sig }),
             Sysno::tkill => sys_req!(Tkill { tid, sig }),
             Sysno::tgkill => sys_req!(Tgkill { tgid, tid, sig }),
+            Sysno::rt_sigtimedwait => {
+                sys_req!(RtSigtimedwait { set:*, info:*, timeout: { =*> TimeParam::timespec_old }, sigsetsize })
+            }
+            Sysno::rt_sigqueueinfo => sys_req!(RtSigqueueinfo { pid, sig, info:* }),
+            Sysno::rt_tgsigqueueinfo => sys_req!(RtTgsigqueueinfo { tgid, tid, sig, info:* }),
+            Sysno::getpriority => sys_req!(Getpriority { which, who }),
+            Sysno::setpriority => sys_req!(Setpriority {
+                which,
+                who,
+                niceval
+            }),
+            Sysno::membarrier => sys_req!(Membarrier { cmd, flags, cpu_id }),
             Sysno::sigaltstack => sys_req!(Sigaltstack { ss:*, old_ss:* }),
             Sysno::ioctl => SyscallRequest::Ioctl {
                 fd: ctx.sys_req_arg(0),
@@ -2559,11 +3539,23 @@ impl SyscallRequest {
                     let cmd = ctx.sys_req_arg(1);
                     match cmd {
                         TCGETS => IoctlArg::TCGETS(ctx.sys_req_ptr(2)),
-                        TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2)),
+                        TCSETS => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Now),
+                        TCSETSW => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Drain),
+                        TCSETSF => IoctlArg::TCSETS(ctx.sys_req_ptr(2), TerminalSetAction::Flush),
+                        TIOCSCTTY => IoctlArg::TIOCSCTTY(ctx.sys_req_arg(2)),
+                        TIOCGPGRP => IoctlArg::TIOCGPGRP(ctx.sys_req_ptr(2)),
+                        TIOCSPGRP => IoctlArg::TIOCSPGRP(ctx.sys_req_ptr(2)),
                         TIOCGWINSZ => IoctlArg::TIOCGWINSZ(ctx.sys_req_ptr(2)),
+                        TIOCSWINSZ => IoctlArg::TIOCSWINSZ(ctx.sys_req_ptr(2)),
                         TIOCGPTN => IoctlArg::TIOCGPTN(ctx.sys_req_ptr(2)),
+                        TIOCSPTLCK => IoctlArg::TIOCSPTLCK(ctx.sys_req_ptr(2)),
                         FIONBIO => IoctlArg::FIONBIO(ctx.sys_req_ptr(2)),
                         FIOCLEX => IoctlArg::FIOCLEX,
+                        FBIOGET_VSCREENINFO => IoctlArg::FBIOGET_VSCREENINFO(ctx.sys_req_ptr(2)),
+                        FBIOPUT_VSCREENINFO => IoctlArg::FBIOPUT_VSCREENINFO(ctx.sys_req_ptr(2)),
+                        FBIOGET_FSCREENINFO => IoctlArg::FBIOGET_FSCREENINFO(ctx.sys_req_ptr(2)),
+                        FBIOPAN_DISPLAY => IoctlArg::FBIOPAN_DISPLAY(ctx.sys_req_ptr(2)),
+                        FBIOBLANK => IoctlArg::FBIOBLANK,
                         _ => IoctlArg::Raw {
                             cmd,
                             arg: ctx.sys_req_ptr(2),
@@ -2588,6 +3580,8 @@ impl SyscallRequest {
             Sysno::writev => sys_req!(Writev { fd, iovec:*, iovcnt }),
             Sysno::preadv => sys_req!(Preadv { fd, iovec:*, iovcnt, pos_l, pos_h }),
             Sysno::pwritev => sys_req!(Pwritev { fd, iovec:*, iovcnt, pos_l, pos_h }),
+            Sysno::preadv2 => sys_req!(Preadv2 { fd, iovec:*, iovcnt, pos_l, pos_h, flags }),
+            Sysno::pwritev2 => sys_req!(Pwritev2 { fd, iovec:*, iovcnt, pos_l, pos_h, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::access => SyscallRequest::Faccessat {
                 dirfd: AT_FDCWD,
@@ -2685,6 +3679,15 @@ impl SyscallRequest {
                     })?,
                 }
             }
+            Sysno::flock => {
+                let operation: i32 = ctx.sys_req_arg(1);
+                SyscallRequest::Flock {
+                    fd: ctx.sys_req_arg(0),
+                    operation: FlockOperation::from_bits(operation).ok_or_else(|| {
+                        unsupported_einval(format_args!("flock(operation = {operation})"))
+                    })?,
+                }
+            }
             Sysno::gettimeofday => sys_req!(Gettimeofday { tv:*, tz:* }),
             Sysno::clock_gettime => {
                 sys_req!(ClockGettime { clockid, tp: { =*> TimeParam::timespec_old } })
@@ -2717,10 +3720,27 @@ impl SyscallRequest {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::getpgid => sys_req!(Getpgid { pid }),
+            Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
+            Sysno::setsid => SyscallRequest::Setsid,
+            Sysno::wait4 => sys_req!(Wait4 {
+                pid,
+                wstatus:*,
+                options,
+                rusage
+            }),
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,
             Sysno::getegid => SyscallRequest::Getegid,
+            Sysno::getgroups => sys_req!(Getgroups { size, list:* }),
+            Sysno::setgroups => sys_req!(Setgroups { size, list:* }),
+            Sysno::setuid => sys_req!(Setuid { uid }),
+            Sysno::setgid => sys_req!(Setgid { gid }),
+            Sysno::setresuid => sys_req!(Setresuid { ruid, euid, suid }),
+            Sysno::setresgid => sys_req!(Setresgid { rgid, egid, sgid }),
+            Sysno::getresuid => sys_req!(Getresuid { ruid:*, euid:*, suid:* }),
+            Sysno::getresgid => sys_req!(Getresgid { rgid:*, egid:*, sgid:* }),
             Sysno::epoll_ctl => sys_req!(EpollCtl { epfd, op:?, fd, event:* }),
             #[cfg(target_arch = "x86_64")]
             Sysno::epoll_wait => {
@@ -2767,21 +3787,121 @@ impl SyscallRequest {
                 let op: u32 = ctx.sys_req_arg(0);
                 if let Ok(op) = PrctlOption::try_from(op) {
                     match op {
+                        PrctlOption::SetPDeathSig => {
+                            let signal: i32 = ctx.sys_req_arg(1);
+                            let signal = if signal == 0 {
+                                None
+                            } else {
+                                Some(signal::Signal::try_from(signal)?)
+                            };
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetPDeathSig(signal),
+                            }
+                        }
+                        PrctlOption::GetPDeathSig => SyscallRequest::Prctl {
+                            args: PrctlArg::GetPDeathSig(ctx.sys_req_ptr(1)),
+                        },
                         PrctlOption::SetName => SyscallRequest::Prctl {
                             args: PrctlArg::SetName(ctx.sys_req_ptr(1)),
                         },
                         PrctlOption::GetName => SyscallRequest::Prctl {
                             args: PrctlArg::GetName(ctx.sys_req_ptr(1)),
                         },
+                        // Linux (`kernel/sys.c`) does not check the trailing arguments for
+                        // `PR_GET_DUMPABLE`; callers (Chromium's sandbox) pass whatever is
+                        // left in the registers, and an `EINVAL` here reads as "no dumpable
+                        // support" and trips their CHECK.
+                        PrctlOption::GetDumpable => SyscallRequest::Prctl {
+                            args: PrctlArg::GetDumpable,
+                        },
+                        // Linux (`kernel/sys.c`): only `SUID_DUMP_DISABLE` (0) and
+                        // `SUID_DUMP_USER` (1) may be set through prctl; anything else is
+                        // `EINVAL`. The trailing arguments are not checked by the kernel.
+                        PrctlOption::SetDumpable => {
+                            let value: usize = ctx.sys_req_arg(1);
+                            if value > 1 {
+                                return Err(unsupported_einval(format_args!(
+                                    "prctl(PR_SET_DUMPABLE, {value})"
+                                )));
+                            }
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetDumpable(value as u64),
+                            }
+                        }
+                        // `prctl(PR_SET_SECCOMP, mode, filter)` is `seccomp(op, 0, filter)`
+                        // with `SECCOMP_MODE_STRICT` (1) -> `SECCOMP_SET_MODE_STRICT` (0) and
+                        // `SECCOMP_MODE_FILTER` (2) -> `SECCOMP_SET_MODE_FILTER` (1), exactly
+                        // as the kernel's `prctl_set_seccomp` maps it; other modes are
+                        // `EINVAL`.
+                        PrctlOption::SetSeccomp => {
+                            let mode: usize = ctx.sys_req_arg(1);
+                            let operation = match mode {
+                                1 => 0,
+                                2 => 1,
+                                _ => {
+                                    return Err(unsupported_einval(format_args!(
+                                        "prctl(PR_SET_SECCOMP, mode = {mode})"
+                                    )));
+                                }
+                            };
+                            SyscallRequest::Seccomp {
+                                operation,
+                                flags: 0,
+                                args: ctx.sys_req_ptr(2),
+                            }
+                        }
+                        PrctlOption::SetVma => SyscallRequest::Prctl {
+                            args: PrctlArg::SetVma {
+                                opcode: ctx.sys_req_arg::<usize>(1) as u64,
+                                addr: ctx.sys_req_arg(2),
+                                len: ctx.sys_req_arg(3),
+                                arg: ctx.sys_req_arg(4),
+                            },
+                        },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
                         },
+                        PrctlOption::SetNoNewPrivs
+                            if ctx.sys_req_arg::<usize>(1) == 1
+                                && (2..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetNoNewPrivs,
+                            }
+                        }
+                        PrctlOption::GetNoNewPrivs
+                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetNoNewPrivs,
+                            }
+                        }
+                        PrctlOption::SetKeepCaps
+                            if (2..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            let keep: usize = ctx.sys_req_arg(1);
+                            if keep > 1 {
+                                return Err(unsupported_einval(format_args!(
+                                    "prctl(PR_SET_KEEPCAPS, {keep})"
+                                )));
+                            }
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::SetKeepCaps(keep == 1),
+                            }
+                        }
+                        PrctlOption::GetKeepCaps
+                            if (1..5).all(|index| ctx.sys_req_arg::<usize>(index) == 0) =>
+                        {
+                            SyscallRequest::Prctl {
+                                args: PrctlArg::GetKeepCaps,
+                            }
+                        }
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));
                         }
                     }
                 } else {
-                    return Err(errno::Errno::EINVAL);
+                    return Err(unsupported_einval(format_args!("prctl(option = {op:#x})")));
                 }
             }
             #[cfg(target_arch = "x86_64")]
@@ -2823,6 +3943,39 @@ impl SyscallRequest {
                 mode_and_type: ctx.sys_req_arg(1),
                 dev: ctx.sys_req_arg(2),
             },
+            Sysno::symlinkat => sys_req!(Symlinkat { target:*, newdirfd, linkpath:* }),
+            Sysno::linkat => {
+                sys_req!(Linkat { olddirfd, oldpath:*, newdirfd, newpath:*, flags })
+            }
+            #[cfg(target_arch = "x86_64")]
+            Sysno::symlink => {
+                // symlink is symlinkat with newdirfd AT_FDCWD
+                SyscallRequest::Symlinkat {
+                    target: ctx.sys_req_ptr(0),
+                    newdirfd: AT_FDCWD,
+                    linkpath: ctx.sys_req_ptr(1),
+                }
+            }
+            Sysno::renameat2 => {
+                sys_req!(Renameat2 { olddirfd, oldpath:*, newdirfd, newpath:*, flags })
+            }
+            Sysno::renameat => SyscallRequest::Renameat2 {
+                // `renameat` has no flags argument; it is `renameat2` with flags 0.
+                olddirfd: ctx.sys_req_arg(0),
+                oldpath: ctx.sys_req_ptr(1),
+                newdirfd: ctx.sys_req_arg(2),
+                newpath: ctx.sys_req_ptr(3),
+                flags: 0,
+            },
+            #[cfg(target_arch = "x86_64")]
+            Sysno::rename => SyscallRequest::Renameat2 {
+                // `rename` is `renameat2` with both dirfds AT_FDCWD and flags 0.
+                olddirfd: AT_FDCWD,
+                oldpath: ctx.sys_req_ptr(0),
+                newdirfd: AT_FDCWD,
+                newpath: ctx.sys_req_ptr(1),
+                flags: 0,
+            },
             Sysno::unlinkat => sys_req!(Unlinkat { dirfd,pathname:*,flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::unlink => {
@@ -2855,6 +4008,19 @@ impl SyscallRequest {
                 }
             }
             Sysno::ftruncate => sys_req!(Ftruncate { fd, length }),
+            Sysno::fallocate => sys_req!(Fallocate {
+                fd,
+                mode,
+                offset,
+                len
+            }),
+            Sysno::fadvise64 => sys_req!(Fadvise64 {
+                fd,
+                offset,
+                len,
+                advice
+            }),
+            Sysno::memfd_create => sys_req!(MemfdCreate { name:*, flags }),
             #[cfg(target_arch = "x86_64")]
             Sysno::newfstatat => sys_req!(Newfstatat { dirfd,pathname:*,buf:*,flags }),
             #[cfg(target_arch = "aarch64")]
@@ -2865,6 +4031,13 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::inotify_init => SyscallRequest::InotifyInit1 {
+                flags: InotifyInitFlags::empty(),
+            },
+            Sysno::inotify_init1 => sys_req!(InotifyInit1 { flags }),
+            Sysno::inotify_add_watch => sys_req!(InotifyAddWatch { fd, pathname:*, mask }),
+            Sysno::inotify_rm_watch => sys_req!(InotifyRmWatch { fd, wd }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -2899,6 +4072,9 @@ impl SyscallRequest {
                     args: ctx.sys_req_ptr(0),
                 }
             }
+            Sysno::unshare => SyscallRequest::Unshare {
+                flags: CloneFlags::from_bits_retain(ctx.sys_req_arg(0)),
+            },
             Sysno::set_robust_list => {
                 if ctx.sys_req_arg::<usize>(1) == size_of::<RobustListHead>() {
                     sys_req!(SetRobustList { head })
@@ -2915,7 +4091,9 @@ impl SyscallRequest {
                 }
             }
             Sysno::sysinfo => sys_req!(Sysinfo { buf:* }),
+            Sysno::getrusage => sys_req!(Getrusage { who, usage:* }),
             Sysno::capget => sys_req!(CapGet { header:*,data:* }),
+            Sysno::capset => sys_req!(CapSet { header:*,data:* }),
             Sysno::getdents64 => sys_req!(GetDirent64 { fd,dirp:*,count }),
             Sysno::sched_getaffinity => {
                 let pid = ctx.sys_req_arg(0);
@@ -2926,6 +4104,34 @@ impl SyscallRequest {
                 }
             }
             Sysno::sched_yield => SyscallRequest::SchedYield,
+            Sysno::sched_getparam => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedGetParam {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    param: ctx.sys_req_ptr(1),
+                }
+            }
+            Sysno::sched_setparam => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetParam {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    param: ctx.sys_req_ptr(1),
+                }
+            }
+            Sysno::sched_getscheduler => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedGetScheduler {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                }
+            }
+            Sysno::sched_setscheduler => {
+                let pid = ctx.sys_req_arg(0);
+                SyscallRequest::SchedSetScheduler {
+                    pid: if pid == 0 { None } else { Some(pid) },
+                    policy: ctx.sys_req_arg(1),
+                    param: ctx.sys_req_ptr(2),
+                }
+            }
             Sysno::futex => Self::parse_futex(ctx, TimeParam::timespec_old, unsupported_einval)?,
             Sysno::execve => sys_req!(Execve { pathname:*, argv:*, envp:* }),
             Sysno::umask => sys_req!(Umask { mask }),
@@ -2942,8 +4148,16 @@ impl SyscallRequest {
                 mask,
                 statxbuf:*,
             }),
+            Sysno::statfs => sys_req!(Statfs { pathname:*, buf:* }),
+            Sysno::fstatfs => sys_req!(Fstatfs { fd, buf:* }),
+            Sysno::ptrace => sys_req!(Ptrace {
+                request,
+                pid,
+                addr,
+                data
+            }),
             // Noisy unsupported syscalls.
-            Sysno::io_uring_setup | Sysno::rseq | Sysno::statfs => {
+            Sysno::io_uring_setup | Sysno::rseq => {
                 return Err(errno::Errno::ENOSYS);
             }
             sysno => {
@@ -2988,6 +4202,46 @@ impl SyscallRequest {
                 flags,
                 count: val,
             },
+            FutexOperation::WakeBitset => FutexArgs::WakeBitset {
+                addr,
+                flags,
+                count: val,
+                bitmask: ctx.sys_req_arg(5),
+            },
+            FutexOperation::Requeue => {
+                let num_to_requeue: u32 = ctx.sys_req_arg(3);
+                // Linux's requeue quotas are `int`, despite occupying raw register-sized syscall
+                // slots. Negative values are rejected before comparing or mutating either queue.
+                if val > i32::MAX as u32 || num_to_requeue > i32::MAX as u32 {
+                    return Err(errno::Errno::EINVAL);
+                }
+                FutexArgs::Requeue {
+                    addr,
+                    flags,
+                    num_to_wake: val,
+                    // ABI quirk: for `FUTEX_REQUEUE`, argument slot 3 (`WAIT`'s `timeout` pointer)
+                    // is instead a plain integer, `num_to_requeue` -- not read via `time_param`/
+                    // `sys_req_ptr` at all. See `man 2 futex`.
+                    num_to_requeue,
+                    addr2: ctx.sys_req_ptr(4),
+                }
+            }
+            FutexOperation::CmpRequeue => {
+                let num_to_requeue: u32 = ctx.sys_req_arg(3);
+                if val > i32::MAX as u32 || num_to_requeue > i32::MAX as u32 {
+                    return Err(errno::Errno::EINVAL);
+                }
+                FutexArgs::CmpRequeue {
+                    addr,
+                    flags,
+                    num_to_wake: val,
+                    // Same ABI quirk as `FUTEX_REQUEUE`: argument slot 3 is the plain integer
+                    // `num_to_requeue`, not a `timeout` pointer. See `man 2 futex`.
+                    num_to_requeue,
+                    addr2: ctx.sys_req_ptr(4),
+                    expected_value: ctx.sys_req_arg(5),
+                }
+            }
         };
         Ok(SyscallRequest::Futex { args })
     }
@@ -3146,6 +4400,93 @@ pub struct PtRegs {
     pub syscallno: i32,
     pub unused2: u32,
     /* add remaining fields if needed */
+}
+
+/// AArch64 `ptrace(2)` request numbers, `NT_*` regset identifiers, and the
+/// on-the-wire register layouts a `PTRACE_GETREGSET`/`PTRACE_SETREGSET`
+/// exchanges for each supported `NT_*` type.
+///
+/// Only [`NT_PRSTATUS`](ptrace::NT_PRSTATUS) (general-purpose registers) and
+/// [`NT_ARM_TLS`](ptrace::NT_ARM_TLS)
+/// (`TPIDR_EL0`) are supported. Any other regset is a distinct, real Linux
+/// type this shim does not populate (`NT_PRFPREG`/`NT_ARM_VFP` for FPSIMD
+/// state, `NT_ARM_HW_BREAK`/`NT_ARM_HW_WATCH` for hardware debug state, and
+/// so on) -- callers must reject those explicitly (`ENODEV`), never return
+/// zeroed or partially-populated data for them.
+#[cfg(target_arch = "aarch64")]
+pub mod ptrace {
+    use zerocopy::{FromBytes, Immutable, IntoBytes};
+
+    /// Attach to a running process, stopping it and delivering the usual
+    /// synthetic `SIGSTOP` a tracer waits for.
+    pub const PTRACE_ATTACH: i64 = 16;
+    /// Detach, resuming the tracee.
+    pub const PTRACE_DETACH: i64 = 17;
+    /// Resume a stopped tracee, optionally delivering `data` as a pending
+    /// signal.
+    pub const PTRACE_CONT: i64 = 7;
+    /// Attach without an implicit stop; the tracee keeps running until an
+    /// explicit `PTRACE_INTERRUPT` (unsupported here) or its own trap.
+    pub const PTRACE_SEIZE: i64 = 0x4206;
+    /// Read a register set (`data` is a `struct iovec *`).
+    pub const PTRACE_GETREGSET: i64 = 0x4204;
+    /// Write a register set (`data` is a `struct iovec *`).
+    pub const PTRACE_SETREGSET: i64 = 0x4205;
+
+    /// General-purpose registers: `x0`-`x30`, `sp`, `pc`, `pstate` -- Linux's
+    /// `struct user_pt_regs`, 34 64-bit words / 272 bytes. Field-for-field
+    /// identical to the leading portion of [`super::PtRegs`], so marshaling is
+    /// a direct copy, never a reinterpretation of unrelated bytes.
+    pub const NT_PRSTATUS: i32 = 1;
+    /// A single `u64`: the thread pointer, `TPIDR_EL0`.
+    pub const NT_ARM_TLS: i32 = 0x401;
+
+    /// The `NT_PRSTATUS` wire layout: Linux's `struct user_pt_regs`.
+    #[derive(Clone, Copy, Debug, Default, FromBytes, IntoBytes, Immutable)]
+    #[repr(C)]
+    pub struct UserPtRegs {
+        pub regs: [u64; super::AARCH64_GENERAL_REGISTER_COUNT],
+        pub sp: u64,
+        pub pc: u64,
+        pub pstate: u64,
+    }
+
+    impl UserPtRegs {
+        pub const SIZE: usize = core::mem::size_of::<Self>();
+    }
+
+    impl From<&super::PtRegs> for UserPtRegs {
+        fn from(ctx: &super::PtRegs) -> Self {
+            let mut regs = [0u64; super::AARCH64_GENERAL_REGISTER_COUNT];
+            for (dst, src) in regs.iter_mut().zip(ctx.regs.iter()) {
+                *dst = *src as u64;
+            }
+            Self {
+                regs,
+                sp: ctx.sp as u64,
+                pc: ctx.pc as u64,
+                pstate: ctx.pstate,
+            }
+        }
+    }
+
+    impl UserPtRegs {
+        /// Applies this register set onto `ctx`, leaving every field `ctx`
+        /// owns that is not part of `NT_PRSTATUS` (`orig_x0`, `syscallno`)
+        /// untouched.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "this module is aarch64-only, where `u64` and `usize` have the same width"
+        )]
+        pub fn write_into(&self, ctx: &mut super::PtRegs) {
+            for (dst, src) in ctx.regs.iter_mut().zip(self.regs.iter()) {
+                *dst = *src as usize;
+            }
+            ctx.sp = self.sp as usize;
+            ctx.pc = self.pc as usize;
+            ctx.pstate = self.pstate;
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3392,6 +4733,8 @@ reinterpret_truncated_from_usize_for! {
         RngFlags,
         TimerFlags,
         StatxMask,
+        InotifyInitFlags,
+        InotifyMask,
     ],
 }
 

@@ -5,10 +5,11 @@ use crate::ShimPlatform;
 use crate::UserPtrMut;
 use crate::syscalls::signal::{DeliverFault, SignalState};
 use core::mem::offset_of;
+use litebox::shim::{Exception, ExceptionInfo};
 use litebox::utils::{ReinterpretUnsignedExt as _, TruncateExt as _};
 use litebox_common_linux::{
     PtRegs,
-    signal::{SaFlags, SigAction, Siginfo, Ucontext, x86_64::Sigcontext},
+    signal::{SaFlags, SigAction, Siginfo, Signal, Ucontext, x86_64::Sigcontext},
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -20,16 +21,40 @@ struct SignalFrame {
     siginfo: Siginfo,
 }
 
+/// State recorded for a thread that has taken no exception yet.
+pub(super) const NO_EXCEPTION: ExceptionInfo = ExceptionInfo {
+    exception: Exception(0),
+    error_code: 0,
+    cr2: 0,
+    kernel_mode: false,
+};
+
+/// Maps an x86 exception vector to the signal Linux raises for it, together
+/// with the address reported in the accompanying `si_addr`.
+pub(super) fn exception_signal(info: &ExceptionInfo) -> (Signal, usize) {
+    let signal = match info.exception {
+        Exception::DIVIDE_ERROR => Signal::SIGFPE,
+        Exception::BREAKPOINT => Signal::SIGTRAP,
+        Exception::INVALID_OPCODE => Signal::SIGILL,
+        // Page faults and unknown exceptions map to SIGSEGV. There may be
+        // more appropriate signals in some other cases (e.g., SIGBUS).
+        _ => Signal::SIGSEGV,
+    };
+    // Only a page fault carries a faulting address.
+    let fault_address = if info.exception == Exception::PAGE_FAULT {
+        info.cr2
+    } else {
+        0
+    };
+    (signal, fault_address)
+}
+
 pub(super) fn uctx_addr(ctx: &PtRegs) -> usize {
     ctx.rsp
 }
 
 pub(super) fn sp(ctx: &PtRegs) -> usize {
     ctx.rsp
-}
-
-pub(super) fn pc(ctx: &PtRegs) -> usize {
-    ctx.rip
 }
 
 pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
@@ -49,8 +74,13 @@ pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
+    /// `_platform` matches aarch64's signature so `mod.rs`'s single generic
+    /// call site works for both; unused here -- x86-64's `SA_RESTORER`-less
+    /// and FP/SIMD-state gaps (`fpstate: 0` below) are unrelated, unverified-
+    /// on-this-hardware gaps this pass deliberately leaves alone.
     pub(super) fn write_signal_frame(
         &self,
+        _platform: &Platform,
         frame_addr: usize,
         siginfo: &Siginfo,
         action: &SigAction,
@@ -118,7 +148,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     }
 }
 
-pub(super) fn restore_sigcontext(
+/// `_platform`/`Platform` match aarch64's signature so `mod.rs`'s single
+/// generic call site works for both; unused here -- see `write_signal_frame`.
+pub(super) fn restore_sigcontext<Platform: ShimPlatform>(
+    _platform: &Platform,
     ctx: &mut PtRegs,
     sigctx: &litebox_common_linux::signal::x86_64::Sigcontext,
 ) -> usize {

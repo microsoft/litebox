@@ -110,3 +110,75 @@ fn test_bidirectional_tcp_communication_automatic() {
     network.set_platform_interaction(PlatformInteraction::Automatic);
     bidi_tcp_comms(network, |_| {});
 }
+
+/// Number of distinct remote (ip, port) destinations sent to from a single UDP fd in
+/// [`test_udp_socket_table_does_not_grow_with_many_distinct_destinations`].
+const DISTINCT_DESTINATIONS: u32 = 5000;
+
+/// Real reproduction/regression test for the investigated "UDP flow table unbounded growth"
+/// concern: a single guest UDP socket sending traffic to many thousands of distinct remote
+/// destinations (varying both remote IP and remote port, i.e. what a real NAT/conntrack table
+/// would key a "flow" on) must NOT cause `Network`'s own bookkeeping to grow per destination.
+///
+/// LiteBox's UDP socket lifecycle is one `smoltcp::socket::udp::Socket` entry in `socket_set`
+/// per guest `socket()`/`close()` pair (see `Network::socket` and `Network::close_handle`), not
+/// an implicit per-remote-peer table. `Network::send`'s UDP branch always operates on the
+/// existing `SocketHandle`'s single smoltcp handle, regardless of how many distinct
+/// `destination`s are passed across separate calls -- there is no separate NAT-style flow
+/// created per peer to evict.
+#[test]
+fn test_udp_socket_table_does_not_grow_with_many_distinct_destinations() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Automatic);
+
+    let fd = network
+        .socket(Protocol::Udp)
+        .expect("Failed to create UDP socket");
+
+    // Baseline: exactly the one socket we explicitly created.
+    assert_eq!(
+        network.socket_set.iter().count(),
+        1,
+        "expected exactly one smoltcp socket for the one guest UDP fd"
+    );
+
+    // Send real UDP datagrams from the SAME fd to many thousands of distinct remote
+    // (ip, port) pairs -- exactly the pattern that would grow an implicit NAT/conntrack-style
+    // flow table keyed on remote peer, if one existed.
+    let data = b"probe";
+    for i in 0..DISTINCT_DESTINATIONS {
+        let ip = Ipv4Addr::new(
+            203,
+            0,
+            113,
+            u8::try_from(1 + (i % 250)).expect("in range 1..=250"),
+        );
+        let port = u16::try_from(20000 + (i % 40000)).expect("in range 20000..60000");
+        let destination = SocketAddr::V4(SocketAddrV4::new(ip, port));
+
+        network
+            .send(&fd, data, SendFlags::empty(), Some(destination))
+            .unwrap_or_else(|e| panic!("send #{i} to {destination} failed: {e:?}"));
+    }
+
+    // The socket bookkeeping table must remain exactly one entry: LiteBox's UDP "flow" is the
+    // guest's own socket fd, not a per-remote-peer entry.
+    assert_eq!(
+        network.socket_set.iter().count(),
+        1,
+        "socket_set grew while sending to distinct destinations from a single UDP fd -- \
+         indicates an implicit per-remote-peer flow table with no eviction"
+    );
+
+    network.close(&fd, CloseBehavior::Immediate).unwrap();
+
+    // After close, the table shrinks back to zero, confirming the one entry that did exist was
+    // tied to the guest's own fd lifecycle (created at `socket()`, destroyed at `close()`) and
+    // not to any of the many remote peers contacted along the way.
+    assert_eq!(
+        network.socket_set.iter().count(),
+        0,
+        "closing the fd should remove its socket_set entry"
+    );
+}

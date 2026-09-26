@@ -6,11 +6,15 @@
 pub(crate) mod epoll;
 pub(crate) mod eventfd;
 pub mod file;
+pub(crate) mod inotify;
 pub(crate) mod misc;
 pub(crate) mod mm;
 pub(crate) mod net;
+pub(crate) mod netlink;
 pub(crate) mod pipe;
 pub mod process;
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod ptrace;
 pub(crate) mod unix;
 
 pub(crate) mod signal;
@@ -25,6 +29,10 @@ macro_rules! common_functions_for_file_status {
                 & litebox::fs::OFlags::STATUS_FLAGS_MASK
         }
 
+        #[allow(
+            dead_code,
+            reason = "not every file-status-tracking type has an F_SETFL caller yet"
+        )]
         pub(crate) fn set_status(&self, flag: litebox::fs::OFlags, on: bool) {
             if on {
                 self.status

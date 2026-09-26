@@ -13,16 +13,17 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 once_cell = { version = "1.20.2", default-features = false, features = ["alloc", "race"] }
 thiserror = { version = "2.0.6", default-features = false }
 syscalls = { version = "0.6", default-features = false }
+seq-macro = "0.3"
 ringbuf = { version = "0.4.8", default-features = false, features = ["alloc"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false }
 object = { version = "0.36.7", default-features = false, features = ["elf", "read_core"] }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 
 [features]
 alarm_fallback = []
 
 [dev-dependencies]
-spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 libc = "0.2.177"
 tempfile = "3"
 
@@ -31,6 +32,9 @@ tempfile = "3"
 # the host.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 litebox_platform_linux_userland = { path = "../litebox_platform_linux_userland/", version = "0.1.0" }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+litebox_platform_macos_userland = { path = "../litebox_platform_macos_userland/", version = "0.1.0" }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 litebox_platform_windows_userland = { path = "../litebox_platform_windows_userland/", version = "0.1.0" }

@@ -31,13 +31,27 @@ use errors::{
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
-/// IP address for LiteBox interface
-// TODO: Make this configurable
-const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+/// Default IP address for the LiteBox interface (overridable via [`Network::new_with_addrs`]).
+pub const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
 
-/// IP address for the gateway
-// TODO: Make this configurable
-const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+/// Default IP address for the gateway (overridable via [`Network::new_with_addrs`]).
+pub const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
+
+/// The loopback address. Packets destined anywhere in `127.0.0.0/8` are looped
+/// back into the interface's own receive path (see [`phy`]).
+const LOOPBACK_IP_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+/// Internal guest endpoint for the bounded ICMP echo bridge used by rootless macOS networking.
+///
+/// This is not a general raw-packet interface: the Linux shim frames only IPv4 Echo Requests for
+/// this endpoint, and the macOS runner validates them again before using its unprivileged ping
+/// socket.
+#[doc(hidden)]
+pub const ICMP_ECHO_PROXY_ADDR: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 3130);
+
+/// IPv4 destination prefix carried on internal ICMP echo proxy datagrams.
+#[doc(hidden)]
+pub const ICMP_ECHO_PROXY_PREFIX_LEN: usize = 4;
 
 /// Maximum size of rx/tx buffers for sockets
 pub const SOCKET_BUFFER_SIZE: usize = 65536 * 4;
@@ -47,6 +61,28 @@ const MAX_PACKET_COUNT: usize = 32;
 
 /// TCP connection timeout.
 const TCP_CONNECT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(75);
+
+/// How long unacknowledged data may sit in a socket's transmit queue with no packet at all from
+/// the peer before the connection is aborted. Linux gives up after `tcp_retries2` (15)
+/// retransmissions, roughly 15 minutes. This is the only time an established connection is
+/// timed out: an idle one is never dropped (see the timeout policy in
+/// [`Network::drain_socket_channel_buffers`]).
+const TCP_RETRANSMIT_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(900);
+
+/// How long a socket whose descriptor is already closed may wait for the peer to finish the
+/// close handshake (FIN-WAIT-2 waiting for the peer's FIN, or the last writes draining to a
+/// slow peer) before it is reset and reaped. Linux: `tcp_fin_timeout`, 60 s.
+const TCP_ORPHAN_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(60);
+
+/// Whether a listening socket's child has completed its handshake and belongs in the accept
+/// queue. Linux hands out a connection as soon as it is established, including one whose peer
+/// has already sent FIN (`CloseWait`): a client that writes its request and half-closes before
+/// the server gets around to `accept` (busybox wget, `nc -q`, any "send then shutdown(SHUT_WR)"
+/// client) must still be accepted, and then read to EOF. Only `Established` was accepted before,
+/// so such connections sat unaccepted until they were reaped, and their data was lost.
+fn accept_ready(state: tcp::State) -> bool {
+    matches!(state, tcp::State::Established | tcp::State::CloseWait)
+}
 
 /// The `Network` provides access to all networking related functionality provided by LiteBox.
 ///
@@ -67,6 +103,10 @@ where
     socket_set: smoltcp::iface::SocketSet<'static>,
     /// The actual "physical" device, that connects to the platform
     device: phy::Device<Platform>,
+    /// The default-route gateway address the interface was configured with
+    /// (`GATEWAY_IP_ADDR` unless overridden); exposed so routing-table views
+    /// (netlink `RTM_GETROUTE`, `/proc/net/route`) report what smoltcp uses.
+    gateway_ip: Ipv4Addr,
     /// The smoltcp network interface
     interface: smoltcp::iface::Interface,
     /// Initial instant of creation, used as an arbitrary stop point from when time begins
@@ -79,7 +119,26 @@ where
     /// FDs that are queued for eventual closure
     queued_for_closure: Vec<SocketFd<Platform>>,
     /// Sockets that are closing in the background
-    closing_in_background: Vec<smoltcp::iface::SocketHandle>,
+    closing_in_background: Vec<ClosingSocket>,
+    /// Closed TCP sockets whose channel TX ring still holds bytes the application wrote before
+    /// `close()`; they are moved into smoltcp first and the FIN follows (see
+    /// [`Self::drain_closing_with_pending_tx`]).
+    closing_with_pending_tx: Vec<DrainingSocket<Platform>>,
+}
+
+/// A TCP socket whose file descriptor is gone but whose smoltcp state machine is still finishing
+/// the close handshake (or has an RST to emit).
+struct ClosingSocket {
+    handle: smoltcp::iface::SocketHandle,
+    /// When the descriptor was closed; bounds the wait for the peer by [`TCP_ORPHAN_TIMEOUT`].
+    closed_at: smoltcp::time::Instant,
+}
+
+/// A [`ClosingSocket`] that still has application data in its channel's TX ring.
+struct DrainingSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    handle: smoltcp::iface::SocketHandle,
+    closed_at: smoltcp::time::Instant,
+    proxy: alloc::sync::Arc<NetworkProxy<Platform>>,
 }
 
 impl<Platform> Network<Platform>
@@ -93,23 +152,50 @@ where
     /// and the created `Network` handle is expected to be shared across all usage over the
     /// system.
     pub fn new(litebox: &LiteBox<Platform>) -> Self {
+        Self::new_with_addrs(litebox, None, None)
+    }
+
+    /// Same as [`Self::new`], but lets the caller override the interface/gateway
+    /// addresses instead of the fixed `INTERFACE_IP_ADDR`/`GATEWAY_IP_ADDR`
+    /// defaults (`None` = use the default). Needed by any caller that runs more
+    /// than one `Network` on the same host at once (each one needs a distinct
+    /// address to be independently reachable).
+    pub fn new_with_addrs(
+        litebox: &LiteBox<Platform>,
+        interface_ip: Option<Ipv4Addr>,
+        gateway_ip: Option<Ipv4Addr>,
+    ) -> Self {
+        let interface_ip = interface_ip.unwrap_or(INTERFACE_IP_ADDR);
+        let gateway_ip = gateway_ip.unwrap_or(GATEWAY_IP_ADDR);
         let mut device = phy::Device::new(litebox.x.platform);
         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
         let mut interface =
             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         interface.update_ip_addrs(|ip_addrs| {
             match ip_addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
+                smoltcp::wire::IpAddress::Ipv4(interface_ip),
                 24,
             )) {
                 Ok(()) => {}
                 Err(_) => unreachable!(),
             }
+            // Own `127.0.0.0/8` so the interface both accepts inbound packets
+            // to `127.0.0.1` as local and, under `Medium::Ip` (no ARP), sends
+            // to it directly without the default gateway. The `phy::Device`
+            // loops any packet destined here straight back into its own
+            // receive queue (see `phy.rs`), which is what makes an in-process
+            // guest server reachable from the same guest -- a Node http server
+            // on `127.0.0.1` fetched by the same process, and the many test
+            // frameworks and IPC paths that assume a working loopback.
+            match ip_addrs.push(smoltcp::wire::IpCidr::new(
+                smoltcp::wire::IpAddress::Ipv4(LOOPBACK_IP_ADDR),
+                8,
+            )) {
+                Ok(()) => {}
+                Err(_) => unreachable!(),
+            }
         });
-        match interface
-            .routes_mut()
-            .add_default_ipv4_route(GATEWAY_IP_ADDR)
-        {
+        match interface.routes_mut().add_default_ipv4_route(gateway_ip) {
             Ok(None) => {}
             _ => unreachable!(),
         }
@@ -117,12 +203,14 @@ where
             litebox: litebox.clone(),
             socket_set: smoltcp::iface::SocketSet::new(vec![]),
             device,
+            gateway_ip,
             interface,
             zero_time: litebox.x.platform.now(),
             local_port_allocator: LocalPortAllocator::new(),
             platform_interaction: PlatformInteraction::Automatic,
             queued_for_closure: vec![],
             closing_in_background: vec![],
+            closing_with_pending_tx: vec![],
         }
     }
 }
@@ -234,6 +322,44 @@ pub(crate) struct TcpSpecific {
     immediate_close: AtomicBool,
     /// Timestamp when `connect` was initiated
     connect_initiated_at_us: Option<smoltcp::time::Instant>,
+    /// Set by the network worker once the peer's FIN has been seen, every byte before it has
+    /// been handed to the application, and the socket channel's read side has been closed so
+    /// `read()` reports end-of-file. Sticky.
+    rx_eof_signaled: AtomicBool,
+    /// Set by the network worker the moment the peer's FIN is observed, regardless of whether the
+    /// application has drained data queued ahead of it -- unlike `rx_eof_signaled`, which gates
+    /// `read()` returning 0, this only gates `POLLRDHUP` (Linux's `tcp_fin()` sets `RCV_SHUTDOWN`,
+    /// and so `POLLRDHUP`, immediately on FIN arrival, independent of unread data). Sticky.
+    peer_fin_notified: AtomicBool,
+    /// `shutdown(SHUT_RD)`: received data is discarded instead of queued.
+    read_shutdown: AtomicBool,
+    /// `shutdown(SHUT_WR)`: the FIN is sent once the channel's TX ring has drained into smoltcp.
+    write_shutdown: AtomicBool,
+}
+
+impl TcpSpecific {
+    fn new(local_port: Option<LocalPort>) -> Self {
+        Self {
+            local_port,
+            server_socket: None,
+            immediate_close: AtomicBool::new(false),
+            connect_initiated_at_us: None,
+            rx_eof_signaled: AtomicBool::new(false),
+            peer_fin_notified: AtomicBool::new(false),
+            read_shutdown: AtomicBool::new(false),
+            write_shutdown: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Whether the peer's FIN has been received and every byte it sent before it has already been
+/// dequeued. smoltcp keeps `rx_fin_received` private, but a zero-length `recv_slice` reports
+/// exactly that condition as [`tcp::RecvError::Finished`], and has no other effect.
+fn peer_finished(tcp_socket: &mut tcp::Socket<'_>) -> bool {
+    matches!(
+        tcp_socket.recv_slice(&mut []),
+        Err(tcp::RecvError::Finished)
+    )
 }
 
 /// Socket-specific data for TCP server sockets
@@ -484,6 +610,7 @@ where
         self.attempt_to_close_queued();
         self.remove_dead_sockets();
         self.close_pending_sockets();
+        self.drain_closing_with_pending_tx();
 
         // Drain all socket channel buffers before polling to ensure data flows
         self.drain_all_socket_channel_buffers();
@@ -503,17 +630,76 @@ where
 
     /// Remove dead sockets that were closing in the background
     fn remove_dead_sockets(&mut self) {
-        self.closing_in_background.retain(|socket_handle| {
-            let handle = *socket_handle;
-            let tcp_socket = self.socket_set.get::<tcp::Socket>(handle);
+        let now = self.now();
+        self.closing_in_background.retain(|closing| {
+            let handle = closing.handle;
+            let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(handle);
+            if tcp_socket.is_open() {
+                // Nobody will ever read this socket again. Linux resets an orphan as soon as
+                // data arrives for it (RFC 2525 s2.17) instead of ACKing it into a buffer, and
+                // gives it `tcp_fin_timeout` to finish the handshake before reaping it; without
+                // either, a killed downloader's socket kept ACKing the stream and sat in
+                // FIN-WAIT-2 until the server gave up.
+                if tcp_socket.recv_queue() > 0 || now - closing.closed_at >= TCP_ORPHAN_TIMEOUT {
+                    tcp_socket.abort();
+                }
+                return true;
+            }
             // a socket in the CLOSED state with the remote endpoint set means that an outgoing RST packet is pending
-            if !tcp_socket.is_open() && tcp_socket.remote_endpoint().is_none() {
+            if tcp_socket.remote_endpoint().is_none() {
                 self.socket_set.remove(handle);
                 false
             } else {
                 true
             }
         });
+    }
+
+    /// Finish the writes an application made right before `close()`: keep moving the closed
+    /// socket's TX ring into smoltcp and send the FIN only once the ring is empty. Linux's
+    /// `close()` returns at once and the kernel keeps transmitting; before this the ring's
+    /// contents were dropped with the descriptor.
+    fn drain_closing_with_pending_tx(&mut self) {
+        if self.closing_with_pending_tx.is_empty() {
+            return;
+        }
+        let now = self.now();
+        for draining in core::mem::take(&mut self.closing_with_pending_tx) {
+            let NetworkProxy::Stream(channel) = draining.proxy.as_ref() else {
+                unreachable!("a TCP socket carries a stream channel")
+            };
+            let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(draining.handle);
+            while tcp_socket.can_send() {
+                let sent = channel
+                    .pop_tx_data_with(|data| tcp_socket.send_slice(data).unwrap_or_default());
+                if sent == 0 {
+                    break;
+                }
+            }
+            let finished = if !tcp_socket.may_send() {
+                // Reset by the peer (or otherwise dead): nothing more can go out.
+                true
+            } else if tcp_socket.recv_queue() > 0 || now - draining.closed_at >= TCP_ORPHAN_TIMEOUT
+            {
+                // Same rules as `remove_dead_sockets`: an orphan does not buffer the peer's
+                // data, nor wait forever for a peer that stopped reading.
+                tcp_socket.abort();
+                true
+            } else if !channel.has_pending_tx() {
+                tcp_socket.close();
+                true
+            } else {
+                false
+            };
+            if finished {
+                self.closing_in_background.push(ClosingSocket {
+                    handle: draining.handle,
+                    closed_at: draining.closed_at,
+                });
+            } else {
+                self.closing_with_pending_tx.push(draining);
+            }
+        }
     }
 
     /// Close all finished sockets that are marked as closed but waiting for pending data to be sent
@@ -580,6 +766,7 @@ where
         match (socket_handle.protocol(), proxy) {
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                let tcp_specific = socket_handle.specific.tcp();
 
                 // Drain TX buffer: from ring buffer directly to smoltcp
                 while tcp_socket.can_send() {
@@ -590,12 +777,95 @@ where
                     }
                 }
 
-                // Drain RX buffer: from smoltcp directly to ring buffer
-                while tcp_socket.can_recv() {
-                    let received = proxy
-                        .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
-                    if received == 0 {
-                        break;
+                // `shutdown(SHUT_WR)`: the FIN goes out only after everything the application
+                // wrote before it has been handed to smoltcp, so it sequences after the data.
+                if tcp_specific.write_shutdown.load(Ordering::Acquire)
+                    && !proxy.has_pending_tx()
+                    && matches!(
+                        tcp_socket.state(),
+                        tcp::State::SynReceived | tcp::State::Established | tcp::State::CloseWait
+                    )
+                {
+                    tcp_socket.close();
+                }
+
+                // Drain RX buffer: from smoltcp directly to ring buffer. After `shutdown(SHUT_RD)`
+                // the data is discarded instead, so the window stays open and the peer is not
+                // stalled by a reader that will never come.
+                if tcp_specific.read_shutdown.load(Ordering::Acquire) {
+                    while tcp_socket.can_recv() {
+                        let discarded = tcp_socket
+                            .recv(|data| (data.len(), data.len()))
+                            .unwrap_or_default();
+                        if discarded == 0 {
+                            break;
+                        }
+                    }
+                } else {
+                    while tcp_socket.can_recv() {
+                        let received = proxy.push_rx_data_with(|buf| {
+                            tcp_socket.recv_slice(buf).unwrap_or_default()
+                        });
+                        if received == 0 {
+                            break;
+                        }
+                    }
+                }
+
+                // Peer FIN, `POLLRDHUP` half: Linux's `tcp_fin()` sets `RCV_SHUTDOWN` -- and so
+                // `POLLRDHUP` -- the instant the FIN arrives, independent of whatever data is
+                // still queued ahead of it for the application to read. Fired once, as soon as
+                // the FIN is observed, well before the ring-drain-gated `read()`-returns-0
+                // transition below (which is a separate, later event).
+                if !tcp_specific.peer_fin_notified.load(Ordering::Acquire)
+                    && tcp_specific.server_socket.is_none()
+                    && peer_finished(tcp_socket)
+                {
+                    tcp_specific
+                        .peer_fin_notified
+                        .store(true, Ordering::Release);
+                    proxy.notify_peer_fin();
+                    proxy.notify_io_event(Events::RDHUP);
+                }
+
+                // Peer FIN, `read()`-returns-0 half. Once every byte before it has left smoltcp
+                // and the application has emptied the ring, the channel's read side is closed so
+                // `read()` returns 0 and `poll()` reports readable -- Linux's `RCV_SHUTDOWN`
+                // becoming visible to a reader that has caught up. The write side is untouched:
+                // in CLOSE-WAIT the application may still send. Before this a peer close went
+                // unnoticed until the 75 s socket timeout aborted the connection, and then
+                // surfaced as `ECONNRESET`.
+                if !tcp_specific.rx_eof_signaled.load(Ordering::Acquire)
+                    && !tcp_specific.read_shutdown.load(Ordering::Acquire)
+                    && tcp_specific.server_socket.is_none()
+                    && peer_finished(tcp_socket)
+                    && !proxy.is_readable()
+                {
+                    tcp_specific.rx_eof_signaled.store(true, Ordering::Release);
+                    proxy.shutdown_read();
+                    proxy.set_readable(true);
+                    proxy.notify_io_event(Events::IN | Events::RDHUP);
+                }
+
+                // Timeout policy. smoltcp's socket timeout aborts the connection once the peer
+                // has been silent for that long, counted from its last packet and regardless of
+                // whether it owes anything -- left at `TCP_CONNECT_TIMEOUT` after `connect`, it
+                // killed every idle connection (and every CLOSE-WAIT one) after 75 s. Linux only
+                // gives up when *unacknowledged data* goes unanswered, so the timeout is armed
+                // only while the transmit queue is non-empty (smoltcp restarts the clock when
+                // data enters an empty queue) and disarmed otherwise.
+                if matches!(
+                    tcp_socket.state(),
+                    tcp::State::Established
+                        | tcp::State::CloseWait
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                ) {
+                    let wanted = (tcp_socket.send_queue() > 0).then_some(TCP_RETRANSMIT_TIMEOUT);
+                    if tcp_socket.timeout() != wanted {
+                        tcp_socket.set_timeout(wanted);
                     }
                 }
 
@@ -603,10 +873,15 @@ where
                     proxy.set_state(socket_channel::SocketState::Connected);
                     proxy.clear_async_error();
                 }
-                let tcp_specific = socket_handle.specific.tcp();
                 // Update socket state in the channel
                 // server socket that is listening also has closed state
-                if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
+                // (`recv_queue() > 0`: the socket is done on the wire but the application has
+                // not yet been handed everything it received -- keep the channel open until the
+                // ring has room for the rest, so the bytes precede the EOF or error.)
+                if !tcp_socket.is_open()
+                    && tcp_specific.server_socket.is_none()
+                    && tcp_socket.recv_queue() == 0
+                {
                     // Determine error based on previous socket state
                     match proxy.state() {
                         socket_channel::SocketState::Connecting => {
@@ -621,8 +896,13 @@ where
                             proxy.set_state(socket_channel::SocketState::Error);
                         }
                         socket_channel::SocketState::Connected => {
-                            // Connection was reset by peer
-                            proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
+                            // A close that went through the FIN handshake (TIME-WAIT, or CLOSED
+                            // after LAST-ACK) is not an error; only an RST or abort is.
+                            let graceful = tcp_specific.rx_eof_signaled.load(Ordering::Acquire)
+                                || peer_finished(tcp_socket);
+                            if !graceful {
+                                proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
+                            }
                             proxy.set_state(socket_channel::SocketState::Closed);
                         }
                         _ => {
@@ -639,7 +919,7 @@ where
                         .iter()
                         .any(|&h| {
                             let socket: &tcp::Socket = socket_set.get(h);
-                            socket.state() == tcp::State::Established
+                            accept_ready(socket.state())
                         })
                         .then(|| {
                             proxy.set_readable(true);
@@ -662,7 +942,15 @@ where
                             })
                             .or(remote_endpoint);
                         if let Some(endpoint) = destination {
-                            udp_socket.send_slice(data, endpoint).is_ok()
+                            match udp_socket.send_slice(data, endpoint) {
+                                // Retry once smoltcp has room.
+                                Err(udp::SendError::BufferFull) => false,
+                                // Sent, or can never be sent: either way don't retry. An
+                                // unaddressable destination is discarded rather than retried, or
+                                // it would wedge the queue behind it forever (a blocking sender
+                                // would never wake).
+                                Ok(()) | Err(udp::SendError::Unaddressable) => true,
+                            }
                         } else {
                             // No destination - discard
                             true
@@ -780,12 +1068,7 @@ where
             consider_closed: false,
             handle,
             specific: match protocol {
-                Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific {
-                    local_port: None,
-                    server_socket: None,
-                    immediate_close: AtomicBool::new(false),
-                    connect_initiated_at_us: None,
-                }),
+                Protocol::Tcp => ProtocolSpecific::Tcp(TcpSpecific::new(None)),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
                     remote_endpoint: None,
                 }),
@@ -928,7 +1211,9 @@ where
                 socket.close();
             }
             Protocol::Tcp => {
+                let closed_at = self.now();
                 let tcp_specific = specific.tcp_mut();
+                let was_server = tcp_specific.server_socket.is_some();
                 if let Some(server_socket) = tcp_specific.server_socket.take() {
                     // remove all listening sockets in the backlog
                     for handle in server_socket.socket_set_handles {
@@ -938,19 +1223,125 @@ where
                 if let Some(local_port) = tcp_specific.local_port.take() {
                     self.local_port_allocator.deallocate(local_port);
                 }
+                let channel = match proxy.as_deref() {
+                    Some(NetworkProxy::Stream(channel)) => Some(channel),
+                    _ => None,
+                };
                 let tcp_socket: &mut tcp::Socket = self.socket_set.get_mut(handle);
-                if tcp_specific.immediate_close.load(Ordering::Relaxed) {
+                // Data the application never read -- still in smoltcp, or in the ring (whose
+                // `readable` flag is also how EOF and `SHUT_RD` are signalled, hence the
+                // guards). Linux answers such a close with an RST rather than a FIN, since the
+                // peer's bytes are being thrown away (RFC 2525 s2.17, `tcp_close`).
+                let unread = !was_server
+                    && (tcp_socket.recv_queue() > 0
+                        || (!tcp_specific.rx_eof_signaled.load(Ordering::Relaxed)
+                            && !tcp_specific.read_shutdown.load(Ordering::Relaxed)
+                            && channel
+                                .is_some_and(socket_channel::StreamSocketChannel::is_readable)));
+                if tcp_specific.immediate_close.load(Ordering::Relaxed) || unread {
                     tcp_socket.abort();
+                    self.closing_in_background
+                        .push(ClosingSocket { handle, closed_at });
+                } else if channel.is_some_and(socket_channel::StreamSocketChannel::has_pending_tx)
+                    && tcp_socket.may_send()
+                {
+                    // The last writes have not reached smoltcp yet: keep the pair alive until
+                    // they have, then FIN (see `drain_closing_with_pending_tx`).
+                    let Some(proxy) = proxy.clone() else {
+                        unreachable!("`channel` was taken from `proxy`")
+                    };
+                    self.closing_with_pending_tx.push(DrainingSocket {
+                        handle,
+                        closed_at,
+                        proxy,
+                    });
                 } else {
                     tcp_socket.close();
+                    self.closing_in_background
+                        .push(ClosingSocket { handle, closed_at });
                 }
-                self.closing_in_background.push(handle);
             }
         }
         if let Some(proxy) = proxy {
             proxy.set_state(socket_channel::SocketState::Closed);
         }
         self.automated_platform_interaction(PollDirection::Both);
+    }
+
+    /// `shutdown(2)`: close the receive (`read`) and/or transmit (`write`) half of a connected
+    /// socket, leaving the descriptor open.
+    ///
+    /// For TCP, `write` sends a FIN once the bytes already written have been handed to smoltcp
+    /// (later writes fail), and `read` makes reads report end-of-file and discards whatever the
+    /// peer still sends. A connected UDP socket accepts the call as a no-op, as on Linux.
+    pub fn shutdown(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        read: bool,
+        write: bool,
+    ) -> Result<(), ShutdownError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ShutdownError::InvalidFd)?;
+        let socket_handle = &mut table_entry.entry;
+        match socket_handle.protocol() {
+            Protocol::Tcp => {
+                let tcp_specific = socket_handle.specific.tcp();
+                if tcp_specific
+                    .server_socket
+                    .as_ref()
+                    .is_some_and(|server| server.backlog.is_some())
+                {
+                    return Err(ShutdownError::NotConnected);
+                }
+                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                if !matches!(
+                    tcp_socket.state(),
+                    tcp::State::Established
+                        | tcp::State::CloseWait
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::LastAck
+                        | tcp::State::TimeWait
+                ) {
+                    return Err(ShutdownError::NotConnected);
+                }
+                let channel = match socket_handle.proxy.as_deref() {
+                    Some(NetworkProxy::Stream(channel)) => Some(channel),
+                    _ => None,
+                };
+                if read {
+                    tcp_specific.read_shutdown.store(true, Ordering::Release);
+                    if let Some(channel) = channel {
+                        channel.shutdown_read();
+                        // Readable-with-nothing-to-read is how poll learns of the EOF.
+                        channel.set_readable(true);
+                        channel.notify_io_event(Events::IN | Events::RDHUP);
+                    }
+                }
+                if write {
+                    tcp_specific.write_shutdown.store(true, Ordering::Release);
+                    if let Some(channel) = channel {
+                        channel.shutdown_write();
+                        channel.notify_io_event(Events::OUT);
+                    }
+                    // The FIN itself is sent by the drain once the TX ring is empty.
+                }
+            }
+            Protocol::Udp => {
+                if socket_handle.udp().remote_endpoint.is_none() {
+                    return Err(ShutdownError::NotConnected);
+                }
+            }
+            Protocol::Icmp | Protocol::Raw { protocol: _ } => unimplemented!(),
+        }
+        drop(table_entry);
+        drop(descriptor_table);
+
+        self.automated_platform_interaction(PollDirection::Both);
+        Ok(())
     }
 
     /// Initiate a connection to an IP address
@@ -981,11 +1372,19 @@ where
                             // already connected
                             Ok(())
                         }
-                        tcp::State::Closed | tcp::State::TimeWait => {
+                        // The peer may already have closed (or the caller half-closed) by the
+                        // time a blocking `connect` re-checks progress: still a success.
+                        tcp::State::CloseWait
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::LastAck => Ok(()),
+                        tcp::State::Closed | tcp::State::TimeWait | tcp::State::Listen => {
                             Err(ConnectError::InvalidState)
                         }
-                        tcp::State::SynSent => Err(ConnectError::InProgress),
-                        s => unimplemented!("state: {:?}", s),
+                        tcp::State::SynSent | tcp::State::SynReceived => {
+                            Err(ConnectError::InProgress)
+                        }
                     }
                 };
 
@@ -993,24 +1392,53 @@ where
                 if check_progress {
                     check_state(socket.state())
                 } else {
-                    let local_port = self.local_port_allocator.ephemeral_port()?;
-                    let local_endpoint: smoltcp::wire::IpListenEndpoint = local_port.port().into();
+                    let tcp_specific = socket_handle.tcp_mut();
+                    if tcp_specific
+                        .server_socket
+                        .as_ref()
+                        .is_some_and(|server| server.backlog.is_some())
+                    {
+                        // A listening socket cannot be turned into a client.
+                        return Err(ConnectError::InvalidState);
+                    }
+                    // A socket `bind` already gave a local port (and possibly a local address)
+                    // keeps it, exactly as Linux does for a source-bound client; only an
+                    // unbound socket gets an ephemeral port here.
+                    let (local_port, local_endpoint, was_bound) =
+                        if let Some(bound) = tcp_specific.local_port.take() {
+                            let addr = tcp_specific
+                                .server_socket
+                                .as_ref()
+                                .and_then(|server| server.ip_listen_endpoint.addr);
+                            let endpoint = smoltcp::wire::IpListenEndpoint {
+                                addr,
+                                port: bound.port(),
+                            };
+                            (bound, endpoint, true)
+                        } else {
+                            let fresh = self.local_port_allocator.ephemeral_port()?;
+                            let endpoint: smoltcp::wire::IpListenEndpoint = fresh.port().into();
+                            (fresh, endpoint, false)
+                        };
                     let addr: smoltcp::wire::IpEndpoint = (*addr).into();
                     match socket.connect(self.interface.context(), addr, local_endpoint) {
                         Ok(()) => {
                             socket.set_timeout(Some(TCP_CONNECT_TIMEOUT));
-                            let tcp_specific = socket_handle.tcp_mut();
                             tcp_specific.connect_initiated_at_us = Some(now);
-                            let old_port = tcp_specific.local_port.replace(local_port);
-                            if old_port.is_some() {
-                                // Need to think about how to handle this situation
-                                unimplemented!()
-                            }
+                            tcp_specific.local_port = Some(local_port);
+                            // A client is no longer a (bound, never-listened) server socket:
+                            // `get_local_addr`/`listen` must see the established endpoint, not
+                            // the bind-time listen endpoint.
+                            tcp_specific.server_socket = None;
                             check_state(socket.state())
                         }
                         Err(tcp::ConnectError::InvalidState) => unreachable!(),
                         Err(tcp::ConnectError::Unaddressable) => {
-                            self.local_port_allocator.deallocate(local_port);
+                            if was_bound {
+                                tcp_specific.local_port = Some(local_port);
+                            } else {
+                                self.local_port_allocator.deallocate(local_port);
+                            }
                             Err(ConnectError::Unaddressable)
                         }
                     }
@@ -1076,15 +1504,46 @@ where
 
         match socket_handle.protocol() {
             Protocol::Tcp => {
-                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
-                match socket.local_endpoint() {
-                    Some(endpoint) => match endpoint.addr {
-                        smoltcp::wire::IpAddress::Ipv4(ipv4) => {
-                            Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)))
-                        }
-                    },
-                    None => Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))),
+                // A *listening* socket's address is not on the original
+                // `socket()` handle -- `listen`/`refill_to_backlog` create
+                // separate accept sockets, and the original never gets a
+                // `local_endpoint`, so reading it here returns `0.0.0.0:0` and
+                // a guest's `getsockname` (Node's `server.address().port`)
+                // sees port 0. The bound listen endpoint recorded at `bind`
+                // time is the authoritative answer for a server socket.
+                let tcp = socket_handle.tcp();
+                if let Some(server) = tcp.server_socket.as_ref() {
+                    let ep = &server.ip_listen_endpoint;
+                    let addr = match ep.addr {
+                        Some(smoltcp::wire::IpAddress::Ipv4(ipv4)) => ipv4,
+                        None => Ipv4Addr::UNSPECIFIED,
+                    };
+                    return Ok(SocketAddr::V4(SocketAddrV4::new(addr, ep.port)));
                 }
+                // An accepted or connected socket also carries a `local_port`
+                // (copied at `accept` time), but its authoritative identity is
+                // the established endpoint smoltcp chose: getsockname on an
+                // accepted connection must report the concrete local address
+                // (e.g. 10.0.0.2:8080), not 0.0.0.0. Only fall back to the
+                // bare bound port when no endpoint is established.
+                let socket: &tcp::Socket = self.socket_set.get(socket_handle.handle);
+                if let Some(endpoint) = socket.local_endpoint() {
+                    match endpoint.addr {
+                        smoltcp::wire::IpAddress::Ipv4(ipv4) => {
+                            return Ok(SocketAddr::V4(SocketAddrV4::new(ipv4, endpoint.port)));
+                        }
+                    }
+                }
+                if let Some(local_port) = tcp.local_port.as_ref() {
+                    let port = local_port.port();
+                    if port != 0 {
+                        return Ok(SocketAddr::V4(SocketAddrV4::new(
+                            Ipv4Addr::UNSPECIFIED,
+                            port,
+                        )));
+                    }
+                }
+                Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
             }
             Protocol::Udp => {
                 let socket: &udp::Socket = self.socket_set.get(socket_handle.handle);
@@ -1156,7 +1615,11 @@ where
         let socket_handle = &mut table_entry.entry;
         match socket_handle.protocol() {
             Protocol::Tcp => {
-                if socket_handle.tcp().server_socket.is_some() {
+                // Already bound, or already connected (a client owns a local port without a
+                // server-side record): Linux answers a second `bind` with `EINVAL`.
+                if socket_handle.tcp().server_socket.is_some()
+                    || socket_handle.tcp().local_port.is_some()
+                {
                     return Err(BindError::AlreadyBound);
                 }
                 let lp = self
@@ -1164,18 +1627,11 @@ where
                     .allocate_local_port(addr.port())
                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
                 let new_port = lp.port();
-                let old_lp = socket_handle.tcp_mut().local_port.replace(lp);
-                if let Some(old) = old_lp {
-                    self.local_port_allocator.deallocate(old);
-                    // Currently unsure if the dealloc is sufficient and if we need to do
-                    // anything else here (possibly return an error message due to trying to
-                    // do things to a connected socket, not sure), so just marking as
-                    // unimplemented for now to trigger a panic.
-                    unimplemented!()
-                }
+                socket_handle.tcp_mut().local_port = Some(lp);
                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
                     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
-                        addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                        addr: (!addr.ip().is_unspecified())
+                            .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
                         port: new_port,
                     },
                     backlog: None,
@@ -1188,7 +1644,8 @@ where
                     .allocate_local_port(addr.port())
                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
                 let local_endpoint = smoltcp::wire::IpListenEndpoint {
-                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                    addr: (!addr.ip().is_unspecified())
+                        .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
                     port: lp.port(),
                 };
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
@@ -1241,6 +1698,11 @@ where
         match &mut socket_handle.specific {
             ProtocolSpecific::Tcp(handle) => {
                 if handle.server_socket.is_none() {
+                    if handle.local_port.is_some() {
+                        // A local port without a server record means `connect` was called:
+                        // a client socket cannot listen (Linux: `EINVAL`).
+                        return Err(ListenError::InvalidState);
+                    }
                     let local_port =
                         self.local_port_allocator
                             .ephemeral_port()
@@ -1253,12 +1715,7 @@ where
                                 }
                             })?;
                     let port = local_port.port();
-                    let old_local_port = handle.local_port.replace(local_port);
-                    if let Some(lp) = old_local_port {
-                        self.local_port_allocator.deallocate(lp);
-                        // Should anything else be done here?
-                        unimplemented!()
-                    }
+                    handle.local_port = Some(local_port);
                     handle.server_socket = Some(TcpServerSpecific {
                         ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
                             addr: Some(smoltcp::wire::IpAddress::v4(0, 0, 0, 0)),
@@ -1331,11 +1788,10 @@ where
                     let socket: &tcp::Socket = self.socket_set.get(h);
                     socket.is_open()
                 });
-                // Find a socket that has progressed further in its TCP state machine, by finding a
-                // socket in an established state
+                // Find a socket that has completed its handshake (see `accept_ready`).
                 let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
                     let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() == tcp::State::Established
+                    accept_ready(socket.state())
                 }) else {
                     if let Some(proxy) = &socket_handle.proxy {
                         // No connections are ready; make sure the readable flag is cleared
@@ -1363,12 +1819,7 @@ where
                 let handle = SocketHandle {
                     consider_closed: false,
                     handle: ready_handle,
-                    specific: ProtocolSpecific::Tcp(TcpSpecific {
-                        local_port,
-                        server_socket: None,
-                        immediate_close: AtomicBool::new(false),
-                        connect_initiated_at_us: None,
-                    }),
+                    specific: ProtocolSpecific::Tcp(TcpSpecific::new(local_port)),
                     proxy: None,
                 };
                 if let Some(peer) = peer {
@@ -1712,6 +2163,16 @@ pub enum CongestionControl {
     None,
     Reno,
     Cubic,
+}
+
+/// Possible errors from [`Network::shutdown`]
+#[non_exhaustive]
+#[derive(thiserror::Error, Debug, Clone, Copy)]
+pub enum ShutdownError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Socket is not connected")]
+    NotConnected,
 }
 
 #[derive(Debug, Clone, Copy)]

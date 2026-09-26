@@ -10,15 +10,16 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::backend::{
-    Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
-    Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
+    Backend, BackendHandles, DirHandle, FileHandle, PermissionCheck, Permissioned, SeekBehavior,
+    WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ReadError, ReadlinkError, RmdirError, TruncateError, UnlinkError, UtimeError, WalkError,
+    WriteError,
 };
-use super::inode_allocator::{InodeAllocator, InodeAllocators};
-use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use super::inode_allocator::InodeAllocator;
+use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, Timestamp, UserInfo};
 use crate::path::Arg;
 use thiserror::Error;
 
@@ -37,7 +38,7 @@ pub struct Composer {
 /// A [`Composer`] builder.
 pub struct ComposerBuilder {
     mounts: Vec<(Option<String>, Box<dyn Backend>)>,
-    allocators: InodeAllocators,
+    next_backend_device_id: u64,
 }
 
 /// A mounted backend.
@@ -70,7 +71,7 @@ impl Composer {
     pub fn builder() -> ComposerBuilder {
         ComposerBuilder {
             mounts: vec![],
-            allocators: InodeAllocators::starting_at(1),
+            next_backend_device_id: 1,
         }
     }
 }
@@ -79,24 +80,16 @@ impl ComposerBuilder {
     /// Add a backend mounted at `path`.
     #[must_use]
     pub fn mount<B: Backend>(
-        self,
+        mut self,
         path: impl Arg,
         backend: impl FnOnce(InodeAllocator) -> B,
     ) -> Self {
-        self.mount_nestable(path, |allocators| backend(allocators.next()))
-    }
-
-    /// Add a backend mounted at `path`, which may draw an allocator per backend it is made of.
-    #[must_use]
-    pub fn mount_nestable<B: Backend>(
-        mut self,
-        path: impl Arg,
-        backend: impl FnOnce(&InodeAllocators) -> B,
-    ) -> Self {
+        let backend_device_id = self.next_backend_device_id;
         // TODO(jayb): Decide whether we need a fallible version of closure-based mount.
-        let backend = backend(&self.allocators);
+        let backend = backend(InodeAllocator::for_device(backend_device_id));
         self.mounts
             .push((path.as_rust_str().map(Into::into).ok(), Box::new(backend)));
+        self.next_backend_device_id = backend_device_id + 1;
         self
     }
 
@@ -288,6 +281,9 @@ impl Composer {
             owner: UserInfo::ROOT,
             node_info,
             blksize: super::DEFAULT_DIRECTORY_SIZE,
+            atime: Timestamp::default(),
+            mtime: Timestamp::default(),
+            ctime: Timestamp::default(),
         }
     }
 
@@ -676,24 +672,25 @@ impl Backend for Composer {
         self.mounts[h.mount_index].backend.seek_behavior(&h.handle)
     }
 
-    fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
-        match h {
-            HandleRef::File(h) => {
-                let h = h.get_typed::<Self>();
-                self.mounts[h.mount_index]
-                    .backend
-                    .status(HandleRef::File(&h.handle))
-            }
-            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
-                ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
-                ComposerDirHandleInner::Mounted {
-                    mount_index,
-                    handle,
-                    ..
-                } => self.mounts[*mount_index]
-                    .backend
-                    .status(HandleRef::Dir(handle)),
-            },
+    fn file_status(&self, h: &FileHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.file_status(&h.handle)
+    }
+
+    fn read_link(&self, h: &FileHandle) -> Result<alloc::string::String, ReadlinkError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.read_link(&h.handle)
+    }
+
+    fn dir_status(&self, h: &DirHandle) -> Result<FileStatus, FileStatusError> {
+        let h = h.get_typed::<Self>();
+        match &h.inner {
+            ComposerDirHandleInner::Virtual { path } => Ok(self.virtual_dir_status(path)),
+            ComposerDirHandleInner::Mounted {
+                mount_index,
+                handle,
+                ..
+            } => self.mounts[*mount_index].backend.dir_status(handle),
         }
     }
 
@@ -701,7 +698,7 @@ impl Backend for Composer {
         &self,
         dir: DirHandle,
         name: &str,
-        metadata: CreationMetadata,
+        mode: Mode,
     ) -> Result<FileHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
@@ -714,7 +711,7 @@ impl Backend for Composer {
                 self.checked_child_path(path, name, OpenError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
-                    .create_file_at(handle, name, metadata)
+                    .create_file_at(handle, name, mode)
                     .map(|handle| {
                         FileHandle::from_typed::<Self>(ComposerFileHandle {
                             mount_index,
@@ -725,12 +722,7 @@ impl Backend for Composer {
         }
     }
 
-    fn mkdir_at(
-        &self,
-        dir: DirHandle,
-        name: &str,
-        metadata: CreationMetadata,
-    ) -> Result<DirHandle, MkdirError> {
+    fn mkdir_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<DirHandle, MkdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
             ComposerDirHandleInner::Virtual { .. } => Err(MkdirError::ReadOnlyFileSystem),
@@ -742,7 +734,7 @@ impl Backend for Composer {
                 let path = self.checked_child_path(path, name, MkdirError::ReadOnlyFileSystem)?;
                 self.mounts[mount_index]
                     .backend
-                    .mkdir_at(handle, name, metadata)
+                    .mkdir_at(handle, name, mode)
                     .map(|handle| {
                         DirHandle::from_typed::<Self>(
                             ComposerDirHandleInner::Mounted {
@@ -787,50 +779,116 @@ impl Backend for Composer {
         }
     }
 
-    fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
-        match h {
-            HandleRef::File(h) => {
-                let h = h.get_typed::<Self>();
-                self.mounts[h.mount_index]
+    fn chmod_at(&self, dir: DirHandle, name: &str, mode: Mode) -> Result<(), ChmodError> {
+        let dir = dir.into_typed::<Self>();
+        match dir.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => {
+                self.checked_child_path(path, name, ChmodError::ReadOnlyFileSystem)?;
+                self.mounts[mount_index]
                     .backend
-                    .chmod(HandleRef::File(&h.handle), mode)
+                    .chmod_at(handle, name, mode)
             }
-            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
-                ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
-                ComposerDirHandleInner::Mounted {
-                    mount_index,
-                    handle,
-                    ..
-                } => self.mounts[*mount_index]
-                    .backend
-                    .chmod(HandleRef::Dir(handle), mode),
-            },
         }
     }
 
-    fn chown(
+    fn chmod_file(&self, h: &FileHandle, mode: Mode) -> Result<(), ChmodError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index]
+            .backend
+            .chmod_file(&h.handle, mode)
+    }
+
+    fn chmod_dir(&self, h: &DirHandle, mode: Mode) -> Result<(), ChmodError> {
+        let h = h.get_typed::<Self>();
+        match &h.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                mount_index,
+                handle,
+                ..
+            } => self.mounts[*mount_index].backend.chmod_dir(handle, mode),
+        }
+    }
+
+    fn chown_at(
         &self,
-        h: HandleRef<'_>,
+        dir: DirHandle,
+        name: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        match h {
-            HandleRef::File(h) => {
-                let h = h.get_typed::<Self>();
-                self.mounts[h.mount_index]
+        let dir = dir.into_typed::<Self>();
+        match dir.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => {
+                self.checked_child_path(path, name, ChownError::ReadOnlyFileSystem)?;
+                self.mounts[mount_index]
                     .backend
-                    .chown(HandleRef::File(&h.handle), user, group)
+                    .chown_at(handle, name, user, group)
             }
-            HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
-                ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
-                ComposerDirHandleInner::Mounted {
-                    mount_index,
-                    handle,
-                    ..
-                } => self.mounts[*mount_index]
+        }
+    }
+
+    fn utimensat_at(
+        &self,
+        dir: DirHandle,
+        name: &str,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let dir = dir.into_typed::<Self>();
+        match dir.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(UtimeError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                path,
+                mount_index,
+                handle,
+            } => {
+                self.checked_child_path(path, name, UtimeError::ReadOnlyFileSystem)?;
+                self.mounts[mount_index]
                     .backend
-                    .chown(HandleRef::Dir(handle), user, group),
-            },
+                    .utimensat_at(handle, name, atime, mtime)
+            }
+        }
+    }
+
+    fn utimensat_file(
+        &self,
+        h: &FileHandle,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index]
+            .backend
+            .utimensat_file(&h.handle, atime, mtime)
+    }
+
+    fn utimensat_dir(
+        &self,
+        h: &DirHandle,
+        atime: Option<Timestamp>,
+        mtime: Option<Timestamp>,
+    ) -> Result<(), UtimeError> {
+        let h = h.get_typed::<Self>();
+        match &h.inner {
+            ComposerDirHandleInner::Virtual { .. } => Err(UtimeError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Mounted {
+                mount_index,
+                handle,
+                ..
+            } => self.mounts[*mount_index]
+                .backend
+                .utimensat_dir(handle, atime, mtime),
         }
     }
 }

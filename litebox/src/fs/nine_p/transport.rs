@@ -8,7 +8,9 @@
 
 use alloc::vec::Vec;
 
+#[derive(Debug)]
 pub struct ReadError;
+#[derive(Debug)]
 pub struct WriteError;
 
 /// Trait for reading bytes from a transport

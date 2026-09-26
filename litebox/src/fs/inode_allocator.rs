@@ -5,27 +5,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::NodeInfo;
 
-/// Hands out [`InodeAllocator`]s, each with its own device id.
-#[derive(Debug)]
-pub struct InodeAllocators {
-    next_device_id: AtomicU64,
-}
-
-impl InodeAllocators {
-    /// Start handing out allocators, beginning at `first_device_id`.
-    pub(super) fn starting_at(first_device_id: u64) -> Self {
-        Self {
-            next_device_id: AtomicU64::new(first_device_id),
-        }
-    }
-
-    /// Hand out an allocator for one backend.
-    #[must_use]
-    pub fn next(&self) -> InodeAllocator {
-        InodeAllocator::for_device(self.next_device_id.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
 /// Allocator for `(device_id, inode)` pairs scoped to one backend instance.
 #[derive(Debug)]
 pub struct InodeAllocator {
@@ -34,9 +13,10 @@ pub struct InodeAllocator {
 }
 
 impl InodeAllocator {
-    /// Construct an allocator for a specific `device_id`.
+    /// Construct an allocator for a specific `device_id`. The composer hands
+    /// out unique `device_id`s per mounted backend.
     #[must_use]
-    pub(super) fn for_device(device_id: u64) -> Self {
+    pub fn for_device(device_id: u64) -> Self {
         Self {
             device_id,
             counter: AtomicU64::new(1),
@@ -47,7 +27,7 @@ impl InodeAllocator {
     ///
     /// This should (eventually) disappear once we have better device ID allocation setup.
     #[must_use]
-    pub(crate) fn standalone() -> Self {
+    pub fn standalone() -> Self {
         // `b"Stnd".hex()`
         const STANDALONE_DEVICE_ID: u64 = 0x53746e64;
         Self::for_device(STANDALONE_DEVICE_ID)
@@ -58,15 +38,9 @@ impl InodeAllocator {
     pub fn next(&self) -> NodeInfo {
         let ino = self.counter.fetch_add(1, Ordering::Relaxed);
         NodeInfo {
-            dev: self.device_id(),
+            dev: self.device_id.try_into().unwrap(),
             ino: ino.try_into().unwrap(),
             rdev: None,
         }
-    }
-
-    /// The device id this allocator hands out.
-    #[must_use]
-    pub fn device_id(&self) -> usize {
-        self.device_id.try_into().unwrap()
     }
 }

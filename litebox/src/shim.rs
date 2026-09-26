@@ -118,7 +118,7 @@ pub struct ExceptionInfo {
 #[cfg(target_arch = "aarch64")]
 #[derive(Copy, Clone, Debug)]
 pub struct ExceptionInfo {
-    /// The aarch64 exception class from ESR_EL1[31:26].
+    /// The aarch64 exception class from ESR_EL1\[31:26\].
     pub exception: Exception,
     /// The fault address (FAR_EL1).
     pub fault_address: usize,
@@ -148,7 +148,7 @@ impl Exception {
     pub const PAGE_FAULT: Self = Self(14);
 }
 
-/// An aarch64 exception class from ESR_EL1[31:26].
+/// An aarch64 exception class from ESR_EL1\[31:26\].
 #[cfg(target_arch = "aarch64")]
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -156,6 +156,13 @@ pub struct Exception(pub u8);
 
 #[cfg(target_arch = "aarch64")]
 impl Exception {
+    /// Unknown reason. This is the class an undefined instruction raises, among
+    /// other unattributable traps.
+    pub const UNKNOWN: Self = Self(0x00);
+    /// Trapped `MSR`/`MRS`/system-instruction access from AArch64 state.
+    pub const SYSTEM_REGISTER_TRAP: Self = Self(0x18);
+    /// Trapped floating-point exception taken from AArch64 state.
+    pub const FP_EXCEPTION_A64: Self = Self(0x2c);
     /// Breakpoint exception from a lower exception level.
     pub const BREAKPOINT_LOWER_EL: Self = Self(0x30);
     /// Breakpoint exception taken without a change in exception level.

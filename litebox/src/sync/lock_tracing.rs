@@ -88,7 +88,6 @@ const CONFIG_ENABLE_RECORDING: bool = true;
 const CONFIG_MAX_RECORDED_EVENTS: usize = 1_000_000;
 
 /// The kind of lock that has been applied, either for locking or unlocking.
-#[non_exhaustive]
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 pub(crate) enum LockType {
     RwLock,

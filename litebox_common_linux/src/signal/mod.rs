@@ -319,10 +319,6 @@ pub const SI_TKILL: i32 = -6;
 pub const SI_DETHREAD: i32 = -7;
 pub const SI_ASYNCNL: i32 = -60;
 
-pub const ILL_ILLOPN: i32 = 2;
-
-pub const FPE_INTDIV: i32 = 1;
-
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
@@ -375,4 +371,19 @@ impl SiginfoData {
         pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
         Self { pad }
     }
+
+    /// Builds the `_sigchld` arm of the `siginfo_t` union: `si_pid`, `si_uid`, `si_status`,
+    /// followed by `si_utime`/`si_stime`, which this shim does not account for and leaves zero.
+    pub fn new_child(pid: i32, uid: u32, status: i32) -> Self {
+        let mut pad = [0u32; 28];
+        pad[0] = pid.cast_unsigned();
+        pad[1] = uid;
+        pad[2] = status.cast_unsigned();
+        Self { pad }
+    }
 }
+
+/// `si_code` for a `SIGCHLD` reporting a child that exited normally.
+pub const CLD_EXITED: i32 = 1;
+/// `si_code` for a `SIGCHLD` reporting a child killed by a signal.
+pub const CLD_KILLED: i32 = 2;

@@ -70,21 +70,37 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     let platform = Platform::new();
     let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    let litebox = shim_builder.litebox();
 
     // The program path is a Unix-style path inside the tar archive.
     let prog_path = &cli_args.program_and_arguments[0];
 
     let initial_file_system = {
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized([(
-            "/tmp",
-            litebox::fs::in_mem::InitialNode::Directory {
-                mode: litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
-                owner: litebox::fs::UserInfo {
-                    user: 1000,
-                    group: 1000,
-                },
-            },
-        )]);
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
+        in_mem.with_root_privileges(|fs| {
+            use litebox::fs::FileSystem as _;
+            fs.mkdir(
+                "/tmp",
+                litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+            )
+            .unwrap();
+            fs.chown("/tmp", Some(1000), Some(1000)).unwrap();
+
+            // Standard FHS directories that guest tools expect to already exist (e.g. `apk`
+            // opens a log file under `/var/log`) but that don't survive as empty-directory
+            // entries when an OCI image's rootfs is scanned into a file-based tar: an empty
+            // directory has no file contents, so it produces no tar entry, and `TarRo`'s
+            // directory tree is inferred purely from file paths.
+            for dir in ["/run", "/var", "/var/log", "/var/cache", "/var/tmp"] {
+                fs.mkdir(
+                    dir,
+                    litebox::fs::Mode::RWXU | litebox::fs::Mode::RWXG | litebox::fs::Mode::RWXO,
+                )
+                .unwrap_or_else(|_| {
+                    panic!("{dir} creation cannot fail on a fresh in-memory file system")
+                });
+            }
+        });
 
         shim_builder.default_fs(in_mem, tar_data.into())
     };

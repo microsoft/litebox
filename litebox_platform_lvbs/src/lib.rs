@@ -888,6 +888,18 @@ impl<Host: HostInterface> TimeProvider for LinuxKernel<Host> {
     fn current_time(&self) -> Self::SystemTime {
         unimplemented!()
     }
+
+    fn thread_cpu_time(&self) -> core::time::Duration {
+        // As with `current_time` above, this platform has no host-level CPU-time source wired
+        // up yet (no separate host OS to query, and no scheduler-level runtime accounting of its
+        // own), so this is intentionally left unimplemented rather than returning a value that
+        // could be mistaken for genuine CPU-time accounting.
+        unimplemented!()
+    }
+
+    fn process_cpu_time(&self) -> core::time::Duration {
+        unimplemented!()
+    }
 }
 
 impl litebox::platform::Instant for Instant {

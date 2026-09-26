@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// The OP-TEE shim and its shared definitions are both x86-64 only, so on any
+// other host this runner has nothing to drive and compiles to nothing.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};

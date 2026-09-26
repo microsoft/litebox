@@ -1,0 +1,20 @@
+[package]
+name = "litebox_runner_darwin_on_windows_userland"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
+anyhow = "1.0.97"
+clap = { version = "4.5.33", features = ["derive"] }
+litebox = { version = "0.1.0", path = "../litebox" }
+litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
+litebox_platform_windows_userland = { version = "0.1.0", path = "../litebox_platform_windows_userland" }
+litebox_shim_darwin = { version = "0.1.0", path = "../litebox_shim_darwin" }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log", features = ["backend_tracing"] }
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dev-dependencies]
+tar = "0.4"
+
+[lints]
+workspace = true

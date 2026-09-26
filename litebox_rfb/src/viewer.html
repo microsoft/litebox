@@ -1,0 +1,105 @@
+<!-- Copyright (c) Microsoft Corporation.
+     Licensed under the MIT license. -->
+<!doctype html>
+<!-- The litebox guest-framebuffer viewer. Served by litebox_rfb::web; the wire protocol it
+     speaks is documented in web.rs. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>litebox desktop</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1e1e1e; }
+  body { display: flex; align-items: center; justify-content: center; }
+  #screen { image-rendering: pixelated; outline: none; max-width: 100%; max-height: 100%; }
+  #status { position: fixed; top: 8px; left: 8px; color: #9a9a9a;
+            font: 12px ui-monospace, monospace; user-select: none; }
+</style>
+</head>
+<body>
+<div id="status">connecting&hellip;</div>
+<canvas id="screen" width="1024" height="768" tabindex="0"></canvas>
+<script>
+"use strict";
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const status = document.getElementById("status");
+const ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+ws.binaryType = "arraybuffer";
+
+ws.onopen = () => { status.textContent = ""; canvas.focus(); };
+ws.onclose = () => { status.textContent = "disconnected — reload to reconnect"; };
+ws.onerror = () => { status.textContent = "connection error"; };
+
+ws.onmessage = (ev) => {
+  const data = new Uint8Array(ev.data);
+  const w = (data[0] << 8) | data[1];
+  const h = (data[2] << 8) | data[3];
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  const frame = new ImageData(new Uint8ClampedArray(ev.data, 4), w, h);
+  ctx.putImageData(frame, 0, 0);
+};
+
+function send(bytes) { if (ws.readyState === WebSocket.OPEN) ws.send(new Uint8Array(bytes)); }
+
+// --- keyboard: X11 keysyms, matching what an RFB client would send -----------------------
+const SPECIAL_KEYS = {
+  "Enter": 0xff0d, "Backspace": 0xff08, "Tab": 0xff09, "Escape": 0xff1b,
+  "ArrowLeft": 0xff51, "ArrowUp": 0xff52, "ArrowRight": 0xff53, "ArrowDown": 0xff54,
+  "Home": 0xff50, "End": 0xff57, "PageUp": 0xff55, "PageDown": 0xff56,
+  "Insert": 0xff63, "Delete": 0xffff,
+  "F1": 0xffbe, "F2": 0xffbf, "F3": 0xffc0, "F4": 0xffc1, "F5": 0xffc2,
+  "F6": 0xffc3, "F7": 0xffc4, "F8": 0xffc5, "F9": 0xffc6, "F10": 0xffc7,
+  "Shift": 0xffe1, "Control": 0xffe3, "Alt": 0xffe9, "Meta": 0xffe7,
+};
+function keysymOf(e) {
+  if (e.key in SPECIAL_KEYS) return SPECIAL_KEYS[e.key];
+  if (e.key.length === 1) {
+    const cp = e.key.codePointAt(0);
+    if (cp >= 0x20 && cp <= 0xff) return cp;  // Latin-1 keysyms are the characters themselves
+  }
+  return null;
+}
+function sendKey(e, down) {
+  const sym = keysymOf(e);
+  if (sym === null) return;
+  e.preventDefault();
+  send([1, down ? 1 : 0, (sym >>> 24) & 0xff, (sym >>> 16) & 0xff, (sym >>> 8) & 0xff, sym & 0xff]);
+}
+canvas.addEventListener("keydown", (e) => sendKey(e, true));
+canvas.addEventListener("keyup", (e) => sendKey(e, false));
+
+// --- pointer: RFB-style button mask ------------------------------------------------------
+// DOM `buttons`: bit0 left, bit1 RIGHT, bit2 MIDDLE. RFB mask: bit0 left, bit1 MIDDLE,
+// bit2 RIGHT.
+function rfbMask(domButtons) {
+  return (domButtons & 1) | ((domButtons & 4) ? 2 : 0) | ((domButtons & 2) ? 4 : 0);
+}
+function fbCoords(e) {
+  const r = canvas.getBoundingClientRect();
+  const x = Math.round((e.clientX - r.left) * canvas.width / r.width);
+  const y = Math.round((e.clientY - r.top) * canvas.height / r.height);
+  return [Math.min(Math.max(x, 0), canvas.width - 1), Math.min(Math.max(y, 0), canvas.height - 1)];
+}
+function sendPointer(mask, x, y) {
+  send([2, mask, (x >>> 8) & 0xff, x & 0xff, (y >>> 8) & 0xff, y & 0xff]);
+}
+function onMouse(e) {
+  const [x, y] = fbCoords(e);
+  sendPointer(rfbMask(e.buttons), x, y);
+  e.preventDefault();
+  canvas.focus();
+}
+canvas.addEventListener("mousemove", onMouse);
+canvas.addEventListener("mousedown", onMouse);
+canvas.addEventListener("mouseup", onMouse);
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+canvas.addEventListener("wheel", (e) => {
+  const [x, y] = fbCoords(e);
+  const bit = e.deltaY < 0 ? 8 : 16;  // wheel up = RFB button 4, down = button 5
+  sendPointer(rfbMask(e.buttons) | bit, x, y);
+  sendPointer(rfbMask(e.buttons), x, y);
+  e.preventDefault();
+});
+</script>
+</body>
+</html>

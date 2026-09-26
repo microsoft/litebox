@@ -10,16 +10,16 @@
 use core::num::NonZero;
 
 use litebox::{
-    event::{IOPollable, wait::WaitContext},
+    event::wait::WaitContext,
     fd::MetadataError,
     fs::{Mode, OFlags},
     pipes::{Flags, HalfPipeType, PipeFd},
 };
 use litebox_common_linux::{FileDescriptorFlags, InodeType, errno::Errno};
 
-use crate::{GlobalState, ShimPlatform};
+use crate::{GlobalState, ShimFS, ShimPlatform};
 
-const DEFAULT_PIPE_BUF_SIZE: usize = 1024 * 1024;
+const DEFAULT_PIPE_BUF_SIZE: usize = 64 * 1024;
 
 /// Status flags for Linux pipe file descriptions.
 ///
@@ -38,7 +38,7 @@ pub(crate) struct LinuxPipeEnds<Platform: ShimPlatform> {
     pub(crate) writer: PipeFd<Platform>,
 }
 
-impl<Platform: ShimPlatform> GlobalState<Platform> {
+impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
     pub(crate) fn create_linux_pipe(
         &self,
         flags: OFlags,
@@ -51,7 +51,12 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             }
             pipe_flags.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
             if flags.contains(OFlags::DIRECT) {
-                todo!("O_DIRECT not supported");
+                // Real O_DIRECT pipes are packet-mode: each write is a discrete message and
+                // reads never span one. The backing ring buffer here is a flat byte stream
+                // with no message-boundary tracking, so, like `set_linux_pipe_status_flags`
+                // below does for the same flag via fcntl, we accept and record the bit
+                // (readable back through fcntl(F_GETFL)) without enforcing packet framing.
+                log_unsupported!("O_DIRECT (packet-mode) pipe");
             }
             (pipe_flags, flags.contains(OFlags::CLOEXEC))
         };
@@ -61,9 +66,11 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             pipe_flags,
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
             NonZero::new(4096),
-        );
+        )?;
 
-        let initial_status = OFlags::from(pipe_flags);
+        // `Flags` (the internal pipe-backend type) only tracks NON_BLOCKING, so DIRECT
+        // has to be folded back in here to stay visible through fcntl(F_GETFL).
+        let initial_status = OFlags::from(pipe_flags) | (flags & OFlags::DIRECT);
         {
             let mut dt = self.litebox.descriptor_table_mut();
             let old =
@@ -147,14 +154,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         };
         Ok(read_write_mode.bits() | InodeType::NamedPipe as u32)
     }
-
-    pub(crate) fn with_linux_pipe_iopollable<R>(
-        &self,
-        fd: &PipeFd<Platform>,
-        f: impl FnOnce(&dyn IOPollable) -> R,
-    ) -> Result<R, Errno> {
-        self.pipes.with_iopollable(fd, f).map_err(Errno::from)
-    }
 }
 
 fn metadata_to_errno(err: MetadataError) -> Errno {
@@ -163,5 +162,41 @@ fn metadata_to_errno(err: MetadataError) -> Errno {
         MetadataError::NoSuchMetadata => {
             unreachable!("Linux pipe descriptors always carry PipeStatusFlags")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox_common_linux::FcntlArg;
+
+    use super::OFlags;
+    use crate::syscalls::tests::init_platform;
+
+    #[test]
+    fn test_pipe2_direct_is_accepted_and_stays_usable() {
+        let task = init_platform(None);
+        let (read_fd, write_fd) = task
+            .sys_pipe2(OFlags::DIRECT)
+            .expect("pipe2(O_DIRECT) should not error");
+        let read_fd = i32::try_from(read_fd).unwrap();
+        let write_fd = i32::try_from(write_fd).unwrap();
+
+        for fd in [read_fd, write_fd] {
+            let flags = OFlags::from_bits_truncate(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap());
+            assert!(
+                flags.contains(OFlags::DIRECT),
+                "fcntl(F_GETFL) should still report O_DIRECT, as real Linux does"
+            );
+        }
+
+        let msg = b"hello via O_DIRECT pipe";
+        let n = task.sys_write(write_fd, msg, None).expect("write failed");
+        assert_eq!(n, msg.len());
+        let mut buf = [0u8; 64];
+        let n = task.sys_read(read_fd, &mut buf, None).expect("read failed");
+        assert_eq!(&buf[..n], msg);
+
+        task.sys_close(read_fd).unwrap();
+        task.sys_close(write_fd).unwrap();
     }
 }

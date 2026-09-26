@@ -67,11 +67,23 @@ struct TrampolineInfo {
     size: usize,
     /// The entry point to jump to in the trampoline.
     syscall_entry_point: usize,
+    /// The guest thread-pointer byte offset to publish to the trampoline, on a
+    /// host whose gates read it rather than baking it in.
+    guest_tp_slot_offset: Option<usize>,
 }
 
 /// The magic number used to identify the LiteBox trampoline.
 /// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
+
+/// Byte offset, within the trampoline, of the word holding the guest
+/// thread-pointer offset.
+///
+/// This must match `TRAMPOLINE_GUEST_TP_SLOT_OFFSET` in
+/// `litebox_syscall_rewriter`, which is where the emitter puts it. This crate
+/// cannot depend on the rewriter, so `litebox_shim_linux` asserts the two are
+/// equal at compile time rather than leaving the agreement to this comment.
+pub const TRAMPOLINE_GUEST_TP_SLOT_OFFSET: usize = 8;
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
 #[repr(C, packed)]
@@ -266,6 +278,14 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
+    ///
+    /// `guest_tp_slot_offset` is the byte offset from the host's per-thread
+    /// anchor at which the runtime keeps the guest thread pointer, for a host
+    /// whose rewritten gates read that number rather than carrying it as an
+    /// immediate (see `SystemInfoProvider::get_guest_tp_slot_offset`). It is
+    /// written alongside the entry point at map time. `None` leaves the word the
+    /// rewriter seeded in place, which is correct for every host that decides the
+    /// offset when the image is packaged.
     #[expect(
         clippy::missing_panics_doc,
         reason = "cannot panic: array slices are always the correct size"
@@ -274,6 +294,7 @@ impl ElfParsedFile {
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
+        guest_tp_slot_offset: Option<usize>,
     ) -> Result<(), ElfParseError<F::Error>> {
         if syscall_entry_point == 0 {
             // Platform running in kernel mode does not need trampoline
@@ -366,6 +387,7 @@ impl ElfParsedFile {
             size: trampoline_size,
             file_offset,
             syscall_entry_point,
+            guest_tp_slot_offset,
         });
         Ok(())
     }
@@ -571,6 +593,20 @@ impl ElfParsedFile {
             trampoline_start,
             &trampoline.syscall_entry_point.to_ne_bytes(),
         )?;
+
+        // Publish the guest thread-pointer offset the runtime actually reserved.
+        // This is the only chance to do it: the trampoline is writable now and
+        // read+execute from the protect call below onwards, so a gate's offset
+        // has to be a number that is fixed for the whole process. Skipped unless
+        // the platform asks for it, since on every other host the emitted gates
+        // carry the offset as an immediate and this word is ordinary code.
+        if let Some(offset) = trampoline.guest_tp_slot_offset {
+            let slot = trampoline_start + TRAMPOLINE_GUEST_TP_SLOT_OFFSET;
+            if TRAMPOLINE_GUEST_TP_SLOT_OFFSET + size_of::<usize>() > trampoline.size {
+                return Err(ElfLoadError::InvalidTrampolineVersion);
+            }
+            mem.write(slot, &offset.to_ne_bytes())?;
+        }
 
         // Now that the write is done, protect the trampoline code as
         // read+execute only.

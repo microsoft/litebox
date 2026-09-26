@@ -379,7 +379,10 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// The caller must ensure that no references to the released memory regions
     /// are held after this call.
     pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::vmem::VmFlags| true;
+        // This shim instance owns every mapping the manager tracks, so each tracked range is
+        // released whole. See `PageManager::release_memory` for why the callback names ranges
+        // rather than answering yes/no.
+        let release = |r: core::ops::Range<usize>, _vm: litebox::mm::vmem::VmFlags| Some(r);
         unsafe {
             let _ = self.page_manager().release_memory(release);
         }

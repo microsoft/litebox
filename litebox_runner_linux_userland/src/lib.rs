@@ -1,13 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+// Restrict this crate to the host its platform supports. `litebox_platform_linux_userland`
+// is itself gated to x86-64 Linux, so on anything else this runner has no platform to
+// drive and compiles to nothing.
+#![cfg(all(target_os = "linux", target_arch = "x86_64"))]
+
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox::fs::Mode;
+use litebox::fs::{FileSystem as _, Mode};
 use litebox_platform_linux_userland::LinuxUserland as Platform;
 use memmap2::Mmap;
 use std::os::linux::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+
+mod broker;
 
 extern crate alloc;
 
@@ -77,6 +84,16 @@ pub struct CliArgs {
         help_heading = "Unstable Options"
     )]
     pub program_from_tar: bool,
+    /// Broker-supplied Unix socket path for the local control channel.
+    #[arg(
+        long = "broker-control-socket",
+        value_name = "PATH",
+        value_hint = clap::ValueHint::FilePath,
+        hide = true,
+        requires = "unstable",
+        help_heading = "Unstable Options"
+    )]
+    pub broker_control_socket: Option<PathBuf>,
 }
 
 struct MmappedFile {
@@ -137,6 +154,11 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         );
     }
 
+    let broker_connection = match cli_args.broker_control_socket.as_deref() {
+        Some(control_socket_path) => Some(broker::connect(control_socket_path)?),
+        None => None,
+    };
+
     let mut cow_eligible_regions: Vec<MmappedFile> = Vec::new();
 
     // When --program-from-tar is set, the program binary is already in the tar file,
@@ -196,11 +218,38 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new(cli_args.tun_device_name.as_deref());
 
+    let landlock_allowed_read_paths: Vec<PathBuf> = cow_eligible_regions
+        .iter()
+        .map(|file| file.abs_path.clone())
+        .collect();
     for file in cow_eligible_regions {
         platform.register_cow_region(file.data, file.abs_path);
     }
 
-    let shim_builder = litebox_shim_linux::LinuxShimBuilder::new(platform);
+    let mut broker_positional_io_fds = Vec::new();
+    let mut broker_shutdown_fds = Vec::new();
+    let shim_builder = if let Some(broker_connection) = broker_connection {
+        let broker::BrokerConnection {
+            local: broker_local,
+            notifications: broker_notifications,
+            coordinator: broker_association_coordinator,
+            positional_io_fds,
+            shutdown_fd,
+        } = broker_connection;
+        broker_positional_io_fds.extend(positional_io_fds);
+        broker_shutdown_fds.push(shutdown_fd);
+        let litebox = litebox::LiteBox::new_with_broker_local(platform, broker_local);
+        broker_association_coordinator.install_dispatch(litebox.broker_failure_dispatcher());
+        broker::start_notification_receiver(
+            broker_notifications,
+            broker_association_coordinator,
+            litebox.broker_notification_dispatcher(),
+        )?;
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox)
+    } else {
+        litebox_shim_linux::LinuxShimBuilder::new(platform)
+    };
+    let litebox = shim_builder.litebox();
     // SAFETY: `gettid` takes no pointer arguments and has no Rust-side aliasing requirements.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) }
         .try_into()
@@ -216,23 +265,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         egid: u32::from(DEFAULT_GUEST_GID),
     };
     let initial_file_system = {
-        // The in-memory layer is pre-populated at construction, which lets us set up root-owned
-        // directories and files without ever acting as root at runtime.
-        //
-        // A host uid of 0 anywhere along the path means the entry stays root-owned; as soon as a
-        // path component belongs to a non-root host user, that component and everything below it
-        // is owned by the guest user.
-        let owner_of = |parent_host_user: u32, host_user: u32| {
-            if parent_host_user == 0 && host_user == 0 {
-                litebox::fs::UserInfo::ROOT
-            } else {
-                litebox::fs::UserInfo {
-                    user: DEFAULT_GUEST_UID,
-                    group: DEFAULT_GUEST_GID,
-                }
-            }
-        };
-        let mut entries: Vec<(String, litebox::fs::in_mem::InitialNode)> = Vec::new();
+        let mut in_mem = litebox::fs::in_mem::FileSystem::new(litebox);
 
         // When loading the program from the tar, we don't need to create ancestor
         // directories or write the program binary into the in-memory FS -- the program
@@ -240,6 +273,15 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         if let Some(prog_data) = prog_data {
             let prog = std::path::absolute(Path::new(&cli_args.program_and_arguments[0])).unwrap();
             let ancestors: Vec<_> = prog.ancestors().collect();
+            let chown_to_initial_user = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>,
+                                         path: &Path| {
+                fs.chown(
+                    path.to_str().unwrap(),
+                    Some(DEFAULT_GUEST_UID),
+                    Some(DEFAULT_GUEST_GID),
+                )
+                .unwrap();
+            };
             let mut prev_user = 0;
             for (path, &mode_and_user) in ancestors
                 .into_iter()
@@ -248,47 +290,77 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 .skip(1)
                 .zip(&ancestor_modes_and_users)
             {
-                entries.push((
-                    path.to_str().unwrap().to_owned(),
-                    litebox::fs::in_mem::InitialNode::Directory {
-                        mode: mode_and_user.0,
-                        owner: owner_of(prev_user, mode_and_user.1),
-                    },
-                ));
+                if prev_user == 0 {
+                    // require root user
+                    in_mem.with_root_privileges(|fs| {
+                        fs.mkdir(path.to_str().unwrap(), mode_and_user.0).unwrap();
+                        if mode_and_user.1 != 0 {
+                            chown_to_initial_user(fs, path);
+                        }
+                    });
+                } else {
+                    in_mem
+                        .mkdir(path.to_str().unwrap(), mode_and_user.0)
+                        .unwrap();
+                }
                 prev_user = mode_and_user.1;
             }
+
+            let open_file = |fs: &mut litebox::fs::in_mem::FileSystem<Platform>, path, mode| {
+                let fd = fs
+                    .open(
+                        path,
+                        litebox::fs::OFlags::WRONLY | litebox::fs::OFlags::CREAT,
+                        mode,
+                    )
+                    .unwrap();
+                fs.initialize_primarily_read_heavy_file(&fd, prog_data);
+                fs.close(&fd).unwrap();
+            };
             let last = ancestor_modes_and_users.last().ok_or_else(|| {
                 anyhow!("program path has no ancestor directories (is it the root path?)")
             })?;
-            entries.push((
-                prog.to_str().unwrap().to_owned(),
-                litebox::fs::in_mem::InitialNode::File {
-                    mode: last.0,
-                    owner: owner_of(prev_user, last.1),
-                    data: prog_data,
-                },
-            ));
+            if prev_user == 0 {
+                in_mem.with_root_privileges(|fs| {
+                    open_file(fs, prog.to_str().unwrap(), last.0);
+                    if last.1 != 0 {
+                        chown_to_initial_user(fs, &prog);
+                    }
+                });
+            } else {
+                open_file(&mut in_mem, prog.to_str().unwrap(), last.0);
+            }
         }
+        in_mem.with_root_privileges(|fs| {
+            let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
+            if let Err(err) = fs.mkdir("/tmp", mode) {
+                match err {
+                    litebox::fs::errors::MkdirError::AlreadyExists => {
+                        fs.chmod("/tmp", mode).expect("Failed to call chmod");
+                    }
+                    _ => panic!(),
+                }
+            }
 
-        let tmp_mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
-        if let Some((_, node)) = entries.iter_mut().find(|(path, _)| path == "/tmp") {
-            // `/tmp` is an ancestor of the program, so it keeps the owner derived above and only
-            // has its mode widened.
-            let litebox::fs::in_mem::InitialNode::Directory { mode, .. } = node else {
-                unreachable!("ancestors are always directories")
-            };
-            *mode = tmp_mode;
-        } else {
-            entries.push((
-                "/tmp".to_owned(),
-                litebox::fs::in_mem::InitialNode::Directory {
-                    mode: tmp_mode,
-                    owner: litebox::fs::UserInfo::ROOT,
-                },
-            ));
-        }
+            // Standard FHS directories that guest tools expect to already exist (e.g. `apk`
+            // opens a log file under `/var/log`) but that don't survive as empty-directory
+            // entries when an OCI image's rootfs is scanned into a file-based tar: an empty
+            // directory has no file contents, so it produces no tar entry, and `TarRo`'s
+            // directory tree is inferred purely from file paths. A program-from-tar ancestor
+            // directory (created above) may already occupy one of these paths, so tolerate
+            // `AlreadyExists` the same way `/tmp` does.
+            for dir in ["/run", "/var", "/var/log", "/var/cache", "/var/tmp"] {
+                if let Err(err) = fs.mkdir(dir, mode) {
+                    match err {
+                        litebox::fs::errors::MkdirError::AlreadyExists => {
+                            fs.chmod(dir, mode).expect("Failed to call chmod");
+                        }
+                        other => panic!("unexpected error creating {dir}: {other:?}"),
+                    }
+                }
+            }
+        });
 
-        let in_mem = litebox::fs::in_mem::InMem::new_initialized(entries);
         shim_builder.default_fs(in_mem, tar_data.into())
     };
 
@@ -365,7 +437,18 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     };
 
     #[cfg(target_arch = "x86_64")]
-    litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter();
+    litebox_platform_linux_userland::LinuxUserland::enable_landlock_filesystem_ruleset(
+        &landlock_allowed_read_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>(),
+    );
+
+    #[cfg(target_arch = "x86_64")]
+    litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
+        &broker_positional_io_fds,
+        &broker_shutdown_fds,
+    );
 
     let program = shim.load_program(initial_file_system, task_params, prog_path, argv, envp)?;
 
@@ -397,7 +480,13 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         shutdown.store(true, core::sync::atomic::Ordering::Relaxed);
         net_worker.join().unwrap();
     }
-    std::process::exit(program.process.wait_for_unix_shell_exit_code())
+    let status = program.process.wait();
+    if status >= 256 {
+        // `exit` truncates mod 256, which would alias death-by-signal-N with a
+        // guest's normal `exit(N)`; disambiguate on stderr before it is lost.
+        eprintln!("guest terminated by signal {}", status - 256);
+    }
+    std::process::exit(status)
 }
 
 /// Pin the current thread to a specific CPU core
