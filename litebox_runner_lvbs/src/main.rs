@@ -393,10 +393,6 @@ unsafe extern "C" fn common_start(is_bsp: bool) -> ! {
     enable_extended_states();
 
     if is_bsp {
-        // Relocation is now final. Publish the diagnostic writer before heap
-        // seeding emits messages; APs inherit the same VM-wide selection.
-        litebox_platform_lvbs::console::install(litebox_platform_lvbs::host::lvbs::console::print)
-            .expect("the BSP must install the console exactly once");
         litebox_runner_lvbs::seed_initial_heap();
     }
 
@@ -449,9 +445,9 @@ unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
         #[cfg(not(debug_assertions))]
         log::set_max_level(log::LevelFilter::Warn);
 
-        serial_println!("==============================");
-        serial_println!(" Hello from LiteBox for LVBS! ");
-        serial_println!("==============================");
+        serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "==============================");
+        serial_println!(litebox_platform_lvbs::host::lvbs::console::print; " Hello from LiteBox for LVBS! ");
+        serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "==============================");
     }
 
     let platform = litebox_runner_lvbs::init(is_bsp);

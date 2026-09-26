@@ -11,7 +11,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{
     alloc::Layout,
     fmt::{self, Write},
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sync::atomic::AtomicU32,
 };
 use litebox::mm::allocator::SafeZoneAllocator;
 use litebox_common_linux::errno::Errno;
@@ -36,7 +36,6 @@ type Platform = LinuxKernel<QemuHost>;
 
 #[global_allocator]
 static HEAP: SafeZoneAllocator<'static, 30, QemuHost> = SafeZoneAllocator::new();
-static CPU_READY: AtomicBool = AtomicBool::new(false);
 
 impl litebox::mm::allocator::MemoryProvider for QemuHost {
     fn alloc(_layout: &Layout) -> Option<(usize, usize)> {
@@ -48,6 +47,10 @@ impl litebox::mm::allocator::MemoryProvider for QemuHost {
 }
 
 impl MemoryProvider for QemuMemory {
+    fn print(args: fmt::Arguments<'_>) {
+        console(args);
+    }
+
     type Tlb = SingleCpuTlb;
     const GVA_OFFSET: VirtAddr = VirtAddr::new(litebox_platform_lvbs::GVA_OFFSET);
     const PRIVATE_PTE_MASK: u64 = 0;
@@ -154,8 +157,7 @@ pub extern "C" fn early_entry() -> ! {
 
 #[inline(never)]
 fn boot_main() -> ! {
-    litebox_platform_lvbs::console::install(console).unwrap();
-    serial_println!("QEMU-BOOT: long-mode relocated");
+    serial_println!(console; "QEMU-BOOT: long-mode relocated");
     configure_cpu();
     let info_pa = crate::boot::start_info_pa();
     let memory = memory_map::parse(info_pa, |pa, out| {
@@ -184,13 +186,13 @@ fn boot_main() -> ! {
             >= 32 * 1024 * 1024,
         "at least 32 MiB allocatable guest RAM required"
     );
-    serial_println!(
+    serial_println!(console;
         "QEMU-BOOT: ram {:#x}..{:#x}",
         memory.ram.start,
         memory.ram.end
     );
     for range in &memory.heap {
-        serial_println!("QEMU-BOOT: heap {:#x}..{:#x}", range.start, range.end);
+        serial_println!(console; "QEMU-BOOT: heap {:#x}..{:#x}", range.start, range.end);
         // SAFETY: parser returned disjoint usable RAM excluding boot/image and
         // firmware storage. The whole range is mapped and not yet allocated.
         unsafe {
@@ -213,7 +215,6 @@ fn boot_main() -> ! {
     unsafe {
         litebox_common_linux::wrgsbase(core::ptr::from_mut(cpu) as usize);
     }
-    CPU_READY.store(true, Ordering::Release);
     // Like LVBS: switch to a permanent aligned kernel stack, then CALL so the
     // Rust entry sees RSP % 16 == 8. Nothing on the former stack is used again.
     unsafe {
@@ -281,7 +282,6 @@ fn configure_cpu() {
 }
 
 extern "C" fn kernel_main(ram_start: u64, ram_end: u64) -> ! {
-    assert!(CPU_READY.load(Ordering::Acquire));
     litebox_platform_lvbs::per_cpu_variables::with_per_cpu_variables(
         PerCpuVariables::allocate_xsave_areas,
     );
@@ -312,10 +312,10 @@ extern "C" fn kernel_main(ram_start: u64, ram_end: u64) -> ! {
         )
     };
     arch::enable_smep_smap();
-    serial_println!("QEMU-BOOT: shared kernel initialized");
+    serial_println!(console; "QEMU-BOOT: shared kernel initialized");
     smoke(platform);
     user_smoke::run(platform);
-    serial_println!("QEMU-BOOT: PASS");
+    serial_println!(console; "QEMU-BOOT: PASS");
     exit(true)
 }
 
@@ -403,5 +403,5 @@ fn smoke(platform: &Platform) {
     // The final kernel table dropped the identity map. This must recover #PF
     // through the shared exception table, not return successfully or triple fault.
     assert!(unsafe { memcpy_fallible(&raw mut byte, 0x1000 as *const u8, 1) }.is_err());
-    serial_println!("QEMU-BOOT: allocation paging protection fault-recovery OK");
+    serial_println!(console; "QEMU-BOOT: allocation paging protection fault-recovery OK");
 }

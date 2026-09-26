@@ -65,7 +65,7 @@ pub(crate) fn init(is_bsp: bool) {
             let Some(end) = start.checked_add(size) else {
                 panic!("Failed to protect VTL1 memory");
             };
-            debug_serial_println!("VSM: Protect GPAs from {:#x} to {:#x}", start, end);
+            debug_serial_println!(crate::host::lvbs::console::print; "VSM: Protect GPAs from {:#x} to {:#x}", start, end);
             let Ok(end) = PhysAddr::try_new(end) else {
                 panic!("Failed to protect VTL1 memory");
             };
@@ -88,7 +88,7 @@ pub(crate) fn init(is_bsp: bool) {
 
 /// VSM function for enforcing certain security features of VTL0 to protect VTL1
 pub(crate) fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
-    debug_serial_println!("VSM: Secure VTL0 configuration");
+    debug_serial_println!(crate::host::lvbs::console::print; "VSM: Secure VTL0 configuration");
 
     let mut config = HvRegisterVsmVpSecureVtlConfig::new();
     config.set_mbec_enabled(true);
@@ -102,7 +102,7 @@ pub(crate) fn mshv_vsm_secure_config_vtl0() -> Result<i64, VsmError> {
 
 /// VSM function to configure a VSM partition for VTL1
 pub(crate) fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
-    debug_serial_println!("VSM: Configure partition");
+    debug_serial_println!(crate::host::lvbs::console::print; "VSM: Configure partition");
 
     let mut config = HvRegisterVsmPartitionConfig::new();
     config.set_default_vtl_protection_mask(HvPageProtFlags::HV_PAGE_FULL_ACCESS.bits());
@@ -117,7 +117,7 @@ pub(crate) fn mshv_vsm_configure_partition() -> Result<i64, VsmError> {
 /// VSM function for locking VTL0's control registers, snapshotting their
 /// current values into VTL1 per-CPU state.
 pub(crate) fn mshv_vsm_lock_regs(platform: &LvbsLinuxKernel) -> Result<i64, VsmError> {
-    debug_serial_println!("VSM: Lock control registers");
+    debug_serial_println!(crate::host::lvbs::console::print; "VSM: Lock control registers");
 
     if platform.end_of_boot_reached() {
         return Err(VsmError::OperationAfterEndOfBoot(
@@ -746,7 +746,7 @@ impl Vtl0PrivilegedWrite for LvbsVtl0PrivilegedWriter<'_> {
 impl Vtl1Gate for LvbsVtl1Gate {
     fn enable_aps_vtl(&self, _cpu_present_mask_pfn: u64) -> Result<(), VsmError> {
         // APs enter VTL1 via `boot_aps`; no separate enablement step is needed.
-        debug_serial_println!("VSM: Enable APs' VTL is not supported");
+        debug_serial_println!(crate::host::lvbs::console::print; "VSM: Enable APs' VTL is not supported");
         Ok(())
     }
 
@@ -781,7 +781,7 @@ impl Vtl1Gate for LvbsVtl1Gate {
     }
 
     fn signal_end_of_boot(&self) {
-        debug_serial_println!("VSM: End of boot; VTL0 is no longer trusted");
+        debug_serial_println!(crate::host::lvbs::console::print; "VSM: End of boot; VTL0 is no longer trusted");
         self.platform.signal_end_of_boot();
     }
 

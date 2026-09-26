@@ -163,11 +163,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                 Ok((frame, _)) => Some(frame),
                 Err(X64UnmapError::PageNotMapped) => None,
                 Err(X64UnmapError::ParentEntryHugePage) => {
-                    crate::debug_serial_println!("BUG: attempt to unmap a huge page");
+                    crate::debug_serial_println!(M::print; "BUG: attempt to unmap a huge page");
                     None
                 }
                 Err(X64UnmapError::InvalidFrameAddress(pa)) => {
-                    crate::debug_serial_println!(
+                    crate::debug_serial_println!(M::print;
                         "BUG: attempt to unmap an invalid frame address: {:#x}",
                         pa
                     );
@@ -313,7 +313,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                             todo!("Invalid frame address at remap destination: {:#x}", pa);
                             #[cfg(not(debug_assertions))]
                             {
-                                crate::serial_println!(
+                                crate::serial_println!(M::print;
                                     "Invalid frame address at remap destination: {:#x}",
                                     pa
                                 );
@@ -336,7 +336,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                                     if let Err(rollback_err) =
                                         unsafe { inner.map_to(start, frame, flags, &mut allocator) }
                                     {
-                                        crate::serial_println!(
+                                        crate::serial_println!(M::print;
                                             "BUG: remap rollback failed: {:?}",
                                             rollback_err
                                         );
@@ -352,7 +352,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                                         "BUG: map_to reported PageAlreadyMapped after pre-check at {:#x}",
                                         new_start.start_address()
                                     );
-                                    crate::serial_println!(
+                                    crate::serial_println!(M::print;
                                         "BUG: map_to reported PageAlreadyMapped after pre-check at {:#x}",
                                         new_start.start_address()
                                     );
@@ -364,7 +364,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                                         "BUG: map_to reported ParentEntryHugePage after pre-check at {:#x}",
                                         new_start.start_address()
                                     );
-                                    crate::serial_println!(
+                                    crate::serial_println!(M::print;
                                         "BUG: map_to reported ParentEntryHugePage after pre-check at {:#x}",
                                         new_start.start_address()
                                     );
@@ -378,7 +378,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                                 "BUG: unmap reported PageNotMapped after translate said Mapped at {:#x}",
                                 start.start_address()
                             );
-                            crate::serial_println!(
+                            crate::serial_println!(M::print;
                                 "BUG: unmap reported PageNotMapped after translate said Mapped at {:#x}",
                                 start.start_address()
                             );
@@ -389,7 +389,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                             todo!("return Err(page_mgmt::RemapError::RemapToHugePage);");
                             #[cfg(not(debug_assertions))]
                             {
-                                crate::serial_println!("BUG: attempt to unmap a huge page");
+                                crate::serial_println!(M::print; "BUG: attempt to unmap a huge page");
                                 return Err(page_mgmt::RemapError::Unaligned);
                             }
                         }
@@ -400,7 +400,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                             todo!("Invalid frame address: {:#x}", pa);
                             #[cfg(not(debug_assertions))]
                             {
-                                crate::serial_println!("Invalid frame address: {:#x}", pa);
+                                crate::serial_println!(M::print; "Invalid frame address: {:#x}", pa);
                                 return Err(page_mgmt::RemapError::Unaligned);
                             }
                         }
@@ -412,7 +412,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     todo!("Invalid frame address: {:#x}", pa);
                     #[cfg(not(debug_assertions))]
                     {
-                        crate::serial_println!("Invalid frame address: {:#x}", pa);
+                        crate::serial_println!(M::print; "Invalid frame address: {:#x}", pa);
                         return Err(page_mgmt::RemapError::Unaligned);
                     }
                 }
@@ -469,7 +469,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                                     todo!("BUG: attempt to protect a huge page");
                                     #[cfg(not(debug_assertions))]
                                     {
-                                        crate::serial_println!(
+                                        crate::serial_println!(M::print;
                                             "BUG: attempt to protect a huge page"
                                         );
                                         return Err(page_mgmt::PermissionUpdateError::Unaligned);
@@ -485,7 +485,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     todo!("Invalid frame address: {:#x}", pa);
                     #[cfg(not(debug_assertions))]
                     {
-                        crate::serial_println!("Invalid frame address: {:#x}", pa);
+                        crate::serial_println!(M::print; "Invalid frame address: {:#x}", pa);
                         return Err(page_mgmt::PermissionUpdateError::Unaligned);
                     }
                 }
@@ -529,7 +529,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     flags: _,
                 } => {
                     if target_frame.start_address() != frame.start_address() {
-                        crate::serial_println!(
+                        crate::serial_println!(M::print;
                             "BUG: {page:?} already mapped to {frame:?} instead of {target_frame:?}"
                         );
                         return Err(MapToError::PageAlreadyMapped(
@@ -544,7 +544,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     todo!("Invalid frame address: {:#x}", pa);
                     #[cfg(not(debug_assertions))]
                     {
-                        crate::serial_println!("Invalid frame address: {:#x}", pa);
+                        crate::serial_println!(M::print; "Invalid frame address: {:#x}", pa);
                         return Err(MapToError::FrameAllocationFailed);
                     }
                 }
@@ -662,7 +662,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                         "vmap: map_to_with_table_flags failed at page {page:?}: {e:?}"
                     );
                     if mapped_count > 0 {
-                        crate::debug_serial_println!(
+                        crate::debug_serial_println!(M::print;
                             "vmap: rolling back {mapped_count} pages mapped at {base_va:#x} due to error"
                         );
                         Self::rollback_mapped_pages(
@@ -835,7 +835,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                         todo!("COW");
                         #[cfg(not(debug_assertions))]
                         {
-                            crate::serial_println!("BUG: Copy-on-Write not implemented");
+                            crate::serial_println!(M::print; "BUG: Copy-on-Write not implemented");
                             return Err(PageFaultError::AllocationFailed);
                         }
                     }
@@ -850,7 +850,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 todo!("Page fault on present page: {:#x}", page.start_address());
                 #[cfg(not(debug_assertions))]
                 {
-                    crate::serial_println!(
+                    crate::serial_println!(M::print;
                         "Page fault on present page: {:#x}",
                         page.start_address()
                     );
@@ -900,7 +900,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 todo!("Invalid frame address: {:#x}", pa);
                 #[cfg(not(debug_assertions))]
                 {
-                    crate::serial_println!("Invalid frame address: {:#x}", pa);
+                    crate::serial_println!(M::print; "Invalid frame address: {:#x}", pa);
                     return Err(PageFaultError::AccessError("Invalid frame address"));
                 }
             }

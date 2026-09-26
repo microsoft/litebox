@@ -443,7 +443,7 @@ pub(super) fn run(platform: &Platform) {
         3,
         "kernel faults must not notify user timer hook"
     );
-    serial_println!("QEMU-USER: syscall reentry registers XSAVE OK");
+    serial_println!(super::console; "QEMU-USER: syscall reentry registers XSAVE OK");
 
     for (entry, case) in [
         Case::InvalidOpcode,
@@ -478,7 +478,7 @@ pub(super) fn run(platform: &Platform) {
             usize::from(case == Case::InvalidReturn)
         );
         assert_eq!(unsafe { litebox_common_linux::rdgsbase() }, shim.kernel_gs);
-        serial_println!("QEMU-USER: {case:?} OK");
+        serial_println!(super::console; "QEMU-USER: {case:?} OK");
     }
     assert_eq!(timer.arms.get(), 10);
     assert_eq!(timer.user_exceptions.get(), 9);
@@ -510,5 +510,5 @@ pub(super) fn run(platform: &Platform) {
     // dereference the old stack-local ThreadContext after user execution ended.
     let mut byte = 0;
     assert!(unsafe { memcpy_fallible(&raw mut byte, UNMAPPED as *const u8, 1) }.is_err());
-    serial_println!("QEMU-USER: faults isolation teardown OK");
+    serial_println!(super::console; "QEMU-USER: faults isolation teardown OK");
 }

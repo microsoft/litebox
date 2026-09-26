@@ -68,7 +68,7 @@ pub fn vsm_handle_intercept() {
                     &*ptr
                 };
                 let gpa = int_msg.gpa;
-                crate::debug_serial_println!("VSM: GPA intercept on {gpa:#x}");
+                crate::debug_serial_println!(crate::host::lvbs::console::print; "VSM: GPA intercept on {gpa:#x}");
             }
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault on GPA intercept");
         }
@@ -142,7 +142,7 @@ pub fn vsm_handle_intercept() {
             #[cfg(debug_assertions)]
             let msg_type = msg.header.message_type;
             #[cfg(debug_assertions)]
-            crate::debug_serial_println!(
+            crate::debug_serial_println!(crate::host::lvbs::console::print;
                 "VSM: Ignore unknown synthetic interrupt message type {msg_type:#x}"
             );
         }
@@ -190,7 +190,7 @@ fn validate_and_continue_vtl0_register_write(
             advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");
         } else {
             #[cfg(debug_assertions)]
-            crate::debug_serial_println!(
+            crate::debug_serial_println!(crate::host::lvbs::console::print;
                 "VSM: Writing {value:#x} to reg {reg_name:#x} is disallowed"
             );
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault");

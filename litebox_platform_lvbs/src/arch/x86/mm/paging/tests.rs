@@ -59,6 +59,10 @@ unsafe impl<const OFFSET: u64> TlbInvalidation for RecordingTlb<OFFSET> {
 struct TestMemory<const OFFSET: u64 = 0>;
 
 impl<const OFFSET: u64> MemoryProvider for TestMemory<OFFSET> {
+    fn print(args: core::fmt::Arguments<'_>) {
+        std::eprint!("{args}");
+    }
+
     type Tlb = RecordingTlb<OFFSET>;
     const GVA_OFFSET: VirtAddr = VirtAddr::zero();
     const PRIVATE_PTE_MASK: u64 = 0;

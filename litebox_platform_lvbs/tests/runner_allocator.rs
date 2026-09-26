@@ -26,6 +26,10 @@ unsafe impl TlbInvalidation for SoftwareOnlyTlb {
 }
 
 impl MemoryProvider for RunnerMemory {
+    fn print(args: core::fmt::Arguments<'_>) {
+        eprint!("{args}");
+    }
+
     type Tlb = SoftwareOnlyTlb;
     const GVA_OFFSET: VirtAddr = VirtAddr::zero();
     const PRIVATE_PTE_MASK: u64 = 0;

@@ -423,7 +423,7 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
         // Never hand the VP back to VTL0 with the preemption timer live.
         crate::host::lvbs::timer::disarm_preemption();
         if crate::host::lvbs::timer::take_user_timeout_kill() {
-            crate::serial_println!(
+            crate::serial_println!(crate::host::lvbs::console::print;
                 "Terminated user-mode code which exceeded its execution quantum"
             );
         }

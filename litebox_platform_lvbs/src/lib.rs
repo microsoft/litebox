@@ -534,7 +534,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// `PA + KERNEL_OFFSET`. `exec_ranges` must include every required code
     /// page. The active boot mappings must permit constructing the new tables.
     /// The memory provider's translations must remain stable for every live
-    /// frame, and its allocator binding must be installed before this call.
+    /// frame, and its allocator must be ready before this call.
     ///
     /// # Panics
     /// Panics if page-table allocation or mapping fails, or DEP is unavailable.

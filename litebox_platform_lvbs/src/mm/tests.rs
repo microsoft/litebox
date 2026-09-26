@@ -59,6 +59,10 @@ impl litebox::mm::allocator::MemoryProvider for MockMemory {
 }
 
 impl super::MemoryProvider for MockMemory {
+    fn print(args: core::fmt::Arguments<'_>) {
+        MockHostInterface::log(&alloc::format!("{args}"));
+    }
+
     type Tlb = crate::host::mock::MockTlb;
 
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);

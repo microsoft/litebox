@@ -104,14 +104,14 @@ impl ExecutionTimer for LvbsTimer {
 /// behavior: unavailable x2APIC/STIMER is logged and leaves preemption disabled.
 pub fn init() {
     if !apic::enable_x2apic() {
-        crate::serial_println!("preemption disabled: x2APIC unavailable");
+        crate::serial_println!(super::console::print; "preemption disabled: x2APIC unavailable");
         return;
     }
     if init_stimer() {
         with_per_cpu_variables(|pcv| pcv.timer.enabled.set(true));
-        crate::debug_serial_println!("STIMER direct-mode (quantum {QUANTUM_MICROS} us)");
+        crate::debug_serial_println!(super::console::print; "STIMER direct-mode (quantum {QUANTUM_MICROS} us)");
     } else {
-        crate::serial_println!("preemption disabled: no STIMER direct-mode");
+        crate::serial_println!(super::console::print; "preemption disabled: no STIMER direct-mode");
     }
 }
 
@@ -122,7 +122,7 @@ fn init_stimer() -> bool {
         return false;
     }
     let feat = cpuid_count(HYPERV_CPUID_FEATURES, 0x0);
-    crate::debug_serial_println!(
+    crate::debug_serial_println!(super::console::print;
         "HV feature leaf {HYPERV_CPUID_FEATURES:#x}: eax={:#010x} edx={:#010x}",
         feat.eax,
         feat.edx

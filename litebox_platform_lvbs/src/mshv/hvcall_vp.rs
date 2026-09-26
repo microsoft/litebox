@@ -220,7 +220,7 @@ fn get_entry() -> u64 {
 pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     // Skip boot processor since VTL is already enabled for it by VTL0
     if core == 0 {
-        debug_serial_println!("Skipping boot processor (core 0)");
+        debug_serial_println!(crate::host::lvbs::console::print; "Skipping boot processor (core 0)");
         return Ok(0);
     }
 
@@ -241,11 +241,11 @@ pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
     match result {
         Ok(_) => {
-            debug_serial_println!("Enabled VTL for core {}", core);
+            debug_serial_println!(crate::host::lvbs::console::print; "Enabled VTL for core {}", core);
             Ok(0)
         }
         Err(e) => {
-            serial_println!("Failed to enable VTL for core {}: {:?}", core, e);
+            serial_println!(crate::host::lvbs::console::print; "Failed to enable VTL for core {}: {:?}", core, e);
             Err(e)
         }
     }

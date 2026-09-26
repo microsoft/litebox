@@ -5,8 +5,6 @@
 
 extern crate alloc;
 
-mod allocator;
-
 use alloc::{boxed::Box, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
@@ -58,7 +56,6 @@ fn session_manager() -> &'static SessionManager<Platform> {
 /// Seed the initial heap regions so the global allocator has enough memory
 /// for slab-backed allocations (the slab needs >= 2 MB backing pages).
 pub fn seed_initial_heap() {
-    allocator::install();
     let vtl1_base_va = get_memory_base_address();
     let vtl1_start = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(vtl1_base_va));
 
@@ -67,7 +64,7 @@ pub fn seed_initial_heap() {
     unsafe {
         LvbsMemory::mem_fill_pages(mem_fill_start, VTL1_INIT_HEAP_SIZE);
     }
-    debug_serial_println!(
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
         "heap: seed init region (pages {}..+{:#x}): VA {:#x}, size {:#x}",
         VTL1_INIT_HEAP_START_PAGE,
         VTL1_INIT_HEAP_SIZE,
@@ -84,7 +81,7 @@ pub fn seed_initial_heap() {
     unsafe {
         LvbsMemory::mem_fill_pages(mem_fill_start, mem_fill_size);
     }
-    debug_serial_println!(
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
         "heap: add pre-populated region (_heap_start..Phase 1 end): VA {:#x}, size {:#x}",
         mem_fill_start,
         mem_fill_size
@@ -151,7 +148,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             unsafe {
                 LvbsMemory::mem_fill_pages(rela_virt, rela_size);
             }
-            debug_serial_println!(
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                 "heap: reclaim .rela.dyn section: VA {:#x}, size {:#x}",
                 rela_virt,
                 rela_size
@@ -182,7 +179,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             unsafe {
                 LvbsMemory::mem_fill_pages(early_pt_start, early_pt_size);
             }
-            debug_serial_println!(
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                 "heap: reclaim early page table frames (pages {}..{}): VA {:#x}, size {:#x}",
                 VTL1_PML4E_PAGE,
                 VTL1_PML4E_PAGE + (early_pt_size / PAGE_SIZE),
@@ -202,7 +199,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             unsafe {
                 LvbsMemory::mem_fill_pages(remap_pt_start, remap_pt_size);
             }
-            debug_serial_println!(
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                 "heap: reclaim Phase 1 remap PT frames (pages {}..{}): VA {:#x}, size {:#x}",
                 VTL1_REMAP_PDPT_PAGE,
                 VTL1_REMAP_PDE_PAGE + 1,
@@ -221,7 +218,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         unsafe {
             LvbsMemory::mem_fill_pages(mem_fill_start, mem_fill_size);
         }
-        debug_serial_println!(
+        debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
             "heap: add remaining VTL1 memory (post Phase 2): VA {:#x}, size {:#x}",
             mem_fill_start,
             mem_fill_size
@@ -560,7 +557,7 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
     } = smc_result
     {
         let mut msg_args = *msg_args;
-        debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+        debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
         let result = match msg_args.cmd {
             OpenSession => handle_open_session(platform, &mut msg_args, msg_args_phys_addr),
             InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
@@ -675,7 +672,7 @@ fn open_session_single_instance(
     // Record the client identity before running OpenSession
     session_manager().set_session_client_identity(runner_session_id, client_identity);
 
-    debug_serial_println!(
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
         "Reusing single-instance TA: uuid={:?}, task_pt_id={}, session_id={}",
         ta_uuid,
         task_pt_id,
@@ -726,7 +723,7 @@ fn open_session_single_instance(
     // Per OP-TEE OS: if OpenSession fails, don't register the session
     // Reference: tee_ta_open_session() in tee_ta_manager.c
     if return_code != TeeResult::Success {
-        debug_serial_println!(
+        debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
             "OpenSession failed on single-instance TA: return_code={:?}",
             return_code
         );
@@ -749,7 +746,7 @@ fn open_session_single_instance(
         // Regular errors (access denied, bad params, etc.) don't mean the TA is dead -
         // it can still serve future OpenSession requests from other clients.
         if return_code == TeeResult::TargetDead {
-            debug_serial_println!("Single-instance TA panicked during OpenSession, cleaning up");
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "Single-instance TA panicked during OpenSession, cleaning up");
 
             session_manager().mark_sessions_dead_for_instance(instance);
             // Safety: We are about to tear down this TA instance;
@@ -809,7 +806,7 @@ fn open_session_single_instance(
     session_manager().register_sibling_session(runner_session_id, instance)?;
     session_token.disarm();
 
-    debug_serial_println!(
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
         "OpenSession complete on single-instance TA: session_id={}",
         runner_session_id
     );
@@ -847,7 +844,7 @@ fn open_session_new_instance(
     let runner_session_id = session_token.session_id().unwrap();
 
     let task_pt_id = create_task_page_table(platform)?;
-    debug_serial_println!("Created task page table ID: {}", task_pt_id);
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "Created task page table ID: {}", task_pt_id);
 
     let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id).inspect_err(|_| {
         // Safety: switch_to_task_page_table failed, so task page table is not active.
@@ -864,7 +861,7 @@ fn open_session_new_instance(
 
     let ta_flags = loaded_program.ta_flags;
 
-    debug_serial_println!(
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
         "TA flags: {:?}, single_instance={}",
         ta_flags,
         ta_flags.is_single_instance()
@@ -885,7 +882,7 @@ fn open_session_new_instance(
     let ldelf_return_code =
         TeeResult::try_from(ldelf_return_code).unwrap_or(TeeResult::GenericError);
     if ldelf_return_code != TeeResult::Success {
-        debug_serial_println!(
+        debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
             "ldelf/TA_CreateEntryPoint failed: return_code={:?}",
             ldelf_return_code
         );
@@ -971,7 +968,7 @@ fn open_session_new_instance(
     // Per OP-TEE OS: if OpenSession fails, tear down the instance
     // Reference: tee_ta_open_session() in tee_ta_manager.c
     if return_code != TeeResult::Success {
-        debug_serial_println!(
+        debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
             "OpenSession failed on new instance: return_code={:?}",
             return_code
         );
@@ -1025,7 +1022,7 @@ fn open_session_new_instance(
     );
     session_token.disarm();
 
-    debug_serial_println!(
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
         "OpenSession complete: session_id={}, single_instance={}",
         runner_session_id,
         ta_flags.is_single_instance()
@@ -1050,7 +1047,7 @@ fn finalize_dead_session(
     msg_args.ret = return_code;
     msg_args.ret_origin = TeeOrigin::Tee;
     write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
-    debug_serial_println!(
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
         "{}: session_id={} on dead TA session",
         log_prefix,
         session_id
@@ -1093,7 +1090,7 @@ fn handle_invoke_command(
 
         let _task_pt_guard = TaskPageTableGuard::enter(platform, task_pt_id)?;
 
-        debug_serial_println!(
+        debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
             "InvokeCommand: session_id={}, task_pt_id={}, cmd_id={}",
             session_id,
             task_pt_id,
@@ -1151,7 +1148,7 @@ fn handle_invoke_command(
         // unrecoverable; all sessions on the same single-instance TA are
         // implicitly dead (Ref: tee_ta_invoke_command() in tee_ta_manager.c).
         if return_code == TeeResult::TargetDead {
-            debug_serial_println!(
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                 "InvokeCommand: TA panicked (TARGET_DEAD), session_id={}",
                 session_id
             );
@@ -1168,7 +1165,7 @@ fn handle_invoke_command(
                 teardown_ta_page_table(platform, instance.shim(), task_pt_id);
             };
 
-            debug_serial_println!(
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                 "InvokeCommand: cleaned up dead TA instance, task_pt_id={}",
                 task_pt_id
             );
@@ -1199,7 +1196,7 @@ fn handle_close_session(
     }
     let session_id = ta_req_info.session;
 
-    debug_serial_println!("CloseSession: session_id={}", session_id);
+    debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "CloseSession: session_id={}", session_id);
 
     session_manager().with_session(session_id, |instance| {
         let Some(instance) = instance else {
@@ -1262,7 +1259,7 @@ fn handle_close_session(
             && let Some(flags) = removed_flags
         {
             if flags.is_single_instance() && flags.is_keep_alive() {
-                debug_serial_println!(
+                debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                     "CloseSession complete: session_id={}, TA kept alive (INSTANCE_KEEP_ALIVE flag)",
                     session_id
                 );
@@ -1281,12 +1278,12 @@ fn handle_close_session(
                 teardown_ta_page_table(platform, instance.shim(), task_pt_id);
             };
 
-            debug_serial_println!(
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                 "CloseSession complete: deleted task_pt_id={} (last session)",
                 task_pt_id
             );
         } else {
-            debug_serial_println!(
+            debug_serial_println!(litebox_platform_lvbs::host::lvbs::console::print;
                 "CloseSession complete: session_id={}, other sessions remaining on TA",
                 session_id
             );
@@ -1448,8 +1445,8 @@ fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Boot may fail before shared-console installation (or final relocation).
-    // Use the concrete early-output path, preserving serial + optional ringbuffer.
+    // Direct output needs no registration, including during early boot.
+    // Preserve serial + optional ringbuffer diagnostics.
     litebox_platform_lvbs::host::lvbs::console::print(format_args!("{info}\n"));
     match raise_vtl0_gp_fault() {
         Ok(result) => vtl_switch(Some(result.reinterpret_as_signed())),

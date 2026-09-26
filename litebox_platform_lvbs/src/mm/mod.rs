@@ -28,6 +28,10 @@ pub trait MemoryProvider: Send + Sync + 'static {
     /// default: a backend must account for every CPU that can use its mappings.
     type Tlb: tlb::TlbInvalidation;
 
+    /// Diagnostic output selected alongside the memory backend. No global
+    /// registration is required for allocation or page-table fault diagnostics.
+    fn print(args: core::fmt::Arguments<'_>);
+
     /// Global virtual address offset for one-to-one mapping of physical memory
     /// to kernel virtual memory.
     const GVA_OFFSET: VirtAddr;
