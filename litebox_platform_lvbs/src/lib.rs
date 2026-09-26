@@ -1016,6 +1016,8 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     // Kernel memory lives in the high canonical half (at KERNEL_OFFSET).
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
     const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
+    const HINT_PLACEMENT_BEHAVIOR: litebox::platform::page_mgmt::HintPlacementBehavior =
+        litebox::platform::page_mgmt::HintPlacementBehavior::Exact;
 
     fn allocate_pages(
         &self,
@@ -1029,7 +1031,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         let current_pt = self.page_table_manager.current_page_table();
         match fixed_address_behavior {
-            FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
+            FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
                 unsafe { current_pt.unmap_pages(range, true, true, false).unwrap() };
