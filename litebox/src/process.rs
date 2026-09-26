@@ -55,7 +55,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
 /// A broker process object.
 ///
 /// It reports [`Events::IN`] once the process terminates. Dropping it closes
-/// its handle and releases the process's retained exit status.
+/// its handle, releases the process's retained exit status, and wakes its
+/// observers to recheck their state.
 pub struct Process<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     identity: ProcessIdentity,
@@ -109,6 +110,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Process<Platfo
     fn drop(&mut self) {
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
+        // Another waiter may still be blocked on this process's exit
+        // notification, which is discarded once the handle is unregistered.
+        self.pollee.wake_observers();
     }
 }
 
@@ -139,6 +143,90 @@ impl From<BrokerControlError> for ProcessError {
             BrokerControlError::Broker(error) => {
                 panic!("process service returned unexpected error: {error}")
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use litebox_broker_local::test_support::test_broker_local;
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
+    };
+    use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
+    use litebox_broker_protocol::{ProcessId, ThreadId};
+    use litebox_broker_transport::channel::LocalCallChannel;
+    use litebox_broker_transport::shared_memory::{SharedMemory, SharedMemoryError};
+
+    use super::*;
+    use crate::platform::mock::MockPlatform;
+
+    #[test]
+    fn dropping_process_wakes_observers() {
+        let litebox = LiteBox::new_with_broker_local(
+            MockPlatform::new(),
+            test_broker_local(CloseChannel, Arc::new(NoopSharedMemory)),
+        );
+        let process = Process::new(
+            &litebox,
+            litebox.broker_control().unwrap(),
+            ProcessIdentity {
+                process_id: ProcessId(3),
+                initial_thread_id: ThreadId(4),
+            },
+            ObjectHandle(7),
+        );
+        let observer = Arc::new(WakeObserver(AtomicBool::new(false)));
+        process.register_observer(Arc::downgrade(&observer) as _, Events::IN);
+
+        // A waiter that reaps this process may drop it before the exit
+        // notification arrives, so other waiters must still wake.
+        drop(process);
+
+        assert!(observer.0.load(Ordering::SeqCst));
+    }
+
+    struct WakeObserver(AtomicBool);
+
+    impl Observer<Events> for WakeObserver {
+        fn on_events(&self, _events: &Events) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct CloseChannel;
+
+    impl LocalCallChannel for CloseChannel {
+        type Error = ();
+
+        fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
+            assert_eq!(
+                request.operation,
+                BrokerOperation::CloseObject(ObjectHandle(7))
+            );
+            Ok(BrokerResponse {
+                request_id: request.request_id,
+                result: BrokerResult::ObjectClosed,
+            })
+        }
+    }
+
+    struct NoopSharedMemory;
+
+    impl SharedMemory for NoopSharedMemory {
+        fn len(&self) -> usize {
+            SHARED_BUFFER_POOL_SIZE
+        }
+
+        fn read(&self, _offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+            destination.fill(0);
+            Ok(())
+        }
+
+        fn write(&self, _offset: usize, _source: &[u8]) -> Result<(), SharedMemoryError> {
+            Ok(())
         }
     }
 }

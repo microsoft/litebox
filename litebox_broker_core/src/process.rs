@@ -85,7 +85,9 @@ impl ProcessObject {
 
     fn exit_status(&self) -> Result<ProcessExitStatus> {
         match self.process.state.lock().status {
-            ProcessStatus::Starting | ProcessStatus::Running => Err(BrokerError::WouldBlock),
+            ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Exiting => {
+                Err(BrokerError::WouldBlock)
+            }
             ProcessStatus::Failed(_) => Ok(ProcessExitStatus::Unknown),
             ProcessStatus::Zombie(status) => Ok(status),
         }
@@ -153,6 +155,9 @@ pub(crate) enum ProcessStatus {
     Starting,
     /// The process is published and may issue guest-originated operations.
     Running,
+    /// Exit is releasing the process's resources before its status becomes
+    /// observable.
+    Exiting,
     /// Startup failed and host cleanup is still pending.
     Failed(BrokerError),
     /// The process exited and retains its exit status.
@@ -167,7 +172,9 @@ impl ProcessStatus {
     fn transition(&mut self, next: Self) -> Result<()> {
         let allowed = matches!(
             (*self, next),
-            (Self::Starting, Self::Running | Self::Failed(_)) | (Self::Running, Self::Zombie(_))
+            (Self::Starting, Self::Running | Self::Failed(_))
+                | (Self::Running, Self::Exiting)
+                | (Self::Exiting, Self::Zombie(_))
         );
         if !allowed {
             return Err(BrokerError::Internal);
@@ -477,7 +484,9 @@ impl BrokerProcess {
         match self.state.lock().status {
             ProcessStatus::Starting => None,
             // Exit is reachable only after startup completed.
-            ProcessStatus::Running | ProcessStatus::Zombie(_) => Some(Ok(())),
+            ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Zombie(_) => {
+                Some(Ok(()))
+            }
             ProcessStatus::Failed(error) => Some(Err(error)),
         }
     }
@@ -493,7 +502,9 @@ impl BrokerProcess {
                 ProcessStatus::Starting => {}
                 ProcessStatus::Running => return Err(BrokerError::Internal),
                 ProcessStatus::Failed(error) => return Err(error),
-                ProcessStatus::Zombie(_) => return Err(BrokerError::PeerClosed),
+                ProcessStatus::Exiting | ProcessStatus::Zombie(_) => {
+                    return Err(BrokerError::PeerClosed);
+                }
             }
             state.status.transition(ProcessStatus::Running)?;
             state.continue_startup_on_parent_death = false;
@@ -508,17 +519,19 @@ impl BrokerProcess {
     /// retirement, thread IDs. A zombie keeps only its process ID, registry
     /// entry, and exit status, and remains until its parent's process handle
     /// and runner supervision release it. The parent's handle becomes
-    /// readable. Duplicate completion preserves the first authoritative
-    /// status.
+    /// readable. Only the first completion releases resources and records its
+    /// status; later or concurrent completions return without effect.
     pub fn complete_exit(&self, exit_status: ProcessExitStatus) -> Result<()> {
         let release_thread_ids = {
-            let state = self.state.lock();
+            let mut state = self.state.lock();
             match state.status {
                 ProcessStatus::Running => {}
-                ProcessStatus::Zombie(_) => return Ok(()),
+                ProcessStatus::Exiting | ProcessStatus::Zombie(_) => return Ok(()),
                 ProcessStatus::Starting => return Err(BrokerError::WouldBlock),
                 ProcessStatus::Failed(error) => return Err(error),
             }
+            // Only the caller that claims the exit releases resources.
+            state.status.transition(ProcessStatus::Exiting)?;
             matches!(
                 state.retirement,
                 ProcessRetirement::Retired { release_ids: true }
@@ -533,9 +546,6 @@ impl BrokerProcess {
         }
         let exit_readiness = {
             let mut state = self.state.lock();
-            if matches!(state.status, ProcessStatus::Zombie(_)) {
-                return Ok(());
-            }
             state
                 .status
                 .transition(ProcessStatus::Zombie(exit_status))?;
@@ -569,7 +579,9 @@ impl BrokerProcess {
             let mut state = self.state.lock();
             match state.status {
                 ProcessStatus::Starting => {}
-                ProcessStatus::Running | ProcessStatus::Zombie(_) => return Ok(()),
+                ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Zombie(_) => {
+                    return Ok(());
+                }
                 ProcessStatus::Failed(error) => return Err(error),
             }
             if abnormal {
@@ -1415,12 +1427,13 @@ mod tests {
         child
     }
 
-    fn process_statuses() -> [ProcessStatus; 4] {
+    fn process_statuses() -> [ProcessStatus; 5] {
         use ProcessStatus as State;
 
         [
             State::Starting,
             State::Running,
+            State::Exiting,
             State::Failed(BrokerError::PeerClosed),
             State::Zombie(EXITED),
         ]
@@ -1435,7 +1448,8 @@ mod tests {
         let allowed = [
             (State::Starting, State::Running),
             (State::Starting, failed),
-            (State::Running, State::Zombie(EXITED)),
+            (State::Running, State::Exiting),
+            (State::Exiting, State::Zombie(EXITED)),
         ];
 
         for initial in states {
@@ -1518,6 +1532,44 @@ mod tests {
                 .allocate_process(CallerCredential::Unauthenticated, None)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn exit_in_progress_is_neither_observable_nor_repeated() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let sink = readiness_sink();
+        let (child, handle) = root.create_child_process(sink.clone()).unwrap();
+        child.complete_start().unwrap();
+        let (read, write) = crate::pipe::create(&root, 1, 1).unwrap();
+        root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
+            .unwrap();
+        root.close_object_reference(write).unwrap();
+        // Another caller has claimed the exit and is still releasing resources.
+        child.state.lock().status = ProcessStatus::Exiting;
+
+        child.complete_exit(EXITED).unwrap();
+
+        assert_eq!(child.state.lock().status, ProcessStatus::Exiting);
+        assert!(
+            !root
+                .check_readiness(read)
+                .unwrap()
+                .contains(ReadinessFlags::HANGUP)
+        );
+        assert_eq!(
+            root.process_exit_status(handle),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
+        assert!(sink.published.lock().unwrap().is_empty());
     }
 
     #[test]
