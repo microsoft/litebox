@@ -177,6 +177,8 @@ jobs:
           cargo test --locked -p litebox_runner_optee_on_kvm --lib
           cargo clippy --locked -p litebox_runner_optee_on_kvm --all-targets -- -D warnings
           cargo +nightly-2025-12-31 clippy --locked -p litebox_runner_optee_on_kvm --bin litebox_runner_optee_on_kvm --target litebox_runner_optee_on_kvm/x86_64_kvm.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem -- -D warnings
+      - name: Confirm guest no_std with its SSE-capable custom target
+        run: cargo +nightly-2025-12-31 build --locked -p litebox_runner_optee_on_kvm --bin litebox_runner_optee_on_kvm --target litebox_runner_optee_on_kvm/x86_64_kvm.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem
       - name: Boot and validate shared kernel paths without /dev/kvm
         run: |
           python3 litebox_runner_optee_on_kvm/scripts/run.py --negative-tests
@@ -288,6 +290,11 @@ jobs:
           # - `litebox_runner_lvbs` has a custom target (`no_std`), so it does
           #   not work with the current no_std checker.
           #
+          # - `litebox_runner_optee_on_kvm` needs its SSE-capable custom target
+          #   and nightly build-std, like LVBS. `qemu_guest_boot` verifies the
+          #   no_std guest with that target and boots it under TCG. The host
+          #   stub/test harness is intentionally allowed to use std.
+          #
           # - `litebox_runner_optee_on_linux_userland` is allowed to have `std`
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
@@ -322,6 +329,7 @@ jobs:
             -not -path './litebox_platform_lvbs/Cargo.toml' \
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
+            -not -path './litebox_runner_optee_on_kvm/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
