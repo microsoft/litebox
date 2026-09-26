@@ -1509,6 +1509,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Only terminated children are reported. Process groups are not modeled, so `pid == 0`
     /// waits for any child and `pid < -1` matches no child. Resource usage is reported as zero.
     /// A child without an observable termination status is reported as killed by `SIGSEGV`.
+    /// Children belong to the process rather than the creating thread, so `__WNOTHREAD` is
+    /// accepted but does not restrict which children match.
     pub(crate) fn sys_wait4(
         &self,
         pid: i32,
@@ -1529,6 +1531,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let target = match pid {
             -1 | 0 => None,
             1.. => Some(pid),
+            i32::MIN => return Err(Errno::ESRCH),
             _ => return Err(Errno::ECHILD),
         };
         // Every child is created with the default exit signal, so only __WALL selects it

@@ -1088,6 +1088,8 @@ pub struct TimeVal {
 }
 
 /// Linux `struct rusage`.
+///
+/// Counters use the guest's 64-bit `long`, not the host's `c_long`.
 #[repr(C)]
 #[derive(Default, Clone, Copy, FromBytes, IntoBytes, Immutable)]
 #[allow(clippy::struct_field_names, reason = "field names match Linux")]
@@ -1097,33 +1099,33 @@ pub struct Rusage {
     /// System time used.
     ru_stime: TimeVal,
     /// Maximum resident set size.
-    ru_maxrss: core::ffi::c_long,
+    ru_maxrss: i64,
     /// Integral shared memory size.
-    ru_ixrss: core::ffi::c_long,
+    ru_ixrss: i64,
     /// Integral unshared data size.
-    ru_idrss: core::ffi::c_long,
+    ru_idrss: i64,
     /// Integral unshared stack size.
-    ru_isrss: core::ffi::c_long,
+    ru_isrss: i64,
     /// Page reclaims.
-    ru_minflt: core::ffi::c_long,
+    ru_minflt: i64,
     /// Page faults.
-    ru_majflt: core::ffi::c_long,
+    ru_majflt: i64,
     /// Swaps.
-    ru_nswap: core::ffi::c_long,
+    ru_nswap: i64,
     /// Block input operations.
-    ru_inblock: core::ffi::c_long,
+    ru_inblock: i64,
     /// Block output operations.
-    ru_oublock: core::ffi::c_long,
+    ru_oublock: i64,
     /// Messages sent.
-    ru_msgsnd: core::ffi::c_long,
+    ru_msgsnd: i64,
     /// Messages received.
-    ru_msgrcv: core::ffi::c_long,
+    ru_msgrcv: i64,
     /// Signals received.
-    ru_nsignals: core::ffi::c_long,
+    ru_nsignals: i64,
     /// Voluntary context switches.
-    ru_nvcsw: core::ffi::c_long,
+    ru_nvcsw: i64,
     /// Involuntary context switches.
-    ru_nivcsw: core::ffi::c_long,
+    ru_nivcsw: i64,
 }
 #[repr(C)]
 #[derive(Clone, Default, FromBytes, IntoBytes, Immutable)]

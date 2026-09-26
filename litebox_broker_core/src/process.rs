@@ -511,27 +511,36 @@ impl BrokerProcess {
     /// readable. Duplicate completion preserves the first authoritative
     /// status.
     pub fn complete_exit(&self, exit_status: ProcessExitStatus) -> Result<()> {
-        let (release_thread_ids, exit_readiness) = {
-            let mut state = self.state.lock();
+        let release_thread_ids = {
+            let state = self.state.lock();
             match state.status {
-                ProcessStatus::Running => state
-                    .status
-                    .transition(ProcessStatus::Zombie(exit_status))?,
+                ProcessStatus::Running => {}
                 ProcessStatus::Zombie(_) => return Ok(()),
                 ProcessStatus::Starting => return Err(BrokerError::WouldBlock),
                 ProcessStatus::Failed(error) => return Err(error),
             }
-            let release_thread_ids = matches!(
+            matches!(
                 state.retirement,
                 ProcessRetirement::Retired { release_ids: true }
-            );
-            (release_thread_ids, state.exit_readiness.take())
+            )
         };
+        // Like Linux, release resources before the exit becomes observable, so
+        // a parent that reaps the child sees its pipes and sockets closed.
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
         } else if release_thread_ids {
             self.release_threads(true);
         }
+        let exit_readiness = {
+            let mut state = self.state.lock();
+            if matches!(state.status, ProcessStatus::Zombie(_)) {
+                return Ok(());
+            }
+            state
+                .status
+                .transition(ProcessStatus::Zombie(exit_status))?;
+            state.exit_readiness.take()
+        };
         self.core.process_lifecycle_sink.changed();
         publish_exit_readiness(exit_readiness);
         Ok(())
