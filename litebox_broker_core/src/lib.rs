@@ -22,6 +22,7 @@ mod error;
 pub mod event;
 pub mod fs;
 mod id;
+mod object;
 pub mod pipe;
 mod policy;
 mod process;
@@ -45,14 +46,14 @@ use spin::{Mutex, rwlock::RwLock};
 pub use error::BrokerError;
 use fs::FileService;
 use id::{IdAllocator, MAX_ALLOCATED_ID};
+pub use object::ObjectRights;
 pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 use process::ObjectReference;
 pub use process::{
-    AssociationCancellation, BrokerProcess, CallerCredential, ObjectRights, ProcessLifecycleSink,
-    ProcessShutdown,
+    AssociationCancellation, BrokerProcess, CallerCredential, ProcessLifecycleSink, ProcessShutdown,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};

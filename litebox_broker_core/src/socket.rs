@@ -20,7 +20,7 @@ use litebox_broker_protocol::socket::{
 };
 use spin::Mutex;
 
-use crate::process::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, ProcessId, Result};
 

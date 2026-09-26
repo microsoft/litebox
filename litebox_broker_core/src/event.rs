@@ -3,7 +3,7 @@
 
 //! Broker-owned event object operations.
 
-use crate::process::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights};
 use crate::{BrokerError, BrokerProcess, Result};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};

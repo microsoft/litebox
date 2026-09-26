@@ -7,11 +7,8 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::event::EventObject;
-use crate::fs::File;
-use crate::pipe::PipeObject;
+use crate::object::{self, ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
-use crate::socket::SocketObject;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessIdentity};
@@ -60,17 +57,6 @@ impl AssociationCancellation {
     }
 }
 
-bitflags::bitflags! {
-    /// Broker rights attached to an object reference.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-    pub struct ObjectRights: u32 {
-        /// Right to observe or consume object state, including readiness and file reads.
-        const WAIT = 1 << 0;
-        /// Right to mutate object state, such as file contents or event readiness credits.
-        const WRITE = 1 << 1;
-    }
-}
-
 pub(crate) struct ObjectReference {
     pub(crate) object: Arc<RwLock<ObjectEntry>>,
     pub(crate) owner: ProcessId,
@@ -78,31 +64,11 @@ pub(crate) struct ObjectReference {
     process_reference_index: usize,
 }
 
-pub(crate) enum ObjectEntry {
-    Event(EventObject),
-    File(File),
-    Pipe(PipeObject),
-    Socket(SocketObject),
-    Process(ProcessObject),
-}
-
-// Each object kind's module defines its own accessor in an `impl ObjectEntry`
-// block, so adding a kind does not touch other kinds' operations. Only
-// operations that depend on every kind match exhaustively here.
 impl ObjectEntry {
     fn as_process(&self) -> Result<&ProcessObject> {
         match self {
             Self::Process(process) => Ok(process),
             _ => Err(BrokerError::InvalidRights),
-        }
-    }
-
-    /// Returns whether references to this object may be duplicated into
-    /// another process.
-    fn is_duplicable(&self) -> bool {
-        match self {
-            Self::Event(_) | Self::File(_) | Self::Pipe(_) => true,
-            Self::Socket(_) | Self::Process(_) => false,
         }
     }
 }
@@ -116,7 +82,7 @@ pub(crate) struct ProcessObject {
 }
 
 impl ProcessObject {
-    fn readiness(&self) -> ReadinessFlags {
+    pub(crate) fn readiness(&self) -> ReadinessFlags {
         if self.process.state.lock().status.is_terminal() {
             ReadinessFlags::READ
         } else {
@@ -1117,17 +1083,7 @@ impl BrokerProcess {
     /// Returns the current readiness of a broker-owned object.
     pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
-        let socket = {
-            let object = object.read();
-            match &*object {
-                ObjectEntry::Event(event) => return Ok(event.readiness()),
-                ObjectEntry::File(_) => return Err(BrokerError::InvalidRights),
-                ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
-                ObjectEntry::Process(process) => return Ok(process.readiness()),
-                ObjectEntry::Socket(socket) => socket.resource(),
-            }
-        };
-        Ok(socket.readiness())
+        object::readiness(&object)
     }
 
     /// Returns a process's termination status through a process handle.
