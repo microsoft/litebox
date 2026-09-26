@@ -39,8 +39,10 @@ pub enum CallerCredential {
     Unauthenticated,
 }
 
-/// Cancellation state shared by potentially blocking operations in one broker
-/// association.
+/// Cancellation state of one broker association.
+///
+/// Once the association starts ending, potentially blocking operations stop
+/// waiting and the process accepts no new lifecycle operations.
 #[derive(Debug, Default)]
 pub struct AssociationCancellation {
     cancelled: AtomicBool,
@@ -130,7 +132,7 @@ pub struct BrokerProcess {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
-    /// Cancellation state for potentially blocking operations in this process.
+    /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
 }
 
@@ -138,7 +140,6 @@ struct BrokerProcessState {
     status: ProcessStatus,
     /// Parent handle readiness published once this process terminates.
     exit_readiness: Option<ReadinessRegistration>,
-    owner_alive: bool,
     /// Child retained until this process requests startup.
     pending_child_process: Option<Arc<BrokerProcess>>,
     /// Whether a starting child continues after its parent dies.
@@ -243,7 +244,6 @@ impl BrokerProcess {
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
                 exit_readiness: None,
-                owner_alive: true,
                 pending_child_process: None,
                 continue_startup_on_parent_death: false,
                 retirement: ProcessRetirement::Active { abnormal: false },
@@ -308,26 +308,18 @@ impl BrokerProcess {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
-        if self.cancellation.is_cancelled() {
-            return Err(BrokerError::PeerClosed);
-        }
         if core::ptr::eq(self, child) || !Arc::ptr_eq(&self.core.processes, &child.core.processes) {
             return Err(BrokerError::Internal);
         }
 
         let state = self.state.lock();
-        if !state.owner_alive
-            || !matches!(state.status, ProcessStatus::Running)
-            || !matches!(state.retirement, ProcessRetirement::Active { .. })
-        {
+        if !self.accepts_operations(&state) {
             return Err(BrokerError::PeerClosed);
         }
         let mut child_state = child.state.lock();
-        if !child_state.owner_alive
-            || !matches!(child_state.status, ProcessStatus::Starting)
+        if !child.awaits_startup(&child_state)
             || !child.is_child_of(self)
             || child_state.continue_startup_on_parent_death
-            || !matches!(child_state.retirement, ProcessRetirement::Active { .. })
         {
             return Err(BrokerError::Internal);
         }
@@ -346,15 +338,9 @@ impl BrokerProcess {
         if !self.core.policy.process_duplication_enabled() {
             return Err(BrokerError::PolicyDenied);
         }
-        if self.cancellation.is_cancelled() {
-            return Err(BrokerError::PeerClosed);
-        }
         {
             let state = self.state.lock();
-            if !state.owner_alive
-                || !matches!(state.status, ProcessStatus::Running)
-                || !matches!(state.retirement, ProcessRetirement::Active { .. })
-            {
+            if !self.accepts_operations(&state) {
                 return Err(BrokerError::PeerClosed);
             }
             if state.pending_child_process.is_some() {
@@ -365,20 +351,13 @@ impl BrokerProcess {
         let (child, handle) = self.create_child_process(readiness_sink)?;
         let result = {
             let mut state = self.state.lock();
-            if !state.owner_alive
-                || !matches!(state.status, ProcessStatus::Running)
-                || !matches!(state.retirement, ProcessRetirement::Active { .. })
-            {
+            if !self.accepts_operations(&state) {
                 Err(BrokerError::PeerClosed)
             } else if state.pending_child_process.is_some() {
                 Err(BrokerError::WouldBlock)
             } else {
                 let child_state = child.state.lock();
-                if !child_state.owner_alive
-                    || !matches!(child_state.status, ProcessStatus::Starting)
-                    || !matches!(child_state.retirement, ProcessRetirement::Active { .. })
-                    || !child.is_child_of(self)
-                {
+                if !child.awaits_startup(&child_state) || !child.is_child_of(self) {
                     Err(BrokerError::Internal)
                 } else {
                     drop(child_state);
@@ -441,14 +420,8 @@ impl BrokerProcess {
 
     /// Takes the pending child selected for startup.
     pub fn take_child_process(&self, child_process_id: ProcessId) -> Result<Arc<BrokerProcess>> {
-        if self.cancellation.is_cancelled() {
-            return Err(BrokerError::PeerClosed);
-        }
         let mut state = self.state.lock();
-        if !state.owner_alive
-            || !matches!(state.status, ProcessStatus::Running)
-            || !matches!(state.retirement, ProcessRetirement::Active { .. })
-        {
+        if !self.accepts_operations(&state) {
             return Err(BrokerError::PeerClosed);
         }
         let child = state
@@ -456,14 +429,8 @@ impl BrokerProcess {
             .as_ref()
             .filter(|child| child.id() == child_process_id)
             .ok_or(BrokerError::UnknownObject)?;
-        {
-            let child_state = child.state.lock();
-            if !child_state.owner_alive
-                || !matches!(child_state.status, ProcessStatus::Starting)
-                || !matches!(child_state.retirement, ProcessRetirement::Active { .. })
-            {
-                return Err(BrokerError::PeerClosed);
-            }
+        if !child.awaits_startup(&child.state.lock()) {
+            return Err(BrokerError::PeerClosed);
         }
         state
             .pending_child_process
@@ -495,7 +462,7 @@ impl BrokerProcess {
     pub fn complete_start(&self) -> Result<()> {
         {
             let mut state = self.state.lock();
-            if !state.owner_alive || !matches!(state.retirement, ProcessRetirement::Active { .. }) {
+            if !self.is_active(&state) {
                 return Err(BrokerError::PeerClosed);
             }
             match state.status {
@@ -625,14 +592,10 @@ impl BrokerProcess {
     /// Children become orphans; their exit status remains only while this
     /// process still holds their handles.
     pub fn handle_owner_death(&self) {
-        let pending_child_process = {
-            let mut state = self.state.lock();
-            if !state.owner_alive {
-                return;
-            }
-            state.owner_alive = false;
-            state.pending_child_process.take()
-        };
+        self.cancellation.cancel();
+        // Child creation checks cancellation under the state lock, so once this
+        // lock is taken every child created for a live owner is visible below.
+        let pending_child_process = self.state.lock().pending_child_process.take();
         // Drop non-children only after releasing the registry lock, because a
         // final process drop removes itself from the registry.
         let processes = {
@@ -667,10 +630,31 @@ impl BrokerProcess {
 
     pub(crate) fn with_live_owner<T>(&self, operation: impl FnOnce() -> T) -> Result<T> {
         let state = self.state.lock();
-        if !state.owner_alive || !matches!(state.retirement, ProcessRetirement::Active { .. }) {
+        if !self.is_active(&state) {
             return Err(BrokerError::PeerClosed);
         }
         Ok(operation())
+    }
+
+    /// Returns whether this process's association is live and its process is
+    /// not retired.
+    ///
+    /// Callers hold the state lock, which orders this check against
+    /// [`Self::handle_owner_death`].
+    fn is_active(&self, state: &BrokerProcessState) -> bool {
+        !self.cancellation.is_cancelled()
+            && matches!(state.retirement, ProcessRetirement::Active { .. })
+    }
+
+    /// Returns whether this active process is running and accepts
+    /// guest-originated operations.
+    fn accepts_operations(&self, state: &BrokerProcessState) -> bool {
+        self.is_active(state) && matches!(state.status, ProcessStatus::Running)
+    }
+
+    /// Returns whether this active process is still waiting to start.
+    fn awaits_startup(&self, state: &BrokerProcessState) -> bool {
+        self.is_active(state) && matches!(state.status, ProcessStatus::Starting)
     }
 
     fn is_child_of(&self, parent: &BrokerProcess) -> bool {
@@ -782,8 +766,7 @@ impl BrokerProcess {
         Ok(())
     }
 
-    /// Requests cooperative cancellation of potentially blocking operations
-    /// because this association is ending.
+    /// Cancels this process's association because it is ending.
     pub fn request_cancellation(&self) {
         self.cancellation.cancel();
     }
@@ -1827,6 +1810,12 @@ mod tests {
             .unwrap();
         cancelled_parent.complete_start().unwrap();
         let cancelled_child = prepared_duplication(&cancelled_parent);
+        let unprepared_child = broker
+            .allocate_process(
+                cancelled_parent.caller_credential(),
+                Some(cancelled_parent.id()),
+            )
+            .unwrap();
         let shutdowns = Arc::new(AtomicUsize::new(0));
         let shutdown_count = Arc::clone(&shutdowns);
         cancelled_child.install_shutdown(Arc::new(move || {
@@ -1837,12 +1826,6 @@ mod tests {
         cancelled_child.complete_start().unwrap();
         assert_eq!(cancelled_child.state.lock().status, ProcessStatus::Running);
         assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
-        let unprepared_child = broker
-            .allocate_process(
-                cancelled_parent.caller_credential(),
-                Some(cancelled_parent.id()),
-            )
-            .unwrap();
         assert!(matches!(
             cancelled_parent.prepare_duplication_child(&unprepared_child),
             Err(BrokerError::PeerClosed)
