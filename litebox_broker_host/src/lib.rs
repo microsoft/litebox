@@ -44,9 +44,8 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessIdentity, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData,
+    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -145,7 +144,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
     ) -> Result<(), ChannelError> {
         self.execute_request_with(
             request,
-            |_process, _operation, _shared_buffers, _readiness_sink| None,
+            |_process, _operation, _shared_buffers| None,
             send_response,
         )
     }
@@ -161,7 +160,6 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
             &BrokerProcess,
             &BrokerOperation,
             &SharedBufferPool<Memory>,
-            &Arc<dyn ReadinessSink>,
         ) -> Option<core::result::Result<BrokerResult, RequestFailure>>,
         send_response: impl FnOnce(&BrokerResponse) -> core::result::Result<(), ChannelError>,
     ) -> Result<(), ChannelError> {
@@ -188,12 +186,7 @@ impl<Memory: SharedMemory> BrokerHostAssociation<Memory> {
             }
         }
 
-        let request_result = match extension(
-            &self.process,
-            &operation,
-            &self.shared_buffers,
-            &self.readiness_sink,
-        ) {
+        let request_result = match extension(&self.process, &operation, &self.shared_buffers) {
             Some(result) => result,
             None => handle_request(
                 &self.process,
@@ -535,7 +528,7 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
-        BrokerOperation::StartChildProcess(_) | BrokerOperation::CreateChildProcess(_) => {
+        BrokerOperation::StartChildProcess(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
@@ -797,7 +790,6 @@ pub fn handle_process_operation<Memory, Launcher>(
     parent: &BrokerProcess,
     operation: &BrokerOperation,
     shared_buffers: &SharedBufferPool<Memory>,
-    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Option<RequestResult<BrokerResult>>
 where
     Memory: SharedMemory,
@@ -819,23 +811,10 @@ where
                 })
                 .map(|()| BrokerResult::ProcessStarted),
         ),
-        BrokerOperation::CreateChildProcess(StartChildProcessSource::Bootstrap(startup)) => Some(
-            read_shared_buffer(shared_buffers, startup.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
-                .and_then(|payload| {
-                    create_child_process(
-                        Arc::clone(launcher),
-                        parent,
-                        ProcessStartupData { payload },
-                        readiness_sink,
-                    )
-                })
-                .map(BrokerResult::ProcessCreated),
-        ),
         _ => None,
     }
 }
 
-/// Starts a pending child created earlier by the parent.
 fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     launcher: Arc<Launcher>,
     parent: &BrokerProcess,
@@ -848,48 +827,18 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     let process = parent
         .take_child_process(child_process_id)
         .map_err(RequestFailure::from)?;
-    launch_child_process(launcher, parent, process, startup)
-}
-
-/// Creates and starts one child, returning its identity and handle.
-fn create_child_process<Launcher: ProcessLauncher + ?Sized>(
-    launcher: Arc<Launcher>,
-    parent: &BrokerProcess,
-    startup: ProcessStartupData,
-    readiness_sink: &Arc<dyn ReadinessSink>,
-) -> RequestResult<CreatedProcess> {
-    if !parent.is_running() {
-        return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
-    }
-    let (process, handle) = parent
-        .create_child_process(Arc::clone(readiness_sink))
-        .map_err(RequestFailure::from)?;
-    let identity = ProcessIdentity {
-        process_id: process.id(),
-        initial_thread_id: process.initial_thread_id(),
-    };
-    if let Err(error) = launch_child_process(launcher, parent, process, startup) {
-        // The guest never learns this handle. It is already gone if the parent
-        // exited concurrently.
-        let _ = parent.close_object_reference(handle);
-        return Err(error);
-    }
-    Ok(CreatedProcess { identity, handle })
-}
-
-fn launch_child_process<Launcher: ProcessLauncher + ?Sized>(
-    launcher: Arc<Launcher>,
-    parent: &BrokerProcess,
-    process: Arc<BrokerProcess>,
-    startup: ProcessStartupData,
-) -> RequestResult<()> {
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
         process.retire(true);
         return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
     }
     launcher
-        .launch(process, startup)
+        .launch(
+            process,
+            ProcessStartupData {
+                payload: startup.payload,
+            },
+        )
         .map_err(RequestFailure::from)
 }
 

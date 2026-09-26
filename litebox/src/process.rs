@@ -50,13 +50,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         let child = broker.allocate_child_process()?;
         Ok(Process::new(self, broker, child.identity, child.handle))
     }
-
-    /// Creates and starts a new child process in a fresh runner.
-    pub fn create_child_process(&self, payload: &[u8]) -> Result<Process<Platform>, ProcessError> {
-        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let child = broker.create_child_process(payload)?;
-        Ok(Process::new(self, broker, child.identity, child.handle))
-    }
 }
 
 /// A broker process object.
