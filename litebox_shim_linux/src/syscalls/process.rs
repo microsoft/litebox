@@ -14,12 +14,12 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
-use litebox::mm::vmem::VmFlags;
 use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
+use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
     errno::Errno,

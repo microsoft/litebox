@@ -9,7 +9,6 @@
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
-use litebox::mm::vmem::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
@@ -18,6 +17,7 @@ use litebox::platform::{
     UnblockedOrTimedOut,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_common_linux::vmem::PageRange;
 
 extern crate alloc;
 
@@ -428,11 +428,11 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         }
         let flags = u32::from(initial_permissions.bits())
             | if can_grow_down {
-                litebox::mm::vmem::VmFlags::VM_GROWSDOWN.bits()
+                litebox_common_linux::vmem::VmFlags::VM_GROWSDOWN.bits()
             } else {
                 0
             };
-        let flags = litebox::mm::vmem::VmFlags::from_bits(flags).unwrap();
+        let flags = litebox_common_linux::vmem::VmFlags::from_bits(flags).unwrap();
         Ok(self
             .page_table
             .map_pages(range, flags, populate_pages_immediately))
@@ -471,7 +471,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
         let new_flags =
-            litebox::mm::vmem::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
+            litebox_common_linux::vmem::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
         unsafe { self.page_table.mprotect_pages(range, new_flags) }
     }
 
@@ -480,20 +480,20 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     }
 }
 
-impl<Host: HostInterface> litebox::mm::vmem::VmemPageFaultHandler for LinuxKernel<Host> {
+impl<Host: HostInterface> litebox_common_linux::vmem::VmemPageFaultHandler for LinuxKernel<Host> {
     unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,
-        flags: litebox::mm::vmem::VmFlags,
+        flags: litebox_common_linux::vmem::VmFlags,
         error_code: u64,
-    ) -> Result<(), litebox::mm::vmem::PageFaultError> {
+    ) -> Result<(), litebox_common_linux::vmem::PageFaultError> {
         unsafe {
             self.page_table
                 .handle_page_fault(fault_addr, flags, error_code)
         }
     }
 
-    fn access_error(error_code: u64, flags: litebox::mm::vmem::VmFlags) -> bool {
+    fn access_error(error_code: u64, flags: litebox_common_linux::vmem::VmFlags) -> bool {
         mm::PageTable::<4096>::access_error(error_code, flags)
     }
 }

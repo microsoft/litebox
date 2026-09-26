@@ -8,11 +8,10 @@ extern crate alloc;
 use alloc::{boxed::Box, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
-    mm::vmem::PAGE_SIZE,
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
-use litebox_common_linux::errno::Errno;
+use litebox_common_linux::{errno::Errno, vmem::PAGE_SIZE};
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,

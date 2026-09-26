@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::mm::vmem::PageFaultError;
+use litebox_common_linux::vmem::PageFaultError;
 
 use crate::arch::{
     Page, PageFaultErrorCode, PageSize, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,

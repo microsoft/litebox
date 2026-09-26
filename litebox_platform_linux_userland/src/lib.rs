@@ -2208,17 +2208,17 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {
 ///
 /// Page faults are handled transparently by the host Linux kernel.
 /// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
-impl litebox::mm::vmem::VmemPageFaultHandler for LinuxUserland {
+impl litebox_common_linux::vmem::VmemPageFaultHandler for LinuxUserland {
     unsafe fn handle_page_fault(
         &self,
         _fault_addr: usize,
-        _flags: litebox::mm::vmem::VmFlags,
+        _flags: litebox_common_linux::vmem::VmFlags,
         _error_code: u64,
-    ) -> Result<(), litebox::mm::vmem::PageFaultError> {
+    ) -> Result<(), litebox_common_linux::vmem::PageFaultError> {
         unreachable!("host kernel handles page faults for Linux userland")
     }
 
-    fn access_error(_error_code: u64, _flags: litebox::mm::vmem::VmFlags) -> bool {
+    fn access_error(_error_code: u64, _flags: litebox_common_linux::vmem::VmFlags) -> bool {
         unreachable!("host kernel handles page faults for Linux userland")
     }
 }

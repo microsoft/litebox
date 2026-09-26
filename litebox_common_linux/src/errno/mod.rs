@@ -261,35 +261,34 @@ impl From<litebox::platform::page_mgmt::DeallocationError> for Errno {
     }
 }
 
-impl From<litebox::mm::vmem::VmemUnmapError> for Errno {
-    fn from(value: litebox::mm::vmem::VmemUnmapError) -> Self {
+impl From<crate::vmem::VmemUnmapError> for Errno {
+    fn from(value: crate::vmem::VmemUnmapError) -> Self {
         match value {
-            litebox::mm::vmem::VmemUnmapError::UnAligned => Errno::EINVAL,
-            litebox::mm::vmem::VmemUnmapError::UnmapError(e) => e.into(),
+            crate::vmem::VmemUnmapError::UnAligned => Errno::EINVAL,
+            crate::vmem::VmemUnmapError::UnmapError(e) => e.into(),
         }
     }
 }
 
-impl From<litebox::mm::vmem::VmemResetError> for Errno {
-    fn from(value: litebox::mm::vmem::VmemResetError) -> Self {
+impl From<crate::vmem::VmemResetError> for Errno {
+    fn from(value: crate::vmem::VmemResetError) -> Self {
         match value {
-            litebox::mm::vmem::VmemResetError::UnAligned => Errno::EINVAL,
-            litebox::mm::vmem::VmemResetError::AlreadyUnallocated => Errno::ENOMEM,
-            litebox::mm::vmem::VmemResetError::FileBacked => Errno::EINVAL,
+            crate::vmem::VmemResetError::UnAligned => Errno::EINVAL,
+            crate::vmem::VmemResetError::AlreadyUnallocated => Errno::ENOMEM,
+            crate::vmem::VmemResetError::FileBacked => Errno::EINVAL,
         }
     }
 }
 
-impl From<litebox::mm::vmem::MappingError> for Errno {
-    fn from(value: litebox::mm::vmem::MappingError) -> Self {
+impl From<crate::vmem::MappingError> for Errno {
+    fn from(value: crate::vmem::MappingError) -> Self {
         match value {
-            litebox::mm::vmem::MappingError::UnAligned => Errno::EINVAL,
-            litebox::mm::vmem::MappingError::OutOfMemory => Errno::ENOMEM,
-            litebox::mm::vmem::MappingError::BadFD(_) => Errno::EBADF,
-            litebox::mm::vmem::MappingError::NotAFile => Errno::EISDIR,
-            litebox::mm::vmem::MappingError::NotForReading => Errno::EACCES,
-            litebox::mm::vmem::MappingError::MapError(e) => e.into(),
-            _ => unimplemented!(),
+            crate::vmem::MappingError::UnAligned => Errno::EINVAL,
+            crate::vmem::MappingError::OutOfMemory => Errno::ENOMEM,
+            crate::vmem::MappingError::BadFD(_) => Errno::EBADF,
+            crate::vmem::MappingError::NotAFile => Errno::EISDIR,
+            crate::vmem::MappingError::NotForReading => Errno::EACCES,
+            crate::vmem::MappingError::MapError(e) => e.into(),
         }
     }
 }
@@ -317,13 +316,13 @@ impl From<litebox::platform::page_mgmt::PermissionUpdateError> for Errno {
     }
 }
 
-impl From<litebox::mm::vmem::VmemProtectError> for Errno {
-    fn from(value: litebox::mm::vmem::VmemProtectError) -> Self {
+impl From<crate::vmem::VmemProtectError> for Errno {
+    fn from(value: crate::vmem::VmemProtectError) -> Self {
         match value {
-            litebox::mm::vmem::VmemProtectError::UnAligned(_) => Errno::EINVAL,
-            litebox::mm::vmem::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
-            litebox::mm::vmem::VmemProtectError::NoAccess { .. } => Errno::EACCES,
-            litebox::mm::vmem::VmemProtectError::ProtectError(e) => e.into(),
+            crate::vmem::VmemProtectError::UnAligned(_) => Errno::EINVAL,
+            crate::vmem::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
+            crate::vmem::VmemProtectError::NoAccess { .. } => Errno::EACCES,
+            crate::vmem::VmemProtectError::ProtectError(e) => e.into(),
         }
     }
 }

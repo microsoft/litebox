@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::mm::vmem::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use litebox::platform::{RawConstPointer as _, page_mgmt};
+use litebox_common_linux::vmem::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{

@@ -302,8 +302,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox::mm::vmem::PAGE_SIZE;
     use litebox::platform::{PageManagementProvider, RawConstPointer};
+    use litebox_common_linux::vmem::PAGE_SIZE;
 
     fn do_query_on_region(
         mbi: &mut Win32_Memory::MEMORY_BASIC_INFORMATION,

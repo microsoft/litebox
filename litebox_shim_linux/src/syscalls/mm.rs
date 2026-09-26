@@ -7,14 +7,12 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::fs::errors::ReadError;
-use litebox::{
-    mm::vmem::{CreatePagesFlags, MappingError, PAGE_SIZE},
-    platform::page_mgmt::MemoryRegionPermissions,
-};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
+    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE},
 };
 
 use crate::FileFd;
@@ -461,7 +459,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.global.pm, addr)
+        // On failure, Linux returns the current break rather than a negative errno.
+        unsafe {
+            self.global
+                .pm
+                .brk(addr.as_usize())
+                .or_else(|_| self.global.pm.brk(0))
+        }
+        .map_err(Errno::from)
     }
 
     /// Handle syscall `madvise`

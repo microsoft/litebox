@@ -6,17 +6,13 @@ use core::alloc::{GlobalAlloc, Layout};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use litebox::{
-    LiteBox,
-    mm::{
-        PageManager,
-        allocator::SafeZoneAllocator,
-        vmem::{
-            CreatePagesFlags, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, PageFaultError,
-            PageRange, VmFlags,
-        },
+use litebox::{mm::allocator::SafeZoneAllocator, platform::RawConstPointer};
+use litebox_common_linux::{
+    mm::VmemManager,
+    vmem::{
+        CreatePagesFlags, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, PageFaultError, PageRange,
+        VmFlags,
     },
-    platform::RawConstPointer,
 };
 use spin::mutex::SpinMutex;
 
@@ -216,8 +212,7 @@ fn test_vmm_page_fault() {
     let start_addr: usize = 0x1_0000;
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let platform = MockKernel::new(p4.start_address());
-    let litebox = LiteBox::new(platform);
-    let vmm = PageManager::<_, PAGE_SIZE>::new(&litebox);
+    let vmm = VmemManager::<_, PAGE_SIZE>::new(platform);
     unsafe {
         assert_eq!(
             vmm.create_writable_pages(

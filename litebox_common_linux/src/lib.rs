@@ -25,6 +25,7 @@ pub mod physical_pointers;
 pub mod signal;
 pub mod user_pointers;
 pub mod vmap;
+pub mod vmem;
 
 extern crate alloc;
 

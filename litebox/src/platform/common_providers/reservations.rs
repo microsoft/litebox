@@ -50,60 +50,6 @@ macro_rules! define_page_reservation {
     };
 }
 
-/// Reservation store for page managers that do not retain reservation handles.
-#[derive(Default)]
-pub struct NoTrackedReservations<const ALIGN: usize>;
-
-crate::define_page_reservation!(NoTrackedReservation);
-
-impl<const ALIGN: usize> NoTrackedReservations<ALIGN> {
-    /// Represent an exclusively owned range without retaining its reservation handle.
-    ///
-    /// # Safety
-    ///
-    /// `range` must be exclusively owned, nonempty, and `ALIGN`-aligned.
-    pub unsafe fn from_owned_range(range: Range<usize>) -> NoTrackedReservation<ALIGN> {
-        // SAFETY: The caller establishes the reservation ownership and alignment requirements.
-        unsafe { NoTrackedReservation::new(range) }
-    }
-}
-
-impl<const ALIGN: usize> ReservationStore for NoTrackedReservations<ALIGN> {
-    type Reservation = NoTrackedReservation<ALIGN>;
-
-    fn overlaps<V>(
-        &self,
-        vmas: &RangeMap<usize, V>,
-        range: Range<usize>,
-        _include_reservations: bool,
-    ) -> bool {
-        vmas.overlaps(&range)
-    }
-
-    fn insert(
-        &mut self,
-        _base: usize,
-        _reservation: Self::Reservation,
-    ) -> Option<Self::Reservation> {
-        None
-    }
-
-    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Self::Reservation)> {
-        core::iter::empty()
-    }
-
-    fn overlapping(
-        &self,
-        _range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)> {
-        core::iter::empty()
-    }
-
-    fn take_overlapping(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
-        Vec::new()
-    }
-}
-
 /// Reservations indexed by their starting address.
 pub struct TrackedReservations<Reservation>(BTreeMap<usize, Reservation>);
 
