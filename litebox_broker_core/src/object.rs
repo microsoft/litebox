@@ -3,6 +3,9 @@
 
 //! Broker-owned objects shared by every object kind.
 
+use alloc::sync::Arc;
+
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
@@ -22,6 +25,15 @@ bitflags::bitflags! {
         /// Right to mutate object state, such as file contents or event readiness credits.
         const WRITE = 1 << 1;
     }
+}
+
+/// One process's reference to a broker-owned object.
+pub(crate) struct ObjectReference {
+    pub(crate) object: Arc<RwLock<ObjectEntry>>,
+    pub(crate) owner: ProcessId,
+    pub(crate) rights: ObjectRights,
+    /// Position of this reference's handle in the owner's handle list.
+    pub(crate) process_reference_index: usize,
 }
 
 pub(crate) enum ObjectEntry {

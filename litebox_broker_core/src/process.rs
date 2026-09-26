@@ -7,7 +7,7 @@ use alloc::{
 };
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::object::{self, ObjectEntry, ObjectRights};
+use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
@@ -55,13 +55,6 @@ impl AssociationCancellation {
     pub(crate) fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
-}
-
-pub(crate) struct ObjectReference {
-    pub(crate) object: Arc<RwLock<ObjectEntry>>,
-    pub(crate) owner: ProcessId,
-    pub(crate) rights: ObjectRights,
-    process_reference_index: usize,
 }
 
 impl ObjectEntry {
