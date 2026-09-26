@@ -11,11 +11,11 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
-use crate::platform::PageManagementProvider;
-use crate::platform::RawConstPointer;
-use crate::platform::page_mgmt::AllocationError;
-use crate::platform::page_mgmt::FixedAddressBehavior;
-use crate::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::PageManagementProvider;
+use litebox::platform::RawConstPointer;
+use litebox::platform::page_mgmt::AllocationError;
+use litebox::platform::page_mgmt::FixedAddressBehavior;
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -300,8 +300,6 @@ impl VmArea {
 pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
-    /// Current program break address.
-    pub(super) brk: usize,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
 }
@@ -313,7 +311,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) fn new(platform: &'static Platform) -> Self {
         let mut vmem = Self {
             vmas: RangeMap::new(),
-            brk: 0,
             platform,
         };
         for each in platform.reserved_pages() {
@@ -659,7 +656,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
                 Ok(_) => {}
-                Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
                 Err(
                     AllocationError::AddressInUse
                     | AllocationError::AddressInUseByPlatform
@@ -670,6 +666,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     | AllocationError::BelowMinAddress
                     | AllocationError::AboveMaxAddress,
                 ) => unreachable!(),
+                Err(_) => return Err(VmemResizeError::OutOfMemory),
             }
             return Ok(());
         }
@@ -956,7 +953,7 @@ pub enum VmemUnmapError {
     #[error("arg is not aligned")]
     UnAligned,
     #[error("failed to unmap pages: {0}")]
-    UnmapError(#[from] crate::platform::page_mgmt::DeallocationError),
+    UnmapError(#[from] litebox::platform::page_mgmt::DeallocationError),
 }
 
 /// Error for resetting pages
@@ -991,7 +988,7 @@ pub enum VmemMoveError {
     #[error("out of memory")]
     OutOfMemory,
     #[error("remap failed: {0}")]
-    RemapError(#[from] crate::platform::page_mgmt::RemapError),
+    RemapError(#[from] litebox::platform::page_mgmt::RemapError),
 }
 
 /// Error for protecting mappings
@@ -1004,7 +1001,7 @@ pub enum VmemProtectError {
     #[error("failed to change permissions from {old:?} to {new:?}")]
     NoAccess { old: VmFlags, new: VmFlags },
     #[error("mprotect failed: {0}")]
-    ProtectError(#[from] crate::platform::page_mgmt::PermissionUpdateError),
+    ProtectError(#[from] litebox::platform::page_mgmt::PermissionUpdateError),
 }
 
 /// Error for creating mappings
@@ -1025,7 +1022,7 @@ pub enum MappingError {
     NotForReading,
 
     #[error("mapping failed: {0}")]
-    MapError(#[from] crate::platform::page_mgmt::AllocationError),
+    MapError(#[from] litebox::platform::page_mgmt::AllocationError),
 }
 
 /// Enable [`super::PageManager`] to handle page faults if its platform implements this trait

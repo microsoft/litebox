@@ -12,7 +12,6 @@ use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::{Mode, OFlags, SeekWhence},
-    mm::vmem::PAGE_SIZE,
     path,
     platform::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
@@ -20,7 +19,7 @@ use litebox::{
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
-    signal::Signal,
+    signal::Signal, vmem::PAGE_SIZE,
 };
 use thiserror::Error;
 

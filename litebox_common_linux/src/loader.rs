@@ -11,14 +11,13 @@
 use alloc::vec::Vec;
 use elf::file::FileHeader;
 use litebox::{
-    mm::vmem::PAGE_SIZE,
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use crate::errno::Errno;
+use crate::{errno::Errno, vmem::PAGE_SIZE};
 
 type Endian = elf::endian::LittleEndian;
 

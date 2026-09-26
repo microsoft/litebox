@@ -10,8 +10,12 @@ elf = { version = "0.8.0", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }
 thiserror = { version = "2.0.6", default-features = false }
 int-enum = "1.2.0"
+rangemap = { version = "1.5.1", features = ["const_fn"] }
 syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
