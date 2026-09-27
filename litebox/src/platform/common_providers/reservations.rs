@@ -55,6 +55,12 @@ pub struct NoTrackedReservations<const ALIGN: usize>;
 
 crate::define_page_reservation!(NoTrackedReservation);
 
+impl<const ALIGN: usize> From<NoTrackedReservation<ALIGN>> for Range<usize> {
+    fn from(reservation: NoTrackedReservation<ALIGN>) -> Self {
+        reservation.range
+    }
+}
+
 impl<const ALIGN: usize> NoTrackedReservations<ALIGN> {
     /// Represent an exclusively owned range without retaining its reservation handle.
     ///
@@ -69,6 +75,7 @@ impl<const ALIGN: usize> NoTrackedReservations<ALIGN> {
 
 impl<const ALIGN: usize> ReservationStore for NoTrackedReservations<ALIGN> {
     type Reservation = NoTrackedReservation<ALIGN>;
+    type ReleaseTarget = Range<usize>;
 
     fn insert(
         &mut self,
@@ -130,6 +137,7 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
 
 impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Reservation> {
     type Reservation = Reservation;
+    type ReleaseTarget = Reservation;
 
     fn insert(&mut self, base: usize, reservation: Reservation) -> Option<Reservation> {
         let replaced = self.0.insert(base, reservation);
@@ -183,7 +191,7 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{NoTrackedReservations, TrackedReservations};
-    use crate::platform::page_mgmt::{PageReservation, ReservationStore as _};
+    use crate::platform::page_mgmt::{PageReservation, ReservationStore};
 
     crate::define_page_reservation!(TestReservation);
 
@@ -203,6 +211,12 @@ mod tests {
 
     #[test]
     fn reservation_segments_and_take_overlapping_in_order() {
+        fn assert_release_target<
+            Store: ReservationStore<ReleaseTarget = TestReservation<0x1000>>,
+        >() {
+        }
+        assert_release_target::<TrackedReservations<TestReservation<0x1000>>>();
+
         let mut reservations = TrackedReservations::default();
         for range in [0x1000..0x3000, 0x3000..0x4000, 0x5000..0x6000] {
             // SAFETY: Each test range is nonempty, aligned, disjoint, and uniquely represented.

@@ -4,12 +4,16 @@
 use super::{
     AllocationError, FixedAddressBehavior, GetCurrentProcess, GetLastError, MEM_TOP_DOWN,
     MemoryRegionPermissions, PrefetchVirtualMemory, UserMutPtr, VirtualAlloc2, VirtualFree,
-    VirtualProtect, Win32_Memory, WindowsUserland, WindowsUserlandReservation, c_void,
+    VirtualProtect, Win32_Memory, WindowsUserland, c_void,
 };
-use litebox::platform::common_providers::reservations::TrackedReservations;
+use litebox::platform::common_providers::reservations::{
+    NoTrackedReservations, TrackedReservations,
+};
 use litebox::platform::page_mgmt::{
     AllocationDirection, HintPlacementBehavior, PageReservation as _, ReservationStore as _,
 };
+
+litebox::define_page_reservation!(WindowsUserlandReservation);
 
 #[derive(Default)]
 pub(super) struct WindowsReservationStore<const ALIGN: usize> {
@@ -189,7 +193,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     for WindowsUserland<ALIGN>
 {
-    type Reservations = TrackedReservations<WindowsUserlandReservation<ALIGN>>;
+    type Reservations = NoTrackedReservations<ALIGN>;
 
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
@@ -256,7 +260,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         Ok(UserMutPtr::from_ptr(range.start as *mut u8))
     }
 
-    unsafe fn deallocate_pages(
+    unsafe fn release_pages(
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {

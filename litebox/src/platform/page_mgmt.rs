@@ -58,6 +58,8 @@ impl HintPlacementBehavior {
 pub trait ReservationStore {
     /// Reservation value retained by the store.
     type Reservation: PageReservation;
+    /// Ownership representation consumed when this store releases pages.
+    type ReleaseTarget: From<Self::Reservation>;
 
     /// Insert a reservation at `base`.
     fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
@@ -74,6 +76,10 @@ pub trait ReservationStore {
     /// Remove and return every reservation overlapping `range` in ascending address order.
     fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Self::Reservation>;
 }
+
+/// Native release ownership selected by a page-management provider.
+pub type ReleaseTargetOf<Platform, const ALIGN: usize> =
+    <<Platform as PageManagementProvider<ALIGN>>::Reservations as ReservationStore>::ReleaseTarget;
 
 bitflags::bitflags! {
     /// Permissions for a memory region
@@ -144,12 +150,15 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
-    /// De-allocated all pages in the given `range`.
+    /// Release all pages represented by `target`.
     ///
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
-    unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
+    unsafe fn release_pages(
+        &self,
+        target: ReleaseTargetOf<Self, ALIGN>,
+    ) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.
     ///
@@ -170,14 +179,17 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         old_range: Range<usize>,
         new_range: Range<usize>,
         permissions: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+    ) -> Result<Self::RawMutPointer<u8>, RemapError>
+    where
+        ReleaseTargetOf<Self, ALIGN>: From<Range<usize>>,
+    {
         debug_assert!(old_range.start.is_multiple_of(ALIGN));
         debug_assert!(new_range.start.is_multiple_of(ALIGN));
         debug_assert!(old_range.len().is_multiple_of(ALIGN));
         debug_assert!(new_range.len().is_multiple_of(ALIGN));
         debug_assert!(new_range.len() > old_range.len());
         debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
-        // Default implementation: allocate new pages, copy data, deallocate old pages
+        // Default implementation: allocate new pages, copy data, release old pages
         let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
         let new_ptr = self
             .allocate_pages(
@@ -229,7 +241,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
                 .expect("failed to restore permissions on new range");
         }
 
-        (unsafe { self.deallocate_pages(old_range) }).expect("failed to deallocate old range");
+        (unsafe { self.release_pages(old_range.into()) }).expect("failed to release old range");
 
         Ok(new_ptr)
     }
@@ -305,7 +317,7 @@ pub enum AllocationError {
     AddressPartiallyInUse,
 }
 
-/// Possible errors for [`PageManagementProvider::deallocate_pages`]
+/// Possible errors for [`PageManagementProvider::release_pages`]
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum DeallocationError {

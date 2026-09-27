@@ -20,9 +20,9 @@ use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,
     errno::Errno,
     vmem::{
-        self, CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE,
-        PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError,
-        VmemResetError, VmemUnmapError,
+        self, CreatePagesFlags, LinuxReservationStore, MappingError, NonZeroAddress,
+        NonZeroPageSize, PAGE_SIZE, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler,
+        VmemProtectError, VmemResetError, VmemUnmapError,
     },
 };
 
@@ -37,6 +37,7 @@ where
 impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+    Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
 {
     /// Create a new `VmemManager` instance.
     pub fn new(platform: &'static Platform) -> Self {
@@ -568,6 +569,7 @@ impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
     Platform: VmemPageFaultHandler,
+    Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
 {
     /// Handle page fault at the given address.
     ///
@@ -678,6 +680,7 @@ where
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<PAGE_SIZE>,
+    Platform::Reservations: LinuxReservationStore<Platform, PAGE_SIZE>,
 {
     pub fn do_mmap(
         &self,

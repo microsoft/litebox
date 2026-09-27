@@ -1016,7 +1016,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         Ok(current_pt.map_pages(range, flags, populate_pages_immediately))
     }
 
-    unsafe fn deallocate_pages(
+    unsafe fn release_pages(
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {

@@ -18,6 +18,11 @@ use litebox::platform::page_mgmt::AllocationError;
 use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::RemapError;
+use litebox::platform::{
+    common_providers::reservations::NoTrackedReservations,
+    page_mgmt::{DeallocationError, ReservationStore},
+};
 
 /// Page size in bytes
 pub const PAGE_SIZE: usize = 4096;
@@ -324,6 +329,115 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
     pub(super) address_range: Range<usize>,
 }
 
+/// Parameters for creating a Linux Vmem mapping.
+pub struct MmapRequest {
+    /// Requested address range.
+    pub range: Range<usize>,
+    /// Initial page permissions.
+    pub permissions: MemoryRegionPermissions,
+    /// Whether the mapping may grow downward.
+    pub can_grow_down: bool,
+    /// Whether pages should be populated immediately.
+    pub populate_pages_immediately: bool,
+    /// Required fixed-address behavior.
+    pub behavior: FixedAddressBehavior,
+}
+
+/// Linux Vmem operations supported by a reservation store.
+pub trait LinuxReservationStore<Platform, const ALIGN: usize>:
+    ReservationStore<ReleaseTarget = Range<usize>> + Send + Sync
+where
+    Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+{
+    /// Create a platform mapping and update reservation ownership.
+    ///
+    /// # Safety
+    ///
+    /// The caller must authorize replacement when `request.behavior` is
+    /// [`FixedAddressBehavior::Replace`].
+    unsafe fn mmap(
+        &mut self,
+        platform: &Platform,
+        request: MmapRequest,
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError>;
+
+    /// Remove a range from the mapping state and release its platform backing.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that these pages are not in active use.
+    unsafe fn unmap<V: Clone + Eq>(
+        &mut self,
+        vmas: &mut RangeMap<usize, V>,
+        platform: &Platform,
+        range: Range<usize>,
+    ) -> Result<(), DeallocationError>;
+
+    /// Remap platform pages and update reservation ownership.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `old_range` is unused and that `new_range` is a valid,
+    /// disjoint destination.
+    unsafe fn remap(
+        &mut self,
+        platform: &Platform,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, RemapError>;
+}
+
+impl<Platform, const ALIGN: usize> LinuxReservationStore<Platform, ALIGN>
+    for NoTrackedReservations<ALIGN>
+where
+    Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+{
+    unsafe fn mmap(
+        &mut self,
+        platform: &Platform,
+        request: MmapRequest,
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+        let MmapRequest {
+            range,
+            permissions,
+            can_grow_down,
+            populate_pages_immediately,
+            behavior,
+        } = request;
+        platform.allocate_pages(
+            range,
+            permissions,
+            can_grow_down,
+            populate_pages_immediately,
+            behavior,
+        )
+    }
+
+    unsafe fn unmap<V: Clone + Eq>(
+        &mut self,
+        vmas: &mut RangeMap<usize, V>,
+        platform: &Platform,
+        range: Range<usize>,
+    ) -> Result<(), DeallocationError> {
+        // SAFETY: The caller excludes all users of the released range.
+        unsafe { platform.release_pages(range.clone()) }?;
+        vmas.remove(range);
+        Ok(())
+    }
+
+    unsafe fn remap(
+        &mut self,
+        platform: &Platform,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
+        // SAFETY: The caller guarantees that the source is unused and the destination is valid.
+        unsafe { platform.remap_pages(old_range, new_range, permissions) }
+    }
+}
+
 /// Virtual Memory Manager
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
@@ -334,10 +448,6 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// Virtual memory areas.
     pub(super) vmas: RangeMap<usize, VmArea>,
     /// Reservations selected and owned by the platform.
-    #[expect(
-        dead_code,
-        reason = "reservation-aware operations are added separately"
-    )]
     pub(super) reservations: Platform::Reservations,
 }
 
@@ -411,14 +521,15 @@ where
     pub(super) unsafe fn remove_mapping(
         &mut self,
         range: PageRange<ALIGN>,
-    ) -> Result<(), VmemUnmapError> {
+    ) -> Result<(), VmemUnmapError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         unsafe {
-            self.platform
-                .deallocate_pages(range.into())
-                .map_err(VmemUnmapError::UnmapError)?;
+            self.reservations
+                .unmap(&mut self.vmas, self.platform, range.into())
+                .map_err(VmemUnmapError::UnmapError)
         }
-        self.vmas.remove(range.into());
-        Ok(())
     }
 
     /// Reset pages without removing its mapping (similar to Linux `madvise` with
@@ -442,7 +553,10 @@ where
         &mut self,
         range: PageRange<ALIGN>,
         anonymous_only: bool,
-    ) -> Result<(), VmemResetError> {
+    ) -> Result<(), VmemResetError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let range: Range<usize> = range.into();
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
         // while still resetting all of the existing vmas in the range.
@@ -491,7 +605,10 @@ where
         vma: VmArea,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let (start, end) = (suggested_range.start, suggested_range.end);
         if start < Platform::TASK_ADDR_MIN {
             return Err(AllocationError::BelowMinAddress);
@@ -542,19 +659,23 @@ where
         // The `max_permissions` is tracked by `Vmem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = self
-            .platform
-            .allocate_pages(
-                suggested_range.into(),
-                MemoryRegionPermissions::from_bits(permissions).unwrap(),
-                vma.flags.contains(VmFlags::VM_GROWSDOWN),
-                populate_pages_immediately,
-                platform_fixed_address_behavior,
+        // SAFETY: The caller authorizes replacement, and the checks above preserve external gaps.
+        let ret = unsafe {
+            self.reservations.mmap(
+                self.platform,
+                MmapRequest {
+                    range: suggested_range.into(),
+                    permissions: MemoryRegionPermissions::from_bits(permissions).unwrap(),
+                    can_grow_down: vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                    populate_pages_immediately,
+                    behavior: platform_fixed_address_behavior,
+                },
             )
-            .map_err(|err| match err {
-                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                other => other,
-            })?;
+        }
+        .map_err(|err| match err {
+            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+            other => other,
+        })?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
@@ -598,7 +719,10 @@ where
         length: NonZeroPageSize<ALIGN>,
         vma: VmArea,
         flags: CreatePagesFlags,
-    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let total_length = (length
             + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
                 DEFAULT_RESERVED_SPACE_SIZE
@@ -670,7 +794,10 @@ where
         &mut self,
         range: PageRange<ALIGN>,
         new_size: NonZeroPageSize<ALIGN>,
-    ) -> Result<(), VmemResizeError> {
+    ) -> Result<(), VmemResizeError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let range = range.start..range.end;
         // `cur_range` contains `range.start`
         let (cur_range, cur_vma) = self
@@ -760,7 +887,10 @@ where
         old_range: PageRange<ALIGN>,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         new_size: NonZeroPageSize<ALIGN>,
-    ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
+    ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         assert!(new_size.as_usize() >= old_range.len());
 
         // Check if the given range is covered by exactly one mapping
@@ -783,9 +913,14 @@ where
             .map_err(|_| VmemMoveError::OutOfMemory)?
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
+        // SAFETY: The caller excludes source users, and `get_unmmaped_area` found a disjoint gap.
         let new_addr = unsafe {
-            self.platform
-                .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
+            self.reservations.remap(
+                self.platform,
+                old_range.into(),
+                new_range.into(),
+                vma.flags.into(),
+            )
         }
         .map_err(VmemMoveError::RemapError)?;
 
@@ -964,7 +1099,10 @@ where
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         perms: MemoryRegionPermissions,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
         unsafe {
@@ -1293,6 +1431,7 @@ mod tests {
     struct DummyVmemBackend<const TOP_DOWN: bool = false> {
         rejected_address: Option<usize>,
         calls: Mutex<Vec<AllocationCall>>,
+        releases: Mutex<Vec<Range<usize>>>,
     }
 
     impl<const TOP_DOWN: bool> litebox::platform::RawPointerProvider for DummyVmemBackend<TOP_DOWN> {
@@ -1339,10 +1478,11 @@ mod tests {
             Ok(TransparentMutPtr::from_usize(suggested_range.start))
         }
 
-        unsafe fn deallocate_pages(
+        unsafe fn release_pages(
             &self,
             range: Range<usize>,
         ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+            self.releases.lock().push(range);
             Ok(())
         }
 
@@ -1374,6 +1514,7 @@ mod tests {
         Box::leak(Box::new(DummyVmemBackend {
             rejected_address,
             calls: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
         }))
     }
 
@@ -1530,6 +1671,14 @@ mod tests {
             )
         }
         .unwrap();
+        {
+            let releases = vmm.platform.releases.lock();
+            assert_eq!(releases.len(), 1);
+            assert_eq!(
+                releases[0],
+                start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE
+            );
+        }
         assert_eq!(
             collect_mappings(&vmm),
             vec![

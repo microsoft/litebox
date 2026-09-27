@@ -95,7 +95,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(UserMutPtr::from_usize(ptr))
     }
 
-    unsafe fn deallocate_pages(
+    unsafe fn release_pages(
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {

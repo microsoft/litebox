@@ -71,8 +71,12 @@ pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
 pub trait ShimPlatform:
     litebox::platform::RawPointerProvider
     + litebox::platform::TimeProvider
-    + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox_common_linux::vmem::VmemPageFaultHandler
+    + litebox::platform::PageManagementProvider<
+        { PAGE_SIZE },
+        Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
+            PAGE_SIZE,
+        >,
+    > + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
@@ -90,8 +94,12 @@ pub trait ShimPlatform:
 impl<T> ShimPlatform for T where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
-        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox_common_linux::vmem::VmemPageFaultHandler
+        + litebox::platform::PageManagementProvider<
+            { PAGE_SIZE },
+            Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
+                PAGE_SIZE,
+            >,
+        > + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider
