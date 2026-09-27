@@ -294,7 +294,6 @@ mod tests {
     use super::*;
     use crate::{MAX_KERNEL_BUF_SIZE, MacosShimBuilder, Process};
     use alloc::vec;
-    use core::sync::atomic::AtomicI32;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -386,7 +385,7 @@ mod tests {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
+            process: Process::new(),
             thread,
         };
         // SAFETY: a fresh, non-fixed mapping owned by this task.
@@ -405,7 +404,7 @@ mod tests {
             ctx.regs[0] = fd;
             ctx.regs[1] = buf.as_usize();
             ctx.regs[2] = count;
-            task.do_syscall(&ctx)
+            task.do_syscall(&mut ctx)
         };
         let max_count = core::ffi::c_int::MAX.cast_unsigned() as usize;
         let source = task.files.typed_fd(0).unwrap();
@@ -460,7 +459,7 @@ mod tests {
             ctx.regs[0] = path;
             ctx.regs[1] = flags.bits().cast_unsigned() as usize;
             ctx.regs[2] = mode;
-            task.do_syscall(&ctx)
+            task.do_syscall(&mut ctx)
         };
         // The terminator is the last mapped byte: open must not read the next page.
         let path_offset = MAX_KERNEL_BUF_SIZE - b"/new\0".len();

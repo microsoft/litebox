@@ -517,6 +517,19 @@ impl<P: ShimPlatform> Task<P> {
         let suggested = NonZeroAddress::new(address);
         let length = NonZeroPageSize::new(length).ok_or(Errno::EINVAL)?;
         let fixed_range = address..address + length.as_usize();
+        // A successful deferred munmap must not let MAP_FIXED recycle TSD
+        // backing that an exiting guest still needs. Serialize with new pins.
+        let pthread_mappings = flags
+            .contains(MmapFlags::FIXED)
+            .then(|| self.global.pthread_mappings.lock());
+        if pthread_mappings
+            .as_ref()
+            .is_some_and(|mappings| mappings.overlaps(&fixed_range))
+        {
+            // The requested address is unavailable until native cleanup stops
+            // using it. ENOMEM is a Darwin mmap error; EBUSY is not.
+            return Err(Errno::ENOMEM);
+        }
         let fixed_snapshot = flags
             .contains(MmapFlags::FIXED)
             .then(|| self.mapping_snapshot(fixed_range.clone()));
@@ -1346,15 +1359,37 @@ impl<P: ShimPlatform> Task<P> {
             .checked_next_multiple_of(PAGE_SIZE)
             .filter(|length| *length != 0)
             .ok_or(Errno::EINVAL)?;
-        address.checked_add(length).ok_or(Errno::EINVAL)?;
-        // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
+        let end = address.checked_add(length).ok_or(Errno::EINVAL)?;
+        if !address.is_multiple_of(PAGE_SIZE) {
+            return Err(Errno::EINVAL);
+        }
+        let mut pthread_mappings = self.global.pthread_mappings.lock();
+        let mut cursor = address;
+        for page in pthread_mappings.pinned_pages(&(address..end)) {
+            if cursor < page {
+                self.unmap_pages(cursor..page)?;
+            }
+            pthread_mappings.pending_pages.insert(page);
+            cursor = page + PAGE_SIZE;
+        }
+        if cursor < end {
+            self.unmap_pages(cursor..end)?;
+        }
+        Ok(())
+    }
+
+    /// Unmap after the pthread lifetime lock permits physical deallocation.
+    pub(crate) fn unmap_pages(&self, range: Range<usize>) -> Result<(), Errno> {
+        // SAFETY: the caller checked alignment/overflow and excludes new pthread
+        // pins. The VM manager validates the guest mapping; no live pthread
+        // cleanup overlaps a range passed here.
         unsafe {
             self.global
                 .mm
-                .remove_pages(P::RawMutPointer::from_usize(address), length)
+                .remove_pages(P::RawMutPointer::from_usize(range.start), range.len())
         }
         .map_err(|_| Errno::EINVAL)?;
-        self.replace_macho_mappings(address..address + length, None);
+        self.replace_macho_mappings(range, None);
         Ok(())
     }
 
@@ -1417,7 +1452,6 @@ mod tests {
 
     use super::*;
     use alloc::{sync::Arc, vec::Vec};
-    use core::sync::atomic::AtomicI32;
     use litebox::LiteBox;
     use litebox_broker_core::{
         ObjectRights, PolicyEngine,
@@ -1546,7 +1580,7 @@ mod tests {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
+            process: Process::new(),
             thread,
         }
     }
@@ -1561,7 +1595,7 @@ mod tests {
         ctx.regs[2] = usize::try_from(protection.bits().cast_unsigned()).unwrap();
         ctx.regs[3] = usize::try_from(MmapFlags::PRIVATE.bits().cast_unsigned()).unwrap();
         ctx.regs[4] = 0;
-        task.do_syscall(&ctx)
+        task.do_syscall(&mut ctx)
     }
 
     #[test]
@@ -1593,7 +1627,7 @@ mod tests {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
+            process: Process::new(),
             thread,
         };
 

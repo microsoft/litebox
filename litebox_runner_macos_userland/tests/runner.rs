@@ -735,6 +735,195 @@ fn dynamic_libsystem_tls_and_main_thread_e2e() {
     assert_eq!(output.stdout, b"state ok");
 }
 
+/// Exercise real libpthread create/join with 50 overlapping workers per round,
+/// then `pthread_exit` from the main thread.
+#[cfg(feature = "test-broker")]
+#[test]
+fn experimental_pthread_create_join_e2e() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("pthread.c");
+    let binary = dir.path().join("pthread");
+    std::fs::write(&source, include_str!("fixtures/pthread.c")).unwrap();
+    let compiled = Command::new("xcrun")
+        .args(["clang", "-arch", "arm64", "-O0", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output = run_pthread(&binary);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3 * 51 + 1, "{stdout}");
+    assert_eq!(lines[3 * 51], "Main thread exited");
+    let mut expected: Vec<_> = (0..50)
+        .map(|id| format!("Hello from thread {id}"))
+        .collect();
+    expected.sort_unstable();
+    for round in lines.as_chunks::<51>().0 {
+        assert_eq!(round[50], "All threads finished!");
+        let mut workers = round[..50].to_vec();
+        workers.sort_unstable();
+        assert_eq!(workers, expected);
+    }
+}
+
+#[cfg(feature = "test-broker")]
+#[test]
+fn hello_pthread_returns_with_complete_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hello.c");
+    let binary = dir.path().join("hello");
+    std::fs::write(&source, include_str!("fixtures/hello_pthread.c")).unwrap();
+    for (count, optimization) in [(1, "-O0"), (1, "-O2"), (8, "-O2"), (50, "-O2")] {
+        let result = Command::new("xcrun")
+            .args([
+                "clang",
+                "-arch",
+                "arm64",
+                optimization,
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+            ])
+            .arg(format!("-DTHREADS={count}"))
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let mut expected = (0..count)
+            .map(|id| format!("Hello from thread {id}"))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        // A single worker exposes the join/native-destructor teardown race.
+        for _ in 0..if count == 1 { 10 } else { 3 } {
+            let output = run_pthread(&binary);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = String::from_utf8(output.stdout).unwrap();
+            assert!(output.ends_with("\nAll threads finished!"), "{output:?}");
+            let mut lines = output.lines().collect::<Vec<_>>();
+            assert_eq!(lines.pop(), Some("All threads finished!"));
+            lines.sort_unstable();
+            assert_eq!(lines, expected);
+        }
+    }
+}
+
+#[cfg(feature = "test-broker")]
+#[test]
+fn last_pthread_exit_runs_guest_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("last_exit.c");
+    let binary = dir.path().join("last_exit");
+    std::fs::write(&source, include_str!("fixtures/pthread_last_exit.c")).unwrap();
+    let compiled = Command::new("xcrun")
+        .args([
+            "clang", "-arch", "arm64", "-O2", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(compiled.status.success(), "{compiled:?}");
+    let disabled = run_guest(
+        Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .arg(&binary)
+            .arg("0"),
+    );
+    // libpthread treats ENOSYS from bsdthread_terminate as a fatal error;
+    // without the opt-in, pthread_exit must not silently report success.
+    assert!(!disabled.status.success(), "{disabled:?}");
+    for count in ["0", "1", "50", "join"] {
+        let native = run_guest(Command::new(&binary).arg(count));
+        assert_eq!(native.status.code(), Some(0), "{native:?}");
+        assert_eq!(native.stdout, b"ATEXIT\nSTDOUT_BUFFERED");
+        for _ in 0..5 {
+            let output = run_guest(
+                Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+                    .arg("--experimental-pthreads")
+                    .arg(&binary)
+                    .arg(count),
+            );
+            assert_eq!(output.status.code(), Some(0), "{count}: {output:?}");
+            assert_eq!(output.stdout, native.stdout, "{count}: {output:?}");
+            assert_eq!(output.stderr, native.stderr);
+        }
+    }
+}
+
+#[cfg(feature = "test-broker")]
+#[test]
+fn pthread_process_exit_releases_main_thread_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("exit_wait.c");
+    let binary = dir.path().join("exit_wait");
+    std::fs::write(&source, include_str!("fixtures/pthread_exit_wait.c")).unwrap();
+    let compiled = Command::new("xcrun")
+        .args([
+            "clang", "-arch", "arm64", "-O2", "-Wall", "-Wextra", "-Werror",
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for mode in ["mutex", "1", "2"] {
+        for _ in 0..3 {
+            let output = run_guest(
+                Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+                    .arg("--experimental-pthreads")
+                    .arg(&binary)
+                    .arg(mode),
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(5),
+                "{mode}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if mode == "mutex" {
+                assert_eq!(output.stdout, b"MUTEX_WAIT_PATH\n");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "test-broker")]
+fn run_pthread(binary: &Path) -> std::process::Output {
+    run_guest(
+        Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+            .arg("--experimental-pthreads")
+            .arg(binary),
+    )
+}
+
 #[test]
 fn syscall_free_image_delivers_guest_faults() {
     let dir = tempfile::tempdir().unwrap();
