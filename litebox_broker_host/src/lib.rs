@@ -44,7 +44,8 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, ExitChildProcessRequest, MAX_PROCESS_BOOTSTRAP_SIZE,
+    CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
     ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
     StartChildProcessSource,
 };
@@ -63,7 +64,7 @@ use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
-use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ProcessId, RequestId};
+use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferError, SharedBufferPool, SharedMemory};
 use spin::mutex::SpinMutex;
@@ -519,6 +520,10 @@ fn handle_request<Memory: SharedMemory>(
             .set_child_reaping(enabled)
             .map(|()| BrokerResult::ChildReapingSet)
             .map_err(RequestFailure::from),
+        BrokerOperation::DuplicateObjectsToChild(request) => {
+            duplicate_objects_to_child(process, request, shared_buffers)
+                .map(|()| BrokerResult::ObjectsDuplicated)
+        }
         BrokerOperation::Event(request) => {
             handle_event_request(process, request).map(BrokerResult::Event)
         }
@@ -548,6 +553,50 @@ fn handle_request<Memory: SharedMemory>(
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
+}
+
+/// Duplicates the handles in the request's shared buffer into the pending
+/// child, overwriting them with the child's handles.
+fn duplicate_objects_to_child<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    request: DuplicateObjectsToChildRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+) -> RequestResult<()> {
+    const HANDLE_SIZE: usize = size_of::<u64>();
+    const _: () = assert!(
+        MAX_CHILD_OBJECT_DUPLICATES as usize * HANDLE_SIZE == SHARED_BUFFER_SLOT_SIZE as usize
+    );
+
+    let DuplicateObjectsToChildRequest {
+        child_process_id,
+        handles: buffer,
+    } = request;
+    let mut data = read_shared_buffer(shared_buffers, buffer, SHARED_BUFFER_SLOT_SIZE)?;
+    if data.is_empty() || data.len() % HANDLE_SIZE != 0 {
+        return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+    }
+    let mut handles = Vec::new();
+    handles
+        .try_reserve_exact(data.len() / HANDLE_SIZE)
+        .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+    handles.extend(
+        data.as_chunks::<HANDLE_SIZE>()
+            .0
+            .iter()
+            .map(|bytes| ObjectHandle(u64::from_le_bytes(*bytes))),
+    );
+    let duplicates = process
+        .duplicate_object_references_to_child(child_process_id, &handles)
+        .map_err(RequestFailure::from)?;
+    for (bytes, duplicate) in data
+        .as_chunks_mut::<HANDLE_SIZE>()
+        .0
+        .iter_mut()
+        .zip(duplicates)
+    {
+        *bytes = duplicate.0.to_le_bytes();
+    }
+    write_shared_buffer(shared_buffers, buffer, &data, SHARED_BUFFER_SLOT_SIZE)
 }
 
 fn handle_file_request<Memory: SharedMemory>(

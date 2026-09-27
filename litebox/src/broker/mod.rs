@@ -19,7 +19,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus,
+    CreatedProcess, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -65,6 +65,12 @@ pub(crate) trait BrokerControl: Send + Sync {
         child_process_id: litebox_broker_protocol::ProcessId,
         exit_status: ProcessExitStatus,
     ) -> core::result::Result<(), BrokerControlError>;
+
+    fn duplicate_objects_to_child(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        handles: &[ObjectHandle],
+    ) -> core::result::Result<Vec<ObjectHandle>, BrokerControlError>;
 
     fn report_exit_status(
         &self,
@@ -490,6 +496,23 @@ where
         exit_status: ProcessExitStatus,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.exit_child_process(child_process_id, exit_status))
+    }
+
+    fn duplicate_objects_to_child(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        handles: &[ObjectHandle],
+    ) -> core::result::Result<Vec<ObjectHandle>, BrokerControlError> {
+        if handles.is_empty() {
+            return Ok(Vec::new());
+        }
+        if handles.len() > MAX_CHILD_OBJECT_DUPLICATES as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(handles.len() * size_of::<u64>())?;
+        self.request(|local| {
+            local.duplicate_objects_to_child(child_process_id, lease.sequence(), handles)
+        })
     }
 
     fn report_exit_status(

@@ -4,6 +4,7 @@
 //! Broker-backed guest process creation and child termination.
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
@@ -15,6 +16,7 @@ use crate::broker::{
     BrokerControl, BrokerPollableRegistry, error::BrokerControlError, readiness_events,
 };
 use crate::event::{Events, IOPollable, observer::Observer, polling::Pollee};
+use crate::fs::{BrokerFile, FileFd};
 use crate::sync::RawSyncPrimitivesProvider;
 
 /// Error returned by the broker-backed process service.
@@ -41,6 +43,9 @@ pub enum ProcessError {
     /// The child process is invalid or no longer available.
     #[error("invalid child process")]
     InvalidChild,
+    /// A file passed to the child process is closed.
+    #[error("file is closed")]
+    ClosedFile,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -65,6 +70,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn set_child_reaping(&self, enabled: bool) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_child_reaping(enabled)?)
+    }
+
+    /// Returns a descriptor for a file this process inherited from its parent
+    /// through [`Process::inherit_files`].
+    ///
+    /// The descriptor owns `handle`, so callers adopt each handle once and
+    /// duplicate the descriptor for every other use.
+    pub fn adopt_inherited_file(&self, handle: ObjectHandle) -> Result<FileFd, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(self
+            .descriptor_table_mut()
+            .insert(Arc::new(BrokerFile::from_handle(broker, handle))))
     }
 }
 
@@ -121,6 +138,45 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
         Ok(self
             .broker
             .start_child_process(self.identity.process_id, payload)?)
+    }
+
+    /// Gives this pending child process its own references to `files`,
+    /// returning the child's handles in the same order.
+    ///
+    /// Like descriptors a Linux child inherits, each child reference shares
+    /// its file's offset and status. Files sharing an open file description
+    /// get the same handle. The child adopts each handle with
+    /// [`LiteBox::adopt_inherited_file`] and releases its references when it
+    /// terminates. If this fails, the child receives none of them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns fewer handles than were duplicated.
+    pub fn inherit_files(
+        &self,
+        litebox: &LiteBox<Platform>,
+        files: &[&FileFd],
+    ) -> Result<Vec<ObjectHandle>, ProcessError> {
+        // Holding the files keeps their handles open until the child has its own.
+        let files = files
+            .iter()
+            .map(|file| litebox.broker_file(file).ok_or(ProcessError::ClosedFile))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut handles: Vec<_> = files.iter().map(|file| file.handle()).collect();
+        handles.sort_unstable();
+        handles.dedup();
+        let inherited = self
+            .broker
+            .duplicate_objects_to_child(self.identity.process_id, &handles)?;
+        Ok(files
+            .iter()
+            .map(|file| {
+                let index = handles
+                    .binary_search(&file.handle())
+                    .expect("every file handle was duplicated");
+                inherited[index]
+            })
+            .collect())
     }
 
     /// Records that this pending child process exited without starting a

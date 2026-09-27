@@ -163,11 +163,6 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         self.max_fd.store(max_fd, Ordering::Relaxed);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn has_only_standard_descriptor_numbers(&self) -> bool {
-        self.raw_descriptor_store.read().iter_alive().eq([0, 1, 2])
-    }
-
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
     // Err(typed_fd)
     pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(
@@ -222,6 +217,56 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         let success = rds.fd_into_specific_raw_integer(typed_fd, raw_fd);
         assert!(success);
         Ok(raw_fd)
+    }
+
+    /// Installs the descriptors a program inherited across `execve`.
+    pub(crate) fn install_inherited_files(
+        &self,
+        global: &GlobalState<Platform>,
+        inherited_files: &[litebox_common_linux::program_startup::InheritedFile],
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        let litebox = &global.litebox;
+        let max_fd = self.max_fd.load(Ordering::Relaxed);
+        // The first descriptor of each inherited open file description.
+        let mut descriptions = alloc::collections::BTreeMap::new();
+        let mut next_fd = 0;
+        for file in inherited_files {
+            let raw_fd = file.fd as usize;
+            if raw_fd < next_fd || raw_fd - next_fd > MAX_INHERITED_FD_GAP || raw_fd >= max_fd {
+                return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFiles);
+            }
+            let fd = if let Some(&first_fd) = descriptions.get(&file.handle) {
+                let first = self
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<litebox::fs::BrokerFile>(first_fd)
+                    .expect("an installed inherited descriptor stays open");
+                litebox
+                    .descriptor_table_mut()
+                    .duplicate(&first)
+                    .expect("an installed inherited descriptor stays open")
+            } else {
+                let fd = litebox
+                    .adopt_inherited_file(file.handle)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFiles)?;
+                let mut descriptors = litebox.descriptor_table_mut();
+                if let Some(stream) = file.stdio_stream {
+                    descriptors.set_entry_metadata(&fd, stream);
+                }
+                if let Some(flags) = file.stdio_status_flags {
+                    descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
+                }
+                descriptions.insert(file.handle, raw_fd);
+                fd
+            };
+            let success = self
+                .raw_descriptor_store
+                .write()
+                .fd_into_specific_raw_integer(fd, raw_fd);
+            assert!(success);
+            next_fd = raw_fd + 1;
+        }
+        Ok(())
     }
 }
 
@@ -366,7 +411,51 @@ impl FsPath {
     }
 }
 
+/// How far past the lowest descriptor number above those already installed a fresh runner can
+/// install an inherited descriptor, since it installs them in ascending order into an empty table.
+const MAX_INHERITED_FD_GAP: usize = 255;
+
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Returns the descriptors a fresh runner inherits across `execve`, which are those not marked
+    /// close-on-exec, in ascending order.
+    ///
+    /// Fails with `EAGAIN` if one of them cannot transfer: it is not a broker-backed file, it has
+    /// a directory position, which is local to this runner, or it lies more than
+    /// [`MAX_INHERITED_FD_GAP`] past the previous one.
+    pub(crate) fn files_inherited_across_exec(
+        &self,
+    ) -> Result<alloc::vec::Vec<(u32, alloc::sync::Arc<FileFd>)>, Errno> {
+        let files = self.files.borrow();
+        let alive_fds: alloc::vec::Vec<usize> =
+            files.raw_descriptor_store.read().iter_alive().collect();
+        let mut inherited = alloc::vec::Vec::new();
+        let mut next_fd = 0;
+        for raw_fd in alive_fds {
+            let fd = files.typed_fd_from_raw(raw_fd)?;
+            if get_file_descriptor_flags(&fd, &self.global)
+                .contains(FileDescriptorFlags::FD_CLOEXEC)
+            {
+                continue;
+            }
+            let AnyTypedFd::Fs(file) = fd else {
+                return Err(Errno::EAGAIN);
+            };
+            if raw_fd - next_fd > MAX_INHERITED_FD_GAP
+                || self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(&file, |_: &Diroff| ())
+                    .is_ok()
+            {
+                return Err(Errno::EAGAIN);
+            }
+            next_fd = raw_fd + 1;
+            inherited.push((u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?, file));
+        }
+        Ok(inherited)
+    }
+
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }

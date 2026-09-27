@@ -23,9 +23,9 @@ use crate::message::{
     BrokerRequest, BrokerResponse, BrokerResult, ReadinessNotification,
 };
 use crate::process::{
-    CreateThreadRequest, CreateThreadResponse, CreatedProcess, ExitChildProcessRequest,
-    ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -54,6 +54,7 @@ const REQUEST_TAG_GET_PROCESS_EXIT_STATUS: u8 = 12;
 const REQUEST_TAG_EXIT_CHILD_PROCESS: u8 = 13;
 const REQUEST_TAG_REPORT_EXIT_STATUS: u8 = 14;
 const REQUEST_TAG_SET_CHILD_REAPING: u8 = 15;
+const REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 16;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
@@ -80,6 +81,7 @@ const RESPONSE_TAG_PROCESS_EXIT_STATUS: u8 = 12;
 const RESPONSE_TAG_PROCESS_EXITED: u8 = 13;
 const RESPONSE_TAG_EXIT_STATUS_REPORTED: u8 = 14;
 const RESPONSE_TAG_CHILD_REAPING_SET: u8 = 15;
+const RESPONSE_TAG_OBJECTS_DUPLICATED: u8 = 16;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -143,7 +145,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_GET_PROCESS_EXIT_STATUS
         | REQUEST_TAG_EXIT_CHILD_PROCESS
         | REQUEST_TAG_REPORT_EXIT_STATUS
-        | REQUEST_TAG_SET_CHILD_REAPING => {
+        | REQUEST_TAG_SET_CHILD_REAPING
+        | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -255,6 +258,15 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             encoder.u8(u8::from(enabled));
         }
+        BrokerOperation::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
+            child_process_id,
+            handles,
+        }) => {
+            encoder.u8(REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD);
+            encoder.request_id(request_id);
+            encoder.process_id(child_process_id);
+            encoder.shared_buffer_sequence(handles);
+        }
     }
     encoder.finish()
 }
@@ -279,7 +291,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_GET_PROCESS_EXIT_STATUS
         | REQUEST_TAG_EXIT_CHILD_PROCESS
         | REQUEST_TAG_REPORT_EXIT_STATUS
-        | REQUEST_TAG_SET_CHILD_REAPING => {}
+        | REQUEST_TAG_SET_CHILD_REAPING
+        | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -333,6 +346,12 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
             1 => true,
             _ => return Err(WireError::InvalidTag),
         }),
+        REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD => {
+            BrokerOperation::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
+                child_process_id: decoder.process_id()?,
+                handles: decoder.shared_buffer_sequence()?,
+            })
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -413,7 +432,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_PROCESS_EXIT_STATUS
         | RESPONSE_TAG_PROCESS_EXITED
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
-        | RESPONSE_TAG_CHILD_REAPING_SET => {
+        | RESPONSE_TAG_CHILD_REAPING_SET
+        | RESPONSE_TAG_OBJECTS_DUPLICATED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -525,6 +545,10 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_CHILD_REAPING_SET);
             encoder.request_id(request_id);
         }
+        BrokerResult::ObjectsDuplicated => {
+            encoder.u8(RESPONSE_TAG_OBJECTS_DUPLICATED);
+            encoder.request_id(request_id);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -557,7 +581,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_PROCESS_EXIT_STATUS
         | RESPONSE_TAG_PROCESS_EXITED
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
-        | RESPONSE_TAG_CHILD_REAPING_SET => {}
+        | RESPONSE_TAG_CHILD_REAPING_SET
+        | RESPONSE_TAG_OBJECTS_DUPLICATED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -594,6 +619,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_PROCESS_EXITED => BrokerResult::ProcessExited,
         RESPONSE_TAG_EXIT_STATUS_REPORTED => BrokerResult::ExitStatusReported,
         RESPONSE_TAG_CHILD_REAPING_SET => BrokerResult::ChildReapingSet,
+        RESPONSE_TAG_OBJECTS_DUPLICATED => BrokerResult::ObjectsDuplicated,
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -717,9 +743,9 @@ mod tests {
         WritePipeResponse,
     };
     use crate::process::{
-        CreateThreadRequest, CreateThreadResponse, CreatedProcess, ExitChildProcessRequest,
-        ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor, StartChildProcessRequest,
-        StartChildProcessSource,
+        CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
+        ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
+        StartChildProcessRequest, StartChildProcessSource,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -783,6 +809,7 @@ mod tests {
                 RESPONSE_TAG_PROCESS_EXITED,
                 RESPONSE_TAG_EXIT_STATUS_REPORTED,
                 RESPONSE_TAG_CHILD_REAPING_SET,
+                RESPONSE_TAG_OBJECTS_DUPLICATED,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -801,6 +828,7 @@ mod tests {
                 REQUEST_TAG_EXIT_CHILD_PROCESS,
                 REQUEST_TAG_REPORT_EXIT_STATUS,
                 REQUEST_TAG_SET_CHILD_REAPING,
+                REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD,
             ]
         );
         assert_eq!(
@@ -1098,6 +1126,10 @@ mod tests {
             BrokerOperation::ReportExitStatus(ProcessExitStatus::Unknown),
             BrokerOperation::SetChildReaping(false),
             BrokerOperation::SetChildReaping(true),
+            BrokerOperation::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
+                child_process_id: process_id(u32::MAX),
+                handles: largest_sequence,
+            }),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1451,6 +1483,7 @@ mod tests {
             BrokerResult::ProcessExited,
             BrokerResult::ExitStatusReported,
             BrokerResult::ChildReapingSet,
+            BrokerResult::ObjectsDuplicated,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),

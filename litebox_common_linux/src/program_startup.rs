@@ -7,16 +7,19 @@ use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
+use litebox_broker_protocol::stdio::StdioStream;
 
+use crate::OFlags;
 use crate::signal::SigSet;
 
-const HEADER_SIZE: usize = size_of::<[u32; 8]>() + size_of::<[u64; 2]>();
+const HEADER_SIZE: usize = size_of::<[u32; 9]>() + size_of::<[u64; 2]>();
+const INHERITED_FILE_SIZE: usize = size_of::<[u32; 2]>() + size_of::<u64>() + size_of::<[u8; 2]>();
 
 /// Linux program state needed to load a child in a fresh runner.
 ///
-/// Broker object inheritance and platform-managed architectural context are intentionally outside
-/// this payload.
+/// Platform-managed architectural context is intentionally outside this payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinuxProgramStartup {
     /// Parent process ID visible to the child.
@@ -39,6 +42,25 @@ pub struct LinuxProgramStartup {
     pub argv: Vec<CString>,
     /// Program environment.
     pub envp: Vec<CString>,
+    /// Descriptors the program inherits, in strictly ascending descriptor order.
+    pub inherited_files: Vec<InheritedFile>,
+}
+
+/// A descriptor inherited across `execve`, as Linux keeps every descriptor not marked
+/// close-on-exec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InheritedFile {
+    /// Descriptor number.
+    pub fd: u32,
+    /// The child's broker handle to the file.
+    ///
+    /// Descriptors with the same handle share one open file description, whose metadata is taken
+    /// from the first of them.
+    pub handle: ObjectHandle,
+    /// Standard stream the file refers to, if any.
+    pub stdio_stream: Option<StdioStream>,
+    /// Status flags the runner tracks for a standard stream, if any.
+    pub stdio_status_flags: Option<OFlags>,
 }
 
 /// Invalid or unsupported Linux program startup data.
@@ -59,6 +81,9 @@ pub enum LinuxProgramStartupError {
     /// An argument or environment string contains an interior NUL.
     #[error("invalid Linux program string")]
     InvalidString,
+    /// Inherited descriptors are not in strictly ascending order.
+    #[error("invalid Linux program inherited descriptors")]
+    InvalidInheritedFiles,
 }
 
 impl LinuxProgramStartup {
@@ -89,6 +114,11 @@ impl LinuxProgramStartup {
             &mut output,
             u32::try_from(self.envp.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
+        push_u32(
+            &mut output,
+            u32::try_from(self.inherited_files.len())
+                .map_err(|_| LinuxProgramStartupError::TooLarge)?,
+        );
         output.extend_from_slice(self.path.as_bytes());
         for value in self.argv.iter().chain(&self.envp) {
             let value = value.as_bytes();
@@ -97,6 +127,21 @@ impl LinuxProgramStartup {
                 u32::try_from(value.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
             );
             output.extend_from_slice(value);
+        }
+        for file in &self.inherited_files {
+            push_u32(&mut output, file.fd);
+            push_u64(&mut output, file.handle.0);
+            output.push(match file.stdio_stream {
+                None => 0,
+                Some(StdioStream::Stdin) => 1,
+                Some(StdioStream::Stdout) => 2,
+                Some(StdioStream::Stderr) => 3,
+            });
+            output.push(u8::from(file.stdio_status_flags.is_some()));
+            push_u32(
+                &mut output,
+                file.stdio_status_flags.map_or(0, |flags| flags.bits()),
+            );
         }
         debug_assert_eq!(output.len(), encoded_len);
         Ok(output)
@@ -121,6 +166,8 @@ impl LinuxProgramStartup {
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let envp_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let inherited_file_count = usize::try_from(read_u32(&mut input)?)
+            .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let path_bytes = take_bytes(&mut input, path_length)?;
         let path = core::str::from_utf8(path_bytes)
             .map_err(|_| LinuxProgramStartupError::InvalidPath)?
@@ -143,6 +190,40 @@ impl LinuxProgramStartup {
                     .map_err(|_| LinuxProgramStartupError::InvalidString)?,
             );
         }
+        if inherited_file_count.checked_mul(INHERITED_FILE_SIZE) != Some(input.len()) {
+            return Err(LinuxProgramStartupError::Malformed);
+        }
+        let mut inherited_files = Vec::new();
+        inherited_files
+            .try_reserve_exact(inherited_file_count)
+            .map_err(|_| LinuxProgramStartupError::TooLarge)?;
+        for _ in 0..inherited_file_count {
+            let fd = read_u32(&mut input)?;
+            let handle = ObjectHandle(read_u64(&mut input)?);
+            let stdio_stream = match read_u8(&mut input)? {
+                0 => None,
+                1 => Some(StdioStream::Stdin),
+                2 => Some(StdioStream::Stdout),
+                3 => Some(StdioStream::Stderr),
+                _ => return Err(LinuxProgramStartupError::Malformed),
+            };
+            let has_stdio_status_flags = read_u8(&mut input)?;
+            let stdio_status_flags = read_u32(&mut input)?;
+            let stdio_status_flags = match has_stdio_status_flags {
+                0 if stdio_status_flags == 0 => None,
+                1 => Some(
+                    OFlags::from_bits(stdio_status_flags)
+                        .ok_or(LinuxProgramStartupError::Malformed)?,
+                ),
+                _ => return Err(LinuxProgramStartupError::Malformed),
+            };
+            inherited_files.push(InheritedFile {
+                fd,
+                handle,
+                stdio_stream,
+                stdio_status_flags,
+            });
+        }
         if !input.is_empty() {
             return Err(LinuxProgramStartupError::Malformed);
         }
@@ -158,6 +239,7 @@ impl LinuxProgramStartup {
             path,
             argv: values,
             envp,
+            inherited_files,
         };
         validate(&startup)?;
         Ok(startup)
@@ -170,6 +252,13 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     }
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
+    }
+    if !startup
+        .inherited_files
+        .windows(2)
+        .all(|files| files[0].fd < files[1].fd)
+    {
+        return Err(LinuxProgramStartupError::InvalidInheritedFiles);
     }
     Ok(())
 }
@@ -190,6 +279,15 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
             return Err(LinuxProgramStartupError::TooLarge);
         }
     }
+    length = startup
+        .inherited_files
+        .len()
+        .checked_mul(INHERITED_FILE_SIZE)
+        .and_then(|files| length.checked_add(files))
+        .ok_or(LinuxProgramStartupError::TooLarge)?;
+    if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+        return Err(LinuxProgramStartupError::TooLarge);
+    }
     Ok(length)
 }
 
@@ -199,6 +297,10 @@ fn push_u32(output: &mut Vec<u8>, value: u32) {
 
 fn push_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_u8(input: &mut &[u8]) -> Result<u8, LinuxProgramStartupError> {
+    Ok(take_bytes(input, size_of::<u8>())?[0])
 }
 
 fn read_u32(input: &mut &[u8]) -> Result<u32, LinuxProgramStartupError> {
@@ -253,6 +355,20 @@ mod tests {
                 CString::new("argument").unwrap(),
             ],
             envp: vec![CString::new("KEY=value").unwrap()],
+            inherited_files: vec![
+                InheritedFile {
+                    fd: 1,
+                    handle: ObjectHandle(7),
+                    stdio_stream: Some(StdioStream::Stdout),
+                    stdio_status_flags: Some(OFlags::APPEND | OFlags::RDWR),
+                },
+                InheritedFile {
+                    fd: 4,
+                    handle: ObjectHandle(u64::MAX),
+                    stdio_stream: None,
+                    stdio_status_flags: None,
+                },
+            ],
         };
 
         assert_eq!(
@@ -274,6 +390,7 @@ mod tests {
             path: "/child".into(),
             argv: vec![CString::new("").unwrap(); 1025],
             envp: Vec::new(),
+            inherited_files: Vec::new(),
         };
 
         assert_eq!(
@@ -295,6 +412,7 @@ mod tests {
             path: "/child".into(),
             argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),
+            inherited_files: Vec::new(),
         };
         let mut encoded = startup.encode().unwrap();
         encoded.push(0);
@@ -309,6 +427,42 @@ mod tests {
         assert_eq!(
             LinuxProgramStartup::decode(&invalid),
             Err(LinuxProgramStartupError::InvalidString)
+        );
+    }
+
+    #[test]
+    fn program_startup_rejects_unordered_inherited_files() {
+        let file = InheritedFile {
+            fd: 3,
+            handle: ObjectHandle(1),
+            stdio_stream: None,
+            stdio_status_flags: None,
+        };
+        let mut startup = LinuxProgramStartup {
+            parent_process_id: 1,
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            blocked_signals: SigSet::empty(),
+            ignored_signals: SigSet::empty(),
+            path: "/child".into(),
+            argv: Vec::new(),
+            envp: Vec::new(),
+            inherited_files: vec![file, file],
+        };
+        assert_eq!(
+            startup.encode(),
+            Err(LinuxProgramStartupError::InvalidInheritedFiles)
+        );
+
+        startup.inherited_files[1].fd = 4;
+        let mut encoded = startup.encode().unwrap();
+        let second_fd = encoded.len() - INHERITED_FILE_SIZE;
+        encoded[second_fd] = 2;
+        assert_eq!(
+            LinuxProgramStartup::decode(&encoded),
+            Err(LinuxProgramStartupError::InvalidInheritedFiles)
         );
     }
 }

@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use crate::shared_buffer::SharedBufferSequence;
+use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use crate::{ObjectHandle, ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
@@ -95,6 +95,25 @@ pub struct StartChildProcessRequest {
     pub child_process_id: ProcessId,
     /// Process startup source.
     pub source: StartChildProcessSource,
+}
+
+/// Maximum number of object references one [`DuplicateObjectsToChildRequest`]
+/// duplicates, which fill one shared-buffer slot.
+pub const MAX_CHILD_OBJECT_DUPLICATES: u32 = SHARED_BUFFER_SLOT_SIZE / 8;
+
+/// Duplicates the caller's object references into its pending child, as a
+/// Linux child inherits its parent's descriptors.
+///
+/// `handles` holds the caller's handles as consecutive little-endian `u64`
+/// values. On success, the broker overwrites them in place with the child's
+/// handles in the same order. Either every reference is duplicated or none is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DuplicateObjectsToChildRequest {
+    /// Pending child that receives the duplicates.
+    pub child_process_id: ProcessId,
+    /// Operation-scoped shared-buffer sequence holding between one and
+    /// [`MAX_CHILD_OBJECT_DUPLICATES`] handles.
+    pub handles: SharedBufferSequence,
 }
 
 /// Records the exit of a pending child that ran without starting its own

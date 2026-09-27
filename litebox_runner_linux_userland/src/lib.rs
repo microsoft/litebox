@@ -137,6 +137,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             path,
             argv,
             envp,
+            inherited_files,
         } = LinuxProgramStartup::decode(&startup.payload)
             .context("invalid child Linux program startup")?;
         (
@@ -149,6 +150,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                 egid,
                 blocked_signals,
                 ignored_signals,
+                inherited_files: Some(inherited_files),
             },
             path,
             argv,
@@ -190,6 +192,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                 egid: u32::from(DEFAULT_GUEST_GID),
                 blocked_signals: SigSet::empty(),
                 ignored_signals: SigSet::empty(),
+                inherited_files: None,
             },
             prog_path,
             argv,

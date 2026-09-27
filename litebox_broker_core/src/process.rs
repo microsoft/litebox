@@ -508,6 +508,35 @@ impl BrokerProcess {
         Ok(())
     }
 
+    /// Duplicates object references into the pending child selected by
+    /// `child_process_id`, as a Linux child inherits its parent's descriptors.
+    ///
+    /// Returned handles follow the requested order and belong to the child,
+    /// which releases them when it terminates. If duplication fails, the
+    /// child receives none of them.
+    pub fn duplicate_object_references_to_child(
+        &self,
+        child_process_id: ProcessId,
+        handles: &[ObjectHandle],
+    ) -> Result<Vec<ObjectHandle>> {
+        // Hold the state lock so the child stays pending, since a child
+        // removed from its slot may release its references before receiving
+        // these.
+        let state = self.state.lock();
+        if !self.accepts_operations(&state) {
+            return Err(BrokerError::PeerClosed);
+        }
+        let child = state
+            .pending_child_process
+            .as_ref()
+            .filter(|child| child.id() == child_process_id)
+            .ok_or(BrokerError::UnknownObject)?;
+        if !child.awaits_startup(&child.state.lock()) {
+            return Err(BrokerError::PeerClosed);
+        }
+        self.duplicate_object_references_to(handles, child)
+    }
+
     /// Returns this process's parent if it still exists.
     ///
     /// Callers upgrade before taking this process's state lock and drop the
@@ -1981,6 +2010,66 @@ mod tests {
         assert_eq!(
             parent.process_exit_status(handle),
             Ok(Some(ProcessExitStatus::Unknown))
+        );
+    }
+
+    #[test]
+    fn pending_child_receives_references_until_it_exits() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let CreatedProcess { identity, handle } =
+            parent.allocate_child_process(readiness_sink()).unwrap();
+        let child_id = identity.process_id;
+        let child = broker
+            .processes
+            .read()
+            .get(&child_id)
+            .and_then(alloc::sync::Weak::upgrade)
+            .unwrap();
+        let first = crate::event::create(&parent, 1).unwrap();
+        let second = crate::event::create(&parent, 0).unwrap();
+
+        assert_eq!(
+            parent.duplicate_object_references_to_child(ProcessId(child_id.0 + 1), &[first]),
+            Err(BrokerError::UnknownObject)
+        );
+        // A process reference is not duplicable, so the child receives nothing.
+        assert_eq!(
+            parent.duplicate_object_references_to_child(child_id, &[first, handle]),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        assert!(child.references.lock().handles.is_empty());
+
+        let duplicates = parent
+            .duplicate_object_references_to_child(child_id, &[first, second])
+            .unwrap();
+        assert_eq!(child.references.lock().handles, duplicates);
+        assert_eq!(
+            child.check_readiness(duplicates[0]),
+            Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
+        );
+        assert_eq!(
+            child.check_readiness(duplicates[1]),
+            Ok(ReadinessFlags::WRITE)
+        );
+
+        parent.exit_child_process(child_id, EXITED).unwrap();
+        assert!(child.references.lock().handles.is_empty());
+        assert_eq!(
+            parent.duplicate_object_references_to_child(child_id, &[first]),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            parent.check_readiness(first),
+            Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
     }
 
