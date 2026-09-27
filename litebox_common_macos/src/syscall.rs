@@ -32,12 +32,48 @@ pub mod nr {
     pub const MMAP: usize = 197;
     pub const SYSCTL: usize = 202;
     pub const SHARED_REGION_CHECK_NP: usize = 294;
+    pub const PSYNCH_RW_LONGRDLOCK: usize = 297;
+    pub const PSYNCH_RW_YIELDWRLOCK: usize = 298;
+    pub const PSYNCH_RW_DOWNGRADE: usize = 299;
+    pub const PSYNCH_RW_UPGRADE: usize = 300;
+    pub const PSYNCH_MUTEXWAIT: usize = 301;
+    pub const PSYNCH_MUTEXDROP: usize = 302;
+    pub const PSYNCH_CVBROAD: usize = 303;
+    pub const PSYNCH_CVSIGNAL: usize = 304;
+    pub const PSYNCH_CVWAIT: usize = 305;
+    pub const PSYNCH_RW_RDLOCK: usize = 306;
+    pub const PSYNCH_RW_WRLOCK: usize = 307;
+    pub const PSYNCH_RW_UNLOCK: usize = 308;
+    pub const PSYNCH_RW_UNLOCK2: usize = 309;
+    pub const PSYNCH_CVCLRPREPOST: usize = 312;
+    pub const BSDTHREAD_CREATE: usize = 360;
+    pub const BSDTHREAD_TERMINATE: usize = 361;
     pub const THREAD_SELFID: usize = 372;
     pub const READ_NOCANCEL: usize = 396;
     pub const WRITE_NOCANCEL: usize = 397;
     pub const OPEN_NOCANCEL: usize = 398;
     pub const CLOSE_NOCANCEL: usize = 399;
     pub const GETENTROPY: usize = 500;
+    pub const ULOCK_WAIT: usize = 515;
+    pub const ULOCK_WAKE: usize = 516;
+    pub const ULOCK_WAIT2: usize = 544;
+}
+
+fn unsupported_pthread_sync(number: usize) -> Option<&'static str> {
+    match number {
+        nr::PSYNCH_CVBROAD | nr::PSYNCH_CVSIGNAL | nr::PSYNCH_CVWAIT | nr::PSYNCH_CVCLRPREPOST => {
+            Some("condition-variable")
+        }
+        nr::PSYNCH_RW_LONGRDLOCK
+        | nr::PSYNCH_RW_YIELDWRLOCK
+        | nr::PSYNCH_RW_DOWNGRADE
+        | nr::PSYNCH_RW_UPGRADE
+        | nr::PSYNCH_RW_RDLOCK
+        | nr::PSYNCH_RW_WRLOCK
+        | nr::PSYNCH_RW_UNLOCK
+        | nr::PSYNCH_RW_UNLOCK2 => Some("rwlock"),
+        _ => None,
+    }
 }
 
 /// Whether the low 32 bits of an AArch64 syscall selector encode a Mach trap.
@@ -199,6 +235,51 @@ pub enum SyscallRequest {
     Getgid,
     Getegid,
     ThreadSelfid,
+    BsdthreadCreate {
+        function: usize,
+        argument: usize,
+        stack: usize,
+        pthread: usize,
+        flags: u32,
+    },
+    BsdthreadTerminate {
+        stack: usize,
+        size: usize,
+        port: MachPortName,
+        semaphore_or_ulock: usize,
+    },
+    PsynchMutexWait {
+        mutex: usize,
+        mgen: u32,
+        ugen: u32,
+        tid: u64,
+        flags: u32,
+    },
+    PsynchMutexDrop {
+        mutex: usize,
+        mgen: u32,
+        ugen: u32,
+        tid: u64,
+        flags: u32,
+    },
+    UlockWait {
+        operation: u32,
+        address: usize,
+        value: u64,
+        timeout: u32,
+    },
+    UlockWait2 {
+        operation: u32,
+        address: usize,
+        value: u64,
+        timeout: u64,
+        value2: u64,
+    },
+    UlockWake {
+        operation: u32,
+        address: usize,
+        value: u64,
+    },
     Getentropy {
         buffer: UserPtrMut<u8>,
         count: usize,
@@ -290,6 +371,9 @@ impl SyscallRequest {
                 _ => Err(Errno::ENOSYS),
             };
         }
+        if unsupported_pthread_sync(number).is_some() {
+            return Err(Errno::ENOTSUP);
+        }
         Ok(match number {
             nr::EXIT => Self::Exit { status: int_arg(0) },
             nr::READ | nr::READ_NOCANCEL => Self::Read {
@@ -346,6 +430,51 @@ impl SyscallRequest {
             nr::GETGID => Self::Getgid,
             nr::GETEGID => Self::Getegid,
             nr::THREAD_SELFID => Self::ThreadSelfid,
+            nr::PSYNCH_MUTEXWAIT => Self::PsynchMutexWait {
+                mutex: args[0],
+                mgen: args[1].trunc(),
+                ugen: args[2].trunc(),
+                tid: u64_arg(3),
+                flags: args[4].trunc(),
+            },
+            nr::PSYNCH_MUTEXDROP => Self::PsynchMutexDrop {
+                mutex: args[0],
+                mgen: args[1].trunc(),
+                ugen: args[2].trunc(),
+                tid: u64_arg(3),
+                flags: args[4].trunc(),
+            },
+            nr::BSDTHREAD_CREATE => Self::BsdthreadCreate {
+                function: args[0],
+                argument: args[1],
+                stack: args[2],
+                pthread: args[3],
+                flags: args[4].trunc(),
+            },
+            nr::BSDTHREAD_TERMINATE => Self::BsdthreadTerminate {
+                stack: args[0],
+                size: args[1],
+                port: port_arg(2),
+                semaphore_or_ulock: args[3],
+            },
+            nr::ULOCK_WAIT => Self::UlockWait {
+                operation: args[0].trunc(),
+                address: args[1],
+                value: u64_arg(2),
+                timeout: args[3].trunc(),
+            },
+            nr::ULOCK_WAIT2 => Self::UlockWait2 {
+                operation: args[0].trunc(),
+                address: args[1],
+                value: u64_arg(2),
+                timeout: u64_arg(3),
+                value2: u64_arg(4),
+            },
+            nr::ULOCK_WAKE => Self::UlockWake {
+                operation: args[0].trunc(),
+                address: args[1],
+                value: u64_arg(2),
+            },
             nr::SHARED_REGION_CHECK_NP => Self::SharedRegionCheckNp {
                 start_address: UserPtrMut::from_usize(args[0]),
             },
@@ -362,7 +491,13 @@ impl SyscallRequest {
         log_unsupported: impl Fn(core::fmt::Arguments<'_>),
     ) -> Result<Self, Errno> {
         Self::from_args(number, core::array::from_fn(|i| ctx.regs[i])).inspect_err(|_| {
-            log_unsupported(format_args!("unsupported Darwin syscall {number:#x}"));
+            if let Some(kind) = unsupported_pthread_sync(number) {
+                log_unsupported(format_args!(
+                    "unsupported Darwin pthread {kind} synchronization (syscall {number})"
+                ));
+            } else {
+                log_unsupported(format_args!("unsupported Darwin syscall {number:#x}"));
+            }
         })
     }
 }
@@ -370,6 +505,29 @@ impl SyscallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_pthread_synchronization_is_explicit() {
+        for number in [
+            nr::PSYNCH_CVBROAD,
+            nr::PSYNCH_CVSIGNAL,
+            nr::PSYNCH_CVWAIT,
+            nr::PSYNCH_CVCLRPREPOST,
+            nr::PSYNCH_RW_LONGRDLOCK,
+            nr::PSYNCH_RW_YIELDWRLOCK,
+            nr::PSYNCH_RW_DOWNGRADE,
+            nr::PSYNCH_RW_UPGRADE,
+            nr::PSYNCH_RW_RDLOCK,
+            nr::PSYNCH_RW_WRLOCK,
+            nr::PSYNCH_RW_UNLOCK,
+            nr::PSYNCH_RW_UNLOCK2,
+        ] {
+            assert_eq!(
+                SyscallRequest::from_args(number, [0; 8]).unwrap_err(),
+                Errno::ENOTSUP
+            );
+        }
+    }
 
     #[test]
     fn typed_arguments_and_aliases() {

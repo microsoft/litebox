@@ -14,9 +14,154 @@ fn task(shim: MacosShim<Platform>) -> Task<Platform> {
         global: shim.global,
         files: shim.files,
         params: TaskParams::default(),
-        process: Process(Arc::new(AtomicI32::new(-1))),
+        process: Process::new(),
         thread,
     }
+}
+
+#[test]
+fn broker_wait_observes_process_exit() {
+    let task = task(MacosShimBuilder::new(Platform::new()).build());
+    assert!(!litebox::event::wait::CheckForInterrupt::check_for_interrupt(&task));
+    assert!(task.process.exit(5));
+    assert!(matches!(
+        task.wait_cx()
+            .with_timeout(core::time::Duration::from_secs(1))
+            .sleep(),
+        litebox::event::wait::WaitError::Interrupted
+    ));
+}
+
+#[test]
+fn process_exit_retries_an_interrupt_delivered_before_a_host_wait() {
+    use litebox_platform::sync::{RawMutex as _, UnblockedOrTimedOut};
+    use std::time::{Duration, Instant};
+
+    struct Probe<F> {
+        entrypoints: MacosShimEntrypoints<Platform>,
+        body: F,
+    }
+    impl<F: Fn(&MacosShimEntrypoints<Platform>)> EnterShim for Probe<F> {
+        type ExecutionContext = PtRegs;
+        fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
+            assert_eq!(self.entrypoints.init(ctx), ContinueOperation::Resume);
+            (self.body)(&self.entrypoints);
+            self.entrypoints.task.continuation(ctx)
+        }
+        fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+            unreachable!()
+        }
+        fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+            unreachable!()
+        }
+        fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+            unreachable!()
+        }
+    }
+
+    litebox_platform_macos_userland::set_guest_abi(
+        litebox_platform_macos_userland::GuestAbi::Linux,
+    );
+    let waiter = task(MacosShimBuilder::new(Platform::new()).build());
+    let process = waiter.process.clone();
+    let global = waiter.global.clone();
+    process.thread_started();
+    let exiting = Task {
+        global: waiter.global.clone(),
+        files: waiter.files.clone(),
+        params: waiter.params,
+        process: process.clone(),
+        thread: ThreadState::new(waiter.thread.id + 1, waiter.global.platform),
+    };
+    let (ready, receiver) = std::sync::mpsc::channel();
+    let exiter = std::thread::spawn(move || {
+        let probe = Probe {
+            entrypoints: MacosShimEntrypoints {
+                task: exiting,
+                _not_send: core::marker::PhantomData,
+            },
+            body: |entry: &MacosShimEntrypoints<Platform>| {
+                receiver.recv_timeout(Duration::from_secs(3)).unwrap();
+                entry.task.sys_exit(5);
+            },
+        };
+        // SAFETY: init exits the process; no guest instructions execute.
+        unsafe { litebox_platform_macos_userland::run_thread(probe, &mut PtRegs::default()) };
+    });
+    let outcome = core::cell::Cell::new(None);
+    let probe = Probe {
+        entrypoints: MacosShimEntrypoints {
+            task: waiter,
+            _not_send: core::marker::PhantomData,
+        },
+        body: |entry: &MacosShimEntrypoints<Platform>| {
+            // Queue the first exit interrupt so we can deliberately consume it
+            // before entering the host wait, rather than relying on scheduling.
+            let signals = (1 << (libc::SIGUSR1 - 1)) | (1 << (libc::SIGUSR2 - 1));
+            let mut previous = 0;
+            // SAFETY: both masks are live; this changes only the current thread.
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut previous)
+                },
+                0
+            );
+            let _restore = litebox::utils::defer(|| {
+                // SAFETY: previous is this thread's saved signal mask.
+                assert_eq!(
+                    unsafe {
+                        libc::pthread_sigmask(
+                            libc::SIG_SETMASK,
+                            &raw const previous,
+                            core::ptr::null_mut(),
+                        )
+                    },
+                    0
+                );
+            });
+            ready.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut pending = 0;
+                // SAFETY: pending is writable output storage for this thread.
+                assert_eq!(unsafe { libc::sigpending(&raw mut pending) }, 0);
+                if pending & signals != 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "first exit interrupt was not sent"
+                );
+                std::thread::yield_now();
+            }
+            // SAFETY: restoring the mask delivers the queued signal in host code.
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(
+                        libc::SIG_SETMASK,
+                        &raw const previous,
+                        core::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            std::thread::sleep(Duration::from_millis(25));
+            // No waker or pre-wait exit check: only a subsequent interrupt can
+            // release this wait before its test-only safety timeout.
+            let wait = litebox_platform_macos_userland::RawMutex::INIT;
+            outcome.set(Some(
+                wait.block_or_timeout(0, Duration::from_secs(1)).unwrap(),
+            ));
+            // A losing exit caller must not wait for the coordinator waiting on it.
+            entry.task.sys_exit(9);
+        },
+    };
+    // SAFETY: init waits on the host stack, then observes process exit and terminates.
+    unsafe { litebox_platform_macos_userland::run_thread(probe, &mut PtRegs::default()) };
+    exiter.join().unwrap();
+    assert_eq!(outcome.get(), Some(UnblockedOrTimedOut::Unblocked));
+    assert_eq!(process.exit_status(), Some(5));
+    assert!(global.threads.lock().is_empty());
 }
 
 #[test]

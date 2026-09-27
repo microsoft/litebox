@@ -13,7 +13,7 @@
 extern crate alloc;
 
 use alloc::{collections::BTreeMap, ffi::CString, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{
     LiteBox,
@@ -25,7 +25,7 @@ use litebox_common_macos::{
     KernReturn, PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
     VmProtection, errno::Errno, loader::MachoLoaderError,
 };
-use litebox_platform::time::TimeProvider;
+use litebox_platform::{sync::RawMutex as _, time::TimeProvider};
 
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     #[cfg(target_os = "macos")]
@@ -55,6 +55,8 @@ pub trait ShimPlatform:
     + litebox::platform::SignalProvider
     + litebox::platform::SystemInfoProvider
     + litebox_common_macos::MachClock
+    + litebox::platform::ThreadProvider<ExecutionContext = PtRegs>
+    + litebox::platform::ArchSpecificProvider
     + 'static
 {
     /// Opaque page-reservation ownership type supplied by the platform.
@@ -68,6 +70,8 @@ where
         + litebox::platform::SignalProvider
         + litebox::platform::SystemInfoProvider
         + litebox_common_macos::MachClock
+        + litebox::platform::ThreadProvider<ExecutionContext = PtRegs>
+        + litebox::platform::ArchSpecificProvider
         + 'static,
     Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
 {
@@ -78,6 +82,54 @@ pub struct MacosShimBuilder<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
+    pthread_runtime: Option<PthreadRuntime>,
+}
+
+/// Runtime-supplied libpthread entrypoint and registered TSD layout.
+#[derive(Clone, Copy)]
+pub struct PthreadRuntime {
+    pub thread_start: usize,
+    pub tsd_offset: usize,
+    pub mach_thread_self_offset: usize,
+    /// Identity used by the runtime's underlying synchronization backend.
+    pub current_thread_identity: fn() -> (u64, u32),
+    pub synchronize: fn(PthreadSync) -> Result<usize, Errno>,
+}
+
+/// Native synchronization needed while the experimental runtime shares libpthread.
+pub enum PthreadSync {
+    UlockWait {
+        operation: u32,
+        address: usize,
+        value: u64,
+        timeout: u32,
+    },
+    UlockWait2 {
+        operation: u32,
+        address: usize,
+        value: u64,
+        timeout: u64,
+        value2: u64,
+    },
+    UlockWake {
+        operation: u32,
+        address: usize,
+        value: u64,
+    },
+    MutexWait {
+        mutex: usize,
+        mgen: u32,
+        ugen: u32,
+        tid: u64,
+        flags: u32,
+    },
+    MutexDrop {
+        mutex: usize,
+        mgen: u32,
+        ugen: u32,
+        tid: u64,
+        flags: u32,
+    },
 }
 
 impl<P: ShimPlatform> MacosShimBuilder<P> {
@@ -91,6 +143,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
         let litebox = Arc::new(litebox);
         Self {
             platform,
+            pthread_runtime: None,
             files: Arc::new(syscalls::file::FilesState::new(Arc::clone(&litebox))),
             litebox,
         }
@@ -106,6 +159,13 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
         self.files.insert_file(fd)
     }
 
+    /// Enable the experimental pthread path for a prepared runtime.
+    #[must_use]
+    pub fn with_pthread_runtime(mut self, runtime: PthreadRuntime) -> Self {
+        self.pthread_runtime = Some(runtime);
+        self
+    }
+
     pub fn build(self) -> MacosShim<P> {
         MacosShim {
             global: Arc::new(GlobalState {
@@ -119,6 +179,8 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
                 shared_cache_mappings: Mutex::new(Vec::new()),
                 privately_mapped_dyld_range: Mutex::new(None),
                 next_thread_id: core::sync::atomic::AtomicU64::new(1u64 << 32),
+                pthread_runtime: self.pthread_runtime,
+                threads: Mutex::new(BTreeMap::new()),
             }),
             files: self.files,
         }
@@ -257,7 +319,7 @@ impl<P: ShimPlatform> MacosShim<P> {
         argv: Vec<CString>,
         envp: Vec<CString>,
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
-        let process = Process(Arc::new(AtomicI32::new(-1)));
+        let process = Process::new();
         let thread_id = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
         let thread = ThreadState::new(thread_id, self.global.platform);
         let task = Task {
@@ -280,21 +342,83 @@ impl<P: ShimPlatform> MacosShim<P> {
 }
 
 /// Exit status can outlive the task without retaining its mappings or FDs.
-#[derive(Clone)]
-pub struct Process(Arc<AtomicI32>);
-impl Process {
-    pub fn exit_status(&self) -> Option<i32> {
-        let status = self.0.load(Ordering::Acquire);
-        (status >= 0).then_some(status)
+pub struct Process<P: ShimPlatform>(Arc<ProcessState<P>>);
+
+struct ProcessState<P: ShimPlatform> {
+    /// Exit status, or `u32::MAX` while running.
+    status: P::RawMutex,
+    live_threads: AtomicUsize,
+}
+
+impl<P: ShimPlatform> Clone for Process<P> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
-    fn exit(&self, status: i32) {
-        self.0.store(status, Ordering::Release);
+}
+
+impl<P: ShimPlatform> Process<P> {
+    /// Create a process whose first task is already running.
+    fn new() -> Self {
+        let status = P::RawMutex::INIT;
+        status
+            .underlying_atomic()
+            .store(u32::MAX, Ordering::Relaxed);
+        Self(Arc::new(ProcessState {
+            status,
+            live_threads: AtomicUsize::new(1),
+        }))
+    }
+
+    pub fn exit_status(&self) -> Option<i32> {
+        let status = self.0.status.underlying_atomic().load(Ordering::Acquire);
+        (status != u32::MAX).then(|| status.cast_signed())
+    }
+
+    /// Block until a thread exits the process or the last thread terminates.
+    pub fn wait_for_exit(&self) -> i32 {
+        loop {
+            if let Some(status) = self.exit_status() {
+                return status;
+            }
+            let _ = self.0.status.block(u32::MAX);
+        }
+    }
+
+    /// Record `status` unless another thread already exited the process.
+    /// Returns whether this call set the status.
+    fn exit(&self, status: i32) -> bool {
+        let won = self
+            .0
+            .status
+            .underlying_atomic()
+            .compare_exchange(
+                u32::MAX,
+                status.cast_unsigned(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        if won {
+            self.0.status.wake_all();
+        }
+        won
+    }
+
+    fn thread_started(&self) {
+        self.0.live_threads.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Like XNU, the process exits when its last thread terminates.
+    fn thread_stopped(&self) {
+        if self.0.live_threads.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.exit(0);
+        }
     }
 }
 
 pub struct LoadedProgram<P: ShimPlatform> {
     pub entrypoints: MacosShimEntrypoints<P>,
-    pub process: Process,
+    pub process: Process<P>,
     pub initial_ctx: PtRegs,
 }
 
@@ -418,6 +542,8 @@ struct GlobalState<P: ShimPlatform> {
     shared_cache_mappings: Mutex<P, Vec<(core::ops::Range<usize>, VmProtection)>>,
     privately_mapped_dyld_range: Mutex<P, Option<core::ops::Range<usize>>>,
     next_thread_id: core::sync::atomic::AtomicU64,
+    pthread_runtime: Option<PthreadRuntime>,
+    threads: Mutex<P, BTreeMap<u64, Arc<P::ThreadHandle>>>,
 }
 
 impl<P: ShimPlatform> Drop for GlobalState<P> {
@@ -443,6 +569,11 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
 struct ThreadState<P: ShimPlatform> {
     id: u64,
     wait_state: litebox::event::wait::WaitState<P>,
+    exited: AtomicBool,
+    startup: Option<(usize, usize)>,
+    native_identity: core::cell::Cell<Option<(u64, u32)>>,
+    /// LiteBox record for threads created by the guest.
+    litebox_thread: core::cell::Cell<Option<litebox::thread::Thread>>,
 }
 
 impl<P: ShimPlatform> ThreadState<P> {
@@ -450,6 +581,10 @@ impl<P: ShimPlatform> ThreadState<P> {
         Self {
             id,
             wait_state: litebox::event::wait::WaitState::new(platform),
+            exited: AtomicBool::new(false),
+            startup: None,
+            native_identity: core::cell::Cell::new(None),
+            litebox_thread: core::cell::Cell::new(None),
         }
     }
 }
@@ -458,7 +593,7 @@ struct Task<P: ShimPlatform> {
     global: Arc<GlobalState<P>>,
     files: Arc<syscalls::file::FilesState<P>>,
     params: TaskParams,
-    process: Process,
+    process: Process<P>,
     thread: ThreadState<P>,
 }
 
@@ -481,7 +616,24 @@ impl<P: ShimPlatform> litebox::event::wait::CheckForInterrupt for Task<P> {
         self.global
             .platform
             .take_pending_signals(|_| pending = true);
+        // Exit interrupts use the platform's private wake signal, not a guest
+        // signal. A broker wait must also observe the published process status.
         pending
+            || self.process.exit_status().is_some()
+            || self.thread.exited.load(Ordering::Acquire)
+    }
+}
+
+impl<P: ShimPlatform> Drop for Task<P> {
+    fn drop(&mut self) {
+        self.global.threads.lock().remove(&self.thread.id);
+        if let Some(thread) = self.thread.litebox_thread.take() {
+            let thread_id = thread.id();
+            if let Err(error) = thread.exit() {
+                litebox_util_log::error!(error:% = error, thread_id; "failed to record thread exit");
+            }
+        }
+        self.process.thread_stopped();
     }
 }
 
@@ -599,8 +751,91 @@ impl<P: ShimPlatform> Task<P> {
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Getegid => Ok(self.sys_getegid() as usize),
+            SyscallRequest::BsdthreadCreate {
+                function,
+                argument,
+                stack,
+                pthread,
+                flags,
+            } => self.sys_bsdthread_create(function, argument, stack, pthread, flags),
+            SyscallRequest::BsdthreadTerminate {
+                stack,
+                size,
+                port,
+                semaphore_or_ulock,
+            } => {
+                self.sys_bsdthread_terminate(stack, size, port, semaphore_or_ulock);
+                Ok(0)
+            }
+            SyscallRequest::UlockWait {
+                operation,
+                address,
+                value,
+                timeout,
+            } => self.sys_pthread_sync(PthreadSync::UlockWait {
+                operation,
+                address,
+                value,
+                timeout,
+            }),
+            SyscallRequest::UlockWake {
+                operation,
+                address,
+                value,
+            } => self.sys_pthread_sync(PthreadSync::UlockWake {
+                operation,
+                address,
+                value,
+            }),
+            SyscallRequest::PsynchMutexWait {
+                mutex,
+                mgen,
+                ugen,
+                tid,
+                flags,
+            } => self.sys_pthread_sync(PthreadSync::MutexWait {
+                mutex,
+                mgen,
+                ugen,
+                tid,
+                flags,
+            }),
+            SyscallRequest::PsynchMutexDrop {
+                mutex,
+                mgen,
+                ugen,
+                tid,
+                flags,
+            } => self.sys_pthread_sync(PthreadSync::MutexDrop {
+                mutex,
+                mgen,
+                ugen,
+                tid,
+                flags,
+            }),
+            SyscallRequest::UlockWait2 {
+                operation,
+                address,
+                value,
+                timeout,
+                value2,
+            } => self.sys_pthread_sync(PthreadSync::UlockWait2 {
+                operation,
+                address,
+                value,
+                timeout,
+                value2,
+            }),
             SyscallRequest::ThreadSelfid => {
-                Ok(usize::try_from(self.thread.id).expect("AArch64 thread IDs fit in usize"))
+                // Native sync needs host IDs until guest libpthread is isolated.
+                // The initial thread has none: its TSD holds the donor's port
+                // and thread ID, so kernel lock ownership for it names the donor.
+                let id = self
+                    .thread
+                    .native_identity
+                    .get()
+                    .map_or(self.thread.id, |identity| identity.0);
+                Ok(usize::try_from(id).expect("AArch64 thread IDs fit in usize"))
             }
             SyscallRequest::Getentropy { buffer, count } => self.sys_getentropy(buffer, count),
             SyscallRequest::MachVmAllocate {
@@ -661,12 +896,12 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     fn continuation(&self, ctx: &PtRegs) -> ContinueOperation {
-        if self.process.exit_status().is_some() {
+        if self.process.exit_status().is_some() || self.thread.exited.load(Ordering::Acquire) {
             ContinueOperation::Terminate
         } else if !ctx.pc.is_multiple_of(size_of::<u32>())
             || !ctx.sp.is_multiple_of(STACK_ALIGNMENT)
         {
-            self.process.exit(128 + SIGSEGV);
+            self.sys_exit(128 + SIGSEGV);
             ContinueOperation::Terminate
         } else {
             ContinueOperation::Resume
@@ -678,6 +913,13 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
     type ExecutionContext = PtRegs;
 
     fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
+        self.task.global.threads.lock().insert(
+            self.task.thread.id,
+            Arc::new(self.task.global.platform.current_thread()),
+        );
+        if self.task.initialize_pthread(ctx).is_err() {
+            self.task.thread.exited.store(true, Ordering::Release);
+        }
         self.task.continuation(ctx)
     }
 
@@ -689,13 +931,16 @@ impl<P: ShimPlatform> EnterShim for MacosShimEntrypoints<P> {
     fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
         // Syscalls enter through the rewriter's direct callback.
         litebox_util_log::error!(exception:? = info, pc:? = ctx.pc; "unhandled macOS guest exception");
-        self.task.process.exit(128 + SIGSEGV);
+        self.task.sys_exit(128 + SIGSEGV);
         ContinueOperation::Terminate
     }
 
     fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-        // Terminate interrupted guests because guest signal delivery is unsupported.
-        self.task.process.exit(128 + SIGINT);
+        // Siblings are interrupted to observe process exit. Otherwise terminate,
+        // because guest signal delivery is unsupported.
+        if self.task.process.exit_status().is_none() {
+            self.task.sys_exit(128 + SIGINT);
+        }
         ContinueOperation::Terminate
     }
 }

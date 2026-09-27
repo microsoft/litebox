@@ -7,15 +7,41 @@ use crate::{ShimPlatform, Task};
 use core::sync::atomic::Ordering;
 use litebox::utils::TruncateExt as _;
 use litebox_common_macos::{KernReturn, syscall::MachTimebaseInfo, user_pointers::UserPtrMut};
+use litebox_platform::sync::RawMutex as _;
 
 pub(crate) mod file;
 pub(crate) mod mach;
 pub(crate) mod misc;
 pub(crate) mod mm;
+pub(crate) mod thread;
 
 impl<P: ShimPlatform> Task<P> {
     pub(crate) fn sys_exit(&self, status: i32) {
-        self.process.exit(status & 0xff);
+        if !self.process.exit(status & 0xff) {
+            return;
+        }
+        let mut threads: alloc::vec::Vec<_> = self
+            .global
+            .threads
+            .lock()
+            .iter()
+            .filter(|(id, _)| **id != self.thread.id)
+            .map(|(id, handle)| (*id, handle.clone()))
+            .collect();
+        // A signal delivered in host code can precede an indefinite native wait.
+        // Retry until the targets retire; checking exit just before waiting would
+        // still leave a signal-before-wait window. Only the exit winner waits here.
+        // Later registrations observe exit in init before they can enter guest code.
+        let retry = P::RawMutex::INIT;
+        while !threads.is_empty() {
+            for (_, thread) in &threads {
+                self.global.platform.interrupt_thread(thread);
+            }
+            threads.retain(|(id, _)| self.global.threads.lock().contains_key(id));
+            if !threads.is_empty() {
+                let _ = retry.block_or_timeout(0, core::time::Duration::from_millis(10));
+            }
+        }
     }
 
     pub(crate) fn sys_getpid(&self) -> i32 {

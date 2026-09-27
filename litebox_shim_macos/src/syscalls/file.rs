@@ -294,7 +294,6 @@ mod tests {
     use super::*;
     use crate::{MAX_KERNEL_BUF_SIZE, MacosShimBuilder, Process};
     use alloc::vec;
-    use core::sync::atomic::AtomicI32;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -386,7 +385,7 @@ mod tests {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
+            process: Process::new(),
             thread,
         };
         // SAFETY: a fresh, non-fixed mapping owned by this task.

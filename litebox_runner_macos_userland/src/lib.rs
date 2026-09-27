@@ -26,6 +26,10 @@ pub struct CliArgs {
     /// Guest environment entry (KEY=VALUE). Host environment is not forwarded.
     #[arg(long = "env")]
     pub environment_variables: Vec<String>,
+    /// Enable experimental pthread create/join and mutex support.
+    /// Condition variables, rwlocks, custom stacks and cancellation are unsupported.
+    #[arg(long)]
+    pub experimental_pthreads: bool,
     /// Host Mach-O exposed at /mmap-image for mmap rewriting tests.
     #[cfg(feature = "test-broker")]
     #[arg(long, hide = true, value_hint = clap::ValueHint::FilePath)]
@@ -34,6 +38,7 @@ pub struct CliArgs {
 
 mod isolation;
 mod live_cache;
+mod pthread;
 #[cfg(feature = "test-broker")]
 mod test_broker;
 
@@ -112,6 +117,11 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             std::mem::take(&mut data)
         };
         test_broker::setup(platform, executable, mmap_image.as_deref())?
+    };
+    let builder = if cli_args.experimental_pthreads {
+        builder.with_pthread_runtime(pthread::runtime()?)
+    } else {
+        builder
     };
     let shim = builder.build();
     // PID 1 is launchd on Darwin. Dyld gives it process-global responsibilities,
@@ -213,7 +223,9 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     unsafe {
         litebox_platform_macos_userland::run_thread(entrypoints, &mut initial_ctx);
     }
-    finish_guest(dynamic, process.exit_status(), || {
+    // After main-thread pthread_exit, the process ends with its last thread.
+    let status = process.wait_for_exit();
+    finish_guest(dynamic, status, || {
         #[cfg(feature = "test-broker")]
         test_broker::flush_output(&stdio)?;
         Ok(())
@@ -222,12 +234,10 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
 
 fn finish_guest(
     dynamic: bool,
-    status: Option<i32>,
+    status: i32,
     flush_output: impl FnOnce() -> Result<()>,
 ) -> Result<i32> {
-    // Preserve captured output even when the shim stopped without an exit status.
-    let result =
-        flush_output().and_then(|()| status.context("guest stopped without an exit status"));
+    let result = flush_output().map(|()| status);
     if dynamic {
         let status = result.unwrap_or_else(|error| {
             eprintln!("finishing macOS guest: {error:#}");
@@ -252,19 +262,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_exit_status_still_flushes_output() {
+    fn completion_flushes_output_and_preserves_status() {
         let flushed = core::cell::Cell::new(false);
-        let result = finish_guest(false, None, || {
+        let result = finish_guest(false, 23, || {
             flushed.set(true);
             Ok(())
         });
         assert!(flushed.get());
-        assert!(result.is_err());
-        assert_eq!(finish_guest(false, Some(23), || Ok(())).unwrap(), 23);
+        assert_eq!(result.unwrap(), 23);
+        assert!(finish_guest(false, 23, || bail!("flush failed")).is_err());
     }
 
     #[test]
-    fn dynamic_finish_errors_use_raw_exit() {
+    fn dynamic_finish_uses_raw_exit() {
         use std::io::Write as _;
         const CHILD: &str = "LITEBOX_TEST_DYNAMIC_FINISH";
         extern "C" fn native_cleanup() {
@@ -275,7 +285,7 @@ mod tests {
         if let Ok(mode) = std::env::var(CHILD) {
             // SAFETY: this callback remains valid until this test child exits.
             assert_eq!(unsafe { libc::atexit(native_cleanup) }, 0);
-            let result = finish_guest(true, (mode == "flush").then_some(0), || {
+            let result = finish_guest(true, 23, || {
                 std::io::stdout().write_all(b"captured output")?;
                 std::io::stdout().flush()?;
                 if mode == "flush" {
@@ -289,14 +299,18 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "tests::dynamic_finish_errors_use_raw_exit",
+                    "tests::dynamic_finish_uses_raw_exit",
                     "--nocapture",
                     "--quiet",
                 ])
                 .env(CHILD, mode)
                 .output()
                 .unwrap();
-            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(if mode == "flush" { 1 } else { 23 }),
+                "{output:?}"
+            );
             let stdout = String::from_utf8(output.stdout).unwrap();
             assert!(stdout.ends_with("captured output"), "{stdout}");
             assert!(!stdout.contains("unexpected native cleanup"), "{stdout}");

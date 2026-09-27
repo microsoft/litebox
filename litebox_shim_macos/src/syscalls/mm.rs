@@ -1417,7 +1417,6 @@ mod tests {
 
     use super::*;
     use alloc::{sync::Arc, vec::Vec};
-    use core::sync::atomic::AtomicI32;
     use litebox::LiteBox;
     use litebox_broker_core::{
         ObjectRights, PolicyEngine,
@@ -1546,7 +1545,7 @@ mod tests {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
+            process: Process::new(),
             thread,
         }
     }
@@ -1593,7 +1592,7 @@ mod tests {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
-            process: Process(Arc::new(AtomicI32::new(-1))),
+            process: Process::new(),
             thread,
         };
 
