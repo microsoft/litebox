@@ -26,7 +26,8 @@ int main(int argc, char **argv) {
             errno != ENOENT) {
             _exit(112);
         }
-        execve(argv[1], child_argv, child_envp);
+        // Relative to the root working directory.
+        execve(argv[1] + 1, child_argv, child_envp);
         _exit(111);
     }
     if (child_pid < 0) {

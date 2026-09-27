@@ -1894,13 +1894,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let is_vfork_child = self.vfork.borrow().is_some();
-        if is_vfork_child && !path.starts_with('/') {
-            return Err(Errno::ENOENT);
-        }
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
         if is_vfork_child {
             drop(loader);
+            // The fresh runner needs an absolute path; resolve it against this task's cwd.
+            let path = self
+                .resolve_path(path.as_str())?
+                .into_string()
+                .map_err(|_| Errno::EINVAL)?;
             let startup = LinuxProgramStartup {
                 parent_process_id: self.pid,
                 uid: self.credentials.uid,
