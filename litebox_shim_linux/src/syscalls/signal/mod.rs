@@ -156,7 +156,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     /// Returns whether terminated children are reaped automatically instead of becoming zombies,
     /// because `SIGCHLD` is ignored or has `SA_NOCLDWAIT`.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn reaps_children_automatically(&self) -> bool {
         let action = self.handlers.borrow().inner.lock()[Signal::SIGCHLD].action;
         action.sigaction == SIG_IGN || action.flags.contains(SaFlags::NOCLDWAIT)
@@ -631,6 +630,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             old_act
         };
+        // The `vfork` child changes only its own copy of the dispositions and has no children.
+        if signal == Signal::SIGCHLD && act.is_some() && self.vfork.borrow().is_none() {
+            self.process()
+                .update_child_reaping(|| self.signals.reaps_children_automatically());
+        }
 
         if let Some(oldact_ptr) = oldact_ptr {
             oldact_ptr

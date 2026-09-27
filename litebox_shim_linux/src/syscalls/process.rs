@@ -161,7 +161,7 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     nr_threads: <Platform as RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Started child processes that have not been reaped, mapped by process ID.
-    children: Mutex<Platform, BTreeMap<i32, litebox::process::Process<Platform>>>,
+    children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
@@ -186,6 +186,14 @@ impl<Platform: ShimPlatform> Alarm<Platform> {
             .and_then(|d| d.checked_duration_since(&now))
             .unwrap_or(Duration::ZERO)
     }
+}
+
+/// A started child process that has not been reaped.
+struct Child<Platform: ShimPlatform> {
+    process: litebox::process::Process<Platform>,
+    /// Whether the child is reaped automatically instead of becoming a zombie, fixed by the
+    /// parent's `SIGCHLD` disposition when the child was last seen live.
+    reap_on_exit: bool,
 }
 
 /// The locked portion of the process state.
@@ -242,18 +250,76 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         alarm.handle.is_none() && alarm.deadline.is_none()
     }
 
-    /// Adds a started child process.
-    fn add_child(&self, pid: i32, child: litebox::process::Process<Platform>) {
-        let previous = self.children.lock().insert(pid, child);
+    /// Adds a started child process that follows the current `SIGCHLD` disposition, as in
+    /// [`Self::update_child_reaping`].
+    fn add_child(
+        &self,
+        pid: i32,
+        process: litebox::process::Process<Platform>,
+        reaps_children: impl FnOnce() -> bool,
+    ) {
+        let mut children = self.children.lock();
+        let reap_on_exit = reaps_children();
+        let previous = children.insert(
+            pid,
+            Child {
+                process,
+                reap_on_exit,
+            },
+        );
         assert!(
             previous.is_none(),
             "broker child process IDs must be unique"
         );
+        // The child may already have exited, and earlier ones may have been waiting to be reaped.
+        let reaped = Self::take_reaped_children(&mut children, reap_on_exit);
+        drop(children);
+        drop(reaped);
+    }
+
+    /// Applies the current `SIGCHLD` disposition, where `reaps_children` reports whether it is
+    /// ignored or has `SA_NOCLDWAIT`, to the children.
+    ///
+    /// Like Linux, live children follow the new disposition, while existing zombies stay
+    /// waitable. Children that terminated while they were to be reaped automatically are
+    /// reaped. `reaps_children` is read under the children lock so that concurrent disposition
+    /// changes apply in order.
+    pub(crate) fn update_child_reaping(&self, reaps_children: impl FnOnce() -> bool) {
+        let mut children = self.children.lock();
+        let reap_on_exit = reaps_children();
+        let reaped = Self::take_reaped_children(&mut children, reap_on_exit);
+        drop(children);
+        drop(reaped);
+    }
+
+    /// Removes the terminated children marked to be reaped automatically, and marks the live ones
+    /// with `reap_on_exit`.
+    ///
+    /// The caller drops the returned children outside the children lock to reap them.
+    fn take_reaped_children(
+        children: &mut BTreeMap<i32, Child<Platform>>,
+        reap_on_exit: bool,
+    ) -> Vec<Child<Platform>> {
+        children
+            .extract_if(.., |_, child| {
+                if !child.reap_on_exit && !reap_on_exit {
+                    return false;
+                }
+                // A child whose status is unavailable is treated as live.
+                if matches!(child.process.exit_status(), Ok(Some(_))) {
+                    return child.reap_on_exit;
+                }
+                child.reap_on_exit = reap_on_exit;
+                false
+            })
+            .map(|(_, child)| child)
+            .collect()
     }
 
     /// Removes one terminated child with process ID `target`, or any terminated child when
     /// `target` is `None`.
     ///
+    /// Terminated children marked to be reaped automatically are reaped instead of reported.
     /// The caller drops the returned child outside the children lock to reap it.
     fn remove_exited_child(
         &self,
@@ -263,27 +329,41 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         let mut children = self.children.lock();
         let mut matched = false;
         let mut exited = None;
+        let mut reaped = Vec::new();
         for (&pid, child) in children
             .iter()
             .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
         {
-            matched = true;
-            if let Some(status) = child
+            match child
+                .process
                 .exit_status()
                 .map_err(|error| TryOpError::Other(error.into()))?
             {
-                exited = Some((pid, status));
-                break;
+                None => matched = true,
+                Some(_) if child.reap_on_exit => reaped.push(pid),
+                Some(status) => {
+                    exited = Some((pid, status));
+                    break;
+                }
             }
         }
-        if !matched {
-            return Err(TryOpError::Other(Errno::ECHILD));
+        let reaped: Vec<_> = reaped
+            .into_iter()
+            .map(|pid| children.remove(&pid))
+            .collect();
+        let exited = exited.map(|(pid, status)| {
+            let child = children
+                .remove(&pid)
+                .expect("matched child must remain present");
+            (pid, child.process, status)
+        });
+        drop(children);
+        drop(reaped);
+        match exited {
+            Some(exited) => Ok(exited),
+            None if matched => Err(TryOpError::TryAgain),
+            None => Err(TryOpError::Other(Errno::ECHILD)),
         }
-        let (pid, status) = exited.ok_or(TryOpError::TryAgain)?;
-        let child = children
-            .remove(&pid)
-            .expect("matched child must remain present");
-        Ok((pid, child, status))
     }
 
     /// Registers `observer` on each child with process ID `target`, or on every child when
@@ -300,7 +380,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             .iter()
             .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
         {
-            child.register_observer(observer.clone(), mask);
+            child.process.register_observer(observer.clone(), mask);
         }
     }
 
@@ -726,7 +806,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .take()
             .expect("completed vfork window lost its parent context");
         self.signals.restore_vfork_parent(state.parent_signals);
-        self.thread.process.add_child(state.child_pid, state.child);
+        self.thread
+            .process
+            .add_child(state.child_pid, state.child, || {
+                self.signals.reaps_children_automatically()
+            });
         *ctx = state.parent_context;
         state.child_pid.cast_unsigned() as usize
     }
@@ -805,10 +889,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Begins a constrained `vfork` child in the current runner.
     ///
     /// Only single-threaded processes with default filesystem, resource-limit, alarm, and
-    /// transferable descriptor state are admitted. Automatic child reaping is unsupported, so
-    /// `SIGCHLD` must not be ignored or have `SA_NOCLDWAIT`. The child gets a copy of the
-    /// parent's signal dispositions, blocked mask, and alternate stack, but none of its pending
-    /// signals; the parent's signal state is restored when it resumes. The parent remains
+    /// transferable descriptor state are admitted. The child gets a copy of the parent's signal
+    /// dispositions, blocked mask, and alternate stack, but none of its pending signals; the
+    /// parent's signal state is restored when it resumes. The parent remains
     /// suspended until the child exits, is killed by a signal, or successfully transfers to a
     /// fresh runner through `execve`; an `execve` that fails before the transfer returns its error
     /// to the child. The child must not change standard descriptor mappings or flags, or
@@ -820,7 +903,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             || self.thread.process.nr_threads() != 1
             || !self.files.borrow().has_only_standard_descriptor_numbers()
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
-            || self.signals.reaps_children_automatically()
             || !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
         {
@@ -1556,8 +1638,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `wait4`.
     ///
-    /// Only terminated children are reported. Process groups are not modeled, so `pid == 0`
-    /// waits for any child and `pid < -1` matches no child. Resource usage is reported as zero.
+    /// Only terminated children are reported. Like Linux, children that terminate while
+    /// `SIGCHLD` is ignored or has `SA_NOCLDWAIT` are reaped instead of reported. Process groups
+    /// are not modeled, so `pid == 0` waits for any child and `pid < -1` matches no child.
+    /// Resource usage is reported as zero.
     /// A child without an observable termination status is reported as killed by `SIGSEGV`.
     /// Children belong to the process rather than the creating thread, so `__WNOTHREAD` is
     /// accepted but does not restrict which children match.
@@ -1954,6 +2038,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.rebind_exec_identity();
 
         self.signals.reset_for_exec();
+        // Resetting a `SIGCHLD` handler clears `SA_NOCLDWAIT`.
+        self.thread
+            .process
+            .update_child_reaping(|| self.signals.reaps_children_automatically());
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -2332,39 +2420,6 @@ mod tests {
 
         assert!(!task.process().limits.has_default_state());
         assert_eq!(task.sys_vfork(&PtRegs::default()), Err(Errno::EAGAIN));
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn vfork_rejects_automatic_child_reaping() {
-        use crate::syscalls::tests::init_platform;
-        use litebox_common_linux::signal::{SIG_DFL, SIG_IGN, SaFlags, SigAction, SigSet, Signal};
-        use litebox_common_linux::{PtRegs, errno::Errno};
-
-        let task = init_platform();
-        // Without automatic reaping, admission reaches the broker, whose test policy denies
-        // duplication.
-        assert!(matches!(
-            task.sys_vfork(&PtRegs::default()),
-            Err(errno) if errno != Errno::EAGAIN
-        ));
-        for (sigaction, flags) in [(SIG_IGN, SaFlags::empty()), (SIG_DFL, SaFlags::NOCLDWAIT)] {
-            let act = SigAction {
-                sigaction,
-                flags,
-                __pad: 0,
-                restorer: 0,
-                mask: SigSet::empty(),
-            };
-            task.sys_rt_sigaction(
-                Signal::SIGCHLD,
-                Some(UserPtr::from_ptr(&raw const act)),
-                None,
-                size_of::<SigSet>(),
-            )
-            .unwrap();
-            assert_eq!(task.sys_vfork(&PtRegs::default()), Err(Errno::EAGAIN));
-        }
     }
 
     #[cfg(target_arch = "x86_64")]

@@ -19,6 +19,10 @@ int main(int argc, char **argv) {
     if (strcmp(marker, "abort") == 0) {
         abort();
     }
+    if (strcmp(marker, "sleep") == 0) {
+        usleep(200 * 1000);
+        return 42;
+    }
     if (strcmp(marker, "signals") == 0) {
         sigset_t blocked;
         sigprocmask(SIG_BLOCK, NULL, &blocked);

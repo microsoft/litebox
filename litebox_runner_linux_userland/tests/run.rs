@@ -74,6 +74,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_exec_child.c",
     "vfork_exec_parent.c",
     "vfork_exit_parent.c",
+    "vfork_reap_parent.c",
     "vfork_signal_parent.c",
 ];
 
@@ -420,6 +421,57 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(child_line, "ill_default="), 1);
     assert_eq!(numeric_field(child_line, "term_blocked="), 1);
     assert_eq!(numeric_field(child_line, "usr2_blocked="), 0);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_children_are_reaped_automatically_when_sigchld_says_so() {
+    let parent = common::compile(
+        "./tests/vfork_reap_parent.c",
+        "vfork_reap_parent",
+        true,
+        false,
+    );
+    let child = common::compile(
+        "./tests/vfork_exec_child.c",
+        "vfork_reap_child",
+        true,
+        false,
+    );
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "vfork_reap_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    let zombie_line = line("zombie ");
+    assert_eq!(
+        numeric_field(zombie_line, "waited="),
+        numeric_field(zombie_line, "child=")
+    );
+    assert_eq!(numeric_field(zombie_line, "exited="), 1);
+    assert_eq!(numeric_field(zombie_line, "code="), 21);
+    assert_eq!(numeric_field(line("ignored "), "echild="), 1);
+    assert_eq!(numeric_field(line("nocldwait "), "echild="), 1);
+    assert_eq!(numeric_field(line("live-ignored "), "echild="), 1);
+    let restored_line = line("live-restored ");
+    assert_eq!(
+        numeric_field(restored_line, "waited="),
+        numeric_field(restored_line, "child=")
+    );
+    assert_eq!(numeric_field(restored_line, "exited="), 1);
+    assert_eq!(numeric_field(restored_line, "code="), 42);
 }
 
 /// Get the path of a program using `which`
