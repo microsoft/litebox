@@ -693,26 +693,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.exit_group(ExitStatus::Exit(status.trunc()));
     }
 
-    /// Ends the constrained `vfork` child with `exit` or `exit_group`.
+    /// Ends the constrained `vfork` child before it starts its own runner.
     ///
-    /// No runner is launched: the child becomes a zombie reporting `status`, and
-    /// the suspended parent resumes with the child's PID. The child shares the
-    /// parent's thread state, so the parent's `clear_child_tid` and robust
-    /// futex list are left untouched.
+    /// The child becomes a zombie reporting `exit_status`, and the suspended
+    /// parent resumes with the child's PID. The child shares the parent's
+    /// thread state, so the parent's `clear_child_tid` and robust futex list
+    /// are left untouched.
     pub(crate) fn exit_vfork_child(
         &self,
-        status: i32,
+        exit_status: ProcessExitStatus,
         ctx: &mut litebox_common_linux::PtRegs,
     ) -> usize {
-        // Like Linux, only the low byte of the status is reported.
-        let code = status.cast_unsigned() & 0xff;
         let exited = self
             .vfork
             .borrow()
             .as_ref()
             .expect("vfork child exit lost its child")
             .child
-            .exit(ProcessExitStatus::Exited { code });
+            .exit(exit_status);
         if exited.is_err() {
             return self.abort_vfork_window();
         }
@@ -807,10 +805,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Only single-threaded processes with default filesystem, signal, resource-limit, alarm, and
     /// transferable descriptor state are admitted. The parent remains suspended until the child
-    /// exits or successfully transfers to a fresh runner through `execve`; an `execve` that fails
-    /// before the transfer returns its error to the child. The child must not change
-    /// standard descriptor mappings or flags, or platform-managed architectural state outside
-    /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that state.
+    /// exits, is killed by a fault, or successfully transfers to a fresh runner through `execve`;
+    /// an `execve` that fails before the transfer returns its error to the child. The child must
+    /// not change standard descriptor mappings or flags, or platform-managed architectural state
+    /// outside [`litebox_common_linux::PtRegs`], because the current transfer does not preserve
+    /// that state.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()

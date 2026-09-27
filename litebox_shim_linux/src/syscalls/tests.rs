@@ -77,7 +77,7 @@ fn exceptions_queue_their_corresponding_signals() {
     const FAULT_PC: usize = 0x4444_0000;
 
     let task = init_platform();
-    let ctx = PtRegs {
+    let mut ctx = PtRegs {
         rip: FAULT_PC,
         ..Default::default()
     };
@@ -104,7 +104,7 @@ fn exceptions_queue_their_corresponding_signals() {
                 cr2: 0,
                 kernel_mode: false,
             },
-            &ctx,
+            &mut ctx,
         );
 
         let siginfo = task.take_pending_siginfo(signal);
@@ -122,7 +122,7 @@ fn exceptions_queue_their_corresponding_signals() {
     const FAULT_ADDRESS: usize = 0x5555_0000;
 
     let task = init_platform();
-    let ctx = PtRegs {
+    let mut ctx = PtRegs {
         pc: FAULT_PC,
         ..Default::default()
     };
@@ -149,7 +149,7 @@ fn exceptions_queue_their_corresponding_signals() {
                 esr: u64::from(exception.0) << 26,
                 kernel_mode: false,
             },
-            &ctx,
+            &mut ctx,
         );
 
         let siginfo = task.take_pending_siginfo(signal);
