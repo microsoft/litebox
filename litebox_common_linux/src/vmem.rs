@@ -333,6 +333,12 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     pub(super) platform: &'static Platform,
     /// Virtual memory areas.
     pub(super) vmas: RangeMap<usize, VmArea>,
+    /// Reservations selected and owned by the platform.
+    #[expect(
+        dead_code,
+        reason = "reservation-aware operations are added separately"
+    )]
+    pub(super) reservations: Platform::Reservations,
 }
 
 impl<Platform, const ALIGN: usize> Vmem<Platform, ALIGN>
@@ -348,6 +354,7 @@ where
         let mut vmem = Self {
             platform,
             vmas: RangeMap::new(),
+            reservations: Platform::Reservations::default(),
         };
         for each in platform.reserved_pages() {
             assert!(
@@ -1295,6 +1302,9 @@ mod tests {
 
     #[expect(unused_variables, reason = "dummy/mock backend")]
     impl<const TOP_DOWN: bool> PageManagementProvider<PAGE_SIZE> for DummyVmemBackend<TOP_DOWN> {
+        type Reservations =
+            litebox::platform::common_providers::reservations::NoTrackedReservations<PAGE_SIZE>;
+
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         const TASK_ADDR_MIN: usize = 0x1_0000;
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

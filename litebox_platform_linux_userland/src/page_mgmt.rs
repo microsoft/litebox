@@ -25,6 +25,9 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
 }
 
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
+    type Reservations =
+        litebox::platform::common_providers::reservations::NoTrackedReservations<ALIGN>;
+
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;

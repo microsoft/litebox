@@ -978,6 +978,9 @@ pub trait HostInterface: 'static {
 }
 
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+    type Reservations =
+        litebox::platform::common_providers::reservations::NoTrackedReservations<ALIGN>;
+
     // User space occupies the low canonical half (0 .. 0x0000_7FFF_FFFF_FFFF).
     // Kernel memory lives in the high canonical half (at KERNEL_OFFSET).
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;

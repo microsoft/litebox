@@ -96,6 +96,9 @@ bitflags::bitflags! {
 /// `ALIGN` as a parameter. In the future, this may be changed to an associated constant, since each
 /// platform has only one canonical alignment.
 pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
+    /// Reservation storage used by the virtual memory manager.
+    type Reservations: ReservationStore + Default;
+
     /// The lower bound (inclusive) for virtual addresses that can be allocated for task memory.
     ///
     /// Note it must be aligned to `ALIGN`.

@@ -45,6 +45,8 @@ extern crate alloc;
 
 const PAGE_SIZE: usize = 4096;
 
+litebox::define_page_reservation!(WindowsUserlandReservation);
+
 mod page_mgmt;
 
 // Thread-local storage for FS base state
