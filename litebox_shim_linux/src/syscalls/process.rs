@@ -2712,6 +2712,38 @@ mod tests {
     }
 
     #[test]
+    fn test_sigkill_and_sigstop_are_never_blocked() {
+        use crate::syscalls::signal::SignalState;
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+
+        let requested = SigSet::empty()
+            .with(Signal::SIGKILL)
+            .with(Signal::SIGSTOP)
+            .with(Signal::SIGUSR1);
+        let expected = SigSet::empty().with(Signal::SIGUSR1);
+        assert_eq!(
+            SignalState::<crate::syscalls::tests::TestPlatform>::inherited(
+                requested,
+                SigSet::empty()
+            )
+            .blocked(),
+            expected
+        );
+
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_SETMASK,
+                Some(UserPtr::from_ptr(&raw const requested)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            assert_eq!(task.signals.blocked(), expected);
+        });
+    }
+
+    #[test]
     fn test_pause_wakes_on_pending_signal() {
         use litebox_common_linux::{
             PtRegs,

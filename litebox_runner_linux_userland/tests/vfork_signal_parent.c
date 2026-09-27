@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <sys/wait.h>
 #include <ucontext.h>
@@ -23,7 +24,7 @@ static void on_ill(int signal, siginfo_t *info, void *context) {
     (void)info;
     char local;
     ill_pid = getpid();
-    ill_on_child_stack = &local >= child_stack && &local < child_stack + sizeof(child_stack);
+    ill_on_child_stack = (uintptr_t)&local - (uintptr_t)child_stack < sizeof(child_stack);
     // Resume after the two-byte `ud2`.
     ((ucontext_t *)context)->uc_mcontext.gregs[REG_RIP] += 2;
 }

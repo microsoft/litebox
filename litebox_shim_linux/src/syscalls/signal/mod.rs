@@ -122,7 +122,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     /// [`Self::reset_for_exec`].
     pub fn inherited(blocked: SigSet, ignored: SigSet) -> Self {
         let mut state = Self::new_process();
-        state.blocked.set(blocked);
+        state.set_signal_mask(blocked);
         let handlers = Arc::get_mut(state.handlers.get_mut())
             .expect("new signal handlers must not be shared")
             .inner
@@ -397,8 +397,10 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
-    /// Updates the blocked signal mask.
-    fn set_signal_mask(&self, mask: SigSet) {
+    /// Updates the blocked signal mask. Like Linux, SIGKILL and SIGSTOP are never blocked.
+    fn set_signal_mask(&self, mut mask: SigSet) {
+        mask.remove(Signal::SIGKILL);
+        mask.remove(Signal::SIGSTOP);
         self.blocked.set(mask);
     }
 
