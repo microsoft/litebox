@@ -832,8 +832,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         info: &litebox::shim::ExceptionInfo,
         ctx: &mut PtRegs,
     ) {
-        #[cfg(target_arch = "aarch64")]
-        let _ = ctx;
         #[cfg(target_arch = "x86_64")]
         let (signal, fault_address) = match info.exception {
             Exception::DIVIDE_ERROR => (Signal::SIGFPE, arch::pc(ctx)),
