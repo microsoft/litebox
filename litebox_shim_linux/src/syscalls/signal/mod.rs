@@ -22,6 +22,7 @@ use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
+use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::signal::{
     FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags,
     SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
@@ -829,10 +830,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn handle_exception_request(
         &self,
         info: &litebox::shim::ExceptionInfo,
-        ctx: &PtRegs,
+        ctx: &mut PtRegs,
     ) {
-        #[cfg(target_arch = "aarch64")]
-        let _ = ctx;
         #[cfg(target_arch = "x86_64")]
         let (signal, fault_address) = match info.exception {
             Exception::DIVIDE_ERROR => (Signal::SIGFPE, arch::pc(ctx)),
@@ -859,13 +858,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Data aborts and unknown exception classes map to SIGSEGV.
             _ => (Signal::SIGSEGV, info.fault_address),
         };
-        self.signals.last_exception.set(*info);
         if self.vfork.borrow().is_some() {
-            // The current successful-exec-only scope cannot resume the parent after a child fault.
-            // Terminate instead of deferring the signal and retrying the faulting instruction.
-            self.exit_group(ExitStatus::Signal(signal));
+            // Like Linux, the fault kills the constrained vfork child, whose signal dispositions
+            // are all default, and resumes the parent. The fault belongs to the child, so the
+            // parent's last exception is left untouched. The restored parent context already
+            // returns the child's PID from `vfork`.
+            let signal = signal.as_i32().cast_unsigned();
+            self.exit_vfork_child(ProcessExitStatus::Signaled { signal }, ctx);
             return;
         }
+        self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }
 }

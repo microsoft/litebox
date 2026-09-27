@@ -612,7 +612,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             SyscallRequest::Exit { status } | SyscallRequest::ExitGroup { status }
                 if is_vfork_child =>
             {
-                Ok(self.exit_vfork_child(status, ctx))
+                // Like Linux, only the low byte of the status is reported.
+                let code = status.cast_unsigned() & 0xff;
+                Ok(self.exit_vfork_child(ProcessExitStatus::Exited { code }, ctx))
             }
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);

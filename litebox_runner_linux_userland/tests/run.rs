@@ -330,7 +330,7 @@ fn vfork_exec_failure_returns_error_to_child() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn vfork_child_fault_terminates_shared_runner() {
+fn vfork_child_fault_resumes_parent_with_signaled_child() {
     let parent = common::compile(
         "./tests/vfork_fault_parent.c",
         "vfork_fault_parent",
@@ -340,8 +340,20 @@ fn vfork_child_fault_terminates_shared_runner() {
     let mut runner = Runner::new(&parent, "vfork_fault_parent");
     runner.allow_process_duplication();
 
-    let output = String::from_utf8(runner.output_expect_failure()).unwrap();
-    assert_eq!(output, "vfork-started\n");
+    let output = String::from_utf8(runner.output()).unwrap();
+    let parent_line = output
+        .lines()
+        .find(|line| line.starts_with("parent "))
+        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
+    let parent_pid = numeric_field(parent_line, "before=");
+    let child = numeric_field(parent_line, "child=");
+    assert_eq!(numeric_field(parent_line, "after="), parent_pid);
+    assert_ne!(child, parent_pid);
+    assert_eq!(numeric_field(parent_line, "waited="), child);
+    assert_eq!(numeric_field(parent_line, "signaled="), 1);
+    // `__builtin_trap` executes `ud2`.
+    assert_eq!(numeric_field(parent_line, "signal="), libc::SIGILL);
+    assert_eq!(numeric_field(parent_line, "echild="), 1);
 }
 
 /// Get the path of a program using `which`
