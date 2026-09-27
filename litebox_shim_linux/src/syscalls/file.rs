@@ -220,22 +220,22 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     }
 
     /// Installs the descriptors a program inherited across `execve`.
-    pub(crate) fn install_inherited_files(
+    pub(crate) fn install_inherited_fds(
         &self,
         global: &GlobalState<Platform>,
-        inherited_files: &[litebox_common_linux::program_startup::InheritedFile],
+        inherited_fds: &[litebox_common_linux::program_startup::InheritedFd],
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
         let litebox = &global.litebox;
         let max_fd = self.max_fd.load(Ordering::Relaxed);
         // The first descriptor of each inherited open file description.
         let mut descriptions = alloc::collections::BTreeMap::new();
         let mut next_fd = 0;
-        for file in inherited_files {
-            let raw_fd = file.fd as usize;
+        for inherited in inherited_fds {
+            let raw_fd = inherited.fd as usize;
             if raw_fd < next_fd || raw_fd - next_fd > MAX_INHERITED_FD_GAP || raw_fd >= max_fd {
-                return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFiles);
+                return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFds);
             }
-            let fd = if let Some(&first_fd) = descriptions.get(&file.handle) {
+            let fd = if let Some(&first_fd) = descriptions.get(&inherited.handle) {
                 let first = self
                     .raw_descriptor_store
                     .read()
@@ -247,16 +247,16 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                     .expect("an installed inherited descriptor stays open")
             } else {
                 let fd = litebox
-                    .adopt_inherited_file(file.handle)
-                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFiles)?;
+                    .adopt_inherited_file(inherited.handle)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
                 let mut descriptors = litebox.descriptor_table_mut();
-                if let Some(stream) = file.stdio_stream {
+                if let Some(stream) = inherited.stdio_stream {
                     descriptors.set_entry_metadata(&fd, stream);
                 }
-                if let Some(flags) = file.stdio_status_flags {
+                if let Some(flags) = inherited.stdio_status_flags {
                     descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
                 }
-                descriptions.insert(file.handle, raw_fd);
+                descriptions.insert(inherited.handle, raw_fd);
                 fd
             };
             let success = self
@@ -422,7 +422,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Fails with `EAGAIN` if one of them cannot transfer: it is not a broker-backed file, it has
     /// a directory position, which is local to this runner, or it lies more than
     /// [`MAX_INHERITED_FD_GAP`] past the previous one.
-    pub(crate) fn files_inherited_across_exec(
+    pub(crate) fn fds_inherited_across_exec(
         &self,
     ) -> Result<alloc::vec::Vec<(u32, alloc::sync::Arc<FileFd>)>, Errno> {
         let files = self.files.borrow();

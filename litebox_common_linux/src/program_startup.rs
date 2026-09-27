@@ -15,7 +15,7 @@ use crate::OFlags;
 use crate::signal::SigSet;
 
 const HEADER_SIZE: usize = size_of::<[u32; 9]>() + size_of::<[u64; 2]>();
-const INHERITED_FILE_SIZE: usize = size_of::<[u32; 2]>() + size_of::<u64>() + size_of::<[u8; 2]>();
+const INHERITED_FD_SIZE: usize = size_of::<[u32; 2]>() + size_of::<u64>() + size_of::<[u8; 2]>();
 
 /// Linux program state needed to load a child in a fresh runner.
 ///
@@ -43,13 +43,13 @@ pub struct LinuxProgramStartup {
     /// Program environment.
     pub envp: Vec<CString>,
     /// Descriptors the program inherits, in strictly ascending descriptor order.
-    pub inherited_files: Vec<InheritedFile>,
+    pub inherited_fds: Vec<InheritedFd>,
 }
 
 /// A descriptor inherited across `execve`, as Linux keeps every descriptor not marked
 /// close-on-exec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct InheritedFile {
+pub struct InheritedFd {
     /// Descriptor number.
     pub fd: u32,
     /// The child's broker handle to the file.
@@ -83,7 +83,7 @@ pub enum LinuxProgramStartupError {
     InvalidString,
     /// Inherited descriptors are not in strictly ascending order.
     #[error("invalid Linux program inherited descriptors")]
-    InvalidInheritedFiles,
+    InvalidInheritedFds,
 }
 
 impl LinuxProgramStartup {
@@ -116,7 +116,7 @@ impl LinuxProgramStartup {
         );
         push_u32(
             &mut output,
-            u32::try_from(self.inherited_files.len())
+            u32::try_from(self.inherited_fds.len())
                 .map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
         output.extend_from_slice(self.path.as_bytes());
@@ -128,19 +128,19 @@ impl LinuxProgramStartup {
             );
             output.extend_from_slice(value);
         }
-        for file in &self.inherited_files {
-            push_u32(&mut output, file.fd);
-            push_u64(&mut output, file.handle.0);
-            output.push(match file.stdio_stream {
+        for inherited in &self.inherited_fds {
+            push_u32(&mut output, inherited.fd);
+            push_u64(&mut output, inherited.handle.0);
+            output.push(match inherited.stdio_stream {
                 None => 0,
                 Some(StdioStream::Stdin) => 1,
                 Some(StdioStream::Stdout) => 2,
                 Some(StdioStream::Stderr) => 3,
             });
-            output.push(u8::from(file.stdio_status_flags.is_some()));
+            output.push(u8::from(inherited.stdio_status_flags.is_some()));
             push_u32(
                 &mut output,
-                file.stdio_status_flags.map_or(0, |flags| flags.bits()),
+                inherited.stdio_status_flags.map_or(0, |flags| flags.bits()),
             );
         }
         debug_assert_eq!(output.len(), encoded_len);
@@ -166,7 +166,7 @@ impl LinuxProgramStartup {
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let envp_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
-        let inherited_file_count = usize::try_from(read_u32(&mut input)?)
+        let inherited_fd_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let path_bytes = take_bytes(&mut input, path_length)?;
         let path = core::str::from_utf8(path_bytes)
@@ -190,14 +190,14 @@ impl LinuxProgramStartup {
                     .map_err(|_| LinuxProgramStartupError::InvalidString)?,
             );
         }
-        if inherited_file_count.checked_mul(INHERITED_FILE_SIZE) != Some(input.len()) {
+        if inherited_fd_count.checked_mul(INHERITED_FD_SIZE) != Some(input.len()) {
             return Err(LinuxProgramStartupError::Malformed);
         }
-        let mut inherited_files = Vec::new();
-        inherited_files
-            .try_reserve_exact(inherited_file_count)
+        let mut inherited_fds = Vec::new();
+        inherited_fds
+            .try_reserve_exact(inherited_fd_count)
             .map_err(|_| LinuxProgramStartupError::TooLarge)?;
-        for _ in 0..inherited_file_count {
+        for _ in 0..inherited_fd_count {
             let fd = read_u32(&mut input)?;
             let handle = ObjectHandle(read_u64(&mut input)?);
             let stdio_stream = match read_u8(&mut input)? {
@@ -217,7 +217,7 @@ impl LinuxProgramStartup {
                 ),
                 _ => return Err(LinuxProgramStartupError::Malformed),
             };
-            inherited_files.push(InheritedFile {
+            inherited_fds.push(InheritedFd {
                 fd,
                 handle,
                 stdio_stream,
@@ -239,7 +239,7 @@ impl LinuxProgramStartup {
             path,
             argv: values,
             envp,
-            inherited_files,
+            inherited_fds,
         };
         validate(&startup)?;
         Ok(startup)
@@ -254,11 +254,11 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
         return Err(LinuxProgramStartupError::InvalidPath);
     }
     if !startup
-        .inherited_files
+        .inherited_fds
         .windows(2)
-        .all(|files| files[0].fd < files[1].fd)
+        .all(|pair| pair[0].fd < pair[1].fd)
     {
-        return Err(LinuxProgramStartupError::InvalidInheritedFiles);
+        return Err(LinuxProgramStartupError::InvalidInheritedFds);
     }
     Ok(())
 }
@@ -280,9 +280,9 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
         }
     }
     length = startup
-        .inherited_files
+        .inherited_fds
         .len()
-        .checked_mul(INHERITED_FILE_SIZE)
+        .checked_mul(INHERITED_FD_SIZE)
         .and_then(|files| length.checked_add(files))
         .ok_or(LinuxProgramStartupError::TooLarge)?;
     if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
@@ -355,14 +355,14 @@ mod tests {
                 CString::new("argument").unwrap(),
             ],
             envp: vec![CString::new("KEY=value").unwrap()],
-            inherited_files: vec![
-                InheritedFile {
+            inherited_fds: vec![
+                InheritedFd {
                     fd: 1,
                     handle: ObjectHandle(7),
                     stdio_stream: Some(StdioStream::Stdout),
                     stdio_status_flags: Some(OFlags::APPEND | OFlags::RDWR),
                 },
-                InheritedFile {
+                InheritedFd {
                     fd: 4,
                     handle: ObjectHandle(u64::MAX),
                     stdio_stream: None,
@@ -390,7 +390,7 @@ mod tests {
             path: "/child".into(),
             argv: vec![CString::new("").unwrap(); 1025],
             envp: Vec::new(),
-            inherited_files: Vec::new(),
+            inherited_fds: Vec::new(),
         };
 
         assert_eq!(
@@ -412,7 +412,7 @@ mod tests {
             path: "/child".into(),
             argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),
-            inherited_files: Vec::new(),
+            inherited_fds: Vec::new(),
         };
         let mut encoded = startup.encode().unwrap();
         encoded.push(0);
@@ -431,8 +431,8 @@ mod tests {
     }
 
     #[test]
-    fn program_startup_rejects_unordered_inherited_files() {
-        let file = InheritedFile {
+    fn program_startup_rejects_unordered_inherited_fds() {
+        let inherited = InheritedFd {
             fd: 3,
             handle: ObjectHandle(1),
             stdio_stream: None,
@@ -449,20 +449,20 @@ mod tests {
             path: "/child".into(),
             argv: Vec::new(),
             envp: Vec::new(),
-            inherited_files: vec![file, file],
+            inherited_fds: vec![inherited, inherited],
         };
         assert_eq!(
             startup.encode(),
-            Err(LinuxProgramStartupError::InvalidInheritedFiles)
+            Err(LinuxProgramStartupError::InvalidInheritedFds)
         );
 
-        startup.inherited_files[1].fd = 4;
+        startup.inherited_fds[1].fd = 4;
         let mut encoded = startup.encode().unwrap();
-        let second_fd = encoded.len() - INHERITED_FILE_SIZE;
+        let second_fd = encoded.len() - INHERITED_FD_SIZE;
         encoded[second_fd] = 2;
         assert_eq!(
             LinuxProgramStartup::decode(&encoded),
-            Err(LinuxProgramStartupError::InvalidInheritedFiles)
+            Err(LinuxProgramStartupError::InvalidInheritedFds)
         );
     }
 }

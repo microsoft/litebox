@@ -452,7 +452,7 @@ pub enum ElfLoaderError {
     #[error("task process ID does not match the shim")]
     InvalidProcessId,
     #[error("inherited descriptors cannot be installed")]
-    InvalidInheritedFiles,
+    InvalidInheritedFds,
     #[error("failed to open the ELF file")]
     OpenError(#[from] Errno),
     #[error("failed to parse the ELF file")]
@@ -469,7 +469,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
     fn from(value: ElfLoaderError) -> Self {
         match value {
             ElfLoaderError::OpenError(e) => e,
-            ElfLoaderError::InvalidProcessId | ElfLoaderError::InvalidInheritedFiles => {
+            ElfLoaderError::InvalidProcessId | ElfLoaderError::InvalidInheritedFds => {
                 litebox_common_linux::errno::Errno::EINVAL
             }
             ElfLoaderError::ParseError(e) => e.into(),

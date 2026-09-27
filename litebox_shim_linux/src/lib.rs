@@ -277,7 +277,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
             blocked_signals,
             ignored_signals,
-            inherited_files,
+            inherited_fds,
         } = task;
         if pid != self.0.process_id || ppid < 0 {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
@@ -293,14 +293,14 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             egid,
         });
         let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
-        match inherited_files {
+        match inherited_fds {
             None => {
                 files.initialize_stdio_in_shared_descriptors_table(
                     &self.0,
                     &fs_state.context.read(),
                 );
             }
-            Some(inherited_files) => files.install_inherited_files(&self.0, &inherited_files)?,
+            Some(inherited_fds) => files.install_inherited_fds(&self.0, &inherited_fds)?,
         }
 
         let entrypoints = crate::LinuxShimEntrypoints {

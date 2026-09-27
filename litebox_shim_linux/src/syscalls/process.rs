@@ -28,7 +28,7 @@ use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno,
-    program_startup::{InheritedFile, LinuxProgramStartup},
+    program_startup::{InheritedFd, LinuxProgramStartup},
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
@@ -839,7 +839,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Only single-threaded processes with default filesystem, resource-limit, and alarm state are
     /// admitted, and only if every descriptor not marked close-on-exec can transfer to the fresh
-    /// runner; see [`Self::files_inherited_across_exec`]. The child gets a copy of the parent's
+    /// runner; see [`Self::fds_inherited_across_exec`]. The child gets a copy of the parent's
     /// signal dispositions, blocked mask, and alternate stack, but none of its pending signals; the
     /// parent's signal state is restored when it resumes. The parent remains
     /// suspended until the child exits, is killed by a signal, or successfully transfers to a
@@ -858,7 +858,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EAGAIN);
         }
         // The child cannot change its descriptors before `execve`, so they transfer then.
-        self.files_inherited_across_exec()?;
+        self.fds_inherited_across_exec()?;
         self.thread.process.release_reaped_children();
         let child = self
             .global
@@ -1892,7 +1892,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .resolve_path(path.as_str())?
             .into_string()
             .map_err(|_| Errno::EINVAL)?;
-        let inherited = self.files_inherited_across_exec()?;
+        let inherited = self.fds_inherited_across_exec()?;
         let mut startup = LinuxProgramStartup {
             parent_process_id: self.pid,
             uid: self.credentials.uid,
@@ -1904,11 +1904,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             path,
             argv,
             envp,
-            inherited_files: {
+            inherited_fds: {
                 let descriptors = self.global.litebox.descriptor_table();
                 inherited
                     .iter()
-                    .map(|(fd, file)| InheritedFile {
+                    .map(|(fd, file)| InheritedFd {
                         fd: *fd,
                         // Replaced by the child's handle once the startup fits.
                         handle: ObjectHandle::default(),
@@ -1930,8 +1930,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let handles = child
             .inherit_files(&self.global.litebox, &files)
             .map_err(Errno::from)?;
-        for (file, handle) in startup.inherited_files.iter_mut().zip(handles) {
-            file.handle = handle;
+        for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
+            inherited.handle = handle;
         }
         let payload = startup
             .encode()

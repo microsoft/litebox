@@ -796,9 +796,8 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
 fn exec_inherits_only_transferable_descriptors() {
     let task = init_platform();
     let inherited = || {
-        task.files_inherited_across_exec().map(|files| {
-            files
-                .into_iter()
+        task.fds_inherited_across_exec().map(|fds| {
+            fds.into_iter()
                 .map(|(fd, _)| fd)
                 .collect::<alloc::vec::Vec<_>>()
         })
