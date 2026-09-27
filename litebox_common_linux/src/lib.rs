@@ -27,9 +27,6 @@ pub mod user_pointers;
 pub mod vmap;
 pub mod vmem;
 
-#[cfg(test)]
-mod vmem_tests;
-
 extern crate alloc;
 
 use user_pointers::{UserPtr, UserPtrMut};
