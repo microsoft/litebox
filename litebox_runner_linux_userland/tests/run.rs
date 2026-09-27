@@ -472,6 +472,8 @@ fn vfork_children_are_reaped_automatically_when_sigchld_says_so() {
     );
     assert_eq!(numeric_field(restored_line, "exited="), 1);
     assert_eq!(numeric_field(restored_line, "code="), 42);
+    assert_eq!(numeric_field(line("reap-inherited "), "reaped="), 1);
+    assert_eq!(numeric_field(line("reap-reset "), "reaped="), 0);
 }
 
 /// Get the path of a program using `which`

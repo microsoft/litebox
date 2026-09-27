@@ -254,6 +254,21 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Sets whether this process's children are reaped when they terminate.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn set_child_reaping(&self, enabled: bool) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::SetChildReaping(enabled))? {
+            BrokerResult::ChildReapingSet => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected child-reaping response: {response:?}")
+            }
+        }
+    }
+
     /// Allocates one pending child process and its parent-owned handle.
     ///
     /// # Panics
@@ -271,7 +286,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Returns a process's termination status through a process handle.
     ///
-    /// Returns `WouldBlock` while the process is live.
+    /// Returns `WouldBlock` while the process is live, and `None` if it was
+    /// reaped when it terminated.
     ///
     /// # Panics
     ///
@@ -279,7 +295,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn process_exit_status(
         &self,
         handle: ObjectHandle,
-    ) -> Result<ProcessExitStatus, Channel::Error> {
+    ) -> Result<Option<ProcessExitStatus>, Channel::Error> {
         match self.request(BrokerOperation::GetProcessExitStatus(handle))? {
             BrokerResult::ProcessExitStatus(status) => Ok(status),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),

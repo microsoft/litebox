@@ -157,8 +157,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     /// Returns whether terminated children are reaped automatically instead of becoming zombies,
     /// because `SIGCHLD` is ignored or has `SA_NOCLDWAIT`.
     pub(crate) fn reaps_children_automatically(&self) -> bool {
-        let action = self.handlers.borrow().inner.lock()[Signal::SIGCHLD].action;
-        action.sigaction == SIG_IGN || action.flags.contains(SaFlags::NOCLDWAIT)
+        reaps_children(&self.handlers.borrow().inner.lock()[Signal::SIGCHLD].action)
     }
 
     /// Gives the `vfork` child a copy of the current dispositions, blocked mask, and alternate
@@ -348,6 +347,12 @@ impl PendingSignals {
         self.queue.push_back(siginfo);
         self.pending.add(signal);
     }
+}
+
+/// Returns whether a `SIGCHLD` action reaps terminated children automatically, because it
+/// ignores the signal or has `SA_NOCLDWAIT`.
+fn reaps_children(action: &SigAction) -> bool {
+    action.sigaction == SIG_IGN || action.flags.contains(SaFlags::NOCLDWAIT)
 }
 
 /// Returns whether `sp` is within the given signal stack.
@@ -627,14 +632,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let old_act = handler.action;
             if let Some(act) = act {
                 handler.action = act;
+                // The `vfork` child changes only its own copy of the dispositions and has no
+                // children. Updating the broker under the handlers lock applies concurrent
+                // changes in order.
+                if signal == Signal::SIGCHLD
+                    && self.vfork.borrow().is_none()
+                    && reaps_children(&act) != reaps_children(&old_act)
+                {
+                    self.set_child_reaping(reaps_children(&act));
+                }
             }
             old_act
         };
-        // The `vfork` child changes only its own copy of the dispositions and has no children.
-        if signal == Signal::SIGCHLD && act.is_some() && self.vfork.borrow().is_none() {
-            self.process()
-                .update_child_reaping(|| self.signals.reaps_children_automatically());
-        }
 
         if let Some(oldact_ptr) = oldact_ptr {
             oldact_ptr
@@ -643,6 +652,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         Ok(0)
+    }
+
+    /// Sets whether the broker reaps this process's children as they terminate.
+    pub(crate) fn set_child_reaping(&self, enabled: bool) {
+        // Failure means the process service is unavailable or has failed, so no child can be
+        // created or observed.
+        let _ = self.global.litebox.set_child_reaping(enabled);
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {

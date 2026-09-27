@@ -71,10 +71,12 @@ pub(crate) trait BrokerControl: Send + Sync {
         exit_status: ProcessExitStatus,
     ) -> core::result::Result<(), BrokerControlError>;
 
+    fn set_child_reaping(&self, enabled: bool) -> core::result::Result<(), BrokerControlError>;
+
     fn process_exit_status(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<ProcessExitStatus, BrokerControlError>;
+    ) -> core::result::Result<Option<ProcessExitStatus>, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -497,10 +499,14 @@ where
         self.request(|local| local.report_exit_status(exit_status))
     }
 
+    fn set_child_reaping(&self, enabled: bool) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_child_reaping(enabled))
+    }
+
     fn process_exit_status(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<ProcessExitStatus, BrokerControlError> {
+    ) -> core::result::Result<Option<ProcessExitStatus>, BrokerControlError> {
         self.request(|local| local.process_exit_status(handle))
     }
 

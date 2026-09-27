@@ -161,7 +161,7 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     nr_threads: <Platform as RawMutexProvider>::RawMutex,
     inner: Mutex<Platform, ProcessInner<Platform>>,
     /// Started child processes that have not been reaped, mapped by process ID.
-    children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
+    children: Mutex<Platform, BTreeMap<i32, litebox::process::Process<Platform>>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
@@ -186,14 +186,6 @@ impl<Platform: ShimPlatform> Alarm<Platform> {
             .and_then(|d| d.checked_duration_since(&now))
             .unwrap_or(Duration::ZERO)
     }
-}
-
-/// A started child process that has not been reaped.
-struct Child<Platform: ShimPlatform> {
-    process: litebox::process::Process<Platform>,
-    /// Whether the child is reaped automatically instead of becoming a zombie, fixed by the
-    /// parent's `SIGCHLD` disposition when the child was last seen live.
-    reap_on_exit: bool,
 }
 
 /// The locked portion of the process state.
@@ -250,77 +242,40 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         alarm.handle.is_none() && alarm.deadline.is_none()
     }
 
-    /// Adds a started child process that follows the current `SIGCHLD` disposition, as in
-    /// [`Self::update_child_reaping`].
+    /// Adds a started child process.
+    ///
+    /// While children are reaped automatically, this also releases the children the broker
+    /// already reaped, so a parent that never waits does not accumulate them.
     fn add_child(
         &self,
         pid: i32,
-        process: litebox::process::Process<Platform>,
-        reaps_children: impl FnOnce() -> bool,
+        child: litebox::process::Process<Platform>,
+        reaps_children: bool,
     ) {
         let mut children = self.children.lock();
-        let reap_on_exit = reaps_children();
-        let previous = children.insert(
-            pid,
-            Child {
-                process,
-                reap_on_exit,
-            },
-        );
+        let previous = children.insert(pid, child);
         assert!(
             previous.is_none(),
             "broker child process IDs must be unique"
         );
-        // The child may already have exited, and earlier ones may have been waiting to be reaped.
-        let reaped = Self::take_reaped_children(&mut children, reap_on_exit);
+        let reaped: Vec<_> = if reaps_children {
+            children
+                .extract_if(.., |_, child| {
+                    matches!(child.status(), Ok(litebox::process::ChildStatus::Reaped))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         drop(children);
         drop(reaped);
-    }
-
-    /// Applies the current `SIGCHLD` disposition, where `reaps_children` reports whether it is
-    /// ignored or has `SA_NOCLDWAIT`, to the children.
-    ///
-    /// Like Linux, live children follow the new disposition, while existing zombies stay
-    /// waitable. Children that terminated while they were to be reaped automatically are
-    /// reaped. `reaps_children` is read under the children lock so that concurrent disposition
-    /// changes apply in order.
-    pub(crate) fn update_child_reaping(&self, reaps_children: impl FnOnce() -> bool) {
-        let mut children = self.children.lock();
-        let reap_on_exit = reaps_children();
-        let reaped = Self::take_reaped_children(&mut children, reap_on_exit);
-        drop(children);
-        drop(reaped);
-    }
-
-    /// Removes the terminated children marked to be reaped automatically, and marks the live ones
-    /// with `reap_on_exit`.
-    ///
-    /// The caller drops the returned children outside the children lock to reap them.
-    fn take_reaped_children(
-        children: &mut BTreeMap<i32, Child<Platform>>,
-        reap_on_exit: bool,
-    ) -> Vec<Child<Platform>> {
-        children
-            .extract_if(.., |_, child| {
-                if !child.reap_on_exit && !reap_on_exit {
-                    return false;
-                }
-                // A child whose status is unavailable is treated as live.
-                if matches!(child.process.exit_status(), Ok(Some(_))) {
-                    return child.reap_on_exit;
-                }
-                child.reap_on_exit = reap_on_exit;
-                false
-            })
-            .map(|(_, child)| child)
-            .collect()
     }
 
     /// Removes one terminated child with process ID `target`, or any terminated child when
     /// `target` is `None`.
     ///
-    /// Terminated children marked to be reaped automatically are reaped instead of reported.
-    /// The caller drops the returned child outside the children lock to reap it.
+    /// Children the broker reaped as they terminated are released instead of reported. The
+    /// caller drops the returned child outside the children lock to reap it.
     fn remove_exited_child(
         &self,
         target: Option<i32>,
@@ -335,13 +290,12 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
         {
             match child
-                .process
-                .exit_status()
+                .status()
                 .map_err(|error| TryOpError::Other(error.into()))?
             {
-                None => matched = true,
-                Some(_) if child.reap_on_exit => reaped.push(pid),
-                Some(status) => {
+                litebox::process::ChildStatus::Live => matched = true,
+                litebox::process::ChildStatus::Reaped => reaped.push(pid),
+                litebox::process::ChildStatus::Terminated(status) => {
                     exited = Some((pid, status));
                     break;
                 }
@@ -355,7 +309,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             let child = children
                 .remove(&pid)
                 .expect("matched child must remain present");
-            (pid, child.process, status)
+            (pid, child, status)
         });
         drop(children);
         drop(reaped);
@@ -380,7 +334,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             .iter()
             .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
         {
-            child.process.register_observer(observer.clone(), mask);
+            child.register_observer(observer.clone(), mask);
         }
     }
 
@@ -806,11 +760,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .take()
             .expect("completed vfork window lost its parent context");
         self.signals.restore_vfork_parent(state.parent_signals);
-        self.thread
-            .process
-            .add_child(state.child_pid, state.child, || {
-                self.signals.reaps_children_automatically()
-            });
+        self.thread.process.add_child(
+            state.child_pid,
+            state.child,
+            self.signals.reaps_children_automatically(),
+        );
         *ctx = state.parent_context;
         state.child_pid.cast_unsigned() as usize
     }
@@ -2037,11 +1991,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.thread.clear_child_tid.set(None);
         self.rebind_exec_identity();
 
+        let reaped_before_exec = self.signals.reaps_children_automatically();
         self.signals.reset_for_exec();
         // Resetting a `SIGCHLD` handler clears `SA_NOCLDWAIT`.
-        self.thread
-            .process
-            .update_child_reaping(|| self.signals.reaps_children_automatically());
+        let reaps_children = self.signals.reaps_children_automatically();
+        if reaps_children != reaped_before_exec {
+            self.set_child_reaping(reaps_children);
+        }
 
         #[cfg(target_arch = "aarch64")]
         {

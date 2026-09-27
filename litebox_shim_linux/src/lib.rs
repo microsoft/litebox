@@ -314,6 +314,11 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 ),
             },
         };
+        // A program started by `execve` keeps an ignored `SIGCHLD`, while the broker starts
+        // each process without child reaping.
+        if entrypoints.task.signals.reaps_children_automatically() {
+            entrypoints.task.set_child_reaping(true);
+        }
 
         let (path, argv) = entrypoints
             .task

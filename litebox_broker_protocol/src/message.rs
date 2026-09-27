@@ -82,6 +82,12 @@ pub enum BrokerOperation {
     /// The status is published once the runner exits, replacing the status the
     /// broker would otherwise infer from the runner's host termination.
     ReportExitStatus(ProcessExitStatus),
+    /// Set whether this process's children are reaped when they terminate
+    /// instead of retaining their termination status.
+    ///
+    /// Each child applies the setting in effect when it terminates, so a change
+    /// does not affect children that already terminated.
+    SetChildReaping(bool),
 }
 
 impl BrokerOperation {
@@ -127,6 +133,7 @@ impl BrokerOperation {
             | Self::CloseObject(_)
             | Self::ExitChildProcess(_)
             | Self::ReportExitStatus(_)
+            | Self::SetChildReaping(_)
             | Self::GetProcessExitStatus(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
@@ -267,12 +274,15 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A pending child established its broker association.
     ProcessStarted,
-    /// Termination status of a child process.
-    ProcessExitStatus(ProcessExitStatus),
+    /// Termination status of a child process, or `None` if it was reaped
+    /// when it terminated and so retains no status.
+    ProcessExitStatus(Option<ProcessExitStatus>),
     /// A pending child's exit was recorded.
     ProcessExited,
     /// This process's final termination status was recorded.
     ExitStatusReported,
+    /// This process's child-reaping setting was recorded.
+    ChildReapingSet,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
