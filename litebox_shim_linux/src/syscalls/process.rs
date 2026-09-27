@@ -703,17 +703,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         status: i32,
         ctx: &mut litebox_common_linux::PtRegs,
-    ) -> Result<usize, Errno> {
+    ) -> usize {
         // Like Linux, only the low byte of the status is reported.
         let code = status.cast_unsigned() & 0xff;
-        self.vfork
+        let exited = self
+            .vfork
             .borrow()
             .as_ref()
             .expect("vfork child exit lost its child")
             .child
-            .exit(ProcessExitStatus::Exited { code })
-            .map_err(Errno::from)?;
-        Ok(self.resume_vfork_parent(ctx))
+            .exit(ProcessExitStatus::Exited { code });
+        if exited.is_err() {
+            return self.abort_vfork_window();
+        }
+        self.resume_vfork_parent(ctx)
     }
 
     /// Ends the `vfork` window after the child exits or starts its own runner,
@@ -727,6 +730,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.thread.process.add_child(state.child_pid, state.child);
         *ctx = state.parent_context;
         state.child_pid.cast_unsigned() as usize
+    }
+
+    /// Terminates the shared runner when the constrained `vfork` window cannot continue.
+    pub(crate) fn abort_vfork_window(&self) -> usize {
+        self.sys_exit_group(127);
+        0
     }
 }
 
@@ -798,7 +807,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Only single-threaded processes with default filesystem, signal, resource-limit, alarm, and
     /// transferable descriptor state are admitted. The parent remains suspended until the child
-    /// exits or successfully transfers to a fresh runner through `execve`. The child must not change
+    /// exits or successfully transfers to a fresh runner through `execve`; an `execve` that fails
+    /// before the transfer returns its error to the child. The child must not change
     /// standard descriptor mappings or flags, or platform-managed architectural state outside
     /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that state.
     #[cfg(target_arch = "x86_64")]
@@ -1884,13 +1894,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let is_vfork_child = self.vfork.borrow().is_some();
-        if is_vfork_child && !path.starts_with('/') {
-            return Err(Errno::ENOENT);
-        }
         let (path, argv_vec) = self.resolve_shebang(alloc::string::String::from(path), argv_vec)?;
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
         if is_vfork_child {
             drop(loader);
+            // The fresh runner needs an absolute path; resolve it against this task's cwd.
+            let path = self
+                .resolve_path(path.as_str())?
+                .into_string()
+                .map_err(|_| Errno::EINVAL)?;
             let startup = LinuxProgramStartup {
                 parent_process_id: self.pid,
                 uid: self.credentials.uid,
@@ -1902,13 +1914,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 envp: envp_vec,
             };
             let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
-            self.vfork
+            let started = self
+                .vfork
                 .borrow()
                 .as_ref()
                 .expect("vfork transfer lost its child")
                 .child
-                .start(&payload)
-                .map_err(Errno::from)?;
+                .start(&payload);
+            if started.is_err() {
+                // The broker no longer holds a pending child that could retry or exit.
+                return Ok(self.abort_vfork_window());
+            }
             return Ok(self.resume_vfork_parent(ctx));
         }
 

@@ -283,7 +283,7 @@ fn vfork_child_exit_resumes_parent_with_waitable_child() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn vfork_exec_failure_does_not_resume_parent() {
+fn vfork_exec_failure_returns_error_to_child() {
     let parent = common::compile(
         "./tests/vfork_exec_parent.c",
         "vfork_exec_failure_parent",
@@ -295,8 +295,20 @@ fn vfork_exec_failure_does_not_resume_parent() {
         .allow_process_duplication()
         .arg("/missing-vfork-executable");
 
-    let output = String::from_utf8(runner.output_expect_failure()).unwrap();
-    assert_eq!(output, "vfork-started\n");
+    let output = String::from_utf8(runner.output()).unwrap();
+    let parent_line = output
+        .lines()
+        .find(|line| line.starts_with("parent "))
+        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
+    let reported_child = numeric_field(parent_line, "child=");
+    assert_eq!(
+        numeric_field(parent_line, "after="),
+        numeric_field(parent_line, "before=")
+    );
+    assert_eq!(numeric_field(parent_line, "waited="), reported_child);
+    assert_eq!(numeric_field(parent_line, "exited="), 1);
+    assert_eq!(numeric_field(parent_line, "code="), 111);
+    assert_eq!(numeric_field(parent_line, "echild="), 1);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
