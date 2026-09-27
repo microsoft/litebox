@@ -78,7 +78,7 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
 type Vtl0PhysConstPtr<'a, T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysConstPtr<
         'a,
-        crate::host::lvbs::LvbsLinuxKernel,
+        crate::backend::lvbs::LvbsLinuxKernel,
         T,
         ALIGN,
     >;
@@ -89,7 +89,7 @@ type Vtl0PhysConstPtr<'a, T, const ALIGN: usize> =
 type PrivilegedVtl0PhysMutPtr<'a, T, const ALIGN: usize> =
     litebox_common_linux::physical_pointers::PhysMutPtr<
         'a,
-        PrivilegedVmap<'a, crate::host::lvbs::LvbsLinuxKernel>,
+        PrivilegedVmap<'a, crate::backend::lvbs::LvbsLinuxKernel>,
         T,
         ALIGN,
     >;
@@ -973,7 +973,7 @@ impl HvPendingExceptionEvent {
 #[cfg(not(test))]
 #[inline]
 pub(crate) fn is_hvcall_ready() -> bool {
-    use crate::host::lvbs::per_cpu_variables::with_per_cpu_variables;
+    use crate::backend::lvbs::per_cpu_variables::with_per_cpu_variables;
     // The VTL return address is configured only after the hypercall page
     // has been set up, so a non-zero value indicates that hypercalls are
     // available.

@@ -4,11 +4,11 @@
 //! LVBS time-provider binding. Monotonic time uses the Hyper-V reference clock;
 //! wall-clock time remains unsupported, as before this extraction.
 
-use super::LvbsHost;
+use super::LvbsBackend;
 use crate::mshv::clock::Instant;
 use litebox::platform::TimeProvider;
 
-impl TimeProvider for LvbsHost {
+impl TimeProvider for LvbsBackend {
     type Instant = Instant;
     type SystemTime = UnsupportedSystemTime;
 

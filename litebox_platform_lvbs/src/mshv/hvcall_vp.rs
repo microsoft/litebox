@@ -9,8 +9,8 @@ use crate::{
         instrs::rdmsr,
         msr::{MSR_EFER, MSR_IA32_CR_PAT},
     },
+    backend::lvbs::per_cpu_variables::with_per_cpu_variables,
     debug_serial_println,
-    host::lvbs::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HV_VP_INDEX_SELF, HV_VTL_NORMAL, HV_VTL_SECURE, HVCALL_ENABLE_VP_VTL,
         HVCALL_GET_VP_REGISTERS, HVCALL_SET_VP_REGISTERS, HvEnableVpVtl, HvGetVpRegistersInput,
@@ -220,7 +220,7 @@ fn get_entry() -> u64 {
 pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     // Skip boot processor since VTL is already enabled for it by VTL0
     if core == 0 {
-        debug_serial_println!(crate::host::lvbs::console::print; "Skipping boot processor (core 0)");
+        debug_serial_println!(crate::backend::lvbs::console::print; "Skipping boot processor (core 0)");
         return Ok(0);
     }
 
@@ -241,11 +241,11 @@ pub fn init_vtl_ap(core: u32) -> Result<u64, HypervCallError> {
     let result = hvcall_enable_vp_vtl(core, HV_VTL_SECURE, tss, rip, rsp);
     match result {
         Ok(_) => {
-            debug_serial_println!(crate::host::lvbs::console::print; "Enabled VTL for core {}", core);
+            debug_serial_println!(crate::backend::lvbs::console::print; "Enabled VTL for core {}", core);
             Ok(0)
         }
         Err(e) => {
-            serial_println!(crate::host::lvbs::console::print; "Failed to enable VTL for core {}: {:?}", core, e);
+            serial_println!(crate::backend::lvbs::console::print; "Failed to enable VTL for core {}: {:?}", core, e);
             Err(e)
         }
     }

@@ -1,14 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Software-only host for page-table tests. No VM lifecycle or peer operations.
+//! Software-only backend for page-table tests. No VM lifecycle or peer operations.
 
-use crate::host::Host;
+use crate::backend::KernelBackend;
 
 mod clock;
 
-pub struct MockHost {}
-pub type MockKernel = crate::LinuxKernel<MockHost>;
+pub struct MockBackend {}
+pub type MockKernel = crate::LinuxKernel<MockBackend>;
 pub struct MockMemory;
 pub struct MockTlb;
 
@@ -20,33 +20,33 @@ unsafe impl crate::mm::tlb::TlbInvalidation for MockTlb {
     ) {
     }
 }
-impl crate::console::DiagnosticOutput for MockHost {
+impl crate::console::DiagnosticOutput for MockBackend {
     fn print(args: core::fmt::Arguments<'_>) {
         Self::log(&alloc::format!("{args}"));
     }
 }
-impl Host for MockHost {
+impl KernelBackend for MockBackend {
     type Memory = MockMemory;
     type Timer = Self;
     fn execution_timer(&self) -> &Self {
         self
     }
 }
-impl litebox::platform::RawMutexProvider for MockHost {
+impl litebox::platform::RawMutexProvider for MockBackend {
     type RawMutex = super::no_scheduler::NoSchedulerMutex;
 }
-impl crate::execution::ExecutionTimer for MockHost {
+impl crate::execution::ExecutionTimer for MockBackend {
     fn arm(&self) {
-        panic!("software-only host cannot enter user mode");
+        panic!("software-only backend cannot enter user mode");
     }
     fn on_user_exception(&self, _exception: litebox::shim::Exception) {
-        panic!("software-only host cannot receive interrupts");
+        panic!("software-only backend cannot receive interrupts");
     }
 }
 
-impl MockHost {
+impl MockBackend {
     // The old ignored memory tests still lack a boot-memory harness. These
-    // fixture helpers are not part of the production Host contract.
+    // fixture helpers are not part of the production KernelBackend contract.
     pub fn alloc(_layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         todo!()
     }
@@ -68,6 +68,6 @@ macro_rules! mock_log_println {
         use core::fmt::Write;
         let mut t: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         writeln!(t, $($tt)*).unwrap();
-        $crate::host::mock::MockHost::log(&t);
+        $crate::backend::mock::MockBackend::log(&t);
     }};
 }

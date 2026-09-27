@@ -56,7 +56,7 @@ impl<T: EnterShim<ExecutionContext = PtRegs>> EnterShim for Observed<'_, T> {
 }
 
 pub(super) fn run(platform: &'static Platform) {
-    // Both shims use LinuxKernel<QemuHost> directly. Only the session manager
+    // Both shims use LinuxKernel<QemuBackend> directly. Only the session manager
     // needs a VM-lifetime allocation; there is no OP-TEE platform wrapper.
     let sessions = Box::leak(Box::new(SessionManager::<Platform>::new()));
     for (name, binary) in [("hello", HELLO), ("hello3seg", HELLO_3SEG)] {

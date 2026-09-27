@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! QEMU host facilities, independent of any shim. The shared LinuxKernel
+//! QEMU backend facilities, independent of any shim. The shared LinuxKernel
 //! provides kernel mechanisms and delegates capabilities here; no OP-TEE
 //! platform wrapper, VTL peer, fake protection, or scheduler is needed.
 
@@ -16,14 +16,14 @@ use litebox::platform::{
 use litebox_common_linux::vmap::{
     NoopPhysPageMapInfo, PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
-use litebox_platform_lvbs::{execution::ExecutionTimer, host::Host};
-pub struct QemuHost {
+use litebox_platform_lvbs::{backend::KernelBackend, execution::ExecutionTimer};
+pub struct QemuBackend {
     tsc_origin: u64,
     tsc_hz: u64,
     pub timer: FiniteTestTimer,
 }
 
-impl QemuHost {
+impl QemuBackend {
     pub fn new() -> Self {
         let tsc_hz = calibrate_tsc();
         assert_ne!(
@@ -103,7 +103,7 @@ impl SystemTime for NoWallTime {
         panic!("no wall clock in QEMU OP-TEE test");
     }
 }
-impl TimeProvider for QemuHost {
+impl TimeProvider for QemuBackend {
     type Instant = ClockInstant;
     type SystemTime = NoWallTime;
     fn now(&self) -> Self::Instant {
@@ -118,7 +118,7 @@ impl TimeProvider for QemuHost {
         panic!("no wall clock in QEMU OP-TEE test");
     }
 }
-impl CrngProvider for QemuHost {
+impl CrngProvider for QemuBackend {
     fn fill_bytes_crng(&self, bytes: &mut [u8]) {
         for chunk in bytes.chunks_mut(8) {
             let mut value = 0;
@@ -135,7 +135,7 @@ impl CrngProvider for QemuHost {
         }
     }
 }
-impl DerivedKeyProvider for QemuHost {
+impl DerivedKeyProvider for QemuBackend {
     fn derive_key<E>(
         &self,
         _kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
@@ -146,7 +146,7 @@ impl DerivedKeyProvider for QemuHost {
 }
 // SAFETY: all foreign-memory operations deny access. The test exchanges value
 // parameters through TA-owned userspace, not untrusted guest physical pointers.
-unsafe impl VmapManager<4096> for QemuHost {
+unsafe impl VmapManager<4096> for QemuBackend {
     type MapInfo = NoopPhysPageMapInfo;
     fn validate_unowned(&self, _pages: &PhysPageAddrArray<4096>) -> Result<(), PhysPointerError> {
         Err(PhysPointerError::UnsupportedOperation)
@@ -159,21 +159,21 @@ unsafe impl VmapManager<4096> for QemuHost {
         Err(PhysPointerError::UnsupportedOperation)
     }
 }
-impl litebox_platform_lvbs::console::DiagnosticOutput for QemuHost {
+impl litebox_platform_lvbs::console::DiagnosticOutput for QemuBackend {
     fn print(args: core::fmt::Arguments<'_>) {
         super::console(args);
     }
 }
 
-impl Host for QemuHost {
+impl KernelBackend for QemuBackend {
     type Memory = super::QemuMemory;
     type Timer = FiniteTestTimer;
     fn execution_timer(&self) -> &Self::Timer {
         &self.timer
     }
 }
-impl RawMutexProvider for QemuHost {
-    type RawMutex = litebox_platform_lvbs::host::no_scheduler::NoSchedulerMutex;
+impl RawMutexProvider for QemuBackend {
+    type RawMutex = litebox_platform_lvbs::backend::no_scheduler::NoSchedulerMutex;
 }
 
 /// Explicit no-hardware-timer choice for trusted finite test payloads. The

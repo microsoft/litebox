@@ -5,10 +5,10 @@
 
 use crate::{
     arch::instrs::{rdmsr, wrmsr},
-    debug_serial_println,
-    host::lvbs::{
+    backend::lvbs::{
         hv_hypercall_page_address, memory::LvbsMemory, per_cpu_variables::with_per_cpu_variables,
     },
+    debug_serial_println,
     mm::MemoryProvider,
     mshv::{
         HV_HYPERCALL_REP_COMP_MASK, HV_HYPERCALL_REP_COMP_OFFSET, HV_HYPERCALL_REP_START_MASK,
@@ -76,7 +76,7 @@ fn check_hyperv() -> Result<(), HypervError> {
 pub fn init(is_bsp: bool) -> Result<(), HypervError> {
     check_hyperv()?;
 
-    debug_serial_println!(crate::host::lvbs::console::print; "HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
+    debug_serial_println!(crate::backend::lvbs::console::print; "HV_REGISTER_VP_INDEX: {:#x}", rdmsr(HV_REGISTER_VP_INDEX));
 
     with_per_cpu_variables(|per_cpu_variables| {
         let vp_assist_gpa = LvbsMemory::va_to_pa(x86_64::VirtAddr::new(
@@ -94,7 +94,7 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
         }
     })?;
 
-    debug_serial_println!(crate::host::lvbs::console::print;
+    debug_serial_println!(crate::backend::lvbs::console::print;
         "HV_X64_MSR_VP_ASSIST_PAGE: {:#x}",
         rdmsr(HV_X64_MSR_VP_ASSIST_PAGE)
     );
@@ -109,7 +109,7 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
         return Err(HypervError::InvalidGuestOSID);
     }
     if is_bsp {
-        debug_serial_println!(crate::host::lvbs::console::print;
+        debug_serial_println!(crate::backend::lvbs::console::print;
             "HV_X64_MSR_GUEST_OS_ID: {:#x}",
             rdmsr(HV_X64_MSR_GUEST_OS_ID)
         );
@@ -144,7 +144,7 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
         }
     })?;
 
-    debug_serial_println!(crate::host::lvbs::console::print; "HV_X64_MSR_SIMP: {:#x}", rdmsr(HV_X64_MSR_SIMP));
+    debug_serial_println!(crate::backend::lvbs::console::print; "HV_X64_MSR_SIMP: {:#x}", rdmsr(HV_X64_MSR_SIMP));
 
     let mut sint = HvSynicSint::new();
     sint.set_vector(HYPERVISOR_CALLBACK_VECTOR);
@@ -152,7 +152,7 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
 
     wrmsr(HV_X64_MSR_SINT0, sint.as_uint64());
     if is_bsp {
-        debug_serial_println!(crate::host::lvbs::console::print; "HV_X64_MSR_SINT0: {:#x}", rdmsr(HV_X64_MSR_SINT0));
+        debug_serial_println!(crate::backend::lvbs::console::print; "HV_X64_MSR_SINT0: {:#x}", rdmsr(HV_X64_MSR_SINT0));
     }
 
     wrmsr(HV_X64_MSR_SCONTROL, u64::from(HV_X64_MSR_SCONTROL_ENABLE));

@@ -5,7 +5,7 @@
 //! The shared kernel receives the resulting mappings, not linker symbols or
 //! assumptions about a VTL peer.
 
-use super::{LvbsHost, LvbsLinuxKernel};
+use super::{LvbsBackend, LvbsLinuxKernel};
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::{
     PhysAddr,
@@ -60,7 +60,7 @@ impl LvbsLinuxKernel {
             ));
             exec_ranges.push(hypercall..hypercall + Size4KiB::SIZE);
         }
-        let host = LvbsHost {
+        let backend = LvbsBackend {
             vtl1_phys_frame_range: range,
             end_of_boot: AtomicBool::new(false),
             timer: super::timer::LvbsTimer,
@@ -69,18 +69,18 @@ impl LvbsLinuxKernel {
         };
         // SAFETY: the caller supplies the live VTL1 range and relocated text;
         // LVBS adds its other required executable mapping, the hypercall page.
-        unsafe { Self::from_memory(host, range, &exec_ranges) }
+        unsafe { Self::from_memory(backend, range, &exec_ranges) }
     }
 
     pub(crate) fn end_of_boot_reached(&self) -> bool {
-        self.host.end_of_boot.load(Ordering::SeqCst)
+        self.backend.end_of_boot.load(Ordering::SeqCst)
     }
 
     pub(crate) fn signal_end_of_boot(&self) {
-        self.host.end_of_boot.store(true, Ordering::SeqCst);
+        self.backend.end_of_boot.store(true, Ordering::SeqCst);
     }
 
     pub fn vtl1_phys_frame_range(&self) -> PhysFrameRange<Size4KiB> {
-        self.host.vtl1_phys_frame_range
+        self.backend.vtl1_phys_frame_range
     }
 }

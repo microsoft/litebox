@@ -5,7 +5,7 @@
 
 use litebox::shim::Exception;
 
-/// Execution-window capability owned and selected by the host.
+/// Execution-window capability owned and selected by the backend.
 ///
 /// The platform owns initialization, the budget, interrupt registration,
 /// kernel-mode interrupt handling, and the lifetime of an armed execution

@@ -240,17 +240,17 @@ fn permission_updates_use_the_selected_invalidator() {
 }
 
 #[test]
-fn kernel_capabilities_follow_the_owned_host_instance() {
-    use crate::host::mock::MockHost;
-    use crate::{execution::ExecutionTimer, host::Host};
+fn kernel_capabilities_follow_the_owned_backend_instance() {
+    use crate::backend::mock::MockBackend;
+    use crate::{backend::KernelBackend, execution::ExecutionTimer};
     use litebox::platform::{
         CrngProvider, DerivedKeyError, DerivedKeyProvider, KDFParams, RawMutexProvider,
         TimeProvider,
     };
 
-    // An atomic counter keeps the public Host Sync contract genuine.
+    // An atomic counter keeps the public KernelBackend Sync contract genuine.
     struct AtomicTimer(core::sync::atomic::AtomicUsize);
-    struct TestHost {
+    struct TestBackend {
         marker: u8,
         timer: AtomicTimer,
     }
@@ -260,37 +260,37 @@ fn kernel_capabilities_follow_the_owned_host_instance() {
         }
         fn on_user_exception(&self, _exception: litebox::shim::Exception) {}
     }
-    impl crate::console::DiagnosticOutput for TestHost {
+    impl crate::console::DiagnosticOutput for TestBackend {
         fn print(args: core::fmt::Arguments<'_>) {
             std::eprint!("{args}");
         }
     }
-    impl RawMutexProvider for TestHost {
-        type RawMutex = crate::host::no_scheduler::NoSchedulerMutex;
+    impl RawMutexProvider for TestBackend {
+        type RawMutex = crate::backend::no_scheduler::NoSchedulerMutex;
     }
-    impl TimeProvider for TestHost {
-        type Instant = <MockHost as TimeProvider>::Instant;
-        type SystemTime = <MockHost as TimeProvider>::SystemTime;
+    impl TimeProvider for TestBackend {
+        type Instant = <MockBackend as TimeProvider>::Instant;
+        type SystemTime = <MockBackend as TimeProvider>::SystemTime;
         fn now(&self) -> Self::Instant {
-            MockHost {}.now()
+            MockBackend {}.now()
         }
         fn current_time(&self) -> Self::SystemTime {
-            MockHost {}.current_time()
+            MockBackend {}.current_time()
         }
     }
-    impl Host for TestHost {
+    impl KernelBackend for TestBackend {
         type Memory = TestMemory;
         type Timer = AtomicTimer;
         fn execution_timer(&self) -> &Self::Timer {
             &self.timer
         }
     }
-    impl CrngProvider for TestHost {
+    impl CrngProvider for TestBackend {
         fn fill_bytes_crng(&self, buf: &mut [u8]) {
             buf.fill(self.marker);
         }
     }
-    impl DerivedKeyProvider for TestHost {
+    impl DerivedKeyProvider for TestBackend {
         fn derive_key<E>(
             &self,
             kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
@@ -303,7 +303,7 @@ fn kernel_capabilities_follow_the_owned_host_instance() {
     let make = |marker| {
         let base = unsafe { crate::mm::PageTable::<TestMemory, PAGE_SIZE>::new_top_level() };
         crate::LinuxKernel {
-            host: TestHost {
+            backend: TestBackend {
                 marker,
                 timer: AtomicTimer(core::sync::atomic::AtomicUsize::new(0)),
             },
@@ -330,10 +330,10 @@ fn kernel_capabilities_follow_the_owned_host_instance() {
             .unwrap();
         assert_eq!(bytes, [expected; 8]);
     }
-    first.host().execution_timer().arm();
+    first.backend().execution_timer().arm();
     assert_eq!(
         first
-            .host()
+            .backend()
             .timer
             .0
             .load(core::sync::atomic::Ordering::Relaxed),
@@ -341,7 +341,7 @@ fn kernel_capabilities_follow_the_owned_host_instance() {
     );
     assert_eq!(
         second
-            .host()
+            .backend()
             .timer
             .0
             .load(core::sync::atomic::Ordering::Relaxed),

@@ -5,7 +5,7 @@
 //! Writers may be functions or closures borrowing caller-owned state. The
 //! macros do not allocate or select hardware, and need no boot registration.
 
-/// Early diagnostic sink selected by a host/resource type. It may be used
+/// Early diagnostic sink selected by a backend/resource type. It may be used
 /// before the kernel instance exists, so it must not depend on registration.
 /// This is distinct from guest stdio and from memory allocation policy.
 pub trait DiagnosticOutput {

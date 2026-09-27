@@ -5,8 +5,8 @@
 //! interrupts. Boot checks and finite ring-3 payloads precede real OP-TEE TA
 //! lifecycle tests. Service transport and arbitrary TA loading are not provided.
 
-mod host;
-use host::QemuHost;
+mod backend;
+use backend::QemuBackend;
 mod optee_test;
 mod user_smoke;
 
@@ -33,7 +33,7 @@ use x86_64::{
 
 pub struct QemuMemory;
 pub struct SingleCpuTlb;
-type Platform = LinuxKernel<QemuHost>;
+type Platform = LinuxKernel<QemuBackend>;
 
 #[global_allocator]
 static HEAP: SafeZoneAllocator<'static, 30, NoDynamicMemory> = SafeZoneAllocator::new();
@@ -272,7 +272,7 @@ extern "C" fn kernel_main(ram_start: u64, ram_end: u64) -> ! {
     // early mapping covers it, and relocation and allocator seeding are complete.
     let platform = unsafe {
         Platform::from_memory(
-            QemuHost::new(),
+            QemuBackend::new(),
             memory,
             &[PhysAddr::new(text.start)..PhysAddr::new(text.end)],
         )

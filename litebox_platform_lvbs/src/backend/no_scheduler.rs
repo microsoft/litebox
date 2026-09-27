@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Explicit mutex policy for hosts without a scheduler. Uncontended atomic
+//! Explicit mutex policy for kernel backends without a scheduler. Uncontended atomic
 //! locking is supported; actually parking a thread is not. This is not a futex
 //! implementation and must be replaced when scheduler-backed waits are added.
 

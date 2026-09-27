@@ -35,13 +35,13 @@ pub fn hv_hypercall_page_address() -> u64 {
     crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address()
 }
 
-use crate::host::Host;
+use crate::backend::KernelBackend;
 use digest::Digest;
 use litebox_common_lvbs::PRK_LEN;
 use rand_core::{RngCore, SeedableRng};
 use zeroize::Zeroizing;
 
-pub type LvbsLinuxKernel = crate::LinuxKernel<LvbsHost>;
+pub type LvbsLinuxKernel = crate::LinuxKernel<LvbsBackend>;
 
 impl LvbsLinuxKernel {
     // TODO: replace it with actual implementation (e.g., atomically increment PID/TID)
@@ -57,7 +57,7 @@ impl LvbsLinuxKernel {
     }
 }
 
-impl litebox::platform::CrngProvider for LvbsHost {
+impl litebox::platform::CrngProvider for LvbsBackend {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
         let mut random = self.random.lock();
         random
@@ -132,8 +132,8 @@ impl LvbsCrng {
 // Consumers should provide key derivation function and context
 // through `DerivedKeyProvider` so PRK access stays in this module.
 
-impl LvbsHost {
-    /// Install this host's root key once, via the VTL1 setup gate. Later
+impl LvbsBackend {
+    /// Install this backend's root key once, via the VTL1 setup gate. Later
     /// derivations never expose the raw key outside this module.
     pub(crate) fn set_platform_root_key(&self, key: &[u8; PRK_LEN]) {
         self.root_key.call_once(|| {
@@ -144,7 +144,7 @@ impl LvbsHost {
     }
 }
 
-impl litebox::platform::DerivedKeyProvider for LvbsHost {
+impl litebox::platform::DerivedKeyProvider for LvbsBackend {
     fn derive_key<E>(
         &self,
         kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
@@ -205,7 +205,7 @@ fn crng_reseed_from_rdrand_and_state(
         .into()
 }
 
-pub struct LvbsHost {
+pub struct LvbsBackend {
     vtl1_phys_frame_range:
         x86_64::structures::paging::frame::PhysFrameRange<x86_64::structures::paging::Size4KiB>,
     end_of_boot: core::sync::atomic::AtomicBool,
@@ -214,13 +214,13 @@ pub struct LvbsHost {
     root_key: spin::Once<[u8; PRK_LEN]>,
 }
 
-impl crate::console::DiagnosticOutput for LvbsHost {
+impl crate::console::DiagnosticOutput for LvbsBackend {
     fn print(args: core::fmt::Arguments<'_>) {
         console::print(args);
     }
 }
 
-impl Host for LvbsHost {
+impl KernelBackend for LvbsBackend {
     type Memory = memory::LvbsMemory;
     type Timer = timer::LvbsTimer;
     fn execution_timer(&self) -> &Self::Timer {
@@ -228,7 +228,7 @@ impl Host for LvbsHost {
     }
 }
 
-impl litebox::platform::RawMutexProvider for LvbsHost {
+impl litebox::platform::RawMutexProvider for LvbsBackend {
     type RawMutex = super::no_scheduler::NoSchedulerMutex;
 }
 
@@ -242,12 +242,12 @@ mod tests {
     const RESEED_SEED: CrngSeed = [0x5A; 32];
 
     #[test]
-    fn root_key_is_owned_by_each_host_and_installed_once() {
+    fn root_key_is_owned_by_each_backend_and_installed_once() {
         use litebox::platform::{DerivedKeyError, DerivedKeyProvider, KDFParams};
         let make = || {
             let start =
                 x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(0));
-            LvbsHost {
+            LvbsBackend {
                 vtl1_phys_frame_range: x86_64::structures::paging::PhysFrame::range(start, start),
                 end_of_boot: core::sync::atomic::AtomicBool::new(false),
                 timer: timer::LvbsTimer,
@@ -271,18 +271,19 @@ mod tests {
         first.set_platform_root_key(&[0x11; PRK_LEN]);
         second.set_platform_root_key(&[0x22; PRK_LEN]);
         first.set_platform_root_key(&[0x33; PRK_LEN]);
-        for (host, expected) in [(&first, 0x11), (&second, 0x22)] {
-            host.derive_key::<core::convert::Infallible>(
-                Some(|key, params| {
-                    params.output.copy_from_slice(key);
-                    Ok(())
-                }),
-                KDFParams {
-                    context: b"test",
-                    output: &mut output,
-                },
-            )
-            .unwrap();
+        for (backend, expected) in [(&first, 0x11), (&second, 0x22)] {
+            backend
+                .derive_key::<core::convert::Infallible>(
+                    Some(|key, params| {
+                        params.output.copy_from_slice(key);
+                        Ok(())
+                    }),
+                    KDFParams {
+                        context: b"test",
+                        output: &mut output,
+                    },
+                )
+                .unwrap();
             assert_eq!(output, [expected; PRK_LEN]);
         }
     }

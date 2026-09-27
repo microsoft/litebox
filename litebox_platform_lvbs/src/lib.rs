@@ -30,9 +30,9 @@ use zerocopy::{FromBytes, IntoBytes};
 extern crate alloc;
 
 pub mod arch;
+pub mod backend;
 pub mod console;
 pub mod execution;
-pub mod host;
 pub mod mm;
 #[cfg(feature = "lvbs")]
 pub mod mshv;
@@ -396,10 +396,10 @@ impl<M: mm::MemoryProvider> PageTableManager<M> {
 }
 
 /// This is the platform for running LiteBox in kernel mode.
-/// The host selects substrate facilities; peer-domain gates remain separate.
-pub struct LinuxKernel<Host: host::Host> {
-    host: Host,
-    page_table_manager: PageTableManager<Host::Memory>,
+/// The backend selects substrate facilities; peer-domain gates remain separate.
+pub struct LinuxKernel<Backend: backend::KernelBackend> {
+    backend: Backend,
+    page_table_manager: PageTableManager<Backend::Memory>,
 }
 
 /// [`litebox::platform::common_providers::userspace_pointers::ValidateAccess`]
@@ -461,12 +461,14 @@ type UserConstPtr<T> =
 type UserMutPtr<T> =
     litebox::platform::common_providers::userspace_pointers::UserMutPtr<LvbsValidateAccess, T>;
 
-impl<Host: host::Host> RawPointerProvider for LinuxKernel<Host> {
+impl<Backend: backend::KernelBackend> RawPointerProvider for LinuxKernel<Backend> {
     type RawConstPointer<T: FromBytes> = UserConstPtr<T>;
     type RawMutPointer<T: FromBytes + IntoBytes> = UserMutPtr<T>;
 }
 
-unsafe impl<Host: host::Host> litebox::platform::ThreadLocalStorageProvider for LinuxKernel<Host> {
+unsafe impl<Backend: backend::KernelBackend> litebox::platform::ThreadLocalStorageProvider
+    for LinuxKernel<Backend>
+{
     fn get_thread_local_storage() -> *mut () {
         let tls = with_per_cpu_variables(|pcv| pcv.tls.get());
         tls.as_mut_ptr::<()>()
@@ -481,7 +483,7 @@ unsafe impl<Host: host::Host> litebox::platform::ThreadLocalStorageProvider for 
     }
 }
 
-impl<Host: host::Host> ArchSpecificProvider for LinuxKernel<Host> {
+impl<Backend: backend::KernelBackend> ArchSpecificProvider for LinuxKernel<Backend> {
     fn set_arch_specific_register(
         &self,
         reg: &ArchSpecificRegister,
@@ -519,13 +521,13 @@ impl<Host: host::Host> ArchSpecificProvider for LinuxKernel<Host> {
     }
 }
 
-impl<Host: host::Host> LinuxKernel<Host> {
-    /// Access host-owned capabilities, without a global platform lookup.
-    pub fn host(&self) -> &Host {
-        &self.host
+impl<Backend: backend::KernelBackend> LinuxKernel<Backend> {
+    /// Access backend-owned capabilities, without a global platform lookup.
+    pub fn backend(&self) -> &Backend {
+        &self.backend
     }
 
-    /// Run an owned shim using this host's execution timer.
+    /// Run an owned shim using this backend's execution timer.
     ///
     /// # Safety
     /// Same requirements as [`Self::run_thread_ref`].
@@ -533,22 +535,22 @@ impl<Host: host::Host> LinuxKernel<Host> {
     where
         T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     {
-        unsafe { run_thread(shim, ctx, self.host.execution_timer()) };
+        unsafe { run_thread(shim, ctx, self.backend.execution_timer()) };
     }
 
-    /// Run user code using this host's execution timer.
+    /// Run user code using this backend's execution timer.
     ///
     /// # Safety
-    /// The current CPU must be initialized for this host with a valid user
+    /// The current CPU must be initialized for this backend with a valid user
     /// context, address space and interrupt setup.
     pub unsafe fn run_thread_ref<T>(&self, shim: &T, ctx: &mut litebox_common_linux::PtRegs)
     where
         T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     {
-        unsafe { run_thread_ref(shim, ctx, self.host.execution_timer()) };
+        unsafe { run_thread_ref(shim, ctx, self.backend.execution_timer()) };
     }
 
-    /// Reenter user code within this host's execution window.
+    /// Reenter user code within this backend's execution window.
     ///
     /// # Safety
     /// Same requirements as [`Self::run_thread_ref`].
@@ -556,7 +558,7 @@ impl<Host: host::Host> LinuxKernel<Host> {
     where
         T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     {
-        unsafe { reenter_thread_ref(shim, ctx, self.host.execution_timer()) };
+        unsafe { reenter_thread_ref(shim, ctx, self.backend.execution_timer()) };
     }
 
     /// Construct and load the kernel address space from explicit boot inputs.
@@ -574,11 +576,11 @@ impl<Host: host::Host> LinuxKernel<Host> {
     /// # Panics
     /// Panics if page-table allocation or mapping fails, or DEP is unavailable.
     pub unsafe fn from_memory(
-        host: Host,
+        backend: Backend,
         memory: PhysFrameRange<Size4KiB>,
         exec_ranges: &[core::ops::Range<x86_64::PhysAddr>],
     ) -> &'static Self {
-        let base_pt = unsafe { mm::PageTable::<Host::Memory, PAGE_SIZE>::new_top_level() };
+        let base_pt = unsafe { mm::PageTable::<Backend::Memory, PAGE_SIZE>::new_top_level() };
         if base_pt
             .map_phys_frame_range(
                 memory,
@@ -604,7 +606,7 @@ impl<Host: host::Host> LinuxKernel<Host> {
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
-            host,
+            backend,
             page_table_manager: PageTableManager::new(base_pt),
         }))
     }
@@ -679,7 +681,7 @@ impl<Host: host::Host> LinuxKernel<Host> {
     }
 
     /// Returns a reference to the page table manager.
-    pub fn page_table_manager(&self) -> &PageTableManager<Host::Memory> {
+    pub fn page_table_manager(&self) -> &PageTableManager<Backend::Memory> {
         &self.page_table_manager
     }
 
@@ -689,38 +691,42 @@ impl<Host: host::Host> LinuxKernel<Host> {
     }
 }
 
-impl<Host: host::Host> RawMutexProvider for LinuxKernel<Host> {
-    type RawMutex = Host::RawMutex;
+impl<Backend: backend::KernelBackend> RawMutexProvider for LinuxKernel<Backend> {
+    type RawMutex = Backend::RawMutex;
 }
 
-// Time representation and clock access belong to the selected host. In
+// Time representation and clock access belong to the selected backend. In
 // particular, the shared kernel must not assume Hyper-V counter units.
-impl<Host: host::Host> TimeProvider for LinuxKernel<Host> {
-    type Instant = Host::Instant;
-    type SystemTime = Host::SystemTime;
+impl<Backend: backend::KernelBackend> TimeProvider for LinuxKernel<Backend> {
+    type Instant = Backend::Instant;
+    type SystemTime = Backend::SystemTime;
 
     fn now(&self) -> Self::Instant {
-        self.host.now()
+        self.backend.now()
     }
 
     fn current_time(&self) -> Self::SystemTime {
-        self.host.current_time()
+        self.backend.current_time()
     }
 }
 
-impl<Host: host::Host + IPInterfaceProvider> IPInterfaceProvider for LinuxKernel<Host> {
+impl<Backend: backend::KernelBackend + IPInterfaceProvider> IPInterfaceProvider
+    for LinuxKernel<Backend>
+{
     fn send_ip_packet(&self, packet: &[u8]) -> Result<(), litebox::platform::SendError> {
-        self.host.send_ip_packet(packet)
+        self.backend.send_ip_packet(packet)
     }
     fn receive_ip_packet(
         &self,
         packet: &mut [u8],
     ) -> Result<usize, litebox::platform::ReceiveError> {
-        self.host.receive_ip_packet(packet)
+        self.backend.receive_ip_packet(packet)
     }
 }
 
-impl<Host: host::Host, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
+impl<Backend: backend::KernelBackend, const ALIGN: usize> PageManagementProvider<ALIGN>
+    for LinuxKernel<Backend>
+{
     // User space occupies the low canonical half (0 .. 0x0000_7FFF_FFFF_FFFF).
     // Kernel memory lives in the high canonical half (at KERNEL_OFFSET).
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
@@ -808,7 +814,9 @@ impl<Host: host::Host, const ALIGN: usize> PageManagementProvider<ALIGN> for Lin
     }
 }
 
-impl<Host: host::Host> litebox::mm::vmem::VmemPageFaultHandler for LinuxKernel<Host> {
+impl<Backend: backend::KernelBackend> litebox::mm::vmem::VmemPageFaultHandler
+    for LinuxKernel<Backend>
+{
     unsafe fn handle_page_fault(
         &self,
         fault_addr: usize,
@@ -823,27 +831,29 @@ impl<Host: host::Host> litebox::mm::vmem::VmemPageFaultHandler for LinuxKernel<H
     }
 
     fn access_error(error_code: u64, flags: litebox::mm::vmem::VmFlags) -> bool {
-        mm::PageTable::<Host::Memory, PAGE_SIZE>::access_error(error_code, flags)
+        mm::PageTable::<Backend::Memory, PAGE_SIZE>::access_error(error_code, flags)
     }
 }
 
-impl<Host: host::Host + StdioProvider> StdioProvider for LinuxKernel<Host> {
+impl<Backend: backend::KernelBackend + StdioProvider> StdioProvider for LinuxKernel<Backend> {
     fn read_from_stdin(&self, buf: &mut [u8]) -> Result<usize, litebox::platform::StdioReadError> {
-        self.host.read_from_stdin(buf)
+        self.backend.read_from_stdin(buf)
     }
     fn write_to(
         &self,
         stream: litebox::platform::StdioOutStream,
         buf: &[u8],
     ) -> Result<usize, litebox::platform::StdioWriteError> {
-        self.host.write_to(stream, buf)
+        self.backend.write_to(stream, buf)
     }
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
-        self.host.is_a_tty(stream)
+        self.backend.is_a_tty(stream)
     }
 }
 
-impl<Host: host::Host> litebox::platform::SystemInfoProvider for LinuxKernel<Host> {
+impl<Backend: backend::KernelBackend> litebox::platform::SystemInfoProvider
+    for LinuxKernel<Backend>
+{
     fn get_syscall_entry_point(&self) -> usize {
         // Currently this is only used in ELF loader to fix trampoline code.
         // When running in kernel mode, we don't need a syscall trampoline.

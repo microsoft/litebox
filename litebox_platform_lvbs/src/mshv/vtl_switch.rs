@@ -8,7 +8,7 @@ use super::{
     VTL_ENTRY_REASON_INTERRUPT, VTL_ENTRY_REASON_LOWER_VTL_CALL, VTL_ENTRY_REASON_RESERVED,
     hvcall_vp::hvcall_get_vp_registers, vsm_intercept::vsm_handle_intercept,
 };
-use crate::host::lvbs::{
+use crate::backend::lvbs::{
     hv_hypercall_page_address,
     per_cpu_variables::{LvbsPerCpuVariables, Vtl0PerCpuVariablesAsm, with_per_cpu_variables},
 };
@@ -344,7 +344,7 @@ fn handle_vtl_entry() -> Option<[u64; NUM_VTLCALL_PARAMS]> {
         VtlEntryReason::Interrupt => {
             // TODO: Consider whether to handle VTL interrupts/intercepts here or
             // in the runner. Unlike other HVCI/HEKI and OP-TEE functions, this
-            // function relies on many host/platform-specific features to control
+            // function relies on many Hyper-V/VTL-specific features to control
             // VTL0's architecture state like injecting GP or advancing RIP.
             vsm_handle_intercept();
             None
@@ -421,9 +421,9 @@ pub fn vtl_switch(return_value: Option<i64>) -> [u64; NUM_VTLCALL_PARAMS] {
 
     loop {
         // Never hand the VP back to VTL0 with the preemption timer live.
-        crate::host::lvbs::timer::disarm_preemption();
-        if crate::host::lvbs::timer::take_user_timeout_kill() {
-            crate::serial_println!(crate::host::lvbs::console::print;
+        crate::backend::lvbs::timer::disarm_preemption();
+        if crate::backend::lvbs::timer::take_user_timeout_kill() {
+            crate::serial_println!(crate::backend::lvbs::console::print;
                 "Terminated user-mode code which exceeded its execution quantum"
             );
         }

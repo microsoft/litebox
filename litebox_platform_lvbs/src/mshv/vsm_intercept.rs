@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::{
-    host::lvbs::per_cpu_variables::with_per_cpu_variables,
+    backend::lvbs::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         DEFAULT_REG_PIN_MASK, HV_REGISTER_PENDING_EVENT0, HV_X64_REGISTER_APIC_BASE,
         HV_X64_REGISTER_CR0, HV_X64_REGISTER_CR4, HV_X64_REGISTER_CSTAR, HV_X64_REGISTER_EFER,
@@ -68,7 +68,7 @@ pub fn vsm_handle_intercept() {
                     &*ptr
                 };
                 let gpa = int_msg.gpa;
-                crate::debug_serial_println!(crate::host::lvbs::console::print; "VSM: GPA intercept on {gpa:#x}");
+                crate::debug_serial_println!(crate::backend::lvbs::console::print; "VSM: GPA intercept on {gpa:#x}");
             }
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault on GPA intercept");
         }
@@ -142,7 +142,7 @@ pub fn vsm_handle_intercept() {
             #[cfg(debug_assertions)]
             let msg_type = msg.header.message_type;
             #[cfg(debug_assertions)]
-            crate::debug_serial_println!(crate::host::lvbs::console::print;
+            crate::debug_serial_println!(crate::backend::lvbs::console::print;
                 "VSM: Ignore unknown synthetic interrupt message type {msg_type:#x}"
             );
         }
@@ -190,7 +190,7 @@ fn validate_and_continue_vtl0_register_write(
             advance_vtl0_rip(int_msg_hdr).expect("Failed to advance VTL0 RIP");
         } else {
             #[cfg(debug_assertions)]
-            crate::debug_serial_println!(crate::host::lvbs::console::print;
+            crate::debug_serial_println!(crate::backend::lvbs::console::print;
                 "VSM: Writing {value:#x} to reg {reg_name:#x} is disallowed"
             );
             raise_vtl0_gp_fault().expect("Failed to raise VTL0 GP fault");

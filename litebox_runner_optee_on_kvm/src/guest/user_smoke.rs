@@ -396,7 +396,7 @@ pub(super) fn run(platform: &Platform) {
     data[36..40].copy_from_slice(&0x3f80u32.to_le_bytes());
     map_and_copy(platform, DATA, &data, Perms::READ | Perms::WRITE);
     map_and_copy(platform, STACK, &[], Perms::READ | Perms::WRITE);
-    let timer = &platform.host().timer;
+    let timer = &platform.backend().timer;
     let (initial_arms, initial_exceptions) = timer.counts();
     let mut regs = PtRegs::default();
     let roundtrip = TestShim::new(Case::RoundTrip, platform);

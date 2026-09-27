@@ -9,7 +9,7 @@ use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
     arch::{enable_fsgsbase, enable_smep_smap, mm::PAGE_SIZE},
-    host::lvbs::{
+    backend::lvbs::{
         boot::enable_extended_states,
         bootparam::save_boot_info,
         per_cpu_variables::{allocate_per_cpu_variables, init_per_cpu_variables},
@@ -22,9 +22,9 @@ use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
 
 /// `log` backend that forwards to the serial console.
-struct HostLogger;
+struct SerialLogger;
 
-impl log::Log for HostLogger {
+impl log::Log for SerialLogger {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true
     }
@@ -32,13 +32,13 @@ impl log::Log for HostLogger {
     fn log(&self, record: &log::Record) {
         let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         let _ = litebox_util_log::format_record(&mut buf, record);
-        litebox_platform_lvbs::host::lvbs::console::write_serial(&buf);
+        litebox_platform_lvbs::backend::lvbs::console::write_serial(&buf);
     }
 
     fn flush(&self) {}
 }
 
-static HOST_LOGGER: HostLogger = HostLogger;
+static SERIAL_LOGGER: SerialLogger = SerialLogger;
 
 /// Spinlock protecting the shared AP boot stack (`VTL1_KERNEL_STACK_PAGE`).
 ///
@@ -439,15 +439,15 @@ pub unsafe extern "C" fn _start(possible_cpus: u64, mem_pa: u64, mem_size: u64) 
 
 unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
     if is_bsp {
-        let _ = log::set_logger(&HOST_LOGGER);
+        let _ = log::set_logger(&SERIAL_LOGGER);
         #[cfg(debug_assertions)]
         log::set_max_level(log::LevelFilter::Debug);
         #[cfg(not(debug_assertions))]
         log::set_max_level(log::LevelFilter::Warn);
 
-        serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "==============================");
-        serial_println!(litebox_platform_lvbs::host::lvbs::console::print; " Hello from LiteBox for LVBS! ");
-        serial_println!(litebox_platform_lvbs::host::lvbs::console::print; "==============================");
+        serial_println!(litebox_platform_lvbs::backend::lvbs::console::print; "==============================");
+        serial_println!(litebox_platform_lvbs::backend::lvbs::console::print; " Hello from LiteBox for LVBS! ");
+        serial_println!(litebox_platform_lvbs::backend::lvbs::console::print; "==============================");
     }
 
     let platform = litebox_runner_lvbs::init(is_bsp);

@@ -25,7 +25,7 @@ use crate::{
         VirtAddr,
         mm::paging::{X64PageTable, vmflags_to_pteflags},
     },
-    host::mock::{MockHost, MockKernel, MockMemory},
+    backend::mock::{MockBackend, MockKernel, MockMemory},
     mm::{MemoryProvider, pgtable::PageTableAllocator},
 };
 
@@ -40,7 +40,7 @@ static MAPPING: SpinMutex<ArrayVec<VirtAddr, 1024>> = SpinMutex::new(ArrayVec::n
 impl litebox::mm::allocator::MemoryProvider for MockMemory {
     fn alloc(layout: &core::alloc::Layout) -> Option<(usize, usize)> {
         let mut mapping = MAPPING.lock();
-        let (start, len) = MockHost::alloc(layout)?;
+        let (start, len) = MockBackend::alloc(layout)?;
         let begin = Page::<Size4KiB>::from_start_address(VirtAddr::new(start as _)).unwrap();
         let end = Page::<Size4KiB>::from_start_address(VirtAddr::new((start + len) as _)).unwrap();
         for page in Page::range(begin, end) {
@@ -54,18 +54,18 @@ impl litebox::mm::allocator::MemoryProvider for MockMemory {
     }
 
     unsafe fn free(addr: usize) {
-        unsafe { MockHost::free(addr) };
+        unsafe { MockBackend::free(addr) };
     }
 }
 
 impl crate::console::DiagnosticOutput for MockMemory {
     fn print(args: core::fmt::Arguments<'_>) {
-        MockHost::log(&alloc::format!("{args}"));
+        MockBackend::log(&alloc::format!("{args}"));
     }
 }
 
 impl super::MemoryProvider for MockMemory {
-    type Tlb = crate::host::mock::MockTlb;
+    type Tlb = crate::backend::mock::MockTlb;
 
     const GVA_OFFSET: super::VirtAddr = super::VirtAddr::new(0);
     const PRIVATE_PTE_MASK: u64 = 0;
@@ -243,7 +243,7 @@ fn test_vmm_page_fault() {
     let frame = x86_64::structures::paging::PhysFrame::containing_address(x86_64::PhysAddr::new(0));
     let platform = unsafe {
         MockKernel::from_memory(
-            MockHost {},
+            MockBackend {},
             x86_64::structures::paging::PhysFrame::range(frame, frame),
             &[],
         )

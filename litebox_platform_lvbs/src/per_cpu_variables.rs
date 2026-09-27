@@ -270,7 +270,7 @@ mod tests {
             (cpu.exception_stack.as_ptr() as usize + EXCEPTION_STACK_SIZE - 1) & !15
         );
         assert!(
-            cpu.active_page_table::<crate::host::mock::MockMemory>(0)
+            cpu.active_page_table::<crate::backend::mock::MockMemory>(0)
                 .is_none()
         );
         assert!(cpu.gdt.get().is_none());

@@ -13,7 +13,7 @@ use super::{
 };
 use crate::arch::mm::PAGE_SHIFT;
 use crate::{
-    host::lvbs::per_cpu_variables::with_per_cpu_variables,
+    backend::lvbs::per_cpu_variables::with_per_cpu_variables,
     mshv::{
         HV_PARTITION_ID_SELF, HVCALL_MODIFY_VTL_PROTECTION_MASK, HvInputModifyVtlProtectionMask,
         HvInputVtl, HvPageProtFlags, hvcall::hv_do_rep_hypercall,

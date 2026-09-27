@@ -4,7 +4,7 @@
 //! RingBuffer implementation and functions
 
 use super::{PrivilegedVmap, PrivilegedVtl0PhysMutPtr};
-use crate::host::lvbs::LvbsLinuxKernel;
+use crate::backend::lvbs::LvbsLinuxKernel;
 use core::fmt;
 use litebox::mm::vmem::PAGE_SIZE;
 use litebox::utils::TruncateExt;

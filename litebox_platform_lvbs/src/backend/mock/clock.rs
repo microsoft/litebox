@@ -5,7 +5,7 @@
 
 extern crate std;
 
-use super::MockHost;
+use super::MockBackend;
 use core::time::Duration;
 use litebox::platform::{Instant, SystemTime, TimeProvider};
 
@@ -34,7 +34,7 @@ impl SystemTime for MockSystemTime {
     }
 }
 
-impl TimeProvider for MockHost {
+impl TimeProvider for MockBackend {
     type Instant = MockInstant;
     type SystemTime = MockSystemTime;
 
@@ -48,12 +48,12 @@ impl TimeProvider for MockHost {
 }
 
 #[test]
-fn kernel_instant_type_follows_the_host_clock() {
+fn kernel_instant_type_follows_the_backend_clock() {
     use super::MockKernel;
 
     // The associated type must be the mock's, not a Hyper-V instant selected
     // by shared kernel code. No privileged kernel construction is needed.
-    let now: <MockKernel as TimeProvider>::Instant = MockHost {}.now();
+    let now: <MockKernel as TimeProvider>::Instant = MockBackend {}.now();
     let later = now.checked_add(Duration::from_nanos(1)).unwrap();
     assert_eq!(
         later.checked_duration_since(&now),
@@ -63,7 +63,7 @@ fn kernel_instant_type_follows_the_host_clock() {
 }
 
 #[test]
-fn kernel_wall_time_type_follows_the_host_clock() {
+fn kernel_wall_time_type_follows_the_backend_clock() {
     use super::MockKernel;
 
     let epoch = <MockKernel as TimeProvider>::SystemTime::UNIX_EPOCH;
