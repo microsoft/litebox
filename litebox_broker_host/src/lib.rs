@@ -511,6 +511,10 @@ fn handle_request<Memory: SharedMemory>(
             .exit_child_process(child_process_id, exit_status)
             .map(|()| BrokerResult::ProcessExited)
             .map_err(RequestFailure::from),
+        BrokerOperation::ReportExitStatus(exit_status) => process
+            .report_exit_status(exit_status)
+            .map(|()| BrokerResult::ExitStatusReported)
+            .map_err(RequestFailure::from),
         BrokerOperation::Event(request) => {
             handle_event_request(process, request).map(BrokerResult::Event)
         }

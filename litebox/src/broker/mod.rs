@@ -66,6 +66,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         exit_status: ProcessExitStatus,
     ) -> core::result::Result<(), BrokerControlError>;
 
+    fn report_exit_status(
+        &self,
+        exit_status: ProcessExitStatus,
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn process_exit_status(
         &self,
         handle: ObjectHandle,
@@ -483,6 +488,13 @@ where
         exit_status: ProcessExitStatus,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.exit_child_process(child_process_id, exit_status))
+    }
+
+    fn report_exit_status(
+        &self,
+        exit_status: ProcessExitStatus,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.report_exit_status(exit_status))
     }
 
     fn process_exit_status(

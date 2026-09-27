@@ -50,6 +50,13 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         let child = broker.allocate_child_process()?;
         Ok(Process::new(self, broker, child.identity, child.handle))
     }
+
+    /// Reports this process's final termination status, which its parent
+    /// observes once this process's runner exits.
+    pub fn report_exit_status(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.report_exit_status(exit_status)?)
+    }
 }
 
 /// A broker process object.

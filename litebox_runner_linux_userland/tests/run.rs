@@ -196,32 +196,31 @@ fn numeric_field(line: &str, name: &str) -> i32 {
         .unwrap_or_else(|| panic!("missing {name} in {line:?}"))
 }
 
+/// Runs `vfork_exec_parent.c`, which execs `vfork_exec_child.c` with
+/// `child_args`, and returns the combined output.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-#[test]
-fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
-    let parent = common::compile(
-        "./tests/vfork_exec_parent.c",
-        "vfork_exec_parent",
-        true,
-        false,
-    );
-    let child = common::compile(
-        "./tests/vfork_exec_child.c",
-        "vfork_exec_child",
-        true,
-        false,
-    );
+fn run_vfork_exec(name: &str, child_args: &[&str]) -> String {
+    let parent_name = format!("{name}_parent");
+    let child_name = format!("{name}_child");
+    let parent = common::compile("./tests/vfork_exec_parent.c", &parent_name, true, false);
+    let child = common::compile("./tests/vfork_exec_child.c", &child_name, true, false);
     let child_guest_path = std::path::absolute(&child).unwrap();
-    let mut runner = Runner::new(&parent, "vfork_exec_parent");
+    let mut runner = Runner::new(&parent, &parent_name);
     runner
         .allow_process_duplication()
         .arg(&child_guest_path)
+        .args(child_args)
         .with_fs_path(|root| {
             let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
             assert!(common::rewrite_with_cache(&child, &destination, &[]));
         });
+    String::from_utf8(runner.output()).unwrap()
+}
 
-    let output = String::from_utf8(runner.output()).unwrap();
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
+    let output = run_vfork_exec("vfork_exec", &[]);
     let parent_line = output
         .lines()
         .find(|line| line.starts_with("parent "))
@@ -246,6 +245,24 @@ fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
     assert_eq!(numeric_field(child_line, "tid="), reported_child);
     assert!(child_line.contains("marker=from-vfork"));
     assert!(child_line.contains("env=1"));
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_exec_child_signal_death_is_reported_to_parent() {
+    let output = run_vfork_exec("vfork_exec_abort", &["abort"]);
+    let parent_line = output
+        .lines()
+        .find(|line| line.starts_with("parent "))
+        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
+
+    assert_eq!(
+        numeric_field(parent_line, "waited="),
+        numeric_field(parent_line, "child=")
+    );
+    assert_eq!(numeric_field(parent_line, "exited="), 0);
+    assert_eq!(numeric_field(parent_line, "signaled="), 1);
+    assert_eq!(numeric_field(parent_line, "signal="), libc::SIGABRT);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

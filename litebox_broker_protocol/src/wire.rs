@@ -52,6 +52,7 @@ const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
 const REQUEST_TAG_GET_PROCESS_EXIT_STATUS: u8 = 12;
 const REQUEST_TAG_EXIT_CHILD_PROCESS: u8 = 13;
+const REQUEST_TAG_REPORT_EXIT_STATUS: u8 = 14;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
@@ -76,6 +77,7 @@ const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
 const RESPONSE_TAG_PROCESS_EXIT_STATUS: u8 = 12;
 const RESPONSE_TAG_PROCESS_EXITED: u8 = 13;
+const RESPONSE_TAG_EXIT_STATUS_REPORTED: u8 = 14;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -137,7 +139,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_CHILD_PROCESS
         | REQUEST_TAG_GET_PROCESS_EXIT_STATUS
-        | REQUEST_TAG_EXIT_CHILD_PROCESS => {
+        | REQUEST_TAG_EXIT_CHILD_PROCESS
+        | REQUEST_TAG_REPORT_EXIT_STATUS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -239,6 +242,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.process_id(child_process_id);
             encode_process_exit_status(&mut encoder, exit_status);
         }
+        BrokerOperation::ReportExitStatus(exit_status) => {
+            encoder.u8(REQUEST_TAG_REPORT_EXIT_STATUS);
+            encoder.request_id(request_id);
+            encode_process_exit_status(&mut encoder, exit_status);
+        }
     }
     encoder.finish()
 }
@@ -261,7 +269,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_CHILD_PROCESS
         | REQUEST_TAG_GET_PROCESS_EXIT_STATUS
-        | REQUEST_TAG_EXIT_CHILD_PROCESS => {}
+        | REQUEST_TAG_EXIT_CHILD_PROCESS
+        | REQUEST_TAG_REPORT_EXIT_STATUS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -306,6 +315,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                 child_process_id: decoder.process_id()?,
                 exit_status: decode_process_exit_status(&mut decoder)?,
             })
+        }
+        REQUEST_TAG_REPORT_EXIT_STATUS => {
+            BrokerOperation::ReportExitStatus(decode_process_exit_status(&mut decoder)?)
         }
         _ => unreachable!("active request tag was validated"),
     };
@@ -385,7 +397,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
         | RESPONSE_TAG_PROCESS_EXIT_STATUS
-        | RESPONSE_TAG_PROCESS_EXITED => {
+        | RESPONSE_TAG_PROCESS_EXITED
+        | RESPONSE_TAG_EXIT_STATUS_REPORTED => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -486,6 +499,10 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_PROCESS_EXITED);
             encoder.request_id(request_id);
         }
+        BrokerResult::ExitStatusReported => {
+            encoder.u8(RESPONSE_TAG_EXIT_STATUS_REPORTED);
+            encoder.request_id(request_id);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -516,7 +533,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
         | RESPONSE_TAG_PROCESS_EXIT_STATUS
-        | RESPONSE_TAG_PROCESS_EXITED => {}
+        | RESPONSE_TAG_PROCESS_EXITED
+        | RESPONSE_TAG_EXIT_STATUS_REPORTED => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -547,6 +565,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
             BrokerResult::ProcessExitStatus(decode_process_exit_status(&mut decoder)?)
         }
         RESPONSE_TAG_PROCESS_EXITED => BrokerResult::ProcessExited,
+        RESPONSE_TAG_EXIT_STATUS_REPORTED => BrokerResult::ExitStatusReported,
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -734,6 +753,7 @@ mod tests {
                 RESPONSE_TAG_PROCESS_STARTED,
                 RESPONSE_TAG_PROCESS_EXIT_STATUS,
                 RESPONSE_TAG_PROCESS_EXITED,
+                RESPONSE_TAG_EXIT_STATUS_REPORTED,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -750,6 +770,7 @@ mod tests {
                 REQUEST_TAG_START_CHILD_PROCESS,
                 REQUEST_TAG_GET_PROCESS_EXIT_STATUS,
                 REQUEST_TAG_EXIT_CHILD_PROCESS,
+                REQUEST_TAG_REPORT_EXIT_STATUS,
             ]
         );
         assert_eq!(
@@ -1042,6 +1063,9 @@ mod tests {
                 child_process_id: process_id(1),
                 exit_status: ProcessExitStatus::Unknown,
             }),
+            BrokerOperation::ReportExitStatus(ProcessExitStatus::Exited { code: u32::MAX }),
+            BrokerOperation::ReportExitStatus(ProcessExitStatus::Signaled { signal: 6 }),
+            BrokerOperation::ReportExitStatus(ProcessExitStatus::Unknown),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1392,6 +1416,7 @@ mod tests {
             BrokerResult::ProcessExitStatus(ProcessExitStatus::Signaled { signal: 11 }),
             BrokerResult::ProcessExitStatus(ProcessExitStatus::Unknown),
             BrokerResult::ProcessExited,
+            BrokerResult::ExitStatusReported,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),

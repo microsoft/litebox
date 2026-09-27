@@ -31,6 +31,7 @@ use litebox::{
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence,
 };
+use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
     OFlags, SyscallRequest,
     errno::Errno,
@@ -358,6 +359,18 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
             syscalls::process::ExitStatus::Exit(v) => v.into(),
             // TODO: return the enum instead of just a code?
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 256,
+        }
+    }
+
+    /// Wait for the process to exit, returning its termination status.
+    pub fn wait_for_exit_status(&self) -> ProcessExitStatus {
+        match self.0.wait_for_exit() {
+            syscalls::process::ExitStatus::Exit(v) => ProcessExitStatus::Exited {
+                code: u32::from(v.cast_unsigned()),
+            },
+            syscalls::process::ExitStatus::Signal(signal) => ProcessExitStatus::Signaled {
+                signal: signal.as_i32().cast_unsigned(),
+            },
         }
     }
 

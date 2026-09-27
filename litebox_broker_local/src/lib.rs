@@ -238,6 +238,22 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Reports this process's final termination status before its runner
+    /// exits.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn report_exit_status(&self, exit_status: ProcessExitStatus) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::ReportExitStatus(exit_status))? {
+            BrokerResult::ExitStatusReported => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected exit-status report response: {response:?}")
+            }
+        }
+    }
+
     /// Allocates one pending child process and its parent-owned handle.
     ///
     /// # Panics
