@@ -49,6 +49,51 @@ macro_rules! define_page_reservation {
     };
 }
 
+/// Reservation store for page managers that do not retain reservation handles.
+#[derive(Default)]
+pub struct NoTrackedReservations<const ALIGN: usize>;
+
+crate::define_page_reservation!(NoTrackedReservation);
+
+impl<const ALIGN: usize> NoTrackedReservations<ALIGN> {
+    /// Represent an exclusively owned range without retaining its reservation handle.
+    ///
+    /// # Safety
+    ///
+    /// `range` must be exclusively owned, nonempty, and `ALIGN`-aligned.
+    pub unsafe fn from_owned_range(range: Range<usize>) -> NoTrackedReservation<ALIGN> {
+        // SAFETY: The caller establishes the reservation ownership and alignment requirements.
+        unsafe { NoTrackedReservation::new(range) }
+    }
+}
+
+impl<const ALIGN: usize> ReservationStore for NoTrackedReservations<ALIGN> {
+    type Reservation = NoTrackedReservation<ALIGN>;
+
+    fn insert(
+        &mut self,
+        _base: usize,
+        _reservation: Self::Reservation,
+    ) -> Option<Self::Reservation> {
+        None
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Self::Reservation)> {
+        core::iter::empty()
+    }
+
+    fn overlapping(
+        &self,
+        _range: Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)> {
+        core::iter::empty()
+    }
+
+    fn take_overlapping(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
+        Vec::new()
+    }
+}
+
 /// Reservations indexed by their starting address.
 pub struct TrackedReservations<Reservation>(BTreeMap<usize, Reservation>);
 
@@ -137,10 +182,24 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
 mod tests {
     use alloc::vec::Vec;
 
-    use super::TrackedReservations;
+    use super::{NoTrackedReservations, TrackedReservations};
     use crate::platform::page_mgmt::{PageReservation, ReservationStore as _};
 
     crate::define_page_reservation!(TestReservation);
+
+    #[test]
+    fn untracked_reservations_retain_no_handles() {
+        let mut reservations = NoTrackedReservations::<0x1000>;
+        let range = 0x1000..0x3000;
+        // SAFETY: The test range is nonempty, aligned, and uniquely represented.
+        let reservation = unsafe { NoTrackedReservations::from_owned_range(range.clone()) };
+
+        assert_eq!(reservation.range(), range);
+        assert!(reservations.insert(range.start, reservation).is_none());
+        assert_eq!(reservations.iter().count(), 0);
+        assert_eq!(reservations.overlapping(range.clone()).count(), 0);
+        assert!(reservations.take_overlapping(range).is_empty());
+    }
 
     #[test]
     fn reservation_segments_and_take_overlapping_in_order() {
