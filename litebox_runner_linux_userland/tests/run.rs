@@ -73,6 +73,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
     "vfork_exec_parent.c",
+    "vfork_exit_parent.c",
 ];
 
 const BROKER_ONLY_C_TESTS: &[&str] = &[
@@ -185,18 +186,19 @@ fn test_static_exec_with_rewriter() {
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn numeric_field(line: &str, name: &str) -> i32 {
+    line.split_whitespace()
+        .find_map(|field| {
+            field
+                .strip_prefix(name)
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or_else(|| panic!("missing {name} in {line:?}"))
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
-    fn numeric_field(line: &str, name: &str) -> i32 {
-        line.split_whitespace()
-            .find_map(|field| {
-                field
-                    .strip_prefix(name)
-                    .and_then(|value| value.parse().ok())
-            })
-            .unwrap_or_else(|| panic!("missing {name} in {line:?}"))
-    }
-
     let parent = common::compile(
         "./tests/vfork_exec_parent.c",
         "vfork_exec_parent",
@@ -244,6 +246,39 @@ fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
     assert_eq!(numeric_field(child_line, "tid="), reported_child);
     assert!(child_line.contains("marker=from-vfork"));
     assert!(child_line.contains("env=1"));
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_child_exit_resumes_parent_with_waitable_child() {
+    let parent = common::compile(
+        "./tests/vfork_exit_parent.c",
+        "vfork_exit_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "vfork_exit_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    let parent_line = line("parent ");
+    let parent_pid = numeric_field(parent_line, "before=");
+    assert_eq!(numeric_field(parent_line, "after="), parent_pid);
+    assert_eq!(numeric_field(parent_line, "echild="), 1);
+    for (prefix, code) in [("exit_group ", 37), ("exit ", 38)] {
+        let child_line = line(prefix);
+        let child = numeric_field(child_line, "child=");
+        assert_ne!(child, parent_pid);
+        assert_eq!(numeric_field(child_line, "waited="), child);
+        assert_eq!(numeric_field(child_line, "exited="), 1);
+        assert_eq!(numeric_field(child_line, "code="), code);
+    }
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

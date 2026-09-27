@@ -96,3 +96,13 @@ pub struct StartChildProcessRequest {
     /// Process startup source.
     pub source: StartChildProcessSource,
 }
+
+/// Records the exit of a pending child that ran without starting its own
+/// runner, as a Linux `vfork` child does before `execve`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExitChildProcessRequest {
+    /// Pending child that exited.
+    pub child_process_id: ProcessId,
+    /// Termination status retained until the child is reaped.
+    pub exit_status: ProcessExitStatus,
+}

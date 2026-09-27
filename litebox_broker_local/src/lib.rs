@@ -40,9 +40,9 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, CreatedProcess, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, ExitChildProcessRequest,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -214,6 +214,27 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerResult::ProcessStarted => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
+        }
+    }
+
+    /// Records the exit of a pending child created by
+    /// [`Self::allocate_child_process`] that never started.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn exit_child_process(
+        &self,
+        child_process_id: ProcessId,
+        exit_status: ProcessExitStatus,
+    ) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
+            child_process_id,
+            exit_status,
+        }))? {
+            BrokerResult::ProcessExited => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected process-exit response: {response:?}"),
         }
     }
 

@@ -44,8 +44,9 @@ use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, ExitChildProcessRequest, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -502,6 +503,13 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::GetProcessExitStatus(handle) => process
             .process_exit_status(handle)
             .map(BrokerResult::ProcessExitStatus)
+            .map_err(RequestFailure::from),
+        BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
+            child_process_id,
+            exit_status,
+        }) => process
+            .exit_child_process(child_process_id, exit_status)
+            .map(|()| BrokerResult::ProcessExited)
             .map_err(RequestFailure::from),
         BrokerOperation::Event(request) => {
             handle_event_request(process, request).map(BrokerResult::Event)

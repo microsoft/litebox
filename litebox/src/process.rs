@@ -96,6 +96,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
             .start_child_process(self.identity.process_id, payload)?)
     }
 
+    /// Records that this pending child process exited without starting a
+    /// runner, leaving it a zombie reporting `exit_status`.
+    pub fn exit(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
+        Ok(self
+            .broker
+            .exit_child_process(self.identity.process_id, exit_status)?)
+    }
+
     /// Returns the process's termination status, or `None` while the process is live.
     pub fn exit_status(&self) -> Result<Option<ProcessExitStatus>, ProcessError> {
         match self.broker.process_exit_status(self.handle) {

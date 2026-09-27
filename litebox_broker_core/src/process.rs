@@ -174,7 +174,7 @@ impl ProcessStatus {
         let allowed = matches!(
             (*self, next),
             (Self::Starting, Self::Running | Self::Failed(_))
-                | (Self::Running, Self::Exiting)
+                | (Self::Starting | Self::Running, Self::Exiting)
                 | (Self::Exiting, Self::Zombie(_))
         );
         if !allowed {
@@ -438,6 +438,35 @@ impl BrokerProcess {
             .ok_or(BrokerError::Internal)
     }
 
+    /// Records the exit of the pending child selected by `child_process_id`.
+    ///
+    /// A child may run in this process's runner before starting its own, as a
+    /// Linux `vfork` child does until `execve`. If it exits there, it becomes
+    /// a zombie retaining `exit_status`, like a started child after
+    /// [`Self::complete_exit`].
+    pub fn exit_child_process(
+        &self,
+        child_process_id: ProcessId,
+        exit_status: ProcessExitStatus,
+    ) -> Result<()> {
+        let child = self.take_child_process(child_process_id)?;
+        // The child never had a runner, so its teardown is fully accounted.
+        child.retire(true);
+        let release_thread_ids = {
+            let mut state = child.state.lock();
+            // Owner death fails the child if it takes the child lock first.
+            if let ProcessStatus::Failed(error) = state.status {
+                return Err(error);
+            }
+            state.status.transition(ProcessStatus::Exiting)?;
+            matches!(
+                state.retirement,
+                ProcessRetirement::Retired { release_ids: true }
+            )
+        };
+        child.finish_exit(exit_status, release_thread_ids)
+    }
+
     /// Returns whether this process completed broker startup.
     #[must_use]
     pub fn is_running(&self) -> bool {
@@ -450,7 +479,8 @@ impl BrokerProcess {
     pub fn startup_result(&self) -> Option<Result<()>> {
         match self.state.lock().status {
             ProcessStatus::Starting => None,
-            // Exit is reachable only after startup completed.
+            // A process exits only after it runs, possibly before starting its
+            // own runner.
             ProcessStatus::Running | ProcessStatus::Exiting | ProcessStatus::Zombie(_) => {
                 Some(Ok(()))
             }
@@ -504,6 +534,12 @@ impl BrokerProcess {
                 ProcessRetirement::Retired { release_ids: true }
             )
         };
+        self.finish_exit(exit_status, release_thread_ids)
+    }
+
+    /// Releases the resources of a process whose exit this caller claimed,
+    /// then makes it a zombie retaining `exit_status`.
+    fn finish_exit(&self, exit_status: ProcessExitStatus, release_thread_ids: bool) -> Result<()> {
         // Like Linux, release resources before the exit becomes observable, so
         // a parent that reaps the child sees its pipes and sockets closed.
         if self.release_references() {
@@ -1430,6 +1466,7 @@ mod tests {
         let states = process_statuses();
         let allowed = [
             (State::Starting, State::Running),
+            (State::Starting, State::Exiting),
             (State::Starting, failed),
             (State::Running, State::Exiting),
             (State::Exiting, State::Zombie(EXITED)),
@@ -1734,6 +1771,77 @@ mod tests {
             parent.take_child_process(process_id),
             Err(BrokerError::PeerClosed)
         ));
+    }
+
+    #[test]
+    fn pending_child_exit_leaves_waitable_zombie_without_starting() {
+        let lifecycle = Arc::new(TestProcessLifecycleSink::default());
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap()
+        .with_process_lifecycle_sink(lifecycle.clone());
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let sink = readiness_sink();
+        let CreatedProcess { identity, handle } =
+            parent.allocate_child_process(sink.clone()).unwrap();
+        let process_id = identity.process_id;
+        let changes = lifecycle.changes.load(Ordering::Relaxed);
+        let threads = broker.active_thread_count.load(Ordering::Relaxed);
+
+        assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(()));
+
+        assert_eq!(parent.process_exit_status(handle), Ok(EXITED));
+        assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes + 1);
+        assert_eq!(
+            *sink.published.lock().unwrap(),
+            [(handle, ReadinessFlags::READ)]
+        );
+        assert_eq!(
+            broker.active_thread_count.load(Ordering::Relaxed),
+            threads - 1
+        );
+        assert_eq!(
+            parent.exit_child_process(process_id, SIGNALED),
+            Err(BrokerError::UnknownObject)
+        );
+
+        // The zombie stays until its handle closes.
+        assert!(broker.processes.read().contains_key(&process_id));
+        parent.close_object_reference(handle).unwrap();
+        assert!(!broker.processes.read().contains_key(&process_id));
+    }
+
+    #[test]
+    fn pending_child_exit_after_owner_death_is_rejected() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let CreatedProcess { identity, handle } =
+            parent.allocate_child_process(readiness_sink()).unwrap();
+
+        parent.handle_owner_death();
+
+        assert_eq!(
+            parent.exit_child_process(identity.process_id, EXITED),
+            Err(BrokerError::PeerClosed)
+        );
+        assert_eq!(
+            parent.process_exit_status(handle),
+            Ok(ProcessExitStatus::Unknown)
+        );
     }
 
     #[test]
