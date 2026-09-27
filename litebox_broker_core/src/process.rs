@@ -701,7 +701,7 @@ impl BrokerProcess {
             (state.shutdown.clone(), state.exit_readiness.take())
         };
         drop(parent);
-        // Like an exit, release references the child inherited before the failure is observable.
+        // Release the child's references before publishing the failure.
         if self.release_references() {
             self.state.lock().retirement.mark_abnormal();
         }
