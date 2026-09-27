@@ -9,13 +9,13 @@
 #include <unistd.h>
 
 int main(int argc, char **argv) {
-    if (argc != 2 || argv[1][0] != '/') {
-        fprintf(stderr, "usage: %s /absolute/child/path\n", argv[0]);
+    if (argc < 2 || argc > 3 || argv[1][0] != '/') {
+        fprintf(stderr, "usage: %s /absolute/child/path [marker]\n", argv[0]);
         return 2;
     }
 
     pid_t parent_before = getpid();
-    char *child_argv[] = {argv[1], "from-vfork", NULL};
+    char *child_argv[] = {argv[1], argc == 3 ? argv[2] : "from-vfork", NULL};
     char *child_envp[] = {"VFORK_EXEC_TEST=1", NULL};
     printf("vfork-started\n");
     fflush(stdout);
@@ -42,8 +42,9 @@ int main(int argc, char **argv) {
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
     printf("parent before=%d after=%d child=%d waited=%d exited=%d code=%d "
-           "again=%d echild=%d\n",
+           "signaled=%d signal=%d again=%d echild=%d\n",
            parent_before, parent_after, child_pid, waited, WIFEXITED(status),
-           WEXITSTATUS(status), again, again == -1 && again_errno == ECHILD);
+           WEXITSTATUS(status), WIFSIGNALED(status), WTERMSIG(status), again,
+           again == -1 && again_errno == ECHILD);
     return parent_before == parent_after ? 0 : 4;
 }

@@ -138,6 +138,8 @@ pub struct BrokerProcess {
 
 struct BrokerProcessState {
     status: ProcessStatus,
+    /// Final termination status reported by the running process.
+    reported_exit_status: Option<ProcessExitStatus>,
     /// Parent handle readiness published once this process terminates.
     exit_readiness: Option<ReadinessRegistration>,
     /// Child retained until this process requests startup.
@@ -243,6 +245,7 @@ impl BrokerProcess {
             parent,
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
+                reported_exit_status: None,
                 exit_readiness: None,
                 pending_child_process: None,
                 continue_startup_on_parent_death: false,
@@ -467,6 +470,20 @@ impl BrokerProcess {
         child.finish_exit(exit_status, release_thread_ids)
     }
 
+    /// Records the final termination status reported by this running process.
+    ///
+    /// A runner observes its guest's termination more precisely than its host
+    /// exit status can convey, such as a guest killed by a signal. The latest
+    /// report replaces the host status once [`Self::complete_exit`] runs.
+    pub fn report_exit_status(&self, exit_status: ProcessExitStatus) -> Result<()> {
+        let mut state = self.state.lock();
+        if !self.accepts_operations(&state) {
+            return Err(BrokerError::PeerClosed);
+        }
+        state.reported_exit_status = Some(exit_status);
+        Ok(())
+    }
+
     /// Returns whether this process completed broker startup.
     #[must_use]
     pub fn is_running(&self) -> bool {
@@ -518,8 +535,11 @@ impl BrokerProcess {
     /// and runner supervision release it. The parent's handle becomes
     /// readable. Only the first completion releases resources and records its
     /// status; later or concurrent completions return without effect.
+    ///
+    /// A status reported through [`Self::report_exit_status`] takes precedence
+    /// over `exit_status`.
     pub fn complete_exit(&self, exit_status: ProcessExitStatus) -> Result<()> {
-        let release_thread_ids = {
+        let (exit_status, release_thread_ids) = {
             let mut state = self.state.lock();
             match state.status {
                 ProcessStatus::Running => {}
@@ -529,9 +549,12 @@ impl BrokerProcess {
             }
             // Only the caller that claims the exit releases resources.
             state.status.transition(ProcessStatus::Exiting)?;
-            matches!(
-                state.retirement,
-                ProcessRetirement::Retired { release_ids: true }
+            (
+                state.reported_exit_status.unwrap_or(exit_status),
+                matches!(
+                    state.retirement,
+                    ProcessRetirement::Retired { release_ids: true }
+                ),
             )
         };
         self.finish_exit(exit_status, release_thread_ids)
@@ -1590,6 +1613,31 @@ mod tests {
         );
         assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
         assert!(sink.published.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reported_exit_status_replaces_runner_status() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let (child, handle) = root.create_child_process(readiness_sink()).unwrap();
+        assert_eq!(
+            child.report_exit_status(SIGNALED),
+            Err(BrokerError::PeerClosed)
+        );
+        child.complete_start().unwrap();
+
+        child.report_exit_status(SIGNALED).unwrap();
+        child.retire(true);
+        child.complete_exit(EXITED).unwrap();
+
+        assert_eq!(root.process_exit_status(handle), Ok(SIGNALED));
     }
 
     #[test]

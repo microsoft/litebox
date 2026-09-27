@@ -221,6 +221,12 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         }
     }
 
+    // The shell exit code cannot tell a signal death from an exit with code
+    // 128+signal, so report the guest status for the parent to observe. If the
+    // report fails, the broker falls back to the runner's host exit status.
+    let _ = shim
+        .litebox()
+        .report_exit_status(program.process.wait_for_exit_status());
     Ok(program.process.wait_for_unix_shell_exit_code())
 }
 

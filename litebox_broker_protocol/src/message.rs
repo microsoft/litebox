@@ -77,6 +77,11 @@ pub enum BrokerOperation {
     GetProcessExitStatus(ObjectHandle),
     /// Record the exit of one pending child process that never started.
     ExitChildProcess(ExitChildProcessRequest),
+    /// Report this process's final termination status before its runner exits.
+    ///
+    /// The status is published once the runner exits, replacing the status the
+    /// broker would otherwise infer from the runner's host termination.
+    ReportExitStatus(ProcessExitStatus),
 }
 
 impl BrokerOperation {
@@ -121,6 +126,7 @@ impl BrokerOperation {
             | Self::ExitThread(_)
             | Self::CloseObject(_)
             | Self::ExitChildProcess(_)
+            | Self::ReportExitStatus(_)
             | Self::GetProcessExitStatus(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
@@ -265,6 +271,8 @@ pub enum BrokerResult {
     ProcessExitStatus(ProcessExitStatus),
     /// A pending child's exit was recorded.
     ProcessExited,
+    /// This process's final termination status was recorded.
+    ExitStatusReported,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
