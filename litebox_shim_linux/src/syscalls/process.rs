@@ -805,20 +805,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Begins a constrained `vfork` child in the current runner.
     ///
     /// Only single-threaded processes with default filesystem, resource-limit, alarm, and
-    /// transferable descriptor state are admitted. The child gets a copy of the parent's signal
-    /// dispositions, blocked mask, and alternate stack, but none of its pending signals; the
-    /// parent's signal state is restored when it resumes. The parent remains suspended until the
-    /// child exits, is killed by a signal, or successfully transfers to a fresh runner through
-    /// `execve`; an `execve` that fails before the transfer returns its error to the child. The
-    /// child must not change standard descriptor mappings or flags, or platform-managed
-    /// architectural state outside [`litebox_common_linux::PtRegs`], because the current transfer
-    /// does not preserve that state.
+    /// transferable descriptor state are admitted. Automatic child reaping is unsupported, so
+    /// `SIGCHLD` must not be ignored or have `SA_NOCLDWAIT`. The child gets a copy of the
+    /// parent's signal dispositions, blocked mask, and alternate stack, but none of its pending
+    /// signals; the parent's signal state is restored when it resumes. The parent remains
+    /// suspended until the child exits, is killed by a signal, or successfully transfers to a
+    /// fresh runner through `execve`; an `execve` that fails before the transfer returns its error
+    /// to the child. The child must not change standard descriptor mappings or flags, or
+    /// platform-managed architectural state outside [`litebox_common_linux::PtRegs`], because the
+    /// current transfer does not preserve that state.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
             || self.thread.process.nr_threads() != 1
             || !self.files.borrow().has_only_standard_descriptor_numbers()
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
+            || self.signals.reaps_children_automatically()
             || !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
         {
@@ -2330,6 +2332,39 @@ mod tests {
 
         assert!(!task.process().limits.has_default_state());
         assert_eq!(task.sys_vfork(&PtRegs::default()), Err(Errno::EAGAIN));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vfork_rejects_automatic_child_reaping() {
+        use crate::syscalls::tests::init_platform;
+        use litebox_common_linux::signal::{SIG_DFL, SIG_IGN, SaFlags, SigAction, SigSet, Signal};
+        use litebox_common_linux::{PtRegs, errno::Errno};
+
+        let task = init_platform();
+        // Without automatic reaping, admission reaches the broker, whose test policy denies
+        // duplication.
+        assert!(matches!(
+            task.sys_vfork(&PtRegs::default()),
+            Err(errno) if errno != Errno::EAGAIN
+        ));
+        for (sigaction, flags) in [(SIG_IGN, SaFlags::empty()), (SIG_DFL, SaFlags::NOCLDWAIT)] {
+            let act = SigAction {
+                sigaction,
+                flags,
+                __pad: 0,
+                restorer: 0,
+                mask: SigSet::empty(),
+            };
+            task.sys_rt_sigaction(
+                Signal::SIGCHLD,
+                Some(UserPtr::from_ptr(&raw const act)),
+                None,
+                size_of::<SigSet>(),
+            )
+            .unwrap();
+            assert_eq!(task.sys_vfork(&PtRegs::default()), Err(Errno::EAGAIN));
+        }
     }
 
     #[cfg(target_arch = "x86_64")]

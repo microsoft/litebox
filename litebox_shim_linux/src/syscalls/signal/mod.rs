@@ -154,6 +154,14 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         ignored
     }
 
+    /// Returns whether terminated children are reaped automatically instead of becoming zombies,
+    /// because `SIGCHLD` is ignored or has `SA_NOCLDWAIT`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn reaps_children_automatically(&self) -> bool {
+        let action = self.handlers.borrow().inner.lock()[Signal::SIGCHLD].action;
+        action.sigaction == SIG_IGN || action.flags.contains(SaFlags::NOCLDWAIT)
+    }
+
     /// Gives the `vfork` child a copy of the current dispositions, blocked mask, and alternate
     /// stack with no pending thread signals, returning the suspended parent's state.
     ///
