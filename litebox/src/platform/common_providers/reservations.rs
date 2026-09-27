@@ -77,6 +77,21 @@ impl<const ALIGN: usize> ReservationStore for NoTrackedReservations<ALIGN> {
     type Reservation = NoTrackedReservation<ALIGN>;
     type ReleaseTarget = Range<usize>;
 
+    unsafe fn release_all<Platform, const PAGE_ALIGN: usize, V>(
+        &mut self,
+        vmas: &rangemap::RangeMap<usize, V>,
+        platform: &Platform,
+    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
+    where
+        Platform: crate::platform::PageManagementProvider<PAGE_ALIGN, Reservations = Self>,
+    {
+        for (range, _) in vmas.iter() {
+            // SAFETY: The caller relinquishes this provider-owned range without remaining users.
+            let _ = unsafe { platform.release_pages(range.clone()) };
+        }
+        Ok(())
+    }
+
     fn insert(
         &mut self,
         _base: usize,
@@ -138,6 +153,21 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
 impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Reservation> {
     type Reservation = Reservation;
     type ReleaseTarget = Reservation;
+
+    unsafe fn release_all<Platform, const ALIGN: usize, V>(
+        &mut self,
+        _vmas: &rangemap::RangeMap<usize, V>,
+        platform: &Platform,
+    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
+    where
+        Platform: crate::platform::PageManagementProvider<ALIGN, Reservations = Self>,
+    {
+        for (_, reservation) in core::mem::take(&mut self.0) {
+            // SAFETY: The caller relinquishes this reservation without remaining users.
+            let _ = unsafe { platform.release_pages(reservation) };
+        }
+        Ok(())
+    }
 
     fn insert(&mut self, base: usize, reservation: Reservation) -> Option<Reservation> {
         let replaced = self.0.insert(base, reservation);

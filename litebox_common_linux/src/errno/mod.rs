@@ -296,6 +296,7 @@ impl From<crate::vmem::MappingError> for Errno {
 impl From<litebox::platform::page_mgmt::RemapError> for Errno {
     fn from(value: litebox::platform::page_mgmt::RemapError) -> Self {
         match value {
+            litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform => Errno::ENOSYS,
             litebox::platform::page_mgmt::RemapError::Unaligned
             | litebox::platform::page_mgmt::RemapError::Overlapping => Errno::EINVAL,
             litebox::platform::page_mgmt::RemapError::AlreadyAllocated

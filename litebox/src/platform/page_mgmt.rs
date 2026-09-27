@@ -61,6 +61,22 @@ pub trait ReservationStore {
     /// Ownership representation consumed when this store releases pages.
     type ReleaseTarget: From<Self::Reservation>;
 
+    /// Release every extent represented by this store.
+    ///
+    /// Tracked stores release their retained reservations. Handle-free stores release the ranges
+    /// represented by `vmas`.
+    ///
+    /// # Safety
+    ///
+    /// Every represented extent must belong to `platform` and have no remaining users.
+    unsafe fn release_all<Platform, const ALIGN: usize, V>(
+        &mut self,
+        vmas: &rangemap::RangeMap<usize, V>,
+        platform: &Platform,
+    ) -> Result<(), DeallocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>;
+
     /// Insert a reservation at `base`.
     fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
 
@@ -331,6 +347,8 @@ pub enum DeallocationError {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum RemapError {
+    #[error("native page remapping is not supported by this platform")]
+    UnsupportedByPlatform,
     #[error("at least one of the provided ranges was not page-aligned")]
     Unaligned,
     #[error("provided old range contains unallocated pages")]

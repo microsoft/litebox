@@ -20,8 +20,8 @@ use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::page_mgmt::RemapError;
 use litebox::platform::{
-    common_providers::reservations::NoTrackedReservations,
-    page_mgmt::{DeallocationError, ReservationStore},
+    common_providers::reservations::{NoTrackedReservations, TrackedReservations},
+    page_mgmt::{DeallocationError, PageReservation, ReservationStore},
 };
 
 /// Page size in bytes
@@ -345,7 +345,7 @@ pub struct MmapRequest {
 
 /// Linux Vmem operations supported by a reservation store.
 pub trait LinuxReservationStore<Platform, const ALIGN: usize>:
-    ReservationStore<ReleaseTarget = Range<usize>> + Send + Sync
+    ReservationStore + Send + Sync
 where
     Platform: PageManagementProvider<ALIGN, Reservations = Self>,
 {
@@ -435,6 +435,42 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
         // SAFETY: The caller guarantees that the source is unused and the destination is valid.
         unsafe { platform.remap_pages(old_range, new_range, permissions) }
+    }
+}
+
+impl<Platform, Reservation, const ALIGN: usize> LinuxReservationStore<Platform, ALIGN>
+    for TrackedReservations<Reservation>
+where
+    Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    Reservation: PageReservation + Send + Sync,
+{
+    unsafe fn mmap(
+        &mut self,
+        _platform: &Platform,
+        _request: MmapRequest,
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+        // TODO: Implement after page-management interfaces support tracked reservations.
+        todo!("tracked Linux reservations are not supported yet")
+    }
+
+    unsafe fn unmap<V: Clone + Eq>(
+        &mut self,
+        _vmas: &mut RangeMap<usize, V>,
+        _platform: &Platform,
+        _range: Range<usize>,
+    ) -> Result<(), DeallocationError> {
+        // TODO: Implement after page-management interfaces support tracked reservations.
+        todo!("tracked Linux reservations are not supported yet")
+    }
+
+    unsafe fn remap(
+        &mut self,
+        _platform: &Platform,
+        _old_range: Range<usize>,
+        _new_range: Range<usize>,
+        _permissions: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
+        Err(RemapError::UnsupportedByPlatform)
     }
 }
 
@@ -944,19 +980,15 @@ where
         range: PageRange<ALIGN>,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), VmemProtectError> {
+        let range: Range<usize> = range.into();
+        if self.vmas.gaps(&range).next().is_some() {
+            return Err(VmemProtectError::InvalidRange(range));
+        }
         // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
         let flags =
             VmFlags::from_bits(u32::from(permissions.bits())).unwrap() & VmFlags::VM_ACCESS_FLAGS;
-        let range = range.start..range.end;
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
-            mappings_to_change.push((r.start, r.end, *vma));
-        }
-        if mappings_to_change.is_empty() {
-            return Err(VmemProtectError::InvalidRange(range));
-        }
-
-        for (start, end, vma) in mappings_to_change {
             if vma.flags & VmFlags::VM_ACCESS_FLAGS == flags {
                 continue;
             }
@@ -968,25 +1000,18 @@ where
                     new: flags,
                 });
             }
+            let intersection = range.start.max(r.start)..range.end.min(r.end);
+            mappings_to_change.push((intersection, *vma));
+        }
+        if mappings_to_change.is_empty() {
+            return Ok(());
+        }
 
-            self.vmas.remove(start..end);
-            let intersection = range.start.max(start)..range.end.min(end);
-            // split r into three parts: before, intersection, and after
-            let before = start..intersection.start;
-            let after = intersection.end..end;
-
+        // SAFETY: The range has complete VMA coverage and the caller excludes conflicting access.
+        unsafe { self.platform.update_permissions(range, permissions) }
+            .map_err(VmemProtectError::ProtectError)?;
+        for (intersection, vma) in mappings_to_change {
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            // `intersection` is page aligned.
-            unsafe {
-                self.platform
-                    .update_permissions(intersection.clone(), permissions)
-            }
-            .map_err(|e| {
-                // restore the original mapping
-                self.vmas.insert(start..end, vma);
-                VmemProtectError::ProtectError(e)
-            })?;
-
             self.vmas.insert(
                 intersection,
                 VmArea {
@@ -994,12 +1019,6 @@ where
                     is_file_backed: vma.is_file_backed,
                 },
             );
-            if !before.is_empty() {
-                self.vmas.insert(before, vma);
-            }
-            if !after.is_empty() {
-                self.vmas.insert(after, vma);
-            }
         }
 
         Ok(())
@@ -1710,7 +1729,7 @@ mod tests {
         assert!(matches!(
             unsafe {
                 vmm.protect_mapping(
-                    PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
+                    PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 )
             },
