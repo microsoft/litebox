@@ -701,6 +701,10 @@ impl BrokerProcess {
             (state.shutdown.clone(), state.exit_readiness.take())
         };
         drop(parent);
+        // Like an exit, release references the child inherited before the failure is observable.
+        if self.release_references() {
+            self.state.lock().retirement.mark_abnormal();
+        }
         self.core.process_lifecycle_sink.changed();
         publish_exit_readiness(exit_readiness);
         if let Some(shutdown) = shutdown {
@@ -2014,7 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_child_receives_references_until_it_exits() {
+    fn pending_child_receives_references_until_it_terminates() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
@@ -2067,6 +2071,19 @@ mod tests {
             parent.duplicate_object_references_to_child(child_id, &[first]),
             Err(BrokerError::UnknownObject)
         );
+
+        // A child that fails to start also releases them while its parent still holds it.
+        let CreatedProcess { identity, .. } =
+            parent.allocate_child_process(readiness_sink()).unwrap();
+        parent
+            .duplicate_object_references_to_child(identity.process_id, &[first])
+            .unwrap();
+        let failed = parent.take_child_process(identity.process_id).unwrap();
+        assert_eq!(
+            failed.fail_start(BrokerError::PeerClosed, false, true),
+            Err(BrokerError::PeerClosed)
+        );
+        assert!(failed.references.lock().handles.is_empty());
         assert_eq!(
             parent.check_readiness(first),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
