@@ -21,6 +21,11 @@ int main(int argc, char **argv) {
     fflush(stdout);
     pid_t child_pid = vfork();
     if (child_pid == 0) {
+        // A failed exec returns to the child, which may try again.
+        if (execve("/missing-vfork-executable", child_argv, child_envp) != -1 ||
+            errno != ENOENT) {
+            _exit(112);
+        }
         execve(argv[1], child_argv, child_envp);
         _exit(111);
     }

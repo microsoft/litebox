@@ -548,13 +548,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
     fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
         let result = self.do_syscall(ctx);
-        if self.vfork.borrow().is_some() && result.is_err() {
-            // The current constrained vfork scope cannot return an error to a child running in the
-            // parent's runner while leaving the parent suspended. Only child exit or a successful
-            // exec transfer can complete the shared-runner window.
-            self.sys_exit_group(127);
-            return;
-        }
         let return_value = match result {
             Ok(v) => v,
             Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
@@ -582,31 +575,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // AArch64 syscall ABI: `w8`, mirrored in `pt_regs::syscallno`.
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
-        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt)?;
-        // The constrained vfork child may only inspect its temporary identity, exit, or complete
-        // the transfer with execve. The caller terminates the shared runner when this rejection is
-        // returned.
+        let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
+        // The constrained vfork child may only inspect its temporary identity, exit, or attempt
+        // execve. Any other syscall terminates the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
                 &request,
-                SyscallRequest::Exit { .. }
+                Ok(SyscallRequest::Exit { .. }
                     | SyscallRequest::ExitGroup { .. }
                     | SyscallRequest::Execve { .. }
                     | SyscallRequest::Getpid
                     | SyscallRequest::Getppid
-                    | SyscallRequest::Gettid
+                    | SyscallRequest::Gettid)
             )
         {
-            return Err(Errno::EPERM);
+            return Ok(self.abort_vfork_window());
         }
 
+        let request = request?;
         match request {
             // The vfork child is the only thread of its process, so `exit` also ends the process.
             SyscallRequest::Exit { status } | SyscallRequest::ExitGroup { status }
                 if is_vfork_child =>
             {
-                self.exit_vfork_child(status, ctx)
+                Ok(self.exit_vfork_child(status, ctx))
             }
             SyscallRequest::Exit { status } => {
                 self.sys_exit(status);
