@@ -392,9 +392,11 @@ fn vfork_child_has_its_own_signal_state() {
     };
     let parent_line = line("parent ");
     let parent_pid = numeric_field(parent_line, "pid=");
-    // The parent's pending SIGUSR2 and blocked mask survive its children's changes.
+    // The parent's dispositions, pending SIGUSR2, blocked mask, and alternate stack survive its
+    // children's changes.
     assert_eq!(numeric_field(parent_line, "hup_default="), 1);
     assert_eq!(numeric_field(parent_line, "term_blocked="), 1);
+    assert_eq!(numeric_field(parent_line, "altstack_disabled="), 1);
     assert_eq!(numeric_field(parent_line, "usr2_before_unblock="), 0);
     assert_eq!(numeric_field(parent_line, "usr2_pid="), parent_pid);
 

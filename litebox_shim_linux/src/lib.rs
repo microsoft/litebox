@@ -610,7 +610,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Gettid
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
-                    | SyscallRequest::RtSigreturn)
+                    | SyscallRequest::RtSigreturn
+                    | SyscallRequest::Sigaltstack { .. })
             )
         {
             return Ok(self.abort_vfork_window());

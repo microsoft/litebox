@@ -10,6 +10,8 @@
 
 static volatile pid_t usr2_pid;
 static volatile pid_t ill_pid;
+static volatile int ill_on_child_stack;
+static char child_stack[64 * 1024];
 
 static void on_usr2(int signal) {
     (void)signal;
@@ -19,7 +21,9 @@ static void on_usr2(int signal) {
 static void on_ill(int signal, siginfo_t *info, void *context) {
     (void)signal;
     (void)info;
+    char local;
     ill_pid = getpid();
+    ill_on_child_stack = &local >= child_stack && &local < child_stack + sizeof(child_stack);
     // Resume after the two-byte `ud2`.
     ((ucontext_t *)context)->uc_mcontext.gregs[REG_RIP] += 2;
 }
@@ -31,7 +35,7 @@ int main(int argc, char **argv) {
     }
 
     struct sigaction usr2 = {.sa_handler = on_usr2};
-    struct sigaction ill = {.sa_sigaction = on_ill, .sa_flags = SA_SIGINFO};
+    struct sigaction ill = {.sa_sigaction = on_ill, .sa_flags = SA_SIGINFO | SA_ONSTACK};
     sigset_t usr2_set;
     sigemptyset(&usr2_set);
     sigaddset(&usr2_set, SIGUSR2);
@@ -46,11 +50,16 @@ int main(int argc, char **argv) {
     raise(SIGUSR2);
     fflush(stdout);
 
-    // The inherited handler runs in the child and returns past the fault.
+    // The inherited handler runs in the child on the child's own alternate stack and returns
+    // past the fault.
     pid_t fault_child = vfork();
     if (fault_child == 0) {
+        stack_t ss = {.ss_sp = child_stack, .ss_size = sizeof(child_stack)};
+        if (sigaltstack(&ss, NULL) != 0) {
+            _exit(57);
+        }
         __asm__ volatile("ud2");
-        _exit(ill_pid == getpid() ? 55 : 56);
+        _exit(ill_pid == getpid() && ill_on_child_stack ? 55 : 56);
     }
     if (fault_child < 0) {
         perror("vfork");
@@ -85,12 +94,15 @@ int main(int argc, char **argv) {
     // The children's signal changes did not affect the parent.
     struct sigaction hup;
     sigset_t current;
+    stack_t altstack;
     sigaction(SIGHUP, NULL, &hup);
     sigprocmask(SIG_BLOCK, NULL, &current);
+    sigaltstack(NULL, &altstack);
     pid_t usr2_before_unblock = usr2_pid;
     sigprocmask(SIG_UNBLOCK, &usr2_set, NULL);
-    printf("parent pid=%d hup_default=%d term_blocked=%d usr2_before_unblock=%d usr2_pid=%d\n",
+    printf("parent pid=%d hup_default=%d term_blocked=%d altstack_disabled=%d "
+           "usr2_before_unblock=%d usr2_pid=%d\n",
            getpid(), hup.sa_handler == SIG_DFL, sigismember(&current, SIGTERM),
-           usr2_before_unblock, usr2_pid);
+           (altstack.ss_flags & SS_DISABLE) != 0, usr2_before_unblock, usr2_pid);
     return 0;
 }
