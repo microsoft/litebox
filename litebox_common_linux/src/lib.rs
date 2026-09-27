@@ -1407,6 +1407,10 @@ pub struct TaskParams {
     pub gid: u32,
     /// The initial effective gid.
     pub egid: u32,
+    /// The initially blocked signals.
+    pub blocked_signals: SigSet,
+    /// The signals initially ignored; all other dispositions start as default.
+    pub ignored_signals: SigSet,
 }
 
 #[repr(C)]

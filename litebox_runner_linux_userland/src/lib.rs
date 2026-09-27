@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
 use litebox_common_linux::program_startup::LinuxProgramStartup;
+use litebox_common_linux::signal::SigSet;
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
 // credentials aligned with packaged guest files and avoids truncating high host IDs.
@@ -131,6 +132,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             euid,
             gid,
             egid,
+            blocked_signals,
+            ignored_signals,
             path,
             argv,
             envp,
@@ -144,6 +147,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                 euid,
                 gid,
                 egid,
+                blocked_signals,
+                ignored_signals,
             },
             path,
             argv,
@@ -183,6 +188,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                 euid: u32::from(DEFAULT_GUEST_UID),
                 gid: u32::from(DEFAULT_GUEST_GID),
                 egid: u32::from(DEFAULT_GUEST_GID),
+                blocked_signals: SigSet::empty(),
+                ignored_signals: SigSet::empty(),
             },
             prog_path,
             argv,

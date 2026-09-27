@@ -251,10 +251,27 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         );
     }
 
+    /// Releases the children the broker reaped as they terminated.
+    ///
+    /// Each child holds broker process capacity until its handle closes, so a parent that never
+    /// waits releases them before creating another child.
+    #[cfg(target_arch = "x86_64")]
+    fn release_reaped_children(&self) {
+        let reaped: Vec<_> = self
+            .children
+            .lock()
+            .extract_if(.., |_, child| {
+                matches!(child.status(), Ok(litebox::process::ChildStatus::Reaped))
+            })
+            .collect();
+        drop(reaped);
+    }
+
     /// Removes one terminated child with process ID `target`, or any terminated child when
     /// `target` is `None`.
     ///
-    /// The caller drops the returned child outside the children lock to reap it.
+    /// Children the broker reaped as they terminated are released instead of reported. The
+    /// caller drops the returned child outside the children lock to reap it.
     fn remove_exited_child(
         &self,
         target: Option<i32>,
@@ -263,27 +280,40 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         let mut children = self.children.lock();
         let mut matched = false;
         let mut exited = None;
+        let mut reaped = Vec::new();
         for (&pid, child) in children
             .iter()
             .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
         {
-            matched = true;
-            if let Some(status) = child
-                .exit_status()
+            match child
+                .status()
                 .map_err(|error| TryOpError::Other(error.into()))?
             {
-                exited = Some((pid, status));
-                break;
+                litebox::process::ChildStatus::Live => matched = true,
+                litebox::process::ChildStatus::Reaped => reaped.push(pid),
+                litebox::process::ChildStatus::Terminated(status) => {
+                    exited = Some((pid, status));
+                    break;
+                }
             }
         }
-        if !matched {
-            return Err(TryOpError::Other(Errno::ECHILD));
+        let reaped: Vec<_> = reaped
+            .into_iter()
+            .map(|pid| children.remove(&pid))
+            .collect();
+        let exited = exited.map(|(pid, status)| {
+            let child = children
+                .remove(&pid)
+                .expect("matched child must remain present");
+            (pid, child, status)
+        });
+        drop(children);
+        drop(reaped);
+        match exited {
+            Some(exited) => Ok(exited),
+            None if matched => Err(TryOpError::TryAgain),
+            None => Err(TryOpError::Other(Errno::ECHILD)),
         }
-        let (pid, status) = exited.ok_or(TryOpError::TryAgain)?;
-        let child = children
-            .remove(&pid)
-            .expect("matched child must remain present");
-        Ok((pid, child, status))
     }
 
     /// Registers `observer` on each child with process ID `target`, or on every child when
@@ -725,6 +755,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .borrow_mut()
             .take()
             .expect("completed vfork window lost its parent context");
+        self.signals.restore_vfork_parent(state.parent_signals);
         self.thread.process.add_child(state.child_pid, state.child);
         *ctx = state.parent_context;
         state.child_pid.cast_unsigned() as usize
@@ -803,25 +834,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Begins a constrained `vfork` child in the current runner.
     ///
-    /// Only single-threaded processes with default filesystem, signal, resource-limit, alarm, and
-    /// transferable descriptor state are admitted. The parent remains suspended until the child
-    /// exits, is killed by a fault, or successfully transfers to a fresh runner through `execve`;
-    /// an `execve` that fails before the transfer returns its error to the child. The child must
-    /// not change standard descriptor mappings or flags, or platform-managed architectural state
-    /// outside [`litebox_common_linux::PtRegs`], because the current transfer does not preserve
-    /// that state.
+    /// Only single-threaded processes with default filesystem, resource-limit, alarm, and
+    /// transferable descriptor state are admitted. The child gets a copy of the parent's signal
+    /// dispositions, blocked mask, and alternate stack, but none of its pending signals; the
+    /// parent's signal state is restored when it resumes. The parent remains
+    /// suspended until the child exits, is killed by a signal, or successfully transfers to a
+    /// fresh runner through `execve`; an `execve` that fails before the transfer returns its error
+    /// to the child. The child must not change standard descriptor mappings or flags, or
+    /// platform-managed architectural state outside [`litebox_common_linux::PtRegs`], because the
+    /// current transfer does not preserve that state.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
             || self.thread.process.nr_threads() != 1
             || !self.files.borrow().has_only_standard_descriptor_numbers()
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
-            || !self.signals.has_default_signal_state()
             || !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
         {
             return Err(Errno::EAGAIN);
         }
+        self.thread.process.release_reaped_children();
         let child = self
             .global
             .litebox
@@ -835,6 +868,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child,
             child_pid,
             parent_context,
+            parent_signals: self.signals.begin_vfork_child(),
         }));
         Ok(0)
     }
@@ -1551,8 +1585,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `wait4`.
     ///
-    /// Only terminated children are reported. Process groups are not modeled, so `pid == 0`
-    /// waits for any child and `pid < -1` matches no child. Resource usage is reported as zero.
+    /// Only terminated children are reported. Like Linux, children that terminate while
+    /// `SIGCHLD` is ignored or has `SA_NOCLDWAIT` are reaped instead of reported. Process groups
+    /// are not modeled, so `pid == 0` waits for any child and `pid < -1` matches no child.
+    /// Resource usage is reported as zero.
     /// A child without an observable termination status is reported as killed by `SIGSEGV`.
     /// Children belong to the process rather than the creating thread, so `__WNOTHREAD` is
     /// accepted but does not restrict which children match.
@@ -1908,6 +1944,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 euid: self.credentials.euid,
                 gid: self.credentials.gid,
                 egid: self.credentials.egid,
+                blocked_signals: self.signals.blocked(),
+                ignored_signals: self.signals.ignored(),
                 path,
                 argv: argv_vec,
                 envp: envp_vec,
@@ -1946,7 +1984,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.thread.clear_child_tid.set(None);
         self.rebind_exec_identity();
 
+        let reaped_before_exec = self.signals.reaps_children();
         self.signals.reset_for_exec();
+        // Resetting a `SIGCHLD` handler clears `SA_NOCLDWAIT`.
+        let reaps_children = self.signals.reaps_children();
+        if reaps_children != reaped_before_exec {
+            self.set_child_reaping(reaps_children);
+        }
 
         #[cfg(target_arch = "aarch64")]
         {
@@ -2664,6 +2708,38 @@ mod tests {
                 !task.has_pending_signals(),
                 "cancelled alarm should not produce SIGALRM"
             );
+        });
+    }
+
+    #[test]
+    fn test_sigkill_and_sigstop_are_never_blocked() {
+        use crate::syscalls::signal::SignalState;
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+
+        let requested = SigSet::empty()
+            .with(Signal::SIGKILL)
+            .with(Signal::SIGSTOP)
+            .with(Signal::SIGUSR1);
+        let expected = SigSet::empty().with(Signal::SIGUSR1);
+        assert_eq!(
+            SignalState::<crate::syscalls::tests::TestPlatform>::inherited(
+                requested,
+                SigSet::empty()
+            )
+            .blocked(),
+            expected
+        );
+
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            task.sys_rt_sigprocmask(
+                SigmaskHow::SIG_SETMASK,
+                Some(UserPtr::from_ptr(&raw const requested)),
+                None,
+                core::mem::size_of::<SigSet>(),
+            )
+            .unwrap();
+            assert_eq!(task.signals.blocked(), expected);
         });
     }
 

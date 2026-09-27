@@ -117,29 +117,90 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         self.clear_sigaltstack();
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn has_default_signal_state(&self) -> bool {
-        let altstack = self.altstack.get();
-        self.pending.borrow().pending.is_empty()
-            && self.shared_pending.lock().pending.is_empty()
-            && self.blocked.get().is_empty()
-            && altstack.sp == 0
-            && altstack.size == 0
-            && altstack.flags.bits() == SsFlags::DISABLE.bits()
-            && self
-                .handlers
-                .borrow()
-                .inner
-                .lock()
-                .handlers
-                .iter()
-                .all(|handler| {
-                    handler.action.sigaction == SIG_DFL
-                        && handler.action.restorer == 0
-                        && handler.action.flags.is_empty()
-                        && handler.action.mask.is_empty()
-                })
+    /// Returns the initial signal state of a process that inherits the `blocked` mask and
+    /// `ignored` dispositions, as a program started by `execve` in a fresh runner keeps them like
+    /// [`Self::reset_for_exec`].
+    pub fn inherited(blocked: SigSet, ignored: SigSet) -> Self {
+        let mut state = Self::new_process();
+        state.set_signal_mask(blocked);
+        let handlers = Arc::get_mut(state.handlers.get_mut())
+            .expect("new signal handlers must not be shared")
+            .inner
+            .get_mut();
+        for signal in ignored {
+            let handler = &mut handlers[signal];
+            // SIGKILL and SIGSTOP cannot be ignored.
+            if !handler.immutable {
+                handler.action.sigaction = SIG_IGN;
+            }
+        }
+        state
     }
+
+    /// Returns the currently blocked signals.
+    pub(crate) fn blocked(&self) -> SigSet {
+        self.blocked.get()
+    }
+
+    /// Returns the signals whose disposition is `SIG_IGN`.
+    pub(crate) fn ignored(&self) -> SigSet {
+        let handlers = self.handlers.borrow();
+        let handlers = handlers.inner.lock();
+        let mut ignored = SigSet::empty();
+        for signal in !SigSet::empty() {
+            if handlers[signal].action.sigaction == SIG_IGN {
+                ignored.add(signal);
+            }
+        }
+        ignored
+    }
+
+    /// Returns whether terminated children are reaped instead of becoming zombies, because
+    /// `SIGCHLD` is ignored or has `SA_NOCLDWAIT`.
+    pub(crate) fn reaps_children(&self) -> bool {
+        action_reaps_children(&self.handlers.borrow().inner.lock()[Signal::SIGCHLD].action)
+    }
+
+    /// Gives the `vfork` child a copy of the current dispositions, blocked mask, and alternate
+    /// stack with no pending thread signals, returning the suspended parent's state.
+    ///
+    /// Process-directed pending signals stay queued for the parent.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn begin_vfork_child(&self) -> VforkParentSignals<Platform> {
+        let child_handlers = Arc::new(SignalHandlers::clone(&self.handlers.borrow()));
+        VforkParentSignals {
+            pending: self.pending.replace(PendingSignals::new()),
+            blocked: self.blocked.get(),
+            handlers: self.handlers.replace(child_handlers),
+            altstack: self.altstack.get(),
+            last_exception: self.last_exception.get(),
+        }
+    }
+
+    /// Restores the `vfork` parent's state when the child leaves the shared window.
+    pub(crate) fn restore_vfork_parent(&self, parent: VforkParentSignals<Platform>) {
+        let VforkParentSignals {
+            pending,
+            blocked,
+            handlers,
+            altstack,
+            last_exception,
+        } = parent;
+        self.pending.replace(pending);
+        self.blocked.set(blocked);
+        self.handlers.replace(handlers);
+        self.altstack.set(altstack);
+        self.last_exception.set(last_exception);
+    }
+}
+
+/// The signal state of a suspended `vfork` parent.
+pub(crate) struct VforkParentSignals<Platform: ShimPlatform> {
+    pending: PendingSignals,
+    blocked: SigSet,
+    handlers: Arc<SignalHandlers<Platform>>,
+    altstack: SigAltStack,
+    last_exception: litebox::shim::ExceptionInfo,
 }
 
 struct SignalHandlers<Platform: ShimPlatform> {
@@ -289,6 +350,12 @@ impl PendingSignals {
     }
 }
 
+/// Returns whether a `SIGCHLD` action reaps terminated children, because it ignores the signal or
+/// has `SA_NOCLDWAIT`.
+fn action_reaps_children(action: &SigAction) -> bool {
+    action.sigaction == SIG_IGN || action.flags.contains(SaFlags::NOCLDWAIT)
+}
+
 /// Returns whether `sp` is within the given signal stack.
 fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
     if stack.flags.contains(SsFlags::DISABLE) {
@@ -330,8 +397,10 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {
-    /// Updates the blocked signal mask.
-    fn set_signal_mask(&self, mask: SigSet) {
+    /// Updates the blocked signal mask. Like Linux, SIGKILL and SIGSTOP are never blocked.
+    fn set_signal_mask(&self, mut mask: SigSet) {
+        mask.remove(Signal::SIGKILL);
+        mask.remove(Signal::SIGSTOP);
         self.blocked.set(mask);
     }
 
@@ -566,6 +635,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let old_act = handler.action;
             if let Some(act) = act {
                 handler.action = act;
+                // The `vfork` child changes only its own copy of the dispositions and has no
+                // children. Updating the broker under the handlers lock applies concurrent
+                // changes in order.
+                if signal == Signal::SIGCHLD
+                    && self.vfork.borrow().is_none()
+                    && action_reaps_children(&act) != action_reaps_children(&old_act)
+                {
+                    self.set_child_reaping(action_reaps_children(&act));
+                }
             }
             old_act
         };
@@ -577,6 +655,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         Ok(0)
+    }
+
+    /// Sets whether the broker reaps this process's children as they terminate.
+    pub(crate) fn set_child_reaping(&self, enabled: bool) {
+        // Failure means the process service is unavailable or has failed, so no child can be
+        // created or observed.
+        let _ = self.global.litebox.set_child_reaping(enabled);
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {
@@ -635,6 +720,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let mut pending = self.signals.pending.borrow_mut();
                 if let Some(signal) = pending.next(blocked) {
                     (signal, pending.remove(signal))
+                } else if self.vfork.borrow().is_some() {
+                    // Process-directed signals belong to the suspended vfork parent.
+                    break;
                 } else {
                     // Then try shared pending.
                     let mut shared = self.signals.shared_pending.lock();
@@ -658,6 +746,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         SignalDisposition::Terminate
                         | SignalDisposition::Core
                         | SignalDisposition::Stop => {
+                            if self.vfork.borrow().is_some() {
+                                // The signal kills only the vfork child. The parent resumes
+                                // with its own signal state, whose pending signals this loop
+                                // then delivers.
+                                let signal = signal.as_i32().cast_unsigned();
+                                self.exit_vfork_child(ProcessExitStatus::Signaled { signal }, ctx);
+                                continue;
+                            }
                             // STOP is not currently supported, so treat as
                             // terminate. Core dumps are also not currently
                             // supported.
@@ -768,7 +864,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Sends a process-directed signal (stored in shared_pending).
     pub(crate) fn send_shared_signal(&self, signal: Signal, siginfo: Siginfo) {
-        if self.is_signal_ignored(signal) {
+        // During a vfork window the dispositions are the child's, but process-directed signals
+        // stay queued for the suspended parent, whose restored dispositions apply on delivery.
+        if self.vfork.borrow().is_none() && self.is_signal_ignored(signal) {
             return;
         }
         self.signals
@@ -858,15 +956,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Data aborts and unknown exception classes map to SIGSEGV.
             _ => (Signal::SIGSEGV, info.fault_address),
         };
-        if self.vfork.borrow().is_some() {
-            // Like Linux, the fault kills the constrained vfork child, whose signal dispositions
-            // are all default, and resumes the parent. The fault belongs to the child, so the
-            // parent's last exception is left untouched. The restored parent context already
-            // returns the child's PID from `vfork`.
-            let signal = signal.as_i32().cast_unsigned();
-            self.exit_vfork_child(ProcessExitStatus::Signaled { signal }, ctx);
-            return;
-        }
         self.signals.last_exception.set(*info);
         self.force_signal_with_info(signal, false, siginfo_exception(signal, fault_address));
     }

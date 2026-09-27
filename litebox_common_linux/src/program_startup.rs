@@ -9,7 +9,9 @@ use alloc::vec::Vec;
 
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 
-const HEADER_SIZE: usize = size_of::<[u32; 8]>();
+use crate::signal::SigSet;
+
+const HEADER_SIZE: usize = size_of::<[u32; 8]>() + size_of::<[u64; 2]>();
 
 /// Linux program state needed to load a child in a fresh runner.
 ///
@@ -27,6 +29,10 @@ pub struct LinuxProgramStartup {
     pub gid: u32,
     /// Effective group ID.
     pub egid: u32,
+    /// Signals blocked across `execve`.
+    pub blocked_signals: SigSet,
+    /// Signals whose ignored disposition survives `execve`.
+    pub ignored_signals: SigSet,
     /// Absolute executable path.
     pub path: String,
     /// Program arguments.
@@ -69,6 +75,8 @@ impl LinuxProgramStartup {
         push_u32(&mut output, self.euid);
         push_u32(&mut output, self.gid);
         push_u32(&mut output, self.egid);
+        push_u64(&mut output, self.blocked_signals.as_u64());
+        push_u64(&mut output, self.ignored_signals.as_u64());
         push_u32(
             &mut output,
             u32::try_from(self.path.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
@@ -105,6 +113,8 @@ impl LinuxProgramStartup {
         let effective_user_id = read_u32(&mut input)?;
         let real_group_id = read_u32(&mut input)?;
         let effective_group_id = read_u32(&mut input)?;
+        let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
+        let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
         let path_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let argv_count = usize::try_from(read_u32(&mut input)?)
@@ -143,6 +153,8 @@ impl LinuxProgramStartup {
             euid: effective_user_id,
             gid: real_group_id,
             egid: effective_group_id,
+            blocked_signals,
+            ignored_signals,
             path,
             argv: values,
             envp,
@@ -185,9 +197,22 @@ fn push_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
+fn push_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
 fn read_u32(input: &mut &[u8]) -> Result<u32, LinuxProgramStartupError> {
     let bytes = take_bytes(input, size_of::<u32>())?;
     Ok(u32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| LinuxProgramStartupError::Malformed)?,
+    ))
+}
+
+fn read_u64(input: &mut &[u8]) -> Result<u64, LinuxProgramStartupError> {
+    let bytes = take_bytes(input, size_of::<u64>())?;
+    Ok(u64::from_le_bytes(
         bytes
             .try_into()
             .map_err(|_| LinuxProgramStartupError::Malformed)?,
@@ -209,6 +234,7 @@ fn take_bytes<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::signal::Signal;
     use alloc::vec;
 
     #[test]
@@ -219,6 +245,8 @@ mod tests {
             euid: 1001,
             gid: 1002,
             egid: 1003,
+            blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
+            ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
             path: "/bin/child".into(),
             argv: vec![
                 CString::new("child").unwrap(),
@@ -241,6 +269,8 @@ mod tests {
             euid: 0,
             gid: 0,
             egid: 0,
+            blocked_signals: SigSet::empty(),
+            ignored_signals: SigSet::empty(),
             path: "/child".into(),
             argv: vec![CString::new("").unwrap(); 1025],
             envp: Vec::new(),
@@ -260,6 +290,8 @@ mod tests {
             euid: 0,
             gid: 0,
             egid: 0,
+            blocked_signals: SigSet::empty(),
+            ignored_signals: SigSet::empty(),
             path: "/child".into(),
             argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),

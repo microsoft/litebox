@@ -515,6 +515,10 @@ fn handle_request<Memory: SharedMemory>(
             .report_exit_status(exit_status)
             .map(|()| BrokerResult::ExitStatusReported)
             .map_err(RequestFailure::from),
+        BrokerOperation::SetChildReaping(enabled) => process
+            .set_child_reaping(enabled)
+            .map(|()| BrokerResult::ChildReapingSet)
+            .map_err(RequestFailure::from),
         BrokerOperation::Event(request) => {
             handle_event_request(process, request).map(BrokerResult::Event)
         }

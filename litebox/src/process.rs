@@ -57,6 +57,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.report_exit_status(exit_status)?)
     }
+
+    /// Sets whether this process's children are reaped when they terminate.
+    ///
+    /// Each child applies the setting in effect when it terminates, so a
+    /// change does not affect children that already terminated.
+    pub fn set_child_reaping(&self, enabled: bool) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.set_child_reaping(enabled)?)
+    }
+}
+
+/// Termination state of a child process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildStatus {
+    /// The process has not terminated.
+    Live,
+    /// The process terminated and retains this status until its handle closes.
+    Terminated(ProcessExitStatus),
+    /// The process was reaped as it terminated, so it retains no status.
+    Reaped,
 }
 
 /// A broker process object.
@@ -111,11 +131,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
             .exit_child_process(self.identity.process_id, exit_status)?)
     }
 
-    /// Returns the process's termination status, or `None` while the process is live.
-    pub fn exit_status(&self) -> Result<Option<ProcessExitStatus>, ProcessError> {
+    /// Returns the process's termination state.
+    pub fn status(&self) -> Result<ChildStatus, ProcessError> {
         match self.broker.process_exit_status(self.handle) {
-            Ok(status) => Ok(Some(status)),
-            Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
+            Ok(Some(status)) => Ok(ChildStatus::Terminated(status)),
+            Ok(None) => Ok(ChildStatus::Reaped),
+            Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(ChildStatus::Live),
             Err(error) => Err(error.into()),
         }
     }
