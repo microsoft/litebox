@@ -802,17 +802,19 @@ fn exec_inherits_only_transferable_descriptors() {
                 .collect::<alloc::vec::Vec<_>>()
         })
     };
-    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
 
     // Close-on-exec descriptors stay behind whatever their kind, but others must be broker files.
-    let (read_fd, write_fd) = task.sys_pipe2(OFlags::CLOEXEC).unwrap();
-    let (read_fd, write_fd) = (read_fd.try_into().unwrap(), write_fd.try_into().unwrap());
+    let read_fd = task
+        .sys_pipe2(OFlags::CLOEXEC)
+        .unwrap()
+        .0
+        .try_into()
+        .unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
     task.sys_fcntl(read_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
         .unwrap();
     assert_eq!(inherited(), Err(Errno::EAGAIN));
     task.sys_close(read_fd).unwrap();
-    task.sys_close(write_fd).unwrap();
 
     // A fresh runner installs descriptors at most a bounded distance apart.
     assert_eq!(task.sys_dup(1, Some(258), None), Ok(258));

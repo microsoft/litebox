@@ -81,9 +81,6 @@ pub enum LinuxProgramStartupError {
     /// An argument or environment string contains an interior NUL.
     #[error("invalid Linux program string")]
     InvalidString,
-    /// Inherited descriptors are not in strictly ascending order.
-    #[error("invalid Linux program inherited descriptors")]
-    InvalidInheritedFds,
 }
 
 impl LinuxProgramStartup {
@@ -211,10 +208,7 @@ impl LinuxProgramStartup {
             let stdio_status_flags = read_u32(&mut input)?;
             let stdio_status_flags = match has_stdio_status_flags {
                 0 if stdio_status_flags == 0 => None,
-                1 => Some(
-                    OFlags::from_bits(stdio_status_flags)
-                        .ok_or(LinuxProgramStartupError::Malformed)?,
-                ),
+                1 => Some(OFlags::from_bits_retain(stdio_status_flags)),
                 _ => return Err(LinuxProgramStartupError::Malformed),
             };
             inherited_fds.push(InheritedFd {
@@ -252,13 +246,6 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     }
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
-    }
-    if !startup
-        .inherited_fds
-        .windows(2)
-        .all(|pair| pair[0].fd < pair[1].fd)
-    {
-        return Err(LinuxProgramStartupError::InvalidInheritedFds);
     }
     Ok(())
 }
@@ -427,42 +414,6 @@ mod tests {
         assert_eq!(
             LinuxProgramStartup::decode(&invalid),
             Err(LinuxProgramStartupError::InvalidString)
-        );
-    }
-
-    #[test]
-    fn program_startup_rejects_unordered_inherited_fds() {
-        let inherited = InheritedFd {
-            fd: 3,
-            handle: ObjectHandle(1),
-            stdio_stream: None,
-            stdio_status_flags: None,
-        };
-        let mut startup = LinuxProgramStartup {
-            parent_process_id: 1,
-            uid: 0,
-            euid: 0,
-            gid: 0,
-            egid: 0,
-            blocked_signals: SigSet::empty(),
-            ignored_signals: SigSet::empty(),
-            path: "/child".into(),
-            argv: Vec::new(),
-            envp: Vec::new(),
-            inherited_fds: vec![inherited, inherited],
-        };
-        assert_eq!(
-            startup.encode(),
-            Err(LinuxProgramStartupError::InvalidInheritedFds)
-        );
-
-        startup.inherited_fds[1].fd = 4;
-        let mut encoded = startup.encode().unwrap();
-        let second_fd = encoded.len() - INHERITED_FD_SIZE;
-        encoded[second_fd] = 2;
-        assert_eq!(
-            LinuxProgramStartup::decode(&encoded),
-            Err(LinuxProgramStartupError::InvalidInheritedFds)
         );
     }
 }

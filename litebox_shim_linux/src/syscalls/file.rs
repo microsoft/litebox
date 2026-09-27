@@ -419,9 +419,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits across `execve`, which are those not marked
     /// close-on-exec, in ascending order.
     ///
-    /// Fails with `EAGAIN` if one of them cannot transfer: it is not a broker-backed file, it has
-    /// a directory position, which is local to this runner, or it lies more than
-    /// [`MAX_INHERITED_FD_GAP`] past the previous one.
+    /// Linux keeps every such descriptor, whatever it refers to. A fresh runner can share only
+    /// objects the broker holds, and not all of those yet, so this fails with `EAGAIN` if one of
+    /// them is:
+    ///
+    /// - a pipe: the broker does not yet publish pipe readiness across processes, so a blocking
+    ///   pipe wait in the child could hang;
+    /// - a network socket: the broker does not duplicate socket objects;
+    /// - an eventfd, epoll, or Unix socket descriptor: the object is local to this runner;
+    /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
+    ///   runner; or
+    /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
+    ///   install.
+    ///
+    /// Transferred descriptors also differ from Linux in two ways: the parent does not observe the
+    /// child's reads of an inherited directory, and stdio status flags, which this runner tracks
+    /// locally, are copied rather than shared, so an `F_SETFL` in one process is not seen by the
+    /// other.
     pub(crate) fn fds_inherited_across_exec(
         &self,
     ) -> Result<alloc::vec::Vec<(u32, alloc::sync::Arc<FileFd>)>, Errno> {
