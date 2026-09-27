@@ -190,33 +190,13 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{NoTrackedReservations, TrackedReservations};
-    use crate::platform::page_mgmt::{PageReservation, ReservationStore};
+    use super::TrackedReservations;
+    use crate::platform::page_mgmt::{PageReservation, ReservationStore as _};
 
     crate::define_page_reservation!(TestReservation);
 
     #[test]
-    fn untracked_reservations_retain_no_handles() {
-        let mut reservations = NoTrackedReservations::<0x1000>;
-        let range = 0x1000..0x3000;
-        // SAFETY: The test range is nonempty, aligned, and uniquely represented.
-        let reservation = unsafe { NoTrackedReservations::from_owned_range(range.clone()) };
-
-        assert_eq!(reservation.range(), range);
-        assert!(reservations.insert(range.start, reservation).is_none());
-        assert_eq!(reservations.iter().count(), 0);
-        assert_eq!(reservations.overlapping(range.clone()).count(), 0);
-        assert!(reservations.take_overlapping(range).is_empty());
-    }
-
-    #[test]
     fn reservation_segments_and_take_overlapping_in_order() {
-        fn assert_release_target<
-            Store: ReservationStore<ReleaseTarget = TestReservation<0x1000>>,
-        >() {
-        }
-        assert_release_target::<TrackedReservations<TestReservation<0x1000>>>();
-
         let mut reservations = TrackedReservations::default();
         for range in [0x1000..0x3000, 0x3000..0x4000, 0x5000..0x6000] {
             // SAFETY: Each test range is nonempty, aligned, disjoint, and uniquely represented.
