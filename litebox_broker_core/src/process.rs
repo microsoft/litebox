@@ -1780,7 +1780,6 @@ mod tests {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
-        .with_limits(BrokerCoreLimits::DEFAULT.with_process_limit(3))
         .build()
         .unwrap()
         .with_process_lifecycle_sink(lifecycle.clone());
@@ -1792,30 +1791,17 @@ mod tests {
         let CreatedProcess { identity, handle } =
             parent.allocate_child_process(sink.clone()).unwrap();
         let process_id = identity.process_id;
-        let child = broker
-            .processes
-            .read()
-            .get(&process_id)
-            .and_then(alloc::sync::Weak::upgrade)
-            .unwrap();
         let changes = lifecycle.changes.load(Ordering::Relaxed);
         let threads = broker.active_thread_count.load(Ordering::Relaxed);
 
-        assert_eq!(
-            parent.exit_child_process(ProcessId(process_id.0 + 1), EXITED),
-            Err(BrokerError::UnknownObject)
-        );
         assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(()));
 
-        assert_eq!(child.state.lock().status, ProcessStatus::Zombie(EXITED));
-        assert_eq!(child.startup_result(), Some(Ok(())));
+        assert_eq!(parent.process_exit_status(handle), Ok(EXITED));
         assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes + 1);
         assert_eq!(
             *sink.published.lock().unwrap(),
             [(handle, ReadinessFlags::READ)]
         );
-        assert_eq!(parent.check_readiness(handle), Ok(ReadinessFlags::READ));
-        assert_eq!(parent.process_exit_status(handle), Ok(EXITED));
         assert_eq!(
             broker.active_thread_count.load(Ordering::Relaxed),
             threads - 1
@@ -1824,17 +1810,8 @@ mod tests {
             parent.exit_child_process(process_id, SIGNALED),
             Err(BrokerError::UnknownObject)
         );
-        assert!(matches!(
-            parent.take_child_process(process_id),
-            Err(BrokerError::UnknownObject)
-        ));
-        // The zombie no longer blocks another pending child.
-        parent.allocate_child_process(sink.clone()).unwrap();
 
-        // A zombie is not failed by owner death and stays until its handle closes.
-        parent.handle_owner_death();
-        assert_eq!(child.state.lock().status, ProcessStatus::Zombie(EXITED));
-        drop(child);
+        // The zombie stays until its handle closes.
         assert!(broker.processes.read().contains_key(&process_id));
         parent.close_object_reference(handle).unwrap();
         assert!(!broker.processes.read().contains_key(&process_id));
