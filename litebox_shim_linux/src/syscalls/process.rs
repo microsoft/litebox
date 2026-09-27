@@ -243,31 +243,27 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
     }
 
     /// Adds a started child process.
-    ///
-    /// While children are reaped automatically, this also releases the children the broker
-    /// already reaped, so a parent that never waits does not accumulate them.
-    fn add_child(
-        &self,
-        pid: i32,
-        child: litebox::process::Process<Platform>,
-        reaps_children: bool,
-    ) {
-        let mut children = self.children.lock();
-        let previous = children.insert(pid, child);
+    fn add_child(&self, pid: i32, child: litebox::process::Process<Platform>) {
+        let previous = self.children.lock().insert(pid, child);
         assert!(
             previous.is_none(),
             "broker child process IDs must be unique"
         );
-        let reaped: Vec<_> = if reaps_children {
-            children
-                .extract_if(.., |_, child| {
-                    matches!(child.status(), Ok(litebox::process::ChildStatus::Reaped))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        drop(children);
+    }
+
+    /// Releases the children the broker reaped as they terminated.
+    ///
+    /// Each child holds broker process capacity until its handle closes, so a parent that never
+    /// waits releases them before creating another child.
+    #[cfg(target_arch = "x86_64")]
+    fn release_reaped_children(&self) {
+        let reaped: Vec<_> = self
+            .children
+            .lock()
+            .extract_if(.., |_, child| {
+                matches!(child.status(), Ok(litebox::process::ChildStatus::Reaped))
+            })
+            .collect();
         drop(reaped);
     }
 
@@ -760,11 +756,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .take()
             .expect("completed vfork window lost its parent context");
         self.signals.restore_vfork_parent(state.parent_signals);
-        self.thread.process.add_child(
-            state.child_pid,
-            state.child,
-            self.signals.reaps_children_automatically(),
-        );
+        self.thread.process.add_child(state.child_pid, state.child);
         *ctx = state.parent_context;
         state.child_pid.cast_unsigned() as usize
     }
@@ -862,6 +854,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EAGAIN);
         }
+        self.thread.process.release_reaped_children();
         let child = self
             .global
             .litebox
