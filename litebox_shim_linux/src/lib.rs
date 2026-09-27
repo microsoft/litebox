@@ -275,6 +275,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             euid,
             gid,
             egid,
+            blocked_signals,
+            ignored_signals,
         } = task;
         if pid != self.0.process_id || ppid < 0 {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
@@ -306,7 +308,10 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: fs_state.into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_process(),
+                signals: syscalls::signal::SignalState::new_exec_process(
+                    blocked_signals,
+                    ignored_signals,
+                ),
             },
         };
 
@@ -589,8 +594,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
-        // The constrained vfork child may only inspect its temporary identity, exit, or attempt
-        // execve. Any other syscall terminates the shared runner.
+        // The constrained vfork child may only inspect its temporary identity, manage its own
+        // signal state, exit, or attempt execve. Any other syscall terminates the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
@@ -600,7 +605,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Execve { .. }
                     | SyscallRequest::Getpid
                     | SyscallRequest::Getppid
-                    | SyscallRequest::Gettid)
+                    | SyscallRequest::Gettid
+                    | SyscallRequest::RtSigaction { .. }
+                    | SyscallRequest::RtSigprocmask { .. }
+                    | SyscallRequest::RtSigreturn)
             )
         {
             return Ok(self.abort_vfork_window());
@@ -1255,6 +1263,7 @@ struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::Process<Platform>,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
+    parent_signals: syscalls::signal::VforkParentSignals<Platform>,
 }
 
 impl<Platform: ShimPlatform> GlobalState<Platform> {

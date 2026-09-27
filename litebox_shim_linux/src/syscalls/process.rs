@@ -725,6 +725,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .borrow_mut()
             .take()
             .expect("completed vfork window lost its parent context");
+        self.signals.restore_vfork_parent(state.parent_signals);
         self.thread.process.add_child(state.child_pid, state.child);
         *ctx = state.parent_context;
         state.child_pid.cast_unsigned() as usize
@@ -803,20 +804,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Begins a constrained `vfork` child in the current runner.
     ///
-    /// Only single-threaded processes with default filesystem, signal, resource-limit, alarm, and
-    /// transferable descriptor state are admitted. The parent remains suspended until the child
-    /// exits, is killed by a fault, or successfully transfers to a fresh runner through `execve`;
-    /// an `execve` that fails before the transfer returns its error to the child. The child must
-    /// not change standard descriptor mappings or flags, or platform-managed architectural state
-    /// outside [`litebox_common_linux::PtRegs`], because the current transfer does not preserve
-    /// that state.
+    /// Only single-threaded processes with default filesystem, resource-limit, alarm, and
+    /// transferable descriptor state are admitted. The child gets a copy of the parent's signal
+    /// dispositions, blocked mask, and alternate stack, but none of its pending signals; the
+    /// parent's signal state is restored when it resumes. The parent remains suspended until the
+    /// child exits, is killed by a signal, or successfully transfers to a fresh runner through
+    /// `execve`; an `execve` that fails before the transfer returns its error to the child. The
+    /// child must not change standard descriptor mappings or flags, or platform-managed
+    /// architectural state outside [`litebox_common_linux::PtRegs`], because the current transfer
+    /// does not preserve that state.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
             || self.thread.process.nr_threads() != 1
             || !self.files.borrow().has_only_standard_descriptor_numbers()
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
-            || !self.signals.has_default_signal_state()
             || !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
         {
@@ -835,6 +837,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child,
             child_pid,
             parent_context,
+            parent_signals: self.signals.begin_vfork_child(),
         }));
         Ok(0)
     }
@@ -1908,6 +1911,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 euid: self.credentials.euid,
                 gid: self.credentials.gid,
                 egid: self.credentials.egid,
+                blocked_signals: self.signals.blocked(),
+                ignored_signals: self.signals.ignored(),
                 path,
                 argv: argv_vec,
                 envp: envp_vec,

@@ -103,6 +103,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
                     euid: 1000,
                     gid: 1000,
                     egid: 1000,
+                    blocked_signals: litebox_common_linux::signal::SigSet::empty(),
+                    ignored_signals: litebox_common_linux::signal::SigSet::empty(),
                 },
                 setup.initial_thread,
                 program_path,

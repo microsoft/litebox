@@ -74,6 +74,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_exec_child.c",
     "vfork_exec_parent.c",
     "vfork_exit_parent.c",
+    "vfork_signal_parent.c",
 ];
 
 const BROKER_ONLY_C_TESTS: &[&str] = &[
@@ -354,6 +355,71 @@ fn vfork_child_fault_resumes_parent_with_signaled_child() {
     // `__builtin_trap` executes `ud2`.
     assert_eq!(numeric_field(parent_line, "signal="), libc::SIGILL);
     assert_eq!(numeric_field(parent_line, "echild="), 1);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_child_has_its_own_signal_state() {
+    let parent = common::compile(
+        "./tests/vfork_signal_parent.c",
+        "vfork_signal_parent",
+        true,
+        false,
+    );
+    let child = common::compile(
+        "./tests/vfork_exec_child.c",
+        "vfork_signal_child",
+        true,
+        false,
+    );
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "vfork_signal_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    let parent_line = line("parent ");
+    let parent_pid = numeric_field(parent_line, "pid=");
+    // The parent's pending SIGUSR2 and blocked mask survive its children's changes.
+    assert_eq!(numeric_field(parent_line, "hup_default="), 1);
+    assert_eq!(numeric_field(parent_line, "term_blocked="), 1);
+    assert_eq!(numeric_field(parent_line, "usr2_before_unblock="), 0);
+    assert_eq!(numeric_field(parent_line, "usr2_pid="), parent_pid);
+
+    let fault_line = line("fault ");
+    let fault_child = numeric_field(fault_line, "child=");
+    assert_ne!(fault_child, parent_pid);
+    assert_eq!(numeric_field(fault_line, "waited="), fault_child);
+    assert_eq!(numeric_field(fault_line, "exited="), 1);
+    assert_eq!(numeric_field(fault_line, "code="), 55);
+    assert_eq!(numeric_field(fault_line, "handler_pid="), fault_child);
+
+    let exec_line = line("exec ");
+    let exec_child = numeric_field(exec_line, "child=");
+    assert_eq!(numeric_field(exec_line, "waited="), exec_child);
+    assert_eq!(numeric_field(exec_line, "exited="), 1);
+    assert_eq!(numeric_field(exec_line, "code="), 42);
+
+    // Like Linux `execve`, ignored dispositions and the blocked mask survive while handlers
+    // reset to the default.
+    let child_line = line("child-signals ");
+    assert_eq!(numeric_field(child_line, "pipe_ignored="), 1);
+    assert_eq!(numeric_field(child_line, "hup_ignored="), 1);
+    assert_eq!(numeric_field(child_line, "usr2_default="), 1);
+    assert_eq!(numeric_field(child_line, "ill_default="), 1);
+    assert_eq!(numeric_field(child_line, "term_blocked="), 1);
+    assert_eq!(numeric_field(child_line, "usr2_blocked="), 0);
 }
 
 /// Get the path of a program using `which`

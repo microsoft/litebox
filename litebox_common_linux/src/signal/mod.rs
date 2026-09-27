@@ -119,7 +119,7 @@ pub enum SignalDisposition {
     Continue,
 }
 
-#[derive(Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes)]
 #[repr(transparent)]
 pub struct SigSet(u64);
 
