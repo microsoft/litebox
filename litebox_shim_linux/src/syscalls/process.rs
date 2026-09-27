@@ -1984,10 +1984,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.thread.clear_child_tid.set(None);
         self.rebind_exec_identity();
 
-        let reaped_before_exec = self.signals.reaps_children_automatically();
+        let reaped_before_exec = self.signals.reaps_children();
         self.signals.reset_for_exec();
         // Resetting a `SIGCHLD` handler clears `SA_NOCLDWAIT`.
-        let reaps_children = self.signals.reaps_children_automatically();
+        let reaps_children = self.signals.reaps_children();
         if reaps_children != reaped_before_exec {
             self.set_child_reaping(reaps_children);
         }

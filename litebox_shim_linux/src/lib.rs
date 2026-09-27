@@ -308,15 +308,12 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
                 comm: [0; litebox_common_linux::TASK_COMM_LEN].into(), // set at load time
                 fs: fs_state.into(),
                 files: files.into(),
-                signals: syscalls::signal::SignalState::new_exec_process(
-                    blocked_signals,
-                    ignored_signals,
-                ),
+                signals: syscalls::signal::SignalState::inherited(blocked_signals, ignored_signals),
             },
         };
         // A program started by `execve` keeps an ignored `SIGCHLD`, while the broker starts
         // each process without child reaping.
-        if entrypoints.task.signals.reaps_children_automatically() {
+        if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
         }
 

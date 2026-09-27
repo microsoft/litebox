@@ -117,9 +117,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         self.clear_sigaltstack();
     }
 
-    /// Returns the signal state of a program started by `execve` in a new process, which keeps
-    /// the `blocked` mask and `ignored` dispositions like [`Self::reset_for_exec`].
-    pub fn new_exec_process(blocked: SigSet, ignored: SigSet) -> Self {
+    /// Returns the initial signal state of a process that inherits the `blocked` mask and
+    /// `ignored` dispositions, as a program started by `execve` in a fresh runner keeps them like
+    /// [`Self::reset_for_exec`].
+    pub fn inherited(blocked: SigSet, ignored: SigSet) -> Self {
         let mut state = Self::new_process();
         state.blocked.set(blocked);
         let handlers = Arc::get_mut(state.handlers.get_mut())
@@ -154,10 +155,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         ignored
     }
 
-    /// Returns whether terminated children are reaped automatically instead of becoming zombies,
-    /// because `SIGCHLD` is ignored or has `SA_NOCLDWAIT`.
-    pub(crate) fn reaps_children_automatically(&self) -> bool {
-        reaps_children(&self.handlers.borrow().inner.lock()[Signal::SIGCHLD].action)
+    /// Returns whether terminated children are reaped instead of becoming zombies, because
+    /// `SIGCHLD` is ignored or has `SA_NOCLDWAIT`.
+    pub(crate) fn reaps_children(&self) -> bool {
+        action_reaps_children(&self.handlers.borrow().inner.lock()[Signal::SIGCHLD].action)
     }
 
     /// Gives the `vfork` child a copy of the current dispositions, blocked mask, and alternate
@@ -349,9 +350,9 @@ impl PendingSignals {
     }
 }
 
-/// Returns whether a `SIGCHLD` action reaps terminated children automatically, because it
-/// ignores the signal or has `SA_NOCLDWAIT`.
-fn reaps_children(action: &SigAction) -> bool {
+/// Returns whether a `SIGCHLD` action reaps terminated children, because it ignores the signal or
+/// has `SA_NOCLDWAIT`.
+fn action_reaps_children(action: &SigAction) -> bool {
     action.sigaction == SIG_IGN || action.flags.contains(SaFlags::NOCLDWAIT)
 }
 
@@ -637,9 +638,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // changes in order.
                 if signal == Signal::SIGCHLD
                     && self.vfork.borrow().is_none()
-                    && reaps_children(&act) != reaps_children(&old_act)
+                    && action_reaps_children(&act) != action_reaps_children(&old_act)
                 {
-                    self.set_child_reaping(reaps_children(&act));
+                    self.set_child_reaping(action_reaps_children(&act));
                 }
             }
             old_act

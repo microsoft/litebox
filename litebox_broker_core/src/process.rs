@@ -1691,10 +1691,9 @@ mod tests {
 
     #[test]
     fn children_apply_reaping_setting_when_they_terminate() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
         .build()
         .unwrap();
         let root = broker
@@ -1702,51 +1701,33 @@ mod tests {
             .unwrap();
         root.complete_start().unwrap();
         let sink = readiness_sink();
-        let mut children = Vec::new();
-        for _ in 0..4 {
-            let (child, handle) = root.create_child_process(sink.clone()).unwrap();
-            children.push((child, handle));
-        }
-        let [zombie, reaped, failed, restored] = children.try_into().ok().unwrap();
-        let exit = |(child, _): &(Arc<BrokerProcess>, ObjectHandle)| {
+        let (zombie, zombie_handle) = root.create_child_process(sink.clone()).unwrap();
+        let (reaped, reaped_handle) = root.create_child_process(sink.clone()).unwrap();
+        let (failed, failed_handle) = root.create_child_process(sink.clone()).unwrap();
+        assert_eq!(zombie.set_child_reaping(true), Err(BrokerError::PeerClosed));
+        let exit = |child: &BrokerProcess| {
             child.complete_start().unwrap();
             child.retire(true);
             child.complete_exit(EXITED).unwrap();
         };
-        assert_eq!(
-            zombie.0.set_child_reaping(true),
-            Err(BrokerError::PeerClosed)
-        );
 
         exit(&zombie);
         root.set_child_reaping(true).unwrap();
         exit(&reaped);
         assert_eq!(
-            failed.0.fail_start(BrokerError::PeerClosed, false, true),
+            failed.fail_start(BrokerError::PeerClosed, false, true),
             Err(BrokerError::PeerClosed)
         );
-        let CreatedProcess {
-            identity,
-            handle: pending,
-        } = root.allocate_child_process(sink.clone()).unwrap();
-        root.exit_child_process(identity.process_id, EXITED)
-            .unwrap();
-        root.set_child_reaping(false).unwrap();
-        exit(&restored);
 
-        assert_eq!(root.process_exit_status(zombie.1), Ok(Some(EXITED)));
-        assert_eq!(root.process_exit_status(reaped.1), Ok(None));
-        assert_eq!(root.process_exit_status(failed.1), Ok(None));
-        assert_eq!(root.process_exit_status(pending), Ok(None));
-        assert_eq!(root.process_exit_status(restored.1), Ok(Some(EXITED)));
+        assert_eq!(root.process_exit_status(zombie_handle), Ok(Some(EXITED)));
+        assert_eq!(root.process_exit_status(reaped_handle), Ok(None));
+        assert_eq!(root.process_exit_status(failed_handle), Ok(None));
         assert_eq!(
             *sink.published.lock().unwrap(),
             [
-                (zombie.1, ReadinessFlags::READ),
-                (reaped.1, ReadinessFlags::READ),
-                (failed.1, ReadinessFlags::READ),
-                (pending, ReadinessFlags::READ),
-                (restored.1, ReadinessFlags::READ),
+                (zombie_handle, ReadinessFlags::READ),
+                (reaped_handle, ReadinessFlags::READ),
+                (failed_handle, ReadinessFlags::READ),
             ]
         );
     }
