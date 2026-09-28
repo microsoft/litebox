@@ -147,3 +147,26 @@ fn test_fd_raw_integer() {
         .unwrap();
     assert_eq!(data, "test");
 }
+
+#[test]
+fn test_weak_entry_handle_survives_duplicates() {
+    let litebox = litebox();
+    let mut descriptors = litebox.descriptor_table_mut();
+
+    let fd1: TypedFd<MockSubsystem> = descriptors.insert(MockEntry {
+        data: "shared".to_string(),
+    });
+    let fd2 = descriptors.duplicate(&fd1).unwrap();
+    let weak = descriptors.entry_handle(&fd1).unwrap().downgrade();
+    assert!(weak.stable_key() == descriptors.entry_handle(&fd2).unwrap().stable_key());
+
+    // Closing one descriptor keeps the entry alive through the duplicate.
+    assert!(descriptors.remove(&fd1).is_none());
+    let handle = descriptors.upgrade(&weak).unwrap();
+    assert_eq!(handle.with_entry(|e| e.data.clone()), "shared");
+    drop(handle);
+
+    // A weak handle does not keep the entry alive, so the last close still returns it.
+    assert_eq!(descriptors.remove(&fd2).unwrap().data, "shared");
+    assert!(descriptors.upgrade(&weak).is_none());
+}

@@ -170,10 +170,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         f: impl FnOnce(&dyn IOPollable) -> R,
     ) -> Result<R, errors::ClosedError> {
         let dt = self.litebox.descriptor_table();
-        match &dt.get_entry(fd).ok_or(errors::ClosedError::ClosedFd)?.entry {
-            PipeEnd::Receiver(p) => Ok(f(p)),
-            PipeEnd::Sender(p) => Ok(f(p)),
-        }
+        Ok(dt
+            .get_entry(fd)
+            .ok_or(errors::ClosedError::ClosedFd)?
+            .with_iopollable(f))
     }
 }
 

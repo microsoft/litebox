@@ -146,33 +146,11 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
             // Unique, so we can just return it if allowed.
             if can_close_immediately(old.x.entry.read().as_subsystem::<Subsystem>()) {
                 fd.x.mark_as_closed();
-                match Arc::try_unwrap(old.x) {
-                    Ok(shared) => {
-                        let entry = DescriptorEntry::into_subsystem_entry::<Subsystem>(
-                            RwLock::into_inner(shared.entry),
-                        );
-                        Some(CloseResult::Closed(entry))
-                    }
-                    Err(x) => {
-                        // The strong count was 1 above, but a lock-free
-                        // `WeakEntryHandle::upgrade` on another thread (e.g. an
-                        // epoll re-poll of a still-registered interest) can
-                        // transiently re-share the entry before we take
-                        // ownership. Fall back to the shared path: duplicate the
-                        // descriptor so it is closed once that reference drops,
-                        // rather than dropping the entry without an orderly
-                        // close.
-                        let replaced = self.entries[idx].replace(IndividualEntry {
-                            x,
-                            metadata: old.metadata,
-                        });
-                        assert!(replaced.is_none());
-                        Some(CloseResult::Duplicated(TypedFd {
-                            _phantom: PhantomData,
-                            x: OwnedFd::new(idx),
-                        }))
-                    }
-                }
+                let entry = Arc::into_inner(old.x)
+                    .map(|shared| RwLock::into_inner(shared.entry))
+                    .map(DescriptorEntry::into_subsystem_entry::<Subsystem>)
+                    .unwrap();
+                Some(CloseResult::Closed(entry))
             } else {
                 // Put it back
                 let old = self.entries[idx].replace(old);
@@ -361,6 +339,21 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         // somewhere.
         let entry = self.entries[fd.x.as_usize()?].as_ref()?;
         Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
+    }
+
+    /// Upgrade `weak` to a strong [`EntryHandle`], if its entry is still alive.
+    ///
+    /// Upgrading requires the descriptor table that owns the entry, so that (as with
+    /// [`Self::entry_handle`] and [`Self::duplicate`]) strong references are only ever created
+    /// while the table is held. This ensures that the closing operations, which run on an
+    /// exclusively-held table, never observe the number of references to an entry growing.
+    pub fn upgrade<Subsystem: FdEnabledSubsystem>(
+        &self,
+        weak: &WeakEntryHandle<Platform, Subsystem>,
+    ) -> Option<EntryHandle<Platform, Subsystem>> {
+        weak.0
+            .upgrade()
+            .map(|entry| EntryHandle(entry, PhantomData))
     }
 
     /// Use the entry at `internal_fd` as mutably.
@@ -614,6 +607,8 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
 }
 
 /// A weak reference to a descriptor entry.
+///
+/// Upgrade it via [`Descriptors::upgrade`].
 pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
     Weak<SharedEntry<Platform>>,
     PhantomData<fn(Subsystem) -> Subsystem>,
@@ -622,14 +617,6 @@ pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEna
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     WeakEntryHandle<Platform, Subsystem>
 {
-    /// Upgrades to a strong [`EntryHandle`] if the entry is still alive.
-    #[must_use]
-    pub fn upgrade(&self) -> Option<EntryHandle<Platform, Subsystem>> {
-        self.0
-            .upgrade()
-            .map(|entry| EntryHandle(entry, PhantomData))
-    }
-
     /// An opaque, stable identity for this entry (see [`EntryStableKey`]).
     ///
     /// A [`WeakEntryHandle`] keeps the underlying allocation reserved even after

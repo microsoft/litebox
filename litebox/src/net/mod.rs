@@ -871,9 +871,12 @@ where
             }
             super::fd::CloseResult::Duplicated(dup_fd) => {
                 // It seems like there might be other duplicates around (e.g., due to `dup`), so we
-                // can't immediately close it out.
-                // We attempt to queue it for future closure and then just return.
+                // can't immediately close it out. We queue it for closure, and then immediately
+                // close out any queued entries that are no longer referenced elsewhere (e.g., if
+                // this was the last remaining duplicate).
                 self.queued_for_closure.push(dup_fd);
+                drop(dt);
+                self.attempt_to_close_queued();
             }
             super::fd::CloseResult::Deferred => {
                 let Some(()) = dt.with_entry_mut(fd, |entry| entry.entry.consider_closed = true)
