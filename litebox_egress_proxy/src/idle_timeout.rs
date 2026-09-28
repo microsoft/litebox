@@ -110,7 +110,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_stream_times_out() {
         let (client, _server) = duplex(64);
-        let mut limited = IdleTimeoutStream::new(client, Duration::from_secs(60));
+        let mut limited = IdleTimeoutStream::new(client, Duration::from_mins(1));
         let mut buffer = [0_u8; 8];
         let error = limited.read(&mut buffer).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);

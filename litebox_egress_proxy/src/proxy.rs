@@ -35,7 +35,7 @@ use crate::policy::HostPolicy;
 const MAX_CONCURRENT_CLIENT_CONNECTIONS: usize = 256;
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_FIELDS: usize = 100;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 const REQUEST_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const HOP_BY_HOP_HEADERS: [&str; 9] = [
     "connection",
