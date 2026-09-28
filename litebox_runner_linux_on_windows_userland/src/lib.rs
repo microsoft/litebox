@@ -10,7 +10,9 @@ extern crate alloc;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
-use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland as Platform};
+use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
+
+type Platform = WindowsUserland<{ litebox::mm::vmem::PAGE_SIZE }>;
 
 /// Run Linux programs with LiteBox on unmodified Windows.
 ///

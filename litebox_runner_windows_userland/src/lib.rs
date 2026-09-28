@@ -12,6 +12,8 @@ use clap::Parser;
 use litebox_broker_local_userland as broker;
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
 
+type Platform = WindowsUserland<{ litebox::mm::vmem::PAGE_SIZE }>;
+
 /// Runs a Windows PE program with LiteBox on unmodified Windows and returns its exit code.
 ///
 /// The program binary and runtime files must be available in the broker-owned file system.
@@ -63,8 +65,8 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
         anyhow::bail!("unsupported child Windows process startup");
     }
 
-    let platform = WindowsUserland::new();
-    WindowsUserland::set_guest_tls_mode(GuestTlsMode::Windows);
+    let platform = Platform::new();
+    Platform::set_guest_tls_mode(GuestTlsMode::Windows);
     let broker::BrokerConnection {
         local,
         notifications,

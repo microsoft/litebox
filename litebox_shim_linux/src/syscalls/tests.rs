@@ -25,7 +25,8 @@ pub(crate) use litebox_platform_linux_userland::LinuxUserland as TestPlatform;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use litebox_platform_macos_userland::MacosUserland4K as TestPlatform;
 #[cfg(target_os = "windows")]
-pub(crate) use litebox_platform_windows_userland::WindowsUserland as TestPlatform;
+pub(crate) type TestPlatform =
+    litebox_platform_windows_userland::WindowsUserland<{ litebox::mm::vmem::PAGE_SIZE }>;
 
 /// Returns the process-wide test platform, initializing it once.
 pub(crate) fn test_platform() -> &'static TestPlatform {
