@@ -663,9 +663,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         if signal == Signal::SIGCHLD && act.is_some() {
             // Linux decides whether to send `SIGCHLD` as the child terminates, so terminations
-            // the broker already recorded are observed under the old action. A termination
-            // concurrent with this call may still be reaped under the old action and signaled
-            // under the new one.
+            // already notified to this process are observed under the old action. A termination
+            // concurrent with this call, or not yet notified, which the guest cannot tell apart,
+            // may still be reaped under the old action and signaled under the new one.
             let _ = self.observe_child_terminations();
         }
 
