@@ -20,6 +20,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
     CreatedProcess, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus,
+    ProcessTermination,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -82,7 +83,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn process_exit_status(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<Option<ProcessExitStatus>, BrokerControlError>;
+    ) -> core::result::Result<ProcessTermination, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -529,7 +530,7 @@ where
     fn process_exit_status(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<Option<ProcessExitStatus>, BrokerControlError> {
+    ) -> core::result::Result<ProcessTermination, BrokerControlError> {
         self.request(|local| local.process_exit_status(handle))
     }
 

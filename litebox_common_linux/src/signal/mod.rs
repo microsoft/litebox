@@ -323,6 +323,9 @@ pub const ILL_ILLOPN: i32 = 2;
 
 pub const FPE_INTDIV: i32 = 1;
 
+pub const CLD_EXITED: i32 = 1;
+pub const CLD_KILLED: i32 = 2;
+
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, FromBytes, IntoBytes)]
@@ -373,6 +376,16 @@ impl SiginfoData {
     pub fn new_addr(addr: usize) -> Self {
         let mut pad = [0u32; 28];
         pad.as_mut_bytes()[..core::mem::size_of::<usize>()].copy_from_slice(&addr.to_ne_bytes());
+        Self { pad }
+    }
+
+    /// Returns the `SIGCHLD` fields for child `pid` of user `uid` that terminated with `status`,
+    /// reporting zero CPU time.
+    pub fn new_child(pid: i32, uid: u32, status: i32) -> Self {
+        let mut pad = [0u32; 28];
+        pad[0] = pid.cast_unsigned();
+        pad[1] = uid;
+        pad[2] = status.cast_unsigned();
         Self { pad }
     }
 }

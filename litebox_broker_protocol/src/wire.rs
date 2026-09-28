@@ -25,7 +25,7 @@ use crate::message::{
 use crate::process::{
     CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildProcessSource,
+    ProcessTermination, StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -525,13 +525,14 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
             encoder.request_id(request_id);
         }
-        BrokerResult::ProcessExitStatus(status) => {
+        BrokerResult::ProcessExitStatus(ProcessTermination {
+            exit_status,
+            reaped,
+        }) => {
             encoder.u8(RESPONSE_TAG_PROCESS_EXIT_STATUS);
             encoder.request_id(request_id);
-            encoder.u8(u8::from(status.is_some()));
-            if let Some(status) = status {
-                encode_process_exit_status(&mut encoder, status);
-            }
+            encode_process_exit_status(&mut encoder, exit_status);
+            encoder.u8(u8::from(reaped));
         }
         BrokerResult::ProcessExited => {
             encoder.u8(RESPONSE_TAG_PROCESS_EXITED);
@@ -609,13 +610,14 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted,
-        RESPONSE_TAG_PROCESS_EXIT_STATUS => {
-            BrokerResult::ProcessExitStatus(match decoder.u8()? {
-                0 => None,
-                1 => Some(decode_process_exit_status(&mut decoder)?),
+        RESPONSE_TAG_PROCESS_EXIT_STATUS => BrokerResult::ProcessExitStatus(ProcessTermination {
+            exit_status: decode_process_exit_status(&mut decoder)?,
+            reaped: match decoder.u8()? {
+                0 => false,
+                1 => true,
                 _ => return Err(WireError::InvalidTag),
-            })
-        }
+            },
+        }),
         RESPONSE_TAG_PROCESS_EXITED => BrokerResult::ProcessExited,
         RESPONSE_TAG_EXIT_STATUS_REPORTED => BrokerResult::ExitStatusReported,
         RESPONSE_TAG_CHILD_REAPING_SET => BrokerResult::ChildReapingSet,
@@ -745,7 +747,7 @@ mod tests {
     use crate::process::{
         CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
         ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
-        StartChildProcessRequest, StartChildProcessSource,
+        ProcessTermination, StartChildProcessRequest, StartChildProcessSource,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::socket::{
@@ -1476,10 +1478,18 @@ mod tests {
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::ProcessStarted,
-            BrokerResult::ProcessExitStatus(Some(ProcessExitStatus::Exited { code: u32::MAX })),
-            BrokerResult::ProcessExitStatus(Some(ProcessExitStatus::Signaled { signal: 11 })),
-            BrokerResult::ProcessExitStatus(Some(ProcessExitStatus::Unknown)),
-            BrokerResult::ProcessExitStatus(None),
+            BrokerResult::ProcessExitStatus(ProcessTermination {
+                exit_status: ProcessExitStatus::Exited { code: u32::MAX },
+                reaped: false,
+            }),
+            BrokerResult::ProcessExitStatus(ProcessTermination {
+                exit_status: ProcessExitStatus::Signaled { signal: 11 },
+                reaped: true,
+            }),
+            BrokerResult::ProcessExitStatus(ProcessTermination {
+                exit_status: ProcessExitStatus::Unknown,
+                reaped: false,
+            }),
             BrokerResult::ProcessExited,
             BrokerResult::ExitStatusReported,
             BrokerResult::ChildReapingSet,
@@ -2117,13 +2127,25 @@ mod tests {
 
         let mut invalid_exit_status = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::ProcessExitStatus(None),
+            result: BrokerResult::ProcessExitStatus(ProcessTermination {
+                exit_status: ProcessExitStatus::Unknown,
+                reaped: false,
+            }),
         });
-        invalid_exit_status[9] = 2;
+        invalid_exit_status[9] = 0xff;
         assert_eq!(
             decode_response(&invalid_exit_status),
             Err(WireError::InvalidTag)
         );
+        let mut invalid_reaped = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::ProcessExitStatus(ProcessTermination {
+                exit_status: ProcessExitStatus::Unknown,
+                reaped: false,
+            }),
+        });
+        invalid_reaped[10] = 2;
+        assert_eq!(decode_response(&invalid_reaped), Err(WireError::InvalidTag));
 
         let mut frame = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

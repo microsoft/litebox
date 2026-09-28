@@ -42,8 +42,8 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::process::{
     CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor, ProcessTermination,
+    StartChildProcessRequest, StartChildProcessSource,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -339,8 +339,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
 
     /// Returns a process's termination status through a process handle.
     ///
-    /// Returns `WouldBlock` while the process is live, and `None` if it was
-    /// reaped when it terminated.
+    /// Returns `WouldBlock` while the process is live.
     ///
     /// # Panics
     ///
@@ -348,7 +347,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn process_exit_status(
         &self,
         handle: ObjectHandle,
-    ) -> Result<Option<ProcessExitStatus>, Channel::Error> {
+    ) -> Result<ProcessTermination, Channel::Error> {
         match self.request(BrokerOperation::GetProcessExitStatus(handle))? {
             BrokerResult::ProcessExitStatus(status) => Ok(status),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
