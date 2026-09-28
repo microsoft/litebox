@@ -1472,6 +1472,10 @@ impl<const PAGE_SIZE: usize> litebox::platform::SystemInfoProvider
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
     }
+    fn syscall_instruction_len(&self) -> usize {
+        // The rewriter's `B` into the SVC gate, which replaces the `SVC` in place.
+        4
+    }
     fn guest_thread_pointer_offset(&self) -> Option<usize> {
         Some(guest_thread_pointer_tp_offset())
     }

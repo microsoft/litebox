@@ -2036,6 +2036,9 @@ mod tests {
             fn get_syscall_entry_point(&self) -> usize {
                 0
             }
+            fn syscall_instruction_len(&self) -> usize {
+                4
+            }
             fn get_vdso_address(&self) -> Option<usize> {
                 None
             }

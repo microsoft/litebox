@@ -6,7 +6,9 @@
 //! Use a dedicated module to prevent code from accidentally accessing
 //! `wait_state` without going through `wait_cx()`.
 
+use crate::syscalls::signal::SyscallRestart;
 use crate::{ShimPlatform, Task};
+use litebox_common_linux::errno::Errno;
 
 pub(crate) struct WaitState<Platform: ShimPlatform>(litebox::event::wait::WaitState<Platform>);
 
@@ -32,13 +34,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.wait_state.0.finish_running_guest();
     }
 
-    /// Prepares to return to run guest code. Returns `false` if the task should
-    /// exit instead.
+    /// Prepares to return to run guest code, restarting the interrupted syscall `ctx` returns from
+    /// if `restart` is set. Returns `false` if the task should exit instead.
     #[must_use]
-    pub(crate) fn prepare_to_run_guest(&self, ctx: &mut litebox_common_linux::PtRegs) -> bool {
+    pub(crate) fn prepare_to_run_guest(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+        restart: Option<SyscallRestart>,
+    ) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
             self.queue_async_signals();
-            self.process_signals(ctx);
+            self.process_signals(ctx, restart);
             !self.is_exiting()
         })
     }
@@ -52,6 +58,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(feature = "alarm_fallback")]
         self.check_alarm_deadline();
         self.check_for_child_terminations();
+    }
+}
+
+/// Converts the error of a failed wait on `cx`.
+///
+/// An interrupted wait with a deadline fails with `EINTR`, as in Linux when a handler runs, since
+/// restarting it would restart its whole timeout.
+pub(crate) fn wait_errno<Platform: ShimPlatform>(
+    cx: &litebox::event::wait::WaitContext<'_, Platform>,
+    error: impl Into<Errno>,
+) -> Errno {
+    let errno = error.into();
+    if cx.deadline().is_some() {
+        errno.without_restart()
+    } else {
+        errno
     }
 }
 

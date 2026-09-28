@@ -435,6 +435,11 @@ impl<Host: HostInterface> litebox::platform::SystemInfoProvider for LinuxKernel<
         0
     }
 
+    fn syscall_instruction_len(&self) -> usize {
+        // The guest enters through a native `SYSCALL` instruction.
+        2
+    }
+
     fn get_vdso_address(&self) -> Option<usize> {
         None
     }

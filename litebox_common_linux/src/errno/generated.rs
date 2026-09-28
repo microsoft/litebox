@@ -17,8 +17,8 @@ impl super::Errno {
     ///     -e '{n=$1; c=$2; $1=""; $2=""; f(n,c,substr($0,3));}' \
     /// | sort -n
     /// ```
-    /// and very minor manual cleanup (combining same value numbers with `/`, as well as adding the
-    /// fallthrough-unreachable case).
+    /// and very minor manual cleanup (combining same value numbers with `/`, adding the
+    /// kernel-internal restart codes, as well as adding the fallthrough-unreachable case).
     pub const fn as_str(self) -> &'static str {
         match self.value.get() {
             1 => "EPERM: Operation not permitted",
@@ -152,6 +152,8 @@ impl super::Errno {
             131 => "ENOTRECOVERABLE: State not recoverable",
             132 => "ERFKILL: Operation not possible due to RF-kill",
             133 => "EHWPOISON: Memory page has hardware error",
+            512 => "ERESTARTSYS: Interrupted system call, restartable with SA_RESTART",
+            514 => "ERESTARTNOHAND: Interrupted system call, restartable if unhandled",
             _ => unreachable!(),
         }
     }

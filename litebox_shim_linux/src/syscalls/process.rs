@@ -4,6 +4,7 @@
 //! Process/thread related syscalls.
 
 use crate::syscalls::signal::{child_termination, siginfo_child};
+use crate::wait::wait_errno;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -1571,7 +1572,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             WaitError::TimedOut => {}
             WaitError::Interrupted => {
                 if is_abs {
-                    return Err(Errno::EINTR);
+                    // Like Linux, an absolute sleep restarts with its deadline unless a handler
+                    // runs.
+                    return Err(Errno::ERESTARTNOHAND);
                 }
                 if let Some(remaining_timeout) = wait_cx.remaining_timeout() {
                     remain.write::<Platform>(remaining_timeout)?;
@@ -1735,7 +1738,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `pause`.
     pub(crate) fn sys_pause(&self) -> Result<(), Errno> {
         match self.wait_cx().sleep() {
-            WaitError::Interrupted => Err(Errno::EINTR),
+            // Like Linux, `pause` returns only once a handler runs.
+            WaitError::Interrupted => Err(Errno::ERESTARTNOHAND),
             WaitError::TimedOut => unreachable!("pause sleep has no deadline"),
         }
     }
@@ -1914,12 +1918,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => {
                 warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
-                self.global.futex_manager.wait(
-                    &self.wait_cx().with_timeout(timeout),
-                    addr.to_platform_ptr::<Platform>(),
-                    val,
-                    None,
-                )?;
+                let wait_cx = self.wait_cx().with_timeout(timeout);
+                self.global
+                    .futex_manager
+                    .wait(&wait_cx, addr.to_platform_ptr::<Platform>(), val, None)
+                    .map_err(|error| wait_errno(&wait_cx, error))?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -1941,12 +1944,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 };
-                self.global.futex_manager.wait(
-                    &self.wait_cx().with_deadline(deadline),
-                    addr.to_platform_ptr::<Platform>(),
-                    val,
-                    core::num::NonZeroU32::new(bitmask),
-                )?;
+                let wait_cx = self.wait_cx().with_deadline(deadline);
+                self.global
+                    .futex_manager
+                    .wait(
+                        &wait_cx,
+                        addr.to_platform_ptr::<Platform>(),
+                        val,
+                        core::num::NonZeroU32::new(bitmask),
+                    )
+                    .map_err(|error| wait_errno(&wait_cx, error))?;
                 0
             }
             _ => unimplemented!("Unsupported futex operation"),
@@ -2722,7 +2729,7 @@ mod tests {
              let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
              #[cfg(target_arch = "aarch64")]
              let mut regs = litebox_common_linux::PtRegs { sp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
-             task.process_signals(&mut regs);
+             task.process_signals(&mut regs, None);
             assert_eq!(
                 regs.get_ip(), callback_addr,
                 "after processing signals, execution should be redirected to the custom handler"
@@ -2959,7 +2966,7 @@ mod tests {
             assert!(!task.has_pending_signals(), "blocked SIGUSR1 should not be deliverable");
 
             let mut regs = PtRegs::default();
-            task.process_signals(&mut regs);
+            task.process_signals(&mut regs, None);
             assert!(!task.has_pending_signals(), "blocked SIGUSR1 should remain undeliverable");
 
             task.sys_rt_sigprocmask(
@@ -2970,7 +2977,7 @@ mod tests {
             )
             .expect("unblock SIGUSR1 failed");
 
-            assert_eq!(task.sys_pause(), Err(Errno::EINTR));
+            assert_eq!(task.sys_pause(), Err(Errno::ERESTARTNOHAND));
             task.sys_alarm(0).unwrap();
 
             let pending = task.pending_signal_set();
@@ -2979,6 +2986,165 @@ mod tests {
                 !pending.contains(Signal::SIGALRM),
                 "SIGALRM must not be what woke pause()"
             );
+        });
+    }
+
+    const SYSCALL_RETURN_IP: usize = 0x5000;
+    const SYSCALL_ARG0: usize = 7;
+
+    /// Returns the registers of a syscall returning to [`SYSCALL_RETURN_IP`] with the provisional
+    /// `EINTR` of an interrupted syscall, using `stack`.
+    fn interrupted_syscall_regs(stack: &mut [u8]) -> litebox_common_linux::PtRegs {
+        use litebox_common_linux::errno::Errno;
+
+        let eintr = (Errno::EINTR.as_neg() as isize).cast_unsigned();
+        let sp = stack.as_mut_ptr() as usize + stack.len();
+        #[cfg(target_arch = "x86_64")]
+        let regs = litebox_common_linux::PtRegs {
+            rip: SYSCALL_RETURN_IP,
+            rsp: sp,
+            rax: eintr,
+            orig_rax: 0, // read
+            rdi: SYSCALL_ARG0,
+            ..Default::default()
+        };
+        #[cfg(target_arch = "aarch64")]
+        let regs = {
+            let mut regs = litebox_common_linux::PtRegs {
+                pc: SYSCALL_RETURN_IP,
+                sp,
+                orig_x0: SYSCALL_ARG0,
+                ..Default::default()
+            };
+            regs.regs[0] = eintr;
+            regs
+        };
+        regs
+    }
+
+    /// Returns the syscall's instruction pointer and return (or first argument) register.
+    fn syscall_state(regs: &litebox_common_linux::PtRegs) -> (usize, usize) {
+        #[cfg(target_arch = "x86_64")]
+        return (regs.rip, regs.rax);
+        #[cfg(target_arch = "aarch64")]
+        return (regs.pc, regs.regs[0]);
+    }
+
+    fn restarted_state<Platform: litebox::platform::SystemInfoProvider>(
+        platform: &Platform,
+    ) -> (usize, usize) {
+        #[cfg(target_arch = "x86_64")]
+        let reissued = 0; // read
+        #[cfg(target_arch = "aarch64")]
+        let reissued = SYSCALL_ARG0;
+        (
+            SYSCALL_RETURN_IP - platform.syscall_instruction_len(),
+            reissued,
+        )
+    }
+
+    fn interrupted_state() -> (usize, usize) {
+        (
+            SYSCALL_RETURN_IP,
+            (litebox_common_linux::errno::Errno::EINTR.as_neg() as isize).cast_unsigned(),
+        )
+    }
+
+    /// An interrupted syscall restarts when signal processing runs no handler.
+    #[test]
+    fn test_syscall_restarts_without_handler() {
+        use crate::syscalls::signal::SyscallRestart;
+        use litebox_common_linux::signal::{SigSet, SigmaskHow, Signal};
+
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let mut stack = [0u8; 2 * litebox::mm::vmem::PAGE_SIZE];
+            let set = SigSet::empty().with(Signal::SIGCHLD);
+            let sigprocmask = |how| {
+                task.sys_rt_sigprocmask(
+                    how,
+                    Some(UserPtr::from_ptr(&raw const set)),
+                    None,
+                    core::mem::size_of::<SigSet>(),
+                )
+                .expect("rt_sigprocmask failed");
+            };
+            for restart in [None, Some(SyscallRestart::Sys), Some(SyscallRestart::NoHandler)] {
+                // SIGCHLD is ignored by default, but is queued while blocked. Once unblocked,
+                // it interrupts waits, yet runs no handler.
+                sigprocmask(SigmaskHow::SIG_BLOCK);
+                task.sys_tkill(task.tid(), Signal::SIGCHLD.as_i32())
+                    .expect("tkill failed");
+                sigprocmask(SigmaskHow::SIG_UNBLOCK);
+                assert!(task.has_pending_signals(), "SIGCHLD should be pending");
+
+                let mut regs = interrupted_syscall_regs(&mut stack);
+                task.process_signals(&mut regs, restart);
+                assert!(!task.has_pending_signals(), "SIGCHLD should be consumed");
+                let expected = if restart.is_some() {
+                    restarted_state(task.global.platform)
+                } else {
+                    interrupted_state()
+                };
+                assert_eq!(syscall_state(&regs), expected, "{restart:?}");
+            }
+        });
+    }
+
+    /// When a handler runs, the interrupted syscall restarts after it returns only for
+    /// `ERESTARTSYS` with `SA_RESTART`.
+    #[test]
+    fn test_syscall_restart_follows_sa_restart() {
+        use crate::syscalls::signal::SyscallRestart;
+        use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
+
+        let handler = 0x1000usize;
+        let task = crate::syscalls::tests::init_platform();
+        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
+            let mut stack = [0u8; 2 * litebox::mm::vmem::PAGE_SIZE];
+            let cases = [
+                (SyscallRestart::Sys, SaFlags::RESTART, true),
+                (SyscallRestart::Sys, SaFlags::empty(), false),
+                (SyscallRestart::NoHandler, SaFlags::RESTART, false),
+                (SyscallRestart::NoHandler, SaFlags::empty(), false),
+            ];
+            for (restart, flags, restarts) in cases {
+                let act = SigAction {
+                    sigaction: handler,
+                    flags: SaFlags::RESTORER | flags,
+                    #[cfg(target_pointer_width = "64")]
+                    __pad: 0,
+                    restorer: 0,
+                    mask: SigSet::empty(),
+                };
+                task.sys_rt_sigaction(
+                    Signal::SIGUSR1,
+                    Some(UserPtr::from_ptr(&raw const act)),
+                    None,
+                    core::mem::size_of::<SigSet>(),
+                )
+                .expect("rt_sigaction failed");
+                task.sys_tkill(task.tid(), Signal::SIGUSR1.as_i32())
+                    .expect("tkill failed");
+
+                let mut regs = interrupted_syscall_regs(&mut stack);
+                task.process_signals(&mut regs, Some(restart));
+                assert_eq!(regs.get_ip(), handler, "the handler should run");
+
+                // Return from the handler as its restorer would.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    regs.rsp += core::mem::size_of::<usize>();
+                }
+                task.sys_rt_sigreturn(&mut regs).expect("rt_sigreturn failed");
+                let expected = if restarts {
+                    restarted_state(task.global.platform)
+                } else {
+                    interrupted_state()
+                };
+                assert_eq!(syscall_state(&regs), expected, "{restart:?} with SA_RESTART={}",
+                    flags.contains(SaFlags::RESTART));
+            }
         });
     }
 

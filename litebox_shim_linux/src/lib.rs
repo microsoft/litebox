@@ -45,6 +45,7 @@ use litebox_common_linux::{
     },
 };
 use litebox_platform::time::TimeProvider;
+use syscalls::signal::SyscallRestart;
 
 #[cfg(target_arch = "aarch64")]
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
@@ -238,7 +239,10 @@ impl<Platform: ShimPlatform> litebox::shim::EnterShim for LinuxShimEntrypoints<P
     type ExecutionContext = litebox_common_linux::PtRegs;
 
     fn init(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(true, ctx, Task::handle_init_request)
+        self.enter_shim(true, ctx, |task, ctx| {
+            task.handle_init_request(ctx);
+            None
+        })
     }
 
     fn syscall(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
@@ -279,26 +283,29 @@ impl<Platform: ShimPlatform> litebox::shim::EnterShim for LinuxShimEntrypoints<P
         }
         self.enter_shim(false, ctx, |task, ctx| {
             task.handle_exception_request(info, ctx);
+            None
         })
     }
 
     fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-        self.enter_shim(false, ctx, |_, _| {})
+        self.enter_shim(false, ctx, |_, _| None)
     }
 }
 
 impl<Platform: ShimPlatform> LinuxShimEntrypoints<Platform> {
+    /// Runs `f`, which returns how an interrupted syscall restarts, then prepares to resume the
+    /// guest.
     fn enter_shim(
         &self,
         is_init: bool,
         ctx: &mut litebox_common_linux::PtRegs,
-        f: impl FnOnce(&Task<Platform>, &mut litebox_common_linux::PtRegs),
+        f: impl FnOnce(&Task<Platform>, &mut litebox_common_linux::PtRegs) -> Option<SyscallRestart>,
     ) -> ContinueOperation {
         if !is_init {
             self.task.enter_from_guest();
         }
-        f(&self.task, ctx);
-        if self.task.prepare_to_run_guest(ctx) {
+        let restart = f(&self.task, ctx);
+        if self.task.prepare_to_run_guest(ctx, restart) {
             ContinueOperation::Resume
         } else {
             ContinueOperation::Terminate
@@ -682,11 +689,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// # Panics
     ///
     /// Unsupported syscalls or arguments would trigger a panic for development purposes.
-    fn handle_syscall_request(&self, ctx: &mut litebox_common_linux::PtRegs) {
+    ///
+    /// Returns how the syscall restarts if a signal interrupted it. Its return value is then
+    /// `EINTR` until signal delivery decides.
+    fn handle_syscall_request(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> Option<SyscallRestart> {
         let result = self.do_syscall(ctx);
+        let restart = result.err().and_then(SyscallRestart::from_errno);
         let return_value = match result {
             Ok(v) => v,
-            Err(err) => (err.as_neg() as isize).reinterpret_as_unsigned(),
+            Err(err) => (err.without_restart().as_neg() as isize).reinterpret_as_unsigned(),
         };
         #[cfg(target_arch = "x86_64")]
         {
@@ -696,6 +710,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             ctx.regs[0] = return_value;
         }
+        restart
     }
 
     fn do_syscall(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
