@@ -40,9 +40,13 @@ static int clone_child(void *marker) {
     return 111;
 }
 
-// Runs on the child's own stack. With `CLONE_CLEAR_SIGHAND`, the parent's SIGILL handler does not
+// Must run on `child_stack`. With `CLONE_CLEAR_SIGHAND`, the parent's SIGILL handler does not
 // apply, so the fault kills the child.
 static void __attribute__((noreturn, used)) clear_sighand_child(void) {
+    uintptr_t frame = (uintptr_t)__builtin_frame_address(0);
+    if (frame < (uintptr_t)child_stack || frame >= (uintptr_t)child_stack + sizeof(child_stack)) {
+        _exit(55);
+    }
     __asm__ volatile("ud2");
     _exit(56);
 }
