@@ -65,6 +65,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
             .insert(Arc::new(BrokerFile { broker, handle })))
     }
 
+    /// Returns a descriptor for a file this process inherited from its parent
+    /// through [`Process::inherit`](crate::process::Process::inherit).
+    ///
+    /// The descriptor owns `handle`, so callers adopt each handle once and
+    /// duplicate the descriptor for every other use.
+    pub fn adopt_inherited_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<FileFd, crate::process::ProcessError> {
+        let broker = self
+            .broker_control()
+            .ok_or(crate::process::ProcessError::Unavailable)?;
+        Ok(self
+            .descriptor_table_mut()
+            .insert(Arc::new(BrokerFile { broker, handle })))
+    }
+
     /// Close the file at `fd`.
     ///
     /// Future operations on the `fd` will start to return `ClosedFd` errors.
@@ -358,14 +375,6 @@ pub struct BrokerFile {
 }
 
 impl BrokerFile {
-    /// Takes ownership of an existing broker file reference.
-    pub(crate) fn from_handle(
-        broker: Arc<dyn crate::broker::BrokerControl>,
-        handle: ObjectHandle,
-    ) -> Self {
-        Self { broker, handle }
-    }
-
     /// Returns the broker file reference, which identifies its open file description.
     pub(crate) fn handle(&self) -> ObjectHandle {
         self.handle

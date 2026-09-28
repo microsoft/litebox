@@ -418,18 +418,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             .with_entry(fd, |entry| Arc::clone(&entry.entry.0))
     }
 
-    /// Returns a descriptor owning `handle`, an end of a pipe another process
-    /// created.
+    /// Returns a descriptor for a pipe end this process inherited from its
+    /// parent through [`Process::inherit`](crate::process::Process::inherit),
+    /// using `flags` as the end's initial flags.
     ///
-    /// The end has no peer in this process, so broker readiness notifications
-    /// alone wake its waiters.
-    pub(crate) fn insert_broker_pipe_end(
+    /// The descriptor owns `handle`, so callers adopt each handle once and
+    /// duplicate the descriptor for every other use. The end has no peer in
+    /// this process, so broker readiness notifications alone wake its waiters.
+    pub fn adopt_inherited_pipe(
         &self,
-        broker: Arc<dyn BrokerControl>,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,
         flags: Flags,
-    ) -> PipeFd<Platform> {
+    ) -> Result<PipeFd<Platform>, crate::process::ProcessError> {
+        let broker = self
+            .broker_control()
+            .ok_or(crate::process::ProcessError::Unavailable)?;
         let pollable_registry = self.broker_pollable_registry();
         let end = Arc::new(BrokerPipeEnd {
             broker,
@@ -441,7 +445,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
         });
         pollable_registry.register_pollable(handle, &end.pollee);
-        self.descriptor_table_mut().insert(PipeEnd(end))
+        Ok(self.descriptor_table_mut().insert(PipeEnd(end)))
     }
 }
 

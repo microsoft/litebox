@@ -16,8 +16,8 @@ use crate::broker::{
     BrokerControl, BrokerPollableRegistry, error::BrokerControlError, readiness_events,
 };
 use crate::event::{Events, IOPollable, observer::Observer, polling::Pollee};
-use crate::fs::{BrokerFile, FileFd};
-use crate::pipes::{Flags as PipeFlags, HalfPipeType, PipeFd};
+use crate::fs::FileFd;
+use crate::pipes::PipeFd;
 use crate::sync::RawSyncPrimitivesProvider;
 
 /// Error returned by the broker-backed process service.
@@ -71,34 +71,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn set_child_reaping(&self, enabled: bool) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_child_reaping(enabled)?)
-    }
-
-    /// Returns a descriptor for a file this process inherited from its parent
-    /// through [`Process::inherit`].
-    ///
-    /// The descriptor owns `handle`, so callers adopt each handle once and
-    /// duplicate the descriptor for every other use.
-    pub fn adopt_inherited_file(&self, handle: ObjectHandle) -> Result<FileFd, ProcessError> {
-        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(self
-            .descriptor_table_mut()
-            .insert(Arc::new(BrokerFile::from_handle(broker, handle))))
-    }
-
-    /// Returns a descriptor for a pipe end this process inherited from its
-    /// parent through [`Process::inherit`], using `flags` as the end's
-    /// initial flags.
-    ///
-    /// The descriptor owns `handle`, so callers adopt each handle once and
-    /// duplicate the descriptor for every other use.
-    pub fn adopt_inherited_pipe(
-        &self,
-        handle: ObjectHandle,
-        endpoint_type: HalfPipeType,
-        flags: PipeFlags,
-    ) -> Result<PipeFd<Platform>, ProcessError> {
-        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(self.insert_broker_pipe_end(broker, handle, endpoint_type, flags))
     }
 }
 
