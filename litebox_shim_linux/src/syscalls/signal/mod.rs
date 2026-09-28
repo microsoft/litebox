@@ -24,8 +24,9 @@ use core::cell::{Cell, RefCell};
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::signal::{
-    FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL, SIG_IGN, SaFlags,
-    SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal, SsFlags, Ucontext,
+    CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL,
+    SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal,
+    SsFlags, Ucontext,
 };
 use litebox_common_linux::{PtRegs, errno::Errno};
 
@@ -395,6 +396,31 @@ fn siginfo_exception(signal: Signal, fault_address: usize) -> Siginfo {
     }
 }
 
+/// Returns the `SIGCHLD` code and status reporting a child that terminated with `exit_status`.
+///
+/// A child without an observable status failed after its parent resumed, like a Linux exec
+/// failure past the point of no return, which the kernel reports as killed by `SIGSEGV`.
+pub(crate) fn child_termination(exit_status: ProcessExitStatus) -> (i32, i32) {
+    match exit_status {
+        ProcessExitStatus::Exited { code } => (CLD_EXITED, (code & 0xff).cast_signed()),
+        ProcessExitStatus::Signaled { signal } => (CLD_KILLED, (signal & 0x7f).cast_signed()),
+        _ => (CLD_KILLED, Signal::SIGSEGV.as_i32()),
+    }
+}
+
+/// Creates the `Siginfo` for the `SIGCHLD` reporting that child `pid` of user `uid` terminated
+/// with `exit_status`.
+pub(crate) fn siginfo_child(pid: i32, uid: u32, exit_status: ProcessExitStatus) -> Siginfo {
+    let (code, status) = child_termination(exit_status);
+    Siginfo {
+        signo: Signal::SIGCHLD.as_i32(),
+        errno: 0,
+        code,
+        __pad: 0,
+        data: SiginfoData::new_child(pid, uid, status),
+    }
+}
+
 /// Creates a `Siginfo` for a signal sent by a user process via `kill()`,
 /// `tkill()`, or `tgkill()`.
 pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
@@ -635,6 +661,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             None
         };
+        if signal == Signal::SIGCHLD && act.is_some() {
+            // Linux decides whether to send `SIGCHLD` as the child terminates, so terminations
+            // already notified to this process are observed under the old action. A termination
+            // concurrent with this call, or not yet notified, which the guest cannot tell apart,
+            // may still be reaped under the old action and signaled under the new one.
+            let _ = self.observe_child_terminations();
+        }
 
         let handlers = self.signals.handlers.borrow();
         let old_act = {

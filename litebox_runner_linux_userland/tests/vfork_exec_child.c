@@ -42,6 +42,10 @@ int main(int argc, char **argv) {
         }
         return 42;
     }
+    if (strcmp(marker, "sleep") == 0) {
+        usleep(100 * 1000);
+        return 42;
+    }
     if (strcmp(marker, "reap-inherited") == 0) {
         printf("reap-inherited reaped=%d\n", child_is_reaped(24));
         return 42;

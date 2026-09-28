@@ -11,7 +11,9 @@ use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
-use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessIdentity};
+use litebox_broker_protocol::process::{
+    CreatedProcess, ProcessExitStatus, ProcessIdentity, ProcessTermination,
+};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -85,16 +87,19 @@ impl ProcessObject {
         }
     }
 
-    fn exit_status(&self) -> Result<Option<ProcessExitStatus>> {
+    fn termination(&self) -> Result<ProcessTermination> {
         let state = self.process.state.lock();
-        let status = match state.status {
+        let exit_status = match state.status {
             ProcessStatus::Starting | ProcessStatus::Running | ProcessStatus::Exiting => {
                 return Err(BrokerError::WouldBlock);
             }
             ProcessStatus::Failed(_) => ProcessExitStatus::Unknown,
             ProcessStatus::Zombie(status) => status,
         };
-        Ok((!state.reaped).then_some(status))
+        Ok(ProcessTermination {
+            exit_status,
+            reaped: state.reaped,
+        })
     }
 }
 
@@ -1259,13 +1264,12 @@ impl BrokerProcess {
 
     /// Returns a process's termination status through a process handle.
     ///
-    /// Returns `WouldBlock` while the process is live, and `None` if it was
-    /// reaped when it terminated. A process whose startup failed reports
-    /// [`ProcessExitStatus::Unknown`].
-    pub fn process_exit_status(&self, handle: ObjectHandle) -> Result<Option<ProcessExitStatus>> {
+    /// Returns `WouldBlock` while the process is live. A process whose startup
+    /// failed reports [`ProcessExitStatus::Unknown`].
+    pub fn process_exit_status(&self, handle: ObjectHandle) -> Result<ProcessTermination> {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
         let object = object.read();
-        object.as_process()?.exit_status()
+        object.as_process()?.termination()
     }
 
     /// Closes one object reference owned by this process.
@@ -1544,7 +1548,7 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
-    use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus};
+    use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessTermination};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
@@ -1557,6 +1561,13 @@ mod tests {
     const ROOT: FileUser = FileUser { user: 0, group: 0 };
     const EXITED: ProcessExitStatus = ProcessExitStatus::Exited { code: 23 };
     const SIGNALED: ProcessExitStatus = ProcessExitStatus::Signaled { signal: 11 };
+
+    fn termination(exit_status: ProcessExitStatus, reaped: bool) -> ProcessTermination {
+        ProcessTermination {
+            exit_status,
+            reaped,
+        }
+    }
 
     #[derive(Default)]
     struct TestProcessLifecycleSink {
@@ -1754,7 +1765,10 @@ mod tests {
             [(handle, ReadinessFlags::READ)]
         );
         assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::READ));
-        assert_eq!(root.process_exit_status(handle), Ok(Some(EXITED)));
+        assert_eq!(
+            root.process_exit_status(handle),
+            Ok(termination(EXITED, false))
+        );
         assert!(
             root.check_readiness(read)
                 .unwrap()
@@ -1838,7 +1852,10 @@ mod tests {
         child.retire(true);
         child.complete_exit(EXITED).unwrap();
 
-        assert_eq!(root.process_exit_status(handle), Ok(Some(SIGNALED)));
+        assert_eq!(
+            root.process_exit_status(handle),
+            Ok(termination(SIGNALED, false))
+        );
     }
 
     #[test]
@@ -1871,9 +1888,18 @@ mod tests {
             Err(BrokerError::PeerClosed)
         );
 
-        assert_eq!(root.process_exit_status(zombie_handle), Ok(Some(EXITED)));
-        assert_eq!(root.process_exit_status(reaped_handle), Ok(None));
-        assert_eq!(root.process_exit_status(failed_handle), Ok(None));
+        assert_eq!(
+            root.process_exit_status(zombie_handle),
+            Ok(termination(EXITED, false))
+        );
+        assert_eq!(
+            root.process_exit_status(reaped_handle),
+            Ok(termination(EXITED, true))
+        );
+        assert_eq!(
+            root.process_exit_status(failed_handle),
+            Ok(termination(ProcessExitStatus::Unknown, true))
+        );
         assert_eq!(
             *sink.published.lock().unwrap(),
             [
@@ -2057,7 +2083,7 @@ mod tests {
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert_eq!(
             parent.process_exit_status(handle),
-            Ok(Some(ProcessExitStatus::Unknown))
+            Ok(termination(ProcessExitStatus::Unknown, false))
         );
         assert!(matches!(
             parent.take_child_process(process_id),
@@ -2088,7 +2114,10 @@ mod tests {
 
         assert_eq!(parent.exit_child_process(process_id, EXITED), Ok(()));
 
-        assert_eq!(parent.process_exit_status(handle), Ok(Some(EXITED)));
+        assert_eq!(
+            parent.process_exit_status(handle),
+            Ok(termination(EXITED, false))
+        );
         assert_eq!(lifecycle.changes.load(Ordering::Relaxed), changes + 1);
         assert_eq!(
             *sink.published.lock().unwrap(),
@@ -2132,7 +2161,7 @@ mod tests {
         );
         assert_eq!(
             parent.process_exit_status(handle),
-            Ok(Some(ProcessExitStatus::Unknown))
+            Ok(termination(ProcessExitStatus::Unknown, false))
         );
     }
 

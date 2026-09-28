@@ -47,6 +47,16 @@ pub enum ProcessExitStatus {
     Unknown,
 }
 
+/// A terminated process's status as its handle observes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessTermination {
+    /// Termination status.
+    pub exit_status: ProcessExitStatus,
+    /// Whether the process was reaped when it terminated, so no wait reports
+    /// it.
+    pub reaped: bool,
+}
+
 /// One newly created process and the creator's handle to it.
 ///
 /// The handle reports [`ReadinessFlags::READ`](crate::readiness::ReadinessFlags::READ)

@@ -19,8 +19,8 @@ use crate::pipe::{
 };
 use crate::process::{
     CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, ProcessExitStatus, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    ExitChildProcessRequest, ProcessExitStatus, ProcessStartupDescriptor, ProcessTermination,
+    StartChildProcessRequest, StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -281,9 +281,8 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A pending child established its broker association.
     ProcessStarted,
-    /// Termination status of a child process, or `None` if it was reaped
-    /// when it terminated and so retains no status.
-    ProcessExitStatus(Option<ProcessExitStatus>),
+    /// Termination status of a child process.
+    ProcessExitStatus(ProcessTermination),
     /// A pending child's exit was recorded.
     ProcessExited,
     /// This process's final termination status was recorded.

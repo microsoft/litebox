@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::process::{ProcessExitStatus, ProcessIdentity};
+use litebox_broker_protocol::process::{ProcessExitStatus, ProcessIdentity, ProcessTermination};
 use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
@@ -90,10 +90,11 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 pub enum ChildStatus {
     /// The process has not terminated.
     Live,
-    /// The process terminated and retains this status until its handle closes.
+    /// The process terminated with this status and waits to be reported.
     Terminated(ProcessExitStatus),
-    /// The process was reaped as it terminated, so it retains no status.
-    Reaped,
+    /// The process terminated with this status and was reaped as it
+    /// terminated, so no wait reports it.
+    Reaped(ProcessExitStatus),
 }
 
 /// A broker process object.
@@ -211,8 +212,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     /// Returns the process's termination state.
     pub fn status(&self) -> Result<ChildStatus, ProcessError> {
         match self.broker.process_exit_status(self.handle) {
-            Ok(Some(status)) => Ok(ChildStatus::Terminated(status)),
-            Ok(None) => Ok(ChildStatus::Reaped),
+            Ok(ProcessTermination {
+                exit_status,
+                reaped: false,
+            }) => Ok(ChildStatus::Terminated(exit_status)),
+            Ok(ProcessTermination {
+                exit_status,
+                reaped: true,
+            }) => Ok(ChildStatus::Reaped(exit_status)),
             Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(ChildStatus::Live),
             Err(error) => Err(error.into()),
         }
