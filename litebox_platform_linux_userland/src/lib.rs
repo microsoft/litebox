@@ -1714,18 +1714,6 @@ impl litebox::platform::SystemInfoProvider for LinuxUserland {
         syscall_callback as *const () as usize
     }
 
-    #[cfg(target_arch = "x86_64")]
-    fn syscall_instruction_len(&self) -> usize {
-        // The rewriter trampoline's `JMP [RIP + disp32]`, which `RCX` (the resume PC) follows.
-        6
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    fn syscall_instruction_len(&self) -> usize {
-        // The rewriter's `B` into the SVC gate, which replaces the `SVC` in place.
-        4
-    }
-
     fn get_vdso_address(&self) -> Option<usize> {
         // Enabling VDSO on x86 causes glibc to not set a restorer in signal
         // handlers, which we do not currently support. Disable VDSO for

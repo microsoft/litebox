@@ -569,6 +569,22 @@ impl SyscallRestart {
     }
 }
 
+/// Returns the length of the guest instruction through which a syscall enters the shim, which
+/// immediately precedes the syscall's resume PC.
+///
+/// Guest syscalls are rewritten to enter through the rewriter's trampolines when the platform has a
+/// syscall entry point (see the ELF loader and mmap-time rewriting); otherwise the guest issues
+/// native syscall instructions.
+pub(crate) fn syscall_instruction_len(
+    platform: &impl litebox::platform::SystemInfoProvider,
+) -> usize {
+    if platform.get_syscall_entry_point() == 0 {
+        arch::NATIVE_SYSCALL_INSTRUCTION_LEN
+    } else {
+        litebox_syscall_rewriter::SYSCALL_ENTRY_INSTRUCTION_LEN
+    }
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
         let old = self.signals.blocked.get();
@@ -894,7 +910,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Moves `ctx` back to reissue its interrupted syscall.
     fn restart_syscall(&self, ctx: &mut PtRegs) {
-        arch::restart_syscall(ctx, self.global.platform.syscall_instruction_len());
+        arch::restart_syscall(ctx, syscall_instruction_len(self.global.platform));
     }
 
     /// Check whether the process-wide alarm deadline has passed and, if so,

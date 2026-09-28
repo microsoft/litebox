@@ -3030,17 +3030,38 @@ mod tests {
         return (regs.pc, regs.regs[0]);
     }
 
-    fn restarted_state<Platform: litebox::platform::SystemInfoProvider>(
-        platform: &Platform,
-    ) -> (usize, usize) {
+    /// Returns the registers of a syscall that restarts. The test platforms enter syscalls through
+    /// the rewriter's trampolines: x86-64's 6-byte `JMP [RIP + disp32]` or AArch64's 4-byte `B`.
+    fn restarted_state() -> (usize, usize) {
         #[cfg(target_arch = "x86_64")]
-        let reissued = 0; // read
+        let (entry_len, reissued) = (6, 0); // read
         #[cfg(target_arch = "aarch64")]
-        let reissued = SYSCALL_ARG0;
-        (
-            SYSCALL_RETURN_IP - platform.syscall_instruction_len(),
-            reissued,
-        )
+        let (entry_len, reissued) = (4, SYSCALL_ARG0);
+        (SYSCALL_RETURN_IP - entry_len, reissued)
+    }
+
+    /// Syscalls enter through the native syscall instruction on platforms without a syscall entry
+    /// point (the kernel platforms), and through the rewriter's trampolines otherwise.
+    #[test]
+    fn test_syscall_instruction_len_follows_entry_point() {
+        use crate::syscalls::signal::syscall_instruction_len;
+
+        struct EntryPoint(usize);
+        impl litebox::platform::SystemInfoProvider for EntryPoint {
+            fn get_syscall_entry_point(&self) -> usize {
+                self.0
+            }
+            fn get_vdso_address(&self) -> Option<usize> {
+                None
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        let (native, rewritten) = (2, 6);
+        #[cfg(target_arch = "aarch64")]
+        let (native, rewritten) = (4, 4);
+        assert_eq!(syscall_instruction_len(&EntryPoint(0)), native);
+        assert_eq!(syscall_instruction_len(&EntryPoint(0x1000)), rewritten);
     }
 
     fn interrupted_state() -> (usize, usize) {
@@ -3082,7 +3103,7 @@ mod tests {
                 task.process_signals(&mut regs, restart);
                 assert!(!task.has_pending_signals(), "SIGCHLD should be consumed");
                 let expected = if restart.is_some() {
-                    restarted_state(task.global.platform)
+                    restarted_state()
                 } else {
                     interrupted_state()
                 };
@@ -3138,7 +3159,7 @@ mod tests {
                 }
                 task.sys_rt_sigreturn(&mut regs).expect("rt_sigreturn failed");
                 let expected = if restarts {
-                    restarted_state(task.global.platform)
+                    restarted_state()
                 } else {
                     interrupted_state()
                 };

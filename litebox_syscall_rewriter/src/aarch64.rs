@@ -2363,7 +2363,7 @@ const INSN_BYTES_LOG2: u32 = 2;
 
 /// Bytes in one AArch64 instruction. Every patch site, gate slot and scan
 /// stride is a whole number of these.
-const INSN_BYTES: usize = 1 << INSN_BYTES_LOG2;
+pub(crate) const INSN_BYTES: usize = 1 << INSN_BYTES_LOG2;
 
 /// [`INSN_BYTES`] where a virtual address is being measured.
 pub(crate) const INSN_BYTES_U64: u64 = 1 << INSN_BYTES_LOG2;

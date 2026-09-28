@@ -313,13 +313,6 @@ pub trait SystemInfoProvider {
     /// execution context and transfer control to the syscall handler.
     fn get_syscall_entry_point(&self) -> usize;
 
-    /// The length in bytes of the guest instruction that enters the syscall handler.
-    ///
-    /// A syscall's resume PC immediately follows this instruction, so moving the PC back by this
-    /// length, with the syscall's registers restored, reissues the syscall. Shims use this to
-    /// restart interrupted syscalls.
-    fn syscall_instruction_len(&self) -> usize;
-
     /// Get the address of the VDSO (Virtual Dynamic Shared Object).
     ///
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`

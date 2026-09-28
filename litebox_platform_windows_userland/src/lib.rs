@@ -2107,11 +2107,6 @@ impl<const ALIGN: usize> litebox::platform::SystemInfoProvider for WindowsUserla
         syscall_callback as *const () as usize
     }
 
-    fn syscall_instruction_len(&self) -> usize {
-        // The rewriter trampoline's `JMP [RIP + disp32]`, which `RCX` (the resume PC) follows.
-        6
-    }
-
     fn get_vdso_address(&self) -> Option<usize> {
         // Windows doesn't have VDSO equivalent, return None
         None
