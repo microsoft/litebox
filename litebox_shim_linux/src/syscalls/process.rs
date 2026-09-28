@@ -15,7 +15,7 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::observer::Observer;
-use litebox::event::polling::TryOpError;
+use litebox::event::polling::{Pollee, TryOpError};
 use litebox::event::wait::WaitError;
 use litebox::event::{Events, IOPollable as _};
 use litebox::mm::vmem::VmFlags;
@@ -165,8 +165,8 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     inner: Arc<Mutex<Platform, ProcessInner<Platform>>>,
     /// Started child processes that have not been reaped, mapped by process ID.
     children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
-    /// Observer of each started child's termination.
-    child_observer: Arc<ChildObserver<Platform>>,
+    /// Termination events of the children, shared with each child's watcher.
+    child_events: Arc<ChildEvents<Platform>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
@@ -178,28 +178,46 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
 /// A started child process.
 struct Child<Platform: ShimPlatform> {
     process: litebox::process::Process<Platform>,
+    /// Watcher of the child's termination, registered on `process`.
+    watcher: Arc<ChildWatcher<Platform>>,
     /// Termination status once observed. Observing a termination queues the child's `SIGCHLD`.
     exit_status: Option<ProcessExitStatus>,
 }
 
-/// Observer of a process's child terminations, which interrupts the process's threads to observe
-/// them.
-struct ChildObserver<Platform: ShimPlatform> {
+/// A process's view of its children's terminations, which its threads observe.
+///
+/// This does not own the children, so a watcher holding it cannot drop them while its child's
+/// handle notifies it.
+struct ChildEvents<Platform: ShimPlatform> {
     /// Set when a child may have terminated since child terminations were last observed.
     changed: AtomicBool,
-    /// The process's locked state.
+    /// Notified when a child may have terminated, waking the threads waiting for a child.
+    pollee: Pollee<Platform>,
+    /// The process's locked state, to interrupt its threads.
     process: Arc<Mutex<Platform, ProcessInner<Platform>>>,
 }
 
-impl<Platform: ShimPlatform> Observer<Events> for ChildObserver<Platform> {
+/// Watcher of one child's termination, which wakes and interrupts its parent's threads to observe
+/// it.
+struct ChildWatcher<Platform: ShimPlatform> {
+    /// Set when the child may have terminated since its status was last queried.
+    changed: AtomicBool,
+    /// The parent's view of its children's terminations.
+    parent: Arc<ChildEvents<Platform>>,
+}
+
+impl<Platform: ShimPlatform> Observer<Events> for ChildWatcher<Platform> {
     fn on_events(&self, events: &Events) {
         // Closing a child's handle wakes its observers without events, and the closing thread
         // already removed that child.
         if events.is_empty() {
             return;
         }
+        // Set the child's flag first, so an observation that sees the parent's also sees it.
         self.changed.store(true, Ordering::SeqCst);
-        interrupt_threads(&self.process, None);
+        self.parent.changed.store(true, Ordering::SeqCst);
+        self.parent.pollee.notify_observers(Events::IN);
+        interrupt_threads(&self.parent.process, None);
     }
 }
 
@@ -271,8 +289,9 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         }));
         Self {
             nr_threads,
-            child_observer: Arc::new(ChildObserver {
+            child_events: Arc::new(ChildEvents {
                 changed: AtomicBool::new(false),
+                pollee: Pollee::new(),
                 process: inner.clone(),
             }),
             inner,
@@ -298,19 +317,24 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         alarm.handle.is_none() && alarm.deadline.is_none()
     }
 
-    /// Adds a started child process and observes its termination.
+    /// Adds a started child process and watches its termination.
     ///
-    /// The child may have terminated before its observer was registered, so the caller then
-    /// observes child terminations.
+    /// The child may have terminated before its watcher was registered, so the watcher starts
+    /// changed and the caller then observes child terminations.
     fn add_child(&self, pid: i32, process: litebox::process::Process<Platform>) {
+        let watcher = Arc::new(ChildWatcher {
+            changed: AtomicBool::new(true),
+            parent: self.child_events.clone(),
+        });
         process.register_observer(
-            Arc::downgrade(&self.child_observer) as Weak<dyn Observer<Events>>,
+            Arc::downgrade(&watcher) as Weak<dyn Observer<Events>>,
             Events::IN,
         );
         let previous = self.children.lock().insert(
             pid,
             Child {
                 process,
+                watcher,
                 exit_status: None,
             },
         );
@@ -320,19 +344,23 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         );
     }
 
-    /// Records the termination of each child whose termination was not yet observed, returning
-    /// their process IDs and statuses.
+    /// Records the termination of each child whose termination was not yet observed and whose
+    /// watcher saw a change since its status was last queried, returning their process IDs and
+    /// statuses.
     ///
     /// Children the broker reaped as they terminated are released, since no wait reports them
     /// and each holds broker process capacity until its handle closes. Nothing is recorded if a
     /// status query fails.
     fn observe_terminations(&self) -> Result<Vec<(i32, ProcessExitStatus)>, ProcessError> {
-        // Clear before querying, so a termination published during the queries sets it again.
-        self.child_observer.changed.store(false, Ordering::SeqCst);
+        // Clear each flag before querying, so a termination published during the queries sets it
+        // again.
+        self.child_events.changed.store(false, Ordering::SeqCst);
         let mut children = self.children.lock();
         let statuses = children
             .iter()
-            .filter(|(_, child)| child.exit_status.is_none())
+            .filter(|(_, child)| {
+                child.exit_status.is_none() && child.watcher.changed.swap(false, Ordering::SeqCst)
+            })
             .map(|(&pid, child)| Ok((pid, child.process.status()?)))
             .collect::<Result<Vec<_>, ProcessError>>()?;
         let mut terminated = Vec::new();
@@ -384,24 +412,6 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             .remove(&pid)
             .expect("matched child must remain present");
         Ok((pid, child.process, exit_status))
-    }
-
-    /// Registers `observer` on each child with process ID `target`, or on every child when
-    /// `target` is `None`.
-    fn register_child_observer(
-        &self,
-        target: Option<i32>,
-        observer: &Weak<dyn Observer<Events>>,
-        mask: Events,
-    ) {
-        for (_, child) in self
-            .children
-            .lock()
-            .iter()
-            .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
-        {
-            child.process.register_observer(observer.clone(), mask);
-        }
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
@@ -529,7 +539,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self
             .thread
             .process
-            .child_observer
+            .child_events
             .changed
             .load(Ordering::SeqCst)
         {
@@ -1773,13 +1783,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .map_err(|error| TryOpError::Other(error.into()))?;
             process.take_exited_child(target)
         };
-        let exited = match self.wait_cx().wait_on_events(
+        let exited = match process.child_events.pollee.wait(
+            &self.wait_cx(),
             options & WNOHANG != 0,
             Events::IN,
-            |observer, mask| {
-                process.register_child_observer(target, &observer, mask);
-                Ok(())
-            },
             &mut take_exited_child,
         ) {
             // Like Linux, which checks for terminated children before pending signals, report a
