@@ -1096,6 +1096,10 @@ mod tests {
         const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+        #[cfg(target_os = "macos")]
+        const TASK_ADDR_MIN: usize = 0x1_0000_0000;
+        #[cfg(target_os = "macos")]
+        const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
 
         fn allocate_pages(
             &self,
@@ -1144,7 +1148,7 @@ mod tests {
 
     #[test]
     fn test_vmm_mapping() {
-        let start_addr: usize = 0x1_0000;
+        let start_addr = DummyVmemBackend::TASK_ADDR_MIN;
         let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
         let mut vmm = Vmem::new(&DummyVmemBackend);
 
@@ -1355,5 +1359,31 @@ mod tests {
                 DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
             ]
         );
+    }
+
+    #[test]
+    fn fixed_mappings_respect_task_address_bounds() {
+        let mut vmm = Vmem::new(&DummyVmemBackend);
+        let vma = VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false);
+
+        let below_min = PageRange::new(
+            DummyVmemBackend::TASK_ADDR_MIN - PAGE_SIZE,
+            DummyVmemBackend::TASK_ADDR_MIN,
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { vmm.insert_mapping(below_min, vma, false, FixedAddressBehavior::NoReplace,) },
+            Err(AllocationError::BelowMinAddress)
+        ));
+
+        let above_max = PageRange::new(
+            DummyVmemBackend::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX + PAGE_SIZE,
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { vmm.insert_mapping(above_max, vma, false, FixedAddressBehavior::NoReplace,) },
+            Err(AllocationError::AboveMaxAddress)
+        ));
     }
 }

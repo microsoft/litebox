@@ -73,8 +73,6 @@ impl<T> OpteeShimPlatform for T where
 {
 }
 
-// OP-TEE-specific memory manager.
-
 /// OP-TEE memory manager.
 pub struct MemoryManager<Platform: OpteeShimPlatform> {
     vmem: VmemManager<Platform, PAGE_SIZE>,

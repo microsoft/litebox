@@ -152,9 +152,8 @@ where
     ///
     /// # Safety
     ///
-    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
-    /// the kernel uses it directly without checking if it is available, causing overlapping
-    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    /// If a suggested address is given and `flags` contains [`CreatePagesFlags::FIXED_ADDR`],
+    /// overlapping mappings may be unmapped. The caller must ensure they are not in use.
     pub unsafe fn create_executable_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -192,9 +191,8 @@ where
     ///
     /// # Safety
     ///
-    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
-    /// the kernel uses it directly without checking if it is available, causing overlapping
-    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    /// If a suggested address is given and `flags` contains [`CreatePagesFlags::FIXED_ADDR`],
+    /// overlapping mappings may be unmapped. The caller must ensure they are not in use.
     pub unsafe fn create_writable_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -222,9 +220,8 @@ where
     ///
     /// # Safety
     ///
-    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
-    /// the kernel uses it directly without checking if it is available, causing overlapping
-    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    /// If a suggested address is given and `flags` contains [`CreatePagesFlags::FIXED_ADDR`],
+    /// overlapping mappings may be unmapped. The caller must ensure they are not in use.
     pub unsafe fn create_readable_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -262,9 +259,8 @@ where
     ///
     /// # Safety
     ///
-    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
-    /// the kernel uses it directly without checking if it is available, causing overlapping
-    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    /// If a suggested address is given and `flags` contains [`CreatePagesFlags::FIXED_ADDR`],
+    /// overlapping mappings may be unmapped. The caller must ensure they are not in use.
     pub unsafe fn create_inaccessible_pages<F>(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -298,9 +294,8 @@ where
     ///
     /// # Safety
     ///
-    /// If the suggested start address is given (i.e., not zero) and `fixed_addr` is set to `true`,
-    /// the kernel uses it directly without checking if it is available, causing overlapping
-    /// mappings to be unmapped. Caller must ensure any overlapping mappings are not used by any other.
+    /// If a suggested address is given and `flags` contains [`CreatePagesFlags::FIXED_ADDR`],
+    /// overlapping mappings may be unmapped. The caller must ensure they are not in use.
     pub unsafe fn create_stack_pages(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
@@ -782,6 +777,10 @@ where
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<PAGE_SIZE>,
 {
+    /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
+    ///
+    /// `ensure_space_after` reserves an adjacent gap for callers that append trampoline code.
+    /// `op` initializes the mapping while it is writable; its error removes the new mapping.
     pub fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -946,6 +945,10 @@ where
         .map_err(Errno::from)
     }
 
+    /// Applies the supported Linux `madvise` behaviors to a mapped range.
+    ///
+    /// `Normal`, `DontFork`, and `DoFork` are currently no-ops. `DontNeed` discards any mapping
+    /// contents, while `Free` only discards anonymous contents. Unsupported advice values panic.
     pub fn sys_madvise(
         &self,
         addr: UserPtrMut<u8>,

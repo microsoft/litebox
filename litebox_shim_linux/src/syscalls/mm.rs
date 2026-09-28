@@ -1744,6 +1744,20 @@ mod tests {
             .expect("mapping permissions should be tracked")
     }
 
+    #[test]
+    fn brk_can_shrink_within_the_current_page() {
+        let task = init_platform();
+        let initial = 0x4000_0123;
+        let requested = 0x4000_0042;
+        task.global.mm.set_initial_brk(initial);
+
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(requested)),
+            Ok(requested)
+        );
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(requested));
+    }
+
     fn check_file_mmap_permissions(
         task: &Task<Platform>,
         fd: i32,

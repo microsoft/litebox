@@ -1599,7 +1599,6 @@ dependencies = [
  "litebox_broker_protocol",
  "litebox_syscall_rewriter",
  "rangemap",
- "spin 0.9.8",
  "syscalls",
  "thiserror",
  "zerocopy",
