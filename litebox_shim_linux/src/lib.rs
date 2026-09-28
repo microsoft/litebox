@@ -165,9 +165,6 @@ impl<Platform: ShimPlatform> PageManager<Platform> {
             return Ok(requested);
         }
 
-        if self.vmem.overlaps(old_page_end..new_page_end) {
-            return Err(MappingError::OutOfMemory);
-        }
         if let (Some(address), Some(length)) = (
             NonZeroAddress::new(old_page_end),
             NonZeroPageSize::new(new_page_end - old_page_end),
@@ -176,7 +173,9 @@ impl<Platform: ShimPlatform> PageManager<Platform> {
                 self.vmem.create_writable_pages(
                     Some(address),
                     length,
-                    CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                    CreatePagesFlags::FIXED_ADDR
+                        | CreatePagesFlags::NOREPLACE
+                        | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                     |_| Ok(0),
                 )
             }?;
