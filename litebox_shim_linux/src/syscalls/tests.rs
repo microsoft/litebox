@@ -2,7 +2,9 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::fs::FileMode as Mode;
-use litebox_common_linux::{AtFlags, FcntlArg, FileDescriptorFlags, OFlags, errno::Errno};
+use litebox_common_linux::{
+    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, OFlags, errno::Errno,
+};
 use zerocopy::FromBytes as _;
 
 use crate::UserPtrMut;
@@ -803,18 +805,22 @@ fn exec_inherits_only_transferable_descriptors() {
         })
     };
 
-    // Close-on-exec descriptors stay behind whatever their kind, but others must be broker files.
-    let read_fd = task
-        .sys_pipe2(OFlags::CLOEXEC)
+    // Broker files and pipes transfer. Close-on-exec descriptors stay behind whatever their kind,
+    // but others must be broker objects.
+    let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 3, 4]));
+    task.sys_close(read_fd.try_into().unwrap()).unwrap();
+    task.sys_close(write_fd.try_into().unwrap()).unwrap();
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::CLOEXEC)
         .unwrap()
-        .0
         .try_into()
         .unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
-    task.sys_fcntl(read_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+    task.sys_fcntl(eventfd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
         .unwrap();
     assert_eq!(inherited(), Err(Errno::EAGAIN));
-    task.sys_close(read_fd).unwrap();
+    task.sys_close(eventfd).unwrap();
 
     // A fresh runner installs descriptors at most a bounded distance apart.
     assert_eq!(task.sys_dup(1, Some(258), None), Ok(258));

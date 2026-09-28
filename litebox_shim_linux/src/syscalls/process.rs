@@ -3,6 +3,7 @@
 
 //! Process/thread related syscalls.
 
+use crate::syscalls::file::ExecInheritedFd;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -20,6 +21,7 @@ use litebox::event::{Events, IOPollable as _};
 use litebox::mm::vmem::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
+use litebox::process::InheritableFd;
 use litebox::stdio::StdioStream;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
@@ -28,7 +30,7 @@ use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno,
-    program_startup::{InheritedFd, LinuxProgramStartup},
+    program_startup::{InheritedFd, InheritedFdKind, LinuxProgramStartup},
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
@@ -1950,31 +1952,47 @@ impl<Platform: ShimPlatform> Task<Platform> {
             path,
             argv,
             envp,
-            inherited_fds: {
-                let descriptors = self.global.litebox.descriptor_table();
-                inherited
-                    .iter()
-                    .map(|(fd, file)| InheritedFd {
+            inherited_fds: inherited
+                .iter()
+                .map(|(fd, inherited)| {
+                    let kind = match inherited {
+                        ExecInheritedFd::File(file) => {
+                            let descriptors = self.global.litebox.descriptor_table();
+                            InheritedFdKind::File {
+                                stdio_stream: descriptors
+                                    .with_metadata(&**file, |stream: &StdioStream| *stream)
+                                    .ok(),
+                                stdio_status_flags: descriptors
+                                    .with_metadata(&**file, |crate::StdioStatusFlags(flags)| *flags)
+                                    .ok(),
+                            }
+                        }
+                        ExecInheritedFd::Pipe(pipe) => {
+                            self.global.inherited_linux_pipe_kind(pipe)?
+                        }
+                    };
+                    Ok(InheritedFd {
                         fd: *fd,
                         // Replaced by the child's handle once the startup fits.
                         handle: ObjectHandle::default(),
-                        stdio_stream: descriptors
-                            .with_metadata(&**file, |stream: &StdioStream| *stream)
-                            .ok(),
-                        stdio_status_flags: descriptors
-                            .with_metadata(&**file, |crate::StdioStatusFlags(flags)| *flags)
-                            .ok(),
+                        kind,
                     })
-                    .collect()
-            },
+                })
+                .collect::<Result<_, Errno>>()?,
         };
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::E2BIG)?;
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let files: alloc::vec::Vec<_> = inherited.iter().map(|(_, file)| &**file).collect();
+        let fds: alloc::vec::Vec<_> = inherited
+            .iter()
+            .map(|(_, inherited)| match inherited {
+                ExecInheritedFd::File(file) => InheritableFd::File(file),
+                ExecInheritedFd::Pipe(pipe) => InheritableFd::Pipe(pipe),
+            })
+            .collect();
         let handles = child
-            .inherit_files(&self.global.litebox, &files)
+            .inherit(&self.global.litebox, &fds)
             .map_err(Errno::from)?;
         for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
             inherited.handle = handle;

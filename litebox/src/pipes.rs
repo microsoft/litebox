@@ -339,7 +339,8 @@ impl From<TryOpError<PipeError>> for PipeError {
     }
 }
 
-struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+/// One end of a broker-owned pipe, which owns its handle.
+pub(crate) struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
@@ -407,7 +408,49 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
     Ok((writer, reader))
 }
 
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
+    /// Returns the pipe end at `fd`, which keeps its handle open while held.
+    pub(crate) fn broker_pipe_end(
+        &self,
+        fd: &PipeFd<Platform>,
+    ) -> Option<Arc<BrokerPipeEnd<Platform>>> {
+        self.descriptor_table()
+            .with_entry(fd, |entry| Arc::clone(&entry.entry.0))
+    }
+
+    /// Returns a descriptor owning `handle`, an end of a pipe another process
+    /// created.
+    ///
+    /// The end has no peer in this process, so broker readiness notifications
+    /// alone wake its waiters.
+    pub(crate) fn insert_broker_pipe_end(
+        &self,
+        broker: Arc<dyn BrokerControl>,
+        handle: ObjectHandle,
+        endpoint_type: HalfPipeType,
+        flags: Flags,
+    ) -> PipeFd<Platform> {
+        let pollable_registry = self.broker_pollable_registry();
+        let end = Arc::new(BrokerPipeEnd {
+            broker,
+            handle,
+            pollable_registry: Arc::clone(&pollable_registry),
+            pollee: Arc::new(Pollee::new()),
+            peer: Weak::new(),
+            endpoint_type,
+            non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
+        });
+        pollable_registry.register_pollable(handle, &end.pollee);
+        self.descriptor_table_mut().insert(PipeEnd(end))
+    }
+}
+
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform> {
+    /// The broker handle this end owns.
+    pub(crate) fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
     fn read(&self, cx: &WaitContext<'_, Platform>, buf: &mut [u8]) -> Result<usize, PipeError> {
         let length = buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize);
         if length == 0 {

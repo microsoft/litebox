@@ -14,8 +14,10 @@ use litebox::{
     fd::MetadataError,
     pipes::{Flags, HalfPipeType, PipeFd},
 };
-use litebox_broker_protocol::fs::FileMode as Mode;
-use litebox_common_linux::{FileDescriptorFlags, InodeType, OFlags, errno::Errno};
+use litebox_broker_protocol::{ObjectHandle, fs::FileMode as Mode};
+use litebox_common_linux::{
+    FileDescriptorFlags, InodeType, OFlags, errno::Errno, program_startup::InheritedFdKind,
+};
 
 use crate::{GlobalState, ShimPlatform};
 
@@ -154,6 +156,42 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         f: impl FnOnce(&dyn IOPollable) -> R,
     ) -> Result<R, Errno> {
         self.pipes.with_iopollable(fd, f).map_err(Errno::from)
+    }
+
+    /// Describes the pipe end at `fd` for a fresh runner inheriting it across `execve`.
+    pub(crate) fn inherited_linux_pipe_kind(
+        &self,
+        fd: &PipeFd<Platform>,
+    ) -> Result<InheritedFdKind, Errno> {
+        let status_flags = self
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |PipeStatusFlags(flags)| *flags)
+            .map_err(metadata_to_errno)?;
+        Ok(match self.pipes.half_pipe_type(fd)? {
+            HalfPipeType::ReceiverHalf => InheritedFdKind::PipeReader { status_flags },
+            HalfPipeType::SenderHalf => InheritedFdKind::PipeWriter { status_flags },
+        })
+    }
+
+    /// Adopts a pipe end this runner inherited across `execve` with `status_flags`.
+    pub(crate) fn adopt_inherited_linux_pipe(
+        &self,
+        handle: ObjectHandle,
+        endpoint_type: HalfPipeType,
+        status_flags: OFlags,
+    ) -> Result<PipeFd<Platform>, litebox::process::ProcessError> {
+        let mut flags = Flags::empty();
+        flags.set(Flags::NON_BLOCKING, status_flags.contains(OFlags::NONBLOCK));
+        let fd = self
+            .litebox
+            .adopt_inherited_pipe(handle, endpoint_type, flags)?;
+        let old = self
+            .litebox
+            .descriptor_table_mut()
+            .set_entry_metadata(&fd, PipeStatusFlags(status_flags));
+        debug_assert!(old.is_none());
+        Ok(fd)
     }
 }
 

@@ -225,6 +225,9 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         global: &GlobalState<Platform>,
         inherited_fds: &[litebox_common_linux::program_startup::InheritedFd],
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        use litebox::pipes::HalfPipeType;
+        use litebox_common_linux::program_startup::InheritedFdKind;
+
         let litebox = &global.litebox;
         let max_fd = self.max_fd.load(Ordering::Relaxed);
         // The first descriptor of each inherited open file description.
@@ -235,39 +238,91 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             if raw_fd < next_fd || raw_fd - next_fd > MAX_INHERITED_FD_GAP || raw_fd >= max_fd {
                 return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFds);
             }
-            let fd = if let Some(&first_fd) = descriptions.get(&inherited.handle) {
-                let first = self
-                    .raw_descriptor_store
-                    .read()
-                    .fd_from_raw_integer::<litebox::fs::BrokerFile>(first_fd)
-                    .expect("an installed inherited descriptor stays open");
-                litebox
-                    .descriptor_table_mut()
-                    .duplicate(&first)
-                    .expect("an installed inherited descriptor stays open")
-            } else {
-                let fd = litebox
-                    .adopt_inherited_file(inherited.handle)
-                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
-                let mut descriptors = litebox.descriptor_table_mut();
-                if let Some(stream) = inherited.stdio_stream {
-                    descriptors.set_entry_metadata(&fd, stream);
+            let first_fd = descriptions.get(&inherited.handle).copied();
+            let handle = inherited.handle;
+            match inherited.kind {
+                InheritedFdKind::File {
+                    stdio_stream,
+                    stdio_status_flags,
+                } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                    let fd = litebox
+                        .adopt_inherited_file(handle)
+                        .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
+                    let mut descriptors = litebox.descriptor_table_mut();
+                    if let Some(stream) = stdio_stream {
+                        descriptors.set_entry_metadata(&fd, stream);
+                    }
+                    if let Some(flags) = stdio_status_flags {
+                        descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
+                    }
+                    Ok(fd)
+                })?,
+                InheritedFdKind::PipeReader { status_flags } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_linux_pipe(
+                                handle,
+                                HalfPipeType::ReceiverHalf,
+                                status_flags,
+                            )
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
                 }
-                if let Some(flags) = inherited.stdio_status_flags {
-                    descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
+                InheritedFdKind::PipeWriter { status_flags } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_linux_pipe(
+                                handle,
+                                HalfPipeType::SenderHalf,
+                                status_flags,
+                            )
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
                 }
-                descriptions.insert(inherited.handle, raw_fd);
-                fd
-            };
-            let success = self
-                .raw_descriptor_store
-                .write()
-                .fd_into_specific_raw_integer(fd, raw_fd);
-            assert!(success);
+            }
+            descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
         }
         Ok(())
     }
+
+    /// Installs an inherited descriptor at `raw_fd`, duplicating the descriptor at `first_fd` if
+    /// it shares an already installed open file description and calling `adopt` otherwise.
+    fn install_inherited_fd<Subsystem: FdEnabledSubsystem>(
+        &self,
+        litebox: &litebox::LiteBox<Platform>,
+        first_fd: Option<usize>,
+        raw_fd: usize,
+        adopt: impl FnOnce() -> Result<TypedFd<Subsystem>, crate::loader::elf::ElfLoaderError>,
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        let fd = match first_fd {
+            Some(first_fd) => {
+                // A handle is inherited as one kind of object.
+                let first = self
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<Subsystem>(first_fd)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
+                litebox
+                    .descriptor_table_mut()
+                    .duplicate(&first)
+                    .expect("an installed inherited descriptor stays open")
+            }
+            None => adopt()?,
+        };
+        let success = self
+            .raw_descriptor_store
+            .write()
+            .fd_into_specific_raw_integer(fd, raw_fd);
+        assert!(success);
+        Ok(())
+    }
+}
+
+/// A descriptor a fresh runner can inherit across `execve`.
+pub(crate) enum ExecInheritedFd<Platform: ShimPlatform> {
+    File(alloc::sync::Arc<FileFd>),
+    Pipe(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
 }
 
 /// A raw fd resolved once into the subsystem that owns it.
@@ -463,8 +518,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// objects the broker holds, and not all of those yet, so this fails with `EAGAIN` if one of
     /// them is:
     ///
-    /// - a pipe: the broker does not yet publish pipe readiness across processes, so a blocking
-    ///   pipe wait in the child could hang;
     /// - a network socket: the broker does not duplicate socket objects;
     /// - an eventfd, epoll, or Unix socket descriptor: the object is local to this runner;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
@@ -473,12 +526,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///   install.
     ///
     /// Transferred descriptors also differ from Linux in two ways: the parent does not observe the
-    /// child's reads of an inherited directory, and stdio status flags, which this runner tracks
-    /// locally, are copied rather than shared, so an `F_SETFL` in one process is not seen by the
-    /// other.
+    /// child's reads of an inherited directory, and pipe and stdio status flags, which this runner
+    /// tracks locally, are copied rather than shared, so an `F_SETFL` in one process is not seen by
+    /// the other.
     pub(crate) fn fds_inherited_across_exec(
         &self,
-    ) -> Result<alloc::vec::Vec<(u32, alloc::sync::Arc<FileFd>)>, Errno> {
+    ) -> Result<alloc::vec::Vec<(u32, ExecInheritedFd<Platform>)>, Errno> {
         let files = self.files.borrow();
         let alive_fds: alloc::vec::Vec<usize> =
             files.raw_descriptor_store.read().iter_alive().collect();
@@ -491,21 +544,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
             {
                 continue;
             }
-            let AnyTypedFd::Fs(file) = fd else {
-                return Err(Errno::EAGAIN);
-            };
-            if raw_fd - next_fd > MAX_INHERITED_FD_GAP
-                || self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(&file, |_: &Diroff| ())
-                    .is_ok()
-            {
+            if raw_fd - next_fd > MAX_INHERITED_FD_GAP {
                 return Err(Errno::EAGAIN);
             }
+            let fd = match fd {
+                AnyTypedFd::Fs(file) => {
+                    if self
+                        .global
+                        .litebox
+                        .descriptor_table()
+                        .with_metadata(&file, |_: &Diroff| ())
+                        .is_ok()
+                    {
+                        return Err(Errno::EAGAIN);
+                    }
+                    ExecInheritedFd::File(file)
+                }
+                AnyTypedFd::Pipes(pipe) => ExecInheritedFd::Pipe(pipe),
+                _ => return Err(Errno::EAGAIN),
+            };
             next_fd = raw_fd + 1;
-            inherited.push((u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?, file));
+            inherited.push((u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?, fd));
         }
         Ok(inherited)
     }

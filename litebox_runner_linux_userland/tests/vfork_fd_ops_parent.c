@@ -34,8 +34,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 299; i++) {
         close(high[i]);
     }
-    // The pipe cannot transfer to a fresh runner, so `execve` succeeds only if the child closes
-    // it in its own table.
+    // The spawned child closes the pipe in its own table, so its fresh runner does not inherit it.
     int p[2];
     if (log < 0 || high[299] < 0 || pipe2(p, O_NONBLOCK) != 0) {
         perror("setup");

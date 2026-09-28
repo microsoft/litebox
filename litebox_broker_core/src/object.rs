@@ -13,6 +13,7 @@ use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
 use crate::process::ProcessObject;
+use crate::readiness::ReadinessRegistration;
 use crate::socket::SocketObject;
 use crate::{BrokerError, Result};
 
@@ -34,6 +35,9 @@ pub(crate) struct ObjectReference {
     pub(crate) rights: ObjectRights,
     /// Position of this reference's handle in the owner's handle list.
     pub(crate) process_reference_index: usize,
+    /// Readiness publication for object kinds whose state other processes
+    /// change, retired when this reference drops.
+    pub(crate) readiness: Option<ReadinessRegistration>,
 }
 
 pub(crate) enum ObjectEntry {

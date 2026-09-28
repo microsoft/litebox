@@ -17,6 +17,7 @@ use crate::broker::{
 };
 use crate::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use crate::fs::{BrokerFile, FileFd};
+use crate::pipes::{Flags as PipeFlags, HalfPipeType, PipeFd};
 use crate::sync::RawSyncPrimitivesProvider;
 
 /// Error returned by the broker-backed process service.
@@ -43,9 +44,9 @@ pub enum ProcessError {
     /// The child process is invalid or no longer available.
     #[error("invalid child process")]
     InvalidChild,
-    /// A file passed to the child process is closed.
-    #[error("file is closed")]
-    ClosedFile,
+    /// A descriptor passed to the child process is closed.
+    #[error("descriptor is closed")]
+    ClosedDescriptor,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -73,7 +74,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Returns a descriptor for a file this process inherited from its parent
-    /// through [`Process::inherit_files`].
+    /// through [`Process::inherit`].
     ///
     /// The descriptor owns `handle`, so callers adopt each handle once and
     /// duplicate the descriptor for every other use.
@@ -83,6 +84,30 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             .descriptor_table_mut()
             .insert(Arc::new(BrokerFile::from_handle(broker, handle))))
     }
+
+    /// Returns a descriptor for a pipe end this process inherited from its
+    /// parent through [`Process::inherit`], using `flags` as the end's
+    /// initial flags.
+    ///
+    /// The descriptor owns `handle`, so callers adopt each handle once and
+    /// duplicate the descriptor for every other use.
+    pub fn adopt_inherited_pipe(
+        &self,
+        handle: ObjectHandle,
+        endpoint_type: HalfPipeType,
+        flags: PipeFlags,
+    ) -> Result<PipeFd<Platform>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(self.insert_broker_pipe_end(broker, handle, endpoint_type, flags))
+    }
+}
+
+/// A descriptor a pending child process can inherit through [`Process::inherit`].
+pub enum InheritableFd<'fd, Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    /// A file, adopted with [`LiteBox::adopt_inherited_file`].
+    File(&'fd FileFd),
+    /// A pipe end, adopted with [`LiteBox::adopt_inherited_pipe`].
+    Pipe(&'fd PipeFd<Platform>),
 }
 
 /// Termination state of a child process.
@@ -140,40 +165,61 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
             .start_child_process(self.identity.process_id, payload)?)
     }
 
-    /// Gives this pending child process its own references to `files`,
-    /// returning the child's handles in the same order.
+    /// Gives this pending child process its own references to the objects
+    /// `fds` refer to, returning the child's handles in the same order.
     ///
     /// Like descriptors a Linux child inherits, each child reference shares
-    /// its file's offset and status. Files sharing an open file description
-    /// get the same handle. The child adopts each handle with
-    /// [`LiteBox::adopt_inherited_file`] and releases its references when it
-    /// terminates. If this fails, the child receives none of them.
+    /// its object's state, such as a file's offset or a pipe's buffer.
+    /// Descriptors sharing an open file description get the same handle. The
+    /// child adopts each handle as the [`InheritableFd`] variant describes and
+    /// releases its references when it terminates. If this fails, the child
+    /// receives none of them.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns fewer handles than were duplicated.
-    pub fn inherit_files(
+    pub fn inherit(
         &self,
         litebox: &LiteBox<Platform>,
-        files: &[&FileFd],
+        fds: &[InheritableFd<'_, Platform>],
     ) -> Result<Vec<ObjectHandle>, ProcessError> {
-        // Holding the files keeps their handles open until the child has its own.
-        let files = files
-            .iter()
-            .map(|file| litebox.broker_file(file).ok_or(ProcessError::ClosedFile))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut handles: Vec<_> = files.iter().map(|file| file.handle()).collect();
+        // Holding the objects keeps their handles open until the child has its own.
+        let mut held_files = Vec::new();
+        let mut held_pipes = Vec::new();
+        let mut fd_handles = Vec::new();
+        for fd in fds {
+            let handle = match fd {
+                InheritableFd::File(file) => {
+                    let file = litebox
+                        .broker_file(file)
+                        .ok_or(ProcessError::ClosedDescriptor)?;
+                    let handle = file.handle();
+                    held_files.push(file);
+                    handle
+                }
+                InheritableFd::Pipe(pipe) => {
+                    let pipe = litebox
+                        .broker_pipe_end(pipe)
+                        .ok_or(ProcessError::ClosedDescriptor)?;
+                    let handle = pipe.handle();
+                    held_pipes.push(pipe);
+                    handle
+                }
+            };
+            fd_handles.push(handle);
+        }
+        let mut handles = fd_handles.clone();
         handles.sort_unstable();
         handles.dedup();
         let inherited = self
             .broker
             .duplicate_objects_to_child(self.identity.process_id, &handles)?;
-        Ok(files
+        Ok(fd_handles
             .iter()
-            .map(|file| {
+            .map(|handle| {
                 let index = handles
-                    .binary_search(&file.handle())
-                    .expect("every file handle was duplicated");
+                    .binary_search(handle)
+                    .expect("every descriptor handle was duplicated");
                 inherited[index]
             })
             .collect())

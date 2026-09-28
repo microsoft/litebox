@@ -121,7 +121,7 @@ impl From<litebox::process::ProcessError> for Errno {
             litebox::process::ProcessError::OutOfMemory => Errno::ENOMEM,
             litebox::process::ProcessError::ServiceFailed
             | litebox::process::ProcessError::InvalidChild => Errno::EIO,
-            litebox::process::ProcessError::ClosedFile => Errno::EBADF,
+            litebox::process::ProcessError::ClosedDescriptor => Errno::EBADF,
         }
     }
 }
@@ -741,7 +741,7 @@ mod tests {
             (ProcessError::OutOfMemory, Errno::ENOMEM),
             (ProcessError::ServiceFailed, Errno::EIO),
             (ProcessError::InvalidChild, Errno::EIO),
-            (ProcessError::ClosedFile, Errno::EBADF),
+            (ProcessError::ClosedDescriptor, Errno::EBADF),
         ];
 
         for (error, expected) in cases {

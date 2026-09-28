@@ -1032,6 +1032,47 @@ impl BrokerProcess {
         Ok(reference.rights)
     }
 
+    /// Publishes readiness of this process's pipe references through
+    /// `readiness_sink`.
+    ///
+    /// Connection setup calls this for references duplicated into the
+    /// process before it connected, so changes made by other processes wake
+    /// its waiters.
+    pub fn register_pipe_readiness(&self, readiness_sink: &Arc<dyn ReadinessSink>) -> Result<()> {
+        let process_references = self.references.lock();
+        self.register_pipe_readiness_for(&process_references.handles, readiness_sink)
+    }
+
+    /// Publishes readiness of the pipe references in `handles` through
+    /// `readiness_sink`, skipping references that already publish readiness.
+    pub(crate) fn register_pipe_readiness_for(
+        &self,
+        handles: &[ObjectHandle],
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<()> {
+        let mut references = self.core.references.write();
+        for &handle in handles {
+            let reference = references
+                .get_mut(&handle)
+                .filter(|reference| reference.owner == self.id)
+                .ok_or(BrokerError::UnknownObject)?;
+            if reference.readiness.is_some() {
+                continue;
+            }
+            let registration = {
+                let object = reference.object.read();
+                let ObjectEntry::Pipe(pipe) = &*object else {
+                    continue;
+                };
+                let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
+                pipe.watch(&registration)?;
+                registration
+            };
+            reference.readiness = Some(registration);
+        }
+        Ok(())
+    }
+
     pub(crate) fn create_object_reference_pair(
         &self,
         first: ObjectEntry,
@@ -1173,6 +1214,7 @@ impl BrokerProcess {
                 owner: self.id,
                 rights,
                 process_reference_index,
+                readiness: None,
             },
         );
         reference_handles.push(handle);
@@ -1499,6 +1541,7 @@ mod tests {
         BrokerProcess, ProcessLifecycleSink, ProcessReferences, ProcessStatus,
         release_pending_reference,
     };
+    use crate::readiness::ReadinessSink;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
@@ -1595,6 +1638,101 @@ mod tests {
         Arc::new(crate::readiness::tests::TestReadinessSink::default())
     }
 
+    fn pipe_readiness_sink() -> Arc<dyn ReadinessSink> {
+        readiness_sink()
+    }
+
+    fn take_published(
+        sink: &crate::readiness::tests::TestReadinessSink,
+    ) -> std::vec::Vec<(ObjectHandle, ReadinessFlags)> {
+        core::mem::take(&mut *sink.published.lock().unwrap())
+    }
+
+    #[test]
+    fn pipe_readiness_reaches_every_process_holding_an_endpoint() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let child = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let parent_sink = readiness_sink();
+        let child_sink = readiness_sink();
+        let (reader, writer) = crate::pipe::create(
+            &parent,
+            4,
+            2,
+            &(parent_sink.clone() as Arc<dyn ReadinessSink>),
+        )
+        .unwrap();
+        let child_reader = parent
+            .duplicate_object_reference_to(reader, &child, ObjectRights::WAIT)
+            .unwrap();
+        let child_writer = parent
+            .duplicate_object_reference_to(writer, &child, ObjectRights::WRITE)
+            .unwrap();
+        for _ in 0..2 {
+            child
+                .register_pipe_readiness(&(child_sink.clone() as Arc<dyn ReadinessSink>))
+                .unwrap();
+        }
+
+        assert_eq!(crate::pipe::write(&child, child_writer, &[1, 2, 3]), Ok(3));
+        assert_eq!(
+            take_published(&parent_sink),
+            [(reader, ReadinessFlags::READ)]
+        );
+        assert_eq!(
+            take_published(&child_sink),
+            [(child_reader, ReadinessFlags::READ)]
+        );
+
+        // Freeing space that an atomic write still cannot use leaves `WRITE`
+        // unchanged but must still wake writers.
+        assert_eq!(
+            crate::pipe::write(&parent, writer, &[4, 5]),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(
+            crate::pipe::read(&parent, reader, 1),
+            Ok(std::vec::Vec::from([1]))
+        );
+        assert_eq!(
+            take_published(&parent_sink),
+            [(writer, ReadinessFlags::WRITE)]
+        );
+        assert_eq!(
+            take_published(&child_sink),
+            [(child_writer, ReadinessFlags::WRITE)]
+        );
+
+        assert_eq!(parent.close_object_reference(writer), Ok(()));
+        assert_eq!(*parent_sink.retired.lock().unwrap(), [writer]);
+        assert!(take_published(&parent_sink).is_empty());
+        assert!(take_published(&child_sink).is_empty());
+
+        assert_eq!(child.close_object_reference(child_writer), Ok(()));
+        let hangup = ReadinessFlags::READ | ReadinessFlags::HANGUP;
+        assert_eq!(take_published(&parent_sink), [(reader, hangup)]);
+        assert_eq!(take_published(&child_sink), [(child_reader, hangup)]);
+        assert_eq!(*child_sink.retired.lock().unwrap(), [child_writer]);
+
+        assert_eq!(child.close_object_reference(child_reader), Ok(()));
+        assert_eq!(parent.close_object_reference(reader), Ok(()));
+        assert_eq!(*parent_sink.retired.lock().unwrap(), [writer, reader]);
+        assert_eq!(
+            *child_sink.retired.lock().unwrap(),
+            [child_writer, child_reader]
+        );
+        assert!(take_published(&parent_sink).is_empty());
+        assert!(take_published(&child_sink).is_empty());
+    }
+
     #[test]
     fn child_handle_retains_zombie_until_closed() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
@@ -1616,7 +1754,7 @@ mod tests {
         );
         assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
         child.complete_start().unwrap();
-        let (read, write) = crate::pipe::create(&root, 1, 1).unwrap();
+        let (read, write) = crate::pipe::create(&root, 1, 1, &pipe_readiness_sink()).unwrap();
         root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
             .unwrap();
         root.close_object_reference(write).unwrap();
@@ -1673,7 +1811,7 @@ mod tests {
         let sink = readiness_sink();
         let (child, handle) = root.create_child_process(sink.clone()).unwrap();
         child.complete_start().unwrap();
-        let (read, write) = crate::pipe::create(&root, 1, 1).unwrap();
+        let (read, write) = crate::pipe::create(&root, 1, 1, &pipe_readiness_sink()).unwrap();
         root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
             .unwrap();
         root.close_object_reference(write).unwrap();
@@ -2631,7 +2769,7 @@ mod tests {
         );
         assert_eq!(target.close_object_reference(duplicated_event), Ok(()));
 
-        let (reader, writer) = crate::pipe::create(&source, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&source, 4, 2, &pipe_readiness_sink()).unwrap();
         let duplicated_writer = source
             .duplicate_object_reference_to(writer, &target, ObjectRights::WRITE)
             .unwrap();
@@ -2973,7 +3111,7 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
-            crate::pipe::create(&process, 4, 2),
+            crate::pipe::create(&process, 4, 2, &pipe_readiness_sink()),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(process.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
@@ -3013,11 +3151,11 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
-            crate::pipe::create(&process, 5, 2),
+            crate::pipe::create(&process, 5, 2, &pipe_readiness_sink()),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-        let (reader, writer) = crate::pipe::create(&process, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&process, 4, 2, &pipe_readiness_sink()).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
             process.check_readiness(reader),
@@ -3060,7 +3198,7 @@ mod tests {
         let process = broker
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let (reader, writer) = crate::pipe::create(&process, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&process, 4, 2, &pipe_readiness_sink()).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(process.close_object_reference(reader), Ok(()));
         assert_eq!(crate::pipe::write(&process, writer, &[]), Ok(0));
@@ -3189,10 +3327,15 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
 
-        let (greedy_reader, greedy_writer) =
-            crate::pipe::create(&greedy, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
+        let (greedy_reader, greedy_writer) = crate::pipe::create(
+            &greedy,
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64,
+            2,
+            &pipe_readiness_sink(),
+        )
+        .unwrap();
         assert_eq!(
-            crate::pipe::create(&greedy, 1, 1),
+            crate::pipe::create(&greedy, 1, 1, &pipe_readiness_sink()),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
@@ -3200,8 +3343,13 @@ mod tests {
             TEST_MAX_PIPE_CAPACITY_PER_PROCESS
         );
 
-        let (neighbor_reader, neighbor_writer) =
-            crate::pipe::create(&neighbor, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
+        let (neighbor_reader, neighbor_writer) = crate::pipe::create(
+            &neighbor,
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64,
+            2,
+            &pipe_readiness_sink(),
+        )
+        .unwrap();
         assert_eq!(
             broker.reserved_pipe_capacity.load(Ordering::Relaxed),
             TEST_MAX_PIPE_CAPACITY
@@ -3211,7 +3359,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
-            crate::pipe::create(&latecomer, 1, 1),
+            crate::pipe::create(&latecomer, 1, 1, &pipe_readiness_sink()),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(latecomer.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
@@ -3230,8 +3378,13 @@ mod tests {
         let process = broker
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let (reader, _writer) =
-            crate::pipe::create(&process, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
+        let (reader, _writer) = crate::pipe::create(
+            &process,
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64,
+            2,
+            &pipe_readiness_sink(),
+        )
+        .unwrap();
         let object = process
             .authorized_object(reader, ObjectRights::WAIT)
             .unwrap();
@@ -3264,7 +3417,7 @@ mod tests {
             *next_reference_handle = u64::MAX - 1;
         }
         assert_eq!(
-            crate::pipe::create(&process, 4, 2),
+            crate::pipe::create(&process, 4, 2, &pipe_readiness_sink()),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(*broker.next_reference_handle.read(), u64::MAX - 1);

@@ -3,7 +3,7 @@
 
 //! Provider-driven broker object readiness.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -33,6 +33,11 @@ pub struct ReadinessRegistration {
 }
 
 impl ReadinessRegistration {
+    /// Creates a registration that retires `handle` once its last clone drops.
+    pub(crate) fn new(handle: ObjectHandle, sink: Arc<dyn ReadinessSink>) -> Self {
+        Self::with_retirement_guard(handle, sink, None)
+    }
+
     pub(crate) fn new_with_retirement_guard<Guard>(
         handle: ObjectHandle,
         sink: Arc<dyn ReadinessSink>,
@@ -43,6 +48,14 @@ impl ReadinessRegistration {
     {
         // The guard keeps capacity charged until a deferred sink retirement
         // has actually been delivered.
+        Self::with_retirement_guard(handle, sink, Some(retirement_guard))
+    }
+
+    fn with_retirement_guard(
+        handle: ObjectHandle,
+        sink: Arc<dyn ReadinessSink>,
+        retirement_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
         Self {
             inner: Arc::new(ReadinessRegistrationInner {
                 handle,
@@ -51,10 +64,15 @@ impl ReadinessRegistration {
                     retired: false,
                     active_publishers: 0,
                     retirement_sent: false,
-                    retirement_guard: Some(retirement_guard),
+                    retirement_guard,
                 }),
             }),
         }
+    }
+
+    /// Returns a reference that does not keep this registration alive.
+    pub(crate) fn downgrade(&self) -> WeakReadinessRegistration {
+        WeakReadinessRegistration(Arc::downgrade(&self.inner))
     }
 
     /// Publishes the object's current readiness.
@@ -94,6 +112,23 @@ impl ReadinessRegistration {
 
     pub(crate) fn retire(&self) {
         self.inner.retire();
+    }
+}
+
+/// A [`ReadinessRegistration`] that stops publishing once every strong clone drops.
+pub(crate) struct WeakReadinessRegistration(Weak<ReadinessRegistrationInner>);
+
+impl WeakReadinessRegistration {
+    /// Returns the registration if a strong clone is still alive.
+    pub(crate) fn upgrade(&self) -> Option<ReadinessRegistration> {
+        self.0
+            .upgrade()
+            .map(|inner| ReadinessRegistration { inner })
+    }
+
+    /// Returns whether a strong clone is still alive.
+    pub(crate) fn is_alive(&self) -> bool {
+        self.0.strong_count() != 0
     }
 }
 

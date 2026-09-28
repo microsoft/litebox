@@ -263,13 +263,14 @@ where
         None => None,
     };
     let limits = core.limits();
-    // Sockets and child process handles register readiness. Add future
-    // resource limits here so every live registration fits in the
+    // Sockets, child process handles, and pipe references register readiness.
+    // Add future resource limits here so every live registration fits in the
     // association's shared readiness sink.
     let max_live_readiness_registrations = limits
         .max_sockets
         .min(limits.max_sockets_per_process)
-        .saturating_add(limits.max_processes);
+        .saturating_add(limits.max_processes)
+        .saturating_add(limits.max_references.min(limits.max_references_per_process));
     if max_live_readiness_registrations > readiness_sink.max_tracked_objects() {
         return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
     }
@@ -337,6 +338,18 @@ where
                 Err(error) => return Err(BrokerHostError::from(error)),
             },
         };
+        // A parent may have duplicated pipe ends into this process before it
+        // connected.
+        if let Err(error) = process.register_pipe_readiness(&readiness_sink) {
+            if finish_on_setup_error {
+                process.retire(true);
+            }
+            let error = ErrorCode::from(error);
+            setup_channel
+                .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                .map_err(BrokerHostError::Channel)?;
+            return Ok(Err(ConnectionTermination::Rejected(error)));
+        }
         let response = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
@@ -528,7 +541,8 @@ fn handle_request<Memory: SharedMemory>(
             handle_event_request(process, request).map(BrokerResult::Event)
         }
         BrokerOperation::Pipe(request) => {
-            handle_pipe_request(process, request, shared_buffers).map(BrokerResult::Pipe)
+            handle_pipe_request(process, request, shared_buffers, readiness_sink)
+                .map(BrokerResult::Pipe)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -1217,18 +1231,22 @@ fn handle_pipe_request<Memory: SharedMemory>(
     process: &BrokerProcess,
     request: PipeRequest,
     shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<PipeResponse> {
     match request {
-        PipeRequest::Create(request) => {
-            litebox_broker_core::pipe::create(process, request.capacity, request.atomic_write_size)
-                .map(|(read_handle, write_handle)| {
-                    PipeResponse::Create(CreatePipeResponse {
-                        read_handle,
-                        write_handle,
-                    })
-                })
-                .map_err(RequestFailure::from)
-        }
+        PipeRequest::Create(request) => litebox_broker_core::pipe::create(
+            process,
+            request.capacity,
+            request.atomic_write_size,
+            readiness_sink,
+        )
+        .map(|(read_handle, write_handle)| {
+            PipeResponse::Create(CreatePipeResponse {
+                read_handle,
+                write_handle,
+            })
+        })
+        .map_err(RequestFailure::from),
         PipeRequest::Read(request) => {
             validate_shared_buffer(request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             let data =
@@ -2763,9 +2781,11 @@ mod tests {
         let shared_buffers = Arc::new(SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap());
         let association = test_association(broker, Arc::clone(&shared_buffers));
         let (_, first_write_handle) =
-            litebox_broker_core::pipe::create(&association.process, 64, 16).unwrap();
+            litebox_broker_core::pipe::create(&association.process, 64, 16, &test_readiness_sink())
+                .unwrap();
         let (_, second_write_handle) =
-            litebox_broker_core::pipe::create(&association.process, 64, 16).unwrap();
+            litebox_broker_core::pipe::create(&association.process, 64, 16, &test_readiness_sink())
+                .unwrap();
 
         std::thread::scope(|scope| {
             let first_association = &association;
