@@ -354,22 +354,21 @@ where
     ///
     /// # Safety
     ///
-    /// The caller must authorize replacement when `request.behavior` is
-    /// [`FixedAddressBehavior::Replace`].
+    /// When `request.behavior` is [`FixedAddressBehavior::Replace`], the caller must ensure that
+    /// any replaced mappings are not in active use.
     unsafe fn mmap(
         &mut self,
         platform: &Platform,
         request: MmapRequest,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError>;
 
-    /// Remove a range from the mapping state and release its platform backing.
+    /// Release a range's platform backing and update reservation ownership.
     ///
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
-    unsafe fn unmap<V: Clone + Eq>(
+    unsafe fn unmap(
         &mut self,
-        vmas: &mut RangeMap<usize, V>,
         platform: &Platform,
         range: Range<usize>,
     ) -> Result<(), DeallocationError>;
@@ -416,15 +415,13 @@ where
         )
     }
 
-    unsafe fn unmap<V: Clone + Eq>(
+    unsafe fn unmap(
         &mut self,
-        vmas: &mut RangeMap<usize, V>,
         platform: &Platform,
         range: Range<usize>,
     ) -> Result<(), DeallocationError> {
         // SAFETY: The caller excludes all users of the released range.
         unsafe { platform.release_pages(range.clone()) }?;
-        vmas.remove(range);
         Ok(())
     }
 
@@ -455,9 +452,8 @@ where
         todo!("tracked Linux reservations are not supported yet")
     }
 
-    unsafe fn unmap<V: Clone + Eq>(
+    unsafe fn unmap(
         &mut self,
-        _vmas: &mut RangeMap<usize, V>,
         _platform: &Platform,
         _range: Range<usize>,
     ) -> Result<(), DeallocationError> {
@@ -563,11 +559,14 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
+        let range: Range<usize> = range.into();
         unsafe {
             self.reservations
-                .unmap(&mut self.vmas, self.platform, range.into())
-                .map_err(VmemUnmapError::UnmapError)
+                .unmap(self.platform, range.clone())
+                .map_err(VmemUnmapError::UnmapError)?;
         }
+        self.vmas.remove(range);
+        Ok(())
     }
 
     /// Reset pages without removing its mapping (similar to Linux `madvise` with
@@ -977,10 +976,14 @@ where
 
     /// Remap by copying into a newly allocated destination.
     ///
+    /// `new_range` provides the destination size and an address hint; the platform may choose a
+    /// different one if the given hint is not suitable.
+    ///
+    /// `vma` is the VMA associated with the source mapping.
+    ///
     /// # Safety
     ///
-    /// The source must be mapped with `vma`'s permissions and have no active users. The destination
-    /// must be larger than the source and contain no mappings.
+    /// The source must have no active users.
     ///
     /// # Panics
     ///
