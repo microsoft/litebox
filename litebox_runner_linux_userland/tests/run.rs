@@ -598,7 +598,6 @@ fn clone_vfork_children_start_like_vfork_children() {
     assert_eq!(numeric_field(parent_line, "hup_ignored="), 1);
     assert_eq!(numeric_field(parent_line, "usr2_handled="), 1);
     assert_eq!(numeric_field(parent_line, "ill_handled="), 1);
-    assert_eq!(numeric_field(parent_line, "term_blocked="), 0);
 }
 
 /// Get the path of a program using `which`

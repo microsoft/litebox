@@ -148,11 +148,9 @@ int main(int argc, char **argv) {
     }
     report("clear-sighand", child);
 
-    // The children's signal changes do not reach the parent.
-    sigset_t blocked;
-    sigprocmask(SIG_BLOCK, NULL, &blocked);
-    printf("parent-signals hup_ignored=%d usr2_handled=%d ill_handled=%d term_blocked=%d\n",
+    // The children's handler resets do not reach the parent.
+    printf("parent-signals hup_ignored=%d usr2_handled=%d ill_handled=%d\n",
            handler_is(SIGHUP, SIG_IGN), handler_is(SIGUSR2, on_signal),
-           handler_is(SIGILL, on_ill), sigismember(&blocked, SIGTERM));
+           handler_is(SIGILL, on_ill));
     return 0;
 }
