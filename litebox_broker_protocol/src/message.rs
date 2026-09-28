@@ -225,6 +225,10 @@ pub enum EventRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TimerRequest {
     /// Create a disarmed broker-owned timer.
+    ///
+    /// Timers are clock-agnostic: they count relative time on the broker's
+    /// monotonic clock, and guests convert their own clocks and absolute
+    /// expiration times before arming them.
     Create,
     /// Arm or disarm a timer.
     Set(SetTimerRequest),

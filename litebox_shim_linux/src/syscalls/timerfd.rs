@@ -32,6 +32,11 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for TimerfdSubsystem<Platform> {
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for TimerFile<Platform> {}
 
 /// Clock against which absolute expiration times are measured.
+///
+/// The clock is only a shim concern: absolute times are converted to relative
+/// ones when the timer is armed, and the broker timer counts them on its own
+/// monotonic clock. Unlike Linux, an armed `CLOCK_REALTIME` timer therefore
+/// does not follow later wall-clock changes.
 #[derive(Clone, Copy)]
 enum TimerClock {
     RealTime,
