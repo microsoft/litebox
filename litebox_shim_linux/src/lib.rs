@@ -33,7 +33,7 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
-    OFlags, SyscallRequest,
+    FcntlArg, OFlags, SyscallRequest,
     errno::Errno,
     user_pointers::{UserPtr, UserPtrMut},
 };
@@ -606,7 +606,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
         // The constrained vfork child may only inspect its temporary identity, manage its own
-        // signal state, exit, or attempt execve. Any other syscall terminates the shared runner.
+        // signal state and descriptors, open and write files, exit, or attempt execve. Any other
+        // syscall terminates the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
@@ -620,7 +621,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn
-                    | SyscallRequest::Sigaltstack { .. })
+                    | SyscallRequest::Sigaltstack { .. }
+                    | SyscallRequest::Close { .. }
+                    | SyscallRequest::Dup { .. }
+                    | SyscallRequest::Fcntl {
+                        arg: FcntlArg::GETFD | FcntlArg::SETFD(_) | FcntlArg::DUPFD { .. },
+                        ..
+                    }
+                    | SyscallRequest::Openat { .. }
+                    | SyscallRequest::Write { .. })
             )
         {
             return Ok(self.abort_vfork_window());
@@ -1275,6 +1284,7 @@ struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::Process<Platform>,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
+    parent_files: Arc<syscalls::file::FilesState<Platform>>,
     parent_signals: syscalls::signal::VforkParentSignals<Platform>,
 }
 

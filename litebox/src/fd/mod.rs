@@ -603,6 +603,17 @@ impl RawDescriptorStorage {
         Self { stored_fds: vec![] }
     }
 
+    /// Create an empty raw descriptor store that can hold a descriptor at any raw integer this
+    /// one can.
+    #[must_use]
+    pub fn new_like(&self) -> Self {
+        Self {
+            stored_fds: core::iter::repeat_with(|| None)
+                .take(self.stored_fds.len())
+                .collect(),
+        }
+    }
+
     /// Get the corresponding integer value of the provided `fd`.
     ///
     /// This explicitly consumes the `fd`.

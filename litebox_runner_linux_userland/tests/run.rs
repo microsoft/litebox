@@ -73,6 +73,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
     "vfork_fd_parent.c",
+    "vfork_fd_ops_parent.c",
     "vfork_exec_parent.c",
     "vfork_exit_parent.c",
     "vfork_reap_parent.c",
@@ -292,6 +293,67 @@ fn vfork_exec_child_inherits_descriptors_not_marked_close_on_exec() {
     let length = numeric_field(parent_line, "length=");
     assert_eq!(numeric_field(parent_line, "offset="), length);
     assert_eq!(usize::try_from(length).unwrap(), log.join("\n").len() + 1);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_children_change_their_own_descriptors() {
+    let parent = common::compile(
+        "./tests/vfork_fd_ops_parent.c",
+        "vfork_fd_ops_parent",
+        true,
+        false,
+    );
+    let child = common::compile(
+        "./tests/vfork_exec_child.c",
+        "vfork_fd_ops_child",
+        true,
+        false,
+    );
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "vfork_fd_ops_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+
+    // `posix_spawn` file actions change only the child's table, which then transfers through
+    // `execve`.
+    let spawn_line = line("spawn ");
+    assert_eq!(numeric_field(spawn_line, "ret="), 0);
+    assert_eq!(numeric_field(spawn_line, "exited="), 1);
+    assert_eq!(numeric_field(spawn_line, "code="), 42);
+    assert_eq!(numeric_field(spawn_line, "log_cloexec="), 1);
+    assert_eq!(numeric_field(spawn_line, "pipe_open="), 1);
+    assert_eq!(numeric_field(spawn_line, "opened_closed="), 1);
+    let child_line = "child-open-fds 0 1 2 3 10";
+    assert_eq!(line("child-open-fds"), child_line);
+    // The parent's `log` shares the offset the child advanced through its stdout.
+    let length = numeric_field(spawn_line, "length=");
+    assert_eq!(numeric_field(spawn_line, "offset="), length);
+    assert_eq!(usize::try_from(length).unwrap(), child_line.len() + 1);
+
+    // A child that exits without `execve` changes only its own table, and its descriptors are
+    // closed when the parent resumes.
+    let vfork_line = line("vfork ");
+    assert_eq!(numeric_field(vfork_line, "exited="), 1);
+    assert_eq!(numeric_field(vfork_line, "code="), 0);
+    assert_eq!(numeric_field(vfork_line, "log_cloexec="), 1);
+    assert_eq!(numeric_field(vfork_line, "pipe_open="), 1);
+    assert_eq!(numeric_field(vfork_line, "first="), 1);
+    assert!(vfork_line.contains(" byte=x "));
+    assert_eq!(numeric_field(vfork_line, "second="), 0);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

@@ -758,10 +758,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .borrow_mut()
             .take()
             .expect("completed vfork window lost its parent context");
+        self.restore_vfork_parent_files(state.parent_files);
         self.signals.restore_vfork_parent(state.parent_signals);
         self.thread.process.add_child(state.child_pid, state.child);
         *ctx = state.parent_context;
         state.child_pid.cast_unsigned() as usize
+    }
+
+    /// Closes the `vfork` child's descriptors, as its exit would, and restores the parent's table.
+    fn restore_vfork_parent_files(
+        &self,
+        parent_files: Arc<crate::syscalls::file::FilesState<Platform>>,
+    ) {
+        let child_fds: Vec<usize> = self
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .iter_alive()
+            .collect();
+        for raw_fd in child_fds {
+            let _ = self.do_close(raw_fd);
+        }
+        self.files.replace(parent_files);
     }
 
     /// Terminates the shared runner when the constrained `vfork` window cannot continue.
@@ -849,10 +868,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// signals start with their default action.
     ///
     /// Only single-threaded processes with default filesystem, resource-limit, and alarm state are
-    /// admitted, and only if every descriptor not marked close-on-exec can transfer to the fresh
-    /// runner; see [`Self::fds_inherited_across_exec`]. The child gets a copy of the parent's
-    /// signal dispositions, blocked mask, and alternate stack, but none of its pending signals; the
-    /// parent's signal state is restored when it resumes. The parent remains
+    /// admitted. The child gets its own copy of the parent's descriptor table, sharing its open
+    /// file descriptions, and a copy of its signal dispositions, blocked mask, and alternate
+    /// stack, but none of its pending signals. When the parent resumes, the child's descriptors
+    /// are closed and the parent's table and signal state are restored. The parent remains
     /// suspended until the child exits, is killed by a signal, or successfully transfers to a
     /// fresh runner through `execve`; an `execve` that fails before the transfer returns its error
     /// to the child. The child must not change platform-managed architectural state outside
@@ -873,14 +892,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EAGAIN);
         }
-        // The child cannot change its descriptors before `execve`, so they transfer then.
-        self.fds_inherited_across_exec()?;
+        let child_files = self.files.borrow().copy_for_vfork(&self.global);
+        let parent_files = self.files.replace(Arc::new(child_files));
         self.thread.process.release_reaped_children();
-        let child = self
-            .global
-            .litebox
-            .allocate_child_process()
-            .map_err(Errno::from)?;
+        let child = match self.global.litebox.allocate_child_process() {
+            Ok(child) => child,
+            Err(error) => {
+                self.restore_vfork_parent_files(parent_files);
+                return Err(Errno::from(error));
+            }
+        };
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
@@ -889,6 +910,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child,
             child_pid,
             parent_context,
+            parent_files,
             parent_signals: self.signals.begin_vfork_child(clear_signal_handlers),
         }));
         if let Some(child_stack) = child_stack {

@@ -351,6 +351,44 @@ impl<Platform: ShimPlatform> core::fmt::Debug for AnyTypedFd<Platform> {
     }
 }
 
+impl<Platform: ShimPlatform> FilesState<Platform> {
+    /// Returns a `vfork` child's copy of this table, whose descriptors keep their numbers and
+    /// close-on-exec flags and share this table's open file descriptions.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn copy_for_vfork(&self, global: &GlobalState<Platform>) -> Self {
+        let rds = self.raw_descriptor_store.read();
+        let alive_fds: alloc::vec::Vec<usize> = rds.iter_alive().collect();
+        let copy = Self {
+            raw_descriptor_store: litebox::sync::RwLock::new(rds.new_like()),
+            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
+        };
+        drop(rds);
+        for raw_fd in alive_fds {
+            let fd = self
+                .typed_fd_from_raw(raw_fd)
+                .expect("the table is not changing");
+            let flags = get_file_descriptor_flags(&fd, global);
+            on_any_fd!(&fd, |fd| {
+                let mut descriptors = global.litebox.descriptor_table_mut();
+                let fd = descriptors
+                    .duplicate(&**fd)
+                    .expect("the table is not changing");
+                if !flags.is_empty() {
+                    let old = descriptors.set_fd_metadata(&fd, flags);
+                    assert!(old.is_none());
+                }
+                drop(descriptors);
+                let success = copy
+                    .raw_descriptor_store
+                    .write()
+                    .fd_into_specific_raw_integer(fd, raw_fd);
+                assert!(success);
+            });
+        }
+        copy
+    }
+}
+
 /// Path in the file system
 #[derive(Debug)]
 enum FsPath {
