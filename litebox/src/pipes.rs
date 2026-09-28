@@ -162,19 +162,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
         }
         Ok(())
     }
-
-    /// Perform `f` with the [`IOPollable`] associated with the pipe at `fd`.
-    pub fn with_iopollable<R>(
-        &self,
-        fd: &PipeFd<Platform>,
-        f: impl FnOnce(&dyn IOPollable) -> R,
-    ) -> Result<R, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
-        Ok(dt
-            .get_entry(fd)
-            .ok_or(errors::ClosedError::ClosedFd)?
-            .with_iopollable(f))
-    }
 }
 
 /// Whether a particular pipe end is the sender half or the receiver half
