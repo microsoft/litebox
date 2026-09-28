@@ -541,7 +541,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 /// Equal keys denote the same entry. A key is stable across `dup` and for the
 /// entry's lifetime, so it can identify an entry (for example as a map key)
 /// without dereferencing anything.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntryStableKey(usize);
 
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
