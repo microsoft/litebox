@@ -14,16 +14,20 @@ use litebox::{
     fs::errors::OpenError,
     mm::vmem::PAGE_SIZE,
     path,
+    process::InheritableFd,
     stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
     FileType, FileUser,
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam, errno::Errno,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam,
+    errno::Errno,
+    program_startup::{InheritedFd, InheritedFdKind},
     signal::Signal,
 };
 use thiserror::Error;
@@ -223,7 +227,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     pub(crate) fn install_inherited_fds(
         &self,
         global: &GlobalState<Platform>,
-        inherited_fds: &[litebox_common_linux::program_startup::InheritedFd],
+        inherited_fds: &[InheritedFd],
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
         let litebox = &global.litebox;
         let max_fd = self.max_fd.load(Ordering::Relaxed);
@@ -235,37 +239,73 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             if raw_fd < next_fd || raw_fd - next_fd > MAX_INHERITED_FD_GAP || raw_fd >= max_fd {
                 return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFds);
             }
-            let fd = if let Some(&first_fd) = descriptions.get(&inherited.handle) {
+            let first_fd = descriptions.get(&inherited.handle).copied();
+            let handle = inherited.handle;
+            let adopt_file = || {
+                litebox
+                    .adopt_inherited_file(handle)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+            };
+            match inherited.kind {
+                InheritedFdKind::File => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, adopt_file)?;
+                }
+                InheritedFdKind::Stdio {
+                    stream,
+                    status_flags,
+                } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                    let fd = adopt_file()?;
+                    let mut descriptors = litebox.descriptor_table_mut();
+                    descriptors.set_entry_metadata(&fd, stream);
+                    if let Some(flags) = status_flags {
+                        descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
+                    }
+                    Ok(fd)
+                })?,
+                InheritedFdKind::Pipe {
+                    endpoint,
+                    status_flags,
+                } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                    global
+                        .adopt_inherited_linux_pipe(handle, endpoint, status_flags)
+                        .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                })?,
+            }
+            descriptions.entry(handle).or_insert(raw_fd);
+            next_fd = raw_fd + 1;
+        }
+        Ok(())
+    }
+
+    /// Installs an inherited descriptor at `raw_fd`, duplicating the descriptor at `first_fd` if
+    /// it shares an already installed open file description and calling `adopt` otherwise.
+    fn install_inherited_fd<Subsystem: FdEnabledSubsystem>(
+        &self,
+        litebox: &litebox::LiteBox<Platform>,
+        first_fd: Option<usize>,
+        raw_fd: usize,
+        adopt: impl FnOnce() -> Result<TypedFd<Subsystem>, crate::loader::elf::ElfLoaderError>,
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        let fd = match first_fd {
+            Some(first_fd) => {
+                // A handle is inherited as one kind of object.
                 let first = self
                     .raw_descriptor_store
                     .read()
-                    .fd_from_raw_integer::<litebox::fs::BrokerFile>(first_fd)
-                    .expect("an installed inherited descriptor stays open");
+                    .fd_from_raw_integer::<Subsystem>(first_fd)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
                 litebox
                     .descriptor_table_mut()
                     .duplicate(&first)
                     .expect("an installed inherited descriptor stays open")
-            } else {
-                let fd = litebox
-                    .adopt_inherited_file(inherited.handle)
-                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
-                let mut descriptors = litebox.descriptor_table_mut();
-                if let Some(stream) = inherited.stdio_stream {
-                    descriptors.set_entry_metadata(&fd, stream);
-                }
-                if let Some(flags) = inherited.stdio_status_flags {
-                    descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
-                }
-                descriptions.insert(inherited.handle, raw_fd);
-                fd
-            };
-            let success = self
-                .raw_descriptor_store
-                .write()
-                .fd_into_specific_raw_integer(fd, raw_fd);
-            assert!(success);
-            next_fd = raw_fd + 1;
-        }
+            }
+            None => adopt()?,
+        };
+        let success = self
+            .raw_descriptor_store
+            .write()
+            .fd_into_specific_raw_integer(fd, raw_fd);
+        assert!(success);
         Ok(())
     }
 }
@@ -459,12 +499,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits across `execve`, which are those not marked
     /// close-on-exec, in ascending order.
     ///
+    /// Each is returned as its startup record, whose handle the caller replaces with the child's,
+    /// and the object the child inherits.
+    ///
     /// Linux keeps every such descriptor, whatever it refers to. A fresh runner can share only
     /// objects the broker holds, and not all of those yet, so this fails with `EAGAIN` if one of
     /// them is:
     ///
-    /// - a pipe: the broker does not yet publish pipe readiness across processes, so a blocking
-    ///   pipe wait in the child could hang;
     /// - a network socket: the broker does not duplicate socket objects;
     /// - an eventfd, epoll, or Unix socket descriptor: the object is local to this runner;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
@@ -473,12 +514,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///   install.
     ///
     /// Transferred descriptors also differ from Linux in two ways: the parent does not observe the
-    /// child's reads of an inherited directory, and stdio status flags, which this runner tracks
-    /// locally, are copied rather than shared, so an `F_SETFL` in one process is not seen by the
-    /// other.
+    /// child's reads of an inherited directory, and pipe and stdio status flags, which this runner
+    /// tracks locally, are copied rather than shared, so an `F_SETFL` in one process is not seen by
+    /// the other.
     pub(crate) fn fds_inherited_across_exec(
         &self,
-    ) -> Result<alloc::vec::Vec<(u32, alloc::sync::Arc<FileFd>)>, Errno> {
+    ) -> Result<alloc::vec::Vec<(InheritedFd, InheritableFd<Platform>)>, Errno> {
         let files = self.files.borrow();
         let alive_fds: alloc::vec::Vec<usize> =
             files.raw_descriptor_store.read().iter_alive().collect();
@@ -491,21 +532,40 @@ impl<Platform: ShimPlatform> Task<Platform> {
             {
                 continue;
             }
-            let AnyTypedFd::Fs(file) = fd else {
-                return Err(Errno::EAGAIN);
-            };
-            if raw_fd - next_fd > MAX_INHERITED_FD_GAP
-                || self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(&file, |_: &Diroff| ())
-                    .is_ok()
-            {
+            if raw_fd - next_fd > MAX_INHERITED_FD_GAP {
                 return Err(Errno::EAGAIN);
             }
+            let (kind, object) = match fd {
+                AnyTypedFd::Fs(file) => {
+                    let descriptors = self.global.litebox.descriptor_table();
+                    if descriptors.with_metadata(&file, |_: &Diroff| ()).is_ok() {
+                        return Err(Errno::EAGAIN);
+                    }
+                    let kind =
+                        match descriptors.with_metadata(&file, |stream: &StdioStream| *stream) {
+                            Ok(stream) => InheritedFdKind::Stdio {
+                                stream,
+                                status_flags: descriptors
+                                    .with_metadata(&file, |crate::StdioStatusFlags(flags)| *flags)
+                                    .ok(),
+                            },
+                            Err(_) => InheritedFdKind::File,
+                        };
+                    (kind, InheritableFd::File(file))
+                }
+                AnyTypedFd::Pipes(pipe) => (
+                    self.global.inherited_linux_pipe_kind(&pipe)?,
+                    InheritableFd::Pipe(pipe),
+                ),
+                _ => return Err(Errno::EAGAIN),
+            };
             next_fd = raw_fd + 1;
-            inherited.push((u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?, file));
+            let inherited_fd = InheritedFd {
+                fd: u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?,
+                handle: ObjectHandle::default(),
+                kind,
+            };
+            inherited.push((inherited_fd, object));
         }
         Ok(inherited)
     }
@@ -2331,10 +2391,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         Ok(())
                     },
                     |fd| {
+                        let flags = if val != 0 {
+                            OFlags::NONBLOCK
+                        } else {
+                            OFlags::empty()
+                        };
                         self.global
-                            .pipes
-                            .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
-                            .map_err(Errno::from)
+                            .set_linux_pipe_status_flags(fd, flags, OFlags::NONBLOCK)
                     },
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),

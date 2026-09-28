@@ -7,6 +7,7 @@ use alloc::ffi::CString;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use litebox::pipes::HalfPipeType;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 use litebox_broker_protocol::stdio::StdioStream;
@@ -15,7 +16,11 @@ use crate::OFlags;
 use crate::signal::SigSet;
 
 const HEADER_SIZE: usize = size_of::<[u32; 9]>() + size_of::<[u64; 2]>();
-const INHERITED_FD_SIZE: usize = size_of::<[u32; 2]>() + size_of::<u64>() + size_of::<[u8; 2]>();
+/// Size of an inherited descriptor's number, handle, and kind tag, which precede its kind's fields.
+const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
+const FILE_TAG: u8 = 0;
+const STDIO_TAG: u8 = 1;
+const PIPE_TAG: u8 = 2;
 
 /// Linux program state needed to load a child in a fresh runner.
 ///
@@ -48,19 +53,42 @@ pub struct LinuxProgramStartup {
 
 /// A descriptor inherited across `execve`, as Linux keeps every descriptor not marked
 /// close-on-exec.
+///
+/// This is the Linux startup record for a descriptor whose object the parent passed to the child
+/// as a [`litebox::process::InheritableFd`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InheritedFd {
     /// Descriptor number.
     pub fd: u32,
-    /// The child's broker handle to the file.
+    /// The child's broker handle to the descriptor's object, as returned by
+    /// [`litebox::process::Process::inherit`].
     ///
-    /// Descriptors with the same handle share one open file description, whose metadata is taken
-    /// from the first of them.
+    /// Descriptors with the same handle share one open file description, whose kind and metadata
+    /// are taken from the first of them.
     pub handle: ObjectHandle,
-    /// Standard stream the file refers to, if any.
-    pub stdio_stream: Option<StdioStream>,
-    /// Status flags the runner tracks for a standard stream, if any.
-    pub stdio_status_flags: Option<OFlags>,
+    /// What the descriptor refers to.
+    pub kind: InheritedFdKind,
+}
+
+/// The kind of object an [`InheritedFd`] refers to, with the metadata the runner tracks for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InheritedFdKind {
+    /// A file, whose access mode and status flags the broker keeps.
+    File,
+    /// A file that refers to a standard stream.
+    Stdio {
+        /// The standard stream.
+        stream: StdioStream,
+        /// Status flags the runner tracks for the stream, if any.
+        status_flags: Option<OFlags>,
+    },
+    /// An end of a pipe.
+    Pipe {
+        /// Which end.
+        endpoint: HalfPipeType,
+        /// The end's access mode, which must match `endpoint`, and status flags.
+        status_flags: OFlags,
+    },
 }
 
 /// Invalid or unsupported Linux program startup data.
@@ -81,6 +109,9 @@ pub enum LinuxProgramStartupError {
     /// An argument or environment string contains an interior NUL.
     #[error("invalid Linux program string")]
     InvalidString,
+    /// An inherited descriptor's metadata does not match its kind.
+    #[error("invalid Linux program inherited descriptor")]
+    InvalidInheritedFd,
 }
 
 impl LinuxProgramStartup {
@@ -126,19 +157,7 @@ impl LinuxProgramStartup {
             output.extend_from_slice(value);
         }
         for inherited in &self.inherited_fds {
-            push_u32(&mut output, inherited.fd);
-            push_u64(&mut output, inherited.handle.0);
-            output.push(match inherited.stdio_stream {
-                None => 0,
-                Some(StdioStream::Stdin) => 1,
-                Some(StdioStream::Stdout) => 2,
-                Some(StdioStream::Stderr) => 3,
-            });
-            output.push(u8::from(inherited.stdio_status_flags.is_some()));
-            push_u32(
-                &mut output,
-                inherited.stdio_status_flags.map_or(0, |flags| flags.bits()),
-            );
+            inherited.encode(&mut output);
         }
         debug_assert_eq!(output.len(), encoded_len);
         Ok(output)
@@ -187,7 +206,7 @@ impl LinuxProgramStartup {
                     .map_err(|_| LinuxProgramStartupError::InvalidString)?,
             );
         }
-        if inherited_fd_count.checked_mul(INHERITED_FD_SIZE) != Some(input.len()) {
+        if inherited_fd_count > input.len() / INHERITED_FD_HEADER_SIZE {
             return Err(LinuxProgramStartupError::Malformed);
         }
         let mut inherited_fds = Vec::new();
@@ -195,28 +214,7 @@ impl LinuxProgramStartup {
             .try_reserve_exact(inherited_fd_count)
             .map_err(|_| LinuxProgramStartupError::TooLarge)?;
         for _ in 0..inherited_fd_count {
-            let fd = read_u32(&mut input)?;
-            let handle = ObjectHandle(read_u64(&mut input)?);
-            let stdio_stream = match read_u8(&mut input)? {
-                0 => None,
-                1 => Some(StdioStream::Stdin),
-                2 => Some(StdioStream::Stdout),
-                3 => Some(StdioStream::Stderr),
-                _ => return Err(LinuxProgramStartupError::Malformed),
-            };
-            let has_stdio_status_flags = read_u8(&mut input)?;
-            let stdio_status_flags = read_u32(&mut input)?;
-            let stdio_status_flags = match has_stdio_status_flags {
-                0 if stdio_status_flags == 0 => None,
-                1 => Some(OFlags::from_bits_retain(stdio_status_flags)),
-                _ => return Err(LinuxProgramStartupError::Malformed),
-            };
-            inherited_fds.push(InheritedFd {
-                fd,
-                handle,
-                stdio_stream,
-                stdio_status_flags,
-            });
+            inherited_fds.push(InheritedFd::decode(&mut input)?);
         }
         if !input.is_empty() {
             return Err(LinuxProgramStartupError::Malformed);
@@ -240,12 +238,107 @@ impl LinuxProgramStartup {
     }
 }
 
+impl InheritedFd {
+    fn encoded_len(&self) -> usize {
+        INHERITED_FD_HEADER_SIZE
+            + match self.kind {
+                InheritedFdKind::File => 0,
+                InheritedFdKind::Stdio { status_flags, .. } => {
+                    size_of::<[u8; 2]>() + status_flags.map_or(0, |_| size_of::<u32>())
+                }
+                InheritedFdKind::Pipe { .. } => size_of::<u8>() + size_of::<u32>(),
+            }
+    }
+
+    fn encode(&self, output: &mut Vec<u8>) {
+        push_u32(output, self.fd);
+        push_u64(output, self.handle.0);
+        match self.kind {
+            InheritedFdKind::File => output.push(FILE_TAG),
+            InheritedFdKind::Stdio {
+                stream,
+                status_flags,
+            } => {
+                output.push(STDIO_TAG);
+                output.push(match stream {
+                    StdioStream::Stdin => 0,
+                    StdioStream::Stdout => 1,
+                    StdioStream::Stderr => 2,
+                });
+                output.push(u8::from(status_flags.is_some()));
+                if let Some(flags) = status_flags {
+                    push_u32(output, flags.bits());
+                }
+            }
+            InheritedFdKind::Pipe {
+                endpoint,
+                status_flags,
+            } => {
+                output.push(PIPE_TAG);
+                output.push(match endpoint {
+                    HalfPipeType::ReceiverHalf => 0,
+                    HalfPipeType::SenderHalf => 1,
+                });
+                push_u32(output, status_flags.bits());
+            }
+        }
+    }
+
+    fn decode(input: &mut &[u8]) -> Result<Self, LinuxProgramStartupError> {
+        let fd = read_u32(input)?;
+        let handle = ObjectHandle(read_u64(input)?);
+        let kind = match read_u8(input)? {
+            FILE_TAG => InheritedFdKind::File,
+            STDIO_TAG => InheritedFdKind::Stdio {
+                stream: match read_u8(input)? {
+                    0 => StdioStream::Stdin,
+                    1 => StdioStream::Stdout,
+                    2 => StdioStream::Stderr,
+                    _ => return Err(LinuxProgramStartupError::Malformed),
+                },
+                status_flags: match read_u8(input)? {
+                    0 => None,
+                    1 => Some(OFlags::from_bits_retain(read_u32(input)?)),
+                    _ => return Err(LinuxProgramStartupError::Malformed),
+                },
+            },
+            PIPE_TAG => InheritedFdKind::Pipe {
+                endpoint: match read_u8(input)? {
+                    0 => HalfPipeType::ReceiverHalf,
+                    1 => HalfPipeType::SenderHalf,
+                    _ => return Err(LinuxProgramStartupError::Malformed),
+                },
+                status_flags: OFlags::from_bits_retain(read_u32(input)?),
+            },
+            _ => return Err(LinuxProgramStartupError::Malformed),
+        };
+        Ok(Self { fd, handle, kind })
+    }
+}
+
 fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupError> {
+    const ACCESS_MODE: OFlags = OFlags::WRONLY.union(OFlags::RDWR);
+
     if startup.parent_process_id <= 0 {
         return Err(LinuxProgramStartupError::InvalidParentProcess);
     }
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
+    }
+    for inherited in &startup.inherited_fds {
+        if let InheritedFdKind::Pipe {
+            endpoint,
+            status_flags,
+        } = inherited.kind
+        {
+            let access_mode = match endpoint {
+                HalfPipeType::ReceiverHalf => OFlags::RDONLY,
+                HalfPipeType::SenderHalf => OFlags::WRONLY,
+            };
+            if status_flags & ACCESS_MODE != access_mode {
+                return Err(LinuxProgramStartupError::InvalidInheritedFd);
+            }
+        }
     }
     Ok(())
 }
@@ -266,14 +359,13 @@ fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStart
             return Err(LinuxProgramStartupError::TooLarge);
         }
     }
-    length = startup
-        .inherited_fds
-        .len()
-        .checked_mul(INHERITED_FD_SIZE)
-        .and_then(|files| length.checked_add(files))
-        .ok_or(LinuxProgramStartupError::TooLarge)?;
-    if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
-        return Err(LinuxProgramStartupError::TooLarge);
+    for inherited in &startup.inherited_fds {
+        length = length
+            .checked_add(inherited.encoded_len())
+            .ok_or(LinuxProgramStartupError::TooLarge)?;
+        if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
+            return Err(LinuxProgramStartupError::TooLarge);
+        }
     }
     Ok(length)
 }
@@ -346,14 +438,39 @@ mod tests {
                 InheritedFd {
                     fd: 1,
                     handle: ObjectHandle(7),
-                    stdio_stream: Some(StdioStream::Stdout),
-                    stdio_status_flags: Some(OFlags::APPEND | OFlags::RDWR),
+                    kind: InheritedFdKind::Stdio {
+                        stream: StdioStream::Stdout,
+                        status_flags: Some(OFlags::APPEND | OFlags::RDWR),
+                    },
+                },
+                InheritedFd {
+                    fd: 2,
+                    handle: ObjectHandle(10),
+                    kind: InheritedFdKind::Stdio {
+                        stream: StdioStream::Stderr,
+                        status_flags: None,
+                    },
                 },
                 InheritedFd {
                     fd: 4,
                     handle: ObjectHandle(u64::MAX),
-                    stdio_stream: None,
-                    stdio_status_flags: None,
+                    kind: InheritedFdKind::File,
+                },
+                InheritedFd {
+                    fd: 5,
+                    handle: ObjectHandle(8),
+                    kind: InheritedFdKind::Pipe {
+                        endpoint: HalfPipeType::ReceiverHalf,
+                        status_flags: OFlags::RDONLY | OFlags::NONBLOCK,
+                    },
+                },
+                InheritedFd {
+                    fd: 6,
+                    handle: ObjectHandle(9),
+                    kind: InheritedFdKind::Pipe {
+                        endpoint: HalfPipeType::SenderHalf,
+                        status_flags: OFlags::WRONLY,
+                    },
                 },
             ],
         };

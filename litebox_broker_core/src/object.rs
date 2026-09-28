@@ -5,14 +5,15 @@
 
 use alloc::sync::Arc;
 
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::rwlock::RwLock;
 
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
 use crate::process::ProcessObject;
+use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::socket::SocketObject;
 use crate::{BrokerError, Result};
 
@@ -34,6 +35,9 @@ pub(crate) struct ObjectReference {
     pub(crate) rights: ObjectRights,
     /// Position of this reference's handle in the owner's handle list.
     pub(crate) process_reference_index: usize,
+    /// Readiness publication once the object is shared, for kinds whose state
+    /// other processes change, retired when this reference drops.
+    pub(crate) readiness: Option<ReadinessRegistration>,
 }
 
 pub(crate) enum ObjectEntry {
@@ -50,10 +54,31 @@ pub(crate) enum ObjectEntry {
 impl ObjectEntry {
     /// Returns whether references to this object may be duplicated into
     /// another process.
+    ///
+    /// A duplicable kind whose waiters need wake-ups for changes made by
+    /// other processes must also implement [`Self::watch`].
     pub(crate) fn is_duplicable(&self) -> bool {
         match self {
             Self::Event(_) | Self::File(_) | Self::Pipe(_) => true,
             Self::Socket(_) | Self::Process(_) => false,
+        }
+    }
+
+    /// Returns a registration that publishes readiness changes to this shared
+    /// object through `readiness_sink` for `handle` until it drops, or `None`
+    /// if references to this kind need none.
+    pub(crate) fn watch(
+        &self,
+        handle: ObjectHandle,
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<Option<ReadinessRegistration>> {
+        match self {
+            Self::Pipe(pipe) => {
+                let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
+                pipe.watch(&registration)?;
+                Ok(Some(registration))
+            }
+            Self::Event(_) | Self::File(_) | Self::Socket(_) | Self::Process(_) => Ok(None),
         }
     }
 }

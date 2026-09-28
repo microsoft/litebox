@@ -4,6 +4,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,6 +83,10 @@ int main(int argc, char **argv) {
         printf("child-fds stdin_setfl=%d hidden_closed=%d\n", stdin_setfl, hidden_closed);
         return 42;
     }
+    if (strcmp(marker, "stdout-mode") == 0) {
+        printf("child-stdout wronly=%d\n", (fcntl(1, F_GETFL) & O_ACCMODE) == O_WRONLY);
+        marker = "open-fds";
+    }
     if (strcmp(marker, "open-fds") == 0) {
         printf("child-open-fds");
         for (int fd = 0; fd < 64; fd++) {
@@ -90,6 +95,40 @@ int main(int argc, char **argv) {
             }
         }
         printf("\n");
+        return 42;
+    }
+    if (strcmp(marker, "cat") == 0) {
+        int flags = fcntl(0, F_GETFL);
+        size_t total = 0;
+        int ok = 1;
+        char buffer[4096];
+        for (;;) {
+            struct pollfd readable = {.fd = 0, .events = POLLIN};
+            if (poll(&readable, 1, -1) != 1) {
+                ok = 0;
+                break;
+            }
+            ssize_t n = read(0, buffer, sizeof buffer);
+            if (n == 0) {
+                break;
+            }
+            if (n < 0) {
+                ok &= errno == EAGAIN;
+                continue;
+            }
+            for (ssize_t i = 0; i < n; i++) {
+                ok &= buffer[i] == 'a' + (total + i) % 26;
+            }
+            total += n;
+        }
+        printf("child-cat bytes=%zu ok=%d rdonly=%d nonblock=%d\n", total, ok,
+               (flags & O_ACCMODE) == O_RDONLY, (flags & O_NONBLOCK) != 0);
+        return 42;
+    }
+    if (strcmp(marker, "read-byte") == 0) {
+        char byte = 0;
+        ssize_t n = read(0, &byte, 1);
+        printf("child-read-byte n=%zd byte=%c\n", n, byte);
         return 42;
     }
     const char *environment = getenv("VFORK_EXEC_TEST");

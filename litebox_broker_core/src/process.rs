@@ -514,11 +514,19 @@ impl BrokerProcess {
     /// Returned handles follow the requested order and belong to the child,
     /// which releases them when it terminates. If duplication fails, the
     /// child receives none of them.
+    ///
+    /// Since the child can now change these objects, this process's
+    /// references first start publishing readiness through `readiness_sink`,
+    /// as [`Self::register_readiness`] describes.
     pub fn duplicate_object_references_to_child(
         &self,
         child_process_id: ProcessId,
         handles: &[ObjectHandle],
+        readiness_sink: &Arc<dyn ReadinessSink>,
     ) -> Result<Vec<ObjectHandle>> {
+        // A registration left behind by a later failure only publishes
+        // readiness the process does not need.
+        self.register_readiness(readiness_sink)?;
         // Hold the state lock so the child stays pending, since a child
         // removed from its slot may release its references before receiving
         // these.
@@ -1032,6 +1040,31 @@ impl BrokerProcess {
         Ok(reference.rights)
     }
 
+    /// Publishes readiness of all of this process's references through
+    /// `readiness_sink` for object kinds that need it, skipping references
+    /// that already publish readiness.
+    ///
+    /// References start publishing once the process shares objects, since
+    /// only then can another process change them. Sharing one reference can
+    /// expose objects behind others, such as a pipe's other endpoint, so all
+    /// of them register. Connection setup calls this for references
+    /// duplicated into the process before it connected, and
+    /// [`Self::duplicate_object_references_to_child`] before sharing more.
+    pub fn register_readiness(&self, readiness_sink: &Arc<dyn ReadinessSink>) -> Result<()> {
+        let process_references = self.references.lock();
+        let mut references = self.core.references.write();
+        for &handle in &process_references.handles {
+            let reference = references
+                .get_mut(&handle)
+                .filter(|reference| reference.owner == self.id)
+                .ok_or(BrokerError::UnknownObject)?;
+            if reference.readiness.is_none() {
+                reference.readiness = reference.object.read().watch(handle, readiness_sink)?;
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn create_object_reference_pair(
         &self,
         first: ObjectEntry,
@@ -1173,6 +1206,7 @@ impl BrokerProcess {
                 owner: self.id,
                 rights,
                 process_reference_index,
+                readiness: None,
             },
         );
         reference_handles.push(handle);
@@ -1499,6 +1533,7 @@ mod tests {
         BrokerProcess, ProcessLifecycleSink, ProcessReferences, ProcessStatus,
         release_pending_reference,
     };
+    use crate::readiness::ReadinessSink;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
@@ -1593,6 +1628,90 @@ mod tests {
 
     fn readiness_sink() -> Arc<crate::readiness::tests::TestReadinessSink> {
         Arc::new(crate::readiness::tests::TestReadinessSink::default())
+    }
+
+    /// Returns the pipe wakeups `sink` received, which republish so a sink
+    /// cannot drop them as unchanged.
+    fn take_republished(
+        sink: &crate::readiness::tests::TestReadinessSink,
+    ) -> std::vec::Vec<(ObjectHandle, ReadinessFlags)> {
+        core::mem::take(&mut *sink.republished.lock().unwrap())
+    }
+
+    #[test]
+    fn pipe_readiness_reaches_every_process_holding_an_endpoint() {
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap();
+        let parent = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let parent_sink = readiness_sink();
+        let child_sink = readiness_sink();
+        let (reader, writer) = crate::pipe::create(&parent, 4, 2).unwrap();
+        let CreatedProcess { identity, .. } =
+            parent.allocate_child_process(parent_sink.clone()).unwrap();
+        // Sharing only the write end still lets the child wake the parent's reader.
+        let child_writer = parent
+            .duplicate_object_references_to_child(
+                identity.process_id,
+                &[writer],
+                &(parent_sink.clone() as Arc<dyn ReadinessSink>),
+            )
+            .unwrap()[0];
+        let child = parent.take_child_process(identity.process_id).unwrap();
+        for _ in 0..2 {
+            child
+                .register_readiness(&(child_sink.clone() as Arc<dyn ReadinessSink>))
+                .unwrap();
+        }
+        child.complete_start().unwrap();
+
+        assert_eq!(crate::pipe::write(&child, child_writer, &[1, 2, 3]), Ok(3));
+        assert_eq!(
+            take_republished(&parent_sink),
+            [(reader, ReadinessFlags::READ)]
+        );
+        assert!(take_republished(&child_sink).is_empty());
+
+        // Freeing space that an atomic write still cannot use leaves `WRITE`
+        // unchanged but must still wake writers.
+        assert_eq!(
+            crate::pipe::write(&parent, writer, &[4, 5]),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(
+            crate::pipe::read(&parent, reader, 1),
+            Ok(std::vec::Vec::from([1]))
+        );
+        assert_eq!(
+            take_republished(&parent_sink),
+            [(writer, ReadinessFlags::WRITE)]
+        );
+        assert_eq!(
+            take_republished(&child_sink),
+            [(child_writer, ReadinessFlags::WRITE)]
+        );
+
+        assert_eq!(parent.close_object_reference(writer), Ok(()));
+        assert_eq!(*parent_sink.retired.lock().unwrap(), [writer]);
+        assert!(take_republished(&parent_sink).is_empty());
+        assert!(take_republished(&child_sink).is_empty());
+
+        assert_eq!(child.close_object_reference(child_writer), Ok(()));
+        let hangup = ReadinessFlags::READ | ReadinessFlags::HANGUP;
+        assert_eq!(take_republished(&parent_sink), [(reader, hangup)]);
+        assert!(take_republished(&child_sink).is_empty());
+        assert_eq!(*child_sink.retired.lock().unwrap(), [child_writer]);
+
+        assert_eq!(parent.close_object_reference(reader), Ok(()));
+        assert_eq!(*parent_sink.retired.lock().unwrap(), [writer, reader]);
+        assert!(take_republished(&parent_sink).is_empty());
+        assert!(take_republished(&child_sink).is_empty());
     }
 
     #[test]
@@ -2038,22 +2157,23 @@ mod tests {
             .get(&child_id)
             .and_then(alloc::sync::Weak::upgrade)
             .unwrap();
+        let sink: Arc<dyn ReadinessSink> = readiness_sink();
         let first = crate::event::create(&parent, 1).unwrap();
         let second = crate::event::create(&parent, 0).unwrap();
 
         assert_eq!(
-            parent.duplicate_object_references_to_child(ProcessId(child_id.0 + 1), &[first]),
+            parent.duplicate_object_references_to_child(ProcessId(child_id.0 + 1), &[first], &sink),
             Err(BrokerError::UnknownObject)
         );
         // A process reference is not duplicable, so the child receives nothing.
         assert_eq!(
-            parent.duplicate_object_references_to_child(child_id, &[first, handle]),
+            parent.duplicate_object_references_to_child(child_id, &[first, handle], &sink),
             Err(BrokerError::UnsupportedOperation)
         );
         assert!(child.references.lock().handles.is_empty());
 
         let duplicates = parent
-            .duplicate_object_references_to_child(child_id, &[first, second])
+            .duplicate_object_references_to_child(child_id, &[first, second], &sink)
             .unwrap();
         assert_eq!(child.references.lock().handles, duplicates);
         assert_eq!(
@@ -2068,7 +2188,7 @@ mod tests {
         parent.exit_child_process(child_id, EXITED).unwrap();
         assert!(child.references.lock().handles.is_empty());
         assert_eq!(
-            parent.duplicate_object_references_to_child(child_id, &[first]),
+            parent.duplicate_object_references_to_child(child_id, &[first], &sink),
             Err(BrokerError::UnknownObject)
         );
 
@@ -2076,7 +2196,7 @@ mod tests {
         let CreatedProcess { identity, .. } =
             parent.allocate_child_process(readiness_sink()).unwrap();
         parent
-            .duplicate_object_references_to_child(identity.process_id, &[first])
+            .duplicate_object_references_to_child(identity.process_id, &[first], &sink)
             .unwrap();
         let failed = parent.take_child_process(identity.process_id).unwrap();
         assert_eq!(

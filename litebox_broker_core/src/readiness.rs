@@ -3,7 +3,8 @@
 
 //! Provider-driven broker object readiness.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -33,6 +34,11 @@ pub struct ReadinessRegistration {
 }
 
 impl ReadinessRegistration {
+    /// Creates a registration that retires `handle` once its last clone drops.
+    pub(crate) fn new(handle: ObjectHandle, sink: Arc<dyn ReadinessSink>) -> Self {
+        Self::with_retirement_guard(handle, sink, None)
+    }
+
     pub(crate) fn new_with_retirement_guard<Guard>(
         handle: ObjectHandle,
         sink: Arc<dyn ReadinessSink>,
@@ -43,6 +49,14 @@ impl ReadinessRegistration {
     {
         // The guard keeps capacity charged until a deferred sink retirement
         // has actually been delivered.
+        Self::with_retirement_guard(handle, sink, Some(retirement_guard))
+    }
+
+    fn with_retirement_guard(
+        handle: ObjectHandle,
+        sink: Arc<dyn ReadinessSink>,
+        retirement_guard: Option<Arc<dyn Send + Sync>>,
+    ) -> Self {
         Self {
             inner: Arc::new(ReadinessRegistrationInner {
                 handle,
@@ -51,7 +65,7 @@ impl ReadinessRegistration {
                     retired: false,
                     active_publishers: 0,
                     retirement_sent: false,
-                    retirement_guard: Some(retirement_guard),
+                    retirement_guard,
                 }),
             }),
         }
@@ -94,6 +108,42 @@ impl ReadinessRegistration {
 
     pub(crate) fn retire(&self) {
         self.inner.retire();
+    }
+}
+
+/// The registrations of every reference to one shared object, so a change
+/// made through any reference wakes waiters in every process holding one.
+///
+/// Each registration belongs to its reference and retires when that reference
+/// drops, so watchers hold it weakly.
+#[derive(Default)]
+pub(crate) struct ReadinessWatchers(Vec<Weak<ReadinessRegistrationInner>>);
+
+impl ReadinessWatchers {
+    /// Adds `registration`, which receives publications until every clone of
+    /// it drops.
+    pub(crate) fn watch(&mut self, registration: &ReadinessRegistration) -> Result<()> {
+        self.0.retain(|watcher| watcher.strong_count() != 0);
+        self.0
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        self.0.push(Arc::downgrade(&registration.inner));
+        Ok(())
+    }
+
+    /// Wakes every watcher to re-check the object, whose readiness is now
+    /// `readiness`.
+    ///
+    /// This republishes even when the flags match an earlier publication,
+    /// since a waiter may need more than the flags report, such as space for
+    /// an atomic write. Failures are ignored because connection setup sizes
+    /// every sink for all of its association's references.
+    pub(crate) fn publish(&self, readiness: ReadinessFlags) {
+        for watcher in &self.0 {
+            if let Some(inner) = watcher.upgrade() {
+                let _ = ReadinessRegistration { inner }.republish(readiness);
+            }
+        }
     }
 }
 
@@ -168,6 +218,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct TestReadinessSink {
         pub(crate) published: Mutex<std::vec::Vec<(ObjectHandle, ReadinessFlags)>>,
+        pub(crate) republished: Mutex<std::vec::Vec<(ObjectHandle, ReadinessFlags)>>,
         pub(crate) retired: Mutex<std::vec::Vec<ObjectHandle>>,
     }
 
@@ -182,7 +233,8 @@ pub(crate) mod tests {
         }
 
         fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-            self.publish(handle, readiness)
+            self.republished.lock().unwrap().push((handle, readiness));
+            Ok(())
         }
 
         fn retire(&self, handle: ObjectHandle) {

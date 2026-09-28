@@ -12,6 +12,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
 use crate::object::{ObjectEntry, ObjectRights};
+use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Maximum capacity accepted by the control-path pipe prototype.
@@ -45,6 +46,8 @@ pub fn create(
         atomic_write_size,
         read_open: true,
         write_open: true,
+        readers: ReadinessWatchers::default(),
+        writers: ReadinessWatchers::default(),
         _capacity_reservation: capacity_reservation,
     }));
     process.create_object_reference_pair(
@@ -102,6 +105,16 @@ impl PipeObject {
         }
     }
 
+    /// Publishes this endpoint's readiness changes through `registration`
+    /// until every clone of `registration` drops.
+    pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        let mut state = self.state.write();
+        match self.endpoint {
+            PipeEndpoint::Read => state.readers.watch(registration),
+            PipeEndpoint::Write => state.writers.watch(registration),
+        }
+    }
+
     fn read(&self, length: usize) -> Result<Vec<u8>> {
         if !matches!(self.endpoint, PipeEndpoint::Read) {
             return Err(BrokerError::InvalidRights);
@@ -124,6 +137,7 @@ impl PipeObject {
         data.try_reserve_exact(read_len)
             .map_err(|_| BrokerError::OutOfMemory)?;
         data.extend(state.data.drain(..read_len));
+        state.publish(PipeEndpoint::Write);
         Ok(data)
     }
 
@@ -146,33 +160,12 @@ impl PipeObject {
 
         let write_len = available.min(data.len());
         state.data.extend(&data[..write_len]);
+        state.publish(PipeEndpoint::Read);
         Ok(write_len)
     }
 
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        let state = self.state.read();
-        match self.endpoint {
-            PipeEndpoint::Read => {
-                let mut readiness = ReadinessFlags::default();
-                if !state.data.is_empty() {
-                    readiness = readiness | ReadinessFlags::READ;
-                }
-                if !state.write_open {
-                    readiness = readiness | ReadinessFlags::HANGUP;
-                }
-                readiness
-            }
-            PipeEndpoint::Write => {
-                let mut readiness = ReadinessFlags::default();
-                if state.data.len() < state.capacity {
-                    readiness = readiness | ReadinessFlags::WRITE;
-                }
-                if !state.read_open {
-                    readiness = readiness | ReadinessFlags::ERROR;
-                }
-                readiness
-            }
-        }
+        self.state.read().readiness(self.endpoint)
     }
 }
 
@@ -183,12 +176,23 @@ impl Drop for PipeObject {
             PipeEndpoint::Read => state.read_open = false,
             PipeEndpoint::Write => state.write_open = false,
         }
+        state.publish(self.endpoint.peer());
     }
 }
 
+#[derive(Clone, Copy)]
 enum PipeEndpoint {
     Read,
     Write,
+}
+
+impl PipeEndpoint {
+    const fn peer(self) -> Self {
+        match self {
+            Self::Read => Self::Write,
+            Self::Write => Self::Read,
+        }
+    }
 }
 
 struct PipeCapacityReservation {
@@ -253,5 +257,48 @@ struct PipeState {
     atomic_write_size: usize,
     read_open: bool,
     write_open: bool,
+    /// Registrations of the read endpoint's references in every process.
+    readers: ReadinessWatchers,
+    /// Registrations of the write endpoint's references in every process.
+    writers: ReadinessWatchers,
     _capacity_reservation: PipeCapacityReservation,
+}
+
+impl PipeState {
+    /// Wakes the watchers of `endpoint` after a change that may make it ready.
+    ///
+    /// Callers hold the state lock, so publications follow the changes in
+    /// order.
+    fn publish(&self, endpoint: PipeEndpoint) {
+        let watchers = match endpoint {
+            PipeEndpoint::Read => &self.readers,
+            PipeEndpoint::Write => &self.writers,
+        };
+        watchers.publish(self.readiness(endpoint));
+    }
+
+    fn readiness(&self, endpoint: PipeEndpoint) -> ReadinessFlags {
+        match endpoint {
+            PipeEndpoint::Read => {
+                let mut readiness = ReadinessFlags::default();
+                if !self.data.is_empty() {
+                    readiness = readiness | ReadinessFlags::READ;
+                }
+                if !self.write_open {
+                    readiness = readiness | ReadinessFlags::HANGUP;
+                }
+                readiness
+            }
+            PipeEndpoint::Write => {
+                let mut readiness = ReadinessFlags::default();
+                if self.data.len() < self.capacity {
+                    readiness = readiness | ReadinessFlags::WRITE;
+                }
+                if !self.read_open {
+                    readiness = readiness | ReadinessFlags::ERROR;
+                }
+                readiness
+            }
+        }
+    }
 }

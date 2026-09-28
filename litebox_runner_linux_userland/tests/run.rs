@@ -75,6 +75,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_fd_parent.c",
     "vfork_fd_ops_parent.c",
     "vfork_exec_parent.c",
+    "vfork_pipe_parent.c",
     "vfork_exit_parent.c",
     "vfork_reap_parent.c",
     "vfork_signal_parent.c",
@@ -354,6 +355,66 @@ fn vfork_children_change_their_own_descriptors() {
     assert_eq!(numeric_field(vfork_line, "first="), 1);
     assert!(vfork_line.contains(" byte=x "));
     assert_eq!(numeric_field(vfork_line, "second="), 0);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_exec_children_share_pipes_with_their_parent() {
+    let parent = common::compile(
+        "./tests/vfork_pipe_parent.c",
+        "vfork_pipe_parent",
+        true,
+        false,
+    );
+    let child = common::compile(
+        "./tests/vfork_exec_child.c",
+        "vfork_pipe_child",
+        true,
+        false,
+    );
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "vfork_pipe_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+
+    // The parent reads the child's stdout from a pipe until the child's exit closes it.
+    let stdout_line = line("stdout-pipe ");
+    assert_eq!(numeric_field(stdout_line, "code="), 42);
+    assert_eq!(numeric_field(stdout_line, "eof="), 1);
+    assert_eq!(line("child-stdout "), "child-stdout wronly=1");
+    assert_eq!(line("child-open-fds"), "child-open-fds 0 1 2");
+
+    // Each process waits for the other to drain or fill the pipe, and the child's nonblocking
+    // read end sees end-of-file once the parent closes its write end.
+    let cat_line = line("child-cat ");
+    assert_eq!(numeric_field(cat_line, "bytes="), 256 * 1024);
+    assert_eq!(numeric_field(cat_line, "ok="), 1);
+    assert_eq!(numeric_field(cat_line, "rdonly="), 1);
+    assert_eq!(numeric_field(cat_line, "nonblock="), 1);
+    let stdin_line = line("stdin-pipe ");
+    assert_eq!(numeric_field(stdin_line, "code="), 42);
+    assert_eq!(numeric_field(stdin_line, "written="), 256 * 1024);
+
+    // The child's exit wakes the parent blocked writing a full pipe.
+    assert_eq!(line("child-read-byte "), "child-read-byte n=1 byte=a");
+    let early_line = line("early-reader ");
+    assert_eq!(numeric_field(early_line, "code="), 42);
+    assert_eq!(numeric_field(early_line, "partial="), 1);
+    assert_eq!(numeric_field(early_line, "second="), -1);
+    assert_eq!(numeric_field(early_line, "epipe="), 1);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

@@ -263,13 +263,14 @@ where
         None => None,
     };
     let limits = core.limits();
-    // Sockets and child process handles register readiness. Add future
-    // resource limits here so every live registration fits in the
-    // association's shared readiness sink.
+    // Sockets, child process handles, and shared object references register
+    // readiness. Add future resource limits here so every live registration
+    // fits in the association's shared readiness sink.
     let max_live_readiness_registrations = limits
         .max_sockets
         .min(limits.max_sockets_per_process)
-        .saturating_add(limits.max_processes);
+        .saturating_add(limits.max_processes)
+        .saturating_add(limits.max_references.min(limits.max_references_per_process));
     if max_live_readiness_registrations > readiness_sink.max_tracked_objects() {
         return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
     }
@@ -337,6 +338,18 @@ where
                 Err(error) => return Err(BrokerHostError::from(error)),
             },
         };
+        // A parent may have duplicated references into this process before it
+        // connected.
+        if let Err(error) = process.register_readiness(&readiness_sink) {
+            if finish_on_setup_error {
+                process.retire(true);
+            }
+            let error = ErrorCode::from(error);
+            setup_channel
+                .send_handshake_response(&BrokerHandshakeResponse::Error(error))
+                .map_err(BrokerHostError::Channel)?;
+            return Ok(Err(ConnectionTermination::Rejected(error)));
+        }
         let response = BrokerHandshakeResponse::Negotiated {
             broker_protocol_version: BROKER_PROTOCOL_VERSION,
             process_id: process.id(),
@@ -521,7 +534,7 @@ fn handle_request<Memory: SharedMemory>(
             .map(|()| BrokerResult::ChildReapingSet)
             .map_err(RequestFailure::from),
         BrokerOperation::DuplicateObjectsToChild(request) => {
-            duplicate_objects_to_child(process, request, shared_buffers)
+            duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
                 .map(|()| BrokerResult::ObjectsDuplicated)
         }
         BrokerOperation::Event(request) => {
@@ -561,6 +574,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
     process: &BrokerProcess,
     request: DuplicateObjectsToChildRequest,
     shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<()> {
     const HANDLE_SIZE: usize = size_of::<u64>();
     const _: () = assert!(
@@ -586,7 +600,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
             .map(|bytes| ObjectHandle(u64::from_le_bytes(*bytes))),
     );
     let duplicates = process
-        .duplicate_object_references_to_child(child_process_id, &handles)
+        .duplicate_object_references_to_child(child_process_id, &handles, readiness_sink)
         .map_err(RequestFailure::from)?;
     for (bytes, duplicate) in data
         .as_chunks_mut::<HANDLE_SIZE>()
