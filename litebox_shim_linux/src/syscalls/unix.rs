@@ -1394,9 +1394,12 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
 
     pub(super) fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         match &self.inner {
-            UnixSocketInner::Stream(stream) => stream
-                .connect(task, addr, self.get_status().contains(OFlags::NONBLOCK))
-                .map_err(|error| socket_intr_errno(self.options.lock().send_timeout, error)),
+            UnixSocketInner::Stream(stream) => {
+                let send_timeout = self.options.lock().send_timeout;
+                stream
+                    .connect(task, addr, self.get_status().contains(OFlags::NONBLOCK))
+                    .map_err(|error| socket_intr_errno(send_timeout, error))
+            }
             UnixSocketInner::Datagram(datagram) => datagram.connect(task, addr),
         }
     }
@@ -1409,6 +1412,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     ) -> Result<UnixSocket<Platform>, Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
+                let recv_timeout = self.recv_timeout();
                 let accepted = stream
                     .accept(
                         cx,
@@ -1416,7 +1420,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
                         self.get_status().contains(OFlags::NONBLOCK)
                             | flags.contains(SockFlags::NONBLOCK),
                     )
-                    .map_err(|error| socket_intr_errno(self.recv_timeout(), error))?;
+                    .map_err(|error| socket_intr_errno(recv_timeout, error))?;
                 Ok(UnixSocket::new_with_inner(accepted, flags))
             }
             UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),
