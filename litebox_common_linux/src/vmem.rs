@@ -1096,10 +1096,10 @@ mod tests {
         const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
-        #[cfg(target_os = "macos")]
-        const TASK_ADDR_MIN: usize = 0x1_0000_0000;
-        #[cfg(target_os = "macos")]
-        const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        const TASK_ADDR_MIN: usize = 0x1_0000; // Vmem unit-test bound
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000; // MACH_VM_MAX_ADDRESS
 
         fn allocate_pages(
             &self,
