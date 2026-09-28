@@ -163,11 +163,6 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         self.max_fd.store(max_fd, Ordering::Relaxed);
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn has_only_standard_descriptor_numbers(&self) -> bool {
-        self.raw_descriptor_store.read().iter_alive().eq([0, 1, 2])
-    }
-
     // Returns Ok(raw_fd) if it fits within the max limits already set up; otherwise returns the
     // Err(typed_fd)
     pub(crate) fn insert_raw_fd<Subsystem: FdEnabledSubsystem>(
@@ -222,6 +217,56 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         let success = rds.fd_into_specific_raw_integer(typed_fd, raw_fd);
         assert!(success);
         Ok(raw_fd)
+    }
+
+    /// Installs the descriptors a program inherited across `execve`.
+    pub(crate) fn install_inherited_fds(
+        &self,
+        global: &GlobalState<Platform>,
+        inherited_fds: &[litebox_common_linux::program_startup::InheritedFd],
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        let litebox = &global.litebox;
+        let max_fd = self.max_fd.load(Ordering::Relaxed);
+        // The first descriptor of each inherited open file description.
+        let mut descriptions = alloc::collections::BTreeMap::new();
+        let mut next_fd = 0;
+        for inherited in inherited_fds {
+            let raw_fd = inherited.fd as usize;
+            if raw_fd < next_fd || raw_fd - next_fd > MAX_INHERITED_FD_GAP || raw_fd >= max_fd {
+                return Err(crate::loader::elf::ElfLoaderError::InvalidInheritedFds);
+            }
+            let fd = if let Some(&first_fd) = descriptions.get(&inherited.handle) {
+                let first = self
+                    .raw_descriptor_store
+                    .read()
+                    .fd_from_raw_integer::<litebox::fs::BrokerFile>(first_fd)
+                    .expect("an installed inherited descriptor stays open");
+                litebox
+                    .descriptor_table_mut()
+                    .duplicate(&first)
+                    .expect("an installed inherited descriptor stays open")
+            } else {
+                let fd = litebox
+                    .adopt_inherited_file(inherited.handle)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
+                let mut descriptors = litebox.descriptor_table_mut();
+                if let Some(stream) = inherited.stdio_stream {
+                    descriptors.set_entry_metadata(&fd, stream);
+                }
+                if let Some(flags) = inherited.stdio_status_flags {
+                    descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
+                }
+                descriptions.insert(inherited.handle, raw_fd);
+                fd
+            };
+            let success = self
+                .raw_descriptor_store
+                .write()
+                .fd_into_specific_raw_integer(fd, raw_fd);
+            assert!(success);
+            next_fd = raw_fd + 1;
+        }
+        Ok(())
     }
 }
 
@@ -366,7 +411,65 @@ impl FsPath {
     }
 }
 
+/// How far past the lowest descriptor number above those already installed a fresh runner can
+/// install an inherited descriptor, since it installs them in ascending order into an empty table.
+const MAX_INHERITED_FD_GAP: usize = 255;
+
 impl<Platform: ShimPlatform> Task<Platform> {
+    /// Returns the descriptors a fresh runner inherits across `execve`, which are those not marked
+    /// close-on-exec, in ascending order.
+    ///
+    /// Linux keeps every such descriptor, whatever it refers to. A fresh runner can share only
+    /// objects the broker holds, and not all of those yet, so this fails with `EAGAIN` if one of
+    /// them is:
+    ///
+    /// - a pipe: the broker does not yet publish pipe readiness across processes, so a blocking
+    ///   pipe wait in the child could hang;
+    /// - a network socket: the broker does not duplicate socket objects;
+    /// - an eventfd, epoll, or Unix socket descriptor: the object is local to this runner;
+    /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
+    ///   runner; or
+    /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
+    ///   install.
+    ///
+    /// Transferred descriptors also differ from Linux in two ways: the parent does not observe the
+    /// child's reads of an inherited directory, and stdio status flags, which this runner tracks
+    /// locally, are copied rather than shared, so an `F_SETFL` in one process is not seen by the
+    /// other.
+    pub(crate) fn fds_inherited_across_exec(
+        &self,
+    ) -> Result<alloc::vec::Vec<(u32, alloc::sync::Arc<FileFd>)>, Errno> {
+        let files = self.files.borrow();
+        let alive_fds: alloc::vec::Vec<usize> =
+            files.raw_descriptor_store.read().iter_alive().collect();
+        let mut inherited = alloc::vec::Vec::new();
+        let mut next_fd = 0;
+        for raw_fd in alive_fds {
+            let fd = files.typed_fd_from_raw(raw_fd)?;
+            if get_file_descriptor_flags(&fd, &self.global)
+                .contains(FileDescriptorFlags::FD_CLOEXEC)
+            {
+                continue;
+            }
+            let AnyTypedFd::Fs(file) = fd else {
+                return Err(Errno::EAGAIN);
+            };
+            if raw_fd - next_fd > MAX_INHERITED_FD_GAP
+                || self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .with_metadata(&file, |_: &Diroff| ())
+                    .is_ok()
+            {
+                return Err(Errno::EAGAIN);
+            }
+            next_fd = raw_fd + 1;
+            inherited.push((u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?, file));
+        }
+        Ok(inherited)
+    }
+
     fn get_umask(&self) -> Mode {
         self.fs.borrow().umask()
     }

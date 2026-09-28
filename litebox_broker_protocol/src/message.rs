@@ -18,8 +18,9 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    CreateThreadRequest, CreateThreadResponse, ExitChildProcessRequest, ProcessExitStatus,
-    ProcessStartupDescriptor, StartChildProcessRequest, StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, ProcessExitStatus, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -88,6 +89,8 @@ pub enum BrokerOperation {
     /// Each child applies the setting in effect when it terminates, so a change
     /// does not affect children that already terminated.
     SetChildReaping(bool),
+    /// Duplicate object references into this process's pending child.
+    DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
 }
 
 impl BrokerOperation {
@@ -126,6 +129,10 @@ impl BrokerOperation {
                 source:
                     StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer, .. })
                     | StartChildProcessSource::Duplicate(buffer),
+                ..
+            })
+            | Self::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
+                handles: buffer,
                 ..
             }) => Some(*buffer),
             Self::CreateThread(_)
@@ -283,6 +290,9 @@ pub enum BrokerResult {
     ExitStatusReported,
     /// This process's child-reaping setting was recorded.
     ChildReapingSet,
+    /// Object references were duplicated into a pending child, whose handles
+    /// replaced the request's handles in its shared buffer.
+    ObjectsDuplicated,
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }

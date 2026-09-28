@@ -40,9 +40,10 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, CreatedProcess, ExitChildProcessRequest,
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildProcessSource,
+    CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
+    ExitChildProcessRequest, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    StartChildProcessSource,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -235,6 +236,58 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerResult::ProcessExited => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-exit response: {response:?}"),
+        }
+    }
+
+    /// Duplicates this process's object references into a pending child
+    /// created by [`Self::allocate_child_process`], returning the child's
+    /// handles in the same order.
+    ///
+    /// `buffer` carries the handles, so its length must be exactly eight bytes
+    /// per handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handles` is empty or exceeds [`MAX_CHILD_OBJECT_DUPLICATES`],
+    /// if `buffer` does not match `handles`, or if the broker returns a
+    /// response for another operation.
+    pub fn duplicate_objects_to_child(
+        &self,
+        child_process_id: ProcessId,
+        buffer: SharedBufferSequence,
+        handles: &[ObjectHandle],
+    ) -> Result<Vec<ObjectHandle>, Channel::Error> {
+        assert!(
+            !handles.is_empty() && handles.len() <= MAX_CHILD_OBJECT_DUPLICATES as usize,
+            "child object duplication must carry between one and the maximum handles"
+        );
+        let mut data = Vec::new();
+        let mut duplicates = Vec::new();
+        data.try_reserve_exact(handles.len() * size_of::<u64>())
+            .and_then(|()| duplicates.try_reserve_exact(handles.len()))
+            .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
+        data.extend(handles.iter().flat_map(|handle| handle.0.to_le_bytes()));
+        self.write_shared_buffer(buffer, &data);
+        match self.request(BrokerOperation::DuplicateObjectsToChild(
+            DuplicateObjectsToChildRequest {
+                child_process_id,
+                handles: buffer,
+            },
+        ))? {
+            BrokerResult::ObjectsDuplicated => {
+                self.read_shared_buffer(buffer, &mut data);
+                let (handles, _) = data.as_chunks::<{ size_of::<u64>() }>();
+                duplicates.extend(
+                    handles
+                        .iter()
+                        .map(|bytes| ObjectHandle(u64::from_le_bytes(*bytes))),
+                );
+                Ok(duplicates)
+            }
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected object-duplication response: {response:?}")
+            }
         }
     }
 

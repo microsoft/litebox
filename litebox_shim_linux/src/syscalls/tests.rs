@@ -791,3 +791,50 @@ fn test_rwlock_readers_not_starved_after_writer_handoff() {
         join_with_timeout(reader_handle, join_timeout, "reader");
     }
 }
+
+#[test]
+fn exec_inherits_only_transferable_descriptors() {
+    let task = init_platform();
+    let inherited = || {
+        task.fds_inherited_across_exec().map(|fds| {
+            fds.into_iter()
+                .map(|(fd, _)| fd)
+                .collect::<alloc::vec::Vec<_>>()
+        })
+    };
+
+    // Close-on-exec descriptors stay behind whatever their kind, but others must be broker files.
+    let read_fd = task
+        .sys_pipe2(OFlags::CLOEXEC)
+        .unwrap()
+        .0
+        .try_into()
+        .unwrap();
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
+    task.sys_fcntl(read_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+        .unwrap();
+    assert_eq!(inherited(), Err(Errno::EAGAIN));
+    task.sys_close(read_fd).unwrap();
+
+    // A fresh runner installs descriptors at most a bounded distance apart.
+    assert_eq!(task.sys_dup(1, Some(258), None), Ok(258));
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 258]));
+    task.sys_close(258).unwrap();
+    assert_eq!(task.sys_dup(1, Some(259), None), Ok(259));
+    assert_eq!(inherited(), Err(Errno::EAGAIN));
+    task.sys_close(259).unwrap();
+
+    // A directory position is local to this runner.
+    let dir_fd = task
+        .sys_open("/", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty())
+        .unwrap();
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, dir_fd]));
+    let mut buffer = alloc::vec![0u8; 4096];
+    task.sys_getdirent64(
+        dir_fd.try_into().unwrap(),
+        UserPtrMut::from_usize(buffer.as_mut_ptr() as usize),
+        buffer.len(),
+    )
+    .unwrap();
+    assert_eq!(inherited(), Err(Errno::EAGAIN));
+}

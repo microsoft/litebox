@@ -20,12 +20,15 @@ use litebox::event::{Events, IOPollable as _};
 use litebox::mm::vmem::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
+use litebox::stdio::StdioStream;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
-    errno::Errno, program_startup::LinuxProgramStartup,
+    errno::Errno,
+    program_startup::{InheritedFd, LinuxProgramStartup},
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
@@ -834,26 +837,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Begins a constrained `vfork` child in the current runner.
     ///
-    /// Only single-threaded processes with default filesystem, resource-limit, alarm, and
-    /// transferable descriptor state are admitted. The child gets a copy of the parent's signal
-    /// dispositions, blocked mask, and alternate stack, but none of its pending signals; the
+    /// Only single-threaded processes with default filesystem, resource-limit, and alarm state are
+    /// admitted, and only if every descriptor not marked close-on-exec can transfer to the fresh
+    /// runner; see [`Self::fds_inherited_across_exec`]. The child gets a copy of the parent's
+    /// signal dispositions, blocked mask, and alternate stack, but none of its pending signals; the
     /// parent's signal state is restored when it resumes. The parent remains
     /// suspended until the child exits, is killed by a signal, or successfully transfers to a
     /// fresh runner through `execve`; an `execve` that fails before the transfer returns its error
-    /// to the child. The child must not change standard descriptor mappings or flags, or
-    /// platform-managed architectural state outside [`litebox_common_linux::PtRegs`], because the
-    /// current transfer does not preserve that state.
+    /// to the child. The child must not change platform-managed architectural state outside
+    /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that
+    /// state.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
             || self.thread.process.nr_threads() != 1
-            || !self.files.borrow().has_only_standard_descriptor_numbers()
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
             || !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
         {
             return Err(Errno::EAGAIN);
         }
+        // The child cannot change its descriptors before `execve`, so they transfer then.
+        self.fds_inherited_across_exec()?;
         self.thread.process.release_reaped_children();
         let child = self
             .global
@@ -1871,6 +1876,75 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Err(Errno::ELOOP)
     }
 
+    /// Starts the `vfork` child's new program in a fresh runner and resumes the parent.
+    ///
+    /// The runner inherits the descriptors not marked close-on-exec. Failures before the transfer
+    /// return to the child, which may retry or exit.
+    fn transfer_vfork_child(
+        &self,
+        path: alloc::string::String,
+        argv: alloc::vec::Vec<alloc::ffi::CString>,
+        envp: alloc::vec::Vec<alloc::ffi::CString>,
+        ctx: &mut litebox_common_linux::PtRegs,
+    ) -> Result<usize, Errno> {
+        // The fresh runner needs an absolute path; resolve it against this task's cwd.
+        let path = self
+            .resolve_path(path.as_str())?
+            .into_string()
+            .map_err(|_| Errno::EINVAL)?;
+        let inherited = self.fds_inherited_across_exec()?;
+        let mut startup = LinuxProgramStartup {
+            parent_process_id: self.pid,
+            uid: self.credentials.uid,
+            euid: self.credentials.euid,
+            gid: self.credentials.gid,
+            egid: self.credentials.egid,
+            blocked_signals: self.signals.blocked(),
+            ignored_signals: self.signals.ignored(),
+            path,
+            argv,
+            envp,
+            inherited_fds: {
+                let descriptors = self.global.litebox.descriptor_table();
+                inherited
+                    .iter()
+                    .map(|(fd, file)| InheritedFd {
+                        fd: *fd,
+                        // Replaced by the child's handle once the startup fits.
+                        handle: ObjectHandle::default(),
+                        stdio_stream: descriptors
+                            .with_metadata(&**file, |stream: &StdioStream| *stream)
+                            .ok(),
+                        stdio_status_flags: descriptors
+                            .with_metadata(&**file, |crate::StdioStatusFlags(flags)| *flags)
+                            .ok(),
+                    })
+                    .collect()
+            },
+        };
+        // The child keeps the references it inherits until it exits, so check the size first.
+        startup.encode().map_err(|_| Errno::E2BIG)?;
+        let vfork = self.vfork.borrow();
+        let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
+        let files: alloc::vec::Vec<_> = inherited.iter().map(|(_, file)| &**file).collect();
+        let handles = child
+            .inherit_files(&self.global.litebox, &files)
+            .map_err(Errno::from)?;
+        for (inherited, handle) in startup.inherited_fds.iter_mut().zip(handles) {
+            inherited.handle = handle;
+        }
+        let payload = startup
+            .encode()
+            .expect("the startup fit with placeholder handles");
+        let started = child.start(&payload);
+        drop(vfork);
+        if started.is_err() {
+            // The broker no longer holds a pending child that could retry or exit.
+            return Ok(self.abort_vfork_window());
+        }
+        Ok(self.resume_vfork_parent(ctx))
+    }
+
     /// Handle syscall `execve`.
     pub(crate) fn sys_execve(
         &self,
@@ -1933,36 +2007,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let loader = crate::loader::elf::ElfLoader::new(self, &path)?;
         if is_vfork_child {
             drop(loader);
-            // The fresh runner needs an absolute path; resolve it against this task's cwd.
-            let path = self
-                .resolve_path(path.as_str())?
-                .into_string()
-                .map_err(|_| Errno::EINVAL)?;
-            let startup = LinuxProgramStartup {
-                parent_process_id: self.pid,
-                uid: self.credentials.uid,
-                euid: self.credentials.euid,
-                gid: self.credentials.gid,
-                egid: self.credentials.egid,
-                blocked_signals: self.signals.blocked(),
-                ignored_signals: self.signals.ignored(),
-                path,
-                argv: argv_vec,
-                envp: envp_vec,
-            };
-            let payload = startup.encode().map_err(|_| Errno::E2BIG)?;
-            let started = self
-                .vfork
-                .borrow()
-                .as_ref()
-                .expect("vfork transfer lost its child")
-                .child
-                .start(&payload);
-            if started.is_err() {
-                // The broker no longer holds a pending child that could retry or exit.
-                return Ok(self.abort_vfork_window());
-            }
-            return Ok(self.resume_vfork_parent(ctx));
+            return self.transfer_vfork_child(path, argv_vec, envp_vec, ctx);
         }
 
         // After this point, the old program is torn down and failures must terminate the process.

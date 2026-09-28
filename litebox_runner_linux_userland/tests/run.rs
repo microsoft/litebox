@@ -72,6 +72,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "svc_scratch_regs.c",
     "vfork_fault_parent.c",
     "vfork_exec_child.c",
+    "vfork_fd_parent.c",
     "vfork_exec_parent.c",
     "vfork_exit_parent.c",
     "vfork_reap_parent.c",
@@ -247,6 +248,49 @@ fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
     assert_eq!(numeric_field(child_line, "tid="), reported_child);
     assert!(child_line.contains("marker=from-vfork"));
     assert!(child_line.contains("env=1"));
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_exec_child_inherits_descriptors_not_marked_close_on_exec() {
+    let parent = common::compile("./tests/vfork_fd_parent.c", "vfork_fd_parent", true, false);
+    let child = common::compile("./tests/vfork_exec_child.c", "vfork_fd_child", true, false);
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "vfork_fd_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let mut lines = output
+        .lines()
+        .skip_while(|line| !line.starts_with("parent "));
+    let parent_line = lines
+        .next()
+        .unwrap_or_else(|| panic!("missing parent output in {output:?}"));
+    assert_eq!(
+        numeric_field(parent_line, "waited="),
+        numeric_field(parent_line, "child=")
+    );
+    assert_eq!(numeric_field(parent_line, "exited="), 1);
+    assert_eq!(numeric_field(parent_line, "code="), 42);
+    // The parent's stdout and `log` share the offset the child advanced through both.
+    let log: Vec<_> = lines.collect();
+    assert_eq!(
+        log,
+        [
+            "child-fds via-stdout",
+            "child-fds via-log",
+            "child-fds stdin_setfl=1 hidden_closed=1",
+        ]
+    );
+    let length = numeric_field(parent_line, "length=");
+    assert_eq!(numeric_field(parent_line, "offset="), length);
+    assert_eq!(usize::try_from(length).unwrap(), log.join("\n").len() + 1);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

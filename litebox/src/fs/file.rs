@@ -24,7 +24,7 @@ use super::errors::{
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
-    fn broker_file(&self, fd: &FileFd) -> Option<Arc<BrokerFile>> {
+    pub(crate) fn broker_file(&self, fd: &FileFd) -> Option<Arc<BrokerFile>> {
         self.descriptor_table()
             .with_entry(fd, |entry| Arc::clone(&entry.entry))
     }
@@ -355,6 +355,21 @@ impl core::fmt::Display for ResolvedPath {
 pub struct BrokerFile {
     broker: Arc<dyn crate::broker::BrokerControl>,
     handle: ObjectHandle,
+}
+
+impl BrokerFile {
+    /// Takes ownership of an existing broker file reference.
+    pub(crate) fn from_handle(
+        broker: Arc<dyn crate::broker::BrokerControl>,
+        handle: ObjectHandle,
+    ) -> Self {
+        Self { broker, handle }
+    }
+
+    /// Returns the broker file reference, which identifies its open file description.
+    pub(crate) fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
 }
 
 impl Drop for BrokerFile {

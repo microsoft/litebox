@@ -1411,6 +1411,8 @@ pub struct TaskParams {
     pub blocked_signals: SigSet,
     /// The signals initially ignored; all other dispositions start as default.
     pub ignored_signals: SigSet,
+    /// Descriptors inherited from the parent, or `None` to start with the standard streams.
+    pub inherited_fds: Option<alloc::vec::Vec<program_startup::InheritedFd>>,
 }
 
 #[repr(C)]
