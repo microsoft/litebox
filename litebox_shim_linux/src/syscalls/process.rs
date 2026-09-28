@@ -1440,7 +1440,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .ok_or(Errno::EFAULT)
     }
 
-    fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
+    pub(super) fn real_time_as_duration_since_epoch(&self) -> core::time::Duration {
         let now = self.global.platform.current_time();
         let unix_epoch = <Platform as TimeProvider>::SystemTime::UNIX_EPOCH;
         now.duration_since(&unix_epoch)

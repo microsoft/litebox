@@ -316,6 +316,7 @@ pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
     Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
     Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
     Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
+    Timerfd(alloc::sync::Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
     Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
     Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform>>>),
 }
@@ -330,6 +331,7 @@ macro_rules! on_any_fd {
             AnyTypedFd::Network($fd) => $body,
             AnyTypedFd::Pipes($fd) => $body,
             AnyTypedFd::Eventfd($fd) => $body,
+            AnyTypedFd::Timerfd($fd) => $body,
             AnyTypedFd::Epoll($fd) => $body,
             AnyTypedFd::Unix($fd) => $body,
         }
@@ -344,6 +346,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
             Self::Network(_) => "net",
             Self::Pipes(_) => "pipes",
             Self::Eventfd(_) => "eventfd",
+            Self::Timerfd(_) => "timerfd",
             Self::Epoll(_) => "epoll",
             Self::Unix(_) => "unix",
         }
@@ -363,12 +366,14 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     }
 
     /// Run the handler matching this fd's subsystem.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch<R>(
         &self,
         fs: impl FnOnce(&FileFd) -> R,
         net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<litebox::pipes::Pipes<Platform>>) -> R,
         eventfd: impl FnOnce(&TypedFd<super::eventfd::EventfdSubsystem<Platform>>) -> R,
+        timerfd: impl FnOnce(&TypedFd<super::timerfd::TimerfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<super::epoll::EpollSubsystem<Platform>>) -> R,
         unix: impl FnOnce(&TypedFd<super::unix::UnixSocketSubsystem<Platform>>) -> R,
     ) -> R {
@@ -377,6 +382,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
             Self::Network(fd) => net(fd),
             Self::Pipes(fd) => pipes(fd),
             Self::Eventfd(fd) => eventfd(fd),
+            Self::Timerfd(fd) => timerfd(fd),
             Self::Epoll(fd) => epoll(fd),
             Self::Unix(fd) => unix(fd),
         }
@@ -508,6 +514,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// - a network socket: the broker does not duplicate socket objects;
     /// - an eventfd, epoll, or Unix socket descriptor: the object is local to this runner;
+    /// - a timerfd: the broker does not duplicate timer objects;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
     ///   runner; or
     /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
@@ -742,6 +749,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |_fd| Err(Errno::EINVAL),
             |_fd| Err(Errno::EINVAL),
             |_fd| Err(Errno::EINVAL),
+            |_fd| Err(Errno::EINVAL),
         )
     }
 
@@ -870,6 +878,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     Ok(size_of::<u64>())
                 })
             },
+            |fd| {
+                espipe_for_non_seekable_offset(offset)?;
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|file| {
+                    let buf = &mut buf.borrow_mut();
+                    if buf.len() < size_of::<u64>() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let expirations = file.read(&self.wait_cx())?;
+                    buf[..size_of::<u64>()].copy_from_slice(&expirations.to_ne_bytes());
+                    Ok(size_of::<u64>())
+                })
+            },
             |_fd| Err(Errno::EINVAL),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -956,6 +982,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     file.write(&self.wait_cx(), value)
                 })
             },
+            |_fd| Err(Errno::EINVAL),
             |_fd| Err(Errno::EINVAL),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -1214,6 +1241,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     AnyTypedFd::Eventfd(fd)
                 } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
+                {
+                    AnyTypedFd::Timerfd(fd)
+                } else if let Ok(fd) =
                     rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<Platform>>(raw_fd)
                 {
                     AnyTypedFd::Epoll(fd)
@@ -1252,6 +1283,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
             AnyTypedFd::Eventfd(fd) => {
+                self.remove_and_drop_descriptor(&fd);
+                Ok(())
+            }
+            AnyTypedFd::Timerfd(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
@@ -1856,6 +1891,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 )))
             },
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
         )
@@ -2031,6 +2067,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
+                        |fd| getfl_from_handle!(fd),
                     )?
                     .bits())
             }
@@ -2106,6 +2143,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |fd| {
+                        toggle_flags!(fd);
+                        Ok(())
+                    },
                     |_fd| todo!("epoll"),
                     |fd| {
                         toggle_flags!(fd);
@@ -2136,6 +2177,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
+                    |_fd| Err(Errno::EBADF),
                 )
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
@@ -2151,6 +2193,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
+                    |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
@@ -2402,6 +2445,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),
+                    |fd| set_nonblock_on_entry!(fd),
                 )?;
                 Ok(0)
             }
@@ -2421,6 +2465,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |fd| set_cloexec!(fd),
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
+                    |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
@@ -2906,6 +2951,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
                     let _ = self.global.close_linux_pipe(&fd);
+                })
+            },
+            |fd| {
+                dup(self, &files, fd, close_on_exec, target, |fd| {
+                    self.remove_and_drop_descriptor(&fd);
                 })
             },
             |fd| {

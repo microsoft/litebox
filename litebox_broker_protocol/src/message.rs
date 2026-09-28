@@ -37,6 +37,10 @@ use crate::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
     WriteStdioRequest, WriteStdioResponse,
 };
+use crate::timer::{
+    CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest, ReadTimerResponse,
+    SetTimerRequest, SetTimerResponse,
+};
 use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
 
 /// Broker handshake request sent before the control channel is active.
@@ -91,6 +95,8 @@ pub enum BrokerOperation {
     SetChildReaping(bool),
     /// Duplicate object references into this process's pending child.
     DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
+    /// Timer object request family.
+    Timer(TimerRequest),
 }
 
 impl BrokerOperation {
@@ -144,6 +150,7 @@ impl BrokerOperation {
             | Self::GetProcessExitStatus(_)
             | Self::CheckReadiness(_)
             | Self::Event(_)
+            | Self::Timer(_)
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
                 SocketRequest::Create(_)
@@ -212,6 +219,19 @@ pub enum EventRequest {
     Add(AddEventRequest),
     /// Consume readiness credits from an event.
     Consume(ConsumeEventRequest),
+}
+
+/// Broker-owned timer object request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimerRequest {
+    /// Create a disarmed broker-owned timer.
+    Create,
+    /// Arm or disarm a timer.
+    Set(SetTimerRequest),
+    /// Read a timer's current schedule.
+    Get(GetTimerRequest),
+    /// Consume a timer's pending expirations.
+    Read(ReadTimerRequest),
 }
 
 /// Broker-owned pipe object request.
@@ -292,6 +312,8 @@ pub enum BrokerResult {
     /// Object references were duplicated into a pending child, whose handles
     /// replaced the request's handles in its shared buffer.
     ObjectsDuplicated,
+    /// Timer object response family.
+    Timer(TimerResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -314,6 +336,19 @@ pub enum EventResponse {
     Add(AddEventResponse),
     /// Consume operation response.
     Consume(ConsumeEventResponse),
+}
+
+/// Broker-owned timer object response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TimerResponse {
+    /// Create operation response.
+    Create(CreateTimerResponse),
+    /// Set operation response.
+    Set(SetTimerResponse),
+    /// Get operation response.
+    Get(GetTimerResponse),
+    /// Read operation response.
+    Read(ReadTimerResponse),
 }
 
 /// Broker-owned pipe object response.

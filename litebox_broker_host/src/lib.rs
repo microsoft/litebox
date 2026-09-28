@@ -38,7 +38,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-    SocketRequest, SocketResponse, StdioRequest, StdioResponse,
+    SocketRequest, SocketResponse, StdioRequest, StdioResponse, TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -63,6 +63,9 @@ use litebox_broker_protocol::socket::{
 use litebox_broker_protocol::stdio::{
     IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
     ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
+};
+use litebox_broker_protocol::timer::{
+    CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
 };
 use litebox_broker_protocol::{BROKER_PROTOCOL_VERSION, ObjectHandle, ProcessId, RequestId};
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
@@ -263,9 +266,9 @@ where
         None => None,
     };
     let limits = core.limits();
-    // Sockets, child process handles, and shared object references register
-    // readiness. Add future resource limits here so every live registration
-    // fits in the association's shared readiness sink.
+    // Sockets, child process handles, and shared object references (including
+    // timers) register readiness. Add future resource limits here so every
+    // live registration fits in the association's shared readiness sink.
     let max_live_readiness_registrations = limits
         .max_sockets
         .min(limits.max_sockets_per_process)
@@ -542,6 +545,9 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::Pipe(request) => {
             handle_pipe_request(process, request, shared_buffers).map(BrokerResult::Pipe)
+        }
+        BrokerOperation::Timer(request) => {
+            handle_timer_request(process, request, readiness_sink).map(BrokerResult::Timer)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -1299,6 +1305,28 @@ fn handle_event_request(
     }
 }
 
+fn handle_timer_request(
+    process: &BrokerProcess,
+    request: TimerRequest,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<TimerResponse> {
+    let response = match request {
+        TimerRequest::Create => {
+            litebox_broker_core::timer::create(process, Arc::clone(readiness_sink))
+                .map(|handle| TimerResponse::Create(CreateTimerResponse { handle }))
+        }
+        TimerRequest::Set(request) => {
+            litebox_broker_core::timer::set(process, request.handle, request.spec)
+                .map(|previous| TimerResponse::Set(SetTimerResponse { previous }))
+        }
+        TimerRequest::Get(request) => litebox_broker_core::timer::get(process, request.handle)
+            .map(|current| TimerResponse::Get(GetTimerResponse { current })),
+        TimerRequest::Read(request) => litebox_broker_core::timer::read(process, request.handle)
+            .map(|expirations| TimerResponse::Read(ReadTimerResponse { expirations })),
+    };
+    response.map_err(RequestFailure::from)
+}
+
 /// Terminal outcome after processing one broker connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1323,7 +1351,9 @@ mod tests {
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
-    use litebox_broker_core::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
+    use litebox_broker_core::test_support::{
+        ManualTimerProvider, TestBrokerCoreBuilder, TestStdioProvider,
+    };
     use litebox_broker_core::{ObjectRights, PolicyEngine, SocketPolicy};
     use litebox_broker_protocol::event::{
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
@@ -1349,6 +1379,9 @@ mod tests {
         TcpOptionValue,
     };
     use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
+    use litebox_broker_protocol::timer::{
+        GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
+    };
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemoryError};
     use litebox_platform::sync::{
@@ -1645,6 +1678,7 @@ mod tests {
         let fs = litebox_broker_core::fs::in_mem::InMem::<TestSync>::new(
             litebox_broker_core::fs::inode_allocator::InodeAllocator::standalone(),
         );
+        let timer_provider = Arc::new(ManualTimerProvider::default());
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network())
@@ -1653,6 +1687,7 @@ mod tests {
         .with_socket_provider(Arc::new(TestSocketProvider))
         .with_random_provider(Arc::new(TestRandomProvider))
         .with_stdio_provider(stdio_provider.clone())
+        .with_timer_provider(timer_provider.clone())
         .with_file_service(Arc::new(litebox_broker_core::fs::resolver::Resolver::<
             TestSync,
             _,
@@ -1676,6 +1711,7 @@ mod tests {
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
+        active_requests_operate_timers(&broker, &timer_provider);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
@@ -2399,6 +2435,63 @@ mod tests {
             ),
             BrokerResult::Error(ErrorCode::UnknownObject)
         );
+    }
+
+    fn active_requests_operate_timers(broker: &BrokerCore, clock: &ManualTimerProvider) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let response = handle_test_request(&process, BrokerOperation::Timer(TimerRequest::Create));
+        let BrokerResult::Timer(TimerResponse::Create(CreateTimerResponse { handle })) = response
+        else {
+            panic!("unexpected create response: {response:?}");
+        };
+        let spec = TimerSpec {
+            value_ns: 10,
+            interval_ns: 5,
+        };
+
+        assert_eq!(
+            handle_test_request(
+                &process,
+                BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest { handle, spec }))
+            ),
+            BrokerResult::Timer(TimerResponse::Set(SetTimerResponse {
+                previous: TimerSpec::default()
+            }))
+        );
+        assert_eq!(
+            handle_test_request(
+                &process,
+                BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle }))
+            ),
+            BrokerResult::Error(ErrorCode::WouldBlock)
+        );
+        clock.advance(Duration::from_nanos(12));
+        assert_eq!(
+            handle_test_request(
+                &process,
+                BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle }))
+            ),
+            BrokerResult::Timer(TimerResponse::Get(GetTimerResponse {
+                current: TimerSpec {
+                    value_ns: 3,
+                    interval_ns: 5
+                }
+            }))
+        );
+        assert_eq!(
+            handle_test_request(
+                &process,
+                BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle }))
+            ),
+            BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse { expirations: 1 }))
+        );
+        assert_eq!(
+            handle_test_request(&process, BrokerOperation::CloseObject(handle)),
+            BrokerResult::ObjectClosed
+        );
+        assert_eq!(clock.alarm_count(), 0);
     }
 
     fn active_request_allocates_and_releases_thread_id(broker: &BrokerCore) {

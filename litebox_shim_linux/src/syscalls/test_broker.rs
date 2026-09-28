@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    test_support::{TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
+    test_support::{ManualTimerProvider, TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
 };
 use litebox_broker_host::{
     BrokerHostError,
@@ -73,6 +73,12 @@ where
     (litebox, process_id)
 }
 
+/// Returns the manual clock that drives the test broker's timers.
+pub(crate) fn timer_provider() -> &'static Arc<ManualTimerProvider> {
+    static TIMERS: OnceLock<Arc<ManualTimerProvider>> = OnceLock::new();
+    TIMERS.get_or_init(Arc::default)
+}
+
 fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
     static BROKER: OnceLock<BrokerCore> = OnceLock::new();
     BROKER.get_or_init(|| {
@@ -97,6 +103,7 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
             TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
         ))
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
+        .with_timer_provider(timer_provider().clone())
         .build()
         .expect("a test process may build only one broker core")
     })

@@ -42,6 +42,7 @@ bitflags::bitflags! {
 
 pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Eventfd(Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
+    Timerfd(Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
     Epoll(Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
     File(Arc<crate::FileFd>),
     Socket(Arc<super::net::SocketFd<Platform>>),
@@ -65,6 +66,11 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
             rds.fd_from_raw_integer::<super::eventfd::EventfdSubsystem<Platform>>(raw_fd)
         {
             return Ok(EpollDescriptor::Eventfd(fd));
+        }
+        if let Ok(fd) =
+            rds.fd_from_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
+        {
+            return Ok(EpollDescriptor::Timerfd(fd));
         }
         if let Ok(fd) = rds.fd_from_raw_integer::<EpollSubsystem<Platform>>(raw_fd) {
             return Ok(EpollDescriptor::Epoll(fd));
@@ -95,6 +101,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
 /// open file description remains open, even if the descriptor it was registered with is closed.
 enum DescriptorRef<Platform: ShimPlatform> {
     Eventfd(WeakEntryHandle<Platform, super::eventfd::EventfdSubsystem<Platform>>),
+    Timerfd(WeakEntryHandle<Platform, super::timerfd::TimerfdSubsystem<Platform>>),
     Epoll(WeakEntryHandle<Platform, super::epoll::EpollSubsystem<Platform>>),
     File(WeakEntryHandle<Platform, litebox::fs::BrokerFile>),
     Socket(WeakEntryHandle<Platform, crate::Network<Platform>>),
@@ -108,6 +115,7 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
         let dt = global.litebox.descriptor_table();
         let desc = match desc {
             EpollDescriptor::Eventfd(fd) => Self::Eventfd(dt.entry_handle(fd)?.downgrade()),
+            EpollDescriptor::Timerfd(fd) => Self::Timerfd(dt.entry_handle(fd)?.downgrade()),
             EpollDescriptor::Epoll(fd) => Self::Epoll(dt.entry_handle(fd)?.downgrade()),
             EpollDescriptor::File(fd) => Self::File(dt.entry_handle(fd)?.downgrade()),
             EpollDescriptor::Socket(fd) => Self::Socket(dt.entry_handle(fd)?.downgrade()),
@@ -121,6 +129,7 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
     fn stable_key(&self) -> EntryStableKey {
         match self {
             DescriptorRef::Eventfd(weak) => weak.stable_key(),
+            DescriptorRef::Timerfd(weak) => weak.stable_key(),
             DescriptorRef::Epoll(weak) => weak.stable_key(),
             DescriptorRef::File(weak) => weak.stable_key(),
             DescriptorRef::Socket(weak) => weak.stable_key(),
@@ -151,6 +160,10 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
         // handle is dropped while the table is still held and is never observed by them.
         match self {
             DescriptorRef::Eventfd(weak) => {
+                let handle = global.litebox.descriptor_table().upgrade(weak)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            DescriptorRef::Timerfd(weak) => {
                 let handle = global.litebox.descriptor_table().upgrade(weak)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }

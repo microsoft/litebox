@@ -15,6 +15,7 @@ use crate::pipe::PipeObject;
 use crate::process::ProcessObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::socket::SocketObject;
+use crate::timer::TimerObject;
 use crate::{BrokerError, Result};
 
 bitflags::bitflags! {
@@ -46,6 +47,7 @@ pub(crate) enum ObjectEntry {
     Pipe(PipeObject),
     Socket(SocketObject),
     Process(ProcessObject),
+    Timer(TimerObject),
 }
 
 // Each object kind's module defines its own accessor in an `impl ObjectEntry`
@@ -60,7 +62,7 @@ impl ObjectEntry {
     pub(crate) fn is_duplicable(&self) -> bool {
         match self {
             Self::Event(_) | Self::File(_) | Self::Pipe(_) => true,
-            Self::Socket(_) | Self::Process(_) => false,
+            Self::Socket(_) | Self::Process(_) | Self::Timer(_) => false,
         }
     }
 
@@ -78,7 +80,11 @@ impl ObjectEntry {
                 pipe.watch(&registration)?;
                 Ok(Some(registration))
             }
-            Self::Event(_) | Self::File(_) | Self::Socket(_) | Self::Process(_) => Ok(None),
+            Self::Event(_)
+            | Self::File(_)
+            | Self::Socket(_)
+            | Self::Process(_)
+            | Self::Timer(_) => Ok(None),
         }
     }
 }
@@ -94,6 +100,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::File(_) => return Err(BrokerError::InvalidRights),
             ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
             ObjectEntry::Process(process) => return Ok(process.readiness()),
+            ObjectEntry::Timer(timer) => return Ok(timer.readiness()),
             ObjectEntry::Socket(socket) => socket.resource(),
         }
     };

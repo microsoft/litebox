@@ -32,6 +32,7 @@ use litebox_broker_protocol::socket::{
     SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
 };
 use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
+use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
 
@@ -207,6 +208,21 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
+
+    fn create_timer(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn set_timer(
+        &self,
+        handle: ObjectHandle,
+        spec: TimerSpec,
+    ) -> core::result::Result<TimerSpec, BrokerControlError>;
+
+    fn get_timer(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<TimerSpec, BrokerControlError>;
+
+    fn read_timer(&self, handle: ObjectHandle) -> core::result::Result<u64, BrokerControlError>;
 
     fn create_pipe(
         &self,
@@ -784,6 +800,29 @@ where
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError> {
         self.request(|local| local.consume_event(handle, mode))
+    }
+
+    fn create_timer(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(BrokerLocal::create_timer)
+    }
+
+    fn set_timer(
+        &self,
+        handle: ObjectHandle,
+        spec: TimerSpec,
+    ) -> core::result::Result<TimerSpec, BrokerControlError> {
+        self.request(|local| local.set_timer(handle, spec))
+    }
+
+    fn get_timer(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<TimerSpec, BrokerControlError> {
+        self.request(|local| local.get_timer(handle))
+    }
+
+    fn read_timer(&self, handle: ObjectHandle) -> core::result::Result<u64, BrokerControlError> {
+        self.request(|local| local.read_timer(handle))
     }
 
     fn create_pipe(

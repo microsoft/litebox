@@ -27,6 +27,7 @@ mod pipe;
 mod random;
 mod socket;
 mod stdio;
+mod timer;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

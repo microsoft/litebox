@@ -24,5 +24,6 @@ pub mod runtime;
 
 mod random;
 mod stdio;
+mod timer;
 
 const WORKER_COUNT: usize = 8;
