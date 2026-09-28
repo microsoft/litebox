@@ -166,7 +166,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Perform the normal mmap first (CoW or memcpy fallback).
         let result = if let Some(cow_result) =
-            self.try_cow_mmap_file(suggested_addr, len, &prot, &flags, &typed_fd, offset)
+            self.try_cow_mmap_file(suggested_addr, len, prot, flags, &typed_fd, offset)
         {
             cow_result?
         } else {
@@ -219,8 +219,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         &self,
         suggested_addr: Option<usize>,
         len: usize,
-        prot: &ProtFlags,
-        flags: &MapFlags,
+        prot: ProtFlags,
+        flags: MapFlags,
         fd: &FileFd<Platform>,
         offset: usize,
     ) -> Option<Result<UserPtrMut<u8>, MappingError>> {
