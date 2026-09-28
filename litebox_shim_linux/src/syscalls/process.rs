@@ -753,23 +753,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Ends the `vfork` window after the child exits or starts its own runner,
     /// restoring the parent's context and returning the child's PID to it.
     fn resume_vfork_parent(&self, ctx: &mut litebox_common_linux::PtRegs) -> usize {
-        let state = self
-            .vfork
-            .borrow_mut()
-            .take()
-            .expect("completed vfork window lost its parent context");
-        self.restore_vfork_parent_files(state.parent_files);
-        self.signals.restore_vfork_parent(state.parent_signals);
-        self.thread.process.add_child(state.child_pid, state.child);
-        *ctx = state.parent_context;
-        state.child_pid.cast_unsigned() as usize
-    }
-
-    /// Closes the `vfork` child's descriptors, as its exit would, and restores the parent's table.
-    fn restore_vfork_parent_files(
-        &self,
-        parent_files: Arc<crate::syscalls::file::FilesState<Platform>>,
-    ) {
+        // Close the child's descriptors, as its exit would, while the window is still open.
         let child_fds: Vec<usize> = self
             .files
             .borrow()
@@ -780,7 +764,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for raw_fd in child_fds {
             let _ = self.do_close(raw_fd);
         }
-        self.files.replace(parent_files);
+        let state = self
+            .vfork
+            .borrow_mut()
+            .take()
+            .expect("completed vfork window lost its parent context");
+        self.files.replace(state.parent_files);
+        self.signals.restore_vfork_parent(state.parent_signals);
+        self.thread.process.add_child(state.child_pid, state.child);
+        *ctx = state.parent_context;
+        state.child_pid.cast_unsigned() as usize
     }
 
     /// Terminates the shared runner when the constrained `vfork` window cannot continue.
@@ -892,20 +885,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EAGAIN);
         }
-        let child_files = self.files.borrow().copy_for_vfork(&self.global);
-        let parent_files = self.files.replace(Arc::new(child_files));
         self.thread.process.release_reaped_children();
-        let child = match self.global.litebox.allocate_child_process() {
-            Ok(child) => child,
-            Err(error) => {
-                self.restore_vfork_parent_files(parent_files);
-                return Err(Errno::from(error));
-            }
-        };
+        let child = self
+            .global
+            .litebox
+            .allocate_child_process()
+            .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
         parent_context.rax = child_pid.cast_unsigned() as usize;
+        let child_files = self.files.borrow().copy_for_vfork(&self.global);
+        let parent_files = self.files.replace(Arc::new(child_files));
         self.vfork.replace(Some(crate::VforkState {
             child,
             child_pid,

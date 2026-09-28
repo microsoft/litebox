@@ -1181,6 +1181,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.finalize_elf_patch(fd);
                 result
             }
+            // A `vfork` child cannot create sockets, so the suspended parent's table still holds
+            // each socket the child's table refers to, and only the child's descriptor goes.
+            AnyTypedFd::Network(fd) if self.vfork.borrow().is_some() => {
+                self.remove_and_drop_descriptor(&fd);
+                Ok(())
+            }
             AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),
             AnyTypedFd::Eventfd(fd) => {
