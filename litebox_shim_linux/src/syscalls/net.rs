@@ -921,7 +921,12 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 .lock()
                 .close(&fd, CloseBehavior::Immediate)
                 .map_err(Errno::from),
-            Err(e) => Err(e.into()),
+            Err(e) => {
+                // The caller has already released the descriptor, so the socket must not be left
+                // open even though lingering was cut short.
+                let _ = self.net.lock().close(&fd, CloseBehavior::Graceful);
+                Err(e.into())
+            }
         }
     }
 }

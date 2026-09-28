@@ -147,9 +147,10 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
             }
             iop.check_io_events() & (mask | Events::ALWAYS_POLLED)
         };
-        // As before, only eventfd and unix sockets are polled through an entry handle that outlives
-        // the descriptor table lock. The others drop their handle while the table is still held,
-        // so their close paths never observe a reference held by polling.
+        // Like in-flight operations, polling releases the table lock before using (and dropping)
+        // its entry handle, so it never finalizes an entry under the lock. Sockets are the
+        // exception: `Network`'s close paths count references to socket entries, so a socket's
+        // handle is dropped while the table is still held and is never observed by them.
         match self {
             DescriptorRef::Eventfd(weak) => {
                 let handle = global.litebox.descriptor_table().upgrade(weak)?;
@@ -158,12 +159,10 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
             DescriptorRef::Epoll(_weak) => unimplemented!(),
             DescriptorRef::File(weak) => {
                 // TODO: File polling returns dummy events for now, but distinguish stdio enough for REPLs.
-                let dt = global.litebox.descriptor_table();
-                let stream = dt
-                    .upgrade(weak)?
-                    .with_entry_metadata(|stream: &litebox::platform::StdioStream| *stream);
-                drop(dt);
-                let events = match stream {
+                let handle = global.litebox.descriptor_table().upgrade(weak)?;
+                let events = match handle
+                    .with_entry_metadata(|stream: &litebox::platform::StdioStream| *stream)
+                {
                     Some(litebox::platform::StdioStream::Stdin) => Events::IN,
                     Some(
                         litebox::platform::StdioStream::Stdout
@@ -183,12 +182,8 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
                 Some(poll(&proxy))
             }
             DescriptorRef::Pipe(weak) => {
-                let dt = global.litebox.descriptor_table();
-                let events = dt
-                    .upgrade(weak)?
-                    .with_entry(|entry| entry.with_iopollable(poll));
-                drop(dt);
-                Some(events)
+                let handle = global.litebox.descriptor_table().upgrade(weak)?;
+                Some(handle.with_entry(|entry| entry.with_iopollable(poll)))
             }
             DescriptorRef::Unix(weak) => {
                 let handle = global.litebox.descriptor_table().upgrade(weak)?;
@@ -251,9 +246,10 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
                 Err(Errno::EINVAL)
             }
             EpollOp::EpollCtlDel => {
-                let key = EpollEntryKey::new(global, fd, file).ok_or(Errno::EBADF)?;
-                let mut interests = self.interests.lock();
-                let _ = interests.remove(&key).ok_or(Errno::ENOENT)?;
+                // Holding `desc` until the removal keeps its key from being reused meanwhile.
+                let desc = DescriptorRef::new(global, file).ok_or(Errno::EBADF)?;
+                let key = EpollEntryKey(fd, desc.stable_key());
+                let _ = self.interests.lock().remove(&key).ok_or(Errno::ENOENT)?;
                 Ok(())
             }
         }
@@ -310,8 +306,9 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
             return Err(Errno::EINVAL);
         }
 
+        let desc = DescriptorRef::new(global, file).ok_or(Errno::EBADF)?;
+        let key = EpollEntryKey(fd, desc.stable_key());
         let mut interests = self.interests.lock();
-        let key = EpollEntryKey::new(global, fd, file).ok_or(Errno::EBADF)?;
         let entry = interests.get(&key).ok_or(Errno::ENOENT)?;
 
         let mut inner = entry.inner.lock();
@@ -350,19 +347,10 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
     super::common_functions_for_file_status!();
 }
 
+/// Identifies an interest by the fd it was registered as and its open file description, like
+/// Linux's `(fd, struct file)` key.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct EpollEntryKey(u32, EntryStableKey);
-impl EpollEntryKey {
-    /// Builds the key identifying `desc`'s open file description registered as `fd`, like Linux's
-    /// `(fd, struct file)` key. Returns `None` if `desc` is closed.
-    fn new<Platform: ShimPlatform>(
-        global: &GlobalState<Platform>,
-        fd: u32,
-        desc: &EpollDescriptor<Platform>,
-    ) -> Option<Self> {
-        Some(Self(fd, DescriptorRef::new(global, desc)?.stable_key()))
-    }
-}
 
 struct EpollEntry<Platform: ShimPlatform> {
     desc: DescriptorRef<Platform>,

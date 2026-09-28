@@ -341,7 +341,8 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
     }
 
-    /// Upgrade `weak` to a strong [`EntryHandle`], if its entry is still alive.
+    /// Upgrade `weak`, which must refer to an entry of this table, to a strong [`EntryHandle`], if
+    /// its entry is still alive.
     ///
     /// Upgrading requires the descriptor table that owns the entry, so that (as with
     /// [`Self::entry_handle`] and [`Self::duplicate`]) strong references are only ever created
@@ -540,7 +541,7 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
 /// Equal keys denote the same entry. A key is stable across `dup` and for the
 /// entry's lifetime, so it can identify an entry (for example as a map key)
 /// without dereferencing anything.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EntryStableKey(usize);
 
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
@@ -591,12 +592,6 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
         T: core::any::Any + Clone + Send + Sync,
     {
         self.0.entry.read().metadata.get::<T>().map(f)
-    }
-
-    /// An opaque, stable identity for this entry (see [`EntryStableKey`]).
-    #[must_use]
-    pub fn stable_key(&self) -> EntryStableKey {
-        EntryStableKey(Arc::as_ptr(&self.0).addr())
     }
 
     /// Obtains a non-owning [`WeakEntryHandle`] to this entry.

@@ -158,7 +158,14 @@ fn test_weak_entry_handle_survives_duplicates() {
     });
     let fd2 = descriptors.duplicate(&fd1).unwrap();
     let weak = descriptors.entry_handle(&fd1).unwrap().downgrade();
-    assert!(weak.stable_key() == descriptors.entry_handle(&fd2).unwrap().stable_key());
+    assert!(
+        weak.stable_key()
+            == descriptors
+                .entry_handle(&fd2)
+                .unwrap()
+                .downgrade()
+                .stable_key()
+    );
 
     // Closing one descriptor keeps the entry alive through the duplicate.
     assert!(descriptors.remove(&fd1).is_none());
