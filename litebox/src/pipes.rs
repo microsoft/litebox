@@ -865,3 +865,13 @@ crate::fd::enable_fds_for_subsystem! {
     PipeEnd<Platform>;
     -> PipeFd<Platform>;
 }
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for DescriptorEntry<Platform> {
+    fn register_observer(&self, observer: Weak<dyn Observer<Events>>, mask: Events) {
+        self.entry.0.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        self.entry.0.check_io_events()
+    }
+}
