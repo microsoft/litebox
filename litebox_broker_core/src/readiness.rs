@@ -218,6 +218,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct TestReadinessSink {
         pub(crate) published: Mutex<std::vec::Vec<(ObjectHandle, ReadinessFlags)>>,
+        pub(crate) republished: Mutex<std::vec::Vec<(ObjectHandle, ReadinessFlags)>>,
         pub(crate) retired: Mutex<std::vec::Vec<ObjectHandle>>,
     }
 
@@ -232,7 +233,8 @@ pub(crate) mod tests {
         }
 
         fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
-            self.publish(handle, readiness)
+            self.republished.lock().unwrap().push((handle, readiness));
+            Ok(())
         }
 
         fn retire(&self, handle: ObjectHandle) {

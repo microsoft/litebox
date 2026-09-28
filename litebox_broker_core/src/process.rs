@@ -1630,10 +1630,12 @@ mod tests {
         Arc::new(crate::readiness::tests::TestReadinessSink::default())
     }
 
-    fn take_published(
+    /// Returns the pipe wakeups `sink` received, which republish so a sink
+    /// cannot drop them as unchanged.
+    fn take_republished(
         sink: &crate::readiness::tests::TestReadinessSink,
     ) -> std::vec::Vec<(ObjectHandle, ReadinessFlags)> {
-        core::mem::take(&mut *sink.published.lock().unwrap())
+        core::mem::take(&mut *sink.republished.lock().unwrap())
     }
 
     #[test]
@@ -1671,10 +1673,10 @@ mod tests {
 
         assert_eq!(crate::pipe::write(&child, child_writer, &[1, 2, 3]), Ok(3));
         assert_eq!(
-            take_published(&parent_sink),
+            take_republished(&parent_sink),
             [(reader, ReadinessFlags::READ)]
         );
-        assert!(take_published(&child_sink).is_empty());
+        assert!(take_republished(&child_sink).is_empty());
 
         // Freeing space that an atomic write still cannot use leaves `WRITE`
         // unchanged but must still wake writers.
@@ -1687,29 +1689,29 @@ mod tests {
             Ok(std::vec::Vec::from([1]))
         );
         assert_eq!(
-            take_published(&parent_sink),
+            take_republished(&parent_sink),
             [(writer, ReadinessFlags::WRITE)]
         );
         assert_eq!(
-            take_published(&child_sink),
+            take_republished(&child_sink),
             [(child_writer, ReadinessFlags::WRITE)]
         );
 
         assert_eq!(parent.close_object_reference(writer), Ok(()));
         assert_eq!(*parent_sink.retired.lock().unwrap(), [writer]);
-        assert!(take_published(&parent_sink).is_empty());
-        assert!(take_published(&child_sink).is_empty());
+        assert!(take_republished(&parent_sink).is_empty());
+        assert!(take_republished(&child_sink).is_empty());
 
         assert_eq!(child.close_object_reference(child_writer), Ok(()));
         let hangup = ReadinessFlags::READ | ReadinessFlags::HANGUP;
-        assert_eq!(take_published(&parent_sink), [(reader, hangup)]);
-        assert!(take_published(&child_sink).is_empty());
+        assert_eq!(take_republished(&parent_sink), [(reader, hangup)]);
+        assert!(take_republished(&child_sink).is_empty());
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_writer]);
 
         assert_eq!(parent.close_object_reference(reader), Ok(()));
         assert_eq!(*parent_sink.retired.lock().unwrap(), [writer, reader]);
-        assert!(take_published(&parent_sink).is_empty());
-        assert!(take_published(&child_sink).is_empty());
+        assert!(take_republished(&parent_sink).is_empty());
+        assert!(take_republished(&child_sink).is_empty());
     }
 
     #[test]
