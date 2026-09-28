@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use litebox::platform::PageManagementProvider;
 use litebox::platform::RawConstPointer;
+use litebox::platform::RawMutPointer;
 use litebox::platform::page_mgmt::AllocationDirection;
 use litebox::platform::page_mgmt::AllocationError;
 use litebox::platform::page_mgmt::CowAllocationError;
@@ -950,21 +951,100 @@ where
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
         // SAFETY: The caller excludes source users, and `get_unmmaped_area` found a disjoint gap.
-        let new_addr = unsafe {
+        let new_addr = match unsafe {
             self.reservations.remap(
                 self.platform,
                 old_range.into(),
                 new_range.into(),
                 vma.flags.into(),
             )
-        }
-        .map_err(VmemMoveError::RemapError)?;
+        } {
+            Ok(new_addr) => new_addr,
+            Err(RemapError::UnsupportedByPlatform) => {
+                // SAFETY: Native remapping left the source unchanged, and the destination is free.
+                return unsafe { self.remap_fallback_with_copy(old_range, new_range, vma) };
+            }
+            Err(error) => return Err(VmemMoveError::RemapError(error)),
+        };
 
         let new_start = new_addr.as_usize();
         let new_end = new_start + new_size.as_usize();
         self.vmas.insert(new_start..new_end, vma);
         self.vmas.remove(old_range.into());
         Ok(new_addr)
+    }
+
+    /// Remap by copying into a newly allocated destination.
+    ///
+    /// # Safety
+    ///
+    /// The source must be mapped with `vma`'s permissions and have no active users. The destination
+    /// must be larger than the source and contain no mappings.
+    ///
+    /// # Panics
+    ///
+    /// Failures after destination allocation are fatal because copying or teardown may have begun.
+    unsafe fn remap_fallback_with_copy(
+        &mut self,
+        old_range: PageRange<ALIGN>,
+        new_range: PageRange<ALIGN>,
+        vma: VmArea,
+    ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
+        let permissions = MemoryRegionPermissions::from(vma.flags());
+        let temporary = VmArea::new(vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE, false);
+        // SAFETY: Placement excludes mapped pages; Hint preserves other mappings and may relocate.
+        let destination = unsafe {
+            self.insert_mapping(
+                new_range,
+                temporary,
+                false,
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )
+        }
+        .map_err(|error| {
+            VmemMoveError::RemapError(match error {
+                AllocationError::OutOfMemory | AllocationError::AboveMaxAddress => {
+                    RemapError::OutOfMemory
+                }
+                AllocationError::Unaligned | AllocationError::BelowMinAddress => {
+                    RemapError::Unaligned
+                }
+                _ => RemapError::AlreadyAllocated,
+            })
+        })?;
+        let extent = destination.as_usize()..destination.as_usize() + new_range.len();
+        if !permissions.contains(MemoryRegionPermissions::READ) {
+            // SAFETY: The caller excludes all source users while copying.
+            unsafe {
+                self.platform.update_permissions(
+                    old_range.into(),
+                    permissions | MemoryRegionPermissions::READ,
+                )
+            }
+            .expect("failed to make remap source readable");
+        }
+        for offset in (0..old_range.len()).step_by(ALIGN) {
+            let source = Platform::RawConstPointer::<u8>::from_usize(old_range.start + offset);
+            let buffer = source
+                .to_owned_slice(ALIGN)
+                .expect("failed to read remap source");
+            destination
+                .copy_from_slice(offset, &buffer)
+                .expect("failed to copy remap source");
+        }
+        // SAFETY: The destination is mapped, exclusively owned, and copying is complete.
+        unsafe {
+            self.platform
+                .update_permissions(extent.clone(), permissions)
+        }
+        .expect("failed to restore remap destination permissions");
+        self.vmas.insert(extent, vma);
+        // SAFETY: Copying is complete and the caller excludes all source users.
+        unsafe { self.remove_mapping(old_range) }.expect("failed to unmap remap source");
+        Ok(destination)
     }
 
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.
