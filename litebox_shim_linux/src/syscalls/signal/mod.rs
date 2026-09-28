@@ -661,7 +661,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             None
         };
-        if signal == Signal::SIGCHLD && act.is_some() && self.vfork.borrow().is_none() {
+        if signal == Signal::SIGCHLD && act.is_some() {
             // Linux decides whether to send `SIGCHLD` as the child terminates, so terminations
             // the broker already recorded are observed under the old action. A termination
             // concurrent with this call may still be reaped under the old action and signaled
@@ -737,10 +737,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let thread_pending = self.signals.pending.borrow().pending & !blocked;
         if !thread_pending.is_empty() {
             return true;
-        }
-        if self.vfork.borrow().is_some() {
-            // Process-directed signals belong to the suspended vfork parent.
-            return false;
         }
         let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
         !shared_pending.is_empty()

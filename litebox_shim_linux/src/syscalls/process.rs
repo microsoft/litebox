@@ -501,8 +501,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Queues `SIGCHLD` for each child whose termination was not yet observed.
+    ///
+    /// During a `vfork` window the signal state is the child's, so the parent observes the
+    /// terminations once it resumes.
     pub(crate) fn observe_child_terminations(&self) -> Result<(), ProcessError> {
-        for (pid, exit_status) in self.thread.process.observe_terminations()? {
+        if self.vfork.borrow().is_some() {
+            return Ok(());
+        }
+        let terminated = self.thread.process.observe_terminations()?;
+        // Like Linux, a child terminating while `SIGCHLD` is set to `SIG_IGN` sends no signal,
+        // even if `SIGCHLD` is blocked.
+        if terminated.is_empty() || self.signals.ignored().contains(Signal::SIGCHLD) {
+            return Ok(());
+        }
+        for (pid, exit_status) in terminated {
             self.send_shared_signal(
                 Signal::SIGCHLD,
                 siginfo_child(pid, self.credentials.uid, exit_status),

@@ -701,9 +701,11 @@ fn vfork_children_signal_parent_on_termination() {
     let exited = line("exited ");
     reaped(exited);
     assert_handled(exited, libc::CLD_EXITED, 7);
+    assert_eq!(numeric_field(exited, "early="), 1);
     let killed = line("killed ");
     reaped(killed);
     assert_handled(killed, libc::CLD_KILLED, libc::SIGILL);
+    assert_eq!(numeric_field(killed, "early="), 1);
     let paused = line("paused ");
     reaped(paused);
     assert_handled(paused, libc::CLD_EXITED, 42);
@@ -716,7 +718,9 @@ fn vfork_children_signal_parent_on_termination() {
     assert_eq!(numeric_field(waited, "exit="), 42);
     let nocldwait = line("nocldwait ");
     assert_handled(nocldwait, libc::CLD_EXITED, 9);
+    assert_eq!(numeric_field(nocldwait, "early="), 1);
     assert_eq!(numeric_field(nocldwait, "echild="), 1);
+    assert_eq!(numeric_field(line("ignored-blocked "), "count="), 0);
     let default = line("default ");
     reaped(default);
     assert_eq!(numeric_field(default, "alarmed="), 1);
