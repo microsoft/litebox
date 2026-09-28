@@ -123,6 +123,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let previous = self.with_timer_file(fd, |file| {
             let value = if flags.contains(TfdTimerFlags::ABSTIME) && !value.is_zero() {
                 // An expiration time that already passed expires immediately.
+                // Unlike Linux, a periodic timer then counts one expiration and
+                // restarts its period from now rather than from `value`.
                 value
                     .saturating_sub(self.timer_clock_now(file.clock))
                     .max(Duration::from_nanos(1))
