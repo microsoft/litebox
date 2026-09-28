@@ -35,8 +35,8 @@ pub(crate) struct ObjectReference {
     pub(crate) rights: ObjectRights,
     /// Position of this reference's handle in the owner's handle list.
     pub(crate) process_reference_index: usize,
-    /// Readiness publication for object kinds whose state other processes
-    /// change, retired when this reference drops.
+    /// Readiness publication once the object is shared, for kinds whose state
+    /// other processes change, retired when this reference drops.
     pub(crate) readiness: Option<ReadinessRegistration>,
 }
 
@@ -54,6 +54,9 @@ pub(crate) enum ObjectEntry {
 impl ObjectEntry {
     /// Returns whether references to this object may be duplicated into
     /// another process.
+    ///
+    /// A duplicable kind whose waiters need wake-ups for changes made by
+    /// other processes must also implement [`Self::watch`].
     pub(crate) fn is_duplicable(&self) -> bool {
         match self {
             Self::Event(_) | Self::File(_) | Self::Pipe(_) => true,
@@ -61,9 +64,9 @@ impl ObjectEntry {
         }
     }
 
-    /// Returns a registration that publishes readiness changes to this object
-    /// through `readiness_sink` for `handle` until it drops, or `None` if
-    /// references to this kind need none.
+    /// Returns a registration that publishes readiness changes to this shared
+    /// object through `readiness_sink` for `handle` until it drops, or `None`
+    /// if references to this kind need none.
     pub(crate) fn watch(
         &self,
         handle: ObjectHandle,

@@ -4,6 +4,7 @@
 //! Provider-driven broker object readiness.
 
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -70,11 +71,6 @@ impl ReadinessRegistration {
         }
     }
 
-    /// Returns a reference that does not keep this registration alive.
-    pub(crate) fn downgrade(&self) -> WeakReadinessRegistration {
-        WeakReadinessRegistration(Arc::downgrade(&self.inner))
-    }
-
     /// Publishes the object's current readiness.
     ///
     /// Updates after the broker retires the object are discarded.
@@ -115,20 +111,39 @@ impl ReadinessRegistration {
     }
 }
 
-/// A [`ReadinessRegistration`] that stops publishing once every strong clone drops.
-pub(crate) struct WeakReadinessRegistration(Weak<ReadinessRegistrationInner>);
+/// The registrations of every reference to one shared object, so a change
+/// made through any reference wakes waiters in every process holding one.
+///
+/// Each registration belongs to its reference and retires when that reference
+/// drops, so watchers hold it weakly.
+#[derive(Default)]
+pub(crate) struct ReadinessWatchers(Vec<Weak<ReadinessRegistrationInner>>);
 
-impl WeakReadinessRegistration {
-    /// Returns the registration if a strong clone is still alive.
-    pub(crate) fn upgrade(&self) -> Option<ReadinessRegistration> {
+impl ReadinessWatchers {
+    /// Adds `registration`, which receives publications until every clone of
+    /// it drops.
+    pub(crate) fn watch(&mut self, registration: &ReadinessRegistration) -> Result<()> {
+        self.0.retain(|watcher| watcher.strong_count() != 0);
         self.0
-            .upgrade()
-            .map(|inner| ReadinessRegistration { inner })
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        self.0.push(Arc::downgrade(&registration.inner));
+        Ok(())
     }
 
-    /// Returns whether a strong clone is still alive.
-    pub(crate) fn is_alive(&self) -> bool {
-        self.0.strong_count() != 0
+    /// Wakes every watcher to re-check the object, whose readiness is now
+    /// `readiness`.
+    ///
+    /// This republishes even when the flags match an earlier publication,
+    /// since a waiter may need more than the flags report, such as space for
+    /// an atomic write. Failures are ignored because connection setup sizes
+    /// every sink for all of its association's references.
+    pub(crate) fn publish(&self, readiness: ReadinessFlags) {
+        for watcher in &self.0 {
+            if let Some(inner) = watcher.upgrade() {
+                let _ = ReadinessRegistration { inner }.republish(readiness);
+            }
+        }
     }
 }
 

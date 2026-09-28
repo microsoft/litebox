@@ -263,9 +263,9 @@ where
         None => None,
     };
     let limits = core.limits();
-    // Sockets, child process handles, and pipe references register readiness.
-    // Add future resource limits here so every live registration fits in the
-    // association's shared readiness sink.
+    // Sockets, child process handles, and shared object references register
+    // readiness. Add future resource limits here so every live registration
+    // fits in the association's shared readiness sink.
     let max_live_readiness_registrations = limits
         .max_sockets
         .min(limits.max_sockets_per_process)
@@ -338,7 +338,7 @@ where
                 Err(error) => return Err(BrokerHostError::from(error)),
             },
         };
-        // A parent may have duplicated pipe ends into this process before it
+        // A parent may have duplicated references into this process before it
         // connected.
         if let Err(error) = process.register_readiness(&readiness_sink) {
             if finish_on_setup_error {
@@ -534,15 +534,14 @@ fn handle_request<Memory: SharedMemory>(
             .map(|()| BrokerResult::ChildReapingSet)
             .map_err(RequestFailure::from),
         BrokerOperation::DuplicateObjectsToChild(request) => {
-            duplicate_objects_to_child(process, request, shared_buffers)
+            duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
                 .map(|()| BrokerResult::ObjectsDuplicated)
         }
         BrokerOperation::Event(request) => {
             handle_event_request(process, request).map(BrokerResult::Event)
         }
         BrokerOperation::Pipe(request) => {
-            handle_pipe_request(process, request, shared_buffers, readiness_sink)
-                .map(BrokerResult::Pipe)
+            handle_pipe_request(process, request, shared_buffers).map(BrokerResult::Pipe)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -575,6 +574,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
     process: &BrokerProcess,
     request: DuplicateObjectsToChildRequest,
     shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<()> {
     const HANDLE_SIZE: usize = size_of::<u64>();
     const _: () = assert!(
@@ -600,7 +600,7 @@ fn duplicate_objects_to_child<Memory: SharedMemory>(
             .map(|bytes| ObjectHandle(u64::from_le_bytes(*bytes))),
     );
     let duplicates = process
-        .duplicate_object_references_to_child(child_process_id, &handles)
+        .duplicate_object_references_to_child(child_process_id, &handles, readiness_sink)
         .map_err(RequestFailure::from)?;
     for (bytes, duplicate) in data
         .as_chunks_mut::<HANDLE_SIZE>()
@@ -1231,22 +1231,18 @@ fn handle_pipe_request<Memory: SharedMemory>(
     process: &BrokerProcess,
     request: PipeRequest,
     shared_buffers: &SharedBufferPool<Memory>,
-    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<PipeResponse> {
     match request {
-        PipeRequest::Create(request) => litebox_broker_core::pipe::create(
-            process,
-            request.capacity,
-            request.atomic_write_size,
-            readiness_sink,
-        )
-        .map(|(read_handle, write_handle)| {
-            PipeResponse::Create(CreatePipeResponse {
-                read_handle,
-                write_handle,
-            })
-        })
-        .map_err(RequestFailure::from),
+        PipeRequest::Create(request) => {
+            litebox_broker_core::pipe::create(process, request.capacity, request.atomic_write_size)
+                .map(|(read_handle, write_handle)| {
+                    PipeResponse::Create(CreatePipeResponse {
+                        read_handle,
+                        write_handle,
+                    })
+                })
+                .map_err(RequestFailure::from)
+        }
         PipeRequest::Read(request) => {
             validate_shared_buffer(request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             let data =
@@ -2781,11 +2777,9 @@ mod tests {
         let shared_buffers = Arc::new(SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap());
         let association = test_association(broker, Arc::clone(&shared_buffers));
         let (_, first_write_handle) =
-            litebox_broker_core::pipe::create(&association.process, 64, 16, &test_readiness_sink())
-                .unwrap();
+            litebox_broker_core::pipe::create(&association.process, 64, 16).unwrap();
         let (_, second_write_handle) =
-            litebox_broker_core::pipe::create(&association.process, 64, 16, &test_readiness_sink())
-                .unwrap();
+            litebox_broker_core::pipe::create(&association.process, 64, 16).unwrap();
 
         std::thread::scope(|scope| {
             let first_association = &association;
