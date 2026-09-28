@@ -356,13 +356,15 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     /// close-on-exec flags and share this table's open file descriptions.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn copy_for_vfork(&self, global: &GlobalState<Platform>) -> Self {
-        let rds = self.raw_descriptor_store.read();
-        let alive_fds: alloc::vec::Vec<usize> = rds.iter_alive().collect();
+        let alive_fds: alloc::vec::Vec<usize> =
+            self.raw_descriptor_store.read().iter_alive().collect();
+        let len = alive_fds.last().map_or(0, |&raw_fd| raw_fd + 1);
         let copy = Self {
-            raw_descriptor_store: litebox::sync::RwLock::new(rds.new_like()),
+            raw_descriptor_store: litebox::sync::RwLock::new(
+                litebox::fd::RawDescriptorStorage::with_len(len),
+            ),
             max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
         };
-        drop(rds);
         for raw_fd in alive_fds {
             let fd = self
                 .typed_fd_from_raw(raw_fd)
