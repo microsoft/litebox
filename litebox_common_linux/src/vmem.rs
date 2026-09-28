@@ -505,6 +505,7 @@ where
         } = request;
 
         if range.start.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
+            && range.end.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
             && self.overlapping(range.clone()).next().is_none()
         {
             // SAFETY: No tracked reservation overlaps this request, and the caller authorizes its
