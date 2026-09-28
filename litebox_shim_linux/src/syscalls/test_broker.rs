@@ -59,7 +59,7 @@ pub(crate) fn litebox_with_channel<Channel>(
 where
     Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
 {
-    let setup = InProcessBrokerSetup::new(test_broker(limits).clone());
+    let setup = InProcessBrokerSetup::new(test_broker(limits).core.clone());
     let readiness = setup.readiness_sink();
     let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
@@ -73,14 +73,26 @@ where
     (litebox, process_id)
 }
 
-/// Returns the manual clock that drives the test broker's timers.
-pub(crate) fn timer_provider() -> &'static Arc<ManualTimerProvider> {
-    static TIMERS: OnceLock<Arc<ManualTimerProvider>> = OnceLock::new();
-    TIMERS.get_or_init(Arc::default)
+struct TestBroker {
+    core: BrokerCore,
+    timers: Arc<ManualTimerProvider>,
 }
 
-fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
-    static BROKER: OnceLock<BrokerCore> = OnceLock::new();
+static BROKER: OnceLock<TestBroker> = OnceLock::new();
+
+/// Returns the manual clock that drives the test broker's timers.
+///
+/// # Panics
+///
+/// Panics if no test task has been created yet.
+pub(crate) fn timer_provider() -> &'static ManualTimerProvider {
+    &BROKER
+        .get()
+        .expect("the test broker must be running")
+        .timers
+}
+
+fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
     BROKER.get_or_init(|| {
         let root = InitialNode::Directory {
             mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
@@ -95,7 +107,8 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
             .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
             .build()
             .expect("the test filesystem must be valid");
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let timers = Arc::new(ManualTimerProvider::default());
+        let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(limits)
@@ -103,8 +116,9 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
             TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
         ))
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
-        .with_timer_provider(timer_provider().clone())
+        .with_timer_provider(timers.clone())
         .build()
-        .expect("a test process may build only one broker core")
+        .expect("a test process may build only one broker core");
+        TestBroker { core, timers }
     })
 }
