@@ -75,8 +75,9 @@ pub trait ShimPlatform:
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<
         { PAGE_SIZE },
-        Reservations = ShimReservations<Self::Reservation>,
-    > + litebox_common_linux::vmem::VmemPageFaultHandler
+        Reservations = <Self as ShimPlatform>::VmemReservations,
+    >
+    + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
@@ -88,19 +89,17 @@ pub trait ShimPlatform:
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
     + litebox::platform::IPInterfaceProvider
     + 'static
+    + Sized
 {
-    /// Opaque page-reservation ownership type supplied by the platform.
-    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
+    type VmemReservations: litebox_common_linux::vmem::LinuxReservationStore<Self, PAGE_SIZE>;
 }
 
-impl<T, Reservation> ShimPlatform for T
+impl<T> ShimPlatform for T
 where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
-        + litebox::platform::PageManagementProvider<
-            { PAGE_SIZE },
-            Reservations = ShimReservations<Reservation>,
-        > + litebox_common_linux::vmem::VmemPageFaultHandler
+        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
+        + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider
@@ -111,10 +110,11 @@ where
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::IPInterfaceProvider
-        + 'static,
-    Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
+        + 'static
+        + Sized,
+    T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
 {
-    type Reservation = Reservation;
+    type VmemReservations = T::Reservations;
 }
 
 // Linux-specific memory manager state and behavior.

@@ -20,9 +20,10 @@ use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::page_mgmt::RemapError;
+use litebox::platform::page_mgmt::ReserveAndCommitError;
 use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
-    page_mgmt::{DeallocationError, PageReservation, ReservationStore},
+    page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
 };
 
 /// Page size in bytes
@@ -370,8 +371,9 @@ where
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
-    unsafe fn unmap(
+    unsafe fn unmap<V: Clone + Eq>(
         &mut self,
+        vmas: &mut RangeMap<usize, V>,
         platform: &Platform,
         range: Range<usize>,
     ) -> Result<(), DeallocationError>;
@@ -389,6 +391,31 @@ where
         new_range: Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError>;
+
+    /// Update permissions using this store's reservation ownership.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the range is mapped and excludes conflicting accesses.
+    unsafe fn protect(
+        &self,
+        platform: &Platform,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), PermissionUpdateError> {
+        // SAFETY: The caller guarantees complete mapping coverage and access exclusion. Tracked
+        // stores yield covering handles; handle-free stores yield an empty iterator.
+        unsafe {
+            platform.protect_pages(
+                || {
+                    self.overlapping(range.clone())
+                        .map(|(_, reservation)| reservation)
+                },
+                range.clone(),
+                permissions,
+            )
+        }
+    }
 }
 
 impl<Platform, Reservation, const ALIGN: usize> LinuxReservationStore<Platform, ALIGN>
@@ -409,22 +436,35 @@ where
             populate_pages_immediately,
             behavior,
         } = request;
-        platform.allocate_pages(
-            range,
-            permissions,
-            can_grow_down,
-            populate_pages_immediately,
-            behavior,
-        )
+        // SAFETY: The caller authorizes replacement and this handle-free store owns mapping ranges.
+        let reservation = unsafe {
+            platform.reserve_and_commit_pages(
+                core::iter::empty,
+                range,
+                permissions,
+                can_grow_down,
+                populate_pages_immediately,
+                behavior,
+            )
+        }
+        .map_err(|error| match error {
+            ReserveAndCommitError::UnsupportedByPlatform => AllocationError::UnsupportedByPlatform,
+            ReserveAndCommitError::Allocation(error) => error,
+        })?;
+        Ok(Platform::RawMutPointer::<u8>::from_usize(
+            reservation.range().start,
+        ))
     }
 
-    unsafe fn unmap(
+    unsafe fn unmap<V: Clone + Eq>(
         &mut self,
+        vmas: &mut RangeMap<usize, V>,
         platform: &Platform,
         range: Range<usize>,
     ) -> Result<(), DeallocationError> {
         // SAFETY: The caller excludes all users of the released range.
         unsafe { platform.release_pages(range.clone()) }?;
+        vmas.remove(range);
         Ok(())
     }
 
@@ -436,7 +476,12 @@ where
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
         // SAFETY: The caller guarantees that the source is unused and the destination is valid.
-        unsafe { platform.remap_pages(old_range, new_range, permissions) }
+        let reservation = unsafe {
+            platform.try_remap_pages(core::iter::empty, old_range, new_range, permissions)
+        }?;
+        Ok(Platform::RawMutPointer::<u8>::from_usize(
+            reservation.range().start,
+        ))
     }
 }
 
@@ -448,20 +493,144 @@ where
 {
     unsafe fn mmap(
         &mut self,
-        _platform: &Platform,
-        _request: MmapRequest,
+        platform: &Platform,
+        request: MmapRequest,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
-        // TODO: Implement after page-management interfaces support tracked reservations.
-        todo!("tracked Linux reservations are not supported yet")
+        let MmapRequest {
+            mut range,
+            permissions,
+            can_grow_down,
+            populate_pages_immediately,
+            behavior,
+        } = request;
+
+        if range.start.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
+            && self.overlapping(range.clone()).next().is_none()
+        {
+            // SAFETY: No tracked reservation overlaps this request, and the caller authorizes its
+            // placement behavior.
+            match unsafe {
+                platform.reserve_and_commit_pages(
+                    core::iter::empty,
+                    range.clone(),
+                    permissions,
+                    can_grow_down,
+                    populate_pages_immediately,
+                    behavior,
+                )
+            } {
+                Ok(reservation) => {
+                    let extent = reservation.range();
+                    let address = extent.start;
+                    assert!(self.insert(extent.start, reservation).is_none());
+                    return Ok(Platform::RawMutPointer::<u8>::from_usize(address));
+                }
+                Err(ReserveAndCommitError::UnsupportedByPlatform) => {}
+                Err(ReserveAndCommitError::Allocation(error)) => return Err(error),
+            }
+        }
+
+        // SAFETY: NoReplace limits acquisition to unowned gaps in the requested range.
+        let acquired = match unsafe {
+            self.reserve_gaps(
+                platform,
+                range.clone(),
+                can_grow_down,
+                FixedAddressBehavior::NoReplace,
+            )
+        } {
+            Ok(acquired) => acquired,
+            Err(
+                AllocationError::AddressInUse
+                | AllocationError::AddressInUseByPlatform
+                | AllocationError::AddressPartiallyInUse,
+            ) if matches!(behavior, FixedAddressBehavior::Hint(_)) => {
+                // SAFETY: Hint permits the platform to relocate the complete requested extent.
+                let acquired = unsafe {
+                    self.reserve_gaps(platform, 0..range.len(), can_grow_down, behavior)
+                }?;
+                debug_assert_eq!(acquired.len(), 1);
+                range = acquired[0]..acquired[0] + range.len();
+                acquired
+            }
+            Err(error) => return Err(error),
+        };
+
+        if behavior == FixedAddressBehavior::Replace {
+            // SAFETY: The caller authorized replacement and excludes users of the old mapping.
+            unsafe {
+                platform.decommit_pages(
+                    || {
+                        self.overlapping(range.clone())
+                            .map(|(_, reservation)| reservation)
+                    },
+                    range.clone(),
+                )
+            }
+            .expect("failed to decommit replacement backing");
+        }
+
+        // SAFETY: The tracked reservations now completely cover the requested range.
+        match unsafe {
+            platform.commit_pages(
+                || {
+                    self.overlapping(range.clone())
+                        .map(|(_, reservation)| reservation)
+                },
+                range.clone(),
+                permissions,
+                populate_pages_immediately,
+            )
+        } {
+            Ok(pointer) => Ok(pointer),
+            Err(error) => {
+                // SAFETY: No mapping is published yet, so all commitment from this attempt is unused.
+                let _ = unsafe {
+                    platform.decommit_pages(
+                        || {
+                            self.overlapping(range.clone())
+                                .map(|(_, reservation)| reservation)
+                        },
+                        range.clone(),
+                    )
+                };
+                for base in acquired {
+                    let reservation = self
+                        .take_overlapping(base..base + 1)
+                        .pop()
+                        .expect("new reservation must remain tracked");
+                    // SAFETY: The failed mapping never published this newly acquired reservation.
+                    let _ = unsafe { platform.release_pages(reservation) };
+                }
+                Err(error)
+            }
+        }
     }
 
-    unsafe fn unmap(
+        unsafe fn unmap<V: Clone + Eq>(
         &mut self,
-        _platform: &Platform,
-        _range: Range<usize>,
+        vmas: &mut RangeMap<usize, V>,
+        platform: &Platform,
+        range: Range<usize>,
     ) -> Result<(), DeallocationError> {
-        // TODO: Implement after page-management interfaces support tracked reservations.
-        todo!("tracked Linux reservations are not supported yet")
+        let reservations = self.take_overlapping(range.clone());
+        let last = reservations.len().saturating_sub(1);
+        vmas.remove(range.clone());
+        for (index, reservation) in reservations.into_iter().enumerate() {
+            if index == 0 || index == last {
+                let extent = reservation.range();
+                if vmas.overlaps(&extent) {
+                    let segment = extent.start.max(range.start)..extent.end.min(range.end);
+                    // SAFETY: The removed segment has no users and remains inside this reservation.
+                    unsafe { platform.decommit_pages(|| core::iter::once(&reservation), segment) }?;
+                    assert!(self.insert(extent.start, reservation).is_none());
+                    continue;
+                }
+            }
+            // SAFETY: No VMA uses this reservation after removing the requested range.
+            unsafe { platform.release_pages(reservation) }?;
+        }
+        Ok(())
     }
 
     unsafe fn remap(
@@ -525,19 +694,6 @@ where
         self.vmas.iter()
     }
 
-    /// Insert an already-allocated region (e.g., via CoW) without calling the platform allocator.
-    ///
-    /// Any existing tracked mappings that overlap `range` are silently removed from tracking
-    /// (without calling the platform deallocator) before inserting. Use [`Self::overlapping`] to
-    /// check for overlap before running this if needed.
-    pub(super) fn register_existing_mapping_overwrite(
-        &mut self,
-        range: PageRange<ALIGN>,
-        vma: VmArea,
-    ) {
-        self.vmas.insert(range.into(), vma);
-    }
-
     /// Gets an iterator over all the stored ranges that are
     /// either partially or completely overlapped by the given range.
     pub(super) fn overlapping(
@@ -562,14 +718,11 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        let range: Range<usize> = range.into();
         unsafe {
             self.reservations
-                .unmap(self.platform, range.clone())
-                .map_err(VmemUnmapError::UnmapError)?;
+                .unmap(&mut self.vmas, self.platform, range.into())
+                .map_err(VmemUnmapError::UnmapError)
         }
-        self.vmas.remove(range);
-        Ok(())
     }
 
     /// Reset pages without removing its mapping (similar to Linux `madvise` with
@@ -1039,7 +1192,8 @@ where
         if !permissions.contains(MemoryRegionPermissions::READ) {
             // SAFETY: The caller excludes all source users while copying.
             unsafe {
-                self.platform.update_permissions(
+                self.reservations.protect(
+                    self.platform,
                     old_range.into(),
                     permissions | MemoryRegionPermissions::READ,
                 )
@@ -1061,8 +1215,8 @@ where
         }
         // SAFETY: The destination is mapped, exclusively owned, and copying is complete.
         unsafe {
-            self.platform
-                .update_permissions(extent.clone(), permissions)
+            self.reservations
+                .protect(self.platform, extent.clone(), permissions)
         }
         .expect("failed to restore remap destination permissions");
         self.vmas.insert(extent, vma);
@@ -1083,7 +1237,10 @@ where
         &mut self,
         range: PageRange<ALIGN>,
         permissions: MemoryRegionPermissions,
-    ) -> Result<(), VmemProtectError> {
+    ) -> Result<(), VmemProtectError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let range: Range<usize> = range.into();
         if self.vmas.gaps(&range).next().is_some() {
             return Err(VmemProtectError::InvalidRange(range));
@@ -1112,7 +1269,7 @@ where
         }
 
         // SAFETY: The range has complete VMA coverage and the caller excludes conflicting access.
-        unsafe { self.platform.update_permissions(range, permissions) }
+        unsafe { self.reservations.protect(self.platform, range, permissions) }
             .map_err(VmemProtectError::ProtectError)?;
         for (intersection, vma) in mappings_to_change {
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
@@ -1166,19 +1323,24 @@ where
         } else {
             0
         };
+        let requested = suggested_start..suggested_start + source_data.len();
 
-        let ptr = self.platform.try_allocate_cow_pages(
-            suggested_start,
-            source_data,
-            permissions,
-            behavior,
-        )?;
-        let actual_start = ptr.as_usize();
-        let actual_end = actual_start
-            .checked_add(source_data.len())
-            .ok_or(CowAllocationError::InternalFailure)?;
-        let actual =
-            PageRange::new(actual_start, actual_end).ok_or(CowAllocationError::InternalFailure)?;
+        // SAFETY: The caller authorizes replacement; the supplier transfers overlapping ownership
+        // only if the provider successfully performs a replacement.
+        let reservation = unsafe {
+            self.platform.try_allocate_cow_pages(
+                || self.reservations.take_overlapping(requested).into_iter(),
+                suggested_start,
+                source_data,
+                permissions,
+                behavior,
+            )
+        }?;
+        let actual = reservation.range();
+        let actual_start = actual.start;
+        let actual_end = actual.end;
+        let ptr = Platform::RawMutPointer::<u8>::from_usize(actual_start);
+        assert_eq!(actual.len(), source_data.len());
         debug_assert!(
             matches!(behavior, FixedAddressBehavior::Hint(_)) || suggested_start == actual_start
         );
@@ -1186,7 +1348,12 @@ where
             actual_start >= Platform::TASK_ADDR_MIN && actual_end <= Platform::TASK_ADDR_MAX
         );
 
-        self.register_existing_mapping_overwrite(
+        assert!(
+            self.reservations
+                .insert(actual_start, reservation)
+                .is_none()
+        );
+        self.vmas.insert(
             actual,
             VmArea::new(
                 VmFlags::from(permissions)
@@ -1599,23 +1766,32 @@ mod tests {
                 AllocationDirection::BottomUp
             });
 
-        fn allocate_pages(
+        unsafe fn reserve_and_commit_pages<Reservations>(
             &self,
+            _replaced_reservations: impl FnOnce() -> Reservations,
             suggested_range: Range<usize>,
             initial_permissions: MemoryRegionPermissions,
             can_grow_down: bool,
             populate_pages_immediately: bool,
             fixed_address_behavior: FixedAddressBehavior,
-        ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+        ) -> Result<
+            litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>,
+            ReserveAndCommitError,
+        >
+        where
+            Reservations:
+                Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
+        {
             self.calls
                 .lock()
                 .push((suggested_range.clone(), fixed_address_behavior));
             if fixed_address_behavior == FixedAddressBehavior::NoReplace
                 && self.rejected_address == Some(suggested_range.start)
             {
-                return Err(AllocationError::AddressInUse);
+                return Err(AllocationError::AddressInUse.into());
             }
-            Ok(TransparentMutPtr::from_usize(suggested_range.start))
+            // SAFETY: The mock models successful exclusive ownership of this exact range.
+            Ok(unsafe { DummyReservation::new(suggested_range) })
         }
 
         unsafe fn release_pages(
@@ -1626,20 +1802,37 @@ mod tests {
             Ok(())
         }
 
-        unsafe fn remap_pages(
+        unsafe fn try_remap_pages<Reservations>(
             &self,
-            old_range: Range<usize>,
+            source_reservations: impl FnOnce() -> Reservations,
+            _old_range: Range<usize>,
             new_range: Range<usize>,
-            permissions: MemoryRegionPermissions,
-        ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
-            Ok(TransparentMutPtr::from_usize(new_range.start))
+            _permissions: MemoryRegionPermissions,
+        ) -> Result<
+            litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>,
+            litebox::platform::page_mgmt::RemapError,
+        >
+        where
+            Reservations:
+                Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
+        {
+            source_reservations().for_each(drop);
+            // SAFETY: The mock models successful transfer to this exact destination.
+            Ok(unsafe { DummyReservation::new(new_range) })
         }
 
-        unsafe fn update_permissions(
+        unsafe fn protect_pages<'reservation, Reservations>(
             &self,
+            _covering_reservations: impl FnOnce() -> Reservations,
             range: Range<usize>,
             new_permissions: MemoryRegionPermissions,
-        ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+        ) -> Result<(), PermissionUpdateError>
+        where
+            Reservations: Iterator<
+                Item = &'reservation litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>,
+            >,
+            litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>: 'reservation,
+        {
             Ok(())
         }
 

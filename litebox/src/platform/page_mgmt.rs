@@ -92,6 +92,10 @@ pub trait ReservationStore {
 pub type ReleaseTargetOf<Platform, const ALIGN: usize> =
     <<Platform as PageManagementProvider<ALIGN>>::Reservations as ReservationStore>::ReleaseTarget;
 
+/// Native reservation handle selected by a page-management provider.
+pub type ReservationOf<Platform, const ALIGN: usize> =
+    <<Platform as PageManagementProvider<ALIGN>>::Reservations as ReservationStore>::Reservation;
+
 bitflags::bitflags! {
     /// Permissions for a memory region
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,11 +137,12 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Placement behavior supported by [`FixedAddressBehavior::Hint`].
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
 
-    /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
+    /// Reserve and commit pages in one platform operation.
     ///
     /// # Parameters
     ///
     /// - `suggested_range`: A suggested address range for the allocation.
+    /// - `replaced_reservations`: Lazily supplies ownership handles replaced by this operation.
     /// - `initial_permissions`: The permissions to apply to the allocated memory region.
     /// - `can_grow_down`: If `true`, the region is allowed to grow downward (towards zero) upon
     ///   a page fault.
@@ -147,19 +152,121 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Returns
     ///
-    /// On success, returns a raw mutable pointer to the start of the allocated memory region.
+    /// On success, returns the exclusive reservation handle for the allocated extent.
     ///
     /// # Errors
     ///
-    /// Returns an [`AllocationError`] if the allocation fails.
-    fn allocate_pages(
+    /// Returns a [`ReserveAndCommitError`] if the combined operation is unsupported for this
+    /// request or the allocation fails.
+    ///
+    /// # Safety
+    ///
+    /// `suggested_range` must be nonempty, its start must be aligned to
+    /// [`Self::RESERVATION_ALIGNMENT`], and its end must be aligned to `ALIGN`. The caller must
+    /// authorize replacement when `fixed_address_behavior` is [`FixedAddressBehavior::Replace`]
+    /// and retain the returned reservation as the unique ownership handle for the allocated extent.
+    /// For replacement, `replaced_reservations` must yield every retained reservation being
+    /// replaced, transferring their ownership to the provider. Handle-free mappings transfer
+    /// ownership through the range and may yield no handles. For other placement modes, the
+    /// iterator must be empty. The provider must not invoke the supplier on recoverable failure.
+    unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
+    ) -> Result<ReservationOf<Self, ALIGN>, ReserveAndCommitError>
+    where
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>;
+
+    /// Reserve virtual address space and return its exclusive ownership handle.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure replacement is authorized when `fixed_address_behavior` is
+    /// [`FixedAddressBehavior::Replace`]. For replacement, `replaced_reservations` must yield every
+    /// retained reservation being replaced, transferring their ownership to the provider.
+    /// Handle-free mappings transfer ownership through the range and may yield no handles. For
+    /// other placement modes, the iterator must be empty. The provider must not invoke the
+    /// supplier on recoverable failure.
+    unsafe fn reserve_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: Range<usize>,
+        can_grow_down: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
+    where
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
+    {
+        let _ = (
+            replaced_reservations,
+            suggested_range,
+            can_grow_down,
+            fixed_address_behavior,
+        );
+        Err(AllocationError::UnsupportedByPlatform)
+    }
+
+    /// Commit backing within live reservations.
+    ///
+    /// # Safety
+    ///
+    /// The reservations must cover `range`, and the caller must exclude conflicting accesses.
+    unsafe fn commit_pages<'reservation, Reservations>(
+        &self,
+        covering_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+        populate_pages_immediately: bool,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
+        ReservationOf<Self, ALIGN>: 'reservation,
+    {
+        let _ = (
+            covering_reservations,
+            range,
+            permissions,
+            populate_pages_immediately,
+        );
+        Err(AllocationError::UnsupportedByPlatform)
+    }
+
+    /// Decommit backing within live reservations.
+    ///
+    /// # Safety
+    ///
+    /// The reservations must cover `range`, and the caller must exclude all users.
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        covering_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+    ) -> Result<(), DeallocationError>
+    where
+        Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
+        ReservationOf<Self, ALIGN>: 'reservation,
+    {
+        let _ = (covering_reservations, range);
+        Err(DeallocationError::UnsupportedByPlatform)
+    }
+
+    /// Update permissions within live reservations.
+    ///
+    /// # Safety
+    ///
+    /// The reservations must cover `range`, and the caller must exclude conflicting accesses.
+    unsafe fn protect_pages<'reservation, Reservations>(
+        &self,
+        covering_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), PermissionUpdateError>
+    where
+        Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
+        ReservationOf<Self, ALIGN>: 'reservation;
 
     /// Release all pages represented by `target`.
     ///
@@ -175,37 +282,31 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// ## Returns
     ///
-    /// On success it returns a pointer to the new virtual memory area.
+    /// On success it returns the exclusive reservation handle for the new virtual memory area.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that it is safe to move the `old_range` (i.e., these pages are not in
-    /// active use).
+    /// `source_reservations` must yield every retained reservation covering `old_range`,
+    /// transferring their ownership to the provider. Handle-free mappings transfer ownership
+    /// through `old_range` and may yield no handles. The provider must not invoke the supplier on
+    /// recoverable failure. The caller must ensure that the source pages are not in active use.
     ///
     /// The `new_range` must be larger than `old_range`, and must not overlap with `old_range`.
     ///
     /// Both ranges must be aligned to `ALIGN`.
     #[expect(unused_variables, reason = "default body")]
-    unsafe fn remap_pages(
+    unsafe fn try_remap_pages<Reservations>(
         &self,
+        source_reservations: impl FnOnce() -> Reservations,
         old_range: Range<usize>,
         new_range: Range<usize>,
         permissions: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+    ) -> Result<ReservationOf<Self, ALIGN>, RemapError>
+    where
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
+    {
         Err(RemapError::UnsupportedByPlatform)
     }
-
-    /// Update the permissions on pages in `range` to `new_permissions`.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that the permissions do not conflict with any currently active usage
-    /// of these pages.
-    unsafe fn update_permissions(
-        &self,
-        range: Range<usize>,
-        new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), PermissionUpdateError>;
 
     /// Return reserved pages that are not available for allocation.
     ///
@@ -220,14 +321,27 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The default implementation returns unsupported CoW. Platforms that DO support COW should
     /// override this method to unlock better performance.
+    /// On success, the returned reservation owns exactly `source_data.len()` bytes. Replacement
+    /// consumes every retained overlapping reservation supplied by `replaced_reservations`.
+    /// Recoverable failure must leave the supplier uninvoked. Other placement modes must not
+    /// invoke it.
+    ///
+    /// # Safety
+    ///
+    /// Replacement ownership follows [`Self::reserve_pages`]. The caller must track the returned
+    /// reservation directly and must not construct duplicate ownership from its range.
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
-    fn try_allocate_cow_pages(
+    unsafe fn try_allocate_cow_pages<Reservations>(
         &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_start: usize,
         source_data: &'static [u8],
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+    ) -> Result<ReservationOf<Self, ALIGN>, CowAllocationError>
+    where
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
+    {
         Err(CowAllocationError::UnsupportedByPlatform)
     }
 }
@@ -246,10 +360,12 @@ pub enum FixedAddressBehavior {
     NoReplace,
 }
 
-/// Possible errors for [`PageManagementProvider::allocate_pages`]
+/// Possible errors for page reservation and commitment.
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum AllocationError {
+    #[error("page reservation is not supported by this platform")]
+    UnsupportedByPlatform,
     #[error("provided range is not page-aligned")]
     Unaligned,
     #[error("provided address is below the minimum allowed address")]
@@ -266,17 +382,28 @@ pub enum AllocationError {
     AddressPartiallyInUse,
 }
 
+/// Possible errors for [`PageManagementProvider::reserve_and_commit_pages`].
+#[derive(Error, Debug)]
+pub enum ReserveAndCommitError {
+    #[error("combined reservation and commitment is not supported for this request")]
+    UnsupportedByPlatform,
+    #[error(transparent)]
+    Allocation(#[from] AllocationError),
+}
+
 /// Possible errors for [`PageManagementProvider::release_pages`]
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum DeallocationError {
+    #[error("page decommit is not supported by this platform")]
+    UnsupportedByPlatform,
     #[error("provided range is not page-aligned")]
     Unaligned,
     #[error("provided range contains unallocated pages")]
     AlreadyUnallocated,
 }
 
-/// Possible errors for [`PageManagementProvider::remap_pages`]
+/// Possible errors for [`PageManagementProvider::try_remap_pages`]
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum RemapError {
@@ -296,7 +423,7 @@ pub enum RemapError {
     OutOfMemory,
 }
 
-/// Possible errors for [`PageManagementProvider::update_permissions`]
+/// Possible errors for [`PageManagementProvider::protect_pages`]
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum PermissionUpdateError {
