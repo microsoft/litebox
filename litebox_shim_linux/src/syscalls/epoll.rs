@@ -76,9 +76,7 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         }
         Err(Errno::EBADF)
     }
-}
 
-impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
     /// Returns the interesting events now and monitors their occurrence in the future if the
     /// observer is provided.
     fn poll(
@@ -183,7 +181,7 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
             }
             DescriptorRef::Pipe(weak) => {
                 let handle = global.litebox.descriptor_table().upgrade(weak)?;
-                Some(handle.with_entry(|entry| entry.with_iopollable(poll)))
+                Some(handle.with_entry(|entry| poll(entry)))
             }
             DescriptorRef::Unix(weak) => {
                 let handle = global.litebox.descriptor_table().upgrade(weak)?;
