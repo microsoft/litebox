@@ -75,6 +75,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
 }
 
 /// A descriptor a pending child process can inherit through [`Process::inherit`].
+///
+/// This identifies only the object. The shim records guest-specific details, such as the
+/// descriptor number, in the child's startup payload alongside the handle `inherit` returns.
 pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// A file, adopted with [`LiteBox::adopt_inherited_file`].
     File(Arc<FileFd>),

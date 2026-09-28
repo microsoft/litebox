@@ -53,11 +53,15 @@ pub struct LinuxProgramStartup {
 
 /// A descriptor inherited across `execve`, as Linux keeps every descriptor not marked
 /// close-on-exec.
+///
+/// This is the Linux startup record for a descriptor whose object the parent passed to the child
+/// as a [`litebox::process::InheritableFd`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InheritedFd {
     /// Descriptor number.
     pub fd: u32,
-    /// The child's broker handle to the descriptor's object.
+    /// The child's broker handle to the descriptor's object, as returned by
+    /// [`litebox::process::Process::inherit`].
     ///
     /// Descriptors with the same handle share one open file description, whose kind and metadata
     /// are taken from the first of them.
