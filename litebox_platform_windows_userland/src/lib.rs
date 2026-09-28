@@ -587,6 +587,7 @@ impl XsaveArea {
         // Standard XRSTOR loads MXCSR even when XSTATE_BV marks SSE as initial.
         unsafe {
             (*area
+                .storage
                 .as_mut_ptr()
                 .cast::<windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT>())
             .MxCsr = Self::GUEST_INITIAL_MXCSR;
@@ -654,7 +655,8 @@ impl XsaveArea {
     ) -> windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT {
         use windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT;
 
-        let saved = unsafe { self.as_ptr().cast::<XSAVE_FORMAT>().read() };
+        // SAFETY: `storage` is 64-byte aligned and initialized for at least the legacy XSAVE area.
+        let saved = unsafe { self.storage.as_ptr().cast::<XSAVE_FORMAT>().read() };
         let mut state = XSAVE_FORMAT {
             ControlWord: Self::GUEST_INITIAL_X87_CONTROL_WORD,
             MxCsr: saved.MxCsr,
