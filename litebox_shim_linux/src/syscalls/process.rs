@@ -3,7 +3,6 @@
 
 //! Process/thread related syscalls.
 
-use crate::syscalls::file::ExecInheritedFd;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
 use alloc::collections::btree_map::BTreeMap;
@@ -21,15 +20,12 @@ use litebox::event::{Events, IOPollable as _};
 use litebox::mm::vmem::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
-use litebox::process::InheritableFd;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
-    errno::Errno,
-    program_startup::{InheritedFd, LinuxProgramStartup},
+    errno::Errno, program_startup::LinuxProgramStartup,
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
@@ -1939,7 +1935,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .resolve_path(path.as_str())?
             .into_string()
             .map_err(|_| Errno::EINVAL)?;
-        let inherited = self.fds_inherited_across_exec()?;
+        let (inherited_fds, fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
+            self.fds_inherited_across_exec()?.into_iter().unzip();
         let mut startup = LinuxProgramStartup {
             parent_process_id: self.pid,
             uid: self.credentials.uid,
@@ -1951,29 +1948,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             path,
             argv,
             envp,
-            inherited_fds: inherited
-                .iter()
-                .map(|(fd, inherited)| {
-                    Ok(InheritedFd {
-                        fd: *fd,
-                        // Replaced by the child's handle once the startup fits.
-                        handle: ObjectHandle::default(),
-                        kind: inherited.kind(&self.global)?,
-                    })
-                })
-                .collect::<Result<_, Errno>>()?,
+            inherited_fds,
         };
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::E2BIG)?;
         let vfork = self.vfork.borrow();
         let child = &vfork.as_ref().expect("vfork transfer lost its child").child;
-        let fds: alloc::vec::Vec<_> = inherited
-            .iter()
-            .map(|(_, inherited)| match inherited {
-                ExecInheritedFd::File(file) => InheritableFd::File(file),
-                ExecInheritedFd::Pipe(pipe) => InheritableFd::Pipe(pipe),
-            })
-            .collect();
         let handles = child
             .inherit(&self.global.litebox, &fds)
             .map_err(Errno::from)?;

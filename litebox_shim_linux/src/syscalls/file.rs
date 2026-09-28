@@ -14,16 +14,20 @@ use litebox::{
     fs::errors::OpenError,
     mm::vmem::PAGE_SIZE,
     path,
+    process::InheritableFd,
     stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
     FileType, FileUser,
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam, errno::Errno,
+    InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam,
+    errno::Errno,
+    program_startup::{InheritedFd, InheritedFdKind},
     signal::Signal,
 };
 use thiserror::Error;
@@ -223,10 +227,8 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     pub(crate) fn install_inherited_fds(
         &self,
         global: &GlobalState<Platform>,
-        inherited_fds: &[litebox_common_linux::program_startup::InheritedFd],
+        inherited_fds: &[InheritedFd],
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        use litebox_common_linux::program_startup::InheritedFdKind;
-
         let litebox = &global.litebox;
         let max_fd = self.max_fd.load(Ordering::Relaxed);
         // The first descriptor of each inherited open file description.
@@ -305,40 +307,6 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             .fd_into_specific_raw_integer(fd, raw_fd);
         assert!(success);
         Ok(())
-    }
-}
-
-/// A descriptor a fresh runner can inherit across `execve`.
-pub(crate) enum ExecInheritedFd<Platform: ShimPlatform> {
-    File(alloc::sync::Arc<FileFd>),
-    Pipe(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
-}
-
-impl<Platform: ShimPlatform> ExecInheritedFd<Platform> {
-    /// Describes this descriptor for the fresh runner inheriting it.
-    pub(crate) fn kind(
-        &self,
-        global: &GlobalState<Platform>,
-    ) -> Result<litebox_common_linux::program_startup::InheritedFdKind, Errno> {
-        use litebox_common_linux::program_startup::InheritedFdKind;
-
-        match self {
-            Self::File(file) => {
-                let descriptors = global.litebox.descriptor_table();
-                let Ok(stream) = descriptors.with_metadata(&**file, |stream: &StdioStream| *stream)
-                else {
-                    return Ok(InheritedFdKind::File);
-                };
-                let status_flags = descriptors
-                    .with_metadata(&**file, |crate::StdioStatusFlags(flags)| *flags)
-                    .ok();
-                Ok(InheritedFdKind::Stdio {
-                    stream,
-                    status_flags,
-                })
-            }
-            Self::Pipe(pipe) => global.inherited_linux_pipe_kind(pipe),
-        }
     }
 }
 
@@ -531,6 +499,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Returns the descriptors a fresh runner inherits across `execve`, which are those not marked
     /// close-on-exec, in ascending order.
     ///
+    /// Each is returned as its startup record, whose handle the caller replaces with the child's,
+    /// and the object the child inherits.
+    ///
     /// Linux keeps every such descriptor, whatever it refers to. A fresh runner can share only
     /// objects the broker holds, and not all of those yet, so this fails with `EAGAIN` if one of
     /// them is:
@@ -548,7 +519,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// the other.
     pub(crate) fn fds_inherited_across_exec(
         &self,
-    ) -> Result<alloc::vec::Vec<(u32, ExecInheritedFd<Platform>)>, Errno> {
+    ) -> Result<alloc::vec::Vec<(InheritedFd, InheritableFd<Platform>)>, Errno> {
         let files = self.files.borrow();
         let alive_fds: alloc::vec::Vec<usize> =
             files.raw_descriptor_store.read().iter_alive().collect();
@@ -564,24 +535,37 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if raw_fd - next_fd > MAX_INHERITED_FD_GAP {
                 return Err(Errno::EAGAIN);
             }
-            let fd = match fd {
+            let (kind, object) = match fd {
                 AnyTypedFd::Fs(file) => {
-                    if self
-                        .global
-                        .litebox
-                        .descriptor_table()
-                        .with_metadata(&file, |_: &Diroff| ())
-                        .is_ok()
-                    {
+                    let descriptors = self.global.litebox.descriptor_table();
+                    if descriptors.with_metadata(&file, |_: &Diroff| ()).is_ok() {
                         return Err(Errno::EAGAIN);
                     }
-                    ExecInheritedFd::File(file)
+                    let kind =
+                        match descriptors.with_metadata(&file, |stream: &StdioStream| *stream) {
+                            Ok(stream) => InheritedFdKind::Stdio {
+                                stream,
+                                status_flags: descriptors
+                                    .with_metadata(&file, |crate::StdioStatusFlags(flags)| *flags)
+                                    .ok(),
+                            },
+                            Err(_) => InheritedFdKind::File,
+                        };
+                    (kind, InheritableFd::File(file))
                 }
-                AnyTypedFd::Pipes(pipe) => ExecInheritedFd::Pipe(pipe),
+                AnyTypedFd::Pipes(pipe) => (
+                    self.global.inherited_linux_pipe_kind(&pipe)?,
+                    InheritableFd::Pipe(pipe),
+                ),
                 _ => return Err(Errno::EAGAIN),
             };
             next_fd = raw_fd + 1;
-            inherited.push((u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?, fd));
+            let inherited_fd = InheritedFd {
+                fd: u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?,
+                handle: ObjectHandle::default(),
+                kind,
+            };
+            inherited.push((inherited_fd, object));
         }
         Ok(inherited)
     }

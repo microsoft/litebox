@@ -103,11 +103,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
 }
 
 /// A descriptor a pending child process can inherit through [`Process::inherit`].
-pub enum InheritableFd<'fd, Platform: RawSyncPrimitivesProvider + TimeProvider> {
+pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     /// A file, adopted with [`LiteBox::adopt_inherited_file`].
-    File(&'fd FileFd),
+    File(Arc<FileFd>),
     /// A pipe end, adopted with [`LiteBox::adopt_inherited_pipe`].
-    Pipe(&'fd PipeFd<Platform>),
+    Pipe(Arc<PipeFd<Platform>>),
 }
 
 /// Termination state of a child process.
@@ -181,7 +181,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     pub fn inherit(
         &self,
         litebox: &LiteBox<Platform>,
-        fds: &[InheritableFd<'_, Platform>],
+        fds: &[InheritableFd<Platform>],
     ) -> Result<Vec<ObjectHandle>, ProcessError> {
         // Holding the objects keeps their handles open until the child has its own.
         let mut held_files = Vec::new();

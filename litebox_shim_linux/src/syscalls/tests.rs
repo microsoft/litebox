@@ -812,7 +812,7 @@ fn exec_inherits_only_transferable_descriptors() {
     let inherited = || {
         task.fds_inherited_across_exec().map(|fds| {
             fds.into_iter()
-                .map(|(fd, _)| fd)
+                .map(|(inherited, _)| inherited.fd)
                 .collect::<alloc::vec::Vec<_>>()
         })
     };
