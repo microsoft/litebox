@@ -6,14 +6,12 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use litebox::{
-    mm::vmem::{MappingError, PAGE_SIZE},
-    platform::page_mgmt::MemoryRegionPermissions,
-};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::{
     HOST_PAGE_SIZE, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
+    vmem::{MappingError, PAGE_SIZE},
 };
 
 use crate::FileFd;
@@ -25,9 +23,9 @@ use crate::syscalls::file::AnyTypedFd;
 use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use core::ops::Range;
-#[cfg(target_arch = "aarch64")]
-use litebox::mm::vmem::VmFlags;
 use litebox::utils::TruncateExt as _;
+#[cfg(target_arch = "aarch64")]
+use litebox_common_linux::vmem::VmFlags;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
 use zerocopy::FromBytes as _;
@@ -284,15 +282,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ensure_space_after: bool,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
-        litebox_common_linux::mm::do_mmap(
-            &self.global.pm,
-            suggested_addr,
-            len,
-            prot,
-            flags,
-            ensure_space_after,
-            op,
-        )
+        self.global
+            .mm
+            .do_mmap(suggested_addr, len, prot, flags, ensure_space_after, op)
     }
 
     #[inline]
@@ -493,7 +485,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// patching logic to avoid deadlocks (the patch path holds elf_patch_cache).
     #[inline]
     fn sys_munmap_raw(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_munmap(&self.global.pm, addr, len)
+        self.global.mm.sys_munmap(addr, len)
     }
 
     /// Clear `file_mappings` entries for any segments that overlap the
@@ -617,7 +609,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_mprotect(&self.global.pm, addr, len, prot)
+        self.global.mm.sys_mprotect(addr, len, prot)
     }
 
     fn restore_page_permissions(&self, protections: &[ProtectionRange]) -> Result<(), Errno> {
@@ -642,20 +634,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        litebox_common_linux::mm::sys_mremap(
-            &self.global.pm,
-            old_addr,
-            old_size,
-            new_size,
-            flags,
-            new_addr,
-        )
+        self.global
+            .mm
+            .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
     }
 
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
-        litebox_common_linux::mm::sys_brk(&self.global.pm, addr)
+        unsafe {
+            self.global
+                .mm
+                .brk(addr.as_usize())
+                .or_else(|_| self.global.mm.brk(0))
+        }
+        .map_err(Errno::from)
     }
 
     /// Handle syscall `madvise`
@@ -666,7 +659,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
-        litebox_common_linux::mm::sys_madvise(&self.global.pm, addr, len, advice)
+        self.global.mm.sys_madvise(addr, len, advice)
     }
 
     // ── Runtime ELF syscall patching ─────────────────────────────────────
@@ -682,7 +675,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let mprotect_start = addr.as_usize();
         let mprotect_end = mprotect_start.saturating_add(len);
-        let mappings = self.global.pm.mappings();
+        let mappings = self.global.mm.mappings();
 
         // Find unpatched file mappings that overlap this mprotect range.
         // Preserve the VMA boundaries for restoration without splitting the
@@ -1034,7 +1027,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return true;
         }
-        for (range, flags) in self.global.pm.mappings() {
+        for (range, flags) in self.global.mm.mappings() {
             if range.end <= start || range.start >= end {
                 continue;
             }
@@ -1690,14 +1683,15 @@ mod tests {
     use alloc::collections::BTreeSet;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox::platform::PageManagementProvider;
-    use litebox::{
-        mm::vmem::{NonZeroAddress, NonZeroPageSize},
-        platform::page_mgmt::MemoryRegionPermissions,
-    };
+    use litebox::platform::page_mgmt::MemoryRegionPermissions;
     use litebox_broker_protocol::fs::FileMode as Mode;
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
-    use litebox_common_linux::{MapFlags, OFlags, ProtFlags, errno::Errno};
+    use litebox_common_linux::{
+        MapFlags, OFlags, ProtFlags,
+        errno::Errno,
+        vmem::{NonZeroAddress, NonZeroPageSize},
+    };
 
     use crate::UserPtrMut;
     use crate::syscalls::file::AnyTypedFd;

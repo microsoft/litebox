@@ -612,13 +612,13 @@ mod tests {
     use super::*;
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
-    use litebox::mm::vmem::PAGE_SIZE;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::loader::{ElfParsedFile, MapMemory, Protection, ReadAt};
+    use litebox_common_linux::vmem::PAGE_SIZE;
 
     const R: Perm = Perm::READ;
     const RW: Perm = Perm::READ.union(Perm::WRITE);

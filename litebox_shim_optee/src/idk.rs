@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 use crate::NormalWorldMutPtr;
-use litebox::{LiteBox, mm::vmem::PAGE_SIZE, utils::TruncateExt};
-use litebox_common_linux::errno::Errno;
+use litebox::{LiteBox, utils::TruncateExt};
+use litebox_common_linux::{errno::Errno, vmem::PAGE_SIZE};
 use num_enum::TryFromPrimitive;
 use p384::{NonZeroScalar, elliptic_curve::sec1::ToEncodedPoint};
 use spin::Once;

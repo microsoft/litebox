@@ -12,17 +12,16 @@ use crate::loader::elf::ElfLoaderError;
 use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
 use alloc::{sync::Arc, vec};
-use core::cell::Cell;
+use core::{cell::Cell, ops::Deref};
 use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
 use litebox::{
     LiteBox,
-    mm::{PageManager, vmem::PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
+use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, mm::VmemManager, vmem::PAGE_SIZE};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
     TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
@@ -48,7 +47,7 @@ pub trait OpteeShimPlatform:
     litebox::platform::RawPointerProvider
     + litebox_platform::time::TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox::mm::vmem::VmemPageFaultHandler
+    + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox_platform::sync::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::SystemInfoProvider
@@ -63,7 +62,7 @@ impl<T> OpteeShimPlatform for T where
     T: litebox::platform::RawPointerProvider
         + litebox_platform::time::TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox::mm::vmem::VmemPageFaultHandler
+        + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox_platform::sync::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::SystemInfoProvider
@@ -72,6 +71,30 @@ impl<T> OpteeShimPlatform for T where
         + litebox_common_linux::vmap::VmapManager<{ PAGE_SIZE }>
         + 'static
 {
+}
+
+// OP-TEE-specific memory manager.
+
+/// OP-TEE memory manager.
+pub struct MemoryManager<Platform: OpteeShimPlatform> {
+    vmem: VmemManager<Platform, PAGE_SIZE>,
+}
+
+impl<Platform: OpteeShimPlatform> MemoryManager<Platform> {
+    /// Creates a memory manager for `litebox`.
+    pub fn new(platform: &'static Platform) -> Self {
+        Self {
+            vmem: VmemManager::new(platform),
+        }
+    }
+}
+
+impl<Platform: OpteeShimPlatform> Deref for MemoryManager<Platform> {
+    type Target = VmemManager<Platform, PAGE_SIZE>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vmem
+    }
 }
 
 pub struct OpteeShimEntrypoints<Platform: OpteeShimPlatform> {
@@ -105,7 +128,7 @@ impl<Platform: OpteeShimPlatform> litebox::shim::EnterShim for OpteeShimEntrypoi
             let result = unsafe {
                 self.task
                     .global
-                    .pm
+                    .mm
                     .handle_page_fault(info.cr2, info.error_code.into())
             };
             if info.kernel_mode {
@@ -188,7 +211,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             platform: self.platform,
             session_manager: self.session_manager,
             boot_instant: TimeProvider::now(self.platform),
-            pm: PageManager::new(&self.litebox),
+            mm: MemoryManager::new(self.platform),
             litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
@@ -207,8 +230,8 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// arbitrary origin for GP "system time" (`TEE_GetSystemTime`).
     /// See [`GlobalState::system_time`].
     boot_instant: <Platform as TimeProvider>::Instant,
-    /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The memory manager for managing virtual memory.
+    mm: MemoryManager<Platform>,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
@@ -332,7 +355,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
                 entrypoints.task.get_ta_stack_base_addr(),
             )
             .ok_or(loader::elf::ElfLoaderError::MappingError(
-                litebox::mm::vmem::MappingError::OutOfMemory,
+                litebox_common_linux::vmem::MappingError::OutOfMemory,
             ))?;
             Some(ta_stack.get_params_address())
         } else {
@@ -359,9 +382,9 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         self.0.session_manager
     }
 
-    /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self.0.pm
+    /// Returns the global memory manager.
+    pub fn memory_manager(&self) -> &MemoryManager<Platform> {
+        &self.0.mm
     }
 
     /// Store a TA binary associated with the given TA UUID.
@@ -387,9 +410,9 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// The caller must ensure that no references to the released memory regions
     /// are held after this call.
     pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox::mm::vmem::VmFlags| true;
+        let release = |_r: core::ops::Range<usize>, _vm: litebox_common_linux::vmem::VmFlags| true;
         unsafe {
-            let _ = self.page_manager().release_memory(release);
+            let _ = self.memory_manager().release_memory(release);
         }
     }
 }
@@ -890,7 +913,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
             let mut elf_loader = loader::elf::ElfLoader::new(self, &ta_bin, false)?;
             elf_loader.load_ta_trampoline(ta_entry_point)?;
             self.allocate_guest_tls(None).map_err(|_| {
-                ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory)
+                ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory)
             })?;
             self.ta_prepared.set(true);
         }
@@ -900,7 +923,7 @@ impl<Platform: OpteeShimPlatform> Task<Platform> {
 
         let mut ta_stack =
             crate::loader::ta_stack::allocate_stack(self, self.get_ta_stack_base_addr()).ok_or(
-                ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory),
+                ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory),
             )?;
         let mut stack_canary = [0; 16];
         self.global.litebox.fill_random(&mut stack_canary)?;

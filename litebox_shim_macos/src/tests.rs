@@ -4,8 +4,8 @@
 extern crate std;
 
 use super::*;
-use litebox::mm::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
 use litebox::platform::{RawConstPointer as _, page_mgmt::MemoryRegionPermissions as Permissions};
+use litebox_common_linux::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {

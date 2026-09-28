@@ -18,7 +18,6 @@ use litebox::{
         wait::{WaitContext, WaitError},
     },
     fd::EntryHandle,
-    mm::vmem::PAGE_SIZE,
     net::{
         CloseBehavior, SOCKET_RECEIVE_OPERATION_SIZE, TcpOptionData,
         errors::AcceptError,
@@ -33,6 +32,7 @@ use litebox_common_linux::{
     SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr,
     UserMsgHdr, errno::Errno, signal::Signal,
 };
+use litebox_common_linux::{mm::VmemManager, vmem::PAGE_SIZE};
 use litebox_platform::time::Instant as _;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -1669,7 +1669,7 @@ fn copy_iovs_to_vec<Platform: ShimPlatform>(
 }
 
 fn user_write_prefix<Platform: ShimPlatform>(
-    page_manager: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+    page_manager: &VmemManager<Platform, PAGE_SIZE>,
     ptr: UserPtrMut<u8>,
     offset: usize,
     len: usize,
@@ -1680,7 +1680,7 @@ fn user_write_prefix<Platform: ShimPlatform>(
 }
 
 fn iov_write_prefix<Platform: ShimPlatform>(
-    page_manager: &litebox::mm::PageManager<Platform, PAGE_SIZE>,
+    page_manager: &VmemManager<Platform, PAGE_SIZE>,
     iovs: &[litebox_common_linux::IoVec],
     mut skip: usize,
     mut len: usize,
@@ -2067,7 +2067,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let reported = loop {
             let requested_chunk_len = (len - received).min(buffer.len());
             let write_prefix = (preflight_stream && copy_received && requested_chunk_len != 0)
-                .then(|| user_write_prefix(&self.global.pm, buf, received, requested_chunk_len));
+                .then(|| user_write_prefix(&self.global.mm, buf, received, requested_chunk_len));
             let needs_probe = write_prefix.as_ref().is_some_and(
                 |prefix| !matches!(prefix, Ok(prefix) if *prefix == requested_chunk_len),
             );
@@ -2353,7 +2353,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let requested_chunk_len = (total_iov_capacity - total_received).min(buffer.len());
             let write_prefix = (preflight_stream && copy_received && requested_chunk_len != 0)
                 .then(|| {
-                    iov_write_prefix(&self.global.pm, &iovs, total_received, requested_chunk_len)
+                    iov_write_prefix(&self.global.mm, &iovs, total_received, requested_chunk_len)
                 });
             let needs_probe = write_prefix.as_ref().is_some_and(
                 |prefix| !matches!(prefix, Ok(prefix) if *prefix == requested_chunk_len),

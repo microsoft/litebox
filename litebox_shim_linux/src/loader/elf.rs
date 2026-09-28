@@ -4,13 +4,14 @@
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, vec::Vec};
-use litebox::{
-    mm::vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmFlags},
-    platform::PageManagementProvider,
-    utils::ReinterpretSignedExt,
-};
+use litebox::{platform::PageManagementProvider, utils::ReinterpretSignedExt};
 use litebox_broker_protocol::fs::FileMode as Mode;
-use litebox_common_linux::{MapFlags, OFlags, errno::Errno, loader::ElfParsedFile};
+use litebox_common_linux::{
+    MapFlags, OFlags,
+    errno::Errno,
+    loader::ElfParsedFile,
+    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmFlags},
+};
 use thiserror::Error;
 
 use crate::{
@@ -37,8 +38,8 @@ fn find_bottom_up_gap<Platform: ShimPlatform>(
         return None;
     }
 
-    // PageManager::mappings() is ordered by ascending start address.
-    for (range, flags) in task.global.pm.mappings() {
+    // MemoryManager::mappings() is ordered by ascending start address.
+    for (range, flags) in task.global.mm.mappings() {
         let protected_start = if flags.contains(VmFlags::VM_GROWSDOWN) {
             range.start.saturating_sub(STACK_GUARD_GAP << 1)
         } else {
@@ -162,7 +163,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
             .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
             .and_then(|len| {
                 len.checked_add(if self.reserve_runtime_trampoline {
-                    litebox::mm::vmem::DEFAULT_RESERVED_SPACE_SIZE
+                    litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE
                 } else {
                     0
                 })
@@ -336,7 +337,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // embedded trampoline, reserve space so that brk starts past the
         // runtime trampoline region.
         let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
-            Some(litebox::mm::vmem::DEFAULT_RESERVED_SPACE_SIZE)
+            Some(litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE)
         } else {
             None
         };
@@ -405,7 +406,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
             None
         };
 
-        global.pm.set_initial_brk(info.brk);
+        global.mm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
@@ -419,10 +420,11 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         };
 
         let sp = unsafe {
-            let length = litebox::mm::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
-                .expect("DEFAULT_STACK_SIZE is not page-aligned");
+            let length =
+                litebox_common_linux::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+                    .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
-                .pm
+                .mm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
@@ -725,14 +727,14 @@ mod tests {
         // A grow-down mapping protects its guard gap below the mapped pages.
         // Bottom-up placement must skip the guard and the stack itself.
         let stack_start = hint + (STACK_GUARD_GAP << 1);
-        let stack_address = litebox::mm::vmem::NonZeroAddress::new(stack_start).unwrap();
-        let stack_len = litebox::mm::vmem::NonZeroPageSize::new(PAGE_SIZE).unwrap();
+        let stack_address = litebox_common_linux::vmem::NonZeroAddress::new(stack_start).unwrap();
+        let stack_len = litebox_common_linux::vmem::NonZeroPageSize::new(PAGE_SIZE).unwrap();
         // SAFETY: FIXED_ADDR is paired with NOREPLACE, so this cannot replace
         // an existing mapping. The test does not retain or access the returned
         // pointer and unmaps the exact range before continuing.
         unsafe {
             task.global
-                .pm
+                .mm
                 .create_stack_pages(
                     Some(stack_address),
                     stack_len,

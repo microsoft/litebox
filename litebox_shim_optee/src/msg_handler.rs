@@ -20,11 +20,10 @@ use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use hashbrown::{HashMap, HashSet};
 use litebox::{
-    mm::vmem::PAGE_SIZE,
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt,
 };
-use litebox_common_linux::vmap::PhysPageAddr;
+use litebox_common_linux::{vmap::PhysPageAddr, vmem::PAGE_SIZE};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
     OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,

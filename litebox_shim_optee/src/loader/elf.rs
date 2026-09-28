@@ -19,7 +19,6 @@
 //! mapping in the future.
 use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
 use litebox::{
-    mm::vmem::{MappingError, PAGE_SIZE},
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt,
 };
@@ -27,6 +26,7 @@ use litebox_common_linux::{
     MapFlags, ProtFlags,
     errno::Errno,
     loader::{ElfParseError, ElfParsedFile},
+    vmem::{MappingError, PAGE_SIZE},
 };
 use litebox_common_optee::{LdelfArg, TeeUuid};
 use thiserror::Error;
@@ -274,7 +274,7 @@ impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
                 .load(&mut self.main.file, &mut &*global.platform, None)?;
 
         let mut ta_stack = crate::loader::ta_stack::allocate_stack(task, None).ok_or(
-            ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory),
+            ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory),
         )?;
         ta_stack
             .init_with_ldelf_arg(ldelf_arg)
@@ -303,7 +303,9 @@ impl<'a, Platform: crate::OpteeShimPlatform> ElfLoader<'a, Platform> {
         self.main
             .parsed
             .load_secondary_trampoline(&mut self.main.file, &mut &*global.platform, ta_entry_point)
-            .map_err(|_| ElfLoaderError::MappingError(litebox::mm::vmem::MappingError::OutOfMemory))
+            .map_err(|_| {
+                ElfLoaderError::MappingError(litebox_common_linux::vmem::MappingError::OutOfMemory)
+            })
     }
 }
 

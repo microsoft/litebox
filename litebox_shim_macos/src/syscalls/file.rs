@@ -291,7 +291,6 @@ mod tests {
     use crate::{MAX_KERNEL_BUF_SIZE, MacosShimBuilder, Process};
     use alloc::vec;
     use core::sync::atomic::AtomicI32;
-    use litebox::mm::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -308,6 +307,7 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileUser,
     };
+    use litebox_common_linux::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize};
     use litebox_common_macos::{
         MmapFlags, PAGE_SIZE, PtRegs, TaskParams, VmProtection, syscall::nr,
     };

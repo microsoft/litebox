@@ -3,9 +3,9 @@
 
 use arrayvec::ArrayVec;
 use core::ops::Range;
-use litebox::mm::vmem::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use litebox::platform::page_mgmt;
 use litebox::utils::TruncateExt;
+use litebox_common_linux::vmem::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{
@@ -132,7 +132,7 @@ impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
 
 pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
     let mut flags = PageTableFlags::empty();
-    if values.intersects(VmFlags::VM_READ | VmFlags::VM_WRITE) {
+    if values.intersects(VmFlags::VM_ACCESS_FLAGS) {
         flags |= PageTableFlags::USER_ACCESSIBLE;
     }
     if values.contains(VmFlags::VM_WRITE) {

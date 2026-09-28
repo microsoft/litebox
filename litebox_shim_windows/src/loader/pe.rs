@@ -7,13 +7,13 @@ use core::{
     marker::PhantomData,
     mem::{align_of, size_of},
 };
+use litebox::platform::RawPointerProvider;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt as _;
-use litebox::{
-    mm::vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError},
-    platform::RawPointerProvider,
-};
 use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
+use litebox_common_linux::vmem::{
+    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmemProtectError,
+};
 use litebox_common_windows::loader::{
     AccessMemory, Fault, KiUserInvertedFunctionTableEntry, KiUserInvertedFunctionTableHeader,
     MAXIMUM_INVERTED_FUNCTION_TABLE_SIZE, MapMemory, MappingInfo, PAGE_SIZE, PeExportError,
@@ -2554,7 +2554,9 @@ mod tests {
         // Process environment construction only writes guest memory, so this needs no files and
         // uses the objectless broker association.
         let (litebox, _) = crate::test_broker::litebox(crate::tests::test_platform());
-        let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(&litebox);
+        let page_manager = crate::WindowsPageManager::<crate::tests::TestPlatform>::new(
+            crate::tests::test_platform(),
+        );
         let image = loaded_module_image(application_module_base());
 
         let image_base_address = image.mapping.base_addr;

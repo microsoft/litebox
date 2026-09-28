@@ -17,10 +17,10 @@ use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::{
     LiteBox,
-    mm::PageManager,
     platform::PageManagementProvider,
     sync::{Mutex, RawSyncPrimitivesProvider},
 };
+use litebox_common_linux::{mm::VmemManager, vmem::VmFlags};
 use litebox_common_macos::{
     KernReturn, PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
     VmProtection, errno::Errno, loader::MachoLoaderError,
@@ -94,7 +94,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
         MacosShim {
             global: Arc::new(GlobalState {
                 platform: self.platform,
-                pm: PageManager::new(&self.litebox),
+                pm: VmemManager::new(self.platform),
                 litebox: self.litebox,
                 macho_mappings: Mutex::new(BTreeMap::new()),
                 macho_trampolines: Mutex::new(BTreeMap::new()),
@@ -379,7 +379,7 @@ pub struct MacosShimEntrypoints<P: ShimPlatform> {
 struct GlobalState<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
-    pm: PageManager<P, PAGE_SIZE>,
+    pm: VmemManager<P, PAGE_SIZE>,
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
     shared_cache_base: AtomicUsize,
@@ -395,7 +395,7 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
         // are executing or borrowed. Vmem's platform reservations have empty
         // flags; our anonymous mappings have VM_MAY_ACCESS_FLAGS, even guards.
         for (range, flags) in self.pm.mappings() {
-            if !flags.intersects(litebox::mm::vmem::VmFlags::VM_MAY_ACCESS_FLAGS) {
+            if !flags.intersects(VmFlags::VM_MAY_ACCESS_FLAGS) {
                 continue;
             }
             let ptr = litebox_common_macos::user_pointers::UserPtrMut::from_usize(range.start)
