@@ -1025,7 +1025,7 @@ pub enum MappingError {
     MapError(#[from] litebox::platform::page_mgmt::AllocationError),
 }
 
-/// Enable [`super::PageManager`] to handle page faults if its platform implements this trait
+/// Enable [`crate::mm::VmemManager`] to handle page faults if its platform implements this trait.
 pub trait VmemPageFaultHandler {
     /// Handle a page fault for the given address.
     ///
