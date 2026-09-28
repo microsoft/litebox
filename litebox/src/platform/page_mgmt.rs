@@ -5,8 +5,6 @@
 
 use alloc::vec::Vec;
 
-use crate::platform::{RawConstPointer as _, RawMutPointer as _};
-
 use super::RawPointerProvider;
 use core::ops::Range;
 use thiserror::Error;
@@ -190,76 +188,14 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// The `new_range` must be larger than `old_range`, and must not overlap with `old_range`.
     ///
     /// Both ranges must be aligned to `ALIGN`.
+    #[expect(unused_variables, reason = "default body")]
     unsafe fn remap_pages(
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
         permissions: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, RemapError>
-    where
-        ReleaseTargetOf<Self, ALIGN>: From<Range<usize>>,
-    {
-        debug_assert!(old_range.start.is_multiple_of(ALIGN));
-        debug_assert!(new_range.start.is_multiple_of(ALIGN));
-        debug_assert!(old_range.len().is_multiple_of(ALIGN));
-        debug_assert!(new_range.len().is_multiple_of(ALIGN));
-        debug_assert!(new_range.len() > old_range.len());
-        debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
-        // Default implementation: allocate new pages, copy data, release old pages
-        let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
-        let new_ptr = self
-            .allocate_pages(
-                new_range.clone(),
-                temp_permissions,
-                false,
-                true,
-                FixedAddressBehavior::NoReplace,
-            )
-            .map_err(|e| match e {
-                AllocationError::OutOfMemory => RemapError::OutOfMemory,
-                AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
-                    RemapError::AlreadyAllocated
-                }
-                AllocationError::Unaligned
-                | AllocationError::BelowMinAddress
-                | AllocationError::AboveMaxAddress
-                | AllocationError::AddressPartiallyInUse => unreachable!(),
-            })?;
-
-        // Copy memory from old range to new range
-        if !permissions.contains(MemoryRegionPermissions::READ) {
-            (unsafe {
-                self.update_permissions(
-                    old_range.clone(),
-                    permissions | MemoryRegionPermissions::READ,
-                )
-            })
-            .expect("failed to update permissions on old range for copying");
-        }
-        // Copy in chunks of ALIGN bytes to handle very large memory regions
-        let total_len = old_range.len();
-        let mut offset = 0;
-        while offset < total_len {
-            let chunk_len = (total_len - offset).min(ALIGN);
-            let old_ptr =
-                <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start + offset);
-            new_ptr
-                .write_slice_at_offset(
-                    isize::try_from(offset).unwrap(),
-                    &old_ptr.to_owned_slice(chunk_len).unwrap(),
-                )
-                .unwrap();
-            offset += ALIGN;
-        }
-
-        if temp_permissions != permissions {
-            (unsafe { self.update_permissions(new_range.clone(), permissions) })
-                .expect("failed to restore permissions on new range");
-        }
-
-        (unsafe { self.release_pages(old_range.into()) }).expect("failed to release old range");
-
-        Ok(new_ptr)
+    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
+        Err(RemapError::UnsupportedByPlatform)
     }
 
     /// Update the permissions on pages in `range` to `new_permissions`.
