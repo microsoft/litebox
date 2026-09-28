@@ -55,7 +55,7 @@ pub extern "C" fn page_fault_handler(pt_regs: &mut litebox_common_linux::PtRegs)
     let shim = SHIM.get().expect("initialized");
 
     match unsafe {
-        shim.page_manager()
+        shim.memory_manager()
             .handle_page_fault(addr.trunc(), code as u64)
     } {
         Ok(()) => (),

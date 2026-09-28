@@ -106,16 +106,16 @@ impl<T> ShimPlatform for T where
 {
 }
 
-// Linux-specific page manager state and behavior.
+// Linux-specific memory manager state and behavior.
 
-/// Linux page manager.
-pub struct PageManager<Platform: ShimPlatform> {
+/// Linux memory manager.
+pub struct MemoryManager<Platform: ShimPlatform> {
     vmem: VmemManager<Platform, PAGE_SIZE>,
     brk: Mutex<Platform, usize>,
 }
 
-impl<Platform: ShimPlatform> PageManager<Platform> {
-    /// Creates a page manager for `litebox`.
+impl<Platform: ShimPlatform> MemoryManager<Platform> {
+    /// Creates a memory manager for `litebox`.
     pub fn new(platform: &'static Platform) -> Self {
         Self {
             vmem: VmemManager::new(platform),
@@ -200,7 +200,7 @@ impl<Platform: ShimPlatform> PageManager<Platform> {
     }
 }
 
-impl<Platform: ShimPlatform> Deref for PageManager<Platform> {
+impl<Platform: ShimPlatform> Deref for MemoryManager<Platform> {
     type Target = VmemManager<Platform, PAGE_SIZE>;
 
     fn deref(&self) -> &Self::Target {
@@ -252,7 +252,7 @@ impl<Platform: ShimPlatform> litebox::shim::EnterShim for LinuxShimEntrypoints<P
             if unsafe {
                 self.task
                     .global
-                    .pm
+                    .mm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
             .is_ok()
@@ -326,7 +326,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(self.platform),
+            mm: MemoryManager::new(self.platform),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&self.litebox),
             net: litebox::sync::Mutex::new(net),
@@ -413,9 +413,9 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         })
     }
 
-    /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform> {
-        &self.0.pm
+    /// Returns the global memory manager.
+    pub fn memory_manager(&self) -> &MemoryManager<Platform> {
+        &self.0.mm
     }
 
     /// Perform queued network interactions with the outside world.
@@ -1289,8 +1289,8 @@ struct GlobalState<Platform: ShimPlatform> {
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
-    /// The page manager for managing virtual memory.
-    pm: PageManager<Platform>,
+    /// The memory manager for managing virtual memory.
+    mm: MemoryManager<Platform>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.

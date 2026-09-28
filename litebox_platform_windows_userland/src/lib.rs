@@ -23,7 +23,6 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::vmem::PAGE_SIZE;
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -42,6 +41,8 @@ use windows_sys::Win32::{
 use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
+
+const PAGE_SIZE: usize = 4096;
 
 mod page_mgmt;
 
@@ -2153,7 +2154,7 @@ impl<const ALIGN: usize> litebox::platform::CrngProvider for WindowsUserland<ALI
 /// Dummy `VmemPageFaultHandler`.
 ///
 /// Page faults are handled transparently by the host Windows kernel.
-/// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
+/// Provided to satisfy trait bounds for `MemoryManager::handle_page_fault`.
 impl<const ALIGN: usize> litebox_common_linux::vmem::VmemPageFaultHandler
     for WindowsUserland<ALIGN>
 {

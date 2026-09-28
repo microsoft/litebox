@@ -32,8 +32,8 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         if candidate.end > task_addr_max {
             return None;
         }
-        // `PageManager::mappings()` returns mappings ordered by ascending start address.
-        for (range, flags) in self.global.pm.mappings() {
+        // `MemoryManager::mappings()` returns mappings ordered by ascending start address.
+        for (range, flags) in self.global.mm.mappings() {
             let protected_range = if flags.contains(VmFlags::VM_GROWSDOWN) {
                 range.start.saturating_sub(STACK_GUARD_GAP << 1)
             } else {
@@ -61,16 +61,10 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         flags: MapFlags,
     ) -> Result<UserMutPtr<Platform, u8>, MappingError> {
         let op = |_| Ok(0);
-        litebox_common_linux::mm::do_mmap(
-            &self.global.pm,
-            suggested_addr,
-            len,
-            prot,
-            flags,
-            false,
-            op,
-        )
-        .map(UserPtrMut::to_platform_ptr::<Platform>)
+        self.global
+            .mm
+            .do_mmap(suggested_addr, len, prot, flags, false, op)
+            .map(UserPtrMut::to_platform_ptr::<Platform>)
     }
 
     /// Handle syscall `mmap`
@@ -154,12 +148,9 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         addr: UserMutPtr<Platform, u8>,
         len: usize,
     ) -> Result<(), Errno> {
-        let pm = &self.global.pm;
-        litebox_common_linux::mm::sys_munmap(
-            pm,
-            UserPtrMut::from_platform_ptr::<Platform>(addr),
-            len,
-        )
+        self.global
+            .mm
+            .sys_munmap(UserPtrMut::from_platform_ptr::<Platform>(addr), len)
     }
 
     /// Handle syscall `mprotect`
@@ -170,12 +161,8 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
-        let pm = &self.global.pm;
-        litebox_common_linux::mm::sys_mprotect(
-            pm,
-            UserPtrMut::from_platform_ptr::<Platform>(addr),
-            len,
-            prot,
-        )
+        self.global
+            .mm
+            .sys_mprotect(UserPtrMut::from_platform_ptr::<Platform>(addr), len, prot)
     }
 }

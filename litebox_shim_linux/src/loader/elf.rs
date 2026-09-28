@@ -41,8 +41,8 @@ fn find_bottom_up_gap<Platform: ShimPlatform>(
         return None;
     }
 
-    // PageManager::mappings() is ordered by ascending start address.
-    for (range, flags) in task.global.pm.mappings() {
+    // MemoryManager::mappings() is ordered by ascending start address.
+    for (range, flags) in task.global.mm.mappings() {
         let protected_start = if flags.contains(VmFlags::VM_GROWSDOWN) {
             range.start.saturating_sub(STACK_GUARD_GAP << 1)
         } else {
@@ -365,7 +365,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
             None
         };
 
-        global.pm.set_initial_brk(info.brk);
+        global.mm.set_initial_brk(info.brk);
         aux.insert(AuxKey::AT_PAGESZ, PAGE_SIZE);
         aux.insert(AuxKey::AT_PHDR, info.phdrs_addr);
         aux.insert(AuxKey::AT_PHENT, info.phent_size());
@@ -383,7 +383,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
                 litebox_common_linux::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                     .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
-                .pm
+                .mm
                 .create_stack_pages(None, length, CreatePagesFlags::empty())
                 .map_err(ElfLoaderError::MappingError)?
         };
@@ -651,7 +651,7 @@ mod tests {
         // pointer and unmaps the exact range before continuing.
         unsafe {
             task.global
-                .pm
+                .mm
                 .create_stack_pages(
                     Some(stack_address),
                     stack_len,

@@ -352,7 +352,7 @@ pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
         unsafe {
             task.global
-                .pm
+                .mm
                 .create_stack_pages(
                     None,
                     length,

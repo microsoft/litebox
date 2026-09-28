@@ -77,15 +77,15 @@ impl<T> OpteeShimPlatform for T where
 {
 }
 
-// OP-TEE-specific page manager.
+// OP-TEE-specific memory manager.
 
-/// OP-TEE page manager.
-pub struct PageManager<Platform: OpteeShimPlatform> {
+/// OP-TEE memory manager.
+pub struct MemoryManager<Platform: OpteeShimPlatform> {
     vmem: VmemManager<Platform, PAGE_SIZE>,
 }
 
-impl<Platform: OpteeShimPlatform> PageManager<Platform> {
-    /// Creates a page manager for `litebox`.
+impl<Platform: OpteeShimPlatform> MemoryManager<Platform> {
+    /// Creates a memory manager for `litebox`.
     pub fn new(platform: &'static Platform) -> Self {
         Self {
             vmem: VmemManager::new(platform),
@@ -93,7 +93,7 @@ impl<Platform: OpteeShimPlatform> PageManager<Platform> {
     }
 }
 
-impl<Platform: OpteeShimPlatform> Deref for PageManager<Platform> {
+impl<Platform: OpteeShimPlatform> Deref for MemoryManager<Platform> {
     type Target = VmemManager<Platform, PAGE_SIZE>;
 
     fn deref(&self) -> &Self::Target {
@@ -132,7 +132,7 @@ impl<Platform: OpteeShimPlatform> litebox::shim::EnterShim for OpteeShimEntrypoi
             let result = unsafe {
                 self.task
                     .global
-                    .pm
+                    .mm
                     .handle_page_fault(info.cr2, info.error_code.into())
             };
             if info.kernel_mode {
@@ -215,7 +215,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             platform: self.platform,
             session_manager: self.session_manager,
             boot_instant: TimeProvider::now(self.platform),
-            pm: PageManager::new(self.platform),
+            mm: MemoryManager::new(self.platform),
             _litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
             ta_signing_cert: self.ta_signing_cert,
@@ -236,8 +236,8 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// arbitrary origin for GP "system time" (`TEE_GetSystemTime`).
     /// See [`GlobalState::system_time`].
     boot_instant: <Platform as litebox::platform::TimeProvider>::Instant,
-    /// The page manager for managing virtual memory.
-    pm: PageManager<Platform>,
+    /// The memory manager for managing virtual memory.
+    mm: MemoryManager<Platform>,
     /// The LiteBox instance used throughout the shim.
     _litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
@@ -411,9 +411,9 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         self.0.session_manager
     }
 
-    /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform> {
-        &self.0.pm
+    /// Returns the global memory manager.
+    pub fn memory_manager(&self) -> &MemoryManager<Platform> {
+        &self.0.mm
     }
 
     /// Store a TA binary associated with the given TA UUID.
@@ -441,7 +441,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     pub unsafe fn release_user_mappings(&self) {
         let release = |_r: core::ops::Range<usize>, _vm: litebox_common_linux::vmem::VmFlags| true;
         unsafe {
-            let _ = self.page_manager().release_memory(release);
+            let _ = self.memory_manager().release_memory(release);
         }
     }
 }

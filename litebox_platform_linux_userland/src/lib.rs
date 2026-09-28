@@ -2207,7 +2207,7 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {
 /// Dummy `VmemPageFaultHandler`.
 ///
 /// Page faults are handled transparently by the host Linux kernel.
-/// Provided to satisfy trait bounds for `PageManager::handle_page_fault`.
+/// Provided to satisfy trait bounds for `MemoryManager::handle_page_fault`.
 impl litebox_common_linux::vmem::VmemPageFaultHandler for LinuxUserland {
     unsafe fn handle_page_fault(
         &self,

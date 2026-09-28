@@ -308,7 +308,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             .as_usize()
             .checked_add(aligned_len.as_usize())
             .ok_or(TeeResult::AccessConflict)?;
-        if let Some(perms) = self.global.pm.get_memory_permissions(start, aligned_len) {
+        if let Some(perms) = self.global.mm.get_memory_permissions(start, aligned_len) {
             if (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_READ)
                 && !perms.contains(MemoryRegionPermissions::READ))
                 || (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_WRITE)

@@ -1512,7 +1512,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
+        unsafe { self.global.mm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         self.global

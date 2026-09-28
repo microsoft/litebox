@@ -127,7 +127,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
 
         if self
             .global
-            .pm
+            .mm
             .mappings()
             .iter()
             .any(|(range, _flags)| pads.overlaps(range))
