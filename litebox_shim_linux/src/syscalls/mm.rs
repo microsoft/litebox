@@ -240,7 +240,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return None;
         }
 
-        let create_flags = CreatePagesFlags::from(flags);
+        let create_flags = CreatePagesFlags::from(flags) | CreatePagesFlags::TOP_DOWN;
         let permissions = MemoryRegionPermissions::from(prot);
         match unsafe {
             self.global.mm.try_create_cow_pages(

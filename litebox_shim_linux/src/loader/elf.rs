@@ -312,7 +312,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
                     .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
                 .mm
-                .create_stack_pages(None, length, CreatePagesFlags::empty())
+                .create_stack_pages(None, length, CreatePagesFlags::TOP_DOWN)
                 .map_err(ElfLoaderError::MappingError)?
         };
         let mut stack = UserStack::<Platform>::new(
@@ -367,7 +367,7 @@ impl From<ElfLoaderError> for litebox_common_linux::errno::Errno {
 mod tests {
     extern crate std;
 
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     use crate::syscalls::tests::TestPlatform;
     use litebox::{
@@ -500,6 +500,29 @@ mod tests {
         task.sys_write(fd, data, None)
             .expect("failed to write test ELF");
         task.sys_close(fd).expect("failed to close test ELF");
+    }
+
+    #[test]
+    fn initial_stack_is_placed_top_down() {
+        let task = crate::syscalls::tests::init_platform(None);
+        let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
+        write_file(&task, "/pie", &minimal_elf(ET_DYN, None));
+
+        let mut loader = ElfLoader::new(&task, "/pie").expect("loader should parse test ELF");
+        let loaded = loader
+            .load(
+                vec![CString::new("/pie").unwrap()],
+                Vec::new(),
+                task.init_auxv(),
+            )
+            .expect("loader should initialize the process stack");
+
+        assert!(
+            loaded.user_stack_top >= addr_max / 2,
+            "initial stack ended at {:#x}, below the top-down address range (>= {:#x})",
+            loaded.user_stack_top,
+            addr_max / 2,
+        );
     }
 
     #[test]
