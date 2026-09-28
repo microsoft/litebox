@@ -394,6 +394,7 @@ fn vfork_exec_children_share_pipes_with_their_parent() {
     let stdout_line = line("stdout-pipe ");
     assert_eq!(numeric_field(stdout_line, "code="), 42);
     assert_eq!(numeric_field(stdout_line, "eof="), 1);
+    assert_eq!(line("child-stdout "), "child-stdout wronly=1");
     assert_eq!(line("child-open-fds"), "child-open-fds 0 1 2");
 
     // Each process waits for the other to drain or fill the pipe, and the child's nonblocking

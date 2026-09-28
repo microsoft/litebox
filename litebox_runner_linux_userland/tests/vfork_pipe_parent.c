@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
         perror("pipe2");
         return 3;
     }
-    pid_t child = spawn_with(path, "open-fds", out[1], 1);
+    pid_t child = spawn_with(path, "stdout-mode", out[1], 1);
     close(out[1]);
     char text[256];
     size_t length = 0;

@@ -3,11 +3,11 @@
 
 use litebox_broker_protocol::fs::FileMode as Mode;
 use litebox_common_linux::{
-    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, OFlags, errno::Errno,
+    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags, errno::Errno,
 };
 use zerocopy::FromBytes as _;
 
-use crate::UserPtrMut;
+use crate::{UserPtr, UserPtrMut};
 
 use litebox::shim::{Exception, ExceptionInfo};
 use litebox_common_linux::PtRegs;
@@ -191,6 +191,18 @@ fn test_fcntl() {
     check(read_fd, OFlags::RDONLY | OFlags::NONBLOCK, OFlags::RDONLY);
     let write_fd = i32::try_from(write_fd).unwrap();
     check(write_fd, OFlags::WRONLY | OFlags::NONBLOCK, OFlags::WRONLY);
+
+    // `FIONBIO` changes the status flags `F_GETFL` reports.
+    let (read_fd, _write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+    let read_fd = i32::try_from(read_fd).unwrap();
+    for (enable, flags) in [(1i32, OFlags::NONBLOCK), (0, OFlags::empty())] {
+        let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize));
+        assert_eq!(task.sys_ioctl(read_fd, arg), Ok(0));
+        assert_eq!(
+            task.sys_fcntl(read_fd, FcntlArg::GETFL).unwrap(),
+            (OFlags::RDONLY | flags).bits()
+        );
+    }
 
     // Test fcntl with DUPFD
     let fd = task

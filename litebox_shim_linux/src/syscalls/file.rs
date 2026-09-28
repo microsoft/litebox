@@ -2390,10 +2390,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         Ok(())
                     },
                     |fd| {
+                        let flags = if val != 0 {
+                            OFlags::NONBLOCK
+                        } else {
+                            OFlags::empty()
+                        };
                         self.global
-                            .pipes
-                            .update_flags(fd, litebox::pipes::Flags::NON_BLOCKING, val != 0)
-                            .map_err(Errno::from)
+                            .set_linux_pipe_status_flags(fd, flags, OFlags::NONBLOCK)
                     },
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),

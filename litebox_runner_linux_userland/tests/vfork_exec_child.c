@@ -83,6 +83,10 @@ int main(int argc, char **argv) {
         printf("child-fds stdin_setfl=%d hidden_closed=%d\n", stdin_setfl, hidden_closed);
         return 42;
     }
+    if (strcmp(marker, "stdout-mode") == 0) {
+        printf("child-stdout wronly=%d\n", (fcntl(1, F_GETFL) & O_ACCMODE) == O_WRONLY);
+        marker = "open-fds";
+    }
     if (strcmp(marker, "open-fds") == 0) {
         printf("child-open-fds");
         for (int fd = 0; fd < 64; fd++) {
