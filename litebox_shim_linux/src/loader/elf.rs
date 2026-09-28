@@ -508,8 +508,8 @@ mod tests {
         let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
         write_file(&task, "/pie", &minimal_elf(ET_DYN, None));
 
-        let mut loader = ElfLoader::new(&task, "/pie").expect("loader should parse test ELF");
-        let loaded = loader
+        let mut elf_loader = ElfLoader::new(&task, "/pie").expect("loader should parse test ELF");
+        let load_info = elf_loader
             .load(
                 vec![CString::new("/pie").unwrap()],
                 Vec::new(),
@@ -518,9 +518,9 @@ mod tests {
             .expect("loader should initialize the process stack");
 
         assert!(
-            loaded.user_stack_top >= addr_max / 2,
+            load_info.user_stack_top >= addr_max / 2,
             "initial stack ended at {:#x}, below the top-down address range (>= {:#x})",
-            loaded.user_stack_top,
+            load_info.user_stack_top,
             addr_max / 2,
         );
     }
