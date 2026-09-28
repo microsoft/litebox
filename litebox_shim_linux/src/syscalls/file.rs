@@ -351,6 +351,46 @@ impl<Platform: ShimPlatform> core::fmt::Debug for AnyTypedFd<Platform> {
     }
 }
 
+impl<Platform: ShimPlatform> FilesState<Platform> {
+    /// Returns a `vfork` child's copy of this table, whose descriptors keep their numbers and
+    /// close-on-exec flags and share this table's open file descriptions.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn copy_for_vfork(&self, global: &GlobalState<Platform>) -> Self {
+        let alive_fds: alloc::vec::Vec<usize> =
+            self.raw_descriptor_store.read().iter_alive().collect();
+        let len = alive_fds.last().map_or(0, |&raw_fd| raw_fd + 1);
+        let copy = Self {
+            raw_descriptor_store: litebox::sync::RwLock::new(
+                litebox::fd::RawDescriptorStorage::with_len(len),
+            ),
+            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
+        };
+        for raw_fd in alive_fds {
+            let fd = self
+                .typed_fd_from_raw(raw_fd)
+                .expect("the table is not changing");
+            let flags = get_file_descriptor_flags(&fd, global);
+            on_any_fd!(&fd, |fd| {
+                let mut descriptors = global.litebox.descriptor_table_mut();
+                let fd = descriptors
+                    .duplicate(&**fd)
+                    .expect("the table is not changing");
+                if !flags.is_empty() {
+                    let old = descriptors.set_fd_metadata(&fd, flags);
+                    assert!(old.is_none());
+                }
+                drop(descriptors);
+                let success = copy
+                    .raw_descriptor_store
+                    .write()
+                    .fd_into_specific_raw_integer(fd, raw_fd);
+                assert!(success);
+            });
+        }
+        copy
+    }
+}
+
 /// Path in the file system
 #[derive(Debug)]
 enum FsPath {
@@ -1142,6 +1182,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let result = self.global.litebox.close_file(&fd).map_err(Errno::from);
                 self.finalize_elf_patch(fd);
                 result
+            }
+            // A `vfork` child cannot create sockets, so the suspended parent's table still holds
+            // each socket the child's table refers to, and only the child's descriptor goes.
+            AnyTypedFd::Network(fd) if self.vfork.borrow().is_some() => {
+                self.remove_and_drop_descriptor(&fd);
+                Ok(())
             }
             AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
             AnyTypedFd::Pipes(fd) => self.global.close_linux_pipe(&fd),

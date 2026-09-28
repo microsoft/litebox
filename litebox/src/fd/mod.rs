@@ -603,6 +603,14 @@ impl RawDescriptorStorage {
         Self { stored_fds: vec![] }
     }
 
+    /// Create a raw descriptor store with `len` empty slots, so a descriptor can be stored at any
+    /// raw integer below `len` in any order.
+    pub fn with_len(len: usize) -> Self {
+        Self {
+            stored_fds: core::iter::repeat_with(|| None).take(len).collect(),
+        }
+    }
+
     /// Get the corresponding integer value of the provided `fd`.
     ///
     /// This explicitly consumes the `fd`.

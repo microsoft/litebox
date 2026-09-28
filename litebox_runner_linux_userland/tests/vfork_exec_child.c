@@ -82,6 +82,16 @@ int main(int argc, char **argv) {
         printf("child-fds stdin_setfl=%d hidden_closed=%d\n", stdin_setfl, hidden_closed);
         return 42;
     }
+    if (strcmp(marker, "open-fds") == 0) {
+        printf("child-open-fds");
+        for (int fd = 0; fd < 64; fd++) {
+            if (fcntl(fd, F_GETFD) != -1) {
+                printf(" %d", fd);
+            }
+        }
+        printf("\n");
+        return 42;
+    }
     const char *environment = getenv("VFORK_EXEC_TEST");
     printf("child pid=%d ppid=%d tid=%ld marker=%s env=%s\n", getpid(),
            getppid(), syscall(SYS_gettid), marker,
