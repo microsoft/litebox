@@ -820,7 +820,7 @@ impl<Platform: ShimPlatform> litebox::shim::InitThread for NewThreadArgs<Platfor
 impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn sys_clone(
         &self,
-        ctx: &litebox_common_linux::PtRegs,
+        ctx: &mut litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
     ) -> Result<usize, Errno> {
         self.do_clone(ctx, args, false)
@@ -828,14 +828,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     pub(crate) fn sys_clone3(
         &self,
-        ctx: &litebox_common_linux::PtRegs,
+        ctx: &mut litebox_common_linux::PtRegs,
         args: UserPtr<litebox_common_linux::CloneArgs>,
     ) -> Result<usize, Errno> {
         let args = args.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
         self.do_clone(ctx, &args, true)
     }
 
-    /// Begins a constrained `vfork` child in the current runner.
+    /// Handles `vfork`; see [`Self::begin_vfork`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sys_vfork(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+        self.begin_vfork(ctx, None, false)
+    }
+
+    /// Begins a constrained `vfork` child in the current runner, as `vfork`, or `clone` or
+    /// `clone3` with `CLONE_VM | CLONE_VFORK`, do.
+    ///
+    /// The child continues from the syscall on `child_stack` if given, or else on the parent's
+    /// stack. If `clear_signal_handlers` is set (`CLONE_CLEAR_SIGHAND`), the child's handled
+    /// signals start with their default action.
     ///
     /// Only single-threaded processes with default filesystem, resource-limit, and alarm state are
     /// admitted, and only if every descriptor not marked close-on-exec can transfer to the fresh
@@ -848,7 +859,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that
     /// state.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn sys_vfork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+    fn begin_vfork(
+        &self,
+        ctx: &mut litebox_common_linux::PtRegs,
+        child_stack: Option<usize>,
+        clear_signal_handlers: bool,
+    ) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
             || self.thread.process.nr_threads() != 1
             || !self.fs.borrow().has_default_fs_state(&self.credentials)
@@ -873,19 +889,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child,
             child_pid,
             parent_context,
-            parent_signals: self.signals.begin_vfork_child(),
+            parent_signals: self.signals.begin_vfork_child(clear_signal_handlers),
         }));
+        if let Some(child_stack) = child_stack {
+            ctx.rsp = child_stack;
+        }
         Ok(0)
     }
 
-    /// Creates a new thread.
+    /// Creates a new thread, or a `vfork` child for `CLONE_VM | CLONE_VFORK`.
     ///
-    /// Process creation, including `clone` or `clone3` with `CLONE_VFORK`, is intentionally
-    /// unsupported. Those calls require child-stack and ancillary clone-argument semantics rather
-    /// than being aliases for `vfork(2)`.
+    /// A `vfork` child supports only `CLONE_CLEAR_SIGHAND` among other flags and only a
+    /// `SIGCHLD` exit signal, as `posix_spawn` uses. Other process creation is unsupported.
     fn do_clone(
         &self,
-        ctx: &litebox_common_linux::PtRegs,
+        ctx: &mut litebox_common_linux::PtRegs,
         args: &litebox_common_linux::CloneArgs,
         clone3: bool,
     ) -> Result<usize, Errno> {
@@ -909,6 +927,47 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // `clone3` or in combination with `CLONE_PIDFD`.
         if !clone3 && !flags.contains(CloneFlags::PIDFD) {
             flags.remove(CloneFlags::DETACHED);
+        }
+
+        if cgroup != 0 {
+            log_unsupported!("clone with cgroup");
+            return Err(Errno::EINVAL);
+        }
+
+        if set_tid != 0 || set_tid_size != 0 {
+            log_unsupported!("clone with set_tid");
+            return Err(Errno::EINVAL);
+        }
+
+        // Note `exit_signal` is ignored for threads; we just validate it.
+        if exit_signal > MAX_SIGNAL_NUMBER {
+            return Err(Errno::EINVAL);
+        }
+
+        if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
+            return Err(Errno::EINVAL);
+        }
+        let sp = if stack != 0 {
+            let stack: usize = stack.trunc();
+            Some(stack.wrapping_add(stack_size.trunc()))
+        } else {
+            None
+        };
+
+        #[cfg(target_arch = "x86_64")]
+        if flags.contains(CloneFlags::VFORK) {
+            let supported_vfork_flags =
+                CloneFlags::VM | CloneFlags::VFORK | CloneFlags::CLEAR_SIGHAND;
+            if flags.intersects(!supported_vfork_flags) || !flags.contains(CloneFlags::VM) {
+                log_unsupported!("vfork clone with flags: {:?}", flags);
+                return Err(Errno::EINVAL);
+            }
+            let sigchld = litebox_common_linux::signal::Signal::SIGCHLD.as_i32();
+            if exit_signal != u64::from(sigchld.cast_unsigned()) {
+                log_unsupported!("vfork clone with exit signal {exit_signal}");
+                return Err(Errno::EINVAL);
+            }
+            return self.begin_vfork(ctx, sp, flags.contains(CloneFlags::CLEAR_SIGHAND));
         }
 
         let required_clone_flags =
@@ -939,25 +998,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 "clone with missing required flags: {:?}",
                 required_clone_flags & !flags
             );
-            return Err(Errno::EINVAL);
-        }
-
-        if cgroup != 0 {
-            log_unsupported!("clone with cgroup");
-            return Err(Errno::EINVAL);
-        }
-
-        if set_tid != 0 || set_tid_size != 0 {
-            log_unsupported!("clone with set_tid");
-            return Err(Errno::EINVAL);
-        }
-
-        // Note `exit_signal` is ignored because we don't support `fork` yet; we just validate it.
-        if exit_signal > MAX_SIGNAL_NUMBER {
-            return Err(Errno::EINVAL);
-        }
-
-        if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
             return Err(Errno::EINVAL);
         }
 
@@ -1019,13 +1059,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let litebox_thread = self.global.create_thread().map_err(|_| Errno::EAGAIN)?;
         let child_tid = i32::try_from(litebox_thread.id())
             .expect("the assigned thread ID must fit Linux pid_t");
-
-        let sp = if stack != 0 {
-            let stack: usize = stack.trunc();
-            Some(stack.wrapping_add(stack_size.trunc()))
-        } else {
-            None
-        };
 
         let Some(thread) = self.thread.new_thread(child_tid) else {
             let thread_id = litebox_thread.id();
@@ -2413,7 +2446,7 @@ mod tests {
         .unwrap();
 
         assert!(!task.process().limits.has_default_state());
-        assert_eq!(task.sys_vfork(&PtRegs::default()), Err(Errno::EAGAIN));
+        assert_eq!(task.sys_vfork(&mut PtRegs::default()), Err(Errno::EAGAIN));
     }
 
     #[cfg(target_arch = "x86_64")]

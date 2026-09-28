@@ -99,21 +99,10 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     pub(crate) fn reset_for_exec(&self) {
         let mut handlers = self.handlers.borrow_mut();
         // Ensure that the signal handlers are no longer shared.
-        let handlers = Arc::make_mut(&mut handlers);
-        // Reset the handlers to defaults.
-        for handler in &mut handlers.inner.get_mut().handlers {
-            handler.action = SigAction {
-                sigaction: if handler.action.sigaction == SIG_IGN {
-                    SIG_IGN
-                } else {
-                    SIG_DFL
-                },
-                restorer: 0,
-                flags: SaFlags::empty(),
-                mask: SigSet::empty(),
-                __pad: 0,
-            };
-        }
+        Arc::make_mut(&mut handlers)
+            .inner
+            .get_mut()
+            .reset_handlers();
         self.clear_sigaltstack();
     }
 
@@ -164,10 +153,15 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     /// Gives the `vfork` child a copy of the current dispositions, blocked mask, and alternate
     /// stack with no pending thread signals, returning the suspended parent's state.
     ///
-    /// Process-directed pending signals stay queued for the parent.
+    /// If `reset_handlers` is set, like `CLONE_CLEAR_SIGHAND`, the child's handled signals take
+    /// their default action. Process-directed pending signals stay queued for the parent.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn begin_vfork_child(&self) -> VforkParentSignals<Platform> {
-        let child_handlers = Arc::new(SignalHandlers::clone(&self.handlers.borrow()));
+    pub(crate) fn begin_vfork_child(&self, reset_handlers: bool) -> VforkParentSignals<Platform> {
+        let mut child_handlers = SignalHandlers::clone(&self.handlers.borrow());
+        if reset_handlers {
+            child_handlers.inner.get_mut().reset_handlers();
+        }
+        let child_handlers = Arc::new(child_handlers);
         VforkParentSignals {
             pending: self.pending.replace(PendingSignals::new()),
             blocked: self.blocked.get(),
@@ -216,6 +210,23 @@ impl SignalHandlersInner {
     /// Returns the array index for the given signal.
     fn sig_index(signal: Signal) -> usize {
         (signal.as_i32().reinterpret_as_unsigned() - 1) as usize
+    }
+
+    /// Resets every signal that is not ignored to its default action, as `execve` does.
+    fn reset_handlers(&mut self) {
+        for handler in &mut self.handlers {
+            handler.action = SigAction {
+                sigaction: if handler.action.sigaction == SIG_IGN {
+                    SIG_IGN
+                } else {
+                    SIG_DFL
+                },
+                restorer: 0,
+                flags: SaFlags::empty(),
+                mask: SigSet::empty(),
+                __pad: 0,
+            };
+        }
     }
 }
 
