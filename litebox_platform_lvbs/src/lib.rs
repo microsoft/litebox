@@ -977,9 +977,13 @@ pub trait HostInterface: 'static {
     fn switch(result: u64) -> !;
 }
 
+litebox::define_page_reservation!(LvbsReservation);
+
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
-    type Reservations =
-        litebox::platform::common_providers::reservations::NoTrackedReservations<ALIGN>;
+    type Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
+        ALIGN,
+        LvbsReservation<ALIGN>,
+    >;
 
     // User space occupies the low canonical half (0 .. 0x0000_7FFF_FFFF_FFFF).
     // Kernel memory lives in the high canonical half (at KERNEL_OFFSET).

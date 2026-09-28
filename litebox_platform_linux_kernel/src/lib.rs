@@ -403,9 +403,13 @@ pub trait HostInterface: 'static {
     fn log(msg: &str);
 }
 
+litebox::define_page_reservation!(LinuxKernelReservation);
+
 impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for LinuxKernel<Host> {
-    type Reservations =
-        litebox::platform::common_providers::reservations::NoTrackedReservations<ALIGN>;
+    type Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
+        ALIGN,
+        LinuxKernelReservation<ALIGN>,
+    >;
 
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;

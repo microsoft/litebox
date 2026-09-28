@@ -30,6 +30,8 @@ use zerocopy::{FromBytes, IntoBytes};
 extern crate alloc;
 
 mod page_mgmt;
+#[doc(hidden)]
+pub use page_mgmt::LinuxUserlandReservation;
 
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers

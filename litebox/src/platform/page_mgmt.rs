@@ -10,7 +10,7 @@ use core::ops::Range;
 use thiserror::Error;
 
 /// Exclusive ownership of a reserved virtual-address extent.
-pub trait PageReservation {
+pub trait PageReservation: Into<Range<usize>> {
     /// Return the owned address range.
     fn range(&self) -> Range<usize>;
 }
@@ -55,9 +55,9 @@ impl HintPlacementBehavior {
 /// Storage for reservations indexed by their starting address.
 pub trait ReservationStore {
     /// Reservation value retained by the store.
-    type Reservation: PageReservation;
+    type Reservation: PageReservation + Into<Self::ReleaseTarget>;
     /// Ownership representation consumed when this store releases pages.
-    type ReleaseTarget: From<Self::Reservation>;
+    type ReleaseTarget;
 
     /// Release every extent represented by this store.
     ///

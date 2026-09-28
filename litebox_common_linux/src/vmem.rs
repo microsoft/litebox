@@ -389,10 +389,11 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, RemapError>;
 }
 
-impl<Platform, const ALIGN: usize> LinuxReservationStore<Platform, ALIGN>
-    for NoTrackedReservations<ALIGN>
+impl<Platform, Reservation, const ALIGN: usize> LinuxReservationStore<Platform, ALIGN>
+    for NoTrackedReservations<ALIGN, Reservation>
 where
     Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    Reservation: PageReservation + Send + Sync,
 {
     unsafe fn mmap(
         &mut self,
@@ -1526,6 +1527,8 @@ mod tests {
 
     type AllocationCall = (Range<usize>, FixedAddressBehavior);
 
+    litebox::define_page_reservation!(DummyReservation);
+
     /// A configurable dummy page-management backend.
     struct DummyVmemBackend<const TOP_DOWN: bool = false> {
         rejected_address: Option<usize>,
@@ -1541,7 +1544,10 @@ mod tests {
     #[expect(unused_variables, reason = "dummy/mock backend")]
     impl<const TOP_DOWN: bool> PageManagementProvider<PAGE_SIZE> for DummyVmemBackend<TOP_DOWN> {
         type Reservations =
-            litebox::platform::common_providers::reservations::NoTrackedReservations<PAGE_SIZE>;
+            litebox::platform::common_providers::reservations::NoTrackedReservations<
+                PAGE_SIZE,
+                DummyReservation<PAGE_SIZE>,
+            >;
 
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         const TASK_ADDR_MIN: usize = 0x1_0000;

@@ -48,6 +48,8 @@ const PAGE_SIZE: usize = 4096;
 litebox::define_page_reservation!(WindowsUserlandReservation);
 
 mod page_mgmt;
+#[doc(hidden)]
+pub use page_mgmt::WindowsUserlandReservation;
 
 // Thread-local storage for FS base state
 thread_local! {

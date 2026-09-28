@@ -32,6 +32,12 @@ macro_rules! define_page_reservation {
             }
         }
 
+        impl<const ALIGN: usize> From<$name<ALIGN>> for ::core::ops::Range<usize> {
+            fn from(reservation: $name<ALIGN>) -> Self {
+                reservation.range
+            }
+        }
+
         // Reservation handles must remain non-Clone and non-Copy to preserve exclusive ownership.
         // The inferred marker below resolves to `()` only in that case; either trait adds another
         // matching implementation, making trait selection ambiguous and compilation fail.
@@ -50,31 +56,21 @@ macro_rules! define_page_reservation {
 }
 
 /// Reservation store for page managers that do not retain reservation handles.
-#[derive(Default)]
-pub struct NoTrackedReservations<const ALIGN: usize>;
+pub struct NoTrackedReservations<const ALIGN: usize, Reservation>(
+    core::marker::PhantomData<Reservation>,
+);
 
-crate::define_page_reservation!(NoTrackedReservation);
-
-impl<const ALIGN: usize> From<NoTrackedReservation<ALIGN>> for Range<usize> {
-    fn from(reservation: NoTrackedReservation<ALIGN>) -> Self {
-        reservation.range
+impl<const ALIGN: usize, Reservation> Default for NoTrackedReservations<ALIGN, Reservation> {
+    fn default() -> Self {
+        Self(core::marker::PhantomData)
     }
 }
 
-impl<const ALIGN: usize> NoTrackedReservations<ALIGN> {
-    /// Represent an exclusively owned range without retaining its reservation handle.
-    ///
-    /// # Safety
-    ///
-    /// `range` must be exclusively owned, nonempty, and `ALIGN`-aligned.
-    pub unsafe fn from_owned_range(range: Range<usize>) -> NoTrackedReservation<ALIGN> {
-        // SAFETY: The caller establishes the reservation ownership and alignment requirements.
-        unsafe { NoTrackedReservation::new(range) }
-    }
-}
-
-impl<const ALIGN: usize> ReservationStore for NoTrackedReservations<ALIGN> {
-    type Reservation = NoTrackedReservation<ALIGN>;
+impl<const ALIGN: usize, Reservation> ReservationStore for NoTrackedReservations<ALIGN, Reservation>
+where
+    Reservation: PageReservation,
+{
+    type Reservation = Reservation;
     type ReleaseTarget = Range<usize>;
 
     unsafe fn release_all<Platform, const PAGE_ALIGN: usize, V>(

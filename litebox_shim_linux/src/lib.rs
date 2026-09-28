@@ -75,6 +75,7 @@ pub trait ShimPlatform:
         { PAGE_SIZE },
         Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
             PAGE_SIZE,
+            Self::Reservation,
         >,
     > + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
@@ -89,15 +90,19 @@ pub trait ShimPlatform:
     + litebox::platform::IPInterfaceProvider
     + 'static
 {
+    /// Opaque page-reservation ownership type supplied by the platform.
+    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
 }
 
-impl<T> ShimPlatform for T where
+impl<T, Reservation> ShimPlatform for T
+where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
         + litebox::platform::PageManagementProvider<
             { PAGE_SIZE },
             Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
                 PAGE_SIZE,
+                Reservation,
             >,
         > + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
@@ -110,8 +115,10 @@ impl<T> ShimPlatform for T where
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::IPInterfaceProvider
-        + 'static
+        + 'static,
+    Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
 {
+    type Reservation = Reservation;
 }
 
 // Linux-specific memory manager state and behavior.

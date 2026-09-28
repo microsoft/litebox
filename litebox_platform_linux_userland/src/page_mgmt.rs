@@ -24,9 +24,13 @@ fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     res
 }
 
+litebox::define_page_reservation!(LinuxUserlandReservation);
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for LinuxUserland {
-    type Reservations =
-        litebox::platform::common_providers::reservations::NoTrackedReservations<ALIGN>;
+    type Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
+        ALIGN,
+        LinuxUserlandReservation<ALIGN>,
+    >;
 
     const TASK_ADDR_MIN: usize = 0x1_0000; // default linux config
     #[cfg(target_arch = "x86_64")]

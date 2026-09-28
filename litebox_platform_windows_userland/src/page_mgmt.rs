@@ -13,8 +13,6 @@ use litebox::platform::page_mgmt::{
     AllocationDirection, HintPlacementBehavior, PageReservation as _, ReservationStore as _,
 };
 
-litebox::define_page_reservation!(WindowsUserlandReservation);
-
 #[derive(Default)]
 pub(super) struct WindowsReservationStore<const ALIGN: usize> {
     reservations: TrackedReservations<WindowsUserlandReservation<ALIGN>>,
@@ -190,10 +188,12 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     }
 }
 
+litebox::define_page_reservation!(WindowsUserlandReservation);
+
 impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     for WindowsUserland<ALIGN>
 {
-    type Reservations = NoTrackedReservations<ALIGN>;
+    type Reservations = NoTrackedReservations<ALIGN, WindowsUserlandReservation<ALIGN>>;
 
     // TODO(chuqi): These are currently "magic numbers" grabbed from my Windows 11 SystemInformation.
     // The actual values should be determined by `GetSystemInfo()`.
