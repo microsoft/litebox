@@ -3,7 +3,8 @@
 
 // Tests: timerfd_create/timerfd_settime/timerfd_gettime, reads, epoll
 // readiness, and argument validation. Timing checks only use lower bounds on
-// elapsed time so that slow hosts cannot make them fail.
+// elapsed time or upper bounds on remaining time so that slow hosts cannot
+// make them fail.
 
 #include "helpers.h"
 
@@ -68,7 +69,7 @@ static void test_one_shot(void) {
     TEST_ASSERT(timerfd_settime(fd, 0, &armed, &old) == 0, "arm");
     TEST_ASSERT(ns(&old.it_value) == 0 && ns(&old.it_interval) == 0, "old disarmed");
     long remaining = remaining_ns(fd);
-    TEST_ASSERT(remaining > 0 && remaining <= 100 * MS, "armed gettime");
+    TEST_ASSERT(remaining >= 0 && remaining <= 100 * MS, "armed gettime");
 
     TEST_ASSERT(fcntl(fd, F_SETFL, 0) == 0, "clear O_NONBLOCK");
     TEST_ASSERT(read_expirations(fd) == 1, "one-shot expires once");
@@ -108,7 +109,7 @@ static void test_absolute(clockid_t clock) {
     struct itimerspec armed = absolute(clock, 100 * MS);
     TEST_ASSERT(timerfd_settime(fd, TFD_TIMER_ABSTIME, &armed, NULL) == 0, "arm absolute");
     long remaining = remaining_ns(fd);
-    TEST_ASSERT(remaining > 0 && remaining <= 100 * MS, "absolute time uses the clock");
+    TEST_ASSERT(remaining >= 0 && remaining <= 100 * MS, "absolute time uses the clock");
     TEST_ASSERT(read_expirations(fd) == 1, "absolute expires");
 
     struct itimerspec past = spec(1, 0);

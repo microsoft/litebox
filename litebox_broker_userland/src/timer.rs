@@ -27,6 +27,8 @@ struct Shared {
 
 #[derive(Default)]
 struct State {
+    /// Set once the provider is dropped to stop the alarm thread.
+    stopped: bool,
     next_id: u64,
     /// Pending deadlines ordered by expiry.
     queue: BTreeSet<(Duration, u64)>,
@@ -50,6 +52,13 @@ impl UserlandTimerProvider {
             .name("litebox-broker-timer".to_owned())
             .spawn(move || thread_shared.run())?;
         Ok(Self { shared })
+    }
+}
+
+impl Drop for UserlandTimerProvider {
+    fn drop(&mut self) {
+        self.shared.lock().stopped = true;
+        self.shared.wake.notify_one();
     }
 }
 
@@ -88,7 +97,7 @@ impl Shared {
 
     fn run(&self) {
         let mut state = self.lock();
-        loop {
+        while !state.stopped {
             let now = self.now();
             let mut fired = Vec::new();
             while let Some(&(deadline, id)) = state.queue.first()
@@ -178,6 +187,21 @@ mod tests {
     use litebox_broker_protocol::timer::TimerSpec;
 
     use super::UserlandTimerProvider;
+
+    #[test]
+    fn dropping_provider_stops_alarm_thread() {
+        let provider = UserlandTimerProvider::new().unwrap();
+        let shared = Arc::downgrade(&provider.shared);
+        drop(provider);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while shared.strong_count() != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "alarm thread kept running"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     struct ChannelReadinessSink(std::sync::Mutex<Sender<(ObjectHandle, ReadinessFlags)>>);
 
