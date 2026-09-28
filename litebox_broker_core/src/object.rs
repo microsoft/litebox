@@ -5,15 +5,15 @@
 
 use alloc::sync::Arc;
 
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::rwlock::RwLock;
 
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
 use crate::process::ProcessObject;
-use crate::readiness::ReadinessRegistration;
+use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::socket::SocketObject;
 use crate::{BrokerError, Result};
 
@@ -58,6 +58,24 @@ impl ObjectEntry {
         match self {
             Self::Event(_) | Self::File(_) | Self::Pipe(_) => true,
             Self::Socket(_) | Self::Process(_) => false,
+        }
+    }
+
+    /// Returns a registration that publishes readiness changes to this object
+    /// through `readiness_sink` for `handle` until it drops, or `None` if
+    /// references to this kind need none.
+    pub(crate) fn watch(
+        &self,
+        handle: ObjectHandle,
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<Option<ReadinessRegistration>> {
+        match self {
+            Self::Pipe(pipe) => {
+                let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
+                pipe.watch(&registration)?;
+                Ok(Some(registration))
+            }
+            Self::Event(_) | Self::File(_) | Self::Socket(_) | Self::Process(_) => Ok(None),
         }
     }
 }

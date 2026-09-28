@@ -340,7 +340,7 @@ where
         };
         // A parent may have duplicated pipe ends into this process before it
         // connected.
-        if let Err(error) = process.register_pipe_readiness(&readiness_sink) {
+        if let Err(error) = process.register_readiness(&readiness_sink) {
             if finish_on_setup_error {
                 process.retire(true);
             }

@@ -59,8 +59,7 @@ pub fn create(
         ObjectEntry::Pipe(PipeObject::reader(Arc::clone(&shared))),
         ObjectEntry::Pipe(PipeObject::writer(shared)),
     )?;
-    if let Err(error) =
-        process.register_pipe_readiness_for(&[read_handle, write_handle], readiness_sink)
+    if let Err(error) = process.register_readiness_for(&[read_handle, write_handle], readiness_sink)
     {
         for handle in [read_handle, write_handle] {
             if process.close_object_reference(handle).is_err() {

@@ -1032,20 +1032,21 @@ impl BrokerProcess {
         Ok(reference.rights)
     }
 
-    /// Publishes readiness of this process's pipe references through
-    /// `readiness_sink`.
+    /// Publishes readiness of this process's references through
+    /// `readiness_sink`, for objects whose readiness other processes change.
     ///
     /// Connection setup calls this for references duplicated into the
     /// process before it connected, so changes made by other processes wake
     /// its waiters.
-    pub fn register_pipe_readiness(&self, readiness_sink: &Arc<dyn ReadinessSink>) -> Result<()> {
+    pub fn register_readiness(&self, readiness_sink: &Arc<dyn ReadinessSink>) -> Result<()> {
         let process_references = self.references.lock();
-        self.register_pipe_readiness_for(&process_references.handles, readiness_sink)
+        self.register_readiness_for(&process_references.handles, readiness_sink)
     }
 
-    /// Publishes readiness of the pipe references in `handles` through
-    /// `readiness_sink`, skipping references that already publish readiness.
-    pub(crate) fn register_pipe_readiness_for(
+    /// Publishes readiness of the references in `handles` through
+    /// `readiness_sink`, as [`ObjectEntry::watch`] requires, skipping
+    /// references that already publish readiness.
+    pub(crate) fn register_readiness_for(
         &self,
         handles: &[ObjectHandle],
         readiness_sink: &Arc<dyn ReadinessSink>,
@@ -1056,19 +1057,9 @@ impl BrokerProcess {
                 .get_mut(&handle)
                 .filter(|reference| reference.owner == self.id)
                 .ok_or(BrokerError::UnknownObject)?;
-            if reference.readiness.is_some() {
-                continue;
+            if reference.readiness.is_none() {
+                reference.readiness = reference.object.read().watch(handle, readiness_sink)?;
             }
-            let registration = {
-                let object = reference.object.read();
-                let ObjectEntry::Pipe(pipe) = &*object else {
-                    continue;
-                };
-                let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
-                pipe.watch(&registration)?;
-                registration
-            };
-            reference.readiness = Some(registration);
         }
         Ok(())
     }
@@ -1678,7 +1669,7 @@ mod tests {
             .unwrap();
         for _ in 0..2 {
             child
-                .register_pipe_readiness(&(child_sink.clone() as Arc<dyn ReadinessSink>))
+                .register_readiness(&(child_sink.clone() as Arc<dyn ReadinessSink>))
                 .unwrap();
         }
 
