@@ -756,7 +756,7 @@ where
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
-fn memory_region_permissions(prot: &ProtFlags) -> Option<MemoryRegionPermissions> {
+fn memory_region_permissions(prot: ProtFlags) -> Option<MemoryRegionPermissions> {
     if prot.bits() & !ProtFlags::PROT_READ_WRITE_EXEC.bits() != 0 {
         return None;
     }
@@ -824,7 +824,7 @@ where
         };
         let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
         let permissions =
-            memory_region_permissions(&prot).ok_or(MappingError::InvalidPermissions)?;
+            memory_region_permissions(prot).ok_or(MappingError::InvalidPermissions)?;
         if flags.contains(CreatePagesFlags::MAP_FILE) || !permissions.is_empty() {
             unsafe {
                 self.create_pages_with_permissions(suggested_addr, length, flags, permissions, op)
@@ -879,7 +879,7 @@ where
         }
 
         let addr = addr.to_platform_ptr::<Platform>();
-        let permissions = memory_region_permissions(&prot).ok_or(Errno::EINVAL)?;
+        let permissions = memory_region_permissions(prot).ok_or(Errno::EINVAL)?;
         unsafe { self.change_page_permissions(addr, len, permissions) }.map_err(Errno::from)
     }
 

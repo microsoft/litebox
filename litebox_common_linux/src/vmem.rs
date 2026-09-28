@@ -656,7 +656,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
                 Ok(_) => {}
-                Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
                 Err(AllocationError::PermissionDenied) => {
                     return Err(VmemResizeError::PermissionDenied);
                 }

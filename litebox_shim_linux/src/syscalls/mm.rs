@@ -315,14 +315,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let result =
-            self.do_mmap_file_memcpy(suggested_addr, len, prot.clone(), flags, &typed_fd, offset)?;
+            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?;
 
         let patch_key = ElfPatchKey(Arc::clone(file_fd));
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
-            let restore_protections = [(result.as_usize(), len, prot.clone())];
+            let restore_protections = [(result.as_usize(), len, prot)];
             if syscall_entry != 0
                 && self
                     .maybe_patch_exec_segment(
@@ -616,7 +616,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut first_error = None;
         for (start, len, prot) in protections {
             if let Err(error) =
-                self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(*start), *len, prot.clone())
+                self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(*start), *len, *prot)
                 && first_error.is_none()
             {
                 first_error = Some(error);
@@ -1736,7 +1736,7 @@ mod tests {
         address: UserPtrMut<u8>,
     ) -> MemoryRegionPermissions {
         task.global
-            .pm
+            .mm
             .get_memory_permissions(
                 NonZeroAddress::new(address.as_usize()).expect("mapping address is aligned"),
                 NonZeroPageSize::new(PAGE_SIZE).expect("page size is valid"),
