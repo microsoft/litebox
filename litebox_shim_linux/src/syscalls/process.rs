@@ -351,7 +351,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
     /// Children the broker reaped as they terminated are released, since no wait reports them
     /// and each holds broker process capacity until its handle closes. Nothing is recorded if a
     /// status query fails.
-    fn observe_terminations(&self) -> Result<Vec<(i32, ProcessExitStatus)>, ProcessError> {
+    fn record_child_terminations(&self) -> Result<Vec<(i32, ProcessExitStatus)>, ProcessError> {
         // Clear each flag before querying, so a termination published during the queries sets it
         // again.
         self.child_events.changed.store(false, Ordering::SeqCst);
@@ -518,7 +518,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if self.vfork.borrow().is_some() {
             return Ok(());
         }
-        let terminated = self.thread.process.observe_terminations()?;
+        let terminated = self.thread.process.record_child_terminations()?;
         // Like Linux, a child terminating while `SIGCHLD` is set to `SIG_IGN` sends no signal,
         // even if `SIGCHLD` is blocked.
         if terminated.is_empty() || self.signals.ignored().contains(Signal::SIGCHLD) {
