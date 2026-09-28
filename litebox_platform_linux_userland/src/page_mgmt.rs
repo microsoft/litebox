@@ -4,6 +4,8 @@
 use super::*;
 use litebox::platform::page_mgmt::{AllocationDirection, HintPlacementBehavior};
 
+litebox::define_page_reservation!(LinuxUserlandReservation);
+
 fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     let mut res = ProtFlags::PROT_NONE;
     res.set(
@@ -38,14 +40,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
-    fn allocate_pages(
+    unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::ReserveAndCommitError,
+    >
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
         debug_assert!(!matches!(
             fixed_address_behavior,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp)
@@ -96,7 +105,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             }
             _ => panic!("unhandled mmap error {err}"),
         })?;
-        Ok(UserMutPtr::from_usize(ptr))
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            replaced_reservations().for_each(drop);
+        }
+        // SAFETY: mmap returned exclusive ownership of this exact aligned extent.
+        Ok(unsafe { LinuxUserlandReservation::new(ptr..ptr + suggested_range.len()) })
     }
 
     unsafe fn release_pages(
@@ -108,12 +121,19 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
-    unsafe fn remap_pages(
+    unsafe fn try_remap_pages<Reservations>(
         &self,
+        source_reservations: impl FnOnce() -> Reservations,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
         _permissions: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::RemapError,
+    >
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
         let res = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::mremap,
@@ -125,14 +145,22 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
             .expect("mremap failed")
         };
-        Ok(UserMutPtr::from_usize(res))
+        source_reservations().for_each(drop);
+        // SAFETY: Successful mremap transferred ownership to this destination extent.
+        Ok(unsafe { LinuxUserlandReservation::new(res..res + new_range.len()) })
     }
 
-    unsafe fn update_permissions(
+    unsafe fn protect_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError>
+    where
+        Reservations:
+            Iterator<Item = &'reservation litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>: 'reservation,
+    {
         unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::mprotect,
@@ -149,13 +177,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         self.reserved_pages.iter()
     }
 
-    fn try_allocate_cow_pages(
+    unsafe fn try_allocate_cow_pages<Reservations>(
         &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_start: usize,
         source_data: &'static [u8],
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+    ) -> Result<litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>, CowAllocationError>
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
         let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
         };
@@ -208,7 +240,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
 
         match result {
-            Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
+            Ok(address) => {
+                if fixed_address_behavior == FixedAddressBehavior::Replace {
+                    replaced_reservations().for_each(drop);
+                }
+                // SAFETY: mmap returned exclusive ownership of this CoW mapping.
+                Ok(unsafe { LinuxUserlandReservation::new(address..address + source_data.len()) })
+            }
             Err(_) => Err(CowAllocationError::InternalFailure),
         }
     }

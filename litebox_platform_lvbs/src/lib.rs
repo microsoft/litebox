@@ -992,14 +992,21 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     const HINT_PLACEMENT_BEHAVIOR: litebox::platform::page_mgmt::HintPlacementBehavior =
         litebox::platform::page_mgmt::HintPlacementBehavior::Exact;
 
-    fn allocate_pages(
+    unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::ReserveAndCommitError,
+    >
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         let current_pt = self.page_table_manager.current_page_table();
@@ -1009,6 +1016,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 // Clear the existing mappings first.
                 unsafe { current_pt.unmap_pages(range, true, true, false) }
                     .map_err(|_| litebox::platform::page_mgmt::AllocationError::Unaligned)?;
+                replaced_reservations().for_each(drop);
             }
         }
         let flags = u32::from(initial_permissions.bits())
@@ -1018,7 +1026,9 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox_common_linux::vmem::VmFlags::from_bits(flags).unwrap();
-        current_pt.map_pages(range, flags, populate_pages_immediately)
+        current_pt.map_pages(range, flags, populate_pages_immediately)?;
+        // SAFETY: The page table now exclusively owns this exact aligned extent.
+        Ok(unsafe { LvbsReservation::new(suggested_range) })
     }
 
     unsafe fn release_pages(
@@ -1034,12 +1044,16 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         }
     }
 
-    unsafe fn remap_pages(
+    unsafe fn try_remap_pages<Reservations>(
         &self,
+        source_reservations: impl FnOnce() -> Reservations,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
         _permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<UserMutPtr<u8>, litebox::platform::page_mgmt::RemapError> {
+    ) -> Result<LvbsReservation<ALIGN>, litebox::platform::page_mgmt::RemapError>
+    where
+        Reservations: Iterator<Item = LvbsReservation<ALIGN>>,
+    {
         let old_range = PageRange::new(old_range.start, old_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
         let new_range = PageRange::new(new_range.start, new_range.end)
@@ -1050,15 +1064,24 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         unsafe {
             self.page_table_manager
                 .current_page_table()
-                .remap_pages(old_range, new_range)
-        }
+                .remap_pages(old_range, new_range.clone())
+        }?;
+        source_reservations().for_each(drop);
+        // SAFETY: Remapping transferred ownership to this exact destination extent.
+        Ok(unsafe { LvbsReservation::new(new_range.into()) })
     }
 
-    unsafe fn update_permissions(
+    unsafe fn protect_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError>
+    where
+        Reservations:
+            Iterator<Item = &'reservation litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>: 'reservation,
+    {
         let range = PageRange::new(range.start, range.end)
             .ok_or(litebox::platform::page_mgmt::PermissionUpdateError::Unaligned)?;
         let new_flags =

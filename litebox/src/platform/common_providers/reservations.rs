@@ -3,11 +3,14 @@
 
 //! Common virtual-address reservation stores.
 
-use core::ops::Range;
+use core::{marker::PhantomData, ops::Range};
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
-use crate::platform::page_mgmt::{PageReservation, ReservationStore};
+use crate::platform::{
+    PageManagementProvider,
+    page_mgmt::{AllocationError, FixedAddressBehavior, PageReservation, ReservationStore},
+};
 
 /// Define an opaque page-reservation handle with a private constructor.
 #[macro_export]
@@ -56,13 +59,11 @@ macro_rules! define_page_reservation {
 }
 
 /// Reservation store for page managers that do not retain reservation handles.
-pub struct NoTrackedReservations<const ALIGN: usize, Reservation>(
-    core::marker::PhantomData<Reservation>,
-);
+pub struct NoTrackedReservations<const ALIGN: usize, Reservation>(PhantomData<Reservation>);
 
 impl<const ALIGN: usize, Reservation> Default for NoTrackedReservations<ALIGN, Reservation> {
     fn default() -> Self {
-        Self(core::marker::PhantomData)
+        Self(PhantomData)
     }
 }
 
@@ -143,6 +144,86 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
             segments.push((cursor..range.end, None));
         }
         segments
+    }
+
+    /// Round and reserve one currently unowned gap.
+    unsafe fn reserve_gap<Platform, const ALIGN: usize>(
+        platform: &Platform,
+        requested: Range<usize>,
+        can_grow_down: bool,
+        placement: FixedAddressBehavior,
+    ) -> Result<Reservation, AllocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    {
+        let alignment = Platform::RESERVATION_ALIGNMENT;
+        let start = requested.start & !(alignment - 1);
+        let end = requested
+            .end
+            .checked_next_multiple_of(alignment)
+            .ok_or(AllocationError::OutOfMemory)?;
+        let placement =
+            if requested.start == 0 && matches!(placement, FixedAddressBehavior::Hint(_)) {
+                placement
+            } else {
+                FixedAddressBehavior::NoReplace
+            };
+        // SAFETY: Stored reservations use the same native rounding, so this rounded gap remains
+        // unowned. A zero-address hint permits relocation without replacement.
+        unsafe { platform.reserve_pages(core::iter::empty, start..end, can_grow_down, placement) }
+    }
+
+    /// Reserve and track gaps in `requested`, or its full length at a relocated hint.
+    ///
+    /// Returns the bases of newly acquired reservations so the caller can roll them back later.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the platform returns a reservation whose base is already tracked.
+    ///
+    /// # Safety
+    ///
+    /// `placement` must not permit replacement of existing reservations.
+    pub unsafe fn reserve_gaps<Platform, const ALIGN: usize>(
+        &mut self,
+        platform: &Platform,
+        requested: Range<usize>,
+        can_grow_down: bool,
+        placement: FixedAddressBehavior,
+    ) -> Result<Vec<usize>, AllocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    {
+        let mut acquired = Vec::new();
+        let segments = if matches!(placement, FixedAddressBehavior::Hint(_)) {
+            Vec::from([(0..requested.len(), None)])
+        } else {
+            self.segments(requested)
+        };
+        for (gap, base) in segments {
+            if base.is_some() {
+                continue;
+            }
+            // SAFETY: The gap is disjoint from tracked reservations, or a zero-address hint that
+            // permits relocation without replacement.
+            match unsafe { Self::reserve_gap(platform, gap, can_grow_down, placement) } {
+                Ok(reservation) => acquired.push(reservation),
+                Err(error) => {
+                    for reservation in acquired {
+                        // SAFETY: These unpublished reservations have no users.
+                        let _ = unsafe { platform.release_pages(reservation) };
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        let mut bases = Vec::new();
+        for reservation in acquired {
+            let base = reservation.range().start;
+            bases.push(base);
+            assert!(self.insert(base, reservation).is_none());
+        }
+        Ok(bases)
     }
 }
 

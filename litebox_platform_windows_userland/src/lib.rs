@@ -63,7 +63,6 @@ thread_local! {
 /// traits.
 pub struct WindowsUserland<const ALIGN: usize = PAGE_SIZE> {
     reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
-    reservations: std::sync::Mutex<page_mgmt::WindowsReservationStore<ALIGN>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
 }
 
@@ -302,9 +301,6 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
 
         let platform = Self {
             reserved_pages,
-            reservations: std::sync::Mutex::new(
-                page_mgmt::WindowsReservationStore::<ALIGN>::default(),
-            ),
             sys_info: std::sync::RwLock::new(sys_info),
         };
 
@@ -366,16 +362,6 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         unsafe {
             Win32_SysInfo::GetSystemInfo(sys_info);
         }
-    }
-
-    fn round_up_to_granu(&self, x: usize) -> usize {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        (x + gran - 1) & !(gran - 1)
-    }
-
-    fn round_down_to_granu(&self, x: usize) -> usize {
-        let gran = self.sys_info.read().unwrap().dwAllocationGranularity as usize;
-        x & !(gran - 1)
     }
 
     pub fn init_task(&self) -> litebox_common_linux::TaskParams {
