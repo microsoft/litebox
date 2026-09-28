@@ -61,9 +61,6 @@ pub trait ReservationStore {
 
     /// Release every extent represented by this store.
     ///
-    /// Tracked stores release their retained reservations. Handle-free stores release the ranges
-    /// represented by `vmas`.
-    ///
     /// # Safety
     ///
     /// Every represented extent must belong to `platform` and have no remaining users.
