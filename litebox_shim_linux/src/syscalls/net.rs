@@ -2552,7 +2552,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 ReceiveSocket::Inet(socket) => {
                     let wait_cx = self.wait_cx().with_deadline(deadline);
-                    Some(socket.recvmmsg_lock.0.lock_interruptibly(&wait_cx)?)
+                    let guard = socket
+                        .recvmmsg_lock
+                        .0
+                        .lock_interruptibly(&wait_cx)
+                        .map_err(|error| socket_intr_errno(socket.recv_timeout, error))?;
+                    Some(guard)
                 }
                 ReceiveSocket::Unix(_) => None,
             }
