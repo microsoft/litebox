@@ -1361,67 +1361,59 @@ mod tests {
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform(None);
-        let platform = task.global.platform;
+        #[cfg(target_os = "linux")]
+        let external_platform = Platform::new(None);
+        #[cfg(target_os = "windows")]
+        let external_platform = Platform::new();
         let mut data = alloc::vec::Vec::new();
-        // Find an address that is allocated to the global allocator but not in reserved regions.
-        // LiteBox's page manager is not aware of the global allocator's allocations.
+        let mut count = 0;
+        // Model an external allocator allocation that LiteBox's page manager does not track.
         let addr = loop {
-            #[allow(
-                unused_variables,
-                reason = "the following features are mutually exclusive"
-            )]
-            #[cfg(target_os = "windows")]
+            assert!(
+                count < 100,
+                "Failed to find a suitable address after 100 attempts"
+            );
+            count += 1;
             let addr = {
-                let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
-                let addr = buf.as_ptr() as usize;
-                data.push(buf);
-                addr
-            };
-            #[cfg(target_os = "linux")]
-            let addr = {
-                let addr = unsafe {
-                    libc::mmap(
-                        core::ptr::null_mut(),
-                        0x10_000,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    )
-                } as usize;
-                data.push(alloc::vec::Vec::<u8>::from(unsafe {
-                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
-                }));
-                addr
+                use litebox::platform::{
+                    RawConstPointer as _,
+                    page_mgmt::{
+                        AllocationDirection, FixedAddressBehavior, MemoryRegionPermissions,
+                    },
+                };
+
+                let task_addr_min = <Platform as PageManagementProvider<4096>>::TASK_ADDR_MIN;
+                let reservation_alignment =
+                    <Platform as PageManagementProvider<4096>>::RESERVATION_ALIGNMENT;
+                let suggested_start = task_addr_min + count * reservation_alignment;
+                let allocation = <Platform as PageManagementProvider<4096>>::allocate_pages(
+                    external_platform,
+                    suggested_start..suggested_start + 0x1000,
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                    false,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                )
+                .unwrap()
+                .as_usize();
+                data.push(allocation);
+                allocation
             };
 
-            let mut included = false;
-            for r in <crate::syscalls::tests::TestPlatform as PageManagementProvider<
-                4096,
-            >>::reserved_pages(platform)
-            {
-                if r.contains(&addr) {
-                    included = true;
-                    break;
+            // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
+            if let Ok(ptr) = task.sys_mmap(
+                addr - 0x1000,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                -1,
+                0,
+            ) {
+                if ptr.as_usize() != addr - 0x1000 {
+                    task.sys_munmap(ptr, 0x1000).unwrap();
+                    continue;
                 }
-            }
-
-            if !included {
-                // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
-                if let Ok(ptr) = task.sys_mmap(
-                    addr - 0x1000,
-                    0x1000,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
-                    -1,
-                    0,
-                ) {
-                    if ptr.as_usize() != addr - 0x1000 {
-                        task.sys_munmap(ptr, 0x1000).unwrap();
-                        continue;
-                    }
-                    break addr;
-                }
+                break addr;
             }
         };
 
@@ -1439,7 +1431,8 @@ mod tests {
         assert_ne!(res.as_usize(), 0);
         assert_ne!(res.as_usize(), addr);
 
-        // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
+        // Growing without MREMAP_MAYMOVE must fail because the next page belongs to the
+        // independently managed external allocation.
         let err = task
             .sys_mremap(
                 UserPtrMut::from_usize(addr - 0x1000),
@@ -1450,6 +1443,20 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
+
+        task.sys_munmap(res, 0x1000).unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(addr - 0x1000), 0x1000)
+            .unwrap();
+        for allocation in data {
+            // SAFETY: The page belongs to the external provider and has no outstanding references.
+            unsafe {
+                <Platform as PageManagementProvider<4096>>::release_pages(
+                    external_platform,
+                    allocation..allocation + 0x1000,
+                )
+                .unwrap();
+            }
+        }
     }
 
     #[test]
