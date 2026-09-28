@@ -75,6 +75,18 @@ fn socket_io_errno<Platform: ShimPlatform>(
     }
 }
 
+/// Converts the error of a socket operation that ignores the socket's `timeout`.
+///
+/// Like Linux's `sock_intr_errno`, an interrupted operation on a socket with a timeout fails with
+/// `EINTR` instead of restarting.
+pub(super) fn socket_intr_errno(timeout: Option<core::time::Duration>, errno: Errno) -> Errno {
+    if timeout.is_some() {
+        errno.without_restart()
+    } else {
+        errno
+    }
+}
+
 pub(crate) struct ReceiveContext<Instant> {
     deadline: Option<Instant>,
     has_prior_progress: bool,
@@ -876,6 +888,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &SocketFd<Platform>,
         mut peer: Option<&mut SocketAddr>,
     ) -> Result<SocketFd<Platform>, Errno> {
+        let recv_timeout = self.with_socket_options(fd, |opt| opt.recv_timeout);
         cx.wait_on_events(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN,
@@ -886,7 +899,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             },
             || self.try_accept(fd, peer.as_deref_mut()),
         )
-        .map_err(Errno::from)
+        .map_err(|error| socket_intr_errno(recv_timeout, error.into()))
     }
 
     fn bind(&self, fd: &SocketFd<Platform>, sockaddr: SocketAddr) -> Result<(), Errno> {
@@ -902,6 +915,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
             return Err(Errno::ECONNREFUSED);
         }
+        let send_timeout = self.with_socket_options(fd, |opt| opt.send_timeout);
         let mut check_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
@@ -922,7 +936,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         )
         .map_err(|err| match err {
             TryOpError::TryAgain => Errno::EINPROGRESS,
-            err => err.into(),
+            err => socket_intr_errno(send_timeout, err.into()),
         })
     }
 

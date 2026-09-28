@@ -34,7 +34,7 @@ use litebox_common_linux::{
 use crate::{
     FileFd, GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
-    syscalls::net::{SocketOptionValue, SocketOptions},
+    syscalls::net::{SocketOptionValue, SocketOptions, socket_intr_errno},
     wait::wait_errno,
 };
 
@@ -1394,9 +1394,9 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
 
     pub(super) fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         match &self.inner {
-            UnixSocketInner::Stream(stream) => {
-                stream.connect(task, addr, self.get_status().contains(OFlags::NONBLOCK))
-            }
+            UnixSocketInner::Stream(stream) => stream
+                .connect(task, addr, self.get_status().contains(OFlags::NONBLOCK))
+                .map_err(|error| socket_intr_errno(self.options.lock().send_timeout, error)),
             UnixSocketInner::Datagram(datagram) => datagram.connect(task, addr),
         }
     }
@@ -1409,12 +1409,14 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     ) -> Result<UnixSocket<Platform>, Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => {
-                let accepted = stream.accept(
-                    cx,
-                    peer,
-                    self.get_status().contains(OFlags::NONBLOCK)
-                        | flags.contains(SockFlags::NONBLOCK),
-                )?;
+                let accepted = stream
+                    .accept(
+                        cx,
+                        peer,
+                        self.get_status().contains(OFlags::NONBLOCK)
+                            | flags.contains(SockFlags::NONBLOCK),
+                    )
+                    .map_err(|error| socket_intr_errno(self.recv_timeout(), error))?;
                 Ok(UnixSocket::new_with_inner(accepted, flags))
             }
             UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),
