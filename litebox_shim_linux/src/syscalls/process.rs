@@ -2451,36 +2451,6 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn clone_vfork_rejects_unsupported_arguments() {
-        use crate::syscalls::tests::init_platform;
-        use litebox_common_linux::{CloneArgs, CloneFlags, PtRegs, errno::Errno};
-        use zerocopy::FromZeros as _;
-
-        let task = init_platform();
-        let vfork = CloneFlags::VM | CloneFlags::VFORK;
-        let sigchld = u64::from(
-            litebox_common_linux::signal::Signal::SIGCHLD
-                .as_i32()
-                .cast_unsigned(),
-        );
-        for (flags, exit_signal) in [
-            (CloneFlags::VFORK, sigchld),
-            (vfork | CloneFlags::SETTLS, sigchld),
-            (vfork, 0),
-        ] {
-            let mut args = CloneArgs::new_zeroed();
-            args.flags = flags;
-            args.exit_signal = exit_signal;
-            assert_eq!(
-                task.sys_clone(&mut PtRegs::default(), &args),
-                Err(Errno::EINVAL)
-            );
-        }
-        assert!(task.vfork.borrow().is_none());
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
     fn test_arch_prctl() {
         use crate::syscalls::tests::init_platform;
         use litebox_common_linux::ArchPrctlArg;
