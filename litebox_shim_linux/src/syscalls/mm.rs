@@ -123,9 +123,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ensure_space_after: bool,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
-        self.global
-            .mm
-            .do_mmap(suggested_addr, len, prot, flags, ensure_space_after, op)
+        self.global.mm.do_mmap(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            litebox_common_linux::mm::MmapPlacement {
+                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
+                ensure_space_after,
+            },
+            op,
+        )
     }
 
     #[inline]

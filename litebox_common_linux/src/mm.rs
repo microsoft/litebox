@@ -11,7 +11,10 @@ use alloc::vec::Vec;
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{CowAllocationError, DeallocationError, MemoryRegionPermissions, RemapError},
+        page_mgmt::{
+            AllocationDirection, CowAllocationError, DeallocationError, MemoryRegionPermissions,
+            RemapError,
+        },
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -675,6 +678,15 @@ impl From<ProtFlags> for MemoryRegionPermissions {
     }
 }
 
+/// Address-selection policy for an mmap operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmapPlacement {
+    /// Direction in which to search for free address space.
+    pub direction: AllocationDirection,
+    /// Whether to reserve additional growth space after the mapping.
+    pub ensure_space_after: bool,
+}
+
 impl<Platform> VmemManager<Platform, PAGE_SIZE>
 where
     Platform: litebox::platform::RawPointerProvider
@@ -682,19 +694,26 @@ where
         + litebox::platform::PageManagementProvider<PAGE_SIZE>,
     Platform::Reservations: LinuxReservationStore<Platform, PAGE_SIZE>,
 {
+    /// Create an mmap-style mapping using the requested placement policy.
     pub fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        ensure_space_after: bool,
+        placement: MmapPlacement,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_platform_ptr::<Platform>(p));
         let mut flags = CreatePagesFlags::from(flags);
-        flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
-        flags.insert(CreatePagesFlags::TOP_DOWN);
+        flags.set(
+            CreatePagesFlags::ENSURE_SPACE_AFTER,
+            placement.ensure_space_after,
+        );
+        flags.set(
+            CreatePagesFlags::TOP_DOWN,
+            placement.direction == AllocationDirection::TopDown,
+        );
         let suggested_addr = match suggested_addr {
             Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
             None => None,
@@ -727,7 +746,7 @@ where
         .map(UserPtrMut::from_platform_ptr::<Platform>)
     }
 
-    /// Handle syscall `munmap`
+    /// Handle syscall `munmap`.
     pub fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         if addr.as_usize() & !PAGE_MASK != 0 {
             return Err(Errno::EINVAL);
@@ -754,7 +773,7 @@ where
         }
     }
 
-    /// Handle syscall `mprotect`
+    /// Handle syscall `mprotect`.
     pub fn sys_mprotect(
         &self,
         addr: UserPtrMut<u8>,
@@ -785,7 +804,7 @@ where
         .map_err(Errno::from)
     }
 
-    /// Handle syscall `mremap`
+    /// Handle syscall `mremap`.
     pub fn sys_mremap(
         &self,
         old_addr: UserPtrMut<u8>,
@@ -848,6 +867,7 @@ where
         .map_err(Errno::from)
     }
 
+    /// Handle syscall `madvise`.
     pub fn sys_madvise(
         &self,
         addr: UserPtrMut<u8>,
