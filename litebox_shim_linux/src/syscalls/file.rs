@@ -225,7 +225,6 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         global: &GlobalState<Platform>,
         inherited_fds: &[litebox_common_linux::program_startup::InheritedFd],
     ) -> Result<(), crate::loader::elf::ElfLoaderError> {
-        use litebox::pipes::HalfPipeType;
         use litebox_common_linux::program_startup::InheritedFdKind;
 
         let litebox = &global.litebox;
@@ -240,45 +239,35 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
             }
             let first_fd = descriptions.get(&inherited.handle).copied();
             let handle = inherited.handle;
+            let adopt_file = || {
+                litebox
+                    .adopt_inherited_file(handle)
+                    .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+            };
             match inherited.kind {
-                InheritedFdKind::File {
-                    stdio_stream,
-                    stdio_status_flags,
+                InheritedFdKind::File => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, adopt_file)?;
+                }
+                InheritedFdKind::Stdio {
+                    stream,
+                    status_flags,
                 } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                    let fd = litebox
-                        .adopt_inherited_file(handle)
-                        .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)?;
+                    let fd = adopt_file()?;
                     let mut descriptors = litebox.descriptor_table_mut();
-                    if let Some(stream) = stdio_stream {
-                        descriptors.set_entry_metadata(&fd, stream);
-                    }
-                    if let Some(flags) = stdio_status_flags {
+                    descriptors.set_entry_metadata(&fd, stream);
+                    if let Some(flags) = status_flags {
                         descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
                     }
                     Ok(fd)
                 })?,
-                InheritedFdKind::PipeReader { status_flags } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_linux_pipe(
-                                handle,
-                                HalfPipeType::ReceiverHalf,
-                                status_flags,
-                            )
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
-                InheritedFdKind::PipeWriter { status_flags } => {
-                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                        global
-                            .adopt_inherited_linux_pipe(
-                                handle,
-                                HalfPipeType::SenderHalf,
-                                status_flags,
-                            )
-                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                    })?;
-                }
+                InheritedFdKind::Pipe {
+                    endpoint,
+                    status_flags,
+                } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                    global
+                        .adopt_inherited_linux_pipe(handle, endpoint, status_flags)
+                        .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                })?,
             }
             descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
@@ -323,6 +312,34 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 pub(crate) enum ExecInheritedFd<Platform: ShimPlatform> {
     File(alloc::sync::Arc<FileFd>),
     Pipe(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
+}
+
+impl<Platform: ShimPlatform> ExecInheritedFd<Platform> {
+    /// Describes this descriptor for the fresh runner inheriting it.
+    pub(crate) fn kind(
+        &self,
+        global: &GlobalState<Platform>,
+    ) -> Result<litebox_common_linux::program_startup::InheritedFdKind, Errno> {
+        use litebox_common_linux::program_startup::InheritedFdKind;
+
+        match self {
+            Self::File(file) => {
+                let descriptors = global.litebox.descriptor_table();
+                let Ok(stream) = descriptors.with_metadata(&**file, |stream: &StdioStream| *stream)
+                else {
+                    return Ok(InheritedFdKind::File);
+                };
+                let status_flags = descriptors
+                    .with_metadata(&**file, |crate::StdioStatusFlags(flags)| *flags)
+                    .ok();
+                Ok(InheritedFdKind::Stdio {
+                    stream,
+                    status_flags,
+                })
+            }
+            Self::Pipe(pipe) => global.inherited_linux_pipe_kind(pipe),
+        }
+    }
 }
 
 /// A raw fd resolved once into the subsystem that owns it.

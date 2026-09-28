@@ -168,9 +168,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .descriptor_table()
             .with_metadata(fd, |PipeStatusFlags(flags)| *flags)
             .map_err(metadata_to_errno)?;
-        Ok(match self.pipes.half_pipe_type(fd)? {
-            HalfPipeType::ReceiverHalf => InheritedFdKind::PipeReader { status_flags },
-            HalfPipeType::SenderHalf => InheritedFdKind::PipeWriter { status_flags },
+        Ok(InheritedFdKind::Pipe {
+            endpoint: self.pipes.half_pipe_type(fd)?,
+            status_flags,
         })
     }
 

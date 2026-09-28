@@ -22,7 +22,6 @@ use litebox::mm::vmem::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
 use litebox::process::InheritableFd;
-use litebox::stdio::StdioStream;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::ObjectHandle;
@@ -30,7 +29,7 @@ use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno,
-    program_startup::{InheritedFd, InheritedFdKind, LinuxProgramStartup},
+    program_startup::{InheritedFd, LinuxProgramStartup},
 };
 use litebox_platform::sync::{RawMutex as _, RawMutexProvider};
 use litebox_platform::time::{Instant as _, SystemTime as _, TimeProvider};
@@ -1955,27 +1954,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             inherited_fds: inherited
                 .iter()
                 .map(|(fd, inherited)| {
-                    let kind = match inherited {
-                        ExecInheritedFd::File(file) => {
-                            let descriptors = self.global.litebox.descriptor_table();
-                            InheritedFdKind::File {
-                                stdio_stream: descriptors
-                                    .with_metadata(&**file, |stream: &StdioStream| *stream)
-                                    .ok(),
-                                stdio_status_flags: descriptors
-                                    .with_metadata(&**file, |crate::StdioStatusFlags(flags)| *flags)
-                                    .ok(),
-                            }
-                        }
-                        ExecInheritedFd::Pipe(pipe) => {
-                            self.global.inherited_linux_pipe_kind(pipe)?
-                        }
-                    };
                     Ok(InheritedFd {
                         fd: *fd,
                         // Replaced by the child's handle once the startup fits.
                         handle: ObjectHandle::default(),
-                        kind,
+                        kind: inherited.kind(&self.global)?,
                     })
                 })
                 .collect::<Result<_, Errno>>()?,
