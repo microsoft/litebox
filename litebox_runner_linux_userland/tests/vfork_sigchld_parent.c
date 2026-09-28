@@ -76,6 +76,15 @@ static pid_t spawn_sleeper(void) {
     return child;
 }
 
+// Waits up to a second for the SIGCHLD handler to run, returning how many times it ran. Linux
+// resumes a vfork parent before the child finishes exiting, so the handler may run shortly after.
+static int await_sigchld(void) {
+    for (int i = 0; i < 1000 && chld_count == 0; i++) {
+        usleep(1000);
+    }
+    return chld_count;
+}
+
 // Prints what the handler recorded for `child`, leaving the line open for extra fields.
 static void report(const char *name, pid_t child, pid_t waited) {
     printf("%s child=%d waited=%d count=%d pid=%d code=%d status=%d uid=%d", name, child, waited,
@@ -89,10 +98,10 @@ int main(int argc, char **argv) {
     }
     child_path = argv[1];
 
-    // A child exiting in its vfork window signals the parent as it resumes, before any wait.
+    // A child exiting in its vfork window signals the parent without any wait.
     catch_sigchld(SA_RESTART);
     pid_t child = spawn_exit(7);
-    int early = chld_count;
+    int early = await_sigchld();
     pid_t waited = waitpid(child, NULL, 0);
     report("exited", child, waited);
     printf(" early=%d\n", early);
@@ -108,7 +117,7 @@ int main(int argc, char **argv) {
         perror("vfork");
         return 4;
     }
-    early = chld_count;
+    early = await_sigchld();
     waited = waitpid(child, NULL, 0);
     report("killed", child, waited);
     printf(" early=%d\n", early);
@@ -136,7 +145,7 @@ int main(int argc, char **argv) {
     // A child reaped as it terminates still signals the parent's handler with its status.
     catch_sigchld(SA_RESTART | SA_NOCLDWAIT);
     child = spawn_exit(9);
-    early = chld_count;
+    early = await_sigchld();
     errno = 0;
     waited = waitpid(child, NULL, 0);
     report("nocldwait", child, waited);
@@ -153,12 +162,14 @@ int main(int argc, char **argv) {
     }
     set_action(SIGCHLD, &ignore);
     child = spawn_exit(11);
+    // Waiting while SIGCHLD is ignored returns ECHILD once the child is reaped.
+    waited = waitpid(child, NULL, 0);
     catch_sigchld(SA_RESTART);
     if (sigprocmask(SIG_UNBLOCK, &chld_set, NULL) != 0) {
         perror("sigprocmask");
         return 6;
     }
-    printf("ignored-blocked child=%d count=%d\n", child, chld_count);
+    printf("ignored-blocked child=%d waited=%d count=%d\n", child, waited, chld_count);
 
     // The default SIGCHLD action does not interrupt the sleeping parent. This runs last since
     // vfork fails once an alarm has been set.

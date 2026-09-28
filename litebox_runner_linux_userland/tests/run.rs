@@ -720,7 +720,9 @@ fn vfork_children_signal_parent_on_termination() {
     assert_handled(nocldwait, libc::CLD_EXITED, 9);
     assert_eq!(numeric_field(nocldwait, "early="), 1);
     assert_eq!(numeric_field(nocldwait, "echild="), 1);
-    assert_eq!(numeric_field(line("ignored-blocked "), "count="), 0);
+    let ignored = line("ignored-blocked ");
+    assert_eq!(numeric_field(ignored, "waited="), -1);
+    assert_eq!(numeric_field(ignored, "count="), 0);
     let default = line("default ");
     reaped(default);
     assert_eq!(numeric_field(default, "alarmed="), 1);
