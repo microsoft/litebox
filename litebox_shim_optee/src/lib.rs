@@ -79,8 +79,7 @@ pub struct MemoryManager<Platform: OpteeShimPlatform> {
 }
 
 impl<Platform: OpteeShimPlatform> MemoryManager<Platform> {
-    /// Creates a memory manager for `litebox`.
-    pub fn new(platform: &'static Platform) -> Self {
+    fn new(platform: &'static Platform) -> Self {
         Self {
             vmem: VmemManager::new(platform),
         }

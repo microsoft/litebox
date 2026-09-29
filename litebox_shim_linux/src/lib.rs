@@ -118,8 +118,7 @@ pub struct MemoryManager<Platform: ShimPlatform> {
 }
 
 impl<Platform: ShimPlatform> MemoryManager<Platform> {
-    /// Creates a memory manager for `litebox`.
-    pub fn new(platform: &'static Platform) -> Self {
+    fn new(platform: &'static Platform) -> Self {
         Self {
             vmem: VmemManager::new(platform),
             brk: Mutex::new(0),
@@ -131,7 +130,7 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     /// # Panics
     ///
     /// Panics if the initial program break has already been set.
-    pub fn set_initial_brk(&self, brk: usize) {
+    fn set_initial_brk(&self, brk: usize) {
         let mut current = self.brk.lock();
         assert_eq!(*current, 0, "initial brk is already set");
         *current = brk;
@@ -147,7 +146,7 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     ///
     /// If shrinking the program break, the caller must ensure that the released region is no
     /// longer used.
-    pub unsafe fn brk(&self, requested: usize) -> Result<usize, MappingError> {
+    unsafe fn brk(&self, requested: usize) -> Result<usize, MappingError> {
         let mut current = self.brk.lock();
         assert_ne!(*current, 0, "initial brk is not set yet");
         if requested == 0 {

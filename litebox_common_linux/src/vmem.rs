@@ -1078,7 +1078,7 @@ mod tests {
 
     use super::*;
 
-    /// A dummy implementation of [`VmemBackend`] that does nothing.
+    /// A dummy page-management platform for virtual-memory tests.
     struct DummyVmemBackend;
 
     impl litebox::platform::RawPointerProvider for DummyVmemBackend {

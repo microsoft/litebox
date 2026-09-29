@@ -330,8 +330,11 @@ where
         Ok(())
     }
 
-    /// Returns whether any tracked mapping overlaps `range`.
-    pub fn overlaps(&self, range: Range<usize>) -> bool {
+    #[expect(
+        dead_code,
+        reason = "reserved for internal virtual-memory overlap checks"
+    )]
+    fn overlaps(&self, range: Range<usize>) -> bool {
         self.vmem.read().overlapping(range).next().is_some()
     }
 
