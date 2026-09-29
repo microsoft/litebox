@@ -591,11 +591,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(range.start), 0, prot);
         }
         for sub in subranges {
-            self.sys_mprotect_raw(
-                UserPtrMut::<u8>::from_usize(sub.start),
-                sub.len(),
-                prot.clone(),
-            )?;
+            self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(sub.start), sub.len(), prot)?;
         }
         Ok(())
     }
