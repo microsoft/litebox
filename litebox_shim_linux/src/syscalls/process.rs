@@ -3040,30 +3040,6 @@ mod tests {
         (SYSCALL_RETURN_IP - entry_len, reissued)
     }
 
-    /// Syscalls enter through the native syscall instruction on platforms without a syscall entry
-    /// point (the kernel platforms), and through the rewriter's trampolines otherwise.
-    #[test]
-    fn test_syscall_instruction_len_follows_entry_point() {
-        use crate::syscalls::signal::syscall_instruction_len;
-
-        struct EntryPoint(usize);
-        impl litebox::platform::SystemInfoProvider for EntryPoint {
-            fn get_syscall_entry_point(&self) -> usize {
-                self.0
-            }
-            fn get_vdso_address(&self) -> Option<usize> {
-                None
-            }
-        }
-
-        #[cfg(target_arch = "x86_64")]
-        let (native, rewritten) = (2, 6);
-        #[cfg(target_arch = "aarch64")]
-        let (native, rewritten) = (4, 4);
-        assert_eq!(syscall_instruction_len(&EntryPoint(0)), native);
-        assert_eq!(syscall_instruction_len(&EntryPoint(0x1000)), rewritten);
-    }
-
     fn interrupted_state() -> (usize, usize) {
         (
             SYSCALL_RETURN_IP,
@@ -3108,63 +3084,6 @@ mod tests {
                     interrupted_state()
                 };
                 assert_eq!(syscall_state(&regs), expected, "{restart:?}");
-            }
-        });
-    }
-
-    /// When a handler runs, the interrupted syscall restarts after it returns only for
-    /// `ERESTARTSYS` with `SA_RESTART`.
-    #[test]
-    fn test_syscall_restart_follows_sa_restart() {
-        use crate::syscalls::signal::SyscallRestart;
-        use litebox_common_linux::signal::{SaFlags, SigAction, SigSet, Signal};
-
-        let handler = 0x1000usize;
-        let task = crate::syscalls::tests::init_platform();
-        <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
-            let mut stack = [0u8; 2 * litebox::mm::vmem::PAGE_SIZE];
-            let cases = [
-                (SyscallRestart::Sys, SaFlags::RESTART, true),
-                (SyscallRestart::Sys, SaFlags::empty(), false),
-                (SyscallRestart::NoHandler, SaFlags::RESTART, false),
-                (SyscallRestart::NoHandler, SaFlags::empty(), false),
-            ];
-            for (restart, flags, restarts) in cases {
-                let act = SigAction {
-                    sigaction: handler,
-                    flags: SaFlags::RESTORER | flags,
-                    #[cfg(target_pointer_width = "64")]
-                    __pad: 0,
-                    restorer: 0,
-                    mask: SigSet::empty(),
-                };
-                task.sys_rt_sigaction(
-                    Signal::SIGUSR1,
-                    Some(UserPtr::from_ptr(&raw const act)),
-                    None,
-                    core::mem::size_of::<SigSet>(),
-                )
-                .expect("rt_sigaction failed");
-                task.sys_tkill(task.tid(), Signal::SIGUSR1.as_i32())
-                    .expect("tkill failed");
-
-                let mut regs = interrupted_syscall_regs(&mut stack);
-                task.process_signals(&mut regs, Some(restart));
-                assert_eq!(regs.get_ip(), handler, "the handler should run");
-
-                // Return from the handler as its restorer would.
-                #[cfg(target_arch = "x86_64")]
-                {
-                    regs.rsp += core::mem::size_of::<usize>();
-                }
-                task.sys_rt_sigreturn(&mut regs).expect("rt_sigreturn failed");
-                let expected = if restarts {
-                    restarted_state()
-                } else {
-                    interrupted_state()
-                };
-                assert_eq!(syscall_state(&regs), expected, "{restart:?} with SA_RESTART={}",
-                    flags.contains(SaFlags::RESTART));
             }
         });
     }

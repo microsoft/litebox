@@ -575,9 +575,7 @@ impl SyscallRestart {
 /// Guest syscalls are rewritten to enter through the rewriter's trampolines when the platform has a
 /// syscall entry point (see the ELF loader and mmap-time rewriting); otherwise the guest issues
 /// native syscall instructions.
-pub(crate) fn syscall_instruction_len(
-    platform: &impl litebox::platform::SystemInfoProvider,
-) -> usize {
+fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider) -> usize {
     if platform.get_syscall_entry_point() == 0 {
         arch::NATIVE_SYSCALL_INSTRUCTION_LEN
     } else {
