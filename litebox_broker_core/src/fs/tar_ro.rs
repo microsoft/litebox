@@ -63,8 +63,6 @@ impl TarRo {
     }
 }
 
-impl super::backend::private::Sealed for TarRo {}
-
 /// Directory handle
 #[derive(Clone)]
 pub struct TarRoDirHandle {

@@ -199,11 +199,6 @@ pub enum InitialNode {
     },
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::private::Sealed
-    for InMem<Platform>
-{
-}
-
 /// Directory handle
 pub struct InMemDirHandle<Platform: sync::RawSyncPrimitivesProvider> {
     dir: DirNode<Platform>,

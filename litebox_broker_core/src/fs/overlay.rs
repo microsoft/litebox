@@ -714,8 +714,6 @@ fn file_status_to_open_error(error: FileStatusError) -> OpenError {
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider> super::backend::private::Sealed for Overlay<Platform> {}
-
 impl<Platform: RawSyncPrimitivesProvider> BackendHandles for Overlay<Platform> {
     type WalkingDirHandle<'a> = OverlayWalkingDir;
     type FileHandle = OverlayFile;
