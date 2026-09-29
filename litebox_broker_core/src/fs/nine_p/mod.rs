@@ -256,11 +256,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::
     }
 }
 
-impl<Platform: sync::RawSyncPrimitivesProvider, T: transport::Read + transport::Write>
-    super::backend::private::Sealed for NineP<Platform, T>
-{
-}
-
 impl<Platform, T> super::backend::BackendHandles for NineP<Platform, T>
 where
     Platform: sync::RawSyncPrimitivesProvider + 'static,

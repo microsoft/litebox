@@ -381,8 +381,6 @@ impl Clone for ComposerDirHandleInner {
     }
 }
 
-impl super::backend::private::Sealed for Composer {}
-
 impl BackendHandles for Composer {
     type WalkingDirHandle<'a> = ComposerWalkingDirHandle<'a>;
     type FileHandle = ComposerFileHandle;

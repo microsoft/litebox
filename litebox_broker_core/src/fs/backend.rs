@@ -45,22 +45,8 @@ pub enum SeekBehavior {
     PositionBased,
 }
 
-/// A private module (private to the filesystem subsystem), to help support writing sealed traits.
-/// This module should _itself_ not be made public.
-pub(super) mod private {
-    /// A trait to help seal the main `Backend` trait.
-    ///
-    /// This trait is explicitly public, but unnameable, thereby preventing code outside this crate
-    /// from implementing this trait.
-    ///
-    /// XXX(jayb): We may (in the future) de-restrict backends to allow other crates to also
-    /// introduce backends, but while we migrate the file-system subsystem over from the old
-    /// approach to the new one, we will not allow other crates to introduce backends.
-    pub trait Sealed {}
-}
-
 /// A backend that can be used to support a (full or subset of) a LiteBox filesystem.
-pub trait Backend: private::Sealed + Send + Sync + Any {
+pub trait Backend: Send + Sync + Any {
     /// Obtain access to the root directory of the backend.
     fn root(&self) -> WalkingDirHandle<'_>;
 
@@ -186,7 +172,7 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
 /// This trait is intentionally separate from [`Backend`]: the dyn-safe [`Backend`] interface keeps
 /// using erased handle wrappers, while concrete backend implementations can use these associated
 /// types at their own boundaries instead of spelling out manual erased-handle downcasts.
-pub(crate) trait BackendHandles {
+pub trait BackendHandles {
     /// Supporting walk through the backend
     type WalkingDirHandle<'a>: 'a;
     /// An owned handle to an open file
@@ -255,7 +241,8 @@ impl<H> ErasedWalkingDirHandle for H {
 }
 
 impl<'a> WalkingDirHandle<'a> {
-    pub(super) fn from_typed<B: BackendHandles + 'static>(handle: B::WalkingDirHandle<'a>) -> Self {
+    /// Erase the concrete type of the handle.
+    pub fn from_typed<B: BackendHandles + 'static>(handle: B::WalkingDirHandle<'a>) -> Self {
         Self {
             backend_type: TypeId::of::<B>(),
             raw: Box::new(handle),
@@ -266,8 +253,12 @@ impl<'a> WalkingDirHandle<'a> {
     /// Recover the concrete handle stored in this erased handle.
     ///
     /// Intended to be called by backend implementations as `handle.into_typed::<Self>()` on
-    /// handles that the resolver passed back to the same backend; it may panic otherwise.
-    pub(super) fn into_typed<B: BackendHandles + 'static>(self) -> B::WalkingDirHandle<'a> {
+    /// handles that the resolver passed back to the same backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `B` is not the backend type used to create this handle.
+    pub fn into_typed<B: BackendHandles + 'static>(self) -> B::WalkingDirHandle<'a> {
         assert_eq!(
             self.backend_type,
             TypeId::of::<B>(),
@@ -283,7 +274,8 @@ impl<'a> WalkingDirHandle<'a> {
 }
 
 impl FileHandle {
-    pub(super) fn from_typed<B: BackendHandles>(handle: B::FileHandle) -> Self {
+    /// Erase the concrete type of the handle.
+    pub fn from_typed<B: BackendHandles>(handle: B::FileHandle) -> Self {
         Self::from_typed_with_device::<B>(handle, None)
     }
 
@@ -304,8 +296,12 @@ impl FileHandle {
     /// Borrow the concrete handle stored in this erased handle.
     ///
     /// Intended to be called by backend implementations as `handle.get_typed::<Self>()` on handles
-    /// that the resolver passed back to the same backend; it may panic otherwise.
-    pub(super) fn get_typed<B: BackendHandles>(&self) -> &B::FileHandle {
+    /// that the resolver passed back to the same backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored handle's concrete type is not `B::FileHandle`.
+    pub fn get_typed<B: BackendHandles>(&self) -> &B::FileHandle {
         (&*self.raw as &dyn Any)
             .downcast_ref::<B::FileHandle>()
             .expect("backend file handle type mismatch")
@@ -313,7 +309,8 @@ impl FileHandle {
 }
 
 impl DirHandle {
-    pub(super) fn from_typed<B: BackendHandles>(handle: B::DirHandle) -> Self {
+    /// Erase a concrete directory handle.
+    pub fn from_typed<B: BackendHandles>(handle: B::DirHandle) -> Self {
         Self {
             raw: Box::new(handle),
         }
@@ -322,8 +319,12 @@ impl DirHandle {
     /// Borrow the concrete handle stored in this erased handle.
     ///
     /// Intended to be called by backend implementations as `handle.get_typed::<Self>()` on handles
-    /// that the resolver passed back to the same backend; it may panic otherwise.
-    pub(super) fn get_typed<B: BackendHandles>(&self) -> &B::DirHandle {
+    /// that the resolver passed back to the same backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored handle's concrete type is not `B::DirHandle`.
+    pub fn get_typed<B: BackendHandles>(&self) -> &B::DirHandle {
         (&*self.raw as &dyn Any)
             .downcast_ref::<B::DirHandle>()
             .expect("backend directory handle type mismatch")
@@ -332,8 +333,12 @@ impl DirHandle {
     /// Recover the concrete handle stored in this erased handle.
     ///
     /// Intended to be called by backend implementations as `handle.into_typed::<Self>()` on
-    /// handles that the resolver passed back to the same backend; it may panic otherwise.
-    pub(super) fn into_typed<B: BackendHandles>(self) -> B::DirHandle {
+    /// handles that the resolver passed back to the same backend.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored handle's concrete type is not `B::DirHandle`.
+    pub fn into_typed<B: BackendHandles>(self) -> B::DirHandle {
         let raw: Box<dyn Any> = self.raw;
         *raw.downcast::<B::DirHandle>()
             .expect("backend directory handle type mismatch")
@@ -348,24 +353,23 @@ pub struct WalkOutcome<Walking> {
     ///
     /// Components are in natural order (i.e., the last element is the last component visited thus
     /// far).
-    pub(super) components: Vec<WalkedComponent>,
+    pub components: Vec<WalkedComponent>,
     /// The last handle of the walk thus far.
     ///
-    pub(super) last: Walking,
+    pub last: Walking,
     /// Why this walk stopped at `last`.
-    pub(super) stop_reason: WalkStopReason,
+    pub stop_reason: WalkStopReason,
 }
 
 /// Why a backend directory walk stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
-pub(super) enum WalkStopReason {
+pub enum WalkStopReason {
     /// All requested components were walked, and `last` is the requested directory.
     CompleteDirectory,
     /// The next requested component exists but is not a directory; `last` is its parent directory.
     StoppedAtNonDirectory,
     /// The backend stopped early; the resolver should continue walking from `last`.
-    #[expect(dead_code, reason = "no backend currently returns partial walks")]
     Continue,
 }
 
@@ -381,14 +385,16 @@ pub struct CreationMetadata {
 
 /// A backend item plus permission metadata for resolver-side checks.
 pub struct Permissioned<H> {
-    pub(super) item: H,
-    pub(super) permissions: PermissionCheck,
+    /// The backend item.
+    pub item: H,
+    /// How permissions for this item should be checked.
+    pub permissions: PermissionCheck,
 }
 
 /// Whether a resolved component should be permission-checked by the resolver.
 #[derive(Clone, Debug)]
 #[must_use]
-pub(super) enum PermissionCheck {
+pub enum PermissionCheck {
     /// The backend is self-enforcing permissions for this item.
     ByBackend,
     /// The resolver should check this permission metadata.
@@ -398,16 +404,18 @@ pub(super) enum PermissionCheck {
 /// Per-component status returned by a backend walk
 #[derive(Clone, Debug)]
 #[must_use]
-pub(super) struct WalkedComponent {
+pub struct WalkedComponent {
     /// How permissions for this component should be checked.
-    pub(super) permissions: PermissionCheck,
+    pub permissions: PermissionCheck,
 }
 
 /// Permission information for a particular component of the walk.
 #[derive(Clone, Debug)]
-pub(super) struct PermissionInfo {
-    pub(super) mode: Mode,
-    pub(super) owner: UserInfo,
+pub struct PermissionInfo {
+    /// Permission bits for the component.
+    pub mode: Mode,
+    /// Owner of the component.
+    pub owner: UserInfo,
 }
 
 #[cfg(test)]

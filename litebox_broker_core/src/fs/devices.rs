@@ -173,8 +173,6 @@ pub struct DeviceFileHandle {
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceDirHandle;
 
-impl super::backend::private::Sealed for Devices {}
-
 impl BackendHandles for Devices {
     type WalkingDirHandle<'a> = DeviceDirHandle;
     type FileHandle = DeviceFileHandle;
