@@ -386,7 +386,7 @@ mod tests {
         };
         // SAFETY: a fresh, non-fixed mapping owned by this task.
         let buf = unsafe {
-            task.global.pm.create_writable_pages(
+            task.global.mm.create_writable_pages(
                 NonZeroAddress::new(Platform::TASK_ADDR_MIN),
                 NonZeroPageSize::new(MAX_KERNEL_BUF_SIZE).unwrap(),
                 CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,

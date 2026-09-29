@@ -94,7 +94,7 @@ impl<P: ShimPlatform> MacosShimBuilder<P> {
         MacosShim {
             global: Arc::new(GlobalState {
                 platform: self.platform,
-                pm: VmemManager::new(self.platform),
+                mm: VmemManager::new(self.platform),
                 litebox: self.litebox,
                 macho_mappings: Mutex::new(BTreeMap::new()),
                 macho_trampolines: Mutex::new(BTreeMap::new()),
@@ -379,7 +379,7 @@ pub struct MacosShimEntrypoints<P: ShimPlatform> {
 struct GlobalState<P: ShimPlatform> {
     platform: &'static P,
     litebox: Arc<LiteBox<P>>,
-    pm: VmemManager<P, PAGE_SIZE>,
+    mm: VmemManager<P, PAGE_SIZE>,
     macho_mappings: Mutex<P, BTreeMap<usize, syscalls::mm::MachoMapping>>,
     macho_trampolines: Mutex<P, BTreeMap<usize, syscalls::mm::MachoRuntimeTrampoline>>,
     shared_cache_base: AtomicUsize,
@@ -394,7 +394,7 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
         // SAFETY: the last task/loader owner is gone, so none of these mappings
         // are executing or borrowed. Vmem's platform reservations have empty
         // flags; our anonymous mappings have VM_MAY_ACCESS_FLAGS, even guards.
-        for (range, flags) in self.pm.mappings() {
+        for (range, flags) in self.mm.mappings() {
             if !flags.intersects(VmFlags::VM_MAY_ACCESS_FLAGS) {
                 continue;
             }
@@ -402,7 +402,7 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
                 .to_platform_ptr::<P>();
             // Best effort during Drop, including unwinding: a failed unmap
             // must not cause a second panic or prevent releasing later ranges.
-            if let Err(error) = unsafe { self.pm.remove_pages(ptr, range.len()) } {
+            if let Err(error) = unsafe { self.mm.remove_pages(ptr, range.len()) } {
                 litebox_util_log::warn!(error:? = error; "failed to release macOS guest mapping");
             }
         }

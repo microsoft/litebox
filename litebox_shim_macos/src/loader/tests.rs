@@ -158,7 +158,7 @@ fn filesystem_loader_runs_linked_static_macho() {
         ] {
             assert_eq!(
                 task.global
-                    .pm
+                    .mm
                     .range_has_permissions(range.clone(), permission),
                 segment.protection.contains(protection)
             );
@@ -197,7 +197,7 @@ fn filesystem_loader_runs_linked_static_macho() {
     assert!(
         !task
             .global
-            .pm
+            .mm
             .range_has_permissions(guard..guard + PAGE_SIZE, Permissions::READ)
     );
     let crate::LoadedProgram {
