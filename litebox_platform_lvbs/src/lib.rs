@@ -992,6 +992,49 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     const HINT_PLACEMENT_BEHAVIOR: litebox::platform::page_mgmt::HintPlacementBehavior =
         litebox::platform::page_mgmt::HintPlacementBehavior::Exact;
 
+    unsafe fn reserve_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: core::ops::Range<usize>,
+        can_grow_down: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<LvbsReservation<ALIGN>, litebox::platform::page_mgmt::AllocationError>
+    where
+        Reservations: Iterator<Item = LvbsReservation<ALIGN>>,
+    {
+        unsafe {
+            self.reserve_and_commit_pages(
+                replaced_reservations,
+                suggested_range,
+                litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
+                can_grow_down,
+                false,
+                fixed_address_behavior,
+            )
+        }
+    }
+
+    unsafe fn commit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        populate_pages_immediately: bool,
+    ) -> Result<UserMutPtr<u8>, litebox::platform::page_mgmt::AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation LvbsReservation<ALIGN>>,
+        LvbsReservation<ALIGN>: 'reservation,
+    {
+        let range = PageRange::new(range.start, range.end)
+            .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
+        let flags =
+            litebox_common_linux::vmem::VmFlags::from_bits(permissions.bits().into()).unwrap();
+        let current_pt = self.page_table_manager.current_page_table();
+        unsafe { current_pt.mprotect_pages(range, flags) }
+            .expect("failed to protect committed pages");
+        current_pt.map_pages(range, flags, populate_pages_immediately)
+    }
+
     unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
@@ -1009,11 +1052,13 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     {
         debug_assert!(!suggested_range.is_empty());
         debug_assert!(
-            suggested_range.start >= Self::TASK_ADDR_MIN
+            suggested_range.start >= <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
                 || (suggested_range.start == 0
                     && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
         );
-        debug_assert!(suggested_range.end <= Self::TASK_ADDR_MAX);
+        debug_assert!(
+            suggested_range.end <= <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+        );
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         let current_pt = self.page_table_manager.current_page_table();
@@ -1036,6 +1081,19 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         current_pt.map_pages(range, flags, populate_pages_immediately)?;
         // SAFETY: The page table now exclusively owns this exact aligned extent.
         Ok(unsafe { LvbsReservation::new(suggested_range) })
+    }
+
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError>
+    where
+        Reservations: Iterator<Item = &'reservation LvbsReservation<ALIGN>>,
+        LvbsReservation<ALIGN>: 'reservation,
+    {
+        // SAFETY: Releasing LVBS pages only frees backing; the caller retains the reservation.
+        unsafe { <Self as PageManagementProvider<ALIGN>>::release_pages(self, range) }
     }
 
     unsafe fn release_pages(

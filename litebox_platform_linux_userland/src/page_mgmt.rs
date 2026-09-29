@@ -4,8 +4,6 @@
 use super::*;
 use litebox::platform::page_mgmt::{AllocationDirection, HintPlacementBehavior};
 
-litebox::define_page_reservation!(LinuxUserlandReservation);
-
 fn prot_flags(flags: MemoryRegionPermissions) -> ProtFlags {
     let mut res = ProtFlags::PROT_NONE;
     res.set(
@@ -40,6 +38,64 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
+    unsafe fn reserve_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: core::ops::Range<usize>,
+        can_grow_down: bool,
+        fixed_address_behavior: FixedAddressBehavior,
+    ) -> Result<LinuxUserlandReservation<ALIGN>, litebox::platform::page_mgmt::AllocationError>
+    where
+        Reservations: Iterator<Item = LinuxUserlandReservation<ALIGN>>,
+    {
+        // SAFETY: The caller authorizes replacement and exclusive ownership of the range.
+        unsafe {
+            self.reserve_and_commit_pages(
+                replaced_reservations,
+                suggested_range,
+                MemoryRegionPermissions::empty(),
+                can_grow_down,
+                false,
+                fixed_address_behavior,
+            )
+        }
+    }
+
+    unsafe fn commit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+        populate_pages_immediately: bool,
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
+        LinuxUserlandReservation<ALIGN>: 'reservation,
+    {
+        // SAFETY: The caller owns the mapping and excludes conflicting access to these pages.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::mprotect,
+                range.start,
+                range.len(),
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+            )
+        }
+        .expect("mprotect failed while committing pages");
+        if populate_pages_immediately {
+            // SAFETY: This advice covers the live owned mapping and does not change its contents.
+            let _ = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::madvise,
+                    range.start,
+                    range.len(),
+                    libc::MADV_WILLNEED as usize,
+                )
+            };
+        }
+        Ok(UserMutPtr::from_ptr(range.start as *mut u8))
+    }
+
     unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
@@ -57,11 +113,15 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     {
         debug_assert!(!suggested_range.is_empty());
         debug_assert!(
-            suggested_range.start >= Self::TASK_ADDR_MIN
+            suggested_range.start
+                >= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
                 || (suggested_range.start == 0
                     && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
         );
-        debug_assert!(suggested_range.end <= Self::TASK_ADDR_MAX);
+        debug_assert!(
+            suggested_range.end
+                <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+        );
         debug_assert!(!matches!(
             fixed_address_behavior,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp)
@@ -117,6 +177,38 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         }
         // SAFETY: mmap returned exclusive ownership of this exact aligned extent.
         Ok(unsafe { LinuxUserlandReservation::new(ptr..ptr + suggested_range.len()) })
+    }
+
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError>
+    where
+        Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
+        LinuxUserlandReservation<ALIGN>: 'reservation,
+    {
+        // SAFETY: The caller owns these pages and excludes all users of the decommitted range.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::mprotect,
+                range.start,
+                range.len(),
+                ProtFlags::PROT_NONE.bits().reinterpret_as_unsigned() as usize,
+            )
+        }
+        .expect("mprotect failed while decommitting pages");
+        // SAFETY: The range is owned and inaccessible; discard its anonymous backing.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::madvise,
+                range.start,
+                range.len(),
+                libc::MADV_DONTNEED as usize,
+            )
+        }
+        .expect("madvise failed while decommitting pages");
+        Ok(())
     }
 
     unsafe fn release_pages(

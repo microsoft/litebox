@@ -189,7 +189,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// [`Self::RESERVATION_ALIGNMENT`], and its end must be aligned to `ALIGN`.
     /// When `fixed_address_behavior` is [`FixedAddressBehavior::Replace`], the caller must ensure
     /// any replaced mappings are not in active use.
-    #[expect(unused_variables, reason = "default body")]
     unsafe fn reserve_pages<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
@@ -198,10 +197,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
     where
-        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
-    {
-        unimplemented!("remove it once all platforms implement this")
-    }
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>;
 
     /// Commit backing within live reservations.
     ///
@@ -221,7 +217,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// The supplied reservations must collectively cover `range`. The caller must exclude
     /// accesses to `range` that could conflict with changes to its backing or permissions.
-    #[expect(unused_variables, reason = "default body")]
     unsafe fn commit_pages<'reservation, Reservations>(
         &self,
         covering_reservations: impl FnOnce() -> Reservations,
@@ -231,10 +226,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>
     where
         Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
-        ReservationOf<Self, ALIGN>: 'reservation,
-    {
-        unimplemented!("remove it once all platforms implement this")
-    }
+        ReservationOf<Self, ALIGN>: 'reservation;
 
     /// Reserve and commit pages in one platform operation.
     ///
@@ -288,7 +280,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// # Safety
     ///
     /// The reservations must cover `range`, and the caller must exclude all users.
-    #[expect(unused_variables, reason = "default body")]
     unsafe fn decommit_pages<'reservation, Reservations>(
         &self,
         covering_reservations: impl FnOnce() -> Reservations,
@@ -296,10 +287,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ) -> Result<(), DeallocationError>
     where
         Reservations: Iterator<Item = &'reservation ReservationOf<Self, ALIGN>>,
-        ReservationOf<Self, ALIGN>: 'reservation,
-    {
-        unimplemented!("remove it once all platforms implement this")
-    }
+        ReservationOf<Self, ALIGN>: 'reservation;
 
     /// Update permissions within live reservations.
     ///

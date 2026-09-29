@@ -1773,6 +1773,43 @@ mod tests {
                 AllocationDirection::BottomUp
             });
 
+        unsafe fn reserve_pages<Reservations>(
+            &self,
+            replaced_reservations: impl FnOnce() -> Reservations,
+            suggested_range: Range<usize>,
+            can_grow_down: bool,
+            fixed_address_behavior: FixedAddressBehavior,
+        ) -> Result<DummyReservation<PAGE_SIZE>, AllocationError>
+        where
+            Reservations: Iterator<Item = DummyReservation<PAGE_SIZE>>,
+        {
+            // SAFETY: The mock models ownership of the allocated range without real backing.
+            unsafe {
+                self.reserve_and_commit_pages(
+                    replaced_reservations,
+                    suggested_range,
+                    MemoryRegionPermissions::empty(),
+                    can_grow_down,
+                    false,
+                    fixed_address_behavior,
+                )
+            }
+        }
+
+        unsafe fn commit_pages<'reservation, Reservations>(
+            &self,
+            _covering_reservations: impl FnOnce() -> Reservations,
+            range: Range<usize>,
+            _permissions: MemoryRegionPermissions,
+            _populate_pages_immediately: bool,
+        ) -> Result<TransparentMutPtr<u8>, AllocationError>
+        where
+            Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
+            DummyReservation<PAGE_SIZE>: 'reservation,
+        {
+            Ok(TransparentMutPtr::from_usize(range.start))
+        }
+
         unsafe fn reserve_and_commit_pages<Reservations>(
             &self,
             _replaced_reservations: impl FnOnce() -> Reservations,
@@ -1803,6 +1840,18 @@ mod tests {
             }
             // SAFETY: The mock models successful exclusive ownership of this exact range.
             Ok(unsafe { DummyReservation::new(suggested_range) })
+        }
+
+        unsafe fn decommit_pages<'reservation, Reservations>(
+            &self,
+            _covering_reservations: impl FnOnce() -> Reservations,
+            _range: Range<usize>,
+        ) -> Result<(), litebox::platform::page_mgmt::DeallocationError>
+        where
+            Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
+            DummyReservation<PAGE_SIZE>: 'reservation,
+        {
+            Ok(())
         }
 
         unsafe fn release_pages(
