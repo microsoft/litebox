@@ -31,6 +31,37 @@ fn ratchet_transmutes() -> Result<()> {
 }
 
 #[test]
+fn ratchet_pub_uses() -> Result<()> {
+    ratchet(
+        &[
+            ("litebox/", 11),
+            ("litebox_broker_core/", 6),
+            ("litebox_broker_host/", 1),
+            ("litebox_broker_local/", 1),
+            ("litebox_broker_local_userland/", 2),
+            ("litebox_broker_platform_linux_userland/", 3),
+            ("litebox_broker_platform_windows_userland/", 1),
+            ("litebox_broker_transport_linux_userland/", 3),
+            ("litebox_broker_transport_windows_userland/", 4),
+            ("litebox_common_linux/", 1),
+            ("litebox_common_macos/", 2),
+            ("litebox_platform/", 3),
+            ("litebox_platform_linux_kernel/", 3),
+            ("litebox_platform_lvbs/", 2),
+            ("litebox_shim_optee/", 1),
+            ("litebox_syscall_rewriter/", 1),
+            ("litebox_util_log/", 7),
+        ],
+        |file| {
+            Ok(file
+                .lines()
+                .filter(|line| line.as_ref().unwrap().trim_start().starts_with("pub use "))
+                .count())
+        },
+    )
+}
+
+#[test]
 fn ratchet_globals() -> Result<()> {
     ratchet(
         &[
