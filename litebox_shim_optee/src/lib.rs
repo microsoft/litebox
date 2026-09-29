@@ -190,6 +190,7 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
     session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
     ta_signing_cert: &'static [u8],
+    ta_verify_key: &'static [u8],
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
@@ -205,6 +206,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             session_manager,
             litebox: LiteBox::new(platform),
             ta_signing_cert: &[],
+            ta_verify_key: &[],
         }
     }
 
@@ -212,6 +214,13 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
     #[must_use]
     pub fn with_ta_signing_cert(mut self, ta_signing_cert: &'static [u8]) -> Self {
         self.ta_signing_cert = ta_signing_cert;
+        self
+    }
+
+    /// A public key for TA signature verification. Defaults to empty (no key).
+    #[must_use]
+    pub fn with_ta_verify_key(mut self, ta_verify_key: &'static [u8]) -> Self {
+        self.ta_verify_key = ta_verify_key;
         self
     }
 
@@ -231,6 +240,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             embedded_ta_uuid_map: embedded_ta_uuid_map(),
             dynamic_ta_uuid_map: TaUuidMap::new(),
             ta_signing_cert: self.ta_signing_cert,
+            ta_verify_key: self.ta_verify_key,
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
             page_table_keepalive: None,
         });
@@ -257,6 +267,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// Dynamically supplied TA binaries scoped to this shim instance.
     dynamic_ta_uuid_map: TaUuidMap,
     ta_signing_cert: &'static [u8],
+    ta_verify_key: &'static [u8],
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.
@@ -281,7 +292,7 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
                 .insert(ta_head.uuid, ta_bin.into());
         }
 
-        let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin) else {
+        let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
             return false;
         };
         self.embedded_ta_uuid_map.insert(ta_uuid, ta_elf.into())
@@ -295,7 +306,7 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        let Some((verified_uuid, ta_elf)) = verify_signed_ta(ta_bin) else {
+        let Some((verified_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
             return false;
         };
         if verified_uuid != *ta_uuid {
@@ -1601,13 +1612,19 @@ fn embedded_ta_uuid_map() -> &'static TaUuidMap {
     EMBEDDED_TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
-fn verify_signed_ta(ta_bin: &[u8]) -> Option<(TeeUuid, &[u8])> {
+fn verify_signed_ta<'a>(ta_bin: &'a [u8], verify_key_der: &[u8]) -> Option<(TeeUuid, &'a [u8])> {
     use litebox_common_optee::{TaVerifyKey, parse_and_verify_ta};
 
-    const TA_VERIFY_KEY_DER: &[u8] =
-        include_bytes!(concat!(env!("OUT_DIR"), "/ta-signing-public.der"));
-    let verify_key = TaVerifyKey::from_der(TA_VERIFY_KEY_DER).ok()?;
-    let (ta_head, ta_elf) = parse_and_verify_ta(ta_bin, &verify_key).ok()?;
+    let verify_key = TaVerifyKey::from_der(verify_key_der)
+        .map_err(|error| {
+            litebox_util_log::error!(error:% = error; "TA verification key is missing or invalid");
+        })
+        .ok()?;
+    let (ta_head, ta_elf) = parse_and_verify_ta(ta_bin, &verify_key)
+        .map_err(|error| {
+            litebox_util_log::error!(error:% = error; "signed TA verification failed");
+        })
+        .ok()?;
     Some((ta_head.uuid, ta_elf))
 }
 
