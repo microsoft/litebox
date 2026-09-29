@@ -4,8 +4,8 @@
 //! Structured configuration for constructing a userland broker core.
 //!
 //! [`BrokerCoreBuilder`] selects the platform socket provider, the
-//! cross-platform getrandom-backed random provider, and the inherited-stdio
-//! provider, and applies whatever platform setup a deployment needs before its
+//! cross-platform getrandom-backed random provider, the inherited-stdio
+//! provider, and the thread-backed timer provider, and applies whatever platform setup a deployment needs before its
 //! first association is served (for example, Linux lock-tracing
 //! initialization). This is what lets an in-process caller construct the same
 //! [`BrokerCore`] the userland broker binary does, from a structured
@@ -20,6 +20,7 @@ use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngin
 
 use crate::random::UserlandRandomProvider;
 use crate::stdio::UserlandStdioProvider;
+use crate::timer::UserlandTimerProvider;
 
 /// Failure constructing a userland [`BrokerCore`].
 ///
@@ -126,6 +127,7 @@ impl BrokerCoreBuilder {
             socket_provider,
             Arc::new(UserlandRandomProvider),
             Arc::new(UserlandStdioProvider::new()?),
+            Arc::new(UserlandTimerProvider::new()?),
             self.fs,
         )?;
         Ok(broker)

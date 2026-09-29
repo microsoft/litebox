@@ -37,6 +37,7 @@ mod pipe;
 mod primitive;
 mod socket;
 mod stdio;
+mod timer;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
 const REQUEST_TAG_EVENT: u8 = 1;
@@ -55,6 +56,7 @@ const REQUEST_TAG_EXIT_CHILD_PROCESS: u8 = 13;
 const REQUEST_TAG_REPORT_EXIT_STATUS: u8 = 14;
 const REQUEST_TAG_SET_CHILD_REAPING: u8 = 15;
 const REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 16;
+const REQUEST_TAG_TIMER: u8 = 17;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
@@ -82,6 +84,7 @@ const RESPONSE_TAG_PROCESS_EXITED: u8 = 13;
 const RESPONSE_TAG_EXIT_STATUS_REPORTED: u8 = 14;
 const RESPONSE_TAG_CHILD_REAPING_SET: u8 = 15;
 const RESPONSE_TAG_OBJECTS_DUPLICATED: u8 = 16;
+const RESPONSE_TAG_TIMER: u8 = 17;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -146,7 +149,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_EXIT_CHILD_PROCESS
         | REQUEST_TAG_REPORT_EXIT_STATUS
         | REQUEST_TAG_SET_CHILD_REAPING
-        | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD => {
+        | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD
+        | REQUEST_TAG_TIMER => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -267,6 +271,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.process_id(child_process_id);
             encoder.shared_buffer_sequence(handles);
         }
+        BrokerOperation::Timer(request) => {
+            encoder.u8(REQUEST_TAG_TIMER);
+            encoder.request_id(request_id);
+            timer::encode_timer_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -292,7 +301,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_EXIT_CHILD_PROCESS
         | REQUEST_TAG_REPORT_EXIT_STATUS
         | REQUEST_TAG_SET_CHILD_REAPING
-        | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD => {}
+        | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD
+        | REQUEST_TAG_TIMER => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -352,6 +362,7 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                 handles: decoder.shared_buffer_sequence()?,
             })
         }
+        REQUEST_TAG_TIMER => BrokerOperation::Timer(timer::decode_timer_request(&mut decoder)?),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -433,7 +444,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_PROCESS_EXITED
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
         | RESPONSE_TAG_CHILD_REAPING_SET
-        | RESPONSE_TAG_OBJECTS_DUPLICATED => {
+        | RESPONSE_TAG_OBJECTS_DUPLICATED
+        | RESPONSE_TAG_TIMER => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -550,6 +562,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_OBJECTS_DUPLICATED);
             encoder.request_id(request_id);
         }
+        BrokerResult::Timer(response) => {
+            encoder.u8(RESPONSE_TAG_TIMER);
+            encoder.request_id(request_id);
+            timer::encode_timer_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -583,7 +600,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_PROCESS_EXITED
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
         | RESPONSE_TAG_CHILD_REAPING_SET
-        | RESPONSE_TAG_OBJECTS_DUPLICATED => {}
+        | RESPONSE_TAG_OBJECTS_DUPLICATED
+        | RESPONSE_TAG_TIMER => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -622,6 +640,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_EXIT_STATUS_REPORTED => BrokerResult::ExitStatusReported,
         RESPONSE_TAG_CHILD_REAPING_SET => BrokerResult::ChildReapingSet,
         RESPONSE_TAG_OBJECTS_DUPLICATED => BrokerResult::ObjectsDuplicated,
+        RESPONSE_TAG_TIMER => BrokerResult::Timer(timer::decode_timer_response(&mut decoder)?),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -738,7 +757,7 @@ mod tests {
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-        SocketRequest, SocketResponse, StdioRequest, StdioResponse,
+        SocketRequest, SocketResponse, StdioRequest, StdioResponse, TimerRequest, TimerResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -764,6 +783,10 @@ mod tests {
     use crate::stdio::{
         IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
         StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
+    };
+    use crate::timer::{
+        CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
+        ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
     };
     use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
     use core::net::{Ipv4Addr, SocketAddrV4};
@@ -812,6 +835,7 @@ mod tests {
                 RESPONSE_TAG_EXIT_STATUS_REPORTED,
                 RESPONSE_TAG_CHILD_REAPING_SET,
                 RESPONSE_TAG_OBJECTS_DUPLICATED,
+                RESPONSE_TAG_TIMER,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -831,6 +855,7 @@ mod tests {
                 REQUEST_TAG_REPORT_EXIT_STATUS,
                 REQUEST_TAG_SET_CHILD_REAPING,
                 REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD,
+                REQUEST_TAG_TIMER,
             ]
         );
         assert_eq!(
@@ -897,6 +922,16 @@ mod tests {
                 handle,
                 mode: EventConsumeMode::One,
             })),
+            BrokerOperation::Timer(TimerRequest::Create),
+            BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
+                handle,
+                spec: TimerSpec {
+                    value_ns: u64::MAX,
+                    interval_ns: 1,
+                },
+            })),
+            BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle })),
+            BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle })),
             BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                 capacity: 4096,
                 atomic_write_size: 512,
@@ -1355,6 +1390,19 @@ mod tests {
                 value: 3,
                 readiness: ReadinessFlags::WRITE,
             })),
+            BrokerResult::Timer(TimerResponse::Create(CreateTimerResponse { handle })),
+            BrokerResult::Timer(TimerResponse::Set(SetTimerResponse {
+                previous: TimerSpec {
+                    value_ns: 5,
+                    interval_ns: u64::MAX,
+                },
+            })),
+            BrokerResult::Timer(TimerResponse::Get(GetTimerResponse {
+                current: TimerSpec::default(),
+            })),
+            BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
+                expirations: u64::MAX,
+            })),
             BrokerResult::Pipe(PipeResponse::Create(CreatePipeResponse {
                 read_handle: handle,
                 write_handle: ObjectHandle(14),
@@ -1637,6 +1685,26 @@ mod tests {
         assert_eq!(
             decode_request(&unknown_consume_mode),
             Err(WireError::InvalidTag)
+        );
+        let mut unknown_timer_request = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Timer(TimerRequest::Create),
+        });
+        unknown_timer_request[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_timer_request),
+            Err(WireError::InvalidTag)
+        );
+        let truncated_timer_set = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
+                handle: ObjectHandle(13),
+                spec: TimerSpec::default(),
+            })),
+        });
+        assert_eq!(
+            decode_request(&truncated_timer_set[..truncated_timer_set.len() - 1]),
+            Err(WireError::TruncatedFrame)
         );
         let mut unknown_create_thread = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
@@ -2146,6 +2214,16 @@ mod tests {
         });
         invalid_reaped[10] = 2;
         assert_eq!(decode_response(&invalid_reaped), Err(WireError::InvalidTag));
+
+        let mut unknown_timer_response = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse { expirations: 1 })),
+        });
+        unknown_timer_response[9] = 0xff;
+        assert_eq!(
+            decode_response(&unknown_timer_response),
+            Err(WireError::InvalidTag)
+        );
 
         let mut frame = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,

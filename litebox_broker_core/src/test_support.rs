@@ -3,10 +3,13 @@
 
 //! Strict default providers for constructing broker cores in tests.
 
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::time::Duration;
 
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
 use spin::Mutex;
 
@@ -14,8 +17,10 @@ use crate::{
     AssociationCancellation, BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
     fs::{FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
+    readiness::ReadinessRegistration,
     socket::{SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioProvider, StdioProviderError, UnsupportedStdioProvider},
+    timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
 };
 
 /// Builder for a test broker core with strict providers that reject unexpected operations.
@@ -25,6 +30,7 @@ pub struct TestBrokerCoreBuilder {
     socket_provider: Arc<dyn SocketProvider>,
     random_provider: Arc<dyn RandomProvider>,
     stdio_provider: Arc<dyn StdioProvider>,
+    timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
 }
 
@@ -38,6 +44,7 @@ impl TestBrokerCoreBuilder {
             socket_provider: Arc::new(UnsupportedSocketProvider),
             random_provider: Arc::new(FailingRandomProvider),
             stdio_provider: Arc::new(UnsupportedStdioProvider),
+            timer_provider: Arc::new(UnsupportedTimerProvider),
             fs: Arc::new(UnsupportedFileService),
         }
     }
@@ -70,6 +77,13 @@ impl TestBrokerCoreBuilder {
         self
     }
 
+    /// Installs the timer provider used by the test.
+    #[must_use]
+    pub fn with_timer_provider(mut self, provider: Arc<dyn TimerProvider>) -> Self {
+        self.timer_provider = provider;
+        self
+    }
+
     /// Installs the broker-authoritative file service used by the test.
     #[must_use]
     pub fn with_file_service(mut self, fs: Arc<dyn FileService>) -> Self {
@@ -89,6 +103,7 @@ impl TestBrokerCoreBuilder {
             self.socket_provider,
             self.random_provider,
             self.stdio_provider,
+            self.timer_provider,
             self.fs,
         )
     }
@@ -244,5 +259,86 @@ impl StdioProvider for TerminalOnlyStdioProvider {
             StdioStream::Stdout => self.stdout_terminal,
             StdioStream::Stderr => self.stderr_terminal,
         })
+    }
+}
+
+/// Timer provider for tests whose clock advances only through
+/// [`Self::advance`].
+#[derive(Default)]
+pub struct ManualTimerProvider {
+    state: Arc<Mutex<ManualTimerState>>,
+}
+
+#[derive(Default)]
+struct ManualTimerState {
+    now: Duration,
+    next_alarm: u64,
+    alarms: BTreeMap<u64, (Option<Duration>, ReadinessRegistration)>,
+}
+
+impl ManualTimerProvider {
+    /// Advances the clock by `duration` and fires every alarm whose deadline
+    /// passed.
+    pub fn advance(&self, duration: Duration) {
+        let fired: Vec<ReadinessRegistration> = {
+            let mut state = self.state.lock();
+            state.now = state.now.saturating_add(duration);
+            let now = state.now;
+            state
+                .alarms
+                .values_mut()
+                .filter(|(deadline, _)| deadline.is_some_and(|deadline| deadline <= now))
+                .map(|(deadline, readiness)| {
+                    *deadline = None;
+                    readiness.clone()
+                })
+                .collect()
+        };
+        for readiness in fired {
+            let _ = readiness.republish(ReadinessFlags::READ);
+        }
+    }
+
+    /// Returns the number of live alarms.
+    pub fn alarm_count(&self) -> usize {
+        self.state.lock().alarms.len()
+    }
+}
+
+impl TimerProvider for ManualTimerProvider {
+    fn now(&self) -> Duration {
+        self.state.lock().now
+    }
+
+    fn create_alarm(&self, readiness: ReadinessRegistration) -> Result<Box<dyn Alarm>> {
+        let mut state = self.state.lock();
+        let id = state.next_alarm;
+        state.next_alarm += 1;
+        state.alarms.insert(id, (None, readiness));
+        Ok(Box::new(ManualAlarm {
+            state: Arc::clone(&self.state),
+            id,
+        }))
+    }
+}
+
+struct ManualAlarm {
+    state: Arc<Mutex<ManualTimerState>>,
+    id: u64,
+}
+
+impl Alarm for ManualAlarm {
+    fn set(&self, deadline: Option<Duration>) {
+        if let Some(alarm) = self.state.lock().alarms.get_mut(&self.id) {
+            alarm.0 = deadline;
+        }
+    }
+}
+
+impl Drop for ManualAlarm {
+    fn drop(&mut self) {
+        // Release the registration after unlocking, since dropping it may retire.
+        let alarm = self.state.lock().alarms.remove(&self.id);
+        drop(alarm);
     }
 }

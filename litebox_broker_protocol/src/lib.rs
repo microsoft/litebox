@@ -27,6 +27,7 @@ pub mod readiness;
 pub mod shared_buffer;
 pub mod socket;
 pub mod stdio;
+pub mod timer;
 pub mod wire;
 
 /// Guest process ID carried by broker protocol messages.

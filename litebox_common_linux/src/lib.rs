@@ -65,6 +65,7 @@ pub const CLOCK_REALTIME: i32 = 0;
 pub const CLOCK_MONOTONIC: i32 = 1;
 pub const CLOCK_REALTIME_COARSE: i32 = 5;
 pub const CLOCK_MONOTONIC_COARSE: i32 = 6;
+pub const CLOCK_BOOTTIME: i32 = 7;
 
 /// Special value `libc::AT_FDCWD` used to indicate openat should use
 /// the current working directory.
@@ -796,6 +797,28 @@ bitflags::bitflags! {
     }
 }
 
+bitflags::bitflags! {
+    /// `timerfd_create` flags.
+    #[derive(Debug, Clone, Copy)]
+    pub struct TfdFlags: core::ffi::c_uint {
+        const CLOEXEC = OFlags::CLOEXEC.bits();
+        const NONBLOCK = OFlags::NONBLOCK.bits();
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
+    /// `timerfd_settime` flags.
+    #[derive(Debug, Clone, Copy)]
+    pub struct TfdTimerFlags: core::ffi::c_uint {
+        const ABSTIME = 1 << 0;
+        const CANCEL_ON_SET = 1 << 1;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
 type cc_t = ::core::ffi::c_uchar;
 type tcflag_t = ::core::ffi::c_uint;
 #[repr(C)]
@@ -1045,6 +1068,17 @@ impl From<Duration> for Timespec {
             tv_nsec: value.subsec_nanos().into(),
         }
     }
+}
+
+/// itimerspec from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/include/uapi/linux/time_types.h#L12)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, Default)]
+#[repr(C)]
+pub struct Itimerspec {
+    /// Timer period.
+    pub it_interval: Timespec,
+
+    /// Time until the next expiration.
+    pub it_value: Timespec,
 }
 
 #[repr(C)]
@@ -2597,6 +2631,20 @@ pub enum SyscallRequest {
         mask: StatxMask,
         statxbuf: UserPtrMut<Statx>,
     },
+    TimerfdCreate {
+        clockid: i32,
+        flags: TfdFlags,
+    },
+    TimerfdSettime {
+        fd: i32,
+        flags: TfdTimerFlags,
+        new_value: UserPtr<Itimerspec>,
+        old_value: Option<UserPtrMut<Itimerspec>>,
+    },
+    TimerfdGettime {
+        fd: i32,
+        curr_value: UserPtrMut<Itimerspec>,
+    },
 }
 
 impl SyscallRequest {
@@ -3047,6 +3095,11 @@ impl SyscallRequest {
                 flags: EfdFlags::empty(),
             },
             Sysno::eventfd2 => sys_req!(Eventfd2 { initval, flags }),
+            Sysno::timerfd_create => sys_req!(TimerfdCreate { clockid, flags }),
+            Sysno::timerfd_settime => {
+                sys_req!(TimerfdSettime { fd, flags, new_value:*, old_value:* })
+            }
+            Sysno::timerfd_gettime => sys_req!(TimerfdGettime { fd, curr_value:* }),
             Sysno::getrandom => sys_req!(GetRandom { buf:*,count,flags }),
             Sysno::clone => {
                 let args = CloneArgs {
@@ -3587,6 +3640,8 @@ reinterpret_truncated_from_usize_for! {
         ReceiveFlags,
         EpollCreateFlags,
         EfdFlags,
+        TfdFlags,
+        TfdTimerFlags,
         RngFlags,
         TimerFlags,
         StatxMask,

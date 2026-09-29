@@ -30,6 +30,7 @@ pub mod random;
 pub mod readiness;
 pub mod socket;
 pub mod stdio;
+pub mod timer;
 
 #[cfg(test)]
 mod test_platform;
@@ -58,6 +59,7 @@ pub use process::{
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
 use stdio::StdioProvider;
+use timer::TimerProvider;
 
 /// BrokerCore result type.
 pub type Result<T> = core::result::Result<T, BrokerError>;
@@ -213,6 +215,7 @@ pub struct BrokerCore {
     pub(crate) random_provider: Arc<dyn RandomProvider>,
     pub(crate) stdio_provider: Arc<dyn StdioProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
+    pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
     pub(crate) socket_ports: BrokerSocketPorts,
     pub(crate) process_lifecycle_sink: Arc<dyn ProcessLifecycleSink>,
@@ -233,6 +236,7 @@ impl BrokerCore {
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
         stdio_provider: Arc<dyn StdioProvider>,
+        timer_provider: Arc<dyn TimerProvider>,
         fs: Arc<dyn FileService>,
     ) -> Result<Self> {
         Self::new_with_limits(
@@ -241,6 +245,7 @@ impl BrokerCore {
             socket_provider,
             random_provider,
             stdio_provider,
+            timer_provider,
             fs,
         )
     }
@@ -252,6 +257,7 @@ impl BrokerCore {
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
         stdio_provider: Arc<dyn StdioProvider>,
+        timer_provider: Arc<dyn TimerProvider>,
         fs: Arc<dyn FileService>,
     ) -> Result<Self> {
         let ids = IdAllocator::new(MAX_ALLOCATED_ID)?;
@@ -273,6 +279,7 @@ impl BrokerCore {
             random_provider,
             stdio_provider,
             socket_provider,
+            timer_provider,
             fs,
             socket_ports: BrokerSocketPorts::default(),
             process_lifecycle_sink: Arc::new(NoopProcessLifecycleSink),

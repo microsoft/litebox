@@ -5,7 +5,7 @@ use litebox_broker_local::BrokerLocalError;
 use litebox_broker_protocol::error::ErrorCode;
 use thiserror::Error;
 
-use crate::event::{counter::EventCounterError, polling::TryOpError};
+use crate::event::{counter::EventCounterError, polling::TryOpError, timer::TimerError};
 
 /// Error returned by the deployment-provided broker control path.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -99,6 +99,31 @@ impl From<BrokerObjectError> for EventCounterError {
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
+            | BrokerObjectError::PeerClosed
+            | BrokerObjectError::UnsupportedOperation => Self::Io,
+        }
+    }
+}
+
+impl From<BrokerObjectError> for TryOpError<TimerError> {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::WouldBlock => Self::TryAgain,
+            error => Self::Other(error.into()),
+        }
+    }
+}
+
+impl From<BrokerObjectError> for TimerError {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
+                Self::ResourceExhausted
+            }
+            BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            BrokerObjectError::Control
+            | BrokerObjectError::InvalidObject
+            | BrokerObjectError::WouldBlock
             | BrokerObjectError::PeerClosed
             | BrokerObjectError::UnsupportedOperation => Self::Io,
         }

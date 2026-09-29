@@ -47,6 +47,7 @@ pub(crate) enum EpollDescriptor<Platform: ShimPlatform> {
     Socket(Arc<super::net::SocketFd<Platform>>),
     Pipe(Arc<litebox::pipes::PipeFd<Platform>>),
     Unix(Arc<TypedFd<crate::syscalls::unix::UnixSocketSubsystem<Platform>>>),
+    Timerfd(Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
 }
 
 impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
@@ -74,6 +75,11 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
         {
             return Ok(EpollDescriptor::Unix(fd));
         }
+        if let Ok(fd) =
+            rds.fd_from_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
+        {
+            return Ok(EpollDescriptor::Timerfd(fd));
+        }
         Err(Errno::EBADF)
     }
 
@@ -100,6 +106,7 @@ enum DescriptorRef<Platform: ShimPlatform> {
     Socket(WeakEntryHandle<Platform, crate::Network<Platform>>),
     Pipe(WeakEntryHandle<Platform, litebox::pipes::Pipes<Platform>>),
     Unix(WeakEntryHandle<Platform, crate::syscalls::unix::UnixSocketSubsystem<Platform>>),
+    Timerfd(WeakEntryHandle<Platform, super::timerfd::TimerfdSubsystem<Platform>>),
 }
 
 impl<Platform: ShimPlatform> DescriptorRef<Platform> {
@@ -113,6 +120,7 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
             EpollDescriptor::Socket(fd) => Self::Socket(dt.entry_handle(fd)?.downgrade()),
             EpollDescriptor::Pipe(fd) => Self::Pipe(dt.entry_handle(fd)?.downgrade()),
             EpollDescriptor::Unix(fd) => Self::Unix(dt.entry_handle(fd)?.downgrade()),
+            EpollDescriptor::Timerfd(fd) => Self::Timerfd(dt.entry_handle(fd)?.downgrade()),
         };
         Some(desc)
     }
@@ -126,6 +134,7 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
             DescriptorRef::Socket(weak) => weak.stable_key(),
             DescriptorRef::Pipe(weak) => weak.stable_key(),
             DescriptorRef::Unix(weak) => weak.stable_key(),
+            DescriptorRef::Timerfd(weak) => weak.stable_key(),
         }
     }
 
@@ -183,6 +192,10 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
                 Some(handle.with_entry(|entry| poll(entry)))
             }
             DescriptorRef::Unix(weak) => {
+                let handle = global.litebox.descriptor_table().upgrade(weak)?;
+                Some(handle.with_entry(|entry| poll(entry)))
+            }
+            DescriptorRef::Timerfd(weak) => {
                 let handle = global.litebox.descriptor_table().upgrade(weak)?;
                 Some(handle.with_entry(|entry| poll(entry)))
             }

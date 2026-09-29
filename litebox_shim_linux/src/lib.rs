@@ -605,6 +605,7 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
         resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
         resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);
+        resolve_fd!(syscalls::timerfd::TimerfdSubsystem<Platform>, Timerfd);
         Err(Errno::EBADF)
     }
 }
@@ -1209,6 +1210,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             SyscallRequest::Eventfd2 { initval, flags } => {
                 syscall!(sys_eventfd2(initval, flags))
+            }
+            SyscallRequest::TimerfdCreate { clockid, flags } => {
+                syscall!(sys_timerfd_create(clockid, flags))
+            }
+            SyscallRequest::TimerfdSettime {
+                fd,
+                flags,
+                new_value,
+                old_value,
+            } => syscall!(sys_timerfd_settime(fd, flags, new_value, old_value)),
+            SyscallRequest::TimerfdGettime { fd, curr_value } => {
+                syscall!(sys_timerfd_gettime(fd, curr_value))
             }
             SyscallRequest::Pipe2 { pipefd, flags } => {
                 self.sys_pipe2(flags).and_then(|(read_fd, write_fd)| {

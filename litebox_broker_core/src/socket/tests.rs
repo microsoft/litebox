@@ -1338,6 +1338,7 @@ fn test_broker_with_policy(
         random_provider: Arc::new(crate::random::TestRandomProvider),
         stdio_provider: Arc::new(crate::stdio::UnsupportedStdioProvider),
         socket_provider,
+        timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         fs: Arc::new(crate::fs::UnsupportedFileService),
         socket_ports: BrokerSocketPorts::default(),
         process_lifecycle_sink: Arc::new(crate::NoopProcessLifecycleSink),

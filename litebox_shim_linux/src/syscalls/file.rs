@@ -318,6 +318,7 @@ pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
     Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
     Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
     Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform>>>),
+    Timerfd(alloc::sync::Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
 }
 
 /// Apply one subsystem-generic expression to whichever subsystem an [`AnyTypedFd`] holds.
@@ -332,6 +333,7 @@ macro_rules! on_any_fd {
             AnyTypedFd::Eventfd($fd) => $body,
             AnyTypedFd::Epoll($fd) => $body,
             AnyTypedFd::Unix($fd) => $body,
+            AnyTypedFd::Timerfd($fd) => $body,
         }
     };
 }
@@ -346,6 +348,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
             Self::Eventfd(_) => "eventfd",
             Self::Epoll(_) => "epoll",
             Self::Unix(_) => "unix",
+            Self::Timerfd(_) => "timerfd",
         }
     }
 
@@ -363,6 +366,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
     }
 
     /// Run the handler matching this fd's subsystem.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn dispatch<R>(
         &self,
         fs: impl FnOnce(&FileFd) -> R,
@@ -371,6 +375,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
         eventfd: impl FnOnce(&TypedFd<super::eventfd::EventfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<super::epoll::EpollSubsystem<Platform>>) -> R,
         unix: impl FnOnce(&TypedFd<super::unix::UnixSocketSubsystem<Platform>>) -> R,
+        timerfd: impl FnOnce(&TypedFd<super::timerfd::TimerfdSubsystem<Platform>>) -> R,
     ) -> R {
         match self {
             Self::Fs(fd) => fs(fd),
@@ -379,6 +384,7 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
             Self::Eventfd(fd) => eventfd(fd),
             Self::Epoll(fd) => epoll(fd),
             Self::Unix(fd) => unix(fd),
+            Self::Timerfd(fd) => timerfd(fd),
         }
     }
 }
@@ -508,6 +514,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// - a network socket: the broker does not duplicate socket objects;
     /// - an eventfd, epoll, or Unix socket descriptor: the object is local to this runner;
+    /// - a timerfd: the broker does not duplicate timer objects;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
     ///   runner; or
     /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
@@ -742,6 +749,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |_fd| Err(Errno::EINVAL),
             |_fd| Err(Errno::EINVAL),
             |_fd| Err(Errno::EINVAL),
+            |_fd| Err(Errno::EINVAL),
         )
     }
 
@@ -889,6 +897,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     )
                 })
             },
+            |fd| {
+                espipe_for_non_seekable_offset(offset)?;
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|file| {
+                    let buf = &mut buf.borrow_mut();
+                    if buf.len() < size_of::<u64>() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let expirations = file.read(&self.wait_cx())?;
+                    buf[..size_of::<u64>()].copy_from_slice(&expirations.to_ne_bytes());
+                    Ok(size_of::<u64>())
+                })
+            },
         );
         // For datagrams, the returned size represents the actual size of the message,
         // which may be larger than the buffer size.
@@ -969,6 +995,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
+            |_fd| Err(Errno::EINVAL),
         );
         if let Err(Errno::EPIPE) = result
             && !is_inet_datagram.get()
@@ -1221,6 +1248,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<Platform>>(raw_fd)
                 {
                     AnyTypedFd::Unix(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
+                {
+                    AnyTypedFd::Timerfd(fd)
                 } else {
                     unreachable!("all subsystems covered")
                 }
@@ -1260,6 +1291,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok(())
             }
             AnyTypedFd::Unix(fd) => {
+                self.remove_and_drop_descriptor(&fd);
+                Ok(())
+            }
+            AnyTypedFd::Timerfd(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
@@ -1858,6 +1893,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
         )
     }
 
@@ -2031,6 +2067,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
+                        |fd| getfl_from_handle!(fd),
                     )?
                     .bits())
             }
@@ -2111,6 +2148,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |fd| {
+                        toggle_flags!(fd);
+                        Ok(())
+                    },
                 )?;
                 Ok(0)
             }
@@ -2136,6 +2177,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
+                    |_fd| Err(Errno::EBADF),
                 )
             }
             FcntlArg::SETLK(lock) | FcntlArg::SETLKW(lock) => {
@@ -2151,6 +2193,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     },
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
+                    |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
                     |_fd| Err(Errno::EBADF),
@@ -2402,6 +2445,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),
+                    |fd| set_nonblock_on_entry!(fd),
                 )?;
                 Ok(0)
             }
@@ -2421,6 +2465,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |fd| set_cloexec!(fd),
                     |_fd| todo!("net"),
                     |_fd| todo!("pipes"),
+                    |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
                     |fd| set_cloexec!(fd),
@@ -2906,6 +2951,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 dup(self, &files, fd, close_on_exec, target, |fd| {
                     let _ = self.global.close_linux_pipe(&fd);
+                })
+            },
+            |fd| {
+                dup(self, &files, fd, close_on_exec, target, |fd| {
+                    self.remove_and_drop_descriptor(&fd);
                 })
             },
             |fd| {
