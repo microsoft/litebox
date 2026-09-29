@@ -800,6 +800,8 @@ where
                     if direction.is_some()
                         && platform_behavior == FixedAddressBehavior::NoReplace =>
                 {
+                    // Retry if the requested behavior is `Hint` but the suggested address is already
+                    // in use and the platform does not support the required search direction.
                     request.suggested_address = None;
                     if direction == Some(AllocationDirection::TopDown) {
                         request.address_range.end = new_addr;
@@ -997,6 +999,8 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
+        const COPY_CHUNK_SIZE: usize = 1 << 16;
+
         let permissions = MemoryRegionPermissions::from(vma.flags());
         let temporary = VmArea::new(vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE, false);
         // SAFETY: Placement excludes mapped pages; Hint preserves other mappings and may relocate.
@@ -1030,14 +1034,18 @@ where
             }
             .expect("failed to make remap source readable");
         }
-        for offset in (0..old_range.len()).step_by(ALIGN) {
+        let total = old_range.len();
+        let mut offset = 0;
+        while offset < total {
+            let chunk = (total - offset).min(COPY_CHUNK_SIZE);
             let source = Platform::RawConstPointer::<u8>::from_usize(old_range.start + offset);
             let buffer = source
-                .to_owned_slice(ALIGN)
+                .to_owned_slice(chunk)
                 .expect("failed to read remap source");
             destination
                 .copy_from_slice(offset, &buffer)
                 .expect("failed to copy remap source");
+            offset += chunk;
         }
         // SAFETY: The destination is mapped, exclusively owned, and copying is complete.
         unsafe {
@@ -1367,39 +1375,35 @@ where
                 None
             }
         };
-        let mut vmas = self.vmas.iter();
-        let mut gap_boundary = if top_down { high_limit } else { low_limit };
-        while let Some((range, vma)) = if top_down {
-            vmas.next_back()
-        } else {
-            vmas.next()
-        } {
+        // A grow-down mapping also blocks the guard gap below its start.
+        let blocked_extent = |(range, vma): (&Range<usize>, &VmArea)| {
             let guard = if vma.flags.contains(VmFlags::VM_GROWSDOWN) {
                 Self::STACK_GUARD_GAP << 1
             } else {
                 0
             };
-            let guarded_start = range.start.saturating_sub(guard).min(high_limit);
-            let gap = if top_down {
-                range.end.max(low_limit)..gap_boundary
-            } else {
-                gap_boundary..guarded_start
-            };
-            if let Some(start) = find_in_gap(gap) {
-                return Some(start);
-            }
-            gap_boundary = if top_down {
-                guarded_start
-            } else {
-                range.end.max(low_limit)
-            };
-        }
-        let gap = if top_down {
-            low_limit..gap_boundary
-        } else {
-            gap_boundary..high_limit
+            range.start.saturating_sub(guard).min(high_limit)..range.end.max(low_limit)
         };
-        find_in_gap(gap)
+        // Walk mappings in search order, testing the free gap that precedes each one.
+        if top_down {
+            let mut boundary = high_limit;
+            for blocked in self.vmas.iter().rev().map(blocked_extent) {
+                if let Some(start) = find_in_gap(blocked.end..boundary) {
+                    return Some(start);
+                }
+                boundary = blocked.start;
+            }
+            find_in_gap(low_limit..boundary)
+        } else {
+            let mut boundary = low_limit;
+            for blocked in self.vmas.iter().map(blocked_extent) {
+                if let Some(start) = find_in_gap(boundary..blocked.start) {
+                    return Some(start);
+                }
+                boundary = blocked.end;
+            }
+            find_in_gap(boundary..high_limit)
+        }
     }
 }
 

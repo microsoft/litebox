@@ -64,6 +64,13 @@ pub(crate) type LinuxFS<Platform> =
 
 pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
 
+/// Reservation store required of a shim platform.
+pub type ShimReservations<Reservation> =
+    litebox::platform::common_providers::reservations::NoTrackedReservations<
+        PAGE_SIZE,
+        Reservation,
+    >;
+
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written
@@ -73,10 +80,7 @@ pub trait ShimPlatform:
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<
         { PAGE_SIZE },
-        Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
-            PAGE_SIZE,
-            Self::Reservation,
-        >,
+        Reservations = ShimReservations<Self::Reservation>,
     > + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
@@ -100,10 +104,7 @@ where
         + litebox::platform::TimeProvider
         + litebox::platform::PageManagementProvider<
             { PAGE_SIZE },
-            Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
-                PAGE_SIZE,
-                Reservation,
-            >,
+            Reservations = ShimReservations<Reservation>,
         > + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
