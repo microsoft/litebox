@@ -8,6 +8,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::convert::Infallible;
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
@@ -78,20 +79,44 @@ impl ComposerBuilder {
     /// Add a backend mounted at `path`.
     #[must_use]
     pub fn mount<B: Backend>(self, path: &str, backend: impl FnOnce(InodeAllocator) -> B) -> Self {
-        self.mount_nestable(path, |allocators| backend(allocators.next()))
+        self.try_mount(path, |allocator| Ok::<_, Infallible>(backend(allocator)))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// Add a backend mounted at `path`, propagating errors from its constructor.
+    ///
+    /// The backend is only mounted when construction succeeds.
+    pub fn try_mount<B: Backend, E>(
+        self,
+        path: &str,
+        backend: impl FnOnce(InodeAllocator) -> Result<B, E>,
+    ) -> Result<Self, E> {
+        self.try_mount_nestable(path, |allocators| backend(allocators.next()))
     }
 
     /// Add a backend mounted at `path`, which may draw an allocator per backend it is made of.
     #[must_use]
     pub fn mount_nestable<B: Backend>(
-        mut self,
+        self,
         path: &str,
         backend: impl FnOnce(&InodeAllocators) -> B,
     ) -> Self {
-        // TODO(jayb): Decide whether we need a fallible version of closure-based mount.
-        let backend = backend(&self.allocators);
+        self.try_mount_nestable(path, |allocators| Ok::<_, Infallible>(backend(allocators)))
+            .unwrap_or_else(|never| match never {})
+    }
+
+    /// Add a backend mounted at `path` using a fallible constructor which may draw an allocator
+    /// per backend it is made of.
+    ///
+    /// The backend is only mounted when construction succeeds.
+    pub fn try_mount_nestable<B: Backend, E>(
+        mut self,
+        path: &str,
+        backend: impl FnOnce(&InodeAllocators) -> Result<B, E>,
+    ) -> Result<Self, E> {
+        let backend = backend(&self.allocators)?;
         self.mounts.push((path.into(), Box::new(backend)));
-        self
+        Ok(self)
     }
 
     /// Validate mount paths and finalize the composer.
