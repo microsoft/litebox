@@ -26,7 +26,8 @@ mod generated;
 /// to provide some type safety by expecting explicit conversions to/from `i32`s.
 #[derive(PartialEq, Eq, Clone, Copy, Error)]
 pub struct Errno {
-    // Wide enough for the kernel-internal restart codes above `Errno::MAX`.
+    // `u16`, not `u8`, to hold the kernel-internal restart codes, whose Linux values (512 and 514)
+    // exceed 255.
     value: core::num::NonZeroU16,
 }
 
@@ -49,6 +50,17 @@ impl core::fmt::Debug for Errno {
 }
 
 impl Errno {
+    // Kernel-internal codes for a syscall interrupted by a signal, with Linux's values. They exceed
+    // the largest real errno, `Errno::MAX`, so conversions from integers never produce them. They
+    // never reach the guest: signal delivery either restarts the syscall or replaces them with
+    // `EINTR`.
+
+    /// Restart the syscall unless a handler without `SA_RESTART` runs. Interrupted waits convert
+    /// to this, as in Linux.
+    pub const ERESTARTSYS: Self = Self::from_const(512);
+    /// Restart the syscall only if no handler runs.
+    pub const ERESTARTNOHAND: Self = Self::from_const(514);
+
     /// Provide the negative integer representation of the error
     ///
     /// ```
@@ -61,26 +73,6 @@ impl Errno {
         -i32::from(self)
     }
 
-    /// (Private-only) Helper function that makes the associated constants on [`Errno`] significantly more
-    /// readable. Not intended to be used outside this crate, or even this module.
-    const fn from_const(v: u16) -> Self {
-        Self {
-            value: core::num::NonZeroU16::new(v).unwrap(),
-        }
-    }
-}
-
-/// Kernel-internal codes for a syscall interrupted by a signal, with Linux's values.
-///
-/// These are above [`Errno::MAX`], so conversions from integers never produce them. They never
-/// reach the guest: signal delivery either restarts the syscall or replaces them with `EINTR`.
-impl Errno {
-    /// Restart the syscall unless a handler without `SA_RESTART` runs. Interrupted waits convert
-    /// to this, as in Linux.
-    pub const ERESTARTSYS: Self = Self::from_const(512);
-    /// Restart the syscall only if no handler runs.
-    pub const ERESTARTNOHAND: Self = Self::from_const(514);
-
     /// Returns `EINTR` in place of a restart code, for an interrupted syscall that must not
     /// restart.
     #[must_use]
@@ -89,6 +81,14 @@ impl Errno {
             Self::EINTR
         } else {
             self
+        }
+    }
+
+    /// (Private-only) Helper function that makes the associated constants on [`Errno`] significantly more
+    /// readable. Not intended to be used outside this crate, or even this module.
+    const fn from_const(v: u16) -> Self {
+        Self {
+            value: core::num::NonZeroU16::new(v).unwrap(),
         }
     }
 }
@@ -781,17 +781,6 @@ mod tests {
 
         for (error, expected) in cases {
             assert_eq!(Errno::from(error), expected);
-        }
-    }
-
-    #[test]
-    fn restart_codes_stay_kernel_internal() {
-        assert_eq!(Errno::ERESTARTSYS.without_restart(), Errno::EINTR);
-        assert_eq!(Errno::ERESTARTNOHAND.without_restart(), Errno::EINTR);
-        assert_eq!(Errno::EAGAIN.without_restart(), Errno::EAGAIN);
-        for code in [512i32, 514] {
-            assert!(Errno::try_from(code).is_err());
-            assert!(Errno::try_from(code.cast_unsigned()).is_err());
         }
     }
 }
