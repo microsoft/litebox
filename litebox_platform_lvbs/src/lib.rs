@@ -1430,14 +1430,17 @@ macro_rules! RESTORE_CALLEE_SAVED_REGISTERS_ASM {
 // VTL1 XSAVE/XRSTOR macros (with XSAVEOPT optimization for kernel-user switches)
 // ============================================================================
 // XSAVE/XRSTOR state tracking (xsaved flag values):
-//   0: never saved - use XSAVE, then set to 1
-//   1: saved but not yet restored - use XSAVE (XSAVEOPT not safe yet)
-//   2: restored at least once - XSAVEOPT is now safe
+//   0: never saved - XSAVE sets to 1; XRSTOR loads init state and leaves at 0
+//   1: saved but not restored - use XSAVE; XRSTOR restores saved state and sets to 2
+//   2: restored saved state - use XSAVEOPT; XRSTOR restores saved state
 //
 // XSAVEOPT requires that XRSTOR has established tracking for this buffer.
 // Only after an XRSTOR can we safely use XSAVEOPT for subsequent saves.
 // VTL1 xsaved flags are reset at each VTL1 entry since returning to VTL0 invalidates
 // the CPU's tracking (VTL0 does XRSTOR from VTL0's buffer, not VTL1's).
+// XRSTOR uses the area's XSTATE_BV to initialize or restore each requested component.
+// Resetting the user area at VTL1 entry makes it represent architectural init state.
+// The kernel area is always saved before it is restored.
 
 /// Assembly macro to save VTL1 extended states (XSAVE/XSAVEOPT).
 /// Uses xsaveopt only after XRSTOR has established tracking (xsaved == 2).
@@ -1476,21 +1479,28 @@ macro_rules! XSAVE_VTL1_ASM {
     };
 }
 
-/// Assembly macro to restore VTL1 extended states (XRSTOR).
-/// Skips restore if state was never saved (xsaved == 0).
-/// Sets xsaved to 2 after restore to enable XSAVEOPT optimization.
+/// Restore VTL1 extended state from its XSAVE area (XRSTOR).
+/// The area's XSTATE_BV determines whether each requested component is initialized
+/// or restored. A reset area represents architectural init state.
+/// When xsaved == 0, request all enabled components to clear stale state; otherwise,
+/// request only the components saved by VTL1 and set xsaved to 2 to enable XSAVEOPT.
 /// Clobbers: rax, rcx, rdx
 #[cfg(target_arch = "x86_64")]
 macro_rules! XRSTOR_VTL1_ASM {
     ($xsave_area_off:tt, $mask_lo_off:tt, $mask_hi_off:tt, $xsaved_off:tt) => {
         concat!(
-            "cmp byte ptr gs:[",
-            stringify!($xsaved_off),
-            "], 0\n",
-            "je 4f\n",
             "mov rcx, gs:[",
             stringify!($xsave_area_off),
             "]\n",
+            "cmp byte ptr gs:[",
+            stringify!($xsaved_off),
+            "], 0\n",
+            "jne 8f\n",
+            "mov eax, -1\n",
+            "mov edx, -1\n",
+            "xrstor [rcx]\n",
+            "jmp 9f\n",
+            "8:\n",
             "mov eax, gs:[",
             stringify!($mask_lo_off),
             "]\n",
@@ -1502,7 +1512,7 @@ macro_rules! XRSTOR_VTL1_ASM {
             "mov byte ptr gs:[",
             stringify!($xsaved_off),
             "], 2\n",
-            "4:\n",
+            "9:\n",
         )
     };
 }
