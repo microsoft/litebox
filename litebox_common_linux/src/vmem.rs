@@ -20,7 +20,6 @@ use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::page_mgmt::RemapError;
-use litebox::platform::page_mgmt::ReserveAndCommitError;
 use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
@@ -446,11 +445,7 @@ where
                 populate_pages_immediately,
                 behavior,
             )
-        }
-        .map_err(|error| match error {
-            ReserveAndCommitError::UnsupportedByPlatform => AllocationError::UnsupportedByPlatform,
-            ReserveAndCommitError::Allocation(error) => error,
-        })?;
+        }?;
         Ok(Platform::RawMutPointer::<u8>::from_usize(
             reservation.range().start,
         ))
@@ -526,8 +521,8 @@ where
                     assert!(self.insert(extent.start, reservation).is_none());
                     return Ok(Platform::RawMutPointer::<u8>::from_usize(address));
                 }
-                Err(ReserveAndCommitError::UnsupportedByPlatform) => {}
-                Err(ReserveAndCommitError::Allocation(error)) => return Err(error),
+                Err(AllocationError::UnsupportedByPlatform) => {}
+                Err(error) => return Err(error),
             }
         }
 
@@ -1775,21 +1770,25 @@ mod tests {
             can_grow_down: bool,
             populate_pages_immediately: bool,
             fixed_address_behavior: FixedAddressBehavior,
-        ) -> Result<
-            litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>,
-            ReserveAndCommitError,
-        >
+        ) -> Result<litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>, AllocationError>
         where
             Reservations:
                 Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
         {
+            debug_assert!(!suggested_range.is_empty());
+            debug_assert!(
+                suggested_range.start >= Self::TASK_ADDR_MIN
+                    || (suggested_range.start == 0
+                        && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
+            );
+            debug_assert!(suggested_range.end <= Self::TASK_ADDR_MAX);
             self.calls
                 .lock()
                 .push((suggested_range.clone(), fixed_address_behavior));
             if fixed_address_behavior == FixedAddressBehavior::NoReplace
                 && self.rejected_address == Some(suggested_range.start)
             {
-                return Err(AllocationError::AddressInUse.into());
+                return Err(AllocationError::AddressInUse);
             }
             // SAFETY: The mock models successful exclusive ownership of this exact range.
             Ok(unsafe { DummyReservation::new(suggested_range) })

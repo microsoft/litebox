@@ -50,11 +50,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<
         litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
-        litebox::platform::page_mgmt::ReserveAndCommitError,
+        litebox::platform::page_mgmt::AllocationError,
     >
     where
         Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
     {
+        debug_assert!(!suggested_range.is_empty());
+        debug_assert!(
+            suggested_range.start >= Self::TASK_ADDR_MIN
+                || (suggested_range.start == 0
+                    && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
+        );
+        debug_assert!(suggested_range.end <= Self::TASK_ADDR_MAX);
         debug_assert!(!matches!(
             fixed_address_behavior,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp)
