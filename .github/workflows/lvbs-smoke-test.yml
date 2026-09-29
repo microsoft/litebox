@@ -39,6 +39,8 @@ jobs:
           ADO_PROJECT: LSG-linux
           LITEBOX_COMMIT: ${{ github.event.pull_request.head.sha }}
           LITEBOX_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+          # A blank kernelRef forces the credential-free prebuilt-kernel path.
+          KERNEL_REF: " "
         with:
           inlineScript: |
             set -eu
@@ -63,7 +65,7 @@ jobs:
               --id "${ADO_PIPELINE_ID}" \
               --organization "${ADO_ORGANIZATION}" \
               --project "${ADO_PROJECT}" \
-              --parameters "liteboxCommit=${LITEBOX_COMMIT}" "liteboxRepoUrl=${LITEBOX_REPO_URL}" \
+              --parameters "liteboxCommit=${LITEBOX_COMMIT}" "liteboxRepoUrl=${LITEBOX_REPO_URL}" "kernelRef=${KERNEL_REF}" \
               --output json)"
 
             BUILD_ID="$(printf '%s\n' "${BUILD_RESULT}" | jq -r '.id // empty')"
