@@ -291,7 +291,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox::mm::vmem::PAGE_SIZE;
+    use crate::PAGE_SIZE;
     use litebox::platform::{PageManagementProvider, RawConstPointer};
 
     fn do_query_on_region(

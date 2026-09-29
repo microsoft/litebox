@@ -3,11 +3,11 @@
 
 //! Implementation of generic TEE related syscalls
 
-use litebox::mm::vmem::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};
 use litebox::path::Arg;
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
+use litebox_common_linux::vmem::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};
 use litebox_common_optee::{
     TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeTime, TeeTimeCategory,
     TeeUuid, UserTaPropType, UteeParams,
@@ -308,7 +308,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             .as_usize()
             .checked_add(aligned_len.as_usize())
             .ok_or(TeeResult::AccessConflict)?;
-        if let Some(perms) = self.global.pm.get_memory_permissions(start, aligned_len) {
+        if let Some(perms) = self.global.mm.get_memory_permissions(start, aligned_len) {
             if (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_READ)
                 && !perms.contains(MemoryRegionPermissions::READ))
                 || (flags.contains(TeeMemoryAccessRights::TEE_MEMORY_ACCESS_WRITE)

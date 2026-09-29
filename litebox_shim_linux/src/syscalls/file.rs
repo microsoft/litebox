@@ -12,7 +12,6 @@ use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
     fs::errors::OpenError,
-    mm::vmem::PAGE_SIZE,
     path,
     process::InheritableFd,
     stdio::StdioStream,
@@ -29,6 +28,7 @@ use litebox_common_linux::{
     errno::Errno,
     program_startup::{InheritedFd, InheritedFdKind},
     signal::Signal,
+    vmem::PAGE_SIZE,
 };
 use thiserror::Error;
 

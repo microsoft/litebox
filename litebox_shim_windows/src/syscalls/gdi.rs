@@ -3,8 +3,8 @@
 
 use core::mem::{offset_of, size_of};
 
-use litebox::mm::vmem::{CreatePagesFlags, MappingError, NonZeroPageSize};
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox_common_linux::vmem::{CreatePagesFlags, MappingError, NonZeroPageSize};
 use litebox_common_windows::loader::PAGE_SIZE;
 use rangemap::RangeMap;
 

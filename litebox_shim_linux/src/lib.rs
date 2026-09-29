@@ -19,12 +19,14 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use core::cell::{Cell, RefCell};
+use core::ops::{Deref, Range};
 use litebox::{
     LiteBox,
-    mm::{PageManager, vmem::PAGE_SIZE},
     net::Network,
     pipes::Pipes,
+    platform::{RawConstPointer, RawPointerProvider},
     shim::ContinueOperation,
+    sync::Mutex,
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
@@ -35,7 +37,12 @@ use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
     FcntlArg, OFlags, SyscallRequest,
     errno::Errno,
+    mm::VmemManager,
     user_pointers::{UserPtr, UserPtrMut},
+    vmem::{
+        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmFlags,
+        VmemUnmapError,
+    },
 };
 use litebox_platform::time::TimeProvider;
 
@@ -72,7 +79,7 @@ pub trait ShimPlatform:
     litebox::platform::RawPointerProvider
     + TimeProvider
     + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox::mm::vmem::VmemPageFaultHandler
+    + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox_platform::sync::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::SystemInfoProvider
@@ -90,7 +97,7 @@ impl<T> ShimPlatform for T where
     T: litebox::platform::RawPointerProvider
         + TimeProvider
         + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox::mm::vmem::VmemPageFaultHandler
+        + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox_platform::sync::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::SystemInfoProvider
@@ -102,6 +109,105 @@ impl<T> ShimPlatform for T where
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
         + 'static
 {
+}
+
+/// Linux memory manager.
+pub struct MemoryManager<Platform: ShimPlatform> {
+    vmem: VmemManager<Platform, PAGE_SIZE>,
+    brk: Mutex<Platform, usize>,
+}
+
+impl<Platform: ShimPlatform> MemoryManager<Platform> {
+    fn new(platform: &'static Platform) -> Self {
+        Self {
+            vmem: VmemManager::new(platform),
+            brk: Mutex::new(0),
+        }
+    }
+
+    /// Sets the initial program break address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial program break has already been set.
+    fn set_initial_brk(&self, brk: usize) {
+        let mut current = self.brk.lock();
+        assert_eq!(*current, 0, "initial brk is already set");
+        *current = brk;
+    }
+
+    /// Sets or queries the Linux program break.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial program break has not been set.
+    ///
+    /// # Safety
+    ///
+    /// If shrinking the program break, the caller must ensure that the released region is no
+    /// longer used.
+    unsafe fn brk(&self, requested: usize) -> Result<usize, MappingError> {
+        let mut current = self.brk.lock();
+        assert_ne!(*current, 0, "initial brk is not set yet");
+        if requested == 0 {
+            return Ok(*current);
+        }
+
+        let old_page_end = current.next_multiple_of(PAGE_SIZE);
+        let new_page_end = requested.next_multiple_of(PAGE_SIZE);
+        if *current >= requested {
+            let length = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end)
+                .ok_or(MappingError::UnAligned)?;
+            let ptr =
+                <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(new_page_end);
+            if unsafe { self.vmem.remove_pages(ptr, length.as_usize()) }.is_err() {
+                return Ok(*current);
+            }
+            *current = requested;
+            return Ok(requested);
+        }
+
+        if let (Some(address), Some(length)) = (
+            NonZeroAddress::new(old_page_end),
+            NonZeroPageSize::new(new_page_end - old_page_end),
+        ) {
+            unsafe {
+                self.vmem.create_writable_pages(
+                    Some(address),
+                    length,
+                    CreatePagesFlags::FIXED_ADDR
+                        | CreatePagesFlags::NOREPLACE
+                        | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                    |_| Ok(0),
+                )
+            }?;
+        }
+        *current = requested;
+        Ok(requested)
+    }
+
+    /// Releases matching mappings and resets Linux program-break state.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the released regions are no longer used.
+    pub unsafe fn release_memory(
+        &self,
+        releasable: fn(Range<usize>, VmFlags) -> bool,
+    ) -> Result<(), VmemUnmapError> {
+        let mut current = self.brk.lock();
+        unsafe { self.vmem.release_memory(releasable) }?;
+        *current = 0;
+        Ok(())
+    }
+}
+
+impl<Platform: ShimPlatform> Deref for MemoryManager<Platform> {
+    type Target = VmemManager<Platform, PAGE_SIZE>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.vmem
+    }
 }
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
@@ -149,7 +255,7 @@ impl<Platform: ShimPlatform> litebox::shim::EnterShim for LinuxShimEntrypoints<P
             if unsafe {
                 self.task
                     .global
-                    .pm
+                    .mm
                     .handle_page_fault(info.cr2, info.error_code.into())
             }
             .is_ok()
@@ -237,7 +343,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
         let net = Network::new(&litebox);
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            pm: PageManager::new(&litebox),
+            mm: MemoryManager::new(self.platform),
             futex_manager: FutexManager::new(),
             pipes: Pipes::new(&litebox),
             net: litebox::sync::Mutex::new(net),
@@ -343,9 +449,9 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         })
     }
 
-    /// Get the global page manager
-    pub fn page_manager(&self) -> &PageManager<Platform, PAGE_SIZE> {
-        &self.0.pm
+    /// Returns the global memory manager.
+    pub fn memory_manager(&self) -> &MemoryManager<Platform> {
+        &self.0.mm
     }
 
     pub fn litebox(&self) -> &LiteBox<Platform> {
@@ -1239,8 +1345,8 @@ struct GlobalState<Platform: ShimPlatform> {
     platform: &'static Platform,
     /// The LiteBox instance used throughout the shim.
     litebox: Arc<litebox::LiteBox<Platform>>,
-    /// The page manager for managing virtual memory.
-    pm: litebox::mm::PageManager<Platform, { PAGE_SIZE }>,
+    /// The memory manager for managing virtual memory.
+    mm: MemoryManager<Platform>,
     /// The futex manager for handling futex operations.
     futex_manager: FutexManager<Platform>,
     /// The anonymous pipe implementation.

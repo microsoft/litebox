@@ -11,11 +11,11 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
-use crate::platform::PageManagementProvider;
-use crate::platform::RawConstPointer;
-use crate::platform::page_mgmt::AllocationError;
-use crate::platform::page_mgmt::FixedAddressBehavior;
-use crate::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::PageManagementProvider;
+use litebox::platform::RawConstPointer;
+use litebox::platform::page_mgmt::AllocationError;
+use litebox::platform::page_mgmt::FixedAddressBehavior;
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 
 /// Page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
@@ -300,8 +300,6 @@ impl VmArea {
 pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> {
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
-    /// Current program break address.
-    pub(super) brk: usize,
     /// Virtual memory areas.
     vmas: RangeMap<usize, VmArea>,
 }
@@ -313,7 +311,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) fn new(platform: &'static Platform) -> Self {
         let mut vmem = Self {
             vmas: RangeMap::new(),
-            brk: 0,
             platform,
         };
         for each in platform.reserved_pages() {
@@ -659,7 +656,6 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
                 Ok(_) => {}
-                Err(AllocationError::OutOfMemory) => return Err(VmemResizeError::OutOfMemory),
                 Err(AllocationError::PermissionDenied) => {
                     return Err(VmemResizeError::PermissionDenied);
                 }
@@ -673,6 +669,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     | AllocationError::BelowMinAddress
                     | AllocationError::AboveMaxAddress,
                 ) => unreachable!(),
+                Err(_) => return Err(VmemResizeError::OutOfMemory),
             }
             return Ok(());
         }
@@ -959,7 +956,7 @@ pub enum VmemUnmapError {
     #[error("arg is not aligned")]
     UnAligned,
     #[error("failed to unmap pages: {0}")]
-    UnmapError(#[from] crate::platform::page_mgmt::DeallocationError),
+    UnmapError(#[from] litebox::platform::page_mgmt::DeallocationError),
 }
 
 /// Error for resetting pages
@@ -996,7 +993,7 @@ pub enum VmemMoveError {
     #[error("out of memory")]
     OutOfMemory,
     #[error("remap failed: {0}")]
-    RemapError(#[from] crate::platform::page_mgmt::RemapError),
+    RemapError(#[from] litebox::platform::page_mgmt::RemapError),
 }
 
 /// Error for protecting mappings
@@ -1009,7 +1006,7 @@ pub enum VmemProtectError {
     #[error("failed to change permissions from {old:?} to {new:?}")]
     NoAccess { old: VmFlags, new: VmFlags },
     #[error("mprotect failed: {0}")]
-    ProtectError(#[from] crate::platform::page_mgmt::PermissionUpdateError),
+    ProtectError(#[from] litebox::platform::page_mgmt::PermissionUpdateError),
 }
 
 /// Error for creating mappings
@@ -1032,12 +1029,12 @@ pub enum MappingError {
     InvalidPermissions,
 
     #[error("mapping failed: {0}")]
-    MapError(#[from] crate::platform::page_mgmt::AllocationError),
+    MapError(#[from] litebox::platform::page_mgmt::AllocationError),
     #[error("failed to apply mapping permissions: {0}")]
     ProtectError(#[from] VmemProtectError),
 }
 
-/// Enable [`super::PageManager`] to handle page faults if its platform implements this trait
+/// Enable [`crate::mm::VmemManager`] to handle page faults if its platform implements this trait.
 pub trait VmemPageFaultHandler {
     /// Handle a page fault for the given address.
     ///
@@ -1064,4 +1061,329 @@ pub enum PageFaultError {
     AllocationFailed,
     #[error("given page is part of an already mapped huge page")]
     HugePage,
+}
+
+#[cfg(test)]
+mod tests {
+    use core::ops::Range;
+
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use litebox::platform::{
+        PageManagementProvider, RawConstPointer,
+        page_mgmt::MemoryRegionPermissions,
+        trivial_providers::{TransparentConstPtr, TransparentMutPtr},
+    };
+    use zerocopy::{FromBytes, IntoBytes};
+
+    use super::*;
+
+    /// A dummy page-management platform for virtual-memory tests.
+    struct DummyVmemBackend;
+
+    impl litebox::platform::RawPointerProvider for DummyVmemBackend {
+        type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
+        type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
+    }
+
+    #[expect(unused_variables, reason = "dummy/mock backend")]
+    impl litebox::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        const TASK_ADDR_MIN: usize = 0x1_0000; // default linux/windows config
+        #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+        const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
+        #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
+        const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        const TASK_ADDR_MIN: usize = 0x1_0000; // Vmem unit-test bound
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000; // MACH_VM_MAX_ADDRESS
+
+        fn allocate_pages(
+            &self,
+            suggested_range: Range<usize>,
+            initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+            can_grow_down: bool,
+            populate_pages_immediately: bool,
+            fixed_address_behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
+        ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError>
+        {
+            Ok(TransparentMutPtr::from_usize(suggested_range.start))
+        }
+
+        unsafe fn deallocate_pages(
+            &self,
+            range: Range<usize>,
+        ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+            Ok(())
+        }
+
+        unsafe fn remap_pages(
+            &self,
+            old_range: Range<usize>,
+            new_range: Range<usize>,
+            permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+            Ok(TransparentMutPtr::from_usize(new_range.start))
+        }
+
+        unsafe fn update_permissions(
+            &self,
+            range: Range<usize>,
+            new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+        ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+            Ok(())
+        }
+
+        fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
+            core::iter::empty()
+        }
+    }
+
+    fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
+        vmm.iter().map(|v| v.0.start..v.0.end).collect()
+    }
+
+    #[test]
+    fn test_vmm_mapping() {
+        let start_addr = DummyVmemBackend::TASK_ADDR_MIN;
+        let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
+        let mut vmm = Vmem::new(&DummyVmemBackend);
+
+        // []
+        unsafe {
+            vmm.insert_mapping(
+                range,
+                VmArea::new(
+                    VmFlags::VM_READ | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
+                    false,
+                ),
+                false,
+                litebox::platform::page_mgmt::FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        // [(0x1_0000, 0x1_c000)]
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![start_addr..start_addr + 12 * PAGE_SIZE]
+        );
+
+        unsafe {
+            vmm.remove_mapping(
+                PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
+            )
+        }
+        .unwrap();
+        // [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![
+                start_addr..start_addr + 2 * PAGE_SIZE,
+                start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
+            ]
+        );
+
+        assert!(matches!(
+            unsafe {
+                vmm.resize_mapping(
+                    PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 3 * PAGE_SIZE).unwrap(),
+                    NonZeroPageSize::new(PAGE_SIZE * 2).unwrap(),
+                )
+            },
+            // Failed to resize, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
+            Err(VmemResizeError::NotExist(_))
+        ));
+
+        assert!(matches!(
+            unsafe {
+                vmm.resize_mapping(
+                    PageRange::new(start_addr, start_addr + 3 * PAGE_SIZE).unwrap(),
+                    NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
+                )
+            },
+            // Failed to resize, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
+            Err(VmemResizeError::InvalidAddr { .. })
+        ));
+
+        assert!(matches!(
+            unsafe {
+                vmm.protect_mapping(
+                    PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                )
+            },
+            // Failed to protect, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
+            Err(VmemProtectError::InvalidRange(_))
+        ));
+
+        assert!(
+            unsafe {
+                vmm.resize_mapping(
+                    PageRange::new(start_addr, start_addr + 2 * PAGE_SIZE).unwrap(),
+                    NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
+                )
+            }
+            .is_ok()
+        );
+        // Grow and merge, [(0x1_0000, 0x1_c000)]
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![start_addr..start_addr + 12 * PAGE_SIZE]
+        );
+
+        assert!(matches!(
+            unsafe {
+                vmm.protect_mapping(
+                    PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                )
+            },
+            // Failed to protect, remain [(0x1_0000, 0x1_c000)]
+            Err(VmemProtectError::NoAccess { .. })
+        ));
+
+        assert!(
+            unsafe {
+                vmm.protect_mapping(
+                    PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                )
+            }
+            .is_ok()
+        );
+        // Change permission, [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![
+                start_addr..start_addr + 2 * PAGE_SIZE,
+                start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE,
+                start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE
+            ]
+        );
+
+        // try to remap [0x1_2000, 0x1_4000)
+        let r = PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap();
+        assert!(matches!(
+            unsafe { vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4).unwrap()) },
+            Err(VmemResizeError::RangeOccupied(_))
+        ));
+        assert!(
+            unsafe {
+                vmm.move_mappings(
+                    r,
+                    Some(NonZeroAddress::new(start_addr + 12 * PAGE_SIZE).unwrap()),
+                    NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
+                )
+            }
+            .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
+        );
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![
+                start_addr..start_addr + 2 * PAGE_SIZE,
+                start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+                start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE
+            ]
+        );
+
+        // create new mapping with no suggested address
+        assert_eq!(
+            unsafe {
+                vmm.create_mapping(
+                    None,
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                    CreatePagesFlags::empty(),
+                )
+            }
+            .unwrap()
+            .as_usize(),
+            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE,
+        );
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![
+                start_addr..start_addr + 2 * PAGE_SIZE,
+                start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+                start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+                DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            ]
+        );
+
+        // create new mapping with fixed address that overlaps with other mapping
+        assert_eq!(
+            unsafe {
+                vmm.create_mapping(
+                    Some(NonZeroAddress::new(start_addr + PAGE_SIZE).unwrap()),
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                    CreatePagesFlags::FIXED_ADDR,
+                )
+            }
+            .unwrap()
+            .as_usize(),
+            start_addr + PAGE_SIZE
+        );
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![
+                start_addr..start_addr + PAGE_SIZE,
+                start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
+                start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+                start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+                DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            ]
+        );
+
+        // shrink mapping
+        assert!(
+            unsafe {
+                vmm.resize_mapping(
+                    PageRange::new(start_addr + 4 * PAGE_SIZE, start_addr + 8 * PAGE_SIZE).unwrap(),
+                    NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+                )
+            }
+            .is_ok()
+        );
+        assert_eq!(
+            collect_mappings(&vmm),
+            vec![
+                start_addr..start_addr + PAGE_SIZE,
+                start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
+                start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
+                start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
+                start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
+                DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+            ]
+        );
+    }
+
+    #[test]
+    fn fixed_mappings_respect_task_address_bounds() {
+        let mut vmm = Vmem::new(&DummyVmemBackend);
+        let vma = VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false);
+
+        let below_min = PageRange::new(
+            DummyVmemBackend::TASK_ADDR_MIN - PAGE_SIZE,
+            DummyVmemBackend::TASK_ADDR_MIN,
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { vmm.insert_mapping(below_min, vma, false, FixedAddressBehavior::NoReplace,) },
+            Err(AllocationError::BelowMinAddress)
+        ));
+
+        let above_max = PageRange::new(
+            DummyVmemBackend::TASK_ADDR_MAX,
+            DummyVmemBackend::TASK_ADDR_MAX + PAGE_SIZE,
+        )
+        .unwrap();
+        assert!(matches!(
+            unsafe { vmm.insert_mapping(above_max, vma, false, FixedAddressBehavior::NoReplace,) },
+            Err(AllocationError::AboveMaxAddress)
+        ));
+    }
 }

@@ -18,7 +18,6 @@ use litebox::event::observer::Observer;
 use litebox::event::polling::{Pollee, TryOpError};
 use litebox::event::wait::WaitError;
 use litebox::event::{Events, IOPollable as _};
-use litebox::mm::vmem::VmFlags;
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::TimerHandle;
 use litebox::process::{ChildStatus, ProcessError};
@@ -26,6 +25,7 @@ use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
+use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno, program_startup::LinuxProgramStartup,
@@ -2190,7 +2190,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Don't release reserved mappings.
         let release = |_r: Range<usize>, vm: VmFlags| !vm.is_empty();
-        unsafe { self.global.pm.release_memory(release) }
+        unsafe { self.global.mm.release_memory(release) }
             .expect("failed to release memory mappings");
 
         // AArch64 patch state contains addresses from the discarded image.
@@ -2717,7 +2717,7 @@ mod tests {
             );
 
              // `process_signals` is called when about to switch back to userspace, so simulate that here.
-            let mut stack = [0u8; 2 * litebox::mm::vmem::PAGE_SIZE];
+            let mut stack = [0u8; 2 * litebox_common_linux::vmem::PAGE_SIZE];
              #[cfg(target_arch = "x86_64")]
              let mut regs = litebox_common_linux::PtRegs { rsp: stack.as_mut_ptr() as usize + stack.len(), ..Default::default() };
              #[cfg(target_arch = "aarch64")]

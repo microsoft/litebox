@@ -19,7 +19,6 @@ use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use litebox_common_windows::nt_status::NtStatus;
 
 use litebox::LiteBox;
-use litebox::mm::PageManager;
 use litebox::platform::{
     ArchSpecificProvider, ArchSpecificRegister, PageManagementProvider, RawConstPointer as _,
     RawMutPointer as _, RawPointerProvider, SystemInfoProvider,
@@ -27,6 +26,7 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
+use litebox_common_linux::mm::VmemManager;
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::{NtSysno, Win32Sysno};
 use litebox_platform::time::TimeProvider;
@@ -99,7 +99,7 @@ pub(crate) type ConstPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 pub(crate) type MutPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
-pub(crate) type WindowsPageManager<Platform> = PageManager<Platform, PAGE_SIZE>;
+pub(crate) type WindowsPageManager<Platform> = VmemManager<Platform, PAGE_SIZE>;
 pub(crate) type WindowsHandleStore<Platform> =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
 
@@ -430,7 +430,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            page_manager: PageManager::new(&litebox),
+            page_manager: VmemManager::new(self.platform),
             registry: syscalls::registry::RegistryStore::new(fs::Fs::registry(Arc::clone(
                 &litebox,
             ))),
@@ -459,7 +459,9 @@ const WINDOWS_USER_SHARED_DATA_BASE: usize = 0x7FFE_0000;
 fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
     page_manager: &crate::WindowsPageManager<Platform>,
 ) -> Option<usize> {
-    use litebox::mm::vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize};
+    use litebox_common_linux::vmem::{
+        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize,
+    };
     use zerocopy::IntoBytes as _;
     let address = NonZeroAddress::new(WINDOWS_USER_SHARED_DATA_BASE)?;
     let length =

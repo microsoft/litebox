@@ -4,8 +4,8 @@
 extern crate std;
 
 use super::*;
-use litebox::mm::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
 use litebox::platform::{RawConstPointer as _, page_mgmt::MemoryRegionPermissions as Permissions};
+use litebox_common_linux::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSize, VmFlags};
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {
@@ -86,7 +86,7 @@ fn dyld_data_remains_writable_during_bootstrap() {
     let task = task(MacosShimBuilder::new(Platform::new()).build());
     // SAFETY: allocate one fresh page owned exclusively by this test task.
     let page = unsafe {
-        task.global.pm.create_writable_pages(
+        task.global.mm.create_writable_pages(
             NonZeroAddress::new(Platform::TASK_ADDR_MIN),
             NonZeroPageSize::new(PAGE_SIZE).unwrap(),
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
@@ -100,7 +100,7 @@ fn dyld_data_remains_writable_during_bootstrap() {
         .unwrap();
     let flags = task
         .global
-        .pm
+        .mm
         .mappings()
         .into_iter()
         .find_map(|(range, flags)| range.contains(&base).then_some(flags))
@@ -119,7 +119,7 @@ fn mach_vm_map_honors_current_protection() {
     let task = task(MacosShimBuilder::new(Platform::new()).build());
     // SAFETY: allocate fresh address-output storage in this idle guest task.
     let slot = unsafe {
-        task.global.pm.create_writable_pages(
+        task.global.mm.create_writable_pages(
             NonZeroAddress::new(Platform::TASK_ADDR_MIN),
             NonZeroPageSize::new(PAGE_SIZE).unwrap(),
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
@@ -162,7 +162,7 @@ fn mach_vm_map_honors_current_protection() {
     let mapped = address.read_at_offset::<Platform>(0).unwrap();
     let flags = task
         .global
-        .pm
+        .mm
         .mappings()
         .into_iter()
         .find_map(|(range, flags)| range.contains(&mapped).then_some(flags))
@@ -182,7 +182,7 @@ fn mach_vm_map_honors_current_protection() {
     );
     let flags = task
         .global
-        .pm
+        .mm
         .mappings()
         .into_iter()
         .find_map(|(range, flags)| range.contains(&mapped).then_some(flags))
@@ -194,7 +194,7 @@ fn mach_vm_map_honors_current_protection() {
     );
     assert!(
         task.global
-            .pm
+            .mm
             .mappings()
             .into_iter()
             .all(|(range, _)| !range.contains(&mapped))
@@ -281,7 +281,7 @@ fn teardown_continues_after_unmap_failure_during_unwind() {
     let task = task(MacosShimBuilder::new(platform).build());
     // SAFETY: non-fixed allocation into a fresh, idle guest address space.
     let ptr = unsafe {
-        task.global.pm.create_writable_pages(
+        task.global.mm.create_writable_pages(
             NonZeroAddress::new(Platform::TASK_ADDR_MIN),
             NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
@@ -294,7 +294,7 @@ fn teardown_continues_after_unmap_failure_during_unwind() {
     // remove the first page behind PageManager to inject a teardown failure.
     unsafe {
         task.global
-            .pm
+            .mm
             .change_page_permissions(ptr, PAGE_SIZE, Permissions::READ)
             .unwrap();
         platform.deallocate_pages(base..base + PAGE_SIZE).unwrap();

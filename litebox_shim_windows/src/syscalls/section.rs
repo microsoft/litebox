@@ -9,9 +9,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use int_enum::IntEnum;
 use litebox::fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry};
-use litebox::mm::vmem::{CreatePagesFlags, NonZeroPageSize};
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+use litebox_common_linux::vmem::{CreatePagesFlags, NonZeroPageSize};
 use litebox_common_windows::nt_status::NtStatus;
 use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};

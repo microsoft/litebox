@@ -11,13 +11,13 @@ use alloc::{collections::BTreeSet, sync::Arc, vec, vec::Vec};
 use core::ops::Range;
 use litebox::{
     fs::errors::ReadError,
-    mm::vmem::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
-    },
     platform::{
         RawConstPointer as _, RawMutPointer as _, page_mgmt::MemoryRegionPermissions as Permissions,
     },
     utils::TruncateExt as _,
+};
+use litebox_common_linux::vmem::{
+    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
 };
 use litebox_common_macos::{
     MmapFlags, PAGE_SIZE, VmProtection, errno::Errno, loader::MAX_IMAGE_SIZE,
@@ -253,7 +253,7 @@ fn reserve_shared_cache_gates(
 impl<P: ShimPlatform> Task<P> {
     fn mapping_snapshot(&self, target: Range<usize>) -> Vec<(Range<usize>, VmFlags)> {
         self.global
-            .pm
+            .mm
             .mappings()
             .into_iter()
             .filter_map(|(range, flags)| {
@@ -467,7 +467,7 @@ impl<P: ShimPlatform> Task<P> {
             // SAFETY: MAP_FIXED has Darwin's replacement semantics; otherwise
             // PageManager treats `suggested` only as an allocation hint.
             let result = unsafe {
-                self.global.pm.create_pages_with_permissions(
+                self.global.mm.create_pages_with_permissions(
                     suggested,
                     length,
                     mapping_flags(flags, false),
@@ -515,7 +515,7 @@ impl<P: ShimPlatform> Task<P> {
         // SAFETY: MAP_FIXED has Darwin's replacement semantics. Initialization
         // runs while the new mapping is private to this syscall and still RW.
         let result = unsafe {
-            self.global.pm.create_pages_with_permissions(
+            self.global.mm.create_pages_with_permissions(
                 suggested,
                 length,
                 create_flags,
@@ -790,7 +790,7 @@ impl<P: ShimPlatform> Task<P> {
             // SAFETY: `range` is the live trampoline allocation, and the
             // trampoline lock serializes permission changes and gate appends.
             unsafe {
-                self.global.pm.change_page_permissions(
+                self.global.mm.change_page_permissions(
                     P::RawMutPointer::from_usize(range.start),
                     range.len(),
                     Permissions::READ | Permissions::WRITE,
@@ -809,7 +809,7 @@ impl<P: ShimPlatform> Task<P> {
                 // SAFETY: `range` remains the live trampoline allocation and
                 // the trampoline lock still serializes this RX restoration.
                 let _ = unsafe {
-                    self.global.pm.change_page_permissions(
+                    self.global.mm.change_page_permissions(
                         P::RawMutPointer::from_usize(range.start),
                         range.len(),
                         Permissions::READ | Permissions::EXEC,
@@ -821,7 +821,7 @@ impl<P: ShimPlatform> Task<P> {
         // SAFETY: no code points to the newly appended gates until the final
         // code copy. The RW-to-RX transition synchronizes instruction caches.
         unsafe {
-            self.global.pm.change_page_permissions(
+            self.global.mm.change_page_permissions(
                 P::RawMutPointer::from_usize(range.start),
                 range.len(),
                 Permissions::READ | Permissions::EXEC,
@@ -896,7 +896,7 @@ impl<P: ShimPlatform> Task<P> {
         // the platform choose unused memory. No existing mappings are replaced.
         unsafe {
             self.global
-                .pm
+                .mm
                 .create_writable_pages(suggested, length, flags, |_| Ok(0))
         }
         .map(|pointer| pointer.as_usize())
@@ -973,7 +973,7 @@ impl<P: ShimPlatform> Task<P> {
         // are passed here.
         if let Err(error) = unsafe {
             self.global
-                .pm
+                .mm
                 .remove_pages(P::RawMutPointer::from_usize(range.start), range.len())
         } {
             litebox_util_log::warn!(error:? = error; "failed to release Mach-O trampoline");
@@ -1144,7 +1144,7 @@ impl<P: ShimPlatform> Task<P> {
             }
             let previous: Vec<_> = self
                 .global
-                .pm
+                .mm
                 .mappings()
                 .into_iter()
                 .filter_map(|(range, flags)| {
@@ -1215,7 +1215,7 @@ impl<P: ShimPlatform> Task<P> {
         // SAFETY: PageManager validates the tracked range and maximum allowed
         // permissions. Callers prevent concurrent execution while rewriting.
         unsafe {
-            self.global.pm.change_page_permissions(
+            self.global.mm.change_page_permissions(
                 P::RawMutPointer::from_usize(range.start),
                 range.len(),
                 permissions(protection),
@@ -1227,7 +1227,7 @@ impl<P: ShimPlatform> Task<P> {
     fn trampoline_address_before(&self, code_address: usize, length: usize) -> Option<usize> {
         let mut previous_end = P::TASK_ADDR_MIN;
         let mut candidate = None;
-        for (range, _) in self.global.pm.mappings() {
+        for (range, _) in self.global.mm.mappings() {
             if range.start >= code_address {
                 break;
             }
@@ -1249,7 +1249,7 @@ impl<P: ShimPlatform> Task<P> {
         trampoline_length: usize,
     ) -> Option<usize> {
         let mut candidate = code_address.checked_add(code_length)?;
-        for (range, _) in self.global.pm.mappings() {
+        for (range, _) in self.global.mm.mappings() {
             if range.end <= candidate {
                 continue;
             }
@@ -1293,7 +1293,7 @@ impl<P: ShimPlatform> Task<P> {
         // SAFETY: Darwin munmap relinquishes the caller-selected guest range.
         unsafe {
             self.global
-                .pm
+                .mm
                 .remove_pages(P::RawMutPointer::from_usize(address), length)
         }
         .map_err(|_| Errno::EINVAL)?;
@@ -1361,7 +1361,7 @@ mod tests {
     use super::*;
     use alloc::{sync::Arc, vec::Vec};
     use core::sync::atomic::AtomicI32;
-    use litebox::{LiteBox, mm::vmem::VmFlags};
+    use litebox::LiteBox;
     use litebox_broker_core::{
         ObjectRights, PolicyEngine,
         fs::{
@@ -1373,6 +1373,7 @@ mod tests {
     use litebox_broker_host::test_support::InProcessBrokerSetup;
     use litebox_broker_local::BrokerLocal;
     use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
+    use litebox_common_linux::vmem::VmFlags;
     use litebox_common_macos::{PtRegs, TaskParams, syscall::nr, user_pointers::UserPtr};
     use litebox_platform_macos_userland::MacosUserland as Platform;
     use litebox_syscall_rewriter::aarch64::{GateMetadata, decode_branch_target};
@@ -1772,7 +1773,7 @@ mod tests {
         );
         let target =
             usize::try_from(decode_branch_target(code, code_address as u64).unwrap()).unwrap();
-        let mappings = task.global.pm.mappings();
+        let mappings = task.global.mm.mappings();
         assert!(mappings.iter().any(|(range, flags)| {
             range.contains(&target)
                 && flags.contains(VmFlags::VM_EXEC)
@@ -1858,7 +1859,7 @@ mod tests {
     #[test]
     fn failed_executable_mmap_rolls_back_unpublished_trampoline() {
         let task = task_with_file(&macho_image());
-        let before = task.global.pm.mappings();
+        let before = task.global.mm.mappings();
         assert!(
             mmap_with_protection(
                 &task,
@@ -1866,7 +1867,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(task.global.pm.mappings(), before);
+        assert_eq!(task.global.mm.mappings(), before);
         assert!(task.global.macho_trampolines.lock().is_empty());
     }
 
@@ -1992,12 +1993,12 @@ mod tests {
     #[test]
     fn executable_file_mmap_rejects_non_macho_without_publishing_pages() {
         let task = task_with_file(b"not a Mach-O");
-        let before = task.global.pm.mappings();
+        let before = task.global.mm.mappings();
         assert_eq!(
             mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE),
             Err(Errno::ENOEXEC)
         );
-        assert_eq!(task.global.pm.mappings(), before);
+        assert_eq!(task.global.mm.mappings(), before);
     }
 
     #[test]
