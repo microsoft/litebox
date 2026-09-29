@@ -234,7 +234,8 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             boot_instant: TimeProvider::now(self.platform),
             mm: MemoryManager::new(self.platform),
             litebox: self.litebox,
-            ta_uuid_map: ta_uuid_map(),
+            embedded_ta_uuid_map: embedded_ta_uuid_map(),
+            dynamic_ta_uuid_map: TaUuidMap::new(),
             ta_signing_cert: self.ta_signing_cert,
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
             page_table_keepalive: None,
@@ -257,8 +258,10 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     mm: MemoryManager<Platform>,
     /// The LiteBox instance used throughout the shim.
     litebox: litebox::LiteBox<Platform>,
-    /// The TA UUID to binary map for TA loading.
-    ta_uuid_map: &'static TaUuidMap,
+    /// TA binaries embedded in the runner image and shared across shim instances.
+    embedded_ta_uuid_map: &'static TaUuidMap,
+    /// Dynamically supplied TA binaries scoped to this shim instance.
+    dynamic_ta_uuid_map: TaUuidMap,
     ta_signing_cert: &'static [u8],
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
@@ -279,12 +282,16 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        self.ta_uuid_map.insert(*ta_uuid, ta_bin.into())
+        self.dynamic_ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
     /// Get the TA binary associated with the given TA UUID.
     pub(crate) fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
-        if let Some(ta_bin) = self.ta_uuid_map.get(ta_uuid) {
+        if let Some(ta_bin) = self
+            .dynamic_ta_uuid_map
+            .get(ta_uuid)
+            .or_else(|| self.embedded_ta_uuid_map.get(ta_uuid))
+        {
             Some(ta_bin)
         } else {
             let ta_bin = Self::rpc_get_ta_bin(ta_uuid)?;
@@ -312,7 +319,7 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     ///
     #[expect(dead_code)]
     pub(crate) fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
-        let _ = self.ta_uuid_map.remove(ta_uuid);
+        let _ = self.dynamic_ta_uuid_map.remove(ta_uuid);
     }
 
     /// RPC to get the TA binary associated with the given TA UUID. Placeholder for now.
@@ -368,8 +375,9 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
         let (ta_binary, ta_flags) = self
             .0
-            .ta_uuid_map
+            .dynamic_ta_uuid_map
             .get_with_flags(&ta_uuid)
+            .or_else(|| self.0.embedded_ta_uuid_map.get_with_flags(&ta_uuid))
             .ok_or(loader::elf::ElfLoaderError::OpenError(Errno::ENOENT))?;
         let ta_digest = Sha256::digest(&ta_binary).into();
         let entrypoints = crate::OpteeShimEntrypoints {
@@ -439,6 +447,11 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
         self.0.store_ta_bin(ta_uuid, ta_bin)
+    }
+
+    /// Store a TA binary embedded in the runner image.
+    pub fn store_embedded_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &'static [u8]) -> bool {
+        self.0.embedded_ta_uuid_map.insert(*ta_uuid, ta_bin.into())
     }
 
     /// Get the TA binary associated with the given TA UUID.
@@ -1522,10 +1535,11 @@ impl TaUuidMap {
     }
 }
 
-/// Get the global TA UUID map.
-fn ta_uuid_map() -> &'static TaUuidMap {
-    static TA_UUID_MAP: once_cell::race::OnceBox<TaUuidMap> = once_cell::race::OnceBox::new();
-    TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
+/// Get the TA binaries embedded in the runner image.
+fn embedded_ta_uuid_map() -> &'static TaUuidMap {
+    static EMBEDDED_TA_UUID_MAP: once_cell::race::OnceBox<TaUuidMap> =
+        once_cell::race::OnceBox::new();
+    EMBEDDED_TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
 /// Per-instance TA state which can be shared between sessions if it is
