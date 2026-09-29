@@ -367,12 +367,14 @@ where
 
     /// Release a range's platform backing and update reservation ownership.
     ///
+    /// `has_mapping` reports whether a queried range is mapped.
+    ///
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
-    unsafe fn unmap<V: Clone + Eq>(
+    unsafe fn unmap(
         &mut self,
-        vmas: &mut RangeMap<usize, V>,
+        has_mapping: impl Fn(&Range<usize>) -> bool,
         platform: &Platform,
         range: Range<usize>,
     ) -> Result<(), DeallocationError>;
@@ -451,15 +453,14 @@ where
         ))
     }
 
-    unsafe fn unmap<V: Clone + Eq>(
+    unsafe fn unmap(
         &mut self,
-        vmas: &mut RangeMap<usize, V>,
+        _has_mapping: impl Fn(&Range<usize>) -> bool,
         platform: &Platform,
         range: Range<usize>,
     ) -> Result<(), DeallocationError> {
         // SAFETY: The caller excludes all users of the released range.
-        unsafe { platform.release_pages(range.clone()) }?;
-        vmas.remove(range);
+        unsafe { platform.release_pages(range) }?;
         Ok(())
     }
 
@@ -603,28 +604,31 @@ where
         }
     }
 
-    unsafe fn unmap<V: Clone + Eq>(
+    unsafe fn unmap(
         &mut self,
-        vmas: &mut RangeMap<usize, V>,
+        has_mapping: impl Fn(&Range<usize>) -> bool,
         platform: &Platform,
         range: Range<usize>,
     ) -> Result<(), DeallocationError> {
         let reservations = self.take_overlapping(range.clone());
         let last = reservations.len().saturating_sub(1);
-        vmas.remove(range.clone());
         for (index, reservation) in reservations.into_iter().enumerate() {
             if index == 0 || index == last {
                 let extent = reservation.range();
-                if vmas.overlaps(&extent) {
+                if (extent.start < range.start && has_mapping(&(extent.start..range.start)))
+                    || (range.end < extent.end && has_mapping(&(range.end..extent.end)))
+                {
                     let segment = extent.start.max(range.start)..extent.end.min(range.end);
                     // SAFETY: The removed segment has no users and remains inside this reservation.
-                    unsafe { platform.decommit_pages(|| core::iter::once(&reservation), segment) }?;
+                    unsafe { platform.decommit_pages(|| core::iter::once(&reservation), segment) }
+                        .expect("failed to decommit unmapped reservation backing");
                     assert!(self.insert(extent.start, reservation).is_none());
                     continue;
                 }
             }
             // SAFETY: No VMA uses this reservation after removing the requested range.
-            unsafe { platform.release_pages(reservation) }?;
+            unsafe { platform.release_pages(reservation) }
+                .expect("failed to release unmapped reservation");
         }
         Ok(())
     }
@@ -714,11 +718,18 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
+        let range = Range::from(range);
+        // SAFETY: The caller excludes all users of the removed range.
         unsafe {
-            self.reservations
-                .unmap(&mut self.vmas, self.platform, range.into())
-                .map_err(VmemUnmapError::UnmapError)
+            self.reservations.unmap(
+                |candidate| self.vmas.overlaps(candidate),
+                self.platform,
+                range.clone(),
+            )
         }
+        .map_err(VmemUnmapError::UnmapError)?;
+        self.vmas.remove(range);
+        Ok(())
     }
 
     /// Reset pages without removing its mapping (similar to Linux `madvise` with
