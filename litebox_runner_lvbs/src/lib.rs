@@ -1376,7 +1376,7 @@ fn register_embedded_ta(
     let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
         return false;
     };
-    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+    shim.store_embedded_ta_bin(&ta_head.uuid, ta_binary)
 }
 
 /// Register all TA binaries embedded in the runner image.
