@@ -3055,7 +3055,7 @@ mod tests {
 
         let task = crate::syscalls::tests::init_platform();
         <crate::syscalls::tests::TestPlatform as litebox::platform::ThreadProvider>::run_test_thread(|| {
-            let mut stack = [0u8; 2 * litebox::mm::vmem::PAGE_SIZE];
+            let mut stack = [0u8; 2 * litebox_common_linux::vmem::PAGE_SIZE];
             let set = SigSet::empty().with(Signal::SIGCHLD);
             let sigprocmask = |how| {
                 task.sys_rt_sigprocmask(
