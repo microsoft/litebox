@@ -152,8 +152,8 @@ impl super::Errno {
             131 => "ENOTRECOVERABLE: State not recoverable",
             132 => "ERFKILL: Operation not possible due to RF-kill",
             133 => "EHWPOISON: Memory page has hardware error",
-            254 => "ERESTARTSYS: Interrupted system call, restartable with SA_RESTART",
-            255 => "ERESTARTNOHAND: Interrupted system call, restartable if unhandled",
+            512 => "ERESTARTSYS: Interrupted system call, restartable with SA_RESTART",
+            514 => "ERESTARTNOHAND: Interrupted system call, restartable if unhandled",
             _ => unreachable!(),
         }
     }

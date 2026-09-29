@@ -26,7 +26,8 @@ mod generated;
 /// to provide some type safety by expecting explicit conversions to/from `i32`s.
 #[derive(PartialEq, Eq, Clone, Copy, Error)]
 pub struct Errno {
-    value: core::num::NonZeroU8,
+    // Wide enough for the kernel-internal restart codes above `Errno::MAX`.
+    value: core::num::NonZeroU16,
 }
 
 impl From<Errno> for i32 {
@@ -62,24 +63,23 @@ impl Errno {
 
     /// (Private-only) Helper function that makes the associated constants on [`Errno`] significantly more
     /// readable. Not intended to be used outside this crate, or even this module.
-    const fn from_const(v: u8) -> Self {
+    const fn from_const(v: u16) -> Self {
         Self {
-            value: core::num::NonZeroU8::new(v).unwrap(),
+            value: core::num::NonZeroU16::new(v).unwrap(),
         }
     }
 }
 
-/// Kernel-internal codes for a syscall interrupted by a signal.
+/// Kernel-internal codes for a syscall interrupted by a signal, with Linux's values.
 ///
-/// They never reach the guest: signal delivery either restarts the syscall or replaces them with
-/// `EINTR`. So unlike Linux's 512 and 514, they only need to stay above [`Errno::MAX`], where
-/// conversions from integers never produce them.
+/// These are above [`Errno::MAX`], so conversions from integers never produce them. They never
+/// reach the guest: signal delivery either restarts the syscall or replaces them with `EINTR`.
 impl Errno {
     /// Restart the syscall unless a handler without `SA_RESTART` runs. Interrupted waits convert
     /// to this, as in Linux.
-    pub const ERESTARTSYS: Self = Self::from_const(254);
+    pub const ERESTARTSYS: Self = Self::from_const(512);
     /// Restart the syscall only if no handler runs.
-    pub const ERESTARTNOHAND: Self = Self::from_const(255);
+    pub const ERESTARTNOHAND: Self = Self::from_const(514);
 
     /// Returns `EINTR` in place of a restart code, for an interrupted syscall that must not
     /// restart.
@@ -92,9 +92,6 @@ impl Errno {
         }
     }
 }
-
-const _: () = assert!(Errno::MAX.value.get() < Errno::ERESTARTSYS.value.get());
-const _: () = assert!(Errno::MAX.value.get() < Errno::ERESTARTNOHAND.value.get());
 
 /// Errors when converting to an [`Errno`]
 #[derive(Error, Debug)]
@@ -128,8 +125,8 @@ impl TryFrom<u32> for Errno {
 impl TryFrom<u8> for Errno {
     type Error = ErrnoConversionError;
     fn try_from(value: u8) -> Result<Self, Self::Error> {
-        let value =
-            core::num::NonZeroU8::new(value).ok_or(ErrnoConversionError::ExpectedNonZero)?;
+        let value = core::num::NonZeroU16::new(value.into())
+            .ok_or(ErrnoConversionError::ExpectedNonZero)?;
         if value.get() <= Self::MAX.value.get() {
             Ok(Self { value })
         } else {
@@ -792,8 +789,7 @@ mod tests {
         assert_eq!(Errno::ERESTARTSYS.without_restart(), Errno::EINTR);
         assert_eq!(Errno::ERESTARTNOHAND.without_restart(), Errno::EINTR);
         assert_eq!(Errno::EAGAIN.without_restart(), Errno::EAGAIN);
-        for code in [Errno::ERESTARTSYS, Errno::ERESTARTNOHAND] {
-            let code = i32::from(code);
+        for code in [512i32, 514] {
             assert!(Errno::try_from(code).is_err());
             assert!(Errno::try_from(code.cast_unsigned()).is_err());
         }
