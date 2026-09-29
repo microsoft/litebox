@@ -171,12 +171,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let AnyTypedFd::Timerfd(fd) = self.typed_fd(fd)? else {
             return Err(Errno::EINVAL);
         };
-        self.global
+        let handle = self
+            .global
             .litebox
             .descriptor_table()
             .entry_handle(&fd)
-            .ok_or(Errno::EBADF)?
-            .with_entry(f)
+            .ok_or(Errno::EBADF)?;
+        handle.with_entry(f)
     }
 
     fn timer_clock_now(&self, clock: TimerClock) -> Duration {
