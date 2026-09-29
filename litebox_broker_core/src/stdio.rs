@@ -5,8 +5,6 @@
 
 use thiserror::Error;
 
-use crate::AssociationCancellation;
-
 /// Standard stream selected by a terminal query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StdioStream {
@@ -45,22 +43,11 @@ pub enum StdioProviderError {
 pub trait StdioProvider: Send + Sync {
     /// Blocks until bytes can be read from standard input, returning zero at
     /// end-of-file.
-    ///
-    /// Blocking implementations must periodically check `cancellation` and
-    /// return promptly when it becomes cancelled.
-    fn read(
-        &self,
-        cancellation: &AssociationCancellation,
-        output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError>;
+    fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError>;
 
     /// Writes bytes to the selected standard output stream.
-    ///
-    /// Blocking implementations must periodically check `cancellation` and
-    /// return promptly when it becomes cancelled.
     fn write(
         &self,
-        cancellation: &AssociationCancellation,
         stream: StdioOutputStream,
         input: &[u8],
     ) -> core::result::Result<usize, StdioProviderError>;
@@ -74,17 +61,12 @@ pub trait StdioProvider: Send + Sync {
 pub struct UnsupportedStdioProvider;
 
 impl StdioProvider for UnsupportedStdioProvider {
-    fn read(
-        &self,
-        _cancellation: &AssociationCancellation,
-        _output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
+    fn read(&self, _output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
         Err(StdioProviderError::Unsupported)
     }
 
     fn write(
         &self,
-        _cancellation: &AssociationCancellation,
         _stream: StdioOutputStream,
         _input: &[u8],
     ) -> core::result::Result<usize, StdioProviderError> {

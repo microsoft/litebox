@@ -397,7 +397,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn read(
         &self,
-        _cancellation: &crate::AssociationCancellation,
         h: &super::backend::FileHandle,
         buf: &mut [u8],
         offset: usize,
@@ -413,7 +412,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn write(
         &self,
-        _cancellation: &crate::AssociationCancellation,
         h: &super::backend::FileHandle,
         buf: &[u8],
         offset: usize,

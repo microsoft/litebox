@@ -33,7 +33,6 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::AssociationCancellation;
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -300,13 +299,11 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         lower: &FileHandle,
         upper: &FileHandle,
     ) -> Result<(), OpenError> {
-        // Copy-up runs during open, which is not cancellable.
-        let cancellation = AssociationCancellation::default();
         let mut offset = 0;
         let mut buf = [0u8; 4096];
         loop {
             let count = self.lowers[layer]
-                .read(&cancellation, lower, &mut buf, offset)
+                .read(lower, &mut buf, offset)
                 .map_err(|_| OpenError::Io)?;
             if count == 0 {
                 return Ok(());
@@ -315,7 +312,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             while written < count {
                 let progress = self
                     .upper
-                    .write(&cancellation, upper, &buf[written..count], offset + written)
+                    .write(upper, &buf[written..count], offset + written)
                     .map_err(|_| OpenError::Io)?;
                 if progress == 0 {
                     return Err(OpenError::Io);
@@ -900,15 +897,9 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(entries)
     }
 
-    fn read(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &mut [u8],
-        offset: usize,
-    ) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
-            backend.read(cancellation, handle, buf, offset)
+            backend.read(handle, buf, offset)
         })
     }
 
@@ -918,19 +909,13 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn write(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &[u8],
-        offset: usize,
-    ) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
         let file = h.get_typed::<Self>();
         if let Some(upper) = self.migrated(file) {
-            return self.upper.write(cancellation, &upper, buf, offset);
+            return self.upper.write(&upper, buf, offset);
         }
         match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.write(cancellation, handle, buf, offset),
+            OverlayFileLayer::Upper(handle) => self.upper.write(handle, buf, offset),
             // A writable open copies up first, so a lower-backed handle is read-only.
             OverlayFileLayer::Lower { .. } => Err(WriteError::NotForWriting),
         }

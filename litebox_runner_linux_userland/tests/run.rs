@@ -38,7 +38,6 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 
     fn read(
         &self,
-        _cancellation: &litebox_broker_core::AssociationCancellation,
         _output: &mut [u8],
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
         Err(litebox_broker_core::stdio::StdioProviderError::Unsupported)
@@ -46,7 +45,6 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 
     fn write(
         &self,
-        _cancellation: &litebox_broker_core::AssociationCancellation,
         stream: litebox_broker_core::stdio::StdioOutputStream,
         input: &[u8],
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {

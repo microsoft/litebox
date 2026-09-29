@@ -161,7 +161,6 @@ where
         }
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
-    let stdio = Arc::new(UserlandStdioProvider::new()?);
     let in_mem = InMem::<Platform>::new_initialized(entries);
     let backend = Composer::builder()
         .mount_nestable("/", |allocators| {
@@ -174,7 +173,7 @@ where
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(
                 allocator,
-                stdio,
+                Arc::new(UserlandStdioProvider),
                 Arc::new(UserlandRandomProvider),
             )
         })

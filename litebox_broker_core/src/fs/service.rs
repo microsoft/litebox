@@ -227,7 +227,7 @@ where
 
     fn read(
         &self,
-        process: &BrokerProcess,
+        _session: &BrokerProcess,
         file: &File,
         output: &mut [u8],
         offset: Option<u64>,
@@ -235,14 +235,13 @@ where
         let Ok(offset) = checked_offset(offset, output.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let cancellation = &process.cancellation;
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.read_without_position_update(cancellation, &entry, output, offset)
+            self.read_without_position_update(&entry, output, offset)
                 .map(|(read, _)| read)
         } else {
             drop(entry);
@@ -250,7 +249,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::read(self, cancellation, &mut entry, output, offset)
+            Resolver::read(self, &mut entry, output, offset)
         };
         let read = match read {
             Ok(read) => read,
@@ -264,7 +263,7 @@ where
 
     fn write(
         &self,
-        process: &BrokerProcess,
+        _session: &BrokerProcess,
         file: &File,
         input: &[u8],
         offset: Option<u64>,
@@ -272,14 +271,13 @@ where
         let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
-        let cancellation = &process.cancellation;
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            self.write_without_position_update(cancellation, &entry, input, offset)
+            self.write_without_position_update(&entry, input, offset)
                 .map(|(written, _)| written)
         } else {
             drop(entry);
@@ -287,7 +285,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::write(self, cancellation, &mut entry, input, offset)
+            Resolver::write(self, &mut entry, input, offset)
         };
         let written = match written {
             Ok(written) => written,

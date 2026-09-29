@@ -13,7 +13,6 @@ use super::errors::{
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
-use crate::AssociationCancellation;
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
@@ -97,16 +96,7 @@ pub trait Backend: Send + Sync + Any {
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets
     /// as needed. For files with non-position-based [`SeekBehavior`], such as `stdin`, the resolver
     /// passes zero and the backend should ignore the offset.
-    ///
-    /// Backends that may block must periodically check `cancellation` and fail promptly once it is
-    /// cancelled.
-    fn read(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &mut [u8],
-        offset: usize,
-    ) -> Result<usize, ReadError>;
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError>;
 
     /// Optional performance hook: get static backing data for a file, if available and supported.
     ///
@@ -121,19 +111,13 @@ pub trait Backend: Send + Sync + Any {
 
     /// Write `buf` into the file, based on `offset`, returning the number of bytes written.
     ///
-    /// See [`Self::read`] on internal offset storage for backends and on `cancellation`.
+    /// See [`Self::read`] on internal offset storage for backends.
     // XXX(jayb): I need to think more about how we set up some sort of "intend to write" flag that
     // we can use to obtain the ability to support writes to an `O_APPEND` file, but without making
     // it ugly on the interface side here. It would be very ugly for us to pass in extra flags, or
     // indeed even need to maintain/handle seeking on every backend; mostly we need some sort of
     // nicer locking discipline, but I don't want to block the MVP for this just yet.
-    fn write(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &[u8],
-        offset: usize,
-    ) -> Result<usize, WriteError>;
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError>;
 
     /// Truncate the file to the specified length.
     ///

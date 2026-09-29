@@ -20,7 +20,6 @@ use super::errors::{
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::AssociationCancellation;
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -660,17 +659,11 @@ impl Backend for Composer {
         }
     }
 
-    fn read(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &mut [u8],
-        offset: usize,
-    ) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(cancellation, &h.handle, buf, offset)
+            .read(&h.handle, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -680,17 +673,11 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
-    fn write(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &[u8],
-        offset: usize,
-    ) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(cancellation, &h.handle, buf, offset)
+            .write(&h.handle, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {

@@ -449,26 +449,14 @@ where
             .collect())
     }
 
-    fn read(
-        &self,
-        _cancellation: &crate::AssociationCancellation,
-        h: &FileHandle,
-        buf: &mut [u8],
-        offset: usize,
-    ) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
         Ok(self
             .client
             .read(&h.get_typed::<Self>().fid.fid, offset, buf)?)
     }
 
-    fn write(
-        &self,
-        _cancellation: &crate::AssociationCancellation,
-        h: &FileHandle,
-        buf: &[u8],
-        offset: usize,
-    ) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
         let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
         Ok(self
             .client

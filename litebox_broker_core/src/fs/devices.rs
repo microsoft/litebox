@@ -20,7 +20,6 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::AssociationCancellation;
 use crate::random::RandomProvider;
 use crate::stdio::{StdioOutputStream, StdioProvider, StdioStream};
 
@@ -253,22 +252,13 @@ impl Backend for Devices {
             .collect())
     }
 
-    fn read(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &mut [u8],
-        _offset: usize,
-    ) -> Result<usize, ReadError> {
+    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
             Device::Stdin if buf.is_empty() => Ok(0),
-            Device::Stdin => self
-                .stdio
-                .read(cancellation, buf)
-                .map_err(|_| ReadError::Io),
+            Device::Stdin => self.stdio.read(buf).map_err(|_| ReadError::Io),
             Device::URandom => {
                 self.random.fill(buf).map_err(|_| ReadError::Io)?;
                 Ok(buf.len())
@@ -276,13 +266,7 @@ impl Backend for Devices {
         }
     }
 
-    fn write(
-        &self,
-        cancellation: &AssociationCancellation,
-        h: &FileHandle,
-        buf: &[u8],
-        _offset: usize,
-    ) -> Result<usize, WriteError> {
+    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
             Device::Stdin => return Err(WriteError::NotForWriting),
@@ -293,9 +277,7 @@ impl Backend for Devices {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.stdio
-            .write(cancellation, stream, buf)
-            .map_err(|_| WriteError::Io)
+        self.stdio.write(stream, buf).map_err(|_| WriteError::Io)
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {

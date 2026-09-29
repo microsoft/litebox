@@ -13,7 +13,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::Mutex;
 
 use crate::{
-    AssociationCancellation, BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
+    BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
     fs::{FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
     readiness::ReadinessRegistration,
@@ -109,8 +109,7 @@ impl RandomProvider for FailingRandomProvider {
 
 /// Functional standard-I/O provider for tests.
 ///
-/// Reads drain buffered input, writes and terminal queries are recorded, and
-/// reads and writes fail once their association is cancelled.
+/// Reads drain buffered input, and writes and terminal queries are recorded.
 pub struct TestStdioProvider {
     input: Mutex<VecDeque<u8>>,
     writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
@@ -162,14 +161,7 @@ impl TestStdioProvider {
 }
 
 impl StdioProvider for TestStdioProvider {
-    fn read(
-        &self,
-        cancellation: &AssociationCancellation,
-        output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        if cancellation.is_cancelled() {
-            return Err(StdioProviderError::Closed);
-        }
+    fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         let read = input.len().min(output.len());
         for (destination, source) in output.iter_mut().zip(input.drain(..read)) {
@@ -180,13 +172,9 @@ impl StdioProvider for TestStdioProvider {
 
     fn write(
         &self,
-        cancellation: &AssociationCancellation,
         stream: StdioOutputStream,
         input: &[u8],
     ) -> core::result::Result<usize, StdioProviderError> {
-        if cancellation.is_cancelled() {
-            return Err(StdioProviderError::Closed);
-        }
         self.writes.lock().push((stream, input.to_vec()));
         Ok(input.len())
     }
@@ -226,17 +214,12 @@ impl TerminalOnlyStdioProvider {
 }
 
 impl StdioProvider for TerminalOnlyStdioProvider {
-    fn read(
-        &self,
-        _cancellation: &AssociationCancellation,
-        _output: &mut [u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
+    fn read(&self, _output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
         panic!("terminal-only test stdio must not read standard input")
     }
 
     fn write(
         &self,
-        _cancellation: &AssociationCancellation,
         _stream: StdioOutputStream,
         _input: &[u8],
     ) -> core::result::Result<usize, StdioProviderError> {

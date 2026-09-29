@@ -3005,10 +3005,9 @@ mod tests {
         let duplicated_stdout = source
             .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
             .unwrap();
-        source.request_cancellation();
         assert_eq!(
             crate::fs::write(&source, stdout, b"source", None),
-            Ok(Err(FileError::Io))
+            Ok(Ok(6))
         );
         assert_eq!(
             crate::fs::write(&target, duplicated_stdout, b"target", None),
@@ -3016,7 +3015,10 @@ mod tests {
         );
         assert_eq!(
             stdio_provider.writes(),
-            vec![(StdioOutputStream::Stdout, b"target".to_vec())]
+            vec![
+                (StdioOutputStream::Stdout, b"source".to_vec()),
+                (StdioOutputStream::Stdout, b"target".to_vec()),
+            ]
         );
         assert_eq!(source.close_object_reference(stdout), Ok(()));
         assert_eq!(target.close_object_reference(duplicated_stdout), Ok(()));

@@ -702,21 +702,14 @@ mod tests {
     use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
-    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+    use std::sync::mpsc::{Receiver, sync_channel};
     use std::time::{Duration, Instant};
 
-    use litebox_broker_core::fs::composer::Composer;
-    use litebox_broker_core::fs::devices::Devices;
-    use litebox_broker_core::fs::resolver::Resolver;
-    use litebox_broker_core::stdio::{
-        StdioOutputStream, StdioProvider, StdioProviderError, StdioStream, UnsupportedStdioProvider,
-    };
     use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-    use litebox_broker_core::{AssociationCancellation, ObjectRights, PolicyEngine};
+    use litebox_broker_core::{ObjectRights, PolicyEngine};
     use litebox_broker_host::setup_connection;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::RequestId;
-    use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
     use litebox_broker_protocol::message::{
         BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     };
@@ -742,7 +735,6 @@ mod tests {
     /// Setup deadline used only to bound test I/O; unrelated to any deadline
     /// the userland binary chooses for real runner processes.
     const TEST_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-    const TEST_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
     #[test]
     fn host_errors_preserve_io_categories() {
@@ -877,7 +869,6 @@ mod tests {
     /// publisher that fails immediately cannot race activation.
     fn spawn_dispatch(
         readiness: Arc<ReadinessPublisherRuntime>,
-        stdio_provider: Arc<dyn StdioProvider>,
     ) -> (
         litebox_broker_local::BrokerLocal<UnixControlRingLocalCallChannel>,
         UnixControlRingLocalNotificationChannel,
@@ -889,24 +880,10 @@ mod tests {
         let (outcome_sender, outcome) = sync_channel(1);
         let (start, started) = sync_channel(1);
         let host = std::thread::spawn(move || {
-            let fs = Composer::builder()
-                .mount("/dev", |allocator| {
-                    Devices::new(
-                        allocator,
-                        stdio_provider,
-                        Arc::new(random::UserlandRandomProvider),
-                    )
-                })
-                .build()
-                .unwrap();
             let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_host_guaranteed_rights(
                 ObjectRights::all(),
             ))
             .with_random_provider(Arc::new(random::UserlandRandomProvider))
-            .with_file_service(Arc::new(Resolver::<
-                litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
-                _,
-            >::new(fs)))
             .build()
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -955,69 +932,6 @@ mod tests {
         let (local, notifications, shutdown) = negotiate_local(local_stream);
         start.send(()).unwrap();
         (local, notifications, shutdown, outcome, host)
-    }
-
-    struct BlockingStdioProvider {
-        started: SyncSender<()>,
-    }
-
-    impl BlockingStdioProvider {
-        fn block_until_cancelled(
-            &self,
-            cancellation: &AssociationCancellation,
-        ) -> Result<usize, StdioProviderError> {
-            self.started.send(()).unwrap();
-            while !cancellation.is_cancelled() {
-                std::thread::sleep(TEST_CANCELLATION_POLL_INTERVAL);
-            }
-            Err(StdioProviderError::Closed)
-        }
-    }
-
-    impl StdioProvider for BlockingStdioProvider {
-        fn is_terminal(&self, _stream: StdioStream) -> bool {
-            false
-        }
-
-        fn read(
-            &self,
-            cancellation: &AssociationCancellation,
-            _output: &mut [u8],
-        ) -> Result<usize, StdioProviderError> {
-            self.block_until_cancelled(cancellation)
-        }
-
-        fn write(
-            &self,
-            cancellation: &AssociationCancellation,
-            _stream: StdioOutputStream,
-            _input: &[u8],
-        ) -> Result<usize, StdioProviderError> {
-            self.block_until_cancelled(cancellation)
-        }
-    }
-
-    /// Opens a standard-stream device through the broker file service.
-    fn open_device(
-        local: &litebox_broker_local::BrokerLocal<UnixControlRingLocalCallChannel>,
-        path: &str,
-        access: FileAccessMode,
-    ) -> litebox_broker_protocol::ObjectHandle {
-        local
-            .open_file(
-                SharedBufferSequence::new(
-                    &[SharedBufferSlotIndex(0)],
-                    u32::try_from(path.len()).unwrap(),
-                )
-                .unwrap(),
-                path,
-                FileUser::ROOT,
-                access,
-                FileOpenFlags::NONE,
-                FileMode::default(),
-            )
-            .unwrap()
-            .unwrap()
     }
 
     struct RecordingShutdown(Arc<AtomicBool>);
@@ -1225,7 +1139,7 @@ mod tests {
         let expected = ReadinessFlags::READ | ReadinessFlags::WRITE;
         let readiness = Arc::new(ReadinessPublisherRuntime::new());
         let (local, mut notifications, _shutdown, outcome, host) =
-            spawn_dispatch(Arc::clone(&readiness), Arc::new(UnsupportedStdioProvider));
+            spawn_dispatch(Arc::clone(&readiness));
 
         readiness.publish(HANDLE, expected).unwrap();
 
@@ -1271,77 +1185,13 @@ mod tests {
         // The local half stays connected and idle, so nothing but the panic can
         // release the request reader that owns association termination.
         let (local, _notifications, _shutdown, outcome, host) =
-            spawn_dispatch(Arc::clone(&readiness), Arc::new(UnsupportedStdioProvider));
+            spawn_dispatch(Arc::clone(&readiness));
         let error = outcome
             .recv_timeout(TEST_SETUP_TIMEOUT)
             .expect("a panicking publisher must end dispatch")
             .expect_err("a panicking publisher must fail the association");
         assert_eq!(error.to_string(), "broker readiness publisher panicked");
         drop(local);
-        host.join().unwrap();
-    }
-
-    #[test]
-    fn association_teardown_cancels_a_blocked_stdin_read() {
-        let readiness = Arc::new(ReadinessPublisherRuntime::new());
-        let (started_sender, started_receiver) = sync_channel(1);
-        let provider = Arc::new(BlockingStdioProvider {
-            started: started_sender,
-        });
-        let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
-        let stdin = open_device(&local, "/dev/stdin", FileAccessMode::ReadOnly);
-        let reader = std::thread::spawn(move || {
-            local.read_file(
-                stdin,
-                SharedBufferSequence::new(&[SharedBufferSlotIndex(1)], 1).unwrap(),
-                &mut [0],
-                None,
-            )
-        });
-        started_receiver
-            .recv_timeout(TEST_SETUP_TIMEOUT)
-            .expect("broker stdin provider did not start reading");
-
-        shutdown.shutdown().unwrap();
-        drop(notifications);
-
-        let dispatch_result = outcome
-            .recv_timeout(TEST_SETUP_TIMEOUT)
-            .expect("association teardown did not cancel the stdin read");
-        assert!(dispatch_result.is_err());
-        assert!(!matches!(reader.join().unwrap(), Ok(Ok(_))));
-        host.join().unwrap();
-    }
-
-    #[test]
-    fn association_teardown_cancels_a_blocked_stdout_write() {
-        let readiness = Arc::new(ReadinessPublisherRuntime::new());
-        let (started_sender, started_receiver) = sync_channel(1);
-        let provider = Arc::new(BlockingStdioProvider {
-            started: started_sender,
-        });
-        let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
-        let stdout = open_device(&local, "/dev/stdout", FileAccessMode::WriteOnly);
-        let writer = std::thread::spawn(move || {
-            local.write_file(
-                stdout,
-                SharedBufferSequence::new(&[SharedBufferSlotIndex(1)], 1).unwrap(),
-                b"x",
-                None,
-            )
-        });
-        started_receiver
-            .recv_timeout(TEST_SETUP_TIMEOUT)
-            .expect("broker stdout provider did not start writing");
-
-        shutdown.shutdown().unwrap();
-        drop(notifications);
-
-        let dispatch_result = outcome
-            .recv_timeout(TEST_SETUP_TIMEOUT)
-            .expect("association teardown did not cancel the stdout write");
-        assert!(dispatch_result.is_err());
-        assert!(!matches!(writer.join().unwrap(), Ok(Ok(_))));
         host.join().unwrap();
     }
 }

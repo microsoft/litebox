@@ -15,7 +15,6 @@ use super::overlay::Overlay;
 use super::resolver::{Resolver, ResolverEntry};
 use super::tar_ro::TarRo;
 use super::{FileType, Mode, OFlags, SeekWhence, UserInfo};
-use crate::AssociationCancellation;
 use crate::test_platform::TestPlatform;
 
 const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
@@ -24,11 +23,6 @@ const USER: UserInfo = UserInfo {
     group: 1000,
 };
 const ROOT: UserInfo = UserInfo::ROOT;
-
-/// Cancellation state for I/O that is never cancelled.
-fn uncancelled() -> AssociationCancellation {
-    AssociationCancellation::default()
-}
 
 fn in_mem_fs() -> Resolver<TestPlatform, InMem<TestPlatform>> {
     Resolver::new(InMem::<TestPlatform>::new(InodeAllocator::standalone()))
@@ -53,7 +47,7 @@ fn overlay_fs(
 mod in_mem {
     use super::{
         FileType, InMem, Mode, OFlags, ROOT, Resolver, ResolverEntry, SeekWhence, TestPlatform,
-        USER, UserInfo, in_mem_fs, uncancelled,
+        USER, UserInfo, in_mem_fs,
     };
     use crate::fs::errors::{
         ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError, RmdirError,
@@ -106,7 +100,7 @@ mod in_mem {
             .open(ROOT, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let data = b"Hello, world!";
-        fs.write(&uncancelled(), &mut fd, data, None)
+        fs.write(&mut fd, data, None)
             .expect("Failed to write to file");
         drop(fd);
 
@@ -116,7 +110,7 @@ mod in_mem {
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(bytes_read, data.len());
         assert_eq!(&buffer, data);
@@ -131,12 +125,11 @@ mod in_mem {
         let mut fd = fs
             .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::WUSR)
             .expect("Failed to create write-only file");
-        fs.write(&uncancelled(), &mut fd, b"x", None)
-            .expect("Failed to write file");
+        fs.write(&mut fd, b"x", None).expect("Failed to write file");
 
         let mut buffer = [0];
         assert!(matches!(
-            fs.read(&uncancelled(), &mut fd, &mut buffer, None),
+            fs.read(&mut fd, &mut buffer, None),
             Err(ReadError::NotForReading)
         ));
         drop(fd);
@@ -156,8 +149,7 @@ mod in_mem {
         let mut fd = fs
             .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::empty())
             .expect("Failed to create zero-mode file");
-        fs.write(&uncancelled(), &mut fd, b"x", None)
-            .expect("Failed to write file");
+        fs.write(&mut fd, b"x", None).expect("Failed to write file");
         drop(fd);
 
         let status = fs.file_status(USER, path).expect("Failed to stat file");
@@ -216,9 +208,9 @@ mod in_mem {
             .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let data = b"Hello, world!";
-        fs.write(&uncancelled(), &mut fd, data, None)
+        fs.write(&mut fd, data, None)
             .expect("Failed to write to file");
-        fs.write(&uncancelled(), &mut fd, &data[2..], Some(2))
+        fs.write(&mut fd, &data[2..], Some(2))
             .expect("Failed to write to file with offset");
         drop(fd);
 
@@ -228,10 +220,10 @@ mod in_mem {
             .expect("Failed to open file");
         let mut buffer = vec![0; data.len()];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         let bytes_read2 = fs
-            .read(&uncancelled(), &mut fd, &mut buffer[2..], Some(2))
+            .read(&mut fd, &mut buffer[2..], Some(2))
             .expect("Failed to read from file with offset");
         assert_eq!(bytes_read, data.len());
         assert_eq!(bytes_read2, data.len() - 2);
@@ -578,7 +570,7 @@ mod in_mem {
             .expect("Failed to create new file with O_CREAT | O_EXCL");
 
         // Write some data to verify file was created
-        fs.write(&uncancelled(), &mut fd, b"test data", None)
+        fs.write(&mut fd, b"test data", None)
             .expect("Failed to write to new file");
         drop(fd);
 
@@ -606,7 +598,7 @@ mod in_mem {
         // Verify we can read the data
         let mut buffer = vec![0; 9];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test data");
         drop(fd);
@@ -642,7 +634,7 @@ mod in_mem {
             .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
         let initial_data = b"Hello, world! This is initial content.";
-        fs.write(&uncancelled(), &mut fd, initial_data, None)
+        fs.write(&mut fd, initial_data, None)
             .expect("Failed to write initial content");
         drop(fd);
 
@@ -652,7 +644,7 @@ mod in_mem {
             .expect("Failed to open file for reading");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read initial content");
         assert_eq!(bytes_read, initial_data.len());
         assert_eq!(&buffer, initial_data);
@@ -665,7 +657,7 @@ mod in_mem {
 
         // Write new content to the truncated file
         let new_data = b"New content";
-        fs.write(&uncancelled(), &mut fd, new_data, None)
+        fs.write(&mut fd, new_data, None)
             .expect("Failed to write new content");
         drop(fd);
 
@@ -675,7 +667,7 @@ mod in_mem {
             .expect("Failed to open file for verification");
         let mut buffer = vec![0; initial_data.len()];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read after truncation");
         assert_eq!(bytes_read, new_data.len());
         assert_eq!(&buffer[..bytes_read], new_data);
@@ -685,7 +677,7 @@ mod in_mem {
         let mut fd = fs
             .open(USER, path, OFlags::WRONLY, Mode::empty())
             .expect("Failed to open file for writing");
-        fs.write(&uncancelled(), &mut fd, b"More content to truncate", None)
+        fs.write(&mut fd, b"More content to truncate", None)
             .expect("Failed to write more content");
         drop(fd);
 
@@ -696,19 +688,19 @@ mod in_mem {
         // File should be empty after truncation
         let mut buffer = vec![0; 100];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from truncated file");
         assert_eq!(bytes_read, 0);
 
         // Write and read back to verify it works
         let test_data = b"After RDWR truncation";
-        fs.write(&uncancelled(), &mut fd, test_data, None)
+        fs.write(&mut fd, test_data, None)
             .expect("Failed to write after RDWR truncation");
 
         fs.seek(&mut fd, 0, SeekWhence::RelativeToBeginning)
             .expect("Failed to seek to beginning");
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read after write");
         assert_eq!(bytes_read, test_data.len());
         assert_eq!(&buffer[..bytes_read], test_data);
@@ -730,7 +722,7 @@ mod in_mem {
             .expect("open failed");
 
         // 1. First positional write; position should advance by 6.
-        fs.write(&uncancelled(), &mut fd, b"abcdef", None)
+        fs.write(&mut fd, b"abcdef", None)
             .expect("first write failed");
 
         // 2. Rewind to beginning.
@@ -738,8 +730,7 @@ mod in_mem {
             .expect("seek failed");
 
         // 3. Another positional write should write from start
-        fs.write(&uncancelled(), &mut fd, b"X", None)
-            .expect("overwrite failed");
+        fs.write(&mut fd, b"X", None).expect("overwrite failed");
 
         // The file offset should now be at 1.
         assert_eq!(
@@ -752,21 +743,17 @@ mod in_mem {
         fs.seek(&mut fd, 0, SeekWhence::RelativeToBeginning)
             .expect("seek failed");
         let mut buf = [0u8; 16];
-        let n = fs
-            .read(&uncancelled(), &mut fd, &mut buf, None)
-            .expect("read failed");
+        let n = fs.read(&mut fd, &mut buf, None).expect("read failed");
         assert_eq!(n, 6, "file length should be 6 after writes");
         assert_eq!(&buf[..n], b"Xbcdef", "file content mismatch");
 
         // Extra: another append to verify continued correct advancement.
-        fs.write(&uncancelled(), &mut fd, b"12", None)
+        fs.write(&mut fd, b"12", None)
             .expect("second append failed");
         fs.seek(&mut fd, 0, SeekWhence::RelativeToBeginning)
             .expect("seek 2 failed");
         let mut buf2 = [0u8; 16];
-        let n2 = fs
-            .read(&uncancelled(), &mut fd, &mut buf2, None)
-            .expect("read 2 failed");
+        let n2 = fs.read(&mut fd, &mut buf2, None).expect("read 2 failed");
         assert_eq!(n2, 8);
         assert_eq!(&buf2[..n2], b"Xbcdef12");
     }
@@ -776,7 +763,7 @@ mod in_mem {
         let mut fd = fs
             .open(USER, path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
             .expect("Failed to create file");
-        fs.write(&uncancelled(), &mut fd, data, None)
+        fs.write(&mut fd, data, None)
             .expect("Failed to write initial content");
     }
 
@@ -784,7 +771,7 @@ mod in_mem {
     fn read_all(fs: &InMemFs, fd: &mut InMemEntry) -> Vec<u8> {
         let mut buffer = vec![0; 64];
         let bytes_read = fs
-            .read(&uncancelled(), fd, &mut buffer, None)
+            .read(fd, &mut buffer, None)
             .expect("Failed to read from file");
         buffer.truncate(bytes_read);
         buffer
@@ -803,7 +790,7 @@ mod in_mem {
         let mut fd = fs
             .open(USER, path, OFlags::WRONLY | OFlags::APPEND, Mode::empty())
             .expect("Failed to open file with O_APPEND");
-        fs.write(&uncancelled(), &mut fd, b" World", None)
+        fs.write(&mut fd, b" World", None)
             .expect("Failed to append data");
         drop(fd);
 
@@ -833,7 +820,7 @@ mod in_mem {
             .expect("Failed to seek to beginning");
 
         // Write some data - it should go to the end despite the seek
-        fs.write(&uncancelled(), &mut fd, b"123", None)
+        fs.write(&mut fd, b"123", None)
             .expect("Failed to write after seek");
         drop(fd);
 
@@ -866,7 +853,7 @@ mod in_mem {
             .expect("Seek failed");
 
         // Write should append to end, ignoring the current position
-        fs.write(&uncancelled(), &mut fd, b" World", None)
+        fs.write(&mut fd, b" World", None)
             .expect("Failed to write with append");
 
         // Seek to beginning and read the whole file
@@ -890,8 +877,7 @@ mod in_mem {
             .expect("Failed to open file with O_APPEND");
 
         // pwrite (write with explicit offset) should ignore O_APPEND per POSIX
-        fs.write(&uncancelled(), &mut fd, b"XX", Some(2))
-            .expect("Failed to pwrite");
+        fs.write(&mut fd, b"XX", Some(2)).expect("Failed to pwrite");
         drop(fd);
 
         // Verify the file content: XX should be at position 2, not appended
@@ -921,9 +907,9 @@ mod in_mem {
             .expect("Failed to open file with O_TRUNC | O_APPEND");
 
         // File should be truncated, then write should append (to empty file)
-        fs.write(&uncancelled(), &mut fd, b"New", None)
+        fs.write(&mut fd, b"New", None)
             .expect("Failed to write after truncation");
-        fs.write(&uncancelled(), &mut fd, b"Content", None)
+        fs.write(&mut fd, b"Content", None)
             .expect("Failed to write second chunk");
         drop(fd);
 
@@ -936,7 +922,7 @@ mod in_mem {
 }
 
 mod tar_ro {
-    use super::{FileType, Mode, OFlags, TEST_TAR_FILE, USER, tar_ro_fs, uncancelled};
+    use super::{FileType, Mode, OFlags, TEST_TAR_FILE, USER, tar_ro_fs};
     use crate::fs::errors::{OpenError, PathError, ReadDirError};
     use alloc::vec;
     use alloc::vec::Vec;
@@ -949,7 +935,7 @@ mod tar_ro {
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
         drop(fd);
@@ -959,7 +945,7 @@ mod tar_ro {
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
     }
@@ -1095,7 +1081,7 @@ mod tar_ro {
 mod overlay {
     use super::{
         FileType, Mode, OFlags, Overlay, Resolver, SeekWhence, TEST_TAR_FILE, TestPlatform, USER,
-        UserInfo, uncancelled,
+        UserInfo,
     };
     use crate::fs::errors::{FileStatusError, OpenError, PathError, RmdirError};
     use crate::fs::in_mem::{InMem, InitialNode};
@@ -1139,7 +1125,7 @@ mod overlay {
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
         let stat = fs.handle_status(&fd).expect("Failed to handle stat");
@@ -1156,7 +1142,7 @@ mod overlay {
             .expect("Failed to open file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test bar baz\n");
         let stat = fs.handle_status(&fd).expect("Failed to handle stat");
@@ -1190,17 +1176,17 @@ mod overlay {
         let mut buffer = vec![0; 1024];
 
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd1, &mut buffer, None)
+            .read(&mut fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"testfoo\n");
 
-        fs.write(&uncancelled(), &mut fd2, b"share", None)
+        fs.write(&mut fd2, b"share", None)
             .expect("Failed to write to file");
 
         fs.seek(&mut fd1, 0, SeekWhence::RelativeToBeginning)
             .expect("Failed to seek to start");
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd1, &mut buffer, None)
+            .read(&mut fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"shareoo\n");
     }
@@ -1220,15 +1206,15 @@ mod overlay {
         let mut buffer = vec![0; 4];
 
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd1, &mut buffer, None)
+            .read(&mut fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test");
 
-        fs.write(&uncancelled(), &mut fd2, b"share", None)
+        fs.write(&mut fd2, b"share", None)
             .expect("Failed to write to file");
 
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd1, &mut buffer, None)
+            .read(&mut fd1, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"eoo\n");
     }
@@ -1244,7 +1230,7 @@ mod overlay {
 
         // The file exists, and is readable
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test");
 
@@ -1253,7 +1239,7 @@ mod overlay {
 
         // This should not really impact the readability; file is fine.
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"foo\n");
 
@@ -1360,7 +1346,7 @@ mod overlay {
 
         // The file exists, and is readable
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from file");
         assert_eq!(&buffer[..bytes_read], b"test");
     }
@@ -1477,7 +1463,7 @@ mod overlay {
             )
             .expect("Failed to create new file with O_CREAT | O_EXCL");
 
-        fs.write(&uncancelled(), &mut fd, b"overlay test", None)
+        fs.write(&mut fd, b"overlay test", None)
             .expect("Failed to write to new file");
         drop(fd);
 
@@ -1519,7 +1505,7 @@ mod overlay {
             )
             .expect("Failed to create file over tombstone with O_CREAT | O_EXCL");
 
-        fs.write(&uncancelled(), &mut fd, b"new foo content", None)
+        fs.write(&mut fd, b"new foo content", None)
             .expect("Failed to write to recreated file");
         drop(fd);
 
@@ -1529,7 +1515,7 @@ mod overlay {
             .expect("Failed to open recreated file");
         let mut buffer = vec![0; 15];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from recreated file");
         assert_eq!(&buffer[..bytes_read], b"new foo content");
         drop(fd);
@@ -1544,7 +1530,7 @@ mod overlay {
                 Mode::RWXU,
             )
             .expect("Failed to create upper layer file");
-        fs.write(&uncancelled(), &mut fd, b"upper content", None)
+        fs.write(&mut fd, b"upper content", None)
             .expect("Failed to write to upper layer file");
         drop(fd);
 
@@ -1601,7 +1587,7 @@ mod overlay {
 
         // Write data to the file
         let data = b"Hello from nested file!";
-        fs.write(&uncancelled(), &mut fd, data, None)
+        fs.write(&mut fd, data, None)
             .expect("Failed to write to bar/test");
         drop(fd);
 
@@ -1611,7 +1597,7 @@ mod overlay {
             .expect("Failed to open bar/test for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from bar/test");
         assert_eq!(&buffer[..bytes_read], data);
         drop(fd);
@@ -1635,7 +1621,7 @@ mod overlay {
 
         // Write new data to the file (overwriting existing content)
         let data = b"Modified content!";
-        fs.write(&uncancelled(), &mut fd, data, None)
+        fs.write(&mut fd, data, None)
             .expect("Failed to write to bar/baz");
         drop(fd);
 
@@ -1645,7 +1631,7 @@ mod overlay {
             .expect("Failed to open bar/baz for reading");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read from bar/baz");
 
         assert_eq!(&buffer[..bytes_read], data);
@@ -1670,12 +1656,12 @@ mod overlay {
         // File should be truncated (empty)
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read file");
         assert_eq!(bytes_read, 0);
 
         // Write new content
-        fs.write(&uncancelled(), &mut fd, b"new content", None)
+        fs.write(&mut fd, b"new content", None)
             .expect("Failed to write to file");
         drop(fd);
 
@@ -1685,7 +1671,7 @@ mod overlay {
             .expect("Failed to reopen file");
         let mut buffer = vec![0; 1024];
         let bytes_read = fs
-            .read(&uncancelled(), &mut fd, &mut buffer, None)
+            .read(&mut fd, &mut buffer, None)
             .expect("Failed to read file");
         assert_eq!(&buffer[..bytes_read], b"new content");
     }
@@ -1800,7 +1786,7 @@ mod overlay {
             let mut fd = fs
                 .open(USER, "foo", OFlags::WRONLY, Mode::RWXU)
                 .expect("Failed to open file for writing");
-            fs.write(&uncancelled(), &mut fd, b"x", None)
+            fs.write(&mut fd, b"x", None)
                 .expect("Failed to write to file");
             drop(fd);
             let _ = tx.send(());
@@ -1812,11 +1798,10 @@ mod overlay {
 }
 
 mod devices {
-    use super::{Mode, OFlags, Resolver, TestPlatform, USER, uncancelled};
-    use crate::AssociationCancellation;
+    use super::{Mode, OFlags, Resolver, TestPlatform, USER};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
-    use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
+    use crate::fs::errors::{OpenError, PathError};
     use crate::random::TestRandomProvider;
     use crate::stdio::{StdioOutputStream, StdioStream};
     use crate::test_support::TestStdioProvider;
@@ -1843,21 +1828,12 @@ mod devices {
         let mut stdout = fs
             .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        assert!(matches!(
-            fs.write(&uncancelled(), &mut stdout, b"", None),
-            Ok(0)
-        ));
-        assert!(matches!(
-            fs.write(&uncancelled(), &mut stdout, b"out", None),
-            Ok(3)
-        ));
+        assert!(matches!(fs.write(&mut stdout, b"", None), Ok(0)));
+        assert!(matches!(fs.write(&mut stdout, b"out", None), Ok(3)));
         let mut stderr = fs
             .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
-        assert!(matches!(
-            fs.write(&uncancelled(), &mut stderr, b"err", None),
-            Ok(3)
-        ));
+        assert!(matches!(fs.write(&mut stderr, b"err", None), Ok(3)));
         assert_eq!(
             provider.writes(),
             vec![
@@ -1871,19 +1847,13 @@ mod devices {
             .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
         let mut buffer = [0; 4];
-        assert!(matches!(
-            fs.read(&uncancelled(), &mut stdin, &mut buffer, None),
-            Ok(2)
-        ));
+        assert!(matches!(fs.read(&mut stdin, &mut buffer, None), Ok(2)));
         assert_eq!(&buffer[..2], b"in");
 
         let mut urandom = fs
             .open(USER, "/dev/urandom", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/urandom");
-        assert!(matches!(
-            fs.read(&uncancelled(), &mut urandom, &mut buffer, None),
-            Ok(4)
-        ));
+        assert!(matches!(fs.read(&mut urandom, &mut buffer, None), Ok(4)));
         assert_eq!(buffer, [0x5a; 4]);
 
         assert!(fs.is_terminal(&stdout));
@@ -1894,38 +1864,6 @@ mod devices {
             .open(USER, "/dev/stdout", OFlags::PATH, Mode::empty())
             .expect("Failed to open /dev/stdout with O_PATH");
         assert!(!fs.is_terminal(&stdout_path));
-    }
-
-    /// Stdio transfers pass the caller's cancellation state to the provider.
-    #[test]
-    fn stdio_fails_once_cancelled() {
-        let provider = Arc::new(TestStdioProvider::default());
-        provider.push_input(b"in");
-        let fs = devices_fs(provider.clone());
-        let cancelled = AssociationCancellation::default();
-        cancelled.cancel();
-
-        let mut stdout = fs
-            .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
-            .expect("Failed to open /dev/stdout");
-        assert!(matches!(
-            fs.write(&cancelled, &mut stdout, b"out", None),
-            Err(WriteError::Io)
-        ));
-        assert!(provider.writes().is_empty());
-
-        let mut stdin = fs
-            .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
-            .expect("Failed to open /dev/stdin");
-        let mut buffer = vec![0; 2];
-        assert!(matches!(
-            fs.read(&cancelled, &mut stdin, &mut buffer, None),
-            Err(ReadError::Io)
-        ));
-        assert!(matches!(
-            fs.read(&uncancelled(), &mut stdin, &mut buffer, None),
-            Ok(2)
-        ));
     }
 
     #[test]
@@ -1941,7 +1879,7 @@ mod devices {
 }
 
 mod composed {
-    use super::{InMem, Mode, OFlags, Resolver, TestPlatform, USER, UserInfo, uncancelled};
+    use super::{InMem, Mode, OFlags, Resolver, TestPlatform, USER, UserInfo};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
     use crate::fs::in_mem::InitialNode;
@@ -1979,10 +1917,7 @@ mod composed {
         let mut fd_stdout = fs
             .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        assert!(matches!(
-            fs.write(&uncancelled(), &mut fd_stdout, b"composed", None),
-            Ok(8)
-        ));
+        assert!(matches!(fs.write(&mut fd_stdout, b"composed", None), Ok(8)));
         assert_eq!(
             provider.writes(),
             vec![(StdioOutputStream::Stdout, b"composed".to_vec())]
@@ -1993,10 +1928,7 @@ mod composed {
             .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
         let mut buffer = vec![0; 1024];
-        assert!(matches!(
-            fs.read(&uncancelled(), &mut fd_stdin, &mut buffer, None),
-            Ok(5)
-        ));
+        assert!(matches!(fs.read(&mut fd_stdin, &mut buffer, None), Ok(5)));
         assert_eq!(&buffer[..5], b"input");
     }
 
