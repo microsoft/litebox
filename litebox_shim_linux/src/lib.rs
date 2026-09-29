@@ -603,9 +603,9 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         resolve_fd!(Network<Platform>, Network);
         resolve_fd!(Pipes<Platform>, Pipes);
         resolve_fd!(syscalls::eventfd::EventfdSubsystem<Platform>, Eventfd);
-        resolve_fd!(syscalls::timerfd::TimerfdSubsystem<Platform>, Timerfd);
         resolve_fd!(syscalls::epoll::EpollSubsystem<Platform>, Epoll);
         resolve_fd!(syscalls::unix::UnixSocketSubsystem<Platform>, Unix);
+        resolve_fd!(syscalls::timerfd::TimerfdSubsystem<Platform>, Timerfd);
         Err(Errno::EBADF)
     }
 }

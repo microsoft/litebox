@@ -316,9 +316,9 @@ pub(crate) enum AnyTypedFd<Platform: ShimPlatform> {
     Network(alloc::sync::Arc<TypedFd<litebox::net::Network<Platform>>>),
     Pipes(alloc::sync::Arc<TypedFd<litebox::pipes::Pipes<Platform>>>),
     Eventfd(alloc::sync::Arc<TypedFd<super::eventfd::EventfdSubsystem<Platform>>>),
-    Timerfd(alloc::sync::Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
     Epoll(alloc::sync::Arc<TypedFd<super::epoll::EpollSubsystem<Platform>>>),
     Unix(alloc::sync::Arc<TypedFd<super::unix::UnixSocketSubsystem<Platform>>>),
+    Timerfd(alloc::sync::Arc<TypedFd<super::timerfd::TimerfdSubsystem<Platform>>>),
 }
 
 /// Apply one subsystem-generic expression to whichever subsystem an [`AnyTypedFd`] holds.
@@ -331,9 +331,9 @@ macro_rules! on_any_fd {
             AnyTypedFd::Network($fd) => $body,
             AnyTypedFd::Pipes($fd) => $body,
             AnyTypedFd::Eventfd($fd) => $body,
-            AnyTypedFd::Timerfd($fd) => $body,
             AnyTypedFd::Epoll($fd) => $body,
             AnyTypedFd::Unix($fd) => $body,
+            AnyTypedFd::Timerfd($fd) => $body,
         }
     };
 }
@@ -346,9 +346,9 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
             Self::Network(_) => "net",
             Self::Pipes(_) => "pipes",
             Self::Eventfd(_) => "eventfd",
-            Self::Timerfd(_) => "timerfd",
             Self::Epoll(_) => "epoll",
             Self::Unix(_) => "unix",
+            Self::Timerfd(_) => "timerfd",
         }
     }
 
@@ -373,18 +373,18 @@ impl<Platform: ShimPlatform> AnyTypedFd<Platform> {
         net: impl FnOnce(&TypedFd<litebox::net::Network<Platform>>) -> R,
         pipes: impl FnOnce(&TypedFd<litebox::pipes::Pipes<Platform>>) -> R,
         eventfd: impl FnOnce(&TypedFd<super::eventfd::EventfdSubsystem<Platform>>) -> R,
-        timerfd: impl FnOnce(&TypedFd<super::timerfd::TimerfdSubsystem<Platform>>) -> R,
         epoll: impl FnOnce(&TypedFd<super::epoll::EpollSubsystem<Platform>>) -> R,
         unix: impl FnOnce(&TypedFd<super::unix::UnixSocketSubsystem<Platform>>) -> R,
+        timerfd: impl FnOnce(&TypedFd<super::timerfd::TimerfdSubsystem<Platform>>) -> R,
     ) -> R {
         match self {
             Self::Fs(fd) => fs(fd),
             Self::Network(fd) => net(fd),
             Self::Pipes(fd) => pipes(fd),
             Self::Eventfd(fd) => eventfd(fd),
-            Self::Timerfd(fd) => timerfd(fd),
             Self::Epoll(fd) => epoll(fd),
             Self::Unix(fd) => unix(fd),
+            Self::Timerfd(fd) => timerfd(fd),
         }
     }
 }
@@ -878,24 +878,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     Ok(size_of::<u64>())
                 })
             },
-            |fd| {
-                espipe_for_non_seekable_offset(offset)?;
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(fd)
-                    .ok_or(Errno::EBADF)?;
-                handle.with_entry(|file| {
-                    let buf = &mut buf.borrow_mut();
-                    if buf.len() < size_of::<u64>() {
-                        return Err(Errno::EINVAL);
-                    }
-                    let expirations = file.read(&self.wait_cx())?;
-                    buf[..size_of::<u64>()].copy_from_slice(&expirations.to_ne_bytes());
-                    Ok(size_of::<u64>())
-                })
-            },
             |_fd| Err(Errno::EINVAL),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
@@ -913,6 +895,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         None,
                         None,
                     )
+                })
+            },
+            |fd| {
+                espipe_for_non_seekable_offset(offset)?;
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|file| {
+                    let buf = &mut buf.borrow_mut();
+                    if buf.len() < size_of::<u64>() {
+                        return Err(Errno::EINVAL);
+                    }
+                    let expirations = file.read(&self.wait_cx())?;
+                    buf[..size_of::<u64>()].copy_from_slice(&expirations.to_ne_bytes());
+                    Ok(size_of::<u64>())
                 })
             },
         );
@@ -983,7 +983,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 })
             },
             |_fd| Err(Errno::EINVAL),
-            |_fd| Err(Errno::EINVAL),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
                 let handle = self
@@ -996,6 +995,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
+            |_fd| Err(Errno::EINVAL),
         );
         if let Err(Errno::EPIPE) = result
             && !is_inet_datagram.get()
@@ -1241,10 +1241,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 {
                     AnyTypedFd::Eventfd(fd)
                 } else if let Ok(fd) =
-                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
-                {
-                    AnyTypedFd::Timerfd(fd)
-                } else if let Ok(fd) =
                     rds.fd_consume_raw_integer::<super::epoll::EpollSubsystem<Platform>>(raw_fd)
                 {
                     AnyTypedFd::Epoll(fd)
@@ -1252,6 +1248,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     rds.fd_consume_raw_integer::<super::unix::UnixSocketSubsystem<Platform>>(raw_fd)
                 {
                     AnyTypedFd::Unix(fd)
+                } else if let Ok(fd) =
+                    rds.fd_consume_raw_integer::<super::timerfd::TimerfdSubsystem<Platform>>(raw_fd)
+                {
+                    AnyTypedFd::Timerfd(fd)
                 } else {
                     unreachable!("all subsystems covered")
                 }
@@ -1286,15 +1286,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
-            AnyTypedFd::Timerfd(fd) => {
-                self.remove_and_drop_descriptor(&fd);
-                Ok(())
-            }
             AnyTypedFd::Epoll(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
             AnyTypedFd::Unix(fd) => {
+                self.remove_and_drop_descriptor(&fd);
+                Ok(())
+            }
+            AnyTypedFd::Timerfd(fd) => {
                 self.remove_and_drop_descriptor(&fd);
                 Ok(())
             }
@@ -1891,9 +1891,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 )))
             },
             |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
-            |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
             |_fd| Ok(T::from(synthetic(rw_user_mode, 0))),
             |_fd| Ok(T::from(synthetic(socket_mode, 4096))),
+            |_fd| Ok(T::from(synthetic(rw_user_mode, 4096))),
         )
     }
 
@@ -2143,11 +2143,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         toggle_flags!(fd);
                         Ok(())
                     },
+                    |_fd| todo!("epoll"),
                     |fd| {
                         toggle_flags!(fd);
                         Ok(())
                     },
-                    |_fd| todo!("epoll"),
                     |fd| {
                         toggle_flags!(fd);
                         Ok(())
