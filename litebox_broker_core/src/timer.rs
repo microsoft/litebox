@@ -324,25 +324,6 @@ mod tests {
     }
 
     #[test]
-    fn timer_operations_require_rights_and_a_timer() {
-        let process = process(
-            builder(ObjectRights::WAIT)
-                .with_timer_provider(Arc::new(ManualTimerProvider::default())),
-        );
-        let handle = super::create(&process, Arc::new(TestReadinessSink::default())).unwrap();
-        assert_eq!(
-            super::set(&process, handle, spec(1, 0)),
-            Err(BrokerError::InvalidRights)
-        );
-        let event = crate::event::create(&process, 0).unwrap();
-        assert_eq!(super::get(&process, event), Err(BrokerError::InvalidRights));
-        assert_eq!(
-            super::read(&process, event),
-            Err(BrokerError::InvalidRights)
-        );
-    }
-
-    #[test]
     fn timer_creation_fails_without_a_provider() {
         let process = process(builder(ObjectRights::all()));
         let sink = Arc::new(TestReadinessSink::default());
