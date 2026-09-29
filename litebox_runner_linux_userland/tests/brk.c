@@ -14,6 +14,11 @@ static void test_shrink_within_current_page(void) {
     TEST_ASSERT(initial != 0, "query initial program break");
     TEST_ASSERT(page_size > 0, "query page size");
 
+    TEST_ASSERT(raw_brk(1) == initial,
+                "reject program break below initial break");
+    TEST_ASSERT(raw_brk(0) == initial,
+                "preserve initial break after rejected shrink");
+
     uintptr_t page_mask = (uintptr_t)page_size - 1;
     uintptr_t grown = ((initial + page_mask) & ~page_mask) + (uintptr_t)page_size + 123;
     uintptr_t requested = grown - 64;
