@@ -35,7 +35,6 @@ use crate::{
     FileFd, GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
     syscalls::net::{SocketOptionValue, SocketOptions, socket_intr_errno},
-    wait::wait_errno,
 };
 
 pub(crate) struct UnixSocketSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
@@ -811,8 +810,7 @@ impl<Platform: ShimPlatform> UnixStream<Platform> {
         addr: Option<UnixSocketAddr>,
     ) -> Result<usize, Errno> {
         let mut msg = Some(Message { data: buf.to_vec() });
-        let wait_cx = cx.with_timeout(timeout);
-        wait_cx
+        cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
                 Events::OUT,
@@ -842,7 +840,7 @@ impl<Platform: ShimPlatform> UnixStream<Platform> {
                     })
                 },
             )
-            .map_err(|error| wait_errno(&wait_cx, error))
+            .map_err(|error| socket_intr_errno(timeout, error.into()))
     }
 
     fn recvfrom(
@@ -854,8 +852,8 @@ impl<Platform: ShimPlatform> UnixStream<Platform> {
         peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        let wait_cx = cx.with_timeout(timeout);
-        let res = wait_cx
+        let res = cx
+            .with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
                 Events::IN,
@@ -880,7 +878,7 @@ impl<Platform: ShimPlatform> UnixStream<Platform> {
                     })
                 },
             )
-            .map_err(|error| wait_errno(&wait_cx, error));
+            .map_err(|error| socket_intr_errno(timeout, error.into()));
         match res {
             // Linux SO_RCVTIMEO expiry surfaces as `EAGAIN`, not `ETIMEDOUT`
             Err(Errno::ETIMEDOUT) => Err(Errno::EAGAIN),
@@ -970,8 +968,7 @@ impl<Platform: ShimPlatform> WriteEnd<Platform, DatagramMessage> {
         is_nonblocking: bool,
     ) -> Result<(), Errno> {
         let mut msg = Some(msg);
-        let wait_cx = cx.with_timeout(timeout);
-        wait_cx
+        cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
                 Events::OUT,
@@ -988,7 +985,7 @@ impl<Platform: ShimPlatform> WriteEnd<Platform, DatagramMessage> {
                     Err((_, err)) => Err(TryOpError::Other(err)),
                 },
             )
-            .map_err(|error| wait_errno(&wait_cx, error))
+            .map_err(|error| socket_intr_errno(timeout, error.into()))
     }
 }
 impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
@@ -1206,8 +1203,8 @@ impl<Platform: ShimPlatform> UnixDatagram<Platform> {
         peek: bool,
         mut source_addr: Option<&mut Option<UnixSocketAddr>>,
     ) -> Result<usize, Errno> {
-        let wait_cx = cx.with_timeout(timeout);
-        let res = wait_cx
+        let res = cx
+            .with_timeout(timeout)
             .wait_on_events(
                 is_nonblocking,
                 Events::IN,
@@ -1223,7 +1220,7 @@ impl<Platform: ShimPlatform> UnixDatagram<Platform> {
                     recv_channel.try_read(buf, peek, source_addr.as_deref_mut())
                 },
             )
-            .map_err(|error| wait_errno(&wait_cx, error));
+            .map_err(|error| socket_intr_errno(timeout, error.into()));
         // - Non-blocking + self-shutdown(SHUT_RD) with empty queue: Linux returns EAGAIN
         //   instead of EOF (datagram boundaries; no message synthesized for the absent peer).
         // - SO_RCVTIMEO expiry on a blocking recv: Linux returns EAGAIN, not ETIMEDOUT
