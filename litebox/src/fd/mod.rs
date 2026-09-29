@@ -9,6 +9,7 @@
 )]
 
 use alloc::sync::Arc;
+use alloc::sync::Weak;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -340,6 +341,22 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
         Some(EntryHandle(Arc::clone(&entry.x), PhantomData))
     }
 
+    /// Upgrade `weak`, which must refer to an entry of this table, to a strong [`EntryHandle`], if
+    /// its entry is still alive.
+    ///
+    /// Upgrading requires the descriptor table that owns the entry, so that (as with
+    /// [`Self::entry_handle`] and [`Self::duplicate`]) strong references are only ever created
+    /// while the table is held. This ensures that the closing operations, which run on an
+    /// exclusively-held table, never observe the number of references to an entry growing.
+    pub fn upgrade<Subsystem: FdEnabledSubsystem>(
+        &self,
+        weak: &WeakEntryHandle<Platform, Subsystem>,
+    ) -> Option<EntryHandle<Platform, Subsystem>> {
+        weak.0
+            .upgrade()
+            .map(|entry| EntryHandle(entry, PhantomData))
+    }
+
     /// Use the entry at `internal_fd` as mutably.
     ///
     /// NOTE: Ideally, prefer using [`Self::with_entry_mut`] instead of this, since it provides a
@@ -518,11 +535,20 @@ impl<Platform: RawSyncPrimitivesProvider> Descriptors<Platform> {
     }
 }
 
+/// An opaque, stable identity for a descriptor's entry (its open file
+/// description).
+///
+/// Equal keys denote the same entry. A key is stable across `dup` and for the
+/// entry's lifetime, so it can identify an entry (for example as a map key)
+/// without dereferencing anything.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntryStableKey(usize);
+
 /// A handle to a descriptor entry (via [`Descriptors::entry_handle`]) that can be used without
 /// maintaining access to the descriptor table itself.
 pub struct EntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
     Arc<SharedEntry<Platform>>,
-    PhantomData<Subsystem>,
+    PhantomData<fn(Subsystem) -> Subsystem>,
 );
 impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
     EntryHandle<Platform, Subsystem>
@@ -555,6 +581,45 @@ impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
 
     pub fn with_entry_mut<R>(&self, f: impl FnOnce(&mut Subsystem::Entry) -> R) -> R {
         f(self.0.entry.write().as_subsystem_mut::<Subsystem>())
+    }
+
+    /// Apply `f` on metadata at the entry, if it exists.
+    ///
+    /// In contrast to [`Descriptors::with_metadata`], this obtains entry-level metadata.
+    /// For FD-specific metadata, one necessarily needs the specific FD.
+    pub fn with_entry_metadata<T, R>(&self, f: impl FnOnce(&T) -> R) -> Option<R>
+    where
+        T: core::any::Any + Clone + Send + Sync,
+    {
+        self.0.entry.read().metadata.get::<T>().map(f)
+    }
+
+    /// Obtains a non-owning [`WeakEntryHandle`] to this entry.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakEntryHandle<Platform, Subsystem> {
+        WeakEntryHandle(Arc::downgrade(&self.0), PhantomData)
+    }
+}
+
+/// A weak reference to a descriptor entry.
+///
+/// Upgrade it via [`Descriptors::upgrade`].
+pub struct WeakEntryHandle<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>(
+    Weak<SharedEntry<Platform>>,
+    PhantomData<fn(Subsystem) -> Subsystem>,
+);
+
+impl<Platform: RawSyncPrimitivesProvider, Subsystem: FdEnabledSubsystem>
+    WeakEntryHandle<Platform, Subsystem>
+{
+    /// An opaque, stable identity for this entry (see [`EntryStableKey`]).
+    ///
+    /// A [`WeakEntryHandle`] keeps the underlying allocation reserved even after
+    /// the entry is closed, so this key is never reused for a different entry
+    /// while this handle exists.
+    #[must_use]
+    pub fn stable_key(&self) -> EntryStableKey {
+        EntryStableKey(self.0.as_ptr().addr())
     }
 }
 
