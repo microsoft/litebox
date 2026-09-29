@@ -15,18 +15,20 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 
 /// Timer provider that fires every broker timer alarm from a single thread.
 pub(super) struct UserlandTimerProvider {
-    shared: Arc<Shared>,
+    scheduler: Arc<AlarmScheduler>,
 }
 
-struct Shared {
+/// Alarm queue shared by the provider, its alarms, and the alarm thread.
+struct AlarmScheduler {
     origin: Instant,
-    state: Mutex<State>,
+    state: Mutex<SchedulerState>,
     /// Signaled when an alarm becomes the earliest pending deadline.
     wake: Condvar,
 }
 
+/// Mutable state of an [`AlarmScheduler`], guarded by its lock.
 #[derive(Default)]
-struct State {
+struct SchedulerState {
     /// Set once the provider is dropped to stop the alarm thread.
     stopped: bool,
     next_id: u64,
@@ -42,33 +44,33 @@ struct AlarmState {
 
 impl UserlandTimerProvider {
     pub(super) fn new() -> IoResult<Self> {
-        let shared = Arc::new(Shared {
+        let scheduler = Arc::new(AlarmScheduler {
             origin: Instant::now(),
-            state: Mutex::new(State::default()),
+            state: Mutex::new(SchedulerState::default()),
             wake: Condvar::new(),
         });
-        let thread_shared = Arc::clone(&shared);
+        let thread_scheduler = Arc::clone(&scheduler);
         std::thread::Builder::new()
             .name("litebox-broker-timer".to_owned())
-            .spawn(move || thread_shared.run())?;
-        Ok(Self { shared })
+            .spawn(move || thread_scheduler.run())?;
+        Ok(Self { scheduler })
     }
 }
 
 impl Drop for UserlandTimerProvider {
     fn drop(&mut self) {
-        self.shared.lock().stopped = true;
-        self.shared.wake.notify_one();
+        self.scheduler.lock().stopped = true;
+        self.scheduler.wake.notify_one();
     }
 }
 
 impl TimerProvider for UserlandTimerProvider {
     fn now(&self) -> Duration {
-        self.shared.now()
+        self.scheduler.now()
     }
 
     fn create_alarm(&self, readiness: ReadinessRegistration) -> Result<Box<dyn Alarm>> {
-        let mut state = self.shared.lock();
+        let mut state = self.scheduler.lock();
         let id = state.next_id;
         state.next_id += 1;
         state.alarms.insert(
@@ -79,18 +81,18 @@ impl TimerProvider for UserlandTimerProvider {
             },
         );
         Ok(Box::new(UserlandAlarm {
-            shared: Arc::clone(&self.shared),
+            scheduler: Arc::clone(&self.scheduler),
             id,
         }))
     }
 }
 
-impl Shared {
+impl AlarmScheduler {
     fn now(&self) -> Duration {
         self.origin.elapsed()
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
+    fn lock(&self) -> MutexGuard<'_, SchedulerState> {
         // Every critical section leaves the state consistent.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -135,14 +137,14 @@ impl Shared {
 }
 
 struct UserlandAlarm {
-    shared: Arc<Shared>,
+    scheduler: Arc<AlarmScheduler>,
     id: u64,
 }
 
 impl Alarm for UserlandAlarm {
     fn set(&self, deadline: Option<Duration>) {
-        let mut state = self.shared.lock();
-        let State { queue, alarms, .. } = &mut *state;
+        let mut state = self.scheduler.lock();
+        let SchedulerState { queue, alarms, .. } = &mut *state;
         let alarm = alarms.get_mut(&self.id).expect("alarm is live");
         if let Some(previous) = core::mem::replace(&mut alarm.deadline, deadline) {
             queue.remove(&(previous, self.id));
@@ -150,7 +152,7 @@ impl Alarm for UserlandAlarm {
         if let Some(deadline) = deadline {
             queue.insert((deadline, self.id));
             if queue.first() == Some(&(deadline, self.id)) {
-                self.shared.wake.notify_one();
+                self.scheduler.wake.notify_one();
             }
         }
     }
@@ -159,7 +161,7 @@ impl Alarm for UserlandAlarm {
 impl Drop for UserlandAlarm {
     fn drop(&mut self) {
         let alarm = {
-            let mut state = self.shared.lock();
+            let mut state = self.scheduler.lock();
             let alarm = state.alarms.remove(&self.id).expect("alarm is live");
             if let Some(deadline) = alarm.deadline {
                 state.queue.remove(&(deadline, self.id));
@@ -191,10 +193,10 @@ mod tests {
     #[test]
     fn dropping_provider_stops_alarm_thread() {
         let provider = UserlandTimerProvider::new().unwrap();
-        let shared = Arc::downgrade(&provider.shared);
+        let scheduler = Arc::downgrade(&provider.scheduler);
         drop(provider);
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while shared.strong_count() != 0 {
+        while scheduler.strong_count() != 0 {
             assert!(
                 std::time::Instant::now() < deadline,
                 "alarm thread kept running"
