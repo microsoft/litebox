@@ -33,6 +33,25 @@ macro_rules! define_page_reservation {
             fn range(&self) -> ::core::ops::Range<usize> {
                 self.range.clone()
             }
+
+            fn split(self, range: ::core::ops::Range<usize>) -> (Option<Self>, Self, Option<Self>) {
+                let extent = self.range;
+                assert!(
+                    extent.start <= range.start && range.end <= extent.end && !range.is_empty()
+                );
+                assert!(range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN));
+                (
+                    (extent.start < range.start).then_some(Self {
+                        range: extent.start..range.start,
+                    }),
+                    Self {
+                        range: range.clone(),
+                    },
+                    (range.end < extent.end).then_some(Self {
+                        range: range.end..extent.end,
+                    }),
+                )
+            }
         }
 
         impl<const ALIGN: usize> From<$name<ALIGN>> for ::core::ops::Range<usize> {
@@ -111,6 +130,10 @@ where
     fn take_overlapping(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
         Vec::new()
     }
+
+    fn take_replaced(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
+        Vec::new()
+    }
 }
 
 /// Reservations indexed by their starting address.
@@ -173,9 +196,14 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
         unsafe { platform.reserve_pages(core::iter::empty, start..end, can_grow_down, placement) }
     }
 
-    /// Reserve and track gaps in `requested`, or its full length at a relocated hint.
+    /// Reserve and track each unreserved gap within `requested`.
     ///
-    /// Returns the bases of newly acquired reservations so the caller can roll them back later.
+    /// For a relocatable hint, instead reserves and tracks one range whose length matches
+    /// `requested`.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok` with a vector of starting addresses if all gaps were successfully reserved.
     ///
     /// # Panics
     ///
@@ -291,6 +319,22 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
             .map(|(_, reservation)| reservation)
             .collect()
     }
+
+    fn take_replaced(&mut self, range: Range<usize>) -> Vec<Reservation> {
+        self.take_overlapping(range.clone())
+            .into_iter()
+            .map(|reservation| {
+                let extent = reservation.range();
+                let clipped = extent.start.max(range.start)..extent.end.min(range.end);
+                let (prefix, middle, suffix) = reservation.split(clipped);
+                for remainder in prefix.into_iter().chain(suffix) {
+                    let base = remainder.range().start;
+                    assert!(self.insert(base, remainder).is_none());
+                }
+                middle
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -341,5 +385,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0], 0x5000..0x6000);
+    }
+
+    #[test]
+    fn take_replaced_splits_and_preserves_outside_ownership() {
+        let mut reservations = TrackedReservations::default();
+        for range in [0x1000..0x3000, 0x3000..0x5000] {
+            // SAFETY: The test ranges are disjoint, aligned, and uniquely represented.
+            let reservation = unsafe { TestReservation::<0x1000>::new(range.clone()) };
+            assert!(reservations.insert(range.start, reservation).is_none());
+        }
+
+        let replaced = reservations.take_replaced(0x2000..0x4000);
+        assert_eq!(
+            replaced
+                .iter()
+                .map(PageReservation::range)
+                .collect::<Vec<_>>(),
+            [0x2000..0x3000, 0x3000..0x4000]
+        );
+        assert_eq!(
+            reservations
+                .iter()
+                .map(|(_, reservation)| reservation.range())
+                .collect::<Vec<_>>(),
+            [0x1000..0x2000, 0x4000..0x5000]
+        );
+        let replaced = reservations.take_replaced(0x1000..0x6000);
+        assert_eq!(
+            replaced
+                .iter()
+                .map(PageReservation::range)
+                .collect::<Vec<_>>(),
+            [0x1000..0x2000, 0x4000..0x5000]
+        );
+        assert_eq!(reservations.iter().count(), 0);
     }
 }

@@ -201,10 +201,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<
-        WindowsUserlandReservation<ALIGN>,
-        litebox::platform::page_mgmt::ReserveAndCommitError,
-    >
+    ) -> Result<WindowsUserlandReservation<ALIGN>, litebox::platform::page_mgmt::AllocationError>
     where
         Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
     {
@@ -215,8 +212,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
                 .is_multiple_of(Self::RESERVATION_ALIGNMENT)
         );
         debug_assert!(suggested_range.end.is_multiple_of(ALIGN));
+        debug_assert!(
+            suggested_range.start >= Self::TASK_ADDR_MIN
+                || (suggested_range.start == 0
+                    && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
+        );
+        debug_assert!(suggested_range.end <= Self::TASK_ADDR_MAX);
         if fixed_address_behavior == FixedAddressBehavior::Replace {
-            return Err(litebox::platform::page_mgmt::ReserveAndCommitError::UnsupportedByPlatform);
+            return Err(AllocationError::UnsupportedByPlatform);
         }
         // TODO: For Windows, there is no MAP_GROWDOWN feature so far.
         let _ = can_grow_down;
@@ -244,14 +247,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
         debug_assert_alignment!(suggested_range, ALIGN);
-
-        assert!(
+        debug_assert!(
             (suggested_range.start == 0
                 && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
                 || suggested_range.start
                     >= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
         );
-        assert!(
+        debug_assert!(
             suggested_range.end
                 <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
         );
