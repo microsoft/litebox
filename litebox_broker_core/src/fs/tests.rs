@@ -1890,6 +1890,10 @@ mod devices {
         assert!(!fs.is_terminal(&stderr));
         assert!(!fs.is_terminal(&stdin));
         assert!(!fs.is_terminal(&urandom));
+        let stdout_path = fs
+            .open(USER, "/dev/stdout", OFlags::PATH, Mode::empty())
+            .expect("Failed to open /dev/stdout with O_PATH");
+        assert!(!fs.is_terminal(&stdout_path));
     }
 
     /// Stdio transfers pass the caller's cancellation state to the provider.
