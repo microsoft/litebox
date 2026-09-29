@@ -10,7 +10,6 @@ use alloc::vec::Vec;
 use litebox::pipes::HalfPipeType;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
-use litebox_broker_protocol::stdio::StdioStream;
 
 use crate::OFlags;
 use crate::signal::SigSet;
@@ -68,6 +67,17 @@ pub struct InheritedFd {
     pub handle: ObjectHandle,
     /// What the descriptor refers to.
     pub kind: InheritedFdKind,
+}
+
+/// A Linux standard stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdioStream {
+    /// Standard input.
+    Stdin,
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
 }
 
 /// The kind of object an [`InheritedFd`] refers to, with the metadata the runner tracks for it.

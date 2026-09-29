@@ -419,6 +419,13 @@ pub struct HandleFileStatusRequest {
     pub handle: ObjectHandle,
 }
 
+/// Determines whether an open file is connected to a terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IsTerminalFileRequest {
+    /// Broker-owned file handle.
+    pub handle: ObjectHandle,
+}
+
 /// Changes mode bits by path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChmodFileRequest {

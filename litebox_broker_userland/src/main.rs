@@ -27,6 +27,8 @@ use litebox_broker_core::{
 };
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_broker_userland::random::UserlandRandomProvider;
+use litebox_broker_userland::stdio::UserlandStdioProvider;
 use litebox_platform::sync::RawSyncPrimitivesProvider;
 
 #[cfg(target_os = "linux")]
@@ -159,6 +161,7 @@ where
         }
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
+    let stdio = Arc::new(UserlandStdioProvider::new()?);
     let in_mem = InMem::<Platform>::new_initialized(entries);
     let backend = Composer::builder()
         .mount_nestable("/", |allocators| {
@@ -168,7 +171,13 @@ where
                 allocators.next(),
             )
         })
-        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+        .mount("/dev", |allocator| {
+            litebox_broker_core::fs::devices::Devices::new(
+                allocator,
+                stdio,
+                Arc::new(UserlandRandomProvider),
+            )
+        })
         .build()
         .map_err(|_| IoError::other("failed to construct broker file service"))?;
     Ok(Arc::new(Resolver::<Platform, _>::new(backend)))

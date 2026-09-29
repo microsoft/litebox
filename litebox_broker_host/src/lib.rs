@@ -29,16 +29,16 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError, FileError,
-    HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest, OpenFileRequest,
-    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
-    ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
-    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
+    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest,
+    SeekFileResponse, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     encode_directory_entries_chunk,
 };
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-    SocketRequest, SocketResponse, StdioRequest, StdioResponse, TimerRequest, TimerResponse,
+    SocketRequest, SocketResponse, TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -59,10 +59,6 @@ use litebox_broker_protocol::socket::{
     ListenSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
     MAX_UDP_DATAGRAM_SIZE, ReceiveFlags, ReceiveFromSocketResponse, ReceiveSocketResponse,
     SendSocketResponse, SendToSocketResponse, SocketOutcome,
-};
-use litebox_broker_protocol::stdio::{
-    IsTerminalStdioRequest, IsTerminalStdioResponse, MAX_STDIO_TRANSFER_SIZE, ReadStdioRequest,
-    ReadStdioResponse, WriteStdioRequest, WriteStdioResponse,
 };
 use litebox_broker_protocol::timer::{
     CreateTimerResponse, GetTimerResponse, ReadTimerResponse, SetTimerResponse,
@@ -562,9 +558,6 @@ fn handle_request<Memory: SharedMemory>(
             write_shared_buffer(shared_buffers, buffer, data, MAX_RANDOM_TRANSFER_SIZE)?;
             Ok(BrokerResult::RandomFilled)
         }
-        BrokerOperation::Stdio(request) => {
-            handle_stdio_request(process, request, shared_buffers).map(BrokerResult::Stdio)
-        }
         BrokerOperation::File(request) => {
             handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
         }
@@ -764,6 +757,14 @@ fn handle_file_request<Memory: SharedMemory>(
                 Err(error) => Ok(FileResponse::Failed(error)),
             }
         }
+        FileRequest::IsTerminal(IsTerminalFileRequest { handle }) => {
+            match litebox_broker_core::fs::is_terminal(process, handle)
+                .map_err(RequestFailure::from)?
+            {
+                Ok(is_terminal) => Ok(FileResponse::IsTerminal(is_terminal)),
+                Err(error) => Ok(FileResponse::Failed(error)),
+            }
+        }
         FileRequest::Chmod(ChmodFileRequest { path, user, mode }) => {
             let path = read_file_path(shared_buffers, path)?;
             Ok(
@@ -957,46 +958,6 @@ fn read_file_path<Memory: SharedMemory>(
         return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
     }
     Ok(path)
-}
-
-fn handle_stdio_request<Memory: SharedMemory>(
-    process: &BrokerProcess,
-    request: StdioRequest,
-    shared_buffers: &SharedBufferPool<Memory>,
-) -> RequestResult<StdioResponse> {
-    match request {
-        StdioRequest::Read(ReadStdioRequest { buffer }) => {
-            validate_shared_buffer(buffer, MAX_STDIO_TRANSFER_SIZE)?;
-            let mut data = allocate_zeroed(buffer.length())?;
-            let read = litebox_broker_core::stdio::read(process, &mut data)
-                .map_err(RequestFailure::from)?;
-            write_shared_buffer(
-                shared_buffers,
-                buffer,
-                &data[..read],
-                MAX_STDIO_TRANSFER_SIZE,
-            )?;
-            Ok(StdioResponse::Read(ReadStdioResponse {
-                read: u32::try_from(read).expect("validated stdio read length must fit in u32"),
-            }))
-        }
-        StdioRequest::Write(WriteStdioRequest { stream, buffer }) => {
-            let data = read_shared_buffer(shared_buffers, buffer, MAX_STDIO_TRANSFER_SIZE)?;
-            let written = litebox_broker_core::stdio::write(process, stream, &data)
-                .map_err(RequestFailure::from)?;
-            Ok(StdioResponse::Write(WriteStdioResponse {
-                written: u32::try_from(written)
-                    .expect("validated stdio write length must fit in u32"),
-            }))
-        }
-        StdioRequest::IsTerminal(IsTerminalStdioRequest { stream }) => {
-            let is_terminal = litebox_broker_core::stdio::is_terminal(process, stream)
-                .map_err(RequestFailure::from)?;
-            Ok(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                is_terminal,
-            }))
-        }
-    }
 }
 
 fn handle_socket_request<Memory: SharedMemory>(
@@ -1351,6 +1312,7 @@ mod tests {
         AcceptedPlatformSocket, PlatformConnectError, PlatformDatagramReceive, PlatformSocket,
         PlatformSocketStatus, PlatformStreamReceive, SocketProvider,
     };
+    use litebox_broker_core::stdio::StdioStream;
     use litebox_broker_core::test_support::{
         ManualTimerProvider, TestBrokerCoreBuilder, TestStdioProvider,
     };
@@ -1378,7 +1340,6 @@ mod tests {
         SocketError, SocketStatusRequest, SocketStatusResponse, SocketType, TcpOptionName,
         TcpOptionValue,
     };
-    use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
     use litebox_broker_protocol::timer::{
         GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
     };
@@ -1675,9 +1636,17 @@ mod tests {
     fn host_request_handling_uses_one_broker_core() {
         let stdio_provider =
             Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stderr));
-        let fs = litebox_broker_core::fs::in_mem::InMem::<TestSync>::new(
-            litebox_broker_core::fs::inode_allocator::InodeAllocator::standalone(),
-        );
+        let fs = litebox_broker_core::fs::composer::Composer::builder()
+            .mount("/", litebox_broker_core::fs::in_mem::InMem::<TestSync>::new)
+            .mount("/dev", |allocator| {
+                litebox_broker_core::fs::devices::Devices::new(
+                    allocator,
+                    stdio_provider.clone(),
+                    Arc::new(TestRandomProvider),
+                )
+            })
+            .build()
+            .unwrap();
         let timer_provider = Arc::new(ManualTimerProvider::default());
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
@@ -1686,7 +1655,6 @@ mod tests {
         )
         .with_socket_provider(Arc::new(TestSocketProvider))
         .with_random_provider(Arc::new(TestRandomProvider))
-        .with_stdio_provider(stdio_provider.clone())
         .with_timer_provider(timer_provider.clone())
         .with_file_service(Arc::new(litebox_broker_core::fs::resolver::Resolver::<
             TestSync,
@@ -1715,7 +1683,7 @@ mod tests {
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
-        association_shared_buffer_sequence_stages_stdio_data(&broker, &stdio_provider);
+        active_request_queries_file_terminal(&broker, &stdio_provider);
         association_shared_buffer_sequences_stage_file_data(&broker);
         shared_buffer_usage_rejects_invalid_sequences();
         association_executes_distinct_slots_concurrently(&broker);
@@ -1976,126 +1944,55 @@ mod tests {
         assert_eq!(output, [0xa5; 2]);
     }
 
-    fn association_shared_buffer_sequence_stages_stdio_data(
-        broker: &BrokerCore,
-        provider: &TestStdioProvider,
-    ) {
+    fn active_request_queries_file_terminal(broker: &BrokerCore, provider: &TestStdioProvider) {
         let process = broker
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let shared_buffers = test_shared_buffers();
-        shared_buffers
-            .write(SharedBufferSlotIndex(7), b"error")
-            .unwrap();
-        provider.push_input(b"input");
+        let is_terminal = |path: &[u8]| {
+            shared_buffers
+                .write(SharedBufferSlotIndex(0), path)
+                .unwrap();
+            let opened = handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+                    path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
+                    user: ROOT,
+                    access: FileAccessMode::WriteOnly,
+                    flags: FileOpenFlags::NONE,
+                    mode: FileMode::default(),
+                })),
+                &shared_buffers,
+            );
+            let BrokerResult::File(FileResponse::Open(opened)) = opened else {
+                panic!("expected successful file open");
+            };
+            let response = handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest {
+                    handle: opened.handle,
+                })),
+                &shared_buffers,
+            );
+            process.close_object_reference(opened.handle).unwrap();
+            response
+        };
 
         assert_eq!(
-            handle_test_request_with_buffers(
-                &process,
-                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: single_slot_sequence(6, 3),
-                })),
-                &shared_buffers,
-            ),
-            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 3 }))
-        );
-        let mut input = [0u8; 3];
-        shared_buffers
-            .read(SharedBufferSlotIndex(6), &mut input)
-            .unwrap();
-        assert_eq!(&input, b"inp");
-
-        shared_buffers
-            .write(SharedBufferSlotIndex(6), &[0xa5; 4])
-            .unwrap();
-        assert_eq!(
-            handle_test_request_with_buffers(
-                &process,
-                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: single_slot_sequence(6, 4),
-                })),
-                &shared_buffers,
-            ),
-            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 2 }))
-        );
-        let mut partial_input = [0u8; 4];
-        shared_buffers
-            .read(SharedBufferSlotIndex(6), &mut partial_input)
-            .unwrap();
-        assert_eq!(&partial_input, b"ut\xa5\xa5");
-
-        shared_buffers
-            .write(SharedBufferSlotIndex(6), &[0xa5; 4])
-            .unwrap();
-        assert_eq!(
-            handle_test_request_with_buffers(
-                &process,
-                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: single_slot_sequence(6, 4),
-                })),
-                &shared_buffers,
-            ),
-            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 0 }))
-        );
-        let mut eof_input = [0u8; 4];
-        shared_buffers
-            .read(SharedBufferSlotIndex(6), &mut eof_input)
-            .unwrap();
-        assert_eq!(eof_input, [0xa5; 4]);
-
-        assert_eq!(
-            handle_test_request_with_buffers(
-                &process,
-                BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
-                    stream: StdioOutputStream::Stderr,
-                    buffer: single_slot_sequence(7, 5),
-                })),
-                &shared_buffers,
-            ),
-            BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 5 }))
+            is_terminal(b"/dev/stderr"),
+            BrokerResult::File(FileResponse::IsTerminal(true))
         );
         assert_eq!(
-            provider.writes().as_slice(),
-            [(StdioOutputStream::Stderr, b"error".to_vec())]
+            is_terminal(b"/dev/stdout"),
+            BrokerResult::File(FileResponse::IsTerminal(false))
         );
         assert_eq!(
-            handle_test_request_with_buffers(
-                &process,
-                BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
-                    stream: StdioStream::Stderr,
-                })),
-                &shared_buffers,
-            ),
-            BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                is_terminal: true,
-            }))
+            is_terminal(b"/dev/null"),
+            BrokerResult::File(FileResponse::IsTerminal(false))
         );
         assert_eq!(
             provider.terminal_queries().as_slice(),
-            [StdioStream::Stderr]
-        );
-        assert_eq!(
-            handle_request(
-                &process,
-                BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
-                    stream: StdioOutputStream::Stdout,
-                    buffer: single_slot_sequence(7, MAX_STDIO_TRANSFER_SIZE + 1),
-                })),
-                &shared_buffers,
-                &test_readiness_sink(),
-            ),
-            Err(RequestFailure::Abort(ErrorCode::MalformedRequest))
-        );
-        assert_eq!(
-            handle_request(
-                &process,
-                BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                    buffer: single_slot_sequence(7, MAX_STDIO_TRANSFER_SIZE + 1),
-                })),
-                &shared_buffers,
-                &test_readiness_sink(),
-            ),
-            Err(RequestFailure::Abort(ErrorCode::MalformedRequest))
+            [StdioStream::Stderr, StdioStream::Stdout]
         );
     }
 

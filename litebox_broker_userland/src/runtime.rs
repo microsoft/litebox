@@ -705,19 +705,24 @@ mod tests {
     use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
     use std::time::{Duration, Instant};
 
-    use litebox_broker_core::stdio::{StdioProvider, StdioProviderError, UnsupportedStdioProvider};
+    use litebox_broker_core::fs::composer::Composer;
+    use litebox_broker_core::fs::devices::Devices;
+    use litebox_broker_core::fs::resolver::Resolver;
+    use litebox_broker_core::stdio::{
+        StdioOutputStream, StdioProvider, StdioProviderError, StdioStream, UnsupportedStdioProvider,
+    };
     use litebox_broker_core::test_support::TestBrokerCoreBuilder;
     use litebox_broker_core::{AssociationCancellation, ObjectRights, PolicyEngine};
     use litebox_broker_host::setup_connection;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
     use litebox_broker_protocol::RequestId;
+    use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
     use litebox_broker_protocol::message::{
         BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     };
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
     };
-    use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_transport::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
     };
@@ -884,11 +889,24 @@ mod tests {
         let (outcome_sender, outcome) = sync_channel(1);
         let (start, started) = sync_channel(1);
         let host = std::thread::spawn(move || {
+            let fs = Composer::builder()
+                .mount("/dev", |allocator| {
+                    Devices::new(
+                        allocator,
+                        stdio_provider,
+                        Arc::new(random::UserlandRandomProvider),
+                    )
+                })
+                .build()
+                .unwrap();
             let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_host_guaranteed_rights(
                 ObjectRights::all(),
             ))
             .with_random_provider(Arc::new(random::UserlandRandomProvider))
-            .with_stdio_provider(stdio_provider)
+            .with_file_service(Arc::new(Resolver::<
+                litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider,
+                _,
+            >::new(fs)))
             .build()
             .unwrap();
             let shared_memory = MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE).unwrap();
@@ -957,11 +975,8 @@ mod tests {
     }
 
     impl StdioProvider for BlockingStdioProvider {
-        fn is_terminal(
-            &self,
-            _stream: litebox_broker_protocol::stdio::StdioStream,
-        ) -> Result<bool, StdioProviderError> {
-            Err(StdioProviderError::Unsupported)
+        fn is_terminal(&self, _stream: StdioStream) -> bool {
+            false
         }
 
         fn read(
@@ -980,6 +995,29 @@ mod tests {
         ) -> Result<usize, StdioProviderError> {
             self.block_until_cancelled(cancellation)
         }
+    }
+
+    /// Opens a standard-stream device through the broker file service.
+    fn open_device(
+        local: &litebox_broker_local::BrokerLocal<UnixControlRingLocalCallChannel>,
+        path: &str,
+        access: FileAccessMode,
+    ) -> litebox_broker_protocol::ObjectHandle {
+        local
+            .open_file(
+                SharedBufferSequence::new(
+                    &[SharedBufferSlotIndex(0)],
+                    u32::try_from(path.len()).unwrap(),
+                )
+                .unwrap(),
+                path,
+                FileUser::ROOT,
+                access,
+                FileOpenFlags::NONE,
+                FileMode::default(),
+            )
+            .unwrap()
+            .unwrap()
     }
 
     struct RecordingShutdown(Arc<AtomicBool>);
@@ -1251,10 +1289,13 @@ mod tests {
             started: started_sender,
         });
         let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
+        let stdin = open_device(&local, "/dev/stdin", FileAccessMode::ReadOnly);
         let reader = std::thread::spawn(move || {
-            local.read_stdio(
-                SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 1).unwrap(),
+            local.read_file(
+                stdin,
+                SharedBufferSequence::new(&[SharedBufferSlotIndex(1)], 1).unwrap(),
                 &mut [0],
+                None,
             )
         });
         started_receiver
@@ -1268,7 +1309,7 @@ mod tests {
             .recv_timeout(TEST_SETUP_TIMEOUT)
             .expect("association teardown did not cancel the stdin read");
         assert!(dispatch_result.is_err());
-        assert!(reader.join().unwrap().is_err());
+        assert!(!matches!(reader.join().unwrap(), Ok(Ok(_))));
         host.join().unwrap();
     }
 
@@ -1280,11 +1321,13 @@ mod tests {
             started: started_sender,
         });
         let (local, notifications, shutdown, outcome, host) = spawn_dispatch(readiness, provider);
+        let stdout = open_device(&local, "/dev/stdout", FileAccessMode::WriteOnly);
         let writer = std::thread::spawn(move || {
-            local.write_stdio(
-                StdioOutputStream::Stdout,
-                SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 1).unwrap(),
+            local.write_file(
+                stdout,
+                SharedBufferSequence::new(&[SharedBufferSlotIndex(1)], 1).unwrap(),
                 b"x",
+                None,
             )
         });
         started_receiver
@@ -1298,7 +1341,7 @@ mod tests {
             .recv_timeout(TEST_SETUP_TIMEOUT)
             .expect("association teardown did not cancel the stdout write");
         assert!(dispatch_result.is_err());
-        assert!(writer.join().unwrap().is_err());
+        assert!(!matches!(writer.join().unwrap(), Ok(Ok(_))));
         host.join().unwrap();
     }
 }

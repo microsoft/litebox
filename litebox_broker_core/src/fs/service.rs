@@ -125,6 +125,10 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
+        fn is_terminal(&self, _session: &BrokerProcess, _file: &File) -> ServiceResult<bool> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
         fn path_status(
             &self,
             _session: &BrokerProcess,
@@ -231,21 +235,14 @@ where
         let Ok(offset) = checked_offset(offset, output.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
+        let cancellation = &process.cancellation;
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
-        let read = if let Some(device) = entry.device() {
+        let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            if !entry.allows_read() {
-                return Ok(Err(FileError::NotForReading));
-            }
-            device.read(process, output)
-        } else if offset.is_some() || !entry.uses_position() {
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            self.read_without_position_update(&entry, output, offset)
+            self.read_without_position_update(cancellation, &entry, output, offset)
                 .map(|(read, _)| read)
         } else {
             drop(entry);
@@ -253,7 +250,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::read(self, &mut entry, output, offset)
+            Resolver::read(self, cancellation, &mut entry, output, offset)
         };
         let read = match read {
             Ok(read) => read,
@@ -275,21 +272,14 @@ where
         let Ok(offset) = checked_offset(offset, input.len()) else {
             return Ok(Err(FileError::InvalidOffset));
         };
+        let cancellation = &process.cancellation;
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
-        let written = if let Some(device) = entry.device() {
+        let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            if !entry.allows_write() {
-                return Ok(Err(FileError::NotForWriting));
-            }
-            device.write(process, input)
-        } else if offset.is_some() || !entry.uses_position() {
-            if entry.is_path_only() {
-                return Ok(Err(FileError::AccessNotAllowed));
-            }
-            self.write_without_position_update(&entry, input, offset)
+            self.write_without_position_update(cancellation, &entry, input, offset)
                 .map(|(written, _)| written)
         } else {
             drop(entry);
@@ -297,7 +287,7 @@ where
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
             }
-            Resolver::write(self, &mut entry, input, offset)
+            Resolver::write(self, cancellation, &mut entry, input, offset)
         };
         let written = match written {
             Ok(written) => written,
@@ -400,6 +390,13 @@ where
         };
         mask_status_mode(&mut status);
         Ok(Ok(status))
+    }
+
+    fn is_terminal(&self, _session: &BrokerProcess, file: &File) -> ServiceResult<bool> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        Ok(Ok(Resolver::is_terminal(self, &entry)))
     }
 
     fn path_status(
@@ -550,6 +547,12 @@ pub fn handle_status(
 ) -> Result<FileResult<FileStatus>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     process.core.fs.handle_status(process, &file)
+}
+
+/// Returns whether a broker-owned open object refers to a terminal.
+pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<bool>> {
+    let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+    process.core.fs.is_terminal(process, &file)
 }
 
 /// Returns status for an absolute path.

@@ -31,7 +31,6 @@ use litebox_broker_protocol::socket::{
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
     SocketConnectionStatus, SocketOutcome, SocketStatusResponse, TcpOptionName, TcpOptionValue,
 };
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
 use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
@@ -91,19 +90,6 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn exit_thread(&self, thread_id: ThreadId) -> core::result::Result<(), BrokerControlError>;
 
     fn fill_random(&self, output: &mut [u8]) -> core::result::Result<(), BrokerControlError>;
-
-    fn is_stdio_terminal(
-        &self,
-        stream: StdioStream,
-    ) -> core::result::Result<bool, BrokerControlError>;
-
-    fn read_stdio(&self, data: &mut [u8]) -> core::result::Result<usize, BrokerControlError>;
-
-    fn write_stdio(
-        &self,
-        stream: StdioOutputStream,
-        data: &[u8],
-    ) -> core::result::Result<usize, BrokerControlError>;
 
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -298,6 +284,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError>;
 
+    fn is_terminal_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<bool, FileError>, BrokerControlError>;
+
     fn chmod_file(
         &self,
         path: &str,
@@ -410,7 +401,6 @@ pub(crate) struct BrokerLocalControl<
     local: Mutex<Platform, Option<Arc<BrokerLocal<Channel>>>>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     slot_allocator: SlotAllocator<Platform>,
-    stdio_read_lock: Mutex<Platform, ()>,
 }
 
 impl<Platform, Channel> BrokerLocalControl<Platform, Channel>
@@ -426,7 +416,6 @@ where
             local: Mutex::new(Some(Arc::new(local))),
             pollable_registry,
             slot_allocator: SlotAllocator::new(),
-            stdio_read_lock: Mutex::new(()),
         }
     }
 
@@ -564,36 +553,6 @@ where
         }
         let lease = self.acquire_shared_buffer(output.len())?;
         self.request(|local| local.fill_random(lease.sequence(), output))
-    }
-
-    fn is_stdio_terminal(
-        &self,
-        stream: StdioStream,
-    ) -> core::result::Result<bool, BrokerControlError> {
-        self.request(|local| local.is_stdio_terminal(stream))
-    }
-
-    fn read_stdio(&self, data: &mut [u8]) -> core::result::Result<usize, BrokerControlError> {
-        if data.len() > MAX_STDIO_TRANSFER_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        // Keep blocking stdin reads from consuming the broker's shared worker
-        // pool when multiple guest threads read concurrently.
-        let _read_guard = self.stdio_read_lock.lock();
-        let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.read_stdio(lease.sequence(), data))
-    }
-
-    fn write_stdio(
-        &self,
-        stream: StdioOutputStream,
-        data: &[u8],
-    ) -> core::result::Result<usize, BrokerControlError> {
-        if data.len() > MAX_STDIO_TRANSFER_SIZE as usize {
-            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
-        }
-        let lease = self.acquire_shared_buffer(data.len())?;
-        self.request(|local| local.write_stdio(stream, lease.sequence(), data))
     }
 
     fn create_tcp_socket(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
@@ -964,6 +923,13 @@ where
         handle: ObjectHandle,
     ) -> core::result::Result<core::result::Result<FileStatus, FileError>, BrokerControlError> {
         self.request(|local| local.handle_file_status(handle))
+    }
+
+    fn is_terminal_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<core::result::Result<bool, FileError>, BrokerControlError> {
+        self.request(|local| local.is_terminal_file(handle))
     }
 
     fn chmod_file(

@@ -6,10 +6,9 @@
 //! Provides `{stdin,stdout,null,urandom,...}` entries, intended to be mounted at `/dev`.
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream};
 
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
@@ -21,7 +20,9 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
-use crate::BrokerProcess;
+use crate::AssociationCancellation;
+use crate::random::RandomProvider;
+use crate::stdio::{StdioOutputStream, StdioProvider, StdioStream};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -59,7 +60,7 @@ const URANDOM_NODE_INFO: NodeInfo = NodeInfo {
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Device {
+enum Device {
     Stdin,
     Stdout,
     Stderr,
@@ -78,38 +79,6 @@ impl Device {
 
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
-    }
-
-    pub(crate) fn read(
-        self,
-        process: &BrokerProcess,
-        output: &mut [u8],
-    ) -> Result<usize, ReadError> {
-        match self {
-            Device::Stdin => {
-                let length = output.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
-                crate::stdio::read(process, &mut output[..length]).map_err(|_| ReadError::Io)
-            }
-            Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
-            Device::Null => Ok(0),
-            Device::URandom => {
-                for chunk in output.chunks_mut(MAX_RANDOM_TRANSFER_SIZE as usize) {
-                    crate::random::fill(process, chunk).map_err(|_| ReadError::Io)?;
-                }
-                Ok(output.len())
-            }
-        }
-    }
-
-    pub(crate) fn write(self, process: &BrokerProcess, input: &[u8]) -> Result<usize, WriteError> {
-        let stream = match self {
-            Device::Stdin => return Err(WriteError::NotForWriting),
-            Device::Stdout => StdioOutputStream::Stdout,
-            Device::Stderr => StdioOutputStream::Stderr,
-            Device::Null | Device::URandom => return Ok(input.len()),
-        };
-        let length = input.len().min(MAX_STDIO_TRANSFER_SIZE as usize);
-        crate::stdio::write(process, stream, &input[..length]).map_err(|_| WriteError::Io)
     }
 
     fn file_status(self) -> FileStatus {
@@ -146,16 +115,26 @@ impl Device {
 pub struct Devices {
     /// Stable inode info for this backend's root directory.
     root_inode: NodeInfo,
+    /// Host standard streams behind `stdin`, `stdout`, and `stderr`.
+    stdio: Arc<dyn StdioProvider>,
+    /// Randomness behind `urandom`.
+    random: Arc<dyn RandomProvider>,
     _alloc: InodeAllocator,
 }
 
 impl Devices {
-    /// Construct a new `Devices` backend.
+    /// Construct a new `Devices` backend over the given providers.
     #[must_use]
-    pub fn new(allocator: InodeAllocator) -> Self {
+    pub fn new(
+        allocator: InodeAllocator,
+        stdio: Arc<dyn StdioProvider>,
+        random: Arc<dyn RandomProvider>,
+    ) -> Self {
         let root_inode = allocator.next();
         Self {
             root_inode,
+            stdio,
+            random,
             _alloc: allocator,
         }
     }
@@ -257,10 +236,7 @@ impl Backend for Devices {
         }
 
         Ok(Permissioned {
-            item: FileHandle::from_typed_with_device::<Self>(
-                DeviceFileHandle { device },
-                Some(device),
-            ),
+            item: FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
             permissions: PermissionCheck::ByBackend,
         })
     }
@@ -277,34 +253,49 @@ impl Backend for Devices {
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], _offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        cancellation: &AssociationCancellation,
+        h: &FileHandle,
+        buf: &mut [u8],
+        _offset: usize,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         match h.device {
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
-            Device::Stdin | Device::URandom => {
-                if buf.is_empty() {
-                    Ok(0)
-                } else {
-                    Err(ReadError::Io)
-                }
+            Device::Stdin if buf.is_empty() => Ok(0),
+            Device::Stdin => self
+                .stdio
+                .read(cancellation, buf)
+                .map_err(|_| ReadError::Io),
+            Device::URandom => {
+                self.random.fill(buf).map_err(|_| ReadError::Io)?;
+                Ok(buf.len())
             }
         }
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        cancellation: &AssociationCancellation,
+        h: &FileHandle,
+        buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
-        match h.device {
-            Device::Stdin => Err(WriteError::NotForWriting),
-            Device::Stdout | Device::Stderr => {
-                if buf.is_empty() {
-                    Ok(0)
-                } else {
-                    Err(WriteError::Io)
-                }
-            }
-            Device::Null | Device::URandom => Ok(buf.len()),
+        let stream = match h.device {
+            Device::Stdin => return Err(WriteError::NotForWriting),
+            Device::Stdout => StdioOutputStream::Stdout,
+            Device::Stderr => StdioOutputStream::Stderr,
+            Device::Null | Device::URandom => return Ok(buf.len()),
+        };
+        if buf.is_empty() {
+            return Ok(0);
         }
+        self.stdio
+            .write(cancellation, stream, buf)
+            .map_err(|_| WriteError::Io)
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
@@ -317,6 +308,16 @@ impl Backend for Devices {
             Device::Stdin | Device::Stdout | Device::Stderr => SeekBehavior::NonSeekable,
             Device::Null | Device::URandom => SeekBehavior::ZeroPosition,
         }
+    }
+
+    fn is_terminal(&self, h: &FileHandle) -> bool {
+        let stream = match h.get_typed::<Self>().device {
+            Device::Stdin => StdioStream::Stdin,
+            Device::Stdout => StdioStream::Stdout,
+            Device::Stderr => StdioStream::Stderr,
+            Device::Null | Device::URandom => return false,
+        };
+        self.stdio.is_terminal(stream)
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
@@ -373,26 +374,5 @@ impl Backend for Devices {
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
         Err(ChownError::ReadOnlyFileSystem)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn urandom_requires_broker_only_for_nonempty_reads() {
-        let devices = Devices::new(InodeAllocator::standalone());
-        let urandom = devices
-            .open_file_at(devices.root(), "urandom", OFlags::RDONLY)
-            .unwrap()
-            .item;
-
-        assert_eq!(urandom.device(), Some(Device::URandom));
-        assert_eq!(devices.read(&urandom, &mut [], 0).unwrap(), 0);
-        assert!(matches!(
-            devices.read(&urandom, &mut [0], 0),
-            Err(ReadError::Io)
-        ));
     }
 }

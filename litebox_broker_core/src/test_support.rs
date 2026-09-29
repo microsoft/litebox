@@ -10,7 +10,6 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::stdio::{StdioOutputStream, StdioStream};
 use spin::Mutex;
 
 use crate::{
@@ -19,7 +18,7 @@ use crate::{
     random::{RandomProvider, RandomProviderError},
     readiness::ReadinessRegistration,
     socket::{SocketProvider, UnsupportedSocketProvider},
-    stdio::{StdioProvider, StdioProviderError, UnsupportedStdioProvider},
+    stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
 };
 
@@ -29,7 +28,6 @@ pub struct TestBrokerCoreBuilder {
     limits: BrokerCoreLimits,
     socket_provider: Arc<dyn SocketProvider>,
     random_provider: Arc<dyn RandomProvider>,
-    stdio_provider: Arc<dyn StdioProvider>,
     timer_provider: Arc<dyn TimerProvider>,
     fs: Arc<dyn FileService>,
 }
@@ -43,7 +41,6 @@ impl TestBrokerCoreBuilder {
             limits: BrokerCoreLimits::DEFAULT,
             socket_provider: Arc::new(UnsupportedSocketProvider),
             random_provider: Arc::new(FailingRandomProvider),
-            stdio_provider: Arc::new(UnsupportedStdioProvider),
             timer_provider: Arc::new(UnsupportedTimerProvider),
             fs: Arc::new(UnsupportedFileService),
         }
@@ -67,13 +64,6 @@ impl TestBrokerCoreBuilder {
     #[must_use]
     pub fn with_random_provider(mut self, provider: Arc<dyn RandomProvider>) -> Self {
         self.random_provider = provider;
-        self
-    }
-
-    /// Installs the standard-I/O provider used by the test.
-    #[must_use]
-    pub fn with_stdio_provider(mut self, provider: Arc<dyn StdioProvider>) -> Self {
-        self.stdio_provider = provider;
         self
     }
 
@@ -102,14 +92,14 @@ impl TestBrokerCoreBuilder {
             self.limits,
             self.socket_provider,
             self.random_provider,
-            self.stdio_provider,
             self.timer_provider,
             self.fs,
         )
     }
 }
 
-struct FailingRandomProvider;
+/// Random provider whose fills always fail.
+pub struct FailingRandomProvider;
 
 impl RandomProvider for FailingRandomProvider {
     fn fill(&self, _output: &mut [u8]) -> core::result::Result<(), RandomProviderError> {
@@ -201,13 +191,13 @@ impl StdioProvider for TestStdioProvider {
         Ok(input.len())
     }
 
-    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
+    fn is_terminal(&self, stream: StdioStream) -> bool {
         self.terminal_queries.lock().push(stream);
-        Ok(match stream {
+        match stream {
             StdioStream::Stdin => self.stdin_terminal,
             StdioStream::Stdout => self.stdout_terminal,
             StdioStream::Stderr => self.stderr_terminal,
-        })
+        }
     }
 }
 
@@ -253,12 +243,12 @@ impl StdioProvider for TerminalOnlyStdioProvider {
         panic!("terminal-only test stdio must not write standard output")
     }
 
-    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
-        Ok(match stream {
+    fn is_terminal(&self, stream: StdioStream) -> bool {
+        match stream {
             StdioStream::Stdin => self.stdin_terminal,
             StdioStream::Stdout => self.stdout_terminal,
             StdioStream::Stderr => self.stderr_terminal,
-        })
+        }
     }
 }
 

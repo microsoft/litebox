@@ -20,6 +20,7 @@ use super::errors::{
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use crate::AssociationCancellation;
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -633,18 +634,12 @@ impl Backend for Composer {
                 self.mounts[mount_index]
                     .backend
                     .open_file_at(handle, name, flags)
-                    .map(|file| {
-                        let device = file.item.device();
-                        Permissioned {
-                            item: FileHandle::from_typed_with_device::<Self>(
-                                ComposerFileHandle {
-                                    mount_index,
-                                    handle: file.item,
-                                },
-                                device,
-                            ),
-                            permissions: file.permissions,
-                        }
+                    .map(|file| Permissioned {
+                        item: FileHandle::from_typed::<Self>(ComposerFileHandle {
+                            mount_index,
+                            handle: file.item,
+                        }),
+                        permissions: file.permissions,
                     })
             }
         }
@@ -665,11 +660,17 @@ impl Backend for Composer {
         }
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        cancellation: &AssociationCancellation,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .read(&h.handle, buf, offset)
+            .read(cancellation, &h.handle, buf, offset)
     }
 
     fn get_static_backing_data(&self, h: &FileHandle) -> Option<&'static [u8]> {
@@ -679,11 +680,17 @@ impl Backend for Composer {
             .get_static_backing_data(&h.handle)
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        cancellation: &AssociationCancellation,
+        h: &FileHandle,
+        buf: &[u8],
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index]
             .backend
-            .write(&h.handle, buf, offset)
+            .write(cancellation, &h.handle, buf, offset)
     }
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
@@ -719,6 +726,11 @@ impl Backend for Composer {
         }
     }
 
+    fn is_terminal(&self, h: &FileHandle) -> bool {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.is_terminal(&h.handle)
+    }
+
     fn create_file_at(
         &self,
         dir: DirHandle,
@@ -738,14 +750,10 @@ impl Backend for Composer {
                     .backend
                     .create_file_at(handle, name, metadata)
                     .map(|handle| {
-                        let device = handle.device();
-                        FileHandle::from_typed_with_device::<Self>(
-                            ComposerFileHandle {
-                                mount_index,
-                                handle,
-                            },
-                            device,
-                        )
+                        FileHandle::from_typed::<Self>(ComposerFileHandle {
+                            mount_index,
+                            handle,
+                        })
                     })
             }
         }

@@ -15,17 +15,15 @@ use std::sync::OnceLock;
 use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    test_support::{TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
+    stdio::StdioStream,
+    test_support::{FailingRandomProvider, TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
 };
 use litebox_broker_host::{
     BrokerHostError,
     test_support::{InProcessBrokerChannel, InProcessBrokerSetup},
 };
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{
-    fs::{FileMode, FileUser},
-    stdio::StdioStream,
-};
+use litebox_broker_protocol::fs::{FileMode, FileUser};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::syscalls::tests::TestPlatform;
@@ -86,16 +84,21 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
             )]);
         let fs = litebox_broker_core::fs::composer::Composer::builder()
             .mount("/", |_| in_mem)
-            .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+            .mount("/dev", |allocator| {
+                litebox_broker_core::fs::devices::Devices::new(
+                    allocator,
+                    Arc::new(
+                        TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
+                    ),
+                    Arc::new(FailingRandomProvider),
+                )
+            })
             .build()
             .expect("the test filesystem must be valid");
         TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(limits)
-        .with_stdio_provider(Arc::new(
-            TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
-        ))
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
         .expect("a test process may build only one broker core")

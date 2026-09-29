@@ -20,6 +20,7 @@ use super::{
     },
 };
 use super::{SeekWhence, UserInfo};
+use crate::AssociationCancellation;
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
@@ -539,6 +540,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     pub(crate) fn read_without_position_update(
         &self,
+        cancellation: &AssociationCancellation,
         entry: &ResolverEntry<Backend>,
         buf: &mut [u8],
         offset: Option<usize>,
@@ -560,7 +562,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             SeekBehavior::NonSeekable | SeekBehavior::ZeroPosition => 0,
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let read = self.backend.read(file, buf, read_offset)?;
+        let read = self.backend.read(cancellation, file, buf, read_offset)?;
         Ok((read, read_offset))
     }
 
@@ -570,16 +572,20 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// offset to the end of the read.
     /// If `offset` is Some, the file offset is not changed.
     ///
+    /// A backend that blocks returns once `cancellation` is cancelled.
+    ///
     /// # Panics
     ///
     /// Panics if the updated file offset would overflow `usize`.
     pub fn read(
         &self,
+        cancellation: &AssociationCancellation,
         entry: &mut ResolverEntry<Backend>,
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let (read, read_offset) = self.read_without_position_update(entry, buf, offset)?;
+        let (read, read_offset) =
+            self.read_without_position_update(cancellation, entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = read_offset.checked_add(read).unwrap();
         }
@@ -588,6 +594,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
 
     pub(crate) fn write_without_position_update(
         &self,
+        cancellation: &AssociationCancellation,
         entry: &ResolverEntry<Backend>,
         buf: &[u8],
         offset: Option<usize>,
@@ -618,7 +625,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.position),
         };
-        let written = self.backend.write(file, buf, write_offset)?;
+        let written = self.backend.write(cancellation, file, buf, write_offset)?;
         Ok((written, write_offset))
     }
 
@@ -628,16 +635,20 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
     /// offset to the end of the write.
     /// If `offset` is Some, the file offset is not changed.
     ///
+    /// A backend that blocks returns once `cancellation` is cancelled.
+    ///
     /// # Panics
     ///
     /// Panics if the updated file offset would overflow `usize`.
     pub fn write(
         &self,
+        cancellation: &AssociationCancellation,
         entry: &mut ResolverEntry<Backend>,
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let (written, write_offset) = self.write_without_position_update(entry, buf, offset)?;
+        let (written, write_offset) =
+            self.write_without_position_update(cancellation, entry, buf, offset)?;
         if entry.uses_position() && offset.is_none() {
             entry.position = write_offset.checked_add(written).unwrap();
         }
@@ -942,6 +953,14 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         self.backend.status(entry.handle.as_ref())
     }
 
+    /// Whether an open entry refers to a terminal.
+    pub fn is_terminal(&self, entry: &ResolverEntry<Backend>) -> bool {
+        match &entry.handle {
+            Handle::File(file) => self.backend.is_terminal(file),
+            Handle::Dir(_) => false,
+        }
+    }
+
     /// Get static backing data for a file, if available and supported.
     ///
     /// This method returns the (entire) underlying static byte slice if the file's contents are
@@ -979,17 +998,6 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
 
     pub(crate) const fn allows_read(&self) -> bool {
         self.read_allowed
-    }
-
-    pub(crate) const fn allows_write(&self) -> bool {
-        self.write_allowed
-    }
-
-    pub(crate) fn device(&self) -> Option<super::devices::Device> {
-        match &self.handle {
-            Handle::File(file) => file.device(),
-            Handle::Dir(_) => None,
-        }
     }
 
     pub(crate) const fn uses_position(&self) -> bool {

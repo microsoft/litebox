@@ -20,7 +20,7 @@ use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
-use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::builder::{BrokerBuildError, BrokerCoreBuilder};
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
 
@@ -48,10 +48,13 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
             &args.allow_udp_destination,
         )?)
         .with_process_duplication_enabled(args.allow_process_duplication);
-    let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
-        args.fs_initial_files.as_deref(),
-    )?;
-    let build_broker = || BrokerCoreBuilder::new(policy).with_file_service(fs).build();
+    // Stdio writer threads start with the file service, so create it with the broker.
+    let build_broker = || -> Result<BrokerCore, BrokerBuildError> {
+        let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
+            args.fs_initial_files.as_deref(),
+        )?;
+        BrokerCoreBuilder::new(policy).with_file_service(fs).build()
+    };
     let broker = if args.in_process_runner {
         litebox_platform_linux_userland::with_guest_signals_blocked(build_broker)?
     } else {

@@ -8,10 +8,10 @@ use crate::event::{
 };
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileError, FileStatus, HandleFileStatusRequest,
-    MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-    ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-    RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest, UnlinkFileRequest,
-    WriteFileRequest, WriteFileResponse,
+    IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -32,10 +32,6 @@ use crate::socket::{
     ReceiveSocketResponse, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
     SendToSocketResponse, SetTcpOptionRequest, ShutdownSocketRequest, SocketError,
     SocketStatusRequest, SocketStatusResponse,
-};
-use crate::stdio::{
-    IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
-    WriteStdioRequest, WriteStdioResponse,
 };
 use crate::timer::{
     CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest, ReadTimerResponse,
@@ -69,8 +65,6 @@ pub enum BrokerOperation {
     Socket(SocketRequest),
     /// Fill a shared buffer with cryptographically secure random bytes.
     FillRandom(SharedBufferSequence),
-    /// Standard-I/O request family.
-    Stdio(StdioRequest),
     /// File request family.
     File(FileRequest),
     /// Start one pending child process.
@@ -115,10 +109,6 @@ impl BrokerOperation {
                 | SocketRequest::ReceiveFrom(ReceiveFromSocketRequest { buffer, .. }),
             )
             | Self::FillRandom(buffer)
-            | Self::Stdio(
-                StdioRequest::Read(ReadStdioRequest { buffer })
-                | StdioRequest::Write(WriteStdioRequest { buffer, .. }),
-            )
             | Self::File(
                 FileRequest::Open(OpenFileRequest { path: buffer, .. })
                 | FileRequest::Read(ReadFileRequest { buffer, .. })
@@ -163,9 +153,11 @@ impl BrokerOperation {
                 | SocketRequest::GetTcpOption(_)
                 | SocketRequest::Status(_),
             )
-            | Self::Stdio(StdioRequest::IsTerminal(_))
             | Self::File(
-                FileRequest::Seek(_) | FileRequest::Truncate(_) | FileRequest::HandleStatus(_),
+                FileRequest::Seek(_)
+                | FileRequest::Truncate(_)
+                | FileRequest::HandleStatus(_)
+                | FileRequest::IsTerminal(_),
             ) => None,
         }
     }
@@ -299,8 +291,6 @@ pub enum BrokerResult {
     Socket(SocketResponse),
     /// The requested shared buffer was filled with random bytes.
     RandomFilled,
-    /// Standard-I/O response family.
-    Stdio(StdioResponse),
     /// File response family.
     File(FileResponse),
     /// A pending child established its broker association.
@@ -406,28 +396,6 @@ pub enum SocketResponse {
     Failed(SocketError),
 }
 
-/// Standard-I/O request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StdioRequest {
-    /// Read bytes from standard input.
-    Read(ReadStdioRequest),
-    /// Write bytes to a standard output stream.
-    Write(WriteStdioRequest),
-    /// Determine whether a standard stream is connected to a terminal.
-    IsTerminal(IsTerminalStdioRequest),
-}
-
-/// Standard-I/O response.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StdioResponse {
-    /// Standard input read response.
-    Read(ReadStdioResponse),
-    /// Standard output write response.
-    Write(WriteStdioResponse),
-    /// Standard-stream terminal capability response.
-    IsTerminal(IsTerminalStdioResponse),
-}
-
 /// Broker-owned fs request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileRequest {
@@ -447,6 +415,8 @@ pub enum FileRequest {
     PathStatus(PathFileStatusRequest),
     /// Read status by open handle.
     HandleStatus(HandleFileStatusRequest),
+    /// Determine whether an open file is connected to a terminal.
+    IsTerminal(IsTerminalFileRequest),
     /// Change mode bits by path.
     Chmod(ChmodFileRequest),
     /// Change ownership by path.
@@ -478,6 +448,8 @@ pub enum FileResponse {
     PathStatus(FileStatus),
     /// Handle-status response.
     HandleStatus(FileStatus),
+    /// Terminal query response.
+    IsTerminal(bool),
     /// Mode change completed.
     Chmod,
     /// Ownership change completed.

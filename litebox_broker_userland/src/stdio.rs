@@ -1,6 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+//! Inherited host standard streams for userland brokers.
+
 use std::collections::VecDeque;
 use std::io::{Error as IoError, ErrorKind, Read as _, Result as IoResult};
 use std::sync::Mutex;
@@ -8,10 +10,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync
 use std::time::Duration;
 
 use litebox_broker_core::AssociationCancellation;
-use litebox_broker_core::stdio::{StdioProvider, StdioProviderError};
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
+use litebox_broker_core::stdio::{
+    StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
+};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const STDIN_READ_BUFFER_SIZE: usize = 32 * 1024;
 const WRITE_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 /// Routes standard I/O for the broker's single child runner through inherited
@@ -19,7 +23,7 @@ const WRITE_RETRY_DELAY: Duration = Duration::from_millis(1);
 ///
 /// A broker serving multiple runners will need association-specific stream
 /// endpoints instead of sharing process-wide standard streams.
-pub(super) struct UserlandStdioProvider {
+pub struct UserlandStdioProvider {
     stdin: Mutex<StdinState>,
     stdout: SyncSender<StdioWriteOperation>,
     stderr: SyncSender<StdioWriteOperation>,
@@ -43,7 +47,13 @@ struct StdioWriteOperation {
 }
 
 impl UserlandStdioProvider {
-    pub(super) fn new() -> IoResult<Self> {
+    /// Creates the provider and starts its standard-output and standard-error
+    /// writer threads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a writer thread cannot be started.
+    pub fn new() -> IoResult<Self> {
         let (stdout, stdout_receiver) = sync_channel(crate::WORKER_COUNT);
         std::thread::Builder::new()
             .name("litebox-broker-stdout".to_owned())
@@ -65,14 +75,14 @@ impl UserlandStdioProvider {
 }
 
 impl StdioProvider for UserlandStdioProvider {
-    fn is_terminal(&self, stream: StdioStream) -> Result<bool, StdioProviderError> {
+    fn is_terminal(&self, stream: StdioStream) -> bool {
         use std::io::IsTerminal as _;
 
-        Ok(match stream {
+        match stream {
             StdioStream::Stdin => std::io::stdin().is_terminal(),
             StdioStream::Stdout => std::io::stdout().is_terminal(),
             StdioStream::Stderr => std::io::stderr().is_terminal(),
-        })
+        }
     }
 
     fn read(
@@ -170,7 +180,7 @@ impl StdioProvider for UserlandStdioProvider {
 fn pump_stdin(sender: SyncSender<StdinReadResult>) {
     let stdin = std::io::stdin();
     let mut stdin = stdin.lock();
-    let mut buffer = vec![0; MAX_STDIO_TRANSFER_SIZE as usize];
+    let mut buffer = vec![0; STDIN_READ_BUFFER_SIZE];
     loop {
         let (result, finished) = match stdin.read(&mut buffer) {
             Ok(0) => (StdinReadResult::Eof, true),

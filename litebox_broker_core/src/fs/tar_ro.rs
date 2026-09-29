@@ -199,7 +199,13 @@ impl super::backend::Backend for TarRo {
             .collect())
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        _cancellation: &crate::AssociationCancellation,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
         let start = offset.min(file.len());
         let end = offset.checked_add(buf.len()).unwrap().min(file.len());
@@ -209,7 +215,13 @@ impl super::backend::Backend for TarRo {
         Ok(len)
     }
 
-    fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        _cancellation: &crate::AssociationCancellation,
+        _h: &FileHandle,
+        _buf: &[u8],
+        _offset: usize,
+    ) -> Result<usize, WriteError> {
         Err(WriteError::NotForWriting)
     }
 

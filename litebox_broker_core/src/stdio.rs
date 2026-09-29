@@ -1,12 +1,31 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-authoritative standard I/O.
+//! Host standard streams behind the `/dev` stdio devices.
 
-use litebox_broker_protocol::stdio::{MAX_STDIO_TRANSFER_SIZE, StdioOutputStream, StdioStream};
 use thiserror::Error;
 
-use crate::{AssociationCancellation, BrokerError, BrokerProcess, Result};
+use crate::AssociationCancellation;
+
+/// Standard stream selected by a terminal query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdioStream {
+    /// Process standard input.
+    Stdin,
+    /// Process standard output.
+    Stdout,
+    /// Process standard error.
+    Stderr,
+}
+
+/// Standard output stream selected by a write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdioOutputStream {
+    /// Process standard output.
+    Stdout,
+    /// Process standard error.
+    Stderr,
+}
 
 /// Failure reported by a trusted standard-I/O provider.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -20,16 +39,6 @@ pub enum StdioProviderError {
     /// This broker deployment does not provide standard I/O.
     #[error("standard I/O is unsupported")]
     Unsupported,
-}
-
-impl From<StdioProviderError> for BrokerError {
-    fn from(error: StdioProviderError) -> Self {
-        match error {
-            StdioProviderError::Closed => Self::PeerClosed,
-            StdioProviderError::Failed => Self::Internal,
-            StdioProviderError::Unsupported => Self::UnsupportedOperation,
-        }
-    }
 }
 
 /// Trusted provider of standard-I/O operations.
@@ -58,7 +67,7 @@ pub trait StdioProvider: Send + Sync {
 
     /// Determines whether the selected standard stream is connected to a
     /// terminal.
-    fn is_terminal(&self, stream: StdioStream) -> core::result::Result<bool, StdioProviderError>;
+    fn is_terminal(&self, stream: StdioStream) -> bool;
 }
 
 /// Standard-I/O provider for deployments that do not expose standard streams.
@@ -82,52 +91,7 @@ impl StdioProvider for UnsupportedStdioProvider {
         Err(StdioProviderError::Unsupported)
     }
 
-    fn is_terminal(&self, _stream: StdioStream) -> core::result::Result<bool, StdioProviderError> {
-        Err(StdioProviderError::Unsupported)
+    fn is_terminal(&self, _stream: StdioStream) -> bool {
+        false
     }
-}
-
-/// Reads standard input through the provider configured for this broker.
-pub fn read(process: &BrokerProcess, output: &mut [u8]) -> Result<usize> {
-    if output.len() > MAX_STDIO_TRANSFER_SIZE as usize {
-        return Err(BrokerError::ResourceExhausted);
-    }
-    if output.is_empty() {
-        return Ok(0);
-    }
-    let read = process
-        .core
-        .stdio_provider
-        .read(&process.cancellation, output)?;
-    if read > output.len() {
-        return Err(BrokerError::Internal);
-    }
-    Ok(read)
-}
-
-/// Writes `input` through the standard-I/O provider configured for this broker.
-pub fn write(process: &BrokerProcess, stream: StdioOutputStream, input: &[u8]) -> Result<usize> {
-    if input.len() > MAX_STDIO_TRANSFER_SIZE as usize {
-        return Err(BrokerError::ResourceExhausted);
-    }
-    if input.is_empty() {
-        return Ok(0);
-    }
-    let written = process
-        .core
-        .stdio_provider
-        .write(&process.cancellation, stream, input)?;
-    if written > input.len() {
-        return Err(BrokerError::Internal);
-    }
-    Ok(written)
-}
-
-/// Determines whether a standard stream is connected to a terminal.
-pub fn is_terminal(process: &BrokerProcess, stream: StdioStream) -> Result<bool> {
-    process
-        .core
-        .stdio_provider
-        .is_terminal(stream)
-        .map_err(Into::into)
 }

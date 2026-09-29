@@ -14,7 +14,6 @@ use litebox::{
     fs::errors::OpenError,
     path,
     process::InheritableFd,
-    stdio::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use litebox_broker_protocol::ObjectHandle;
@@ -26,7 +25,7 @@ use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam,
     errno::Errno,
-    program_startup::{InheritedFd, InheritedFdKind},
+    program_startup::{InheritedFd, InheritedFdKind, StdioStream},
     signal::Signal,
     vmem::PAGE_SIZE,
 };
@@ -2376,17 +2375,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    fn is_stdio(&self, fs: &litebox::LiteBox<Platform>, fd: &FileFd) -> Result<bool, Errno> {
-        match fs.file_status(fd) {
-            Ok(status) => {
-                // See https://www.kernel.org/doc/Documentation/admin-guide/devices.txt
-                let major = status.node_info.rdev.map_or(0, |v| v.get() >> 8);
-                Ok((136..=143).contains(&major) && status.file_type == FileType::CharacterDevice)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-
     /// Handle syscall `ioctl`
     pub fn sys_ioctl(&self, fd: i32, arg: IoctlArg) -> Result<u32, Errno> {
         let files = self.files.borrow();
@@ -2478,28 +2466,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             | IoctlArg::TIOCGWINSZ(..) => {
                 let fd = files.typed_fd(fd)?;
                 let fd = fd.fs_only(Errno::ENOTTY)?;
-                if !self.is_stdio(self.global.litebox.as_ref(), fd)? {
-                    return Err(Errno::ENOTTY);
-                }
-                let stream = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .with_metadata(fd, |stream: &StdioStream| *stream)
-                    .map_err(|_| {
-                        // TODO: Handle missing `StdioStream` metadata (could happen if
-                        // `/dev/stdin`, `/dev/stdout`, or `/dev/stderr` was reopened).
-                        // XXX(jayb): likely we might want to have some backend-specific
-                        // metadata layer in our file system?
-                        litebox_util_log::error!("standard stream is missing StdioStream metadata");
-                        Errno::ENOTTY
-                    })?;
-                if self
-                    .global
-                    .litebox
-                    .is_stdio_terminal(stream)
-                    .map_err(|_| Errno::EIO)?
-                {
+                if self.global.litebox.is_terminal(fd)? {
                     self.stdio_ioctl(&arg)
                 } else {
                     Err(Errno::ENOTTY)

@@ -26,7 +26,6 @@ mod fs;
 mod pipe;
 mod random;
 mod socket;
-mod stdio;
 mod timer;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -512,13 +511,8 @@ mod tests {
     use super::*;
     use core::cell::{Cell, RefCell};
     use core::convert::Infallible;
-    use litebox_broker_protocol::message::{ReadinessNotification, StdioRequest, StdioResponse};
+    use litebox_broker_protocol::message::ReadinessNotification;
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
-    use litebox_broker_protocol::stdio::{
-        IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
-        StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
-    };
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, ThreadId};
     use litebox_broker_transport::channel::LocalNotificationChannel;
     use std::sync::Mutex;
@@ -609,86 +603,6 @@ mod tests {
                 operation: BrokerOperation::ExitThread(thread_id),
             })
         );
-    }
-
-    #[test]
-    fn write_stdio_stages_the_requested_stream_and_buffer() {
-        let buffer = sequence(2, 3);
-        let channel = FakeControlChannel::new(
-            None,
-            Some(BrokerResult::Stdio(StdioResponse::Write(
-                WriteStdioResponse { written: 2 },
-            ))),
-        );
-        let local = test_broker_local(channel, noop_shared_memory());
-
-        assert_eq!(
-            local
-                .write_stdio(StdioOutputStream::Stderr, buffer, b"err")
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            local.channel.sent_request.borrow().clone(),
-            Some(BrokerRequest {
-                request_id: RequestId(0),
-                operation: BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
-                    stream: StdioOutputStream::Stderr,
-                    buffer,
-                })),
-            })
-        );
-    }
-
-    #[test]
-    fn read_stdio_requests_and_reads_the_shared_buffer() {
-        let buffer = sequence(2, 3);
-        let channel = FakeControlChannel::new(
-            None,
-            Some(BrokerResult::Stdio(StdioResponse::Read(
-                ReadStdioResponse { read: 2 },
-            ))),
-        );
-        let local = test_broker_local(channel, noop_shared_memory());
-        let mut output = [0xff; 3];
-
-        assert_eq!(local.read_stdio(buffer, &mut output).unwrap(), 2);
-        assert_eq!(output, [0, 0, 0xff]);
-        assert_eq!(
-            local.channel.sent_request.borrow().clone(),
-            Some(BrokerRequest {
-                request_id: RequestId(0),
-                operation: BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest { buffer })),
-            })
-        );
-    }
-
-    #[test]
-    fn stdio_terminal_query_requests_the_selected_stream() {
-        let channel = FakeControlChannel::new(
-            None,
-            Some(BrokerResult::Stdio(StdioResponse::IsTerminal(
-                IsTerminalStdioResponse { is_terminal: true },
-            ))),
-        );
-        let local = test_broker_local(channel, noop_shared_memory());
-
-        assert!(local.is_stdio_terminal(StdioStream::Stderr).unwrap());
-        assert_eq!(
-            local.channel.sent_request.borrow().clone(),
-            Some(BrokerRequest {
-                request_id: RequestId(0),
-                operation: BrokerOperation::Stdio(StdioRequest::IsTerminal(
-                    IsTerminalStdioRequest {
-                        stream: StdioStream::Stderr,
-                    },
-                )),
-            })
-        );
-    }
-
-    fn sequence(slot: u32, length: u32) -> SharedBufferSequence {
-        SharedBufferSequence::new(&[SharedBufferSlotIndex(slot)], length).unwrap()
     }
 
     #[test]

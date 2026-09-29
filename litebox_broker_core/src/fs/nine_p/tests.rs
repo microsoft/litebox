@@ -12,6 +12,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 
+use crate::AssociationCancellation;
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
     TruncateError, UnlinkError, WriteError,
@@ -230,7 +231,7 @@ fn test_nine_p_create_and_read_file() {
 
     let data = b"Hello from litebox 9P!";
     let written = fs
-        .write(&mut fd, data, None)
+        .write(&AssociationCancellation::default(), &mut fd, data, None)
         .expect("failed to write via 9P");
     assert_eq!(written, data.len());
 
@@ -249,7 +250,7 @@ fn test_nine_p_create_and_read_file() {
 
     let mut buf = alloc::vec![0u8; 256];
     let bytes_read = fs
-        .read(&mut fd, &mut buf, None)
+        .read(&AssociationCancellation::default(), &mut fd, &mut buf, None)
         .expect("failed to read via 9P");
     assert_eq!(&buf[..bytes_read], data);
 
@@ -276,7 +277,13 @@ fn test_nine_p_mkdir_and_readdir() {
             Mode::RWXU,
         )
         .expect("failed to create file in subdir");
-    fs.write(&mut fd, b"nested content", None).unwrap();
+    fs.write(
+        &AssociationCancellation::default(),
+        &mut fd,
+        b"nested content",
+        None,
+    )
+    .unwrap();
     drop(fd);
 
     // Read the root directory
@@ -369,7 +376,8 @@ fn test_nine_p_file_status() {
         )
         .expect("failed to create file");
     let data = b"1234567890";
-    fs.write(&mut fd, data, None).unwrap();
+    fs.write(&AssociationCancellation::default(), &mut fd, data, None)
+        .unwrap();
     drop(fd);
 
     // Check file_status via path
@@ -409,7 +417,13 @@ fn test_nine_p_seek_and_partial_read() {
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.write(&mut fd, b"ABCDEFGHIJ", None).unwrap();
+    fs.write(
+        &AssociationCancellation::default(),
+        &mut fd,
+        b"ABCDEFGHIJ",
+        None,
+    )
+    .unwrap();
     drop(fd);
 
     // Open for reading and seek
@@ -425,7 +439,9 @@ fn test_nine_p_seek_and_partial_read() {
 
     // Read from offset 5 → should get "FGHIJ"
     let mut buf = alloc::vec![0u8; 10];
-    let n = fs.read(&mut fd, &mut buf, None).expect("failed to read");
+    let n = fs
+        .read(&AssociationCancellation::default(), &mut fd, &mut buf, None)
+        .expect("failed to read");
     assert_eq!(&buf[..n], b"FGHIJ");
 
     drop(fd);
@@ -445,7 +461,13 @@ fn test_nine_p_truncate() {
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.write(&mut fd, b"Hello, World!", None).unwrap();
+    fs.write(
+        &AssociationCancellation::default(),
+        &mut fd,
+        b"Hello, World!",
+        None,
+    )
+    .unwrap();
 
     // Truncate to 5 bytes
     fs.truncate(&mut fd, 5, true)
@@ -477,7 +499,9 @@ fn test_nine_p_host_files_visible() {
         .open(USER, "/host_file.txt", OFlags::RDONLY, Mode::empty())
         .expect("failed to open host file via 9P");
     let mut buf = alloc::vec![0u8; 256];
-    let n = fs.read(&mut fd, &mut buf, None).unwrap();
+    let n = fs
+        .read(&AssociationCancellation::default(), &mut fd, &mut buf, None)
+        .unwrap();
     assert_eq!(&buf[..n], b"from host");
     drop(fd);
 
@@ -602,7 +626,7 @@ fn test_nine_p_broken_read() {
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; 64];
-    let result = fs.read(&mut fd, &mut buf, None);
+    let result = fs.read(&AssociationCancellation::default(), &mut fd, &mut buf, None);
     assert!(matches!(result, Err(ReadError::Io)));
 }
 
@@ -623,7 +647,7 @@ fn test_nine_p_broken_write() {
         )
         .expect("create should succeed before break");
 
-    let result = fs.write(&mut fd, b"data", None);
+    let result = fs.write(&AssociationCancellation::default(), &mut fd, b"data", None);
     assert!(matches!(result, Err(WriteError::Io)));
 }
 
@@ -741,7 +765,13 @@ fn test_nine_p_deep_path_walk() {
     let mut fd = fs
         .open(USER, &file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
         .expect("failed to create file in deep path");
-    fs.write(&mut fd, b"deep content", None).unwrap();
+    fs.write(
+        &AssociationCancellation::default(),
+        &mut fd,
+        b"deep content",
+        None,
+    )
+    .unwrap();
     drop(fd);
 
     // Read it back
@@ -749,7 +779,9 @@ fn test_nine_p_deep_path_walk() {
         .open(USER, &file_path, OFlags::RDONLY, Mode::empty())
         .expect("failed to open file in deep path");
     let mut buf = alloc::vec![0u8; 64];
-    let n = fs.read(&mut fd, &mut buf, None).unwrap();
+    let n = fs
+        .read(&AssociationCancellation::default(), &mut fd, &mut buf, None)
+        .unwrap();
     assert_eq!(&buf[..n], b"deep content");
     drop(fd);
 
@@ -855,7 +887,13 @@ fn test_nine_p_handle_status() {
             Mode::RWXU,
         )
         .expect("failed to create file");
-    fs.write(&mut fd, b"hello fd_stat", None).unwrap();
+    fs.write(
+        &AssociationCancellation::default(),
+        &mut fd,
+        b"hello fd_stat",
+        None,
+    )
+    .unwrap();
     drop(fd);
 
     // Open the file and check the open-handle status
@@ -904,7 +942,12 @@ fn test_nine_p_large_read_write() {
     let mut written = 0;
     while written < data.len() {
         let n = fs
-            .write(&mut fd, &data[written..], None)
+            .write(
+                &AssociationCancellation::default(),
+                &mut fd,
+                &data[written..],
+                None,
+            )
             .expect("write failed");
         assert!(n > 0, "write should make progress");
         written += n;
@@ -922,7 +965,12 @@ fn test_nine_p_large_read_write() {
     let mut total_read = 0;
     while total_read < data.len() {
         let n = fs
-            .read(&mut fd, &mut read_buf[total_read..], None)
+            .read(
+                &AssociationCancellation::default(),
+                &mut fd,
+                &mut read_buf[total_read..],
+                None,
+            )
             .expect("read failed");
         if n == 0 {
             break;
@@ -950,17 +998,29 @@ fn test_nine_p_explicit_offset_read_write() {
         .expect("failed to create file");
 
     // Write "AAAAAAAAAA" at offset 0 using implicit offset
-    fs.write(&mut fd, b"AAAAAAAAAA", None).unwrap();
+    fs.write(
+        &AssociationCancellation::default(),
+        &mut fd,
+        b"AAAAAAAAAA",
+        None,
+    )
+    .unwrap();
 
     // Write "BBBBB" at explicit offset 5 — should NOT change the fd offset
     let n = fs
-        .write(&mut fd, b"BBBBB", Some(5))
+        .write(
+            &AssociationCancellation::default(),
+            &mut fd,
+            b"BBBBB",
+            Some(5),
+        )
         .expect("explicit offset write failed");
     assert_eq!(n, 5);
 
     // The fd offset should still be 10 (from the first write), not 10
     // Write "C" using implicit offset — should go at offset 10
-    fs.write(&mut fd, b"C", None).unwrap();
+    fs.write(&AssociationCancellation::default(), &mut fd, b"C", None)
+        .unwrap();
 
     drop(fd);
 
@@ -977,7 +1037,12 @@ fn test_nine_p_explicit_offset_read_write() {
     // Read 5 bytes at explicit offset 5 → "BBBBB"
     let mut buf = alloc::vec![0u8; 5];
     let n = fs
-        .read(&mut fd, &mut buf, Some(5))
+        .read(
+            &AssociationCancellation::default(),
+            &mut fd,
+            &mut buf,
+            Some(5),
+        )
         .expect("explicit offset read failed");
     assert_eq!(n, 5);
     assert_eq!(&buf[..n], b"BBBBB");
@@ -986,7 +1051,7 @@ fn test_nine_p_explicit_offset_read_write() {
     // Read using implicit offset → should start at 0
     let mut buf = alloc::vec![0u8; 11];
     let n = fs
-        .read(&mut fd, &mut buf, None)
+        .read(&AssociationCancellation::default(), &mut fd, &mut buf, None)
         .expect("implicit read failed");
     assert_eq!(&buf[..n], b"AAAAABBBBBC");
 

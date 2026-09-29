@@ -33,6 +33,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use crate::AssociationCancellation;
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -299,11 +300,13 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         lower: &FileHandle,
         upper: &FileHandle,
     ) -> Result<(), OpenError> {
+        // Copy-up runs during open, which is not cancellable.
+        let cancellation = AssociationCancellation::default();
         let mut offset = 0;
         let mut buf = [0u8; 4096];
         loop {
             let count = self.lowers[layer]
-                .read(lower, &mut buf, offset)
+                .read(&cancellation, lower, &mut buf, offset)
                 .map_err(|_| OpenError::Io)?;
             if count == 0 {
                 return Ok(());
@@ -312,7 +315,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             while written < count {
                 let progress = self
                     .upper
-                    .write(upper, &buf[written..count], offset + written)
+                    .write(&cancellation, upper, &buf[written..count], offset + written)
                     .map_err(|_| OpenError::Io)?;
                 if progress == 0 {
                     return Err(OpenError::Io);
@@ -812,12 +815,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(OpenError::AlreadyExists);
         }
 
-        let (layer, permissions, device) = if entry.upper {
+        let (layer, permissions) = if entry.upper {
             let upper = resolved.upper.as_ref().ok_or(OpenError::Io)?;
             let walking = self.upper.walking_dir_at(upper).ok_or(OpenError::Io)?;
             let file = self.upper.open_file_at(walking, name, flags)?;
-            let device = file.item.device();
-            (OverlayFileLayer::Upper(file.item), file.permissions, device)
+            (OverlayFileLayer::Upper(file.item), file.permissions)
         } else {
             let layer = entry.lower.ok_or(OpenError::Io)?;
             let lower_dir = resolved.lowers[layer].as_ref().ok_or(OpenError::Io)?;
@@ -838,7 +840,6 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 flags.difference(OFlags::CREAT)
             };
             let file = self.lowers[layer].open_file_at(walking, name, lower_flags)?;
-            let device = file.item.device();
             // The file's own identity, which is also the key a later copy-up records itself under.
             let status = self.lowers[layer]
                 .status(HandleRef::File(&file.item))
@@ -863,7 +864,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     mode: status.mode,
                     owner: status.owner,
                 });
-                (OverlayFileLayer::Upper(upper), permissions, device)
+                (OverlayFileLayer::Upper(upper), permissions)
             } else {
                 let node = self.map_node(&mut self.state.lock().ids, Some(layer), status.node_info);
                 (
@@ -873,20 +874,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                         node,
                     },
                     file.permissions,
-                    device,
                 )
             }
         };
 
         Ok(Permissioned {
-            item: FileHandle::from_typed_with_device::<Self>(
-                OverlayFile {
-                    layer,
-                    parent: path,
-                    name: String::from(name),
-                },
-                device,
-            ),
+            item: FileHandle::from_typed::<Self>(OverlayFile {
+                layer,
+                parent: path,
+                name: String::from(name),
+            }),
             permissions,
         })
     }
@@ -903,9 +900,15 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         Ok(entries)
     }
 
-    fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
+    fn read(
+        &self,
+        cancellation: &AssociationCancellation,
+        h: &FileHandle,
+        buf: &mut [u8],
+        offset: usize,
+    ) -> Result<usize, ReadError> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
-            backend.read(handle, buf, offset)
+            backend.read(cancellation, handle, buf, offset)
         })
     }
 
@@ -915,13 +918,19 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
-    fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
+    fn write(
+        &self,
+        cancellation: &AssociationCancellation,
+        h: &FileHandle,
+        buf: &[u8],
+        offset: usize,
+    ) -> Result<usize, WriteError> {
         let file = h.get_typed::<Self>();
         if let Some(upper) = self.migrated(file) {
-            return self.upper.write(&upper, buf, offset);
+            return self.upper.write(cancellation, &upper, buf, offset);
         }
         match &file.layer {
-            OverlayFileLayer::Upper(handle) => self.upper.write(handle, buf, offset),
+            OverlayFileLayer::Upper(handle) => self.upper.write(cancellation, handle, buf, offset),
             // A writable open copies up first, so a lower-backed handle is read-only.
             OverlayFileLayer::Lower { .. } => Err(WriteError::NotForWriting),
         }
@@ -941,6 +950,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.seek_behavior(handle)
+        })
+    }
+
+    fn is_terminal(&self, h: &FileHandle) -> bool {
+        self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
+            backend.is_terminal(handle)
         })
     }
 
@@ -983,15 +998,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             let _rollback_result = self.upper.unlink_at(upper, name);
             return Err(unlink_to_open_error(error));
         }
-        let device = file.device();
-        Ok(FileHandle::from_typed_with_device::<Self>(
-            OverlayFile {
-                layer: OverlayFileLayer::Upper(file),
-                parent: path,
-                name: String::from(name),
-            },
-            device,
-        ))
+        Ok(FileHandle::from_typed::<Self>(OverlayFile {
+            layer: OverlayFileLayer::Upper(file),
+            parent: path,
+            name: String::from(name),
+        }))
     }
 
     fn mkdir_at(

@@ -58,7 +58,6 @@ pub use process::{
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
-use stdio::StdioProvider;
 use timer::TimerProvider;
 
 /// BrokerCore result type.
@@ -213,7 +212,6 @@ pub struct BrokerCore {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
-    pub(crate) stdio_provider: Arc<dyn StdioProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
     pub(crate) fs: Arc<dyn FileService>,
@@ -235,7 +233,6 @@ impl BrokerCore {
         policy: PolicyEngine,
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
-        stdio_provider: Arc<dyn StdioProvider>,
         timer_provider: Arc<dyn TimerProvider>,
         fs: Arc<dyn FileService>,
     ) -> Result<Self> {
@@ -244,7 +241,6 @@ impl BrokerCore {
             BrokerCoreLimits::DEFAULT,
             socket_provider,
             random_provider,
-            stdio_provider,
             timer_provider,
             fs,
         )
@@ -256,7 +252,6 @@ impl BrokerCore {
         limits: BrokerCoreLimits,
         socket_provider: Arc<dyn SocketProvider>,
         random_provider: Arc<dyn RandomProvider>,
-        stdio_provider: Arc<dyn StdioProvider>,
         timer_provider: Arc<dyn TimerProvider>,
         fs: Arc<dyn FileService>,
     ) -> Result<Self> {
@@ -277,7 +272,6 @@ impl BrokerCore {
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             random_provider,
-            stdio_provider,
             socket_provider,
             timer_provider,
             fs,

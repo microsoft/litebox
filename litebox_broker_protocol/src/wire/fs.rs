@@ -5,11 +5,11 @@ use core::num::NonZeroU64;
 
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-    FileOpenFlags, FileSeekWhence, FileStatus, FileUser, HandleFileStatusRequest, MkdirFileRequest,
-    OpenFileRequest, OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest,
-    ReadDirectoryResponse, ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest,
-    SeekFileResponse, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
-    file_type_from_raw, file_type_raw,
+    FileOpenFlags, FileSeekWhence, FileStatus, FileUser, HandleFileStatusRequest,
+    IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
+    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -31,6 +31,7 @@ const REQUEST_TAG_CHOWN: u8 = 9;
 const REQUEST_TAG_UNLINK: u8 = 10;
 const REQUEST_TAG_MKDIR: u8 = 11;
 const REQUEST_TAG_RMDIR: u8 = 12;
+const REQUEST_TAG_IS_TERMINAL: u8 = 13;
 
 const RESPONSE_TAG_OPEN: u8 = 0;
 const RESPONSE_TAG_READ: u8 = 1;
@@ -45,6 +46,7 @@ const RESPONSE_TAG_CHOWN: u8 = 9;
 const RESPONSE_TAG_UNLINK: u8 = 10;
 const RESPONSE_TAG_MKDIR: u8 = 11;
 const RESPONSE_TAG_RMDIR: u8 = 12;
+const RESPONSE_TAG_IS_TERMINAL: u8 = 13;
 const RESPONSE_TAG_FAILED: u8 = u8::MAX;
 
 const _: () = {
@@ -61,6 +63,7 @@ const _: () = {
     assert!(REQUEST_TAG_UNLINK == RESPONSE_TAG_UNLINK);
     assert!(REQUEST_TAG_MKDIR == RESPONSE_TAG_MKDIR);
     assert!(REQUEST_TAG_RMDIR == RESPONSE_TAG_RMDIR);
+    assert!(REQUEST_TAG_IS_TERMINAL == RESPONSE_TAG_IS_TERMINAL);
 };
 
 pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
@@ -110,6 +113,10 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
         }
         FileRequest::HandleStatus(request) => {
             encoder.u8(REQUEST_TAG_HANDLE_STATUS);
+            encoder.handle(request.handle);
+        }
+        FileRequest::IsTerminal(request) => {
+            encoder.u8(REQUEST_TAG_IS_TERMINAL);
             encoder.handle(request.handle);
         }
         FileRequest::Chmod(request) => {
@@ -189,6 +196,9 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
         REQUEST_TAG_HANDLE_STATUS => Ok(FileRequest::HandleStatus(HandleFileStatusRequest {
             handle: decoder.handle()?,
         })),
+        REQUEST_TAG_IS_TERMINAL => Ok(FileRequest::IsTerminal(IsTerminalFileRequest {
+            handle: decoder.handle()?,
+        })),
         REQUEST_TAG_CHMOD => Ok(FileRequest::Chmod(ChmodFileRequest {
             path: decoder.shared_buffer_sequence()?,
             user: decode_user(decoder)?,
@@ -249,6 +259,10 @@ pub(super) fn encode_fs_response(encoder: &mut Encoder, response: FileResponse) 
             encoder.u8(RESPONSE_TAG_HANDLE_STATUS);
             encode_status(encoder, status);
         }
+        FileResponse::IsTerminal(is_terminal) => {
+            encoder.u8(RESPONSE_TAG_IS_TERMINAL);
+            encoder.u8(u8::from(is_terminal));
+        }
         FileResponse::Chmod => encoder.u8(RESPONSE_TAG_CHMOD),
         FileResponse::Chown => encoder.u8(RESPONSE_TAG_CHOWN),
         FileResponse::Unlink => encoder.u8(RESPONSE_TAG_UNLINK),
@@ -282,6 +296,11 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
         })),
         RESPONSE_TAG_PATH_STATUS => Ok(FileResponse::PathStatus(decode_status(decoder)?)),
         RESPONSE_TAG_HANDLE_STATUS => Ok(FileResponse::HandleStatus(decode_status(decoder)?)),
+        RESPONSE_TAG_IS_TERMINAL => Ok(FileResponse::IsTerminal(match decoder.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(WireError::InvalidTag),
+        })),
         RESPONSE_TAG_CHMOD => Ok(FileResponse::Chmod),
         RESPONSE_TAG_CHOWN => Ok(FileResponse::Chown),
         RESPONSE_TAG_UNLINK => Ok(FileResponse::Unlink),
