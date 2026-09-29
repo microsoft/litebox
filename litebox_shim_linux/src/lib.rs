@@ -154,12 +154,12 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
         let old_page_end = current.next_multiple_of(PAGE_SIZE);
         let new_page_end = requested.next_multiple_of(PAGE_SIZE);
         if *current >= requested {
-            let length = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end)
-                .ok_or(MappingError::UnAligned)?;
-            let ptr =
-                <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(new_page_end);
-            if unsafe { self.vmem.remove_pages(ptr, length.as_usize()) }.is_err() {
-                return Ok(*current);
+            if let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end) {
+                let ptr =
+                    <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(new_page_end);
+                if unsafe { self.vmem.remove_pages(ptr, length.as_usize()) }.is_err() {
+                    return Ok(*current);
+                }
             }
             *current = requested;
             return Ok(requested);
