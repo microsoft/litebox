@@ -31,6 +31,15 @@ pub(super) fn pc(ctx: &PtRegs) -> usize {
     ctx.rip
 }
 
+/// Length of the native `SYSCALL` instruction.
+pub(super) const NATIVE_SYSCALL_INSTRUCTION_LEN: usize = 2;
+
+/// Moves `ctx`, a syscall's return, back to the syscall instruction with its number restored.
+pub(super) fn restart_syscall(ctx: &mut PtRegs, syscall_instruction_len: usize) {
+    ctx.rax = ctx.orig_rax;
+    ctx.rip = ctx.rip.wrapping_sub(syscall_instruction_len);
+}
+
 pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     let mut frame_addr = sp;
 

@@ -58,6 +58,25 @@ pub const TRAMPOLINE_CURSOR_ALIGN: usize = 1;
 #[cfg(target_arch = "aarch64")]
 pub const TRAMPOLINE_CURSOR_ALIGN: usize = aarch64::GATE_ALIGNMENT;
 
+/// Length of the `JMP [RIP + disp32]` through which an x86-64 ELF trampoline enters the syscall
+/// callback. The preceding `LEA RCX, [RIP + len]` points RCX, the callback's resume PC, just past it.
+const X86_64_SYSCALL_ENTRY_JMP_LEN: u8 = 6;
+
+/// `LEA RCX, [RIP + X86_64_SYSCALL_ENTRY_JMP_LEN]`, which precedes an x86-64 ELF trampoline's
+/// entry `JMP [RIP + disp32]`.
+const X86_64_LEA_RCX_RESUME_PC: [u8; 7] = [0x48, 0x8D, 0x0D, X86_64_SYSCALL_ENTRY_JMP_LEN, 0, 0, 0];
+
+/// Length of the guest instruction through which a rewritten Linux syscall enters the syscall
+/// callback.
+///
+/// The callback's resume PC immediately follows this instruction, so moving the PC back by this
+/// length, with the syscall's registers restored, reissues the syscall. On x86-64 it is the ELF
+/// trampoline's `JMP [RIP + disp32]`; on AArch64 it is the `B` that replaces the `SVC` in place.
+#[cfg(target_arch = "x86_64")]
+pub const SYSCALL_ENTRY_INSTRUCTION_LEN: usize = X86_64_SYSCALL_ENTRY_JMP_LEN as usize;
+#[cfg(target_arch = "aarch64")]
+pub const SYSCALL_ENTRY_INSTRUCTION_LEN: usize = aarch64::INSN_BYTES;
+
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -1339,9 +1358,9 @@ fn hook_syscalls_in_section(
         // LEA RCX, [RIP + 6] — load RCX with the address of the in-trampoline
         // `post_jmp` (the instruction immediately after the indirect JMP into
         // the callback). The SA_RESTART handler relies on the invariant that
-        // pt_regs.rcx - 6 points at the indirect JMP itself, so it can rewind
-        // ctx.rip and re-enter the callback.
-        trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
+        // pt_regs.rcx - X86_64_SYSCALL_ENTRY_JMP_LEN points at the indirect
+        // JMP itself, so it can rewind ctx.rip and re-enter the callback.
+        trampoline_data.extend_from_slice(&X86_64_LEA_RCX_RESUME_PC);
 
         // Add jmp [rip + offset_to_entry_point]
         trampoline_data.extend_from_slice(&[0xFF, 0x25]);
@@ -2428,8 +2447,9 @@ fn hook_syscall_and_after(
     // LEA RCX, [RIP + 6] — make RCX point at the instruction immediately
     // following the indirect JMP: the start of postsyscall_bytes (or, when
     // none, the unconditional JMP back to guest). The SA_RESTART handler
-    // relies on pt_regs.rcx - 6 pointing at the indirect JMP itself.
-    trampoline_data.extend_from_slice(&[0x48, 0x8D, 0x0D, 0x06, 0x00, 0x00, 0x00]);
+    // relies on pt_regs.rcx - X86_64_SYSCALL_ENTRY_JMP_LEN pointing at the
+    // indirect JMP itself.
+    trampoline_data.extend_from_slice(&X86_64_LEA_RCX_RESUME_PC);
     // Add jmp [rip + offset_to_entry_point]
     trampoline_data.extend_from_slice(&[0xFF, 0x25]);
     // RIP after this instruction = trampoline_base_addr + trampoline_data.len() + 4

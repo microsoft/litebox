@@ -1304,7 +1304,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `close`
     pub(crate) fn sys_close(&self, fd: i32) -> Result<(), Errno> {
         let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
-        self.do_close(raw_fd)
+        // Like Linux, an interrupted close does not restart: the descriptor is already gone.
+        self.do_close(raw_fd).map_err(Errno::without_restart)
     }
 
     /// Resolve a userland fd number into the subsystem that owns it.

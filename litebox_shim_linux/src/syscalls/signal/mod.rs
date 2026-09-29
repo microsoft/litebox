@@ -538,6 +538,51 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 /// A fault when delivering a signal.
 struct DeliverFault;
 
+/// How a syscall interrupted by a signal resumes once pending signals are processed.
+///
+/// Like Linux, the syscall restarts by moving the guest back to its syscall instruction, unless a
+/// signal handler interrupts it with `EINTR`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SyscallRestart {
+    /// From [`Errno::ERESTARTSYS`]: only a handler without `SA_RESTART` interrupts the syscall.
+    Sys,
+    /// From [`Errno::ERESTARTNOHAND`]: any handler interrupts the syscall.
+    NoHandler,
+}
+
+impl SyscallRestart {
+    /// Returns how a syscall that failed with `errno` restarts, if it does.
+    pub(crate) fn from_errno(errno: Errno) -> Option<Self> {
+        match errno {
+            Errno::ERESTARTSYS => Some(Self::Sys),
+            Errno::ERESTARTNOHAND => Some(Self::NoHandler),
+            _ => None,
+        }
+    }
+
+    /// Returns whether running `action`'s handler interrupts the syscall instead of restarting it.
+    fn is_interrupted_by(self, action: &SigAction) -> bool {
+        match self {
+            Self::Sys => !action.flags.contains(SaFlags::RESTART),
+            Self::NoHandler => true,
+        }
+    }
+}
+
+/// Returns the length of the guest instruction through which a syscall enters the shim, which
+/// immediately precedes the syscall's resume PC.
+///
+/// Guest syscalls are rewritten to enter through the rewriter's trampolines when the platform has a
+/// syscall entry point (see the ELF loader and mmap-time rewriting); otherwise the guest issues
+/// native syscall instructions.
+fn syscall_instruction_len(platform: &impl litebox::platform::SystemInfoProvider) -> usize {
+    if platform.get_syscall_entry_point() == 0 {
+        arch::NATIVE_SYSCALL_INSTRUCTION_LEN
+    } else {
+        litebox_syscall_rewriter::SYSCALL_ENTRY_INSTRUCTION_LEN
+    }
+}
+
 impl<Platform: ShimPlatform> Task<Platform> {
     pub(crate) fn with_temporary_signal_mask<R>(&self, mask: SigSet, f: impl FnOnce() -> R) -> R {
         let old = self.signals.blocked.get();
@@ -738,6 +783,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !thread_pending.is_empty() {
             return true;
         }
+        // Process-directed signals wait for the suspended vfork parent, so they must not
+        // interrupt the child: its restarted syscalls would be interrupted again forever.
+        if self.vfork.borrow().is_some() {
+            return false;
+        }
         let shared_pending = self.signals.shared_pending.lock().pending & !blocked;
         !shared_pending.is_empty()
     }
@@ -757,7 +807,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Deliver any pending signals.
-    pub(crate) fn process_signals(&self, ctx: &mut PtRegs) {
+    ///
+    /// If `restart` is set, `ctx` is the return from a syscall interrupted by a signal, which
+    /// restarts unless the first handler delivered interrupts it.
+    pub(crate) fn process_signals(&self, ctx: &mut PtRegs, mut restart: Option<SyscallRestart>) {
         loop {
             let blocked = self.signals.blocked.get();
             let (signal, siginfo) = {
@@ -796,6 +849,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 // then delivers.
                                 let signal = signal.as_i32().cast_unsigned();
                                 self.exit_vfork_child(ProcessExitStatus::Signaled { signal }, ctx);
+                                // `ctx` is now the parent's return from vfork.
+                                restart = None;
                                 continue;
                             }
                             // STOP is not currently supported, so treat as
@@ -817,6 +872,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 SIG_IGN => {}
                 _ => {
+                    // Resolve the syscall before the frame saves `ctx`, so a restarting syscall
+                    // is reissued when the handler returns.
+                    if restart
+                        .take()
+                        .is_some_and(|restart| !restart.is_interrupted_by(&action))
+                    {
+                        self.restart_syscall(ctx);
+                    }
                     let delivered =
                         arch::sigreturn_trampoline(self, &action).and_then(|trampoline| {
                             self.signals.deliver_signal(
@@ -837,6 +900,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
             }
         }
+        // No handler ran, so the interrupted syscall is invisible to the guest.
+        if restart.is_some() {
+            self.restart_syscall(ctx);
+        }
+    }
+
+    /// Moves `ctx` back to reissue its interrupted syscall.
+    fn restart_syscall(&self, ctx: &mut PtRegs) {
+        arch::restart_syscall(ctx, syscall_instruction_len(self.global.platform));
     }
 
     /// Check whether the process-wide alarm deadline has passed and, if so,

@@ -106,6 +106,16 @@ pub(super) fn pc(ctx: &PtRegs) -> usize {
     ctx.pc
 }
 
+/// Length of the native `SVC` instruction.
+pub(super) const NATIVE_SYSCALL_INSTRUCTION_LEN: usize = 4;
+
+/// Moves `ctx`, a syscall's return, back to the syscall instruction with its first argument
+/// restored.
+pub(super) fn restart_syscall(ctx: &mut PtRegs, syscall_instruction_len: usize) {
+    ctx.regs[0] = ctx.orig_x0;
+    ctx.pc = ctx.pc.wrapping_sub(syscall_instruction_len);
+}
+
 pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
     let frame_addr = sp.wrapping_sub(core::mem::size_of::<SignalFrame>());
     // Linux AArch64 signal entry requires a 16-byte-aligned stack pointer.
