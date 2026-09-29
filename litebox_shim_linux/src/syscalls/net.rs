@@ -40,6 +40,7 @@ use crate::syscalls::{
     file::AnyTypedFd,
     unix::{CSockUnixAddr, UnixSocket, UnixSocketAddr, UnixSocketSubsystem},
 };
+use crate::wait::wait_errno;
 use crate::{GlobalState, ShimPlatform, Task};
 use crate::{UserPtr, UserPtrMut, syscalls::signal};
 
@@ -67,16 +68,6 @@ fn socket_io_errno(error: TryOpError<Errno>) -> Errno {
     match error {
         TryOpError::WaitError(WaitError::TimedOut) => Errno::EAGAIN,
         error => error.into(),
-    }
-}
-
-/// Like Linux's `sock_intr_errno`, makes an interrupted socket wait with a `timeout` fail with
-/// `EINTR` instead of restarting.
-pub(super) fn socket_intr_errno(timeout: Option<core::time::Duration>, errno: Errno) -> Errno {
-    if timeout.is_some() {
-        errno.without_restart()
-    } else {
-        errno
     }
 }
 
@@ -892,7 +883,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             },
             || self.try_accept(fd, peer.as_deref_mut()),
         )
-        .map_err(|error| socket_intr_errno(recv_timeout, error.into()))
+        .map_err(|error| wait_errno(recv_timeout, error))
     }
 
     fn bind(&self, fd: &SocketFd<Platform>, sockaddr: SocketAddr) -> Result<(), Errno> {
@@ -929,7 +920,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         )
         .map_err(|err| match err {
             TryOpError::TryAgain => Errno::EINPROGRESS,
-            err => socket_intr_errno(send_timeout, err.into()),
+            err => wait_errno(send_timeout, err),
         })
     }
 
@@ -988,7 +979,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Err(e) => Err(TryOpError::Other(Errno::from(e))),
                 },
             )
-            .map_err(|error| socket_intr_errno(timeout, socket_io_errno(error)))
+            .map_err(|error| wait_errno(timeout, socket_io_errno(error)))
     }
 
     /// Receive data via socket channel (lock-free path).
@@ -1219,12 +1210,12 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Err(ChannelReadError::NotConnected) => Err(Errno::ENOTCONN),
                     Err(ChannelReadError::Socket(error)) => Err(error.into()),
                     Err(ChannelReadError::WouldBlock) => {
-                        Err(socket_intr_errno(timeout, socket_io_errno(error)))
+                        Err(wait_errno(timeout, socket_io_errno(error)))
                     }
                 }
             }
 
-            Err(error) => Err(socket_intr_errno(timeout, socket_io_errno(error))),
+            Err(error) => Err(wait_errno(timeout, socket_io_errno(error))),
         }
     }
 
@@ -1260,7 +1251,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Err(error) => Err(TryOpError::Other(Errno::from(error))),
                 },
             )
-            .map_err(|error| socket_intr_errno(socket.send_timeout, socket_io_errno(error)))
+            .map_err(|error| wait_errno(socket.send_timeout, socket_io_errno(error)))
     }
 
     pub(crate) fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
@@ -2549,7 +2540,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .0
                         .lock_interruptibly(&wait_cx)
                         .map_err(|error| {
-                            socket_intr_errno(timeout_duration.or(socket.recv_timeout), error)
+                            wait_errno(timeout_duration.or(socket.recv_timeout), error)
                         })?;
                     Some(guard)
                 }

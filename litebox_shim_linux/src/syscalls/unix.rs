@@ -34,7 +34,8 @@ use litebox_common_linux::{
 use crate::{
     FileFd, GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut,
     channel::{Channel, ReadEnd, WriteEnd},
-    syscalls::net::{SocketOptionValue, SocketOptions, socket_intr_errno},
+    syscalls::net::{SocketOptionValue, SocketOptions},
+    wait::wait_errno,
 };
 
 pub(crate) struct UnixSocketSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
@@ -840,7 +841,7 @@ impl<Platform: ShimPlatform> UnixStream<Platform> {
                     })
                 },
             )
-            .map_err(|error| socket_intr_errno(timeout, error.into()))
+            .map_err(|error| wait_errno(timeout, error))
     }
 
     fn recvfrom(
@@ -878,7 +879,7 @@ impl<Platform: ShimPlatform> UnixStream<Platform> {
                     })
                 },
             )
-            .map_err(|error| socket_intr_errno(timeout, error.into()));
+            .map_err(|error| wait_errno(timeout, error));
         match res {
             // Linux SO_RCVTIMEO expiry surfaces as `EAGAIN`, not `ETIMEDOUT`
             Err(Errno::ETIMEDOUT) => Err(Errno::EAGAIN),
@@ -985,7 +986,7 @@ impl<Platform: ShimPlatform> WriteEnd<Platform, DatagramMessage> {
                     Err((_, err)) => Err(TryOpError::Other(err)),
                 },
             )
-            .map_err(|error| socket_intr_errno(timeout, error.into()))
+            .map_err(|error| wait_errno(timeout, error))
     }
 }
 impl<Platform: ShimPlatform> ReadEnd<Platform, DatagramMessage> {
@@ -1220,7 +1221,7 @@ impl<Platform: ShimPlatform> UnixDatagram<Platform> {
                     recv_channel.try_read(buf, peek, source_addr.as_deref_mut())
                 },
             )
-            .map_err(|error| socket_intr_errno(timeout, error.into()));
+            .map_err(|error| wait_errno(timeout, error));
         // - Non-blocking + self-shutdown(SHUT_RD) with empty queue: Linux returns EAGAIN
         //   instead of EOF (datagram boundaries; no message synthesized for the absent peer).
         // - SO_RCVTIMEO expiry on a blocking recv: Linux returns EAGAIN, not ETIMEDOUT
@@ -1395,7 +1396,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
                 let send_timeout = self.options.lock().send_timeout;
                 stream
                     .connect(task, addr, self.get_status().contains(OFlags::NONBLOCK))
-                    .map_err(|error| socket_intr_errno(send_timeout, error))
+                    .map_err(|error| wait_errno(send_timeout, error))
             }
             UnixSocketInner::Datagram(datagram) => datagram.connect(task, addr),
         }
@@ -1417,7 +1418,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
                         self.get_status().contains(OFlags::NONBLOCK)
                             | flags.contains(SockFlags::NONBLOCK),
                     )
-                    .map_err(|error| socket_intr_errno(recv_timeout, error))?;
+                    .map_err(|error| wait_errno(recv_timeout, error))?;
                 Ok(UnixSocket::new_with_inner(accepted, flags))
             }
             UnixSocketInner::Datagram(_) => Err(Errno::EOPNOTSUPP),

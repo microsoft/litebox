@@ -61,16 +61,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 }
 
-/// Converts the error of a failed wait on `cx`.
+/// Converts the error of a failed wait with an optional `timeout`.
 ///
-/// An interrupted wait with a deadline fails with `EINTR`, as in Linux when a handler runs, since
-/// restarting it would restart its whole timeout.
-pub(crate) fn wait_errno<Platform: ShimPlatform>(
-    cx: &litebox::event::wait::WaitContext<'_, Platform>,
-    error: impl Into<Errno>,
-) -> Errno {
+/// Like Linux (e.g., `sock_intr_errno`), an interrupted wait with a timeout fails with `EINTR`
+/// instead of restarting, since restarting it would restart its whole timeout.
+pub(crate) fn wait_errno(timeout: Option<core::time::Duration>, error: impl Into<Errno>) -> Errno {
     let errno = error.into();
-    if cx.deadline().is_some() {
+    if timeout.is_some() {
         errno.without_restart()
     } else {
         errno

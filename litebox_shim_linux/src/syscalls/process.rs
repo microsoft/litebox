@@ -1918,11 +1918,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => {
                 warn_shared_futex!(flags);
                 let timeout = timeout.read::<Platform>()?;
-                let wait_cx = self.wait_cx().with_timeout(timeout);
                 self.global
                     .futex_manager
-                    .wait(&wait_cx, addr.to_platform_ptr::<Platform>(), val, None)
-                    .map_err(|error| wait_errno(&wait_cx, error))?;
+                    .wait(
+                        &self.wait_cx().with_timeout(timeout),
+                        addr.to_platform_ptr::<Platform>(),
+                        val,
+                        None,
+                    )
+                    .map_err(|error| wait_errno(timeout, error))?;
                 0
             }
             litebox_common_linux::FutexArgs::WaitBitset {
@@ -1933,7 +1937,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 bitmask,
             } => {
                 warn_shared_futex!(flags);
-                let deadline = if let Some(timeout) = timeout.read::<Platform>()? {
+                let timeout = timeout.read::<Platform>()?;
+                let deadline = if let Some(timeout) = timeout {
                     let clock_id =
                         if flags.contains(litebox_common_linux::FutexFlags::CLOCK_REALTIME) {
                             litebox_common_linux::ClockId::RealTime
@@ -1944,16 +1949,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     None
                 };
-                let wait_cx = self.wait_cx().with_deadline(deadline);
                 self.global
                     .futex_manager
                     .wait(
-                        &wait_cx,
+                        &self.wait_cx().with_deadline(deadline),
                         addr.to_platform_ptr::<Platform>(),
                         val,
                         core::num::NonZeroU32::new(bitmask),
                     )
-                    .map_err(|error| wait_errno(&wait_cx, error))?;
+                    .map_err(|error| wait_errno(timeout, error))?;
                 0
             }
             _ => unimplemented!("Unsupported futex operation"),
