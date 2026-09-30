@@ -286,33 +286,48 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     ///
     /// Raw ELF binaries are stored directly. Signed TAs are verified and unwrapped.
     pub(crate) fn store_embedded_ta(&self, ta_bin: &[u8]) -> bool {
-        if let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) {
-            return self
-                .embedded_ta_uuid_map
-                .insert(ta_head.uuid, ta_bin.into());
-        }
-
-        let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
-            return false;
-        };
-        self.embedded_ta_uuid_map.insert(ta_uuid, ta_elf.into())
+        self.store_ta(None, ta_bin, TaSource::BuiltIn)
     }
 
     /// Store the TA binary associated with the given TA UUID.
     ///
-    /// Built-in binaries are trusted raw ELF files. Dynamic binaries must be signed
-    /// and are verified before their inner ELF is cached.
+    /// Built-in binaries are trusted raw ELF files or verified signed TAs.
+    /// Dynamic binaries must be signed and are verified before their inner ELF is cached.
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
-    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
-        let Some((verified_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
-            return false;
+    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], source: TaSource) -> bool {
+        self.store_ta(Some(*ta_uuid), ta_bin, source)
+    }
+
+    fn store_ta(&self, expected_uuid: Option<TeeUuid>, ta_bin: &[u8], source: TaSource) -> bool {
+        let (ta_uuid, ta_elf) = match (source, expected_uuid) {
+            (TaSource::BuiltIn, Some(ta_uuid)) => (ta_uuid, ta_bin),
+            (TaSource::BuiltIn, None) => {
+                if let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) {
+                    (ta_head.uuid, ta_bin)
+                } else {
+                    let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key)
+                    else {
+                        return false;
+                    };
+                    (ta_uuid, ta_elf)
+                }
+            }
+            (TaSource::Dynamic, expected_uuid) => {
+                let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
+                    return false;
+                };
+                if expected_uuid.is_some_and(|expected_uuid| expected_uuid != ta_uuid) {
+                    return false;
+                }
+                (ta_uuid, ta_elf)
+            }
         };
-        if verified_uuid != *ta_uuid {
-            return false;
+        match source {
+            TaSource::BuiltIn => self.embedded_ta_uuid_map.insert(ta_uuid, ta_elf.into()),
+            TaSource::Dynamic => self.dynamic_ta_uuid_map.insert(ta_uuid, ta_elf.into()),
         }
-        self.dynamic_ta_uuid_map.insert(*ta_uuid, ta_elf.into())
     }
 
     /// Get the cached TA binary associated with the given TA UUID.
@@ -471,10 +486,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], source: TaSource) -> bool {
-        match source {
-            TaSource::BuiltIn => self.0.embedded_ta_uuid_map.insert(*ta_uuid, ta_bin.into()),
-            TaSource::Dynamic => self.0.store_ta_bin(ta_uuid, ta_bin),
-        }
+        self.0.store_ta_bin(ta_uuid, ta_bin, source)
     }
 
     /// Store a TA binary embedded in the runner image.
