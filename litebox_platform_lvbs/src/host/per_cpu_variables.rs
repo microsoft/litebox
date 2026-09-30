@@ -80,6 +80,10 @@ impl PerCpuVariables {
     pub const VTL1_XSAVE_MASK: u64 = 0b11; // let XSAVE and XRSTORE deal with x87 and SSE states
     // XSAVE area size for VTL1: 512 bytes (legacy x87+SSE area) + 64 bytes (XSAVE header)
     const VTL1_XSAVE_AREA_SIZE: usize = 512 + 64;
+    const XSAVE_MXCSR_OFFSET: usize = 24;
+    const XSAVE_HEADER_OFFSET: usize = 512;
+    const XSAVE_HEADER_SIZE: usize = 64;
+    const MXCSR_DEFAULT: u32 = 0x1f80;
 
     pub(crate) fn kernel_stack_top(&self) -> u64 {
         &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
@@ -324,9 +328,9 @@ pub struct PerCpuVariablesAsm {
     /// Upper 32 bits of VTL1 XSAVE mask (for edx in xsave/xrstor)
     vtl1_xsave_mask_hi: Cell<u32>,
     /// XSAVE/XRSTOR state tracking for VTL1 kernel:
-    ///   0: never saved - XSAVE uses plain xsave, XRSTOR skips
-    ///   1: saved but not restored - XSAVE uses plain xsave, XRSTOR executes and sets to 2
-    ///   2: restored at least once - XSAVE uses xsaveopt (safe), XRSTOR executes
+    ///   0: never saved - XSAVE sets to 1; XRSTOR loads init state and leaves at 0
+    ///   1: saved but not restored - use XSAVE; XRSTOR restores saved state and sets to 2
+    ///   2: restored saved state - use XSAVEOPT; XRSTOR restores saved state
     /// Reset to 0 at each VTL1 entry (OP-TEE SMC call) since returning to VTL0 invalidates CPU tracking.
     vtl1_kernel_xsaved: Cell<u8>,
     /// XSAVE/XRSTOR state tracking for VTL1 user (see `vtl1_kernel_xsaved` for state values and reset).
@@ -452,13 +456,34 @@ impl PerCpuVariablesAsm {
     pub fn get_user_context_top_addr(&self) -> usize {
         self.user_context_top_addr.get()
     }
-    /// Reset VTL1 xsaved flags to 0 at each VTL1 entry (OP-TEE SMC call).
+    /// Reset VTL1 xsaved flags and the user XSAVE area at each VTL1 entry (OP-TEE SMC call).
     /// This ensures:
-    /// - XRSTOR is skipped until XSAVE populates valid data (no spurious restores on fresh entry)
+    /// - User XRSTOR loads init state until XSAVE populates valid data
     /// - XSAVEOPT is only used after XRSTOR establishes tracking within this VTL1 invocation
     pub fn reset_vtl1_xsaved(&self) {
         self.vtl1_kernel_xsaved.set(0);
         self.vtl1_user_xsaved.set(0);
+
+        let area = self.vtl1_user_xsave_area_addr.get() as *mut u8;
+        debug_assert!(!area.is_null(), "user XSAVE area is not allocated");
+        if area.is_null() {
+            return;
+        }
+        // Safety: The user XSAVE area is a live, 64-byte-aligned allocation of
+        // at least 576 bytes, exclusively owned by this core. The offsets below
+        // are in bounds and aligned for their respective writes.
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "XSAVE areas are 64-byte aligned and each offset preserves the write alignment"
+        )]
+        unsafe {
+            area.add(PerCpuVariables::XSAVE_MXCSR_OFFSET)
+                .cast::<u32>()
+                .write(PerCpuVariables::MXCSR_DEFAULT);
+            // Clear XSTATE_BV, XCOMP_BV, and all reserved header bytes.
+            area.add(PerCpuVariables::XSAVE_HEADER_OFFSET)
+                .write_bytes(0, PerCpuVariables::XSAVE_HEADER_SIZE);
+        }
     }
 }
 
