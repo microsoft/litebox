@@ -2961,7 +2961,6 @@ mod tests {
         let write_only_random = broker
             .fs
             .open(
-                &source,
                 "/dev/urandom",
                 ROOT,
                 FileAccessMode::WriteOnly,
@@ -2971,14 +2970,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.read(&source, &write_only_random, &mut [0], None),
+            broker.fs.read(&write_only_random, &mut [0], None),
             Ok(Err(FileError::NotForReading))
         );
 
         let read_only_null = broker
             .fs
             .open(
-                &source,
                 "/dev/null",
                 ROOT,
                 FileAccessMode::ReadOnly,
@@ -2988,7 +2986,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.write(&source, &read_only_null, &[0], None),
+            broker.fs.write(&read_only_null, &[0], None),
             Ok(Err(FileError::NotForWriting))
         );
 
