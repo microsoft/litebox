@@ -234,13 +234,9 @@ impl VtlState {
     }
 }
 
-/// Initialize VTL switch for the current CPU.
-///
-/// It should be called once before entering the VTL switch loop.
+/// Register this CPU for VTL1 shootdowns after hypercall initialization,
+/// before shared mapping changes or the VTL switch loop.
 pub fn vtl_switch_init() {
-    // The VP is already in VTL1 when the runner calls this; register it
-    // in the mask so TLB flushes during the first VTL call dispatch
-    // target this VP.
     vtl1_vp_enter();
 }
 

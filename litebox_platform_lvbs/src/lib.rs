@@ -363,9 +363,8 @@ impl PageTableManager {
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
         let pt = unsafe { mm::PageTable::new_top_level() };
 
-        // Share the base page table's kernel intermediate tables (kernel PML4
-        // slots only). This is safe because the kernel mapping structure is
-        // fixed after boot; lower slots are not shared (see `copy_pml4_entries_from`).
+        // Share the fixed kernel hierarchy; CPU startup only unmaps guard leaves.
+        // Lower slots stay private (see `copy_pml4_entries_from`).
         pt.copy_pml4_entries_from(&self.base_page_table);
 
         let pt = Arc::new(pt);
