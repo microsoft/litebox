@@ -361,7 +361,7 @@ where
         let old_end = old_addr
             .as_usize()
             .checked_add(old_size)
-            .ok_or(RemapError::OutOfMemory)?;
+            .ok_or(RemapError::InvalidRange)?;
         let old_range =
             PageRange::new(old_addr.as_usize(), old_end).ok_or(RemapError::Unaligned)?;
         match unsafe {

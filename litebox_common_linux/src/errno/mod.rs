@@ -297,7 +297,8 @@ impl From<litebox::platform::page_mgmt::RemapError> for Errno {
     fn from(value: litebox::platform::page_mgmt::RemapError) -> Self {
         match value {
             litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform => Errno::ENOSYS,
-            litebox::platform::page_mgmt::RemapError::Unaligned
+            litebox::platform::page_mgmt::RemapError::InvalidRange
+            | litebox::platform::page_mgmt::RemapError::Unaligned
             | litebox::platform::page_mgmt::RemapError::Overlapping => Errno::EINVAL,
             litebox::platform::page_mgmt::RemapError::AlreadyAllocated
             | litebox::platform::page_mgmt::RemapError::AlreadyUnallocated => Errno::EFAULT,

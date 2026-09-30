@@ -282,6 +282,8 @@ pub enum DeallocationError {
 pub enum RemapError {
     #[error("native page remapping is not supported by this platform")]
     UnsupportedByPlatform,
+    #[error("provided address range is invalid")]
+    InvalidRange,
     #[error("at least one of the provided ranges was not page-aligned")]
     Unaligned,
     #[error("provided old range contains unallocated pages")]
