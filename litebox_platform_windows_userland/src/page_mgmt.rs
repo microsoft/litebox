@@ -346,10 +346,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         }
         Ok(())
     }
-
-    fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
-        self.reserved_pages.iter()
-    }
 }
 
 #[cfg(test)]
@@ -410,25 +406,6 @@ mod tests {
             range = (range.start + len)..range.end;
         }
         Ok(())
-    }
-
-    #[test]
-    fn test_reserved_pages() {
-        let platform = WindowsUserland::new();
-        let reserved_pages: Vec<_> =
-            <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::reserved_pages(platform)
-                .collect();
-
-        // Check that the reserved pages are not empty
-        assert!(!reserved_pages.is_empty(), "No reserved pages found");
-
-        // Check that the reserved pages are in order and non-overlapping
-        let mut prev = 0;
-        for page in reserved_pages {
-            assert!(page.start >= prev);
-            assert!(page.end > page.start);
-            prev = page.end;
-        }
     }
 
     #[test]
