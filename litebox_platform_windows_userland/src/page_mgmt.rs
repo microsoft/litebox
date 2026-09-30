@@ -200,7 +200,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     //
     // NOTE: make sure the values are PAGE_ALIGNED.
     const TASK_ADDR_MIN: usize = 0x1_0000;
-    const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+    const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_0000;
     const RESERVATION_ALIGNMENT: usize = 0x1_0000;
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Bidirectional;
 
@@ -235,6 +235,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
                     0..suggested_range.len(),
                     direction == AllocationDirection::TopDown,
                 )?;
+                debug_assert!(
+                    reservation.range().end
+                        <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+                );
                 let base = reservation.range().start;
                 assert!(
                     reservations

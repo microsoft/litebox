@@ -802,8 +802,13 @@ where
                 {
                     // Retry if the requested behavior is `Hint` but the suggested address is already
                     // in use and the platform does not support the required search direction.
+                    let rejected_hint = request
+                        .suggested_address
+                        .is_some_and(|address| address.as_usize() == new_addr);
                     request.suggested_address = None;
-                    if direction == Some(AllocationDirection::TopDown) {
+                    if rejected_hint {
+                        // The user-provided hint was rejected, so retry the full address range.
+                    } else if direction == Some(AllocationDirection::TopDown) {
                         request.address_range.end = new_addr;
                     } else {
                         request.address_range.start = new_addr
@@ -1321,23 +1326,31 @@ where
             return Ok(None);
         }
         if let Some(suggested_address) = request.suggested_address {
-            let end = suggested_address
-                .0
-                .checked_add(size)
-                .ok_or(AllocationError::AboveMaxAddress)?;
-            if suggested_address.0 < request.address_range.start {
-                return Err(AllocationError::BelowMinAddress);
-            }
-            if end > request.address_range.end {
-                return Err(AllocationError::AboveMaxAddress);
-            }
-            if request.behavior == FixedAddressBehavior::Replace
-                || !self.vmas.overlaps(&(suggested_address.0..end))
-            {
-                return Ok(Some(suggested_address.0));
-            }
-            if request.behavior == FixedAddressBehavior::NoReplace {
-                return Err(AllocationError::AddressInUse);
+            let end = suggested_address.0.saturating_add(size);
+            match request.behavior {
+                FixedAddressBehavior::Hint(_) => {
+                    if suggested_address.0 >= request.address_range.start
+                        && end <= request.address_range.end
+                        && !self.vmas.overlaps(&(suggested_address.0..end))
+                    {
+                        return Ok(Some(suggested_address.0));
+                    }
+                    // fall through if the hint cannot be used
+                }
+                FixedAddressBehavior::NoReplace | FixedAddressBehavior::Replace => {
+                    if suggested_address.0 < request.address_range.start {
+                        return Err(AllocationError::BelowMinAddress);
+                    }
+                    if end > request.address_range.end {
+                        return Err(AllocationError::AboveMaxAddress);
+                    }
+                    if request.behavior == FixedAddressBehavior::Replace
+                        || !self.vmas.overlaps(&(suggested_address.0..end))
+                    {
+                        return Ok(Some(suggested_address.0));
+                    }
+                    return Err(AllocationError::AddressInUse);
+                }
             }
         } else if !matches!(request.behavior, FixedAddressBehavior::Hint(_)) {
             return Err(AllocationError::BelowMinAddress);
@@ -1563,7 +1576,7 @@ mod tests {
         #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
         const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000;
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
-        const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
+        const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_0000;
         const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
             HintPlacementBehavior::Directional(if TOP_DOWN {
                 AllocationDirection::TopDown
@@ -1695,6 +1708,39 @@ mod tests {
                 address..address + PAGE_SIZE,
                 FixedAddressBehavior::Hint(AllocationDirection::TopDown),
             )]
+        );
+    }
+
+    #[test]
+    fn platform_rejected_hint_restarts_full_search() {
+        let suggested_address = DummyVmemBackend::<true>::TASK_ADDR_MAX - PAGE_SIZE;
+        let backend = dummy_backend::<true>(Some(suggested_address));
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+
+        let address = unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(suggested_address),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::empty(),
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(address, DummyVmemBackend::<true>::TASK_ADDR_MIN);
+        assert_eq!(
+            *backend.calls.lock(),
+            [
+                (
+                    suggested_address..suggested_address + PAGE_SIZE,
+                    FixedAddressBehavior::NoReplace,
+                ),
+                (
+                    address..address + PAGE_SIZE,
+                    FixedAddressBehavior::NoReplace,
+                ),
+            ]
         );
     }
 

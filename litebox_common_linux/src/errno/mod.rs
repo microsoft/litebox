@@ -237,10 +237,10 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
-            litebox::platform::page_mgmt::AllocationError::Unaligned
-            | litebox::platform::page_mgmt::AllocationError::AboveMaxAddress => Errno::EINVAL,
+            litebox::platform::page_mgmt::AllocationError::Unaligned => Errno::EINVAL,
             litebox::platform::page_mgmt::AllocationError::BelowMinAddress => Errno::EPERM,
             litebox::platform::page_mgmt::AllocationError::OutOfMemory
+            | litebox::platform::page_mgmt::AllocationError::AboveMaxAddress
             | litebox::platform::page_mgmt::AllocationError::AddressPartiallyInUse
             | litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform => {
                 Errno::ENOMEM
