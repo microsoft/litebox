@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   lvbs_smoke_test:
-    name: Run LVBS smoke test
+    name: LVBS Smoke Test
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
