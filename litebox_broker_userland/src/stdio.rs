@@ -175,8 +175,7 @@ impl StdioProvider for UserlandStdioProvider {
             StdioStream::Stdout => output_index(StdioOutputStream::Stdout),
             StdioStream::Stderr => output_index(StdioOutputStream::Stderr),
         };
-        let state = self.output.lock();
-        if state.queued < OUTPUT_CAPACITY || state.errors[index].is_some() {
+        if self.output.lock().writable(index) {
             ReadinessFlags::WRITE
         } else {
             ReadinessFlags::default()
@@ -246,6 +245,14 @@ struct OutputState {
     watchers: ReadinessWatchers,
 }
 
+impl OutputState {
+    /// Returns whether a write to the stream at `index` would not block, like
+    /// Linux pipes, which report writable only when a `PIPE_BUF` write fits.
+    fn writable(&self, index: usize) -> bool {
+        OUTPUT_CAPACITY - self.queued >= ATOMIC_WRITE_SIZE || self.errors[index].is_some()
+    }
+}
+
 fn read_host_input(input: &Shared<InputState>, mut host: Box<dyn Read + Send>) {
     let mut chunk = vec![0; INPUT_CHUNK_SIZE];
     loop {
@@ -297,7 +304,9 @@ fn write_host_output(output: &Shared<OutputState>, mut hosts: [Box<dyn Write + S
             state.errors[index] = Some(map_stdio_error(&error));
         }
         output.changed.notify_all();
-        state.watchers.publish(ReadinessFlags::WRITE);
+        if state.writable(index) {
+            state.watchers.publish(ReadinessFlags::WRITE);
+        }
     }
 }
 
@@ -491,6 +500,11 @@ mod tests {
         assert_eq!(
             provider.write(StdioOutputStream::Stderr, b"cde"),
             Err(StdioProviderError::WouldBlock)
+        );
+        // Streams are writable only when any small write would fit.
+        assert_eq!(
+            provider.readiness(StdioStream::Stderr),
+            ReadinessFlags::default()
         );
         assert_eq!(
             provider.write(StdioOutputStream::Stdout, &fill[..=ATOMIC_WRITE_SIZE]),
