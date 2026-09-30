@@ -19,7 +19,7 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use litebox_broker_core::{
     BrokerCore, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    stdio::UnsupportedStdioProvider,
+    stdio::{StdioProvider, UnsupportedStdioProvider},
     test_support::{FailingRandomProvider, TestBrokerCoreBuilder},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
@@ -56,13 +56,22 @@ pub(crate) fn litebox_with_broker_files(
     platform: &'static TestPlatform,
     entries: Vec<(String, InitialNode)>,
 ) -> (litebox::LiteBox<TestPlatform>, usize) {
+    litebox_with_broker_files_and_stdio(platform, entries, Arc::new(UnsupportedStdioProvider))
+}
+
+/// Like [`litebox_with_broker_files`], but the broker's `/dev` standard-I/O devices use `stdio`.
+pub(crate) fn litebox_with_broker_files_and_stdio(
+    platform: &'static TestPlatform,
+    entries: Vec<(String, InitialNode)>,
+    stdio: Arc<dyn StdioProvider>,
+) -> (litebox::LiteBox<TestPlatform>, usize) {
     let in_mem = litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(entries);
     let fs = litebox_broker_core::fs::composer::Composer::builder()
         .mount("/", |_| in_mem)
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(
                 allocator,
-                Arc::new(UnsupportedStdioProvider),
+                stdio,
                 Arc::new(FailingRandomProvider),
             )
         })

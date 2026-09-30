@@ -23,7 +23,7 @@ use crate::broker::error::BrokerControlError;
 use crate::broker::{BrokerControl, BrokerPollableRegistry, readiness_events};
 use crate::event::observer::Observer;
 use crate::event::polling::{Pollee, TryOpError};
-use crate::event::wait::{WaitContext, WaitState};
+use crate::event::wait::{WaitContext, WaitError};
 use crate::event::{Events, IOPollable};
 use crate::path::Arg;
 use crate::{LiteBox, sync};
@@ -37,85 +37,57 @@ use super::errors::{
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Read from a file descriptor at `offset` into a buffer.
     ///
-    /// Waits, uninterruptibly, while the file has nothing to read; see
-    /// [`read_file_with_wait`](Self::read_file_with_wait) for interruptible and nonblocking
-    /// reads.
+    /// While the file has nothing to read, waits through `wait`, or fails with
+    /// [`ReadError::WouldBlock`] if `wait` is `None`.
     pub fn read_file(
         &self,
         fd: &FileFd,
         buf: &mut [u8],
         offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, ReadError> {
-        let wait_state = WaitState::new(self.platform());
-        self.read_file_with_wait(&wait_state.context(), fd, buf, offset, false)
-            .map_err(uninterruptible)
-    }
-
-    /// Read from a file descriptor at `offset` into a buffer, waiting through `cx` while the file
-    /// has nothing to read unless `nonblock` is set.
-    pub fn read_file_with_wait(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        fd: &FileFd,
-        buf: &mut [u8],
-        offset: Option<usize>,
-        nonblock: bool,
-    ) -> Result<usize, TryOpError<ReadError>> {
-        let file = self
-            .broker_file(fd)
-            .ok_or(TryOpError::Other(ReadError::ClosedFd))?;
-        self.wait_on_file(cx, &file, nonblock, Events::IN, || {
+        let file = self.broker_file(fd).ok_or(ReadError::ClosedFd)?;
+        self.wait_on_file(wait, &file, Events::IN, || {
             read_broker_file(&file, buf, offset)
         })
+        .map_err(|error| try_op_error(error, ReadError::WouldBlock, ReadError::WaitError))
     }
 
-    /// Write all of a buffer to a file descriptor at `offset`.
+    /// Write from a buffer to a file descriptor at `offset`.
     ///
-    /// Waits, uninterruptibly, while the file cannot accept bytes; see
-    /// [`write_file_with_wait`](Self::write_file_with_wait) for interruptible and nonblocking
-    /// writes.
+    /// While the file cannot accept bytes, waits through `wait`, or fails with
+    /// [`WriteError::WouldBlock`] if `wait` is `None`. When waiting, keeps writing until the whole
+    /// buffer is written or a failure or interruption follows partial progress, which then returns
+    /// the bytes written.
     pub fn write_file(
         &self,
         fd: &FileFd,
         buf: &[u8],
         offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, WriteError> {
-        let wait_state = WaitState::new(self.platform());
-        self.write_file_with_wait(&wait_state.context(), fd, buf, offset, false)
-            .map_err(uninterruptible)
-    }
-
-    /// Write from a buffer to a file descriptor at `offset`, waiting through `cx` while the file
-    /// cannot accept bytes unless `nonblock` is set.
-    ///
-    /// Unless `nonblock` is set, keeps writing until the whole buffer is written or a failure or
-    /// interruption follows partial progress, which then returns the bytes written.
-    pub fn write_file_with_wait(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        fd: &FileFd,
-        buf: &[u8],
-        offset: Option<usize>,
-        nonblock: bool,
-    ) -> Result<usize, TryOpError<WriteError>> {
-        let file = self
-            .broker_file(fd)
-            .ok_or(TryOpError::Other(WriteError::ClosedFd))?;
+        let file = self.broker_file(fd).ok_or(WriteError::ClosedFd)?;
         let mut written = 0;
         loop {
             let rest = &buf[written..];
             let offset = offset.map(|offset| offset.saturating_add(written));
-            match self.wait_on_file(cx, &file, nonblock, Events::OUT, || {
+            match self.wait_on_file(wait, &file, Events::OUT, || {
                 write_broker_file(&file, rest, offset)
             }) {
                 Ok(count) => {
                     written += count;
-                    if nonblock || count == 0 || written == buf.len() {
+                    if wait.is_none() || count == 0 || written == buf.len() {
                         return Ok(written);
                     }
                 }
                 Err(_) if written != 0 => return Ok(written),
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(try_op_error(
+                        error,
+                        WriteError::WouldBlock,
+                        WriteError::WaitError,
+                    ));
+                }
             }
         }
     }
@@ -134,16 +106,20 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         }
     }
 
+    /// Runs `try_op` once, or, given `wait`, until it stops returning [`TryOpError::TryAgain`],
+    /// waiting for `events` on `file` in between.
     fn wait_on_file<R, E>(
         &self,
-        cx: &WaitContext<'_, Platform>,
+        wait: Option<&WaitContext<'_, Platform>>,
         file: &BrokerFile,
-        nonblock: bool,
         events: Events,
-        try_op: impl FnMut() -> Result<R, TryOpError<E>>,
+        mut try_op: impl FnMut() -> Result<R, TryOpError<E>>,
     ) -> Result<R, TryOpError<E>> {
+        let Some(cx) = wait else {
+            return try_op();
+        };
         cx.wait_on_events(
-            nonblock,
+            false,
             events,
             |observer, filter| {
                 self.file_pollee(file).register_observer(observer, filter);
@@ -591,14 +567,16 @@ fn write_broker_file(
     }
 }
 
-/// Returns the error that ended an uninterruptible wait without a deadline, which only ends with
-/// the operation's own result.
-fn uninterruptible<E>(error: TryOpError<E>) -> E {
+/// Returns the error for a failed file operation that may have waited.
+fn try_op_error<E>(
+    error: TryOpError<E>,
+    would_block: E,
+    wait_error: impl FnOnce(WaitError) -> E,
+) -> E {
     match error {
+        TryOpError::TryAgain => would_block,
+        TryOpError::WaitError(error) => wait_error(error),
         TryOpError::Other(error) => error,
-        TryOpError::TryAgain | TryOpError::WaitError(_) => {
-            unreachable!("uninterruptible waits end only with the operation's result")
-        }
     }
 }
 

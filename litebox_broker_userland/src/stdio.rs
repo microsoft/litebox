@@ -35,8 +35,8 @@ const ATOMIC_WRITE_SIZE: usize = 4096;
 /// A broker serving multiple runners will need association-specific stream
 /// endpoints instead of sharing process-wide standard streams.
 pub struct UserlandStdioProvider {
-    input: Arc<Shared<InputState>>,
-    output: Arc<Shared<OutputState>>,
+    input: Arc<HostIo<InputState>>,
+    output: Arc<HostIo<OutputState>>,
 }
 
 impl Default for UserlandStdioProvider {
@@ -52,14 +52,14 @@ impl UserlandStdioProvider {
         stderr: impl Write + Send + 'static,
     ) -> Self {
         Self {
-            input: Arc::new(Shared::new(InputState {
+            input: Arc::new(HostIo::new(InputState {
                 host: Some(Box::new(stdin)),
                 data: VecDeque::new(),
                 end: None,
                 wanted: false,
                 watchers: ReadinessWatchers::default(),
             })),
-            output: Arc::new(Shared::new(OutputState {
+            output: Arc::new(HostIo::new(OutputState {
                 hosts: Some([Box::new(stdout), Box::new(stderr)]),
                 queue: VecDeque::new(),
                 queued: 0,
@@ -196,12 +196,15 @@ impl StdioProvider for UserlandStdioProvider {
     }
 }
 
-struct Shared<State> {
+/// One direction of host standard I/O: its state, shared between broker
+/// requests and the thread performing the blocking host I/O, and a condition
+/// variable signalled when either side changes it.
+struct HostIo<State> {
     state: Mutex<State>,
     changed: Condvar,
 }
 
-impl<State> Shared<State> {
+impl<State> HostIo<State> {
     fn new(state: State) -> Self {
         Self {
             state: Mutex::new(state),
@@ -253,7 +256,7 @@ impl OutputState {
     }
 }
 
-fn read_host_input(input: &Shared<InputState>, mut host: Box<dyn Read + Send>) {
+fn read_host_input(input: &HostIo<InputState>, mut host: Box<dyn Read + Send>) {
     let mut chunk = vec![0; INPUT_CHUNK_SIZE];
     loop {
         let mut state = input.lock();
@@ -281,7 +284,7 @@ fn read_host_input(input: &Shared<InputState>, mut host: Box<dyn Read + Send>) {
     }
 }
 
-fn write_host_output(output: &Shared<OutputState>, mut hosts: [Box<dyn Write + Send>; 2]) {
+fn write_host_output(output: &HostIo<OutputState>, mut hosts: [Box<dyn Write + Send>; 2]) {
     loop {
         let mut state = output.lock();
         let (index, chunk) = loop {
@@ -397,18 +400,6 @@ mod tests {
             }
             state.writes.push((self.stream, input.to_vec()));
             Ok(input.len())
-        }
-
-        fn flush(&mut self) -> IoResult<()> {
-            Ok(())
-        }
-    }
-
-    struct BrokenOutput;
-
-    impl Write for BrokenOutput {
-        fn write(&mut self, _input: &[u8]) -> IoResult<usize> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
         }
 
         fn flush(&mut self) -> IoResult<()> {
@@ -536,157 +527,6 @@ mod tests {
         assert_eq!(
             provider.readiness(StdioStream::Stderr),
             ReadinessFlags::WRITE
-        );
-    }
-
-    #[test]
-    fn host_write_failures_stick_to_their_stream() {
-        let (_sender, receiver) = channel();
-        let output = GatedOutput::default();
-        output.open();
-        let provider = UserlandStdioProvider::with_host(
-            ChannelInput(receiver),
-            BrokenOutput,
-            output.stream(StdioOutputStream::Stderr),
-        );
-
-        assert_eq!(provider.write(StdioOutputStream::Stdout, b"a"), Ok(1));
-        provider.flush();
-        assert_eq!(
-            provider.write(StdioOutputStream::Stdout, b"b"),
-            Err(StdioProviderError::Closed)
-        );
-        assert_eq!(
-            provider.readiness(StdioStream::Stdout),
-            ReadinessFlags::WRITE
-        );
-        assert_eq!(provider.write(StdioOutputStream::Stderr, b"c"), Ok(1));
-        provider.flush();
-        assert_eq!(
-            output.writes(),
-            [(StdioOutputStream::Stderr, b"c".to_vec())]
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn stdio_devices_publish_host_readiness() {
-        use litebox_broker_core::fs::composer::Composer;
-        use litebox_broker_core::fs::devices::Devices;
-        use litebox_broker_core::fs::in_mem::InMem;
-        use litebox_broker_core::fs::resolver::Resolver;
-        use litebox_broker_core::readiness::ReadinessSink;
-        use litebox_broker_core::test_support::TestBrokerCoreBuilder;
-        use litebox_broker_core::{BrokerError, CallerCredential, ObjectRights, PolicyEngine};
-        use litebox_broker_platform_linux_userland::LinuxSyncPrimitivesProvider;
-        use litebox_broker_protocol::ObjectHandle;
-        use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
-
-        struct ChannelReadinessSink(Mutex<Sender<(ObjectHandle, ReadinessFlags)>>);
-
-        impl ReadinessSink for ChannelReadinessSink {
-            fn max_tracked_objects(&self) -> usize {
-                8
-            }
-
-            fn publish(
-                &self,
-                handle: ObjectHandle,
-                readiness: ReadinessFlags,
-            ) -> litebox_broker_core::Result<()> {
-                let _ = self.0.lock().unwrap().send((handle, readiness));
-                Ok(())
-            }
-
-            fn republish(
-                &self,
-                handle: ObjectHandle,
-                readiness: ReadinessFlags,
-            ) -> litebox_broker_core::Result<()> {
-                self.publish(handle, readiness)
-            }
-
-            fn retire(&self, _handle: ObjectHandle) {}
-        }
-
-        let (input, receiver) = channel();
-        let output = GatedOutput::default();
-        let provider = Arc::new(gated_provider(receiver, &output));
-        let fs = Composer::builder()
-            .mount("/", InMem::<LinuxSyncPrimitivesProvider>::new)
-            .mount("/dev", |allocator| {
-                Devices::new(
-                    allocator,
-                    provider.clone(),
-                    Arc::new(crate::random::UserlandRandomProvider),
-                )
-            })
-            .build()
-            .unwrap();
-        let process = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_file_service(Arc::new(Resolver::<LinuxSyncPrimitivesProvider, _>::new(
-            fs,
-        )))
-        .build()
-        .unwrap()
-        .create_process(CallerCredential::Unauthenticated, None)
-        .unwrap();
-        let (sender, published) = channel();
-        let sink: Arc<dyn ReadinessSink> = Arc::new(ChannelReadinessSink(Mutex::new(sender)));
-        let open = |path, access| {
-            litebox_broker_core::fs::open(
-                &process,
-                path,
-                FileUser::ROOT,
-                access,
-                FileOpenFlags::NONE,
-                FileMode::default(),
-                &sink,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let stdin = open("/dev/stdin", FileAccessMode::ReadOnly);
-        let stdout = open("/dev/stdout", FileAccessMode::WriteOnly);
-        let mut byte = [0];
-
-        assert_eq!(
-            litebox_broker_core::fs::read(&process, stdin, &mut byte, None),
-            Err(BrokerError::WouldBlock)
-        );
-        input.send(b"x".to_vec()).unwrap();
-        assert_eq!(
-            published.recv_timeout(TEST_TIMEOUT),
-            Ok((stdin, ReadinessFlags::READ))
-        );
-        assert_eq!(
-            litebox_broker_core::fs::read(&process, stdin, &mut byte, None),
-            Ok(Ok(1))
-        );
-        assert_eq!(&byte, b"x");
-
-        let chunk = [b'y'; 4096];
-        let mut written = 0;
-        while written < OUTPUT_CAPACITY {
-            written += litebox_broker_core::fs::write(&process, stdout, &chunk, None)
-                .unwrap()
-                .unwrap();
-        }
-        assert_eq!(
-            litebox_broker_core::fs::write(&process, stdout, &chunk, None),
-            Err(BrokerError::WouldBlock)
-        );
-        output.open();
-        assert_eq!(
-            published.recv_timeout(TEST_TIMEOUT),
-            Ok((stdout, ReadinessFlags::WRITE))
-        );
-        assert!(
-            litebox_broker_core::fs::write(&process, stdout, &chunk, None)
-                .unwrap()
-                .is_ok()
         );
     }
 }

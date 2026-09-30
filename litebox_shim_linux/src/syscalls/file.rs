@@ -802,15 +802,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
         let result = fd.dispatch(
             |fd| {
+                let cx = self.wait_cx();
+                let wait = (!self.global.file_nonblocking(fd)).then_some(&cx);
                 self.global
                     .litebox
-                    .read_file_with_wait(
-                        &self.wait_cx(),
-                        fd,
-                        &mut buf.borrow_mut(),
-                        offset,
-                        self.global.file_nonblocking(fd),
-                    )
+                    .read_file(fd, &mut buf.borrow_mut(), offset, wait)
                     .map_err(Errno::from)
             },
             |fd| {
@@ -908,15 +904,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let is_inet_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| {
+                let cx = self.wait_cx();
+                let wait = (!self.global.file_nonblocking(fd)).then_some(&cx);
                 self.global
                     .litebox
-                    .write_file_with_wait(
-                        &self.wait_cx(),
-                        fd,
-                        buf,
-                        offset,
-                        self.global.file_nonblocking(fd),
-                    )
+                    .write_file(fd, buf, offset, wait)
                     .map_err(Errno::from)
             },
             |fd| {
@@ -1039,17 +1031,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Errno::EINVAL
             };
             let read_result = match typed_in_fd.as_fs() {
-                Some(fd) => self
-                    .global
-                    .litebox
-                    .read_file_with_wait(
-                        &self.wait_cx(),
-                        fd,
-                        &mut kernel_buf[..to_read],
-                        cur_off,
-                        self.global.file_nonblocking(fd),
-                    )
-                    .map_err(Errno::from),
+                Some(fd) => {
+                    let cx = self.wait_cx();
+                    let wait = (!self.global.file_nonblocking(fd)).then_some(&cx);
+                    self.global
+                        .litebox
+                        .read_file(fd, &mut kernel_buf[..to_read], cur_off, wait)
+                        .map_err(Errno::from)
+                }
                 None => Err(non_fs_err),
             };
             let read_n = match read_result {

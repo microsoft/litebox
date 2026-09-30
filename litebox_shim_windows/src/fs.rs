@@ -8,6 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use litebox::LiteBox;
+use litebox::event::wait::WaitContext;
 #[cfg(test)]
 use litebox::fs::errors::ChmodError;
 use litebox::fs::errors::{
@@ -95,8 +96,9 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         fd: &FileFd,
         buf: &mut [u8],
         offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, ReadError> {
-        self.litebox.read_file(fd, buf, offset)
+        self.litebox.read_file(fd, buf, offset, wait)
     }
 
     pub(crate) fn write_file(
@@ -104,8 +106,9 @@ impl<Platform: crate::ShimPlatform> Fs<Platform> {
         fd: &FileFd,
         buf: &[u8],
         offset: Option<usize>,
+        wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, WriteError> {
-        self.litebox.write_file(fd, buf, offset)
+        self.litebox.write_file(fd, buf, offset, wait)
     }
 
     pub(crate) fn seek_file(

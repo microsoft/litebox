@@ -1130,7 +1130,7 @@ impl<Platform: crate::ShimPlatform> PeImageFile<Platform> {
         mut buf: &mut [u8],
     ) -> Result<(), PeImageAccessError> {
         while !buf.is_empty() {
-            let bytes_read = self.fs.read_file(&self.fd, buf, Some(offset))?;
+            let bytes_read = self.fs.read_file(&self.fd, buf, Some(offset), None)?;
             if bytes_read == 0 {
                 return Err(PeImageAccessError::ShortRead);
             }

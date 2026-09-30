@@ -2019,7 +2019,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 litebox_broker_protocol::fs::FileMode::empty(),
             )?;
             let mut header = [0u8; SHEBANG_MAX_LINE];
-            let n = match self.global.litebox.read_file(&file, &mut header, Some(0)) {
+            let n = match self
+                .global
+                .litebox
+                .read_file(&file, &mut header, Some(0), None)
+            {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = self.global.litebox.close_file(&file);

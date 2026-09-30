@@ -5,6 +5,8 @@
 
 use thiserror::Error;
 
+use crate::event::wait::WaitError;
+
 // XXX(jayb): We probably need to introduce a notion of `Stale` to many/most of these errors, in
 // order to more correctly support network-attached file systems.
 
@@ -43,6 +45,10 @@ pub enum ReadError {
     NotAFile,
     #[error("file not open for reading")]
     NotForReading,
+    #[error("read would block")]
+    WouldBlock,
+    #[error("wait error: {0}")]
+    WaitError(WaitError),
     #[error("I/O error")]
     Io,
 }
@@ -57,6 +63,10 @@ pub enum WriteError {
     NotAFile,
     #[error("file not open for writing")]
     NotForWriting,
+    #[error("write would block")]
+    WouldBlock,
+    #[error("wait error: {0}")]
+    WaitError(WaitError),
     #[error("I/O error")]
     Io,
 }

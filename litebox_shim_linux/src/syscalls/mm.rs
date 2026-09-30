@@ -765,7 +765,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
-        match self.global.litebox.read_file(&fd.0, &mut ehdr_buf, Some(0)) {
+        match self
+            .global
+            .litebox
+            .read_file(&fd.0, &mut ehdr_buf, Some(0), None)
+        {
             Ok(n) if n == ehdr_buf.len() => {}
             _ => return, // Not readable or short read, skip
         }
@@ -802,7 +806,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match self
             .global
             .litebox
-            .read_file(&fd.0, &mut phdrs_buf, Some(e_phoff))
+            .read_file(&fd.0, &mut phdrs_buf, Some(e_phoff), None)
         {
             Ok(n) if n == phdrs_buf.len() => {}
             _ => return,
@@ -1050,7 +1054,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let read = self
                 .global
                 .litebox
-                .read_file(fd, data, Some(offset))
+                .read_file(fd, data, Some(offset), None)
                 .map_err(Errno::from)?;
             if read == 0 {
                 return Err(Errno::EIO);
@@ -1078,7 +1082,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         match self
             .global
             .litebox
-            .read_file(fd, &mut tail, Some(tail_offset))
+            .read_file(fd, &mut tail, Some(tail_offset), None)
         {
             Ok(n) if n == TRAMPOLINE_HEADER_SIZE => {}
             _ => return (false, 0, 0, 0),
