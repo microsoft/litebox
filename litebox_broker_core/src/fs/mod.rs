@@ -33,8 +33,8 @@ pub use litebox_broker_protocol::fs::{
 };
 pub(crate) use service::File;
 pub use service::{
-    FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, mkdir, open,
-    path_status, read, read_directory, rmdir, seek, truncate, unlink, write,
+    FileResult, FileService, UnsupportedFileService, chmod, chown, handle_status, is_terminal,
+    mkdir, open, path_status, read, read_directory, rmdir, seek, truncate, unlink, write,
 };
 
 bitflags! {

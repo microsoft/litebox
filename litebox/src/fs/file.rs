@@ -19,8 +19,9 @@ use crate::path::Arg;
 use crate::{LiteBox, sync};
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WriteError,
+    ChmodError, ChownError, CloseError, FileStatusError, IsTerminalError, MkdirError, OpenError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
+    WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
@@ -276,6 +277,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
                 )
             })?
             .map_err(file_status_error)
+    }
+
+    /// Determine whether an open `fd` is connected to a terminal.
+    pub fn is_terminal(&self, fd: &FileFd) -> Result<bool, IsTerminalError> {
+        let file = self.broker_file(fd).ok_or(IsTerminalError::ClosedFd)?;
+        file.broker
+            .is_terminal_file(file.handle)
+            .map_err(|error| {
+                broker_fd_error(
+                    error,
+                    IsTerminalError::ClosedFd,
+                    IsTerminalError::Io,
+                    IsTerminalError::Io,
+                )
+            })?
+            .map_err(|_| IsTerminalError::Io)
     }
 }
 

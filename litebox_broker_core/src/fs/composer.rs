@@ -633,18 +633,12 @@ impl Backend for Composer {
                 self.mounts[mount_index]
                     .backend
                     .open_file_at(handle, name, flags)
-                    .map(|file| {
-                        let device = file.item.device();
-                        Permissioned {
-                            item: FileHandle::from_typed_with_device::<Self>(
-                                ComposerFileHandle {
-                                    mount_index,
-                                    handle: file.item,
-                                },
-                                device,
-                            ),
-                            permissions: file.permissions,
-                        }
+                    .map(|file| Permissioned {
+                        item: FileHandle::from_typed::<Self>(ComposerFileHandle {
+                            mount_index,
+                            handle: file.item,
+                        }),
+                        permissions: file.permissions,
                     })
             }
         }
@@ -719,6 +713,11 @@ impl Backend for Composer {
         }
     }
 
+    fn is_terminal(&self, h: &FileHandle) -> bool {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index].backend.is_terminal(&h.handle)
+    }
+
     fn create_file_at(
         &self,
         dir: DirHandle,
@@ -738,14 +737,10 @@ impl Backend for Composer {
                     .backend
                     .create_file_at(handle, name, metadata)
                     .map(|handle| {
-                        let device = handle.device();
-                        FileHandle::from_typed_with_device::<Self>(
-                            ComposerFileHandle {
-                                mount_index,
-                                handle,
-                            },
-                            device,
-                        )
+                        FileHandle::from_typed::<Self>(ComposerFileHandle {
+                            mount_index,
+                            handle,
+                        })
                     })
             }
         }

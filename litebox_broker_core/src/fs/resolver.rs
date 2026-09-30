@@ -942,6 +942,14 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         self.backend.status(entry.handle.as_ref())
     }
 
+    /// Whether an open entry refers to a terminal. Path-only entries never do.
+    pub fn is_terminal(&self, entry: &ResolverEntry<Backend>) -> bool {
+        match &entry.handle {
+            Handle::File(file) if !entry.path_only => self.backend.is_terminal(file),
+            Handle::File(_) | Handle::Dir(_) => false,
+        }
+    }
+
     /// Get static backing data for a file, if available and supported.
     ///
     /// This method returns the (entire) underlying static byte slice if the file's contents are
@@ -979,17 +987,6 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
 
     pub(crate) const fn allows_read(&self) -> bool {
         self.read_allowed
-    }
-
-    pub(crate) const fn allows_write(&self) -> bool {
-        self.write_allowed
-    }
-
-    pub(crate) fn device(&self) -> Option<super::devices::Device> {
-        match &self.handle {
-            Handle::File(file) => file.device(),
-            Handle::Dir(_) => None,
-        }
     }
 
     pub(crate) const fn uses_position(&self) -> bool {

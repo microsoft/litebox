@@ -27,7 +27,6 @@ pub mod platform;
 pub mod process;
 pub mod random;
 pub mod shim;
-pub mod stdio;
 pub mod sync;
 pub mod thread;
 pub mod tls;

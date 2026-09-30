@@ -36,7 +36,6 @@ mod fs;
 mod pipe;
 mod primitive;
 mod socket;
-mod stdio;
 mod timer;
 
 const REQUEST_TAG_NEGOTIATE: u8 = 0;
@@ -46,7 +45,6 @@ const REQUEST_TAG_PIPE: u8 = 3;
 const REQUEST_TAG_CHECK_READINESS: u8 = 4;
 const REQUEST_TAG_SOCKET: u8 = 5;
 const REQUEST_TAG_FILL_RANDOM: u8 = 6;
-const REQUEST_TAG_STDIO: u8 = 7;
 const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
@@ -74,7 +72,6 @@ const RESPONSE_TAG_PIPE: u8 = 3;
 const RESPONSE_TAG_READINESS: u8 = 4;
 const RESPONSE_TAG_SOCKET: u8 = 5;
 const RESPONSE_TAG_RANDOM_FILLED: u8 = 6;
-const RESPONSE_TAG_STDIO: u8 = 7;
 const RESPONSE_TAG_FILE: u8 = 8;
 const RESPONSE_TAG_CREATE_THREAD: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
@@ -140,7 +137,6 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_CHECK_READINESS
         | REQUEST_TAG_SOCKET
         | REQUEST_TAG_FILL_RANDOM
-        | REQUEST_TAG_STDIO
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
@@ -212,11 +208,6 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.u8(REQUEST_TAG_FILL_RANDOM);
             encoder.request_id(request_id);
             encoder.shared_buffer_sequence(buffer);
-        }
-        BrokerOperation::Stdio(request) => {
-            encoder.u8(REQUEST_TAG_STDIO);
-            encoder.request_id(request_id);
-            stdio::encode_stdio_request(&mut encoder, request);
         }
         BrokerOperation::File(request) => {
             encoder.u8(REQUEST_TAG_FILE);
@@ -292,7 +283,6 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_PIPE
         | REQUEST_TAG_SOCKET
         | REQUEST_TAG_FILL_RANDOM
-        | REQUEST_TAG_STDIO
         | REQUEST_TAG_FILE
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
@@ -319,7 +309,6 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_sequence()?),
-        REQUEST_TAG_STDIO => BrokerOperation::Stdio(stdio::decode_stdio_request(&mut decoder)?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
         REQUEST_TAG_START_CHILD_PROCESS => {
             let child_process_id = decoder.process_id()?;
@@ -435,7 +424,6 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_ERROR
         | RESPONSE_TAG_SOCKET
         | RESPONSE_TAG_RANDOM_FILLED
-        | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
@@ -523,11 +511,6 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_RANDOM_FILLED);
             encoder.request_id(request_id);
         }
-        BrokerResult::Stdio(response) => {
-            encoder.u8(RESPONSE_TAG_STDIO);
-            encoder.request_id(request_id);
-            stdio::encode_stdio_response(&mut encoder, response);
-        }
         BrokerResult::File(response) => {
             encoder.u8(RESPONSE_TAG_FILE);
             encoder.request_id(request_id);
@@ -591,7 +574,6 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_ERROR
         | RESPONSE_TAG_SOCKET
         | RESPONSE_TAG_RANDOM_FILLED
-        | RESPONSE_TAG_STDIO
         | RESPONSE_TAG_FILE
         | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
@@ -625,7 +607,6 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
-        RESPONSE_TAG_STDIO => BrokerResult::Stdio(stdio::decode_stdio_response(&mut decoder)?),
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted,
         RESPONSE_TAG_PROCESS_EXIT_STATUS => BrokerResult::ProcessExitStatus(ProcessTermination {
@@ -750,14 +731,14 @@ mod tests {
     use crate::fs::{
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
         FileOpenFlags, FileSeekWhence, FileStatus, FileType, FileUser, HandleFileStatusRequest,
-        MkdirFileRequest, OpenFileRequest, OpenFileResponse, PathFileStatusRequest,
-        ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest, ReadFileResponse,
-        RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
+        IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
+        PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
+        ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
         UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-        SocketRequest, SocketResponse, StdioRequest, StdioResponse, TimerRequest, TimerResponse,
+        SocketRequest, SocketResponse, TimerRequest, TimerResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -779,10 +760,6 @@ mod tests {
         SendToSocketRequest, SendToSocketResponse, SetTcpOptionRequest, ShutdownMode,
         ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketStatusRequest,
         SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
-    };
-    use crate::stdio::{
-        IsTerminalStdioRequest, IsTerminalStdioResponse, ReadStdioRequest, ReadStdioResponse,
-        StdioOutputStream, StdioStream, WriteStdioRequest, WriteStdioResponse,
     };
     use crate::timer::{
         CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
@@ -825,7 +802,6 @@ mod tests {
                 RESPONSE_TAG_READINESS,
                 RESPONSE_TAG_SOCKET,
                 RESPONSE_TAG_RANDOM_FILLED,
-                RESPONSE_TAG_STDIO,
                 RESPONSE_TAG_FILE,
                 RESPONSE_TAG_CREATE_THREAD,
                 RESPONSE_TAG_THREAD_EXITED,
@@ -845,7 +821,6 @@ mod tests {
                 REQUEST_TAG_CHECK_READINESS,
                 REQUEST_TAG_SOCKET,
                 REQUEST_TAG_FILL_RANDOM,
-                REQUEST_TAG_STDIO,
                 REQUEST_TAG_FILE,
                 REQUEST_TAG_CREATE_THREAD,
                 REQUEST_TAG_EXIT_THREAD,
@@ -945,26 +920,6 @@ mod tests {
                 buffer: sequence(15, 3),
             })),
             BrokerOperation::FillRandom(sequence(7, 256)),
-            BrokerOperation::Stdio(StdioRequest::Read(ReadStdioRequest {
-                buffer: sequence(4, 31),
-            })),
-            BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
-                stream: StdioOutputStream::Stdout,
-                buffer: sequence(6, 17),
-            })),
-            BrokerOperation::Stdio(StdioRequest::Write(WriteStdioRequest {
-                stream: StdioOutputStream::Stderr,
-                buffer: sequence(5, 23),
-            })),
-            BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
-                stream: StdioStream::Stdin,
-            })),
-            BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
-                stream: StdioStream::Stdout,
-            })),
-            BrokerOperation::Stdio(StdioRequest::IsTerminal(IsTerminalStdioRequest {
-                stream: StdioStream::Stderr,
-            })),
             BrokerOperation::File(FileRequest::Open(OpenFileRequest {
                 path: sequence(1, 7),
                 user: FileUser { user: 2, group: 3 },
@@ -1009,6 +964,7 @@ mod tests {
             BrokerOperation::File(FileRequest::HandleStatus(HandleFileStatusRequest {
                 handle,
             })),
+            BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest { handle })),
             BrokerOperation::File(FileRequest::Chmod(ChmodFileRequest {
                 path: sequence(6, 9),
                 user: FileUser { user: 2, group: 3 },
@@ -1472,14 +1428,6 @@ mod tests {
             ))),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::RandomFilled,
-            BrokerResult::Stdio(StdioResponse::Read(ReadStdioResponse { read: 11 })),
-            BrokerResult::Stdio(StdioResponse::Write(WriteStdioResponse { written: 17 })),
-            BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                is_terminal: false,
-            })),
-            BrokerResult::Stdio(StdioResponse::IsTerminal(IsTerminalStdioResponse {
-                is_terminal: true,
-            })),
             BrokerResult::File(FileResponse::Open(OpenFileResponse { handle })),
             BrokerResult::File(FileResponse::Read(ReadFileResponse { read: 11 })),
             BrokerResult::File(FileResponse::Write(WriteFileResponse { written: 17 })),
@@ -1519,6 +1467,8 @@ mod tests {
                 },
                 blksize: u64::MAX,
             })),
+            BrokerResult::File(FileResponse::IsTerminal(false)),
+            BrokerResult::File(FileResponse::IsTerminal(true)),
             BrokerResult::File(FileResponse::Chmod),
             BrokerResult::File(FileResponse::Chown),
             BrokerResult::File(FileResponse::Unlink),
@@ -1875,6 +1825,15 @@ mod tests {
         *invalid_next_index.last_mut().unwrap() = 2;
         assert_eq!(
             decode_response(&invalid_next_index),
+            Err(WireError::InvalidTag)
+        );
+        let mut invalid_is_terminal = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::File(FileResponse::IsTerminal(true)),
+        });
+        *invalid_is_terminal.last_mut().unwrap() = 2;
+        assert_eq!(
+            decode_response(&invalid_is_terminal),
             Err(WireError::InvalidTag)
         );
 

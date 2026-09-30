@@ -812,12 +812,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             return Err(OpenError::AlreadyExists);
         }
 
-        let (layer, permissions, device) = if entry.upper {
+        let (layer, permissions) = if entry.upper {
             let upper = resolved.upper.as_ref().ok_or(OpenError::Io)?;
             let walking = self.upper.walking_dir_at(upper).ok_or(OpenError::Io)?;
             let file = self.upper.open_file_at(walking, name, flags)?;
-            let device = file.item.device();
-            (OverlayFileLayer::Upper(file.item), file.permissions, device)
+            (OverlayFileLayer::Upper(file.item), file.permissions)
         } else {
             let layer = entry.lower.ok_or(OpenError::Io)?;
             let lower_dir = resolved.lowers[layer].as_ref().ok_or(OpenError::Io)?;
@@ -838,7 +837,6 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                 flags.difference(OFlags::CREAT)
             };
             let file = self.lowers[layer].open_file_at(walking, name, lower_flags)?;
-            let device = file.item.device();
             // The file's own identity, which is also the key a later copy-up records itself under.
             let status = self.lowers[layer]
                 .status(HandleRef::File(&file.item))
@@ -863,7 +861,7 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                     mode: status.mode,
                     owner: status.owner,
                 });
-                (OverlayFileLayer::Upper(upper), permissions, device)
+                (OverlayFileLayer::Upper(upper), permissions)
             } else {
                 let node = self.map_node(&mut self.state.lock().ids, Some(layer), status.node_info);
                 (
@@ -873,20 +871,16 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
                         node,
                     },
                     file.permissions,
-                    device,
                 )
             }
         };
 
         Ok(Permissioned {
-            item: FileHandle::from_typed_with_device::<Self>(
-                OverlayFile {
-                    layer,
-                    parent: path,
-                    name: String::from(name),
-                },
-                device,
-            ),
+            item: FileHandle::from_typed::<Self>(OverlayFile {
+                layer,
+                parent: path,
+                name: String::from(name),
+            }),
             permissions,
         })
     }
@@ -944,6 +938,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         })
     }
 
+    fn is_terminal(&self, h: &FileHandle) -> bool {
+        self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
+            backend.is_terminal(handle)
+        })
+    }
+
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {
         match h {
             HandleRef::File(handle) => {
@@ -983,15 +983,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
             let _rollback_result = self.upper.unlink_at(upper, name);
             return Err(unlink_to_open_error(error));
         }
-        let device = file.device();
-        Ok(FileHandle::from_typed_with_device::<Self>(
-            OverlayFile {
-                layer: OverlayFileLayer::Upper(file),
-                parent: path,
-                name: String::from(name),
-            },
-            device,
-        ))
+        Ok(FileHandle::from_typed::<Self>(OverlayFile {
+            layer: OverlayFileLayer::Upper(file),
+            parent: path,
+            name: String::from(name),
+        }))
     }
 
     fn mkdir_at(

@@ -16,14 +16,12 @@ use litebox_broker_core::{
         tar_ro::{EMPTY_TAR_FILE, TarRo},
     },
     random::{RandomProvider, RandomProviderError},
+    stdio::StdioOutputStream,
     test_support::{TestBrokerCoreBuilder, TestStdioProvider},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{
-    fs::{FileMode, FileUser},
-    stdio::StdioOutputStream,
-};
+use litebox_broker_protocol::fs::{FileMode, FileUser};
 use litebox_platform_macos_userland::MacosUserland4K;
 use litebox_shim_linux::LinuxShimBuilder;
 use std::{
@@ -103,14 +101,15 @@ pub(crate) fn setup(
                 allocators.next(),
             )
         })
-        .mount("/dev", Devices::new)
+        .mount("/dev", |allocator| {
+            Devices::new(allocator, stdio.clone(), Arc::new(TestRandomProvider))
+        })
         .build()
         .map_err(|error| anyhow!("test filesystem: {error:?}"))?;
     let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
     .with_random_provider(Arc::new(TestRandomProvider))
-    .with_stdio_provider(stdio.clone())
     .with_file_service(Arc::new(Resolver::<MacosUserland4K, _>::new(fs)))
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;

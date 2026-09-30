@@ -19,7 +19,8 @@ use alloc::{string::String, sync::Arc, vec::Vec};
 use litebox_broker_core::{
     BrokerCore, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
-    test_support::TestBrokerCoreBuilder,
+    stdio::UnsupportedStdioProvider,
+    test_support::{FailingRandomProvider, TestBrokerCoreBuilder},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
@@ -58,7 +59,13 @@ pub(crate) fn litebox_with_broker_files(
     let in_mem = litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(entries);
     let fs = litebox_broker_core::fs::composer::Composer::builder()
         .mount("/", |_| in_mem)
-        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+        .mount("/dev", |allocator| {
+            litebox_broker_core::fs::devices::Devices::new(
+                allocator,
+                Arc::new(UnsupportedStdioProvider),
+                Arc::new(FailingRandomProvider),
+            )
+        })
         .build()
         .unwrap();
     let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(

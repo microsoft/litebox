@@ -1538,6 +1538,7 @@ mod tests {
         release_pending_reference,
     };
     use crate::readiness::ReadinessSink;
+    use crate::stdio::StdioOutputStream;
     use crate::test_platform::TestPlatform;
     use crate::test_support::{TestBrokerCoreBuilder, TestStdioProvider};
     use crate::{
@@ -1550,7 +1551,6 @@ mod tests {
     };
     use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessTermination};
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::stdio::StdioOutputStream;
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
     use std::{sync::Arc, vec, vec::Vec};
 
@@ -2961,7 +2961,6 @@ mod tests {
         let write_only_random = broker
             .fs
             .open(
-                &source,
                 "/dev/urandom",
                 ROOT,
                 FileAccessMode::WriteOnly,
@@ -2971,14 +2970,13 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.read(&source, &write_only_random, &mut [0], None),
+            broker.fs.read(&write_only_random, &mut [0], None),
             Ok(Err(FileError::NotForReading))
         );
 
         let read_only_null = broker
             .fs
             .open(
-                &source,
                 "/dev/null",
                 ROOT,
                 FileAccessMode::ReadOnly,
@@ -2988,7 +2986,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            broker.fs.write(&source, &read_only_null, &[0], None),
+            broker.fs.write(&read_only_null, &[0], None),
             Ok(Err(FileError::NotForWriting))
         );
 
@@ -3005,26 +3003,20 @@ mod tests {
         let duplicated_stdout = source
             .duplicate_object_reference_to(stdout, &target, ObjectRights::WRITE)
             .unwrap();
-        source.request_cancellation();
         assert_eq!(
             crate::fs::write(&source, stdout, b"source", None),
-            Ok(Err(FileError::Io))
+            Ok(Ok(6))
         );
-        let stdio_input =
-            vec![b'x'; litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize + 1];
         assert_eq!(
-            crate::fs::write(&target, duplicated_stdout, &stdio_input, None),
-            Ok(Ok(
-                litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize
-            ))
+            crate::fs::write(&target, duplicated_stdout, b"target", None),
+            Ok(Ok(6))
         );
         assert_eq!(
             stdio_provider.writes(),
-            vec![(
-                StdioOutputStream::Stdout,
-                stdio_input[..litebox_broker_protocol::stdio::MAX_STDIO_TRANSFER_SIZE as usize]
-                    .to_vec()
-            )]
+            vec![
+                (StdioOutputStream::Stdout, b"source".to_vec()),
+                (StdioOutputStream::Stdout, b"target".to_vec()),
+            ]
         );
         assert_eq!(source.close_object_reference(stdout), Ok(()));
         assert_eq!(target.close_object_reference(duplicated_stdout), Ok(()));
@@ -3033,12 +3025,18 @@ mod tests {
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
+        let stdio_provider = Arc::new(TestStdioProvider::default());
         let fs = crate::fs::composer::Composer::builder()
             .mount("/", crate::fs::in_mem::InMem::<TestPlatform>::new)
-            .mount("/dev", crate::fs::devices::Devices::new)
+            .mount("/dev", |allocator| {
+                crate::fs::devices::Devices::new(
+                    allocator,
+                    stdio_provider.clone(),
+                    Arc::new(crate::random::TestRandomProvider),
+                )
+            })
             .build()
             .unwrap();
-        let stdio_provider = Arc::new(TestStdioProvider::default());
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_socket_policy(SocketPolicy::guest_network()),
@@ -3057,7 +3055,6 @@ mod tests {
         )
         .with_socket_provider(socket_provider.clone())
         .with_random_provider(Arc::new(crate::random::TestRandomProvider))
-        .with_stdio_provider(stdio_provider.clone())
         .with_file_service(Arc::new(
             crate::fs::resolver::Resolver::<TestPlatform, _>::new(fs),
         ))

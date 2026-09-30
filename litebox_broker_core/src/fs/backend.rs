@@ -8,7 +8,6 @@ use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
 
-use super::devices::Device;
 use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
@@ -132,6 +131,12 @@ pub trait Backend: Send + Sync + Any {
     /// Status of an open file or directory handle.
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError>;
 
+    /// Whether an open file handle refers to a terminal.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn is_terminal(&self, h: &FileHandle) -> bool {
+        false
+    }
+
     /// Create a new file at `parent` with the given `name` and metadata.
     fn create_file_at(
         &self,
@@ -192,7 +197,6 @@ pub struct WalkingDirHandle<'a> {
 #[derive(Clone)]
 pub struct FileHandle {
     raw: Box<dyn AnyCloneSendSync>,
-    device: Option<Device>,
 }
 
 /// An owned handle to an open directory
@@ -276,21 +280,9 @@ impl<'a> WalkingDirHandle<'a> {
 impl FileHandle {
     /// Erase the concrete type of the handle.
     pub fn from_typed<B: BackendHandles>(handle: B::FileHandle) -> Self {
-        Self::from_typed_with_device::<B>(handle, None)
-    }
-
-    pub(super) fn from_typed_with_device<B: BackendHandles>(
-        handle: B::FileHandle,
-        device: Option<Device>,
-    ) -> Self {
         Self {
             raw: Box::new(handle),
-            device,
         }
-    }
-
-    pub(crate) const fn device(&self) -> Option<Device> {
-        self.device
     }
 
     /// Borrow the concrete handle stored in this erased handle.

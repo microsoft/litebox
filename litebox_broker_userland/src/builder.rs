@@ -4,9 +4,9 @@
 //! Structured configuration for constructing a userland broker core.
 //!
 //! [`BrokerCoreBuilder`] selects the platform socket provider, the
-//! cross-platform getrandom-backed random provider, the inherited-stdio
-//! provider, and the thread-backed timer provider, and applies whatever platform setup a deployment needs before its
-//! first association is served (for example, Linux lock-tracing
+//! cross-platform getrandom-backed random provider, and the thread-backed
+//! timer provider, and applies whatever platform setup a deployment needs
+//! before its first association is served (for example, Linux lock-tracing
 //! initialization). This is what lets an in-process caller construct the same
 //! [`BrokerCore`] the userland broker binary does, from a structured
 //! configuration rather than from `CliArgs`.
@@ -19,12 +19,11 @@ use litebox_broker_core::socket::SocketProvider;
 use litebox_broker_core::{BrokerCore, BrokerCoreLimits, BrokerError, PolicyEngine};
 
 use crate::random::UserlandRandomProvider;
-use crate::stdio::UserlandStdioProvider;
 use crate::timer::UserlandTimerProvider;
 
 /// Failure constructing a userland [`BrokerCore`].
 ///
-/// Platform setup, such as creating a socket provider or spawning stdio pump
+/// Platform setup, such as creating a socket provider or spawning timer
 /// threads, fails with [`std::io::Error`]. A rejected core configuration, such
 /// as attempting to construct a second core in one process, fails with
 /// [`BrokerError`]. Keeping these distinct lets a caller decide whether a
@@ -126,7 +125,6 @@ impl BrokerCoreBuilder {
             self.limits,
             socket_provider,
             Arc::new(UserlandRandomProvider),
-            Arc::new(UserlandStdioProvider::new()?),
             Arc::new(UserlandTimerProvider::new()?),
             self.fs,
         )?;

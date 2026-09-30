@@ -1800,60 +1800,75 @@ mod overlay {
 mod devices {
     use super::{Mode, OFlags, Resolver, TestPlatform, USER};
     use crate::fs::composer::Composer;
-    use crate::fs::devices::{Device, Devices};
-    use crate::fs::errors::{OpenError, PathError, ReadError, WriteError};
+    use crate::fs::devices::Devices;
+    use crate::fs::errors::{OpenError, PathError};
+    use crate::random::TestRandomProvider;
+    use crate::stdio::{StdioOutputStream, StdioStream};
+    use crate::test_support::TestStdioProvider;
+    use alloc::sync::Arc;
     use alloc::vec;
 
-    fn devices_fs() -> Resolver<TestPlatform, Composer> {
+    fn devices_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
         Resolver::new(
             Composer::builder()
-                .mount("/dev", Devices::new)
+                .mount("/dev", |allocator| {
+                    Devices::new(allocator, provider, Arc::new(TestRandomProvider))
+                })
                 .build()
                 .unwrap(),
         )
     }
 
-    /// Stdio devices hold no data of their own: every non-empty transfer needs the process's
-    /// device I/O, and fails when the process cannot service it.
+    /// Device I/O and terminal queries reach the providers the backend was built with.
     #[test]
-    fn stdio_requires_broker() {
-        let fs = devices_fs();
+    fn devices_use_their_providers() {
+        let provider = Arc::new(TestStdioProvider::default().with_terminal(StdioStream::Stdout));
+        let fs = devices_fs(provider.clone());
 
-        let mut fd_stdout = fs
+        let mut stdout = fs
             .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        assert_eq!(fd_stdout.device(), Some(Device::Stdout));
-        assert!(matches!(fs.write(&mut fd_stdout, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&mut fd_stdout, b"Hello, stdout!", None),
-            Err(WriteError::Io)
-        ));
-        drop(fd_stdout);
-
-        let mut fd_stderr = fs
+        assert!(matches!(fs.write(&mut stdout, b"", None), Ok(0)));
+        assert!(matches!(fs.write(&mut stdout, b"out", None), Ok(3)));
+        let mut stderr = fs
             .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stderr");
-        assert!(matches!(fs.write(&mut fd_stderr, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&mut fd_stderr, b"Hello, stderr!", None),
-            Err(WriteError::Io)
-        ));
-        drop(fd_stderr);
+        assert!(matches!(fs.write(&mut stderr, b"err", None), Ok(3)));
+        assert_eq!(
+            provider.writes(),
+            vec![
+                (StdioOutputStream::Stdout, b"out".to_vec()),
+                (StdioOutputStream::Stderr, b"err".to_vec()),
+            ]
+        );
 
-        let mut fd_stdin = fs
+        provider.push_input(b"in");
+        let mut stdin = fs
             .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
-        assert!(matches!(fs.read(&mut fd_stdin, &mut [], None), Ok(0)));
-        let mut buffer = vec![0; 13];
-        assert!(matches!(
-            fs.read(&mut fd_stdin, &mut buffer, None),
-            Err(ReadError::Io)
-        ));
+        let mut buffer = [0; 4];
+        assert!(matches!(fs.read(&mut stdin, &mut buffer, None), Ok(2)));
+        assert_eq!(&buffer[..2], b"in");
+
+        let mut urandom = fs
+            .open(USER, "/dev/urandom", OFlags::RDONLY, Mode::empty())
+            .expect("Failed to open /dev/urandom");
+        assert!(matches!(fs.read(&mut urandom, &mut buffer, None), Ok(4)));
+        assert_eq!(buffer, [0x5a; 4]);
+
+        assert!(fs.is_terminal(&stdout));
+        assert!(!fs.is_terminal(&stderr));
+        assert!(!fs.is_terminal(&stdin));
+        assert!(!fs.is_terminal(&urandom));
+        let stdout_path = fs
+            .open(USER, "/dev/stdout", OFlags::PATH, Mode::empty())
+            .expect("Failed to open /dev/stdout with O_PATH");
+        assert!(!fs.is_terminal(&stdout_path));
     }
 
     #[test]
     fn non_dev_path_fails() {
-        let fs = devices_fs();
+        let fs = devices_fs(Arc::new(TestStdioProvider::default()));
 
         // Attempt to open a non-/dev/* path
         assert!(matches!(
@@ -1867,11 +1882,14 @@ mod composed {
     use super::{InMem, Mode, OFlags, Resolver, TestPlatform, USER, UserInfo};
     use crate::fs::composer::Composer;
     use crate::fs::devices::Devices;
-    use crate::fs::errors::{ReadError, WriteError};
     use crate::fs::in_mem::InitialNode;
+    use crate::random::TestRandomProvider;
+    use crate::stdio::StdioOutputStream;
+    use crate::test_support::TestStdioProvider;
+    use alloc::sync::Arc;
     use alloc::vec;
 
-    fn composed_fs() -> Resolver<TestPlatform, Composer> {
+    fn composed_fs(provider: Arc<TestStdioProvider>) -> Resolver<TestPlatform, Composer> {
         Resolver::new(
             Composer::builder()
                 .mount("/", |_| {
@@ -1883,50 +1901,40 @@ mod composed {
                         },
                     )])
                 })
-                .mount("/dev", Devices::new)
+                .mount("/dev", |allocator| {
+                    Devices::new(allocator, provider, Arc::new(TestRandomProvider))
+                })
                 .build()
                 .unwrap(),
         )
     }
 
     #[test]
-    fn stdio_requires_broker() {
-        let fs = composed_fs();
+    fn stdio_reaches_mounted_devices() {
+        let provider = Arc::new(TestStdioProvider::default());
+        let fs = composed_fs(provider.clone());
 
         let mut fd_stdout = fs
             .open(USER, "/dev/stdout", OFlags::WRONLY, Mode::empty())
             .expect("Failed to open /dev/stdout");
-        assert!(matches!(fs.write(&mut fd_stdout, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&mut fd_stdout, b"Hello, composed stdout!", None),
-            Err(WriteError::Io)
-        ));
-        drop(fd_stdout);
+        assert!(matches!(fs.write(&mut fd_stdout, b"composed", None), Ok(8)));
+        assert_eq!(
+            provider.writes(),
+            vec![(StdioOutputStream::Stdout, b"composed".to_vec())]
+        );
 
-        let mut fd_stderr = fs
-            .open(USER, "/dev/stderr", OFlags::WRONLY, Mode::empty())
-            .expect("Failed to open /dev/stderr");
-        assert!(matches!(fs.write(&mut fd_stderr, b"", None), Ok(0)));
-        assert!(matches!(
-            fs.write(&mut fd_stderr, b"Hello, composed stderr!", None),
-            Err(WriteError::Io)
-        ));
-        drop(fd_stderr);
-
+        provider.push_input(b"input");
         let mut fd_stdin = fs
             .open(USER, "/dev/stdin", OFlags::RDONLY, Mode::empty())
             .expect("Failed to open /dev/stdin");
-        assert!(matches!(fs.read(&mut fd_stdin, &mut [], None), Ok(0)));
         let mut buffer = vec![0; 1024];
-        assert!(matches!(
-            fs.read(&mut fd_stdin, &mut buffer, None),
-            Err(ReadError::Io)
-        ));
+        assert!(matches!(fs.read(&mut fd_stdin, &mut buffer, None), Ok(5)));
+        assert_eq!(&buffer[..5], b"input");
     }
 
     #[test]
     fn write_to_non_dev() {
-        let fs = composed_fs();
+        let fs = composed_fs(Arc::new(TestStdioProvider::default()));
 
         // Test file creation
         let path = "/testfile";

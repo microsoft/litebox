@@ -22,8 +22,8 @@ pub mod readiness;
 pub mod runner;
 pub mod runtime;
 
-mod random;
-mod stdio;
+pub mod random;
+pub mod stdio;
 mod timer;
 
 const WORKER_COUNT: usize = 8;

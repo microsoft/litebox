@@ -13,14 +13,12 @@ use litebox_broker_core::{
         in_mem::{InMem, InitialNode},
         resolver::Resolver,
     },
-    test_support::{TestBrokerCoreBuilder, TestStdioProvider},
+    stdio::StdioOutputStream,
+    test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
 };
 use litebox_broker_host::test_support::InProcessBrokerSetup;
 use litebox_broker_local::BrokerLocal;
-use litebox_broker_protocol::{
-    fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser},
-    stdio::StdioOutputStream,
-};
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags, FileUser};
 use litebox_platform_macos_userland::MacosUserland;
 use litebox_shim_macos::MacosShimBuilder;
 use std::{
@@ -69,13 +67,14 @@ pub(crate) fn setup(
     let fs = InMem::<MacosUserland>::new_initialized(initial_nodes);
     let fs = Composer::builder()
         .mount("/", |_| fs)
-        .mount("/dev", Devices::new)
+        .mount("/dev", |allocator| {
+            Devices::new(allocator, stdio.clone(), Arc::new(FailingRandomProvider))
+        })
         .build()
         .map_err(|error| anyhow!("test filesystem: {error:?}"))?;
     let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
         ObjectRights::all(),
     ))
-    .with_stdio_provider(stdio.clone())
     .with_file_service(Arc::new(Resolver::<MacosUserland, _>::new(fs)))
     .build()
     .map_err(|error| anyhow!("test broker: {error:?}"))?;

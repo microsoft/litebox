@@ -208,6 +208,16 @@ pub enum FileStatusError {
     PathError(#[from] PathError),
 }
 
+/// Possible errors from [`crate::LiteBox::is_terminal`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum IsTerminalError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("I/O error")]
+    Io,
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {

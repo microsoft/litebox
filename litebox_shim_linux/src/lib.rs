@@ -555,9 +555,21 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
         for (raw_fd, fd, stream) in [
-            (0, stdin, litebox::stdio::StdioStream::Stdin),
-            (1, stdout, litebox::stdio::StdioStream::Stdout),
-            (2, stderr, litebox::stdio::StdioStream::Stderr),
+            (
+                0,
+                stdin,
+                litebox_common_linux::program_startup::StdioStream::Stdin,
+            ),
+            (
+                1,
+                stdout,
+                litebox_common_linux::program_startup::StdioStream::Stdout,
+            ),
+            (
+                2,
+                stderr,
+                litebox_common_linux::program_startup::StdioStream::Stderr,
+            ),
         ] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
             debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);

@@ -8,10 +8,10 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     ChmodFileRequest, ChownFileRequest, DirectoryPayloadError, DirectoryTransferError,
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, HandleFileStatusRequest, MAX_FILE_TRANSFER_SIZE, MkdirFileRequest,
-    OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest, ReadFileRequest,
-    RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
-    try_decode_directory_entries,
+    FileStatus, FileUser, HandleFileStatusRequest, IsTerminalFileRequest, MAX_FILE_TRANSFER_SIZE,
+    MkdirFileRequest, OpenFileRequest, PathFileStatusRequest, ReadDirectoryRequest,
+    ReadFileRequest, RmdirFileRequest, SeekFileRequest, TruncateFileRequest, UnlinkFileRequest,
+    WriteFileRequest, try_decode_directory_entries,
 };
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, FileRequest, FileResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
@@ -264,6 +264,24 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Determines whether an open file is connected to a terminal.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another file operation.
+    pub fn is_terminal_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<FileOperationResult<bool>, Channel::Error> {
+        match self.request_file(FileRequest::IsTerminal(IsTerminalFileRequest { handle }))? {
+            FileResponse::IsTerminal(is_terminal) => Ok(Ok(is_terminal)),
+            FileResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected file terminal-query response: {response:?}")
+            }
+        }
+    }
+
     /// Changes mode bits for an absolute path.
     ///
     /// # Panics
@@ -482,6 +500,7 @@ mod tests {
                 next_index: None,
             })),
             BrokerResult::File(FileResponse::Failed(FileError::NotForReading)),
+            BrokerResult::File(FileResponse::IsTerminal(true)),
         ]);
         let memory = Arc::new(TestSharedMemory::new(SHARED_BUFFER_POOL_SIZE));
         memory
@@ -551,6 +570,7 @@ mod tests {
             local.handle_file_status(handle).unwrap(),
             Err(FileError::NotForReading)
         );
+        assert_eq!(local.is_terminal_file(handle).unwrap(), Ok(true));
 
         assert!(matches!(
             local.channel.sent_operations.borrow().as_slice(),
@@ -562,7 +582,10 @@ mod tests {
                 BrokerOperation::File(FileRequest::PathStatus(_)),
                 BrokerOperation::File(FileRequest::ReadDirectory(_)),
                 BrokerOperation::File(FileRequest::HandleStatus(_)),
-            ]
+                BrokerOperation::File(FileRequest::IsTerminal(IsTerminalFileRequest {
+                    handle: sent_handle,
+                })),
+            ] if *sent_handle == handle
         ));
     }
 

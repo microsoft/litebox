@@ -167,12 +167,13 @@ impl<Platform: ShimPlatform> DescriptorRef<Platform> {
             DescriptorRef::File(weak) => {
                 // TODO: File polling returns dummy events for now, but distinguish stdio enough for REPLs.
                 let handle = global.litebox.descriptor_table().upgrade(weak)?;
-                let events = match handle
-                    .with_entry_metadata(|stream: &litebox::stdio::StdioStream| *stream)
-                {
-                    Some(litebox::stdio::StdioStream::Stdin) => Events::IN,
+                let events = match handle.with_entry_metadata(
+                    |stream: &litebox_common_linux::program_startup::StdioStream| *stream,
+                ) {
+                    Some(litebox_common_linux::program_startup::StdioStream::Stdin) => Events::IN,
                     Some(
-                        litebox::stdio::StdioStream::Stdout | litebox::stdio::StdioStream::Stderr,
+                        litebox_common_linux::program_startup::StdioStream::Stdout
+                        | litebox_common_linux::program_startup::StdioStream::Stderr,
                     )
                     | None => Events::OUT,
                 };

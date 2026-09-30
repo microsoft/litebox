@@ -391,6 +391,16 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::IsTerminalError> for Errno {
+    fn from(value: litebox::fs::errors::IsTerminalError) -> Self {
+        match value {
+            litebox::fs::errors::IsTerminalError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::IsTerminalError::Io => Errno::EIO,
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::net::errors::SocketError> for Errno {
     fn from(value: litebox::net::errors::SocketError) -> Self {
         match value {

@@ -1336,7 +1336,6 @@ fn test_broker_with_policy(
         reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         reserved_sockets: Arc::new(AtomicUsize::new(0)),
         random_provider: Arc::new(crate::random::TestRandomProvider),
-        stdio_provider: Arc::new(crate::stdio::UnsupportedStdioProvider),
         socket_provider,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),
         fs: Arc::new(crate::fs::UnsupportedFileService),

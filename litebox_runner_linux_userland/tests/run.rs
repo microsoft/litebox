@@ -32,16 +32,12 @@ struct CapturingStdioProvider {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
-    fn is_terminal(
-        &self,
-        _stream: litebox_broker_protocol::stdio::StdioStream,
-    ) -> Result<bool, litebox_broker_core::stdio::StdioProviderError> {
-        Err(litebox_broker_core::stdio::StdioProviderError::Unsupported)
+    fn is_terminal(&self, _stream: litebox_broker_core::stdio::StdioStream) -> bool {
+        false
     }
 
     fn read(
         &self,
-        _cancellation: &litebox_broker_core::AssociationCancellation,
         _output: &mut [u8],
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
         Err(litebox_broker_core::stdio::StdioProviderError::Unsupported)
@@ -49,11 +45,10 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 
     fn write(
         &self,
-        _cancellation: &litebox_broker_core::AssociationCancellation,
-        stream: litebox_broker_protocol::stdio::StdioOutputStream,
+        stream: litebox_broker_core::stdio::StdioOutputStream,
         input: &[u8],
     ) -> Result<usize, litebox_broker_core::stdio::StdioProviderError> {
-        if stream == litebox_broker_protocol::stdio::StdioOutputStream::Stdout {
+        if stream == litebox_broker_core::stdio::StdioOutputStream::Stdout {
             self.stdout_tx
                 .send(input.to_vec())
                 .map_err(|_| litebox_broker_core::stdio::StdioProviderError::Failed)?;
@@ -949,6 +944,7 @@ fn spawn_concurrent_test_broker(
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 fn test_file_service(
     file_roots: &[PathBuf],
+    stdio: std::sync::Arc<dyn litebox_broker_core::stdio::StdioProvider>,
 ) -> std::sync::Arc<dyn litebox_broker_core::fs::FileService> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1025,7 +1021,13 @@ fn test_file_service(
         .mount("/", |_| {
             InMem::<LinuxSyncPrimitivesProvider>::new_initialized(entries)
         })
-        .mount("/dev", litebox_broker_core::fs::devices::Devices::new)
+        .mount("/dev", |allocator| {
+            litebox_broker_core::fs::devices::Devices::new(
+                allocator,
+                stdio,
+                std::sync::Arc::new(TestRandomProvider),
+            )
+        })
         .build()
         .unwrap();
     std::sync::Arc::new(Resolver::<LinuxSyncPrimitivesProvider, _>::new(backend))
@@ -1067,8 +1069,10 @@ fn spawn_test_broker_with_mode(
                     .expect("failed to create broker test socket provider"),
                 ))
                 .with_random_provider(std::sync::Arc::new(TestRandomProvider))
-                .with_stdio_provider(std::sync::Arc::new(CapturingStdioProvider { stdout_tx }))
-                .with_file_service(test_file_service(&file_roots))
+                .with_file_service(test_file_service(
+                    &file_roots,
+                    std::sync::Arc::new(CapturingStdioProvider { stdout_tx }),
+                ))
                 .build()
                 .expect("failed to create broker core");
             ready_tx.send(()).expect("failed to report broker ready");
