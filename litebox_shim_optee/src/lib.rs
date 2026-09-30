@@ -11,7 +11,7 @@ extern crate alloc;
 use crate::loader::elf::ElfLoaderError;
 use crate::syscalls::pta::PseudoTa;
 use aes::{Aes128, Aes192, Aes256};
-use alloc::{sync::Arc, vec};
+use alloc::{boxed::Box, sync::Arc, vec};
 use core::{cell::Cell, ops::Deref};
 use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
@@ -225,6 +225,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             ta_uuid_map: ta_uuid_map(),
             ta_signing_cert: self.ta_signing_cert,
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
+            page_table_keepalive: None,
         });
         OpteeShim(global)
     }
@@ -255,6 +256,9 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// blocking/queuing the caller until the PTA is free. We currently reject
     /// instead of serialize; revisit if a PTA needs true serialization.
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
+    /// Keeps the TA page table alive; declared last to drop after all other shim state.
+    // TODO: Replace type erasure with a typed platform page-table handle.
+    page_table_keepalive: Option<Box<dyn Send + Sync>>,
 }
 
 impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
@@ -322,6 +326,21 @@ impl<Platform: OpteeShimPlatform> Clone for OpteeShim<Platform> {
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
+    /// Keeps the TA page table alive until all other shim state is dropped.
+    /// Must be called before the shim is shared.
+    #[must_use]
+    pub fn with_page_table_keepalive<T: Send + Sync + 'static>(
+        mut self,
+        page_table: T,
+    ) -> Option<Self> {
+        let global = Arc::get_mut(&mut self.0)?;
+        if global.page_table_keepalive.is_some() {
+            return None;
+        }
+        global.page_table_keepalive = Some(Box::new(page_table));
+        Some(self)
+    }
+
     /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
     /// by `ta_uuid`.
     ///
@@ -413,22 +432,6 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Get the TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
-    }
-
-    /// Release all user-space memory mappings owned by this shim instance.
-    ///
-    /// This must be called before switching to the base page table and deleting
-    /// the task page table so that every mapped physical page is properly freed.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that no references to the released memory regions
-    /// are held after this call.
-    pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox_common_linux::vmem::VmFlags| true;
-        unsafe {
-            let _ = self.memory_manager().release_memory(release);
-        }
     }
 }
 
