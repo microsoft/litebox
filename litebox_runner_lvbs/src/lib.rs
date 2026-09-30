@@ -228,7 +228,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
     per_cpu_variables::allocate_xsave_area();
 
     if let Err(e) = hvcall::init(is_bsp) {
-        panic!("Err: {:?}", e);
+        panic!("Err: {e:?}");
     }
     gdt::init();
     interrupts::init_idt();
