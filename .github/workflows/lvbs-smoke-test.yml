@@ -6,9 +6,6 @@ on:
       - opened
       - synchronize
       - reopened
-  pull_request:
-    types:
-      - synchronize
 
 permissions:
   contents: read
