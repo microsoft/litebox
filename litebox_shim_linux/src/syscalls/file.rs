@@ -125,7 +125,7 @@ fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), O
         _ => return Err(OpenError::AccessNotAllowed),
     };
     let mut output = FileOpenFlags::NONE;
-    for (guest, broker) in [
+    for (linux, file) in [
         (OFlags::CREAT, FileOpenFlags::CREATE),
         (OFlags::TRUNC, FileOpenFlags::TRUNCATE),
         (OFlags::NOCTTY, FileOpenFlags::NO_CONTROLLING_TERMINAL),
@@ -137,8 +137,8 @@ fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), O
         (OFlags::APPEND, FileOpenFlags::APPEND),
         (OFlags::PATH, FileOpenFlags::PATH),
     ] {
-        if flags.contains(guest) {
-            output = output.union(broker);
+        if flags.contains(linux) {
+            output = output.union(file);
         }
     }
     Ok((access, output))
@@ -156,13 +156,13 @@ fn file_status_flags<Platform: ShimPlatform>(
         FileAccessMode::ReadWrite => OFlags::RDWR,
         _ => return Err(Errno::EIO),
     };
-    for (broker, guest) in [
+    for (file, linux) in [
         (FileOpenFlags::NONBLOCKING, OFlags::NONBLOCK),
         (FileOpenFlags::APPEND, OFlags::APPEND),
         (FileOpenFlags::PATH, OFlags::PATH),
     ] {
-        if status.flags.contains(broker) {
-            flags |= guest;
+        if status.flags.contains(file) {
+            flags |= linux;
         }
     }
     Ok(flags)
@@ -176,20 +176,20 @@ fn set_file_status_flags<Platform: ShimPlatform>(
     mask: OFlags,
     flags: OFlags,
 ) -> Result<(), Errno> {
-    let mut broker_mask = FileOpenFlags::NONE;
-    let mut broker_flags = FileOpenFlags::NONE;
-    for (guest, broker) in [
+    let mut file_mask = FileOpenFlags::NONE;
+    let mut file_flags = FileOpenFlags::NONE;
+    for (linux, file) in [
         (OFlags::NONBLOCK, FileOpenFlags::NONBLOCKING),
         (OFlags::APPEND, FileOpenFlags::APPEND),
     ] {
-        if mask.contains(guest) {
-            broker_mask = broker_mask.union(broker);
-            if flags.contains(guest) {
-                broker_flags = broker_flags.union(broker);
+        if mask.contains(linux) {
+            file_mask = file_mask.union(file);
+            if flags.contains(linux) {
+                file_flags = file_flags.union(file);
             }
         }
     }
-    litebox.set_file_status_flags(fd, broker_mask, broker_flags)?;
+    litebox.set_file_status_flags(fd, file_mask, file_flags)?;
     Ok(())
 }
 
