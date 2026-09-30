@@ -267,6 +267,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
+            let needs_temporary_write = !prot.contains(ProtFlags::PROT_WRITE);
+            let range = ptr.as_usize()..ptr.as_usize() + len;
+            if needs_temporary_write {
+                // SAFETY: This freshly allocated mapping is being initialized before returning it.
+                unsafe {
+                    self.global.platform.update_permissions(
+                        range.clone(),
+                        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                    )
+                }
+                .expect("failed to make file mapping writable for initialization");
+            }
             // Note a malicious user may unmap ptr while we are reading.
             // `sys_read` does not handle page faults, so we need to use a
             // temporary buffer to read the data from fs (without worrying page
@@ -296,6 +308,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .unwrap();
                 copied += size;
                 file_offset += size;
+            }
+            if needs_temporary_write {
+                // SAFETY: Initialization is complete and no further accesses are made here.
+                unsafe {
+                    self.global
+                        .platform
+                        .update_permissions(range, MemoryRegionPermissions::from(prot))
+                }
+                .expect("failed to restore file mapping permissions after initialization");
             }
             Ok(copied)
         };

@@ -266,7 +266,7 @@ impl<const ALIGN: usize> core::ops::Add<usize> for NonZeroPageSize<ALIGN> {
     type Output = Option<Self>;
 
     fn add(self, rhs: usize) -> Self::Output {
-        NonZeroPageSize::new(self.size + rhs)
+        NonZeroPageSize::new(self.size.checked_add(rhs)?)
     }
 }
 
@@ -766,7 +766,7 @@ where
             } else {
                 0
             })
-        .unwrap();
+        .ok_or(AllocationError::OutOfMemory)?;
         let behavior = FixedAddressBehavior::from(flags);
         let direction = match behavior {
             FixedAddressBehavior::Hint(direction) => Some(direction),
@@ -849,7 +849,10 @@ where
             .get_key_value(&range.start)
             .ok_or(VmemResizeError::NotExist(range.start))?;
 
-        let new_end = range.start + new_size.as_usize();
+        let new_end = range
+            .start
+            .checked_add(new_size.as_usize())
+            .ok_or(VmemResizeError::OutOfMemory)?;
         match new_end.cmp(&range.end) {
             core::cmp::Ordering::Equal => {
                 // no change
@@ -1139,21 +1142,25 @@ where
         if suggested_start.is_none() && !matches!(behavior, FixedAddressBehavior::Hint(_)) {
             return Err(CowAllocationError::InternalFailure);
         }
-        if let Some(start) = suggested_start {
-            let end = start
-                .checked_add(source_data.len())
-                .ok_or(CowAllocationError::Unaligned)?;
-            if start < Platform::TASK_ADDR_MIN || end > Platform::TASK_ADDR_MAX {
-                return Err(CowAllocationError::InternalFailure);
+        let suggested_start = if let Some(start) = suggested_start {
+            if !start.is_multiple_of(ALIGN) {
+                return Err(CowAllocationError::Unaligned);
             }
-            let requested =
-                PageRange::<ALIGN>::new(start, end).ok_or(CowAllocationError::Unaligned)?;
-            if behavior == FixedAddressBehavior::NoReplace && self.vmas.overlaps(&requested.into())
-            {
-                return Err(CowAllocationError::InternalFailure);
+            match start.checked_add(source_data.len()) {
+                Some(end) if start >= Platform::TASK_ADDR_MIN && end <= Platform::TASK_ADDR_MAX => {
+                    if behavior == FixedAddressBehavior::NoReplace
+                        && self.vmas.overlaps(&(start..end))
+                    {
+                        return Err(CowAllocationError::InternalFailure);
+                    }
+                    start
+                }
+                _ if matches!(behavior, FixedAddressBehavior::Hint(_)) => 0,
+                _ => return Err(CowAllocationError::InternalFailure),
             }
-        }
-        let suggested_start = suggested_start.unwrap_or(0);
+        } else {
+            0
+        };
 
         let ptr = self.platform.try_allocate_cow_pages(
             suggested_start,

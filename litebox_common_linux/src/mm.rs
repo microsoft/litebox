@@ -358,8 +358,12 @@ where
         may_move: bool,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
         let mut vmem = self.vmem.write();
-        let old_range = PageRange::new(old_addr.as_usize(), old_addr.as_usize() + old_size)
-            .ok_or(RemapError::Unaligned)?;
+        let old_end = old_addr
+            .as_usize()
+            .checked_add(old_size)
+            .ok_or(RemapError::OutOfMemory)?;
+        let old_range =
+            PageRange::new(old_addr.as_usize(), old_end).ok_or(RemapError::Unaligned)?;
         match unsafe {
             vmem.resize_mapping(
                 old_range,

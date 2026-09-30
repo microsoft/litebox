@@ -569,6 +569,10 @@ mod tests {
             litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
                 .expect("PIE reservation should include runtime-trampoline space");
         assert!(reserved < addr_max / 2);
+        assert_ne!(
+            reserved, hint,
+            "trampoline space must force rejection of the hint"
+        );
         task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
             .expect("failed to release trampoline-aware reservation");
         task.sys_munmap(trampoline_blocker, PAGE_SIZE)
