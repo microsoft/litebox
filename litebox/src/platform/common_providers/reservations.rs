@@ -169,8 +169,16 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
         segments
     }
 
-    /// Round and reserve one currently unowned gap.
-    unsafe fn reserve_gap<Platform, const ALIGN: usize>(
+    /// Round and reserve one currently unowned gap, or place one addressless hint.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a zero-address request does not use [`FixedAddressBehavior::Hint`].
+    ///
+    /// # Safety
+    ///
+    /// A nonzero `requested` range must be unowned. `placement` must not permit replacement.
+    pub unsafe fn reserve_gap<Platform, const ALIGN: usize>(
         platform: &Platform,
         requested: Range<usize>,
         can_grow_down: bool,
@@ -185,12 +193,15 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
             .end
             .checked_next_multiple_of(alignment)
             .ok_or(AllocationError::OutOfMemory)?;
-        let placement =
-            if requested.start == 0 && matches!(placement, FixedAddressBehavior::Hint(_)) {
-                placement
-            } else {
-                FixedAddressBehavior::NoReplace
-            };
+        let placement = if requested.start == 0 {
+            assert!(
+                matches!(placement, FixedAddressBehavior::Hint(_)),
+                "a zero-address reservation must be an addressless hint"
+            );
+            placement
+        } else {
+            FixedAddressBehavior::NoReplace
+        };
         // SAFETY: Stored reservations use the same native rounding, so this rounded gap remains
         // unowned. A zero-address hint permits relocation without replacement.
         unsafe { platform.reserve_pages(core::iter::empty, start..end, can_grow_down, placement) }
@@ -198,15 +209,13 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
 
     /// Reserve and track each unreserved gap within `requested`.
     ///
-    /// For a relocatable hint, instead reserves and tracks one range whose length matches
-    /// `requested`.
-    ///
     /// # Returns
     ///
     /// Returns `Ok` with a vector of starting addresses if all gaps were successfully reserved.
     ///
     /// # Panics
     ///
+    /// Panics if `requested` starts at zero.
     /// Panics if the platform returns a reservation whose base is already tracked.
     ///
     /// # Safety
@@ -222,13 +231,9 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
     where
         Platform: PageManagementProvider<ALIGN, Reservations = Self>,
     {
+        assert_ne!(requested.start, 0, "reserve_gaps requires a concrete range");
         let mut acquired = Vec::new();
-        let segments = if matches!(placement, FixedAddressBehavior::Hint(_)) {
-            Vec::from([(0..requested.len(), None)])
-        } else {
-            self.segments(requested)
-        };
-        for (gap, base) in segments {
+        for (gap, base) in self.segments(requested) {
             if base.is_some() {
                 continue;
             }

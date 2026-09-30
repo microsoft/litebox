@@ -237,7 +237,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
 
     unsafe fn reserve_pages<Reservations>(
         &self,
-        replaced_reservations: impl FnOnce() -> Reservations,
+        _replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         can_grow_down: bool,
         fixed_address_behavior: FixedAddressBehavior,
@@ -257,13 +257,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
             suggested_range.end
                 <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
         );
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
         // TODO: For Windows, there is no MAP_GROWDOWN features so far.
         let _ = can_grow_down;
         let reservation =
             Self::allocate_native_reservation(suggested_range, fixed_address_behavior, None)?;
-        if fixed_address_behavior == FixedAddressBehavior::Replace {
-            replaced_reservations().for_each(drop);
-        }
         Ok(reservation)
     }
 

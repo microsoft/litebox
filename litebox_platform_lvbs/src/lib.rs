@@ -1029,10 +1029,13 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
     {
         debug_assert!(!suggested_range.is_empty());
+        if suggested_range.start == 0
+            && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_))
+        {
+            return Err(litebox::platform::page_mgmt::AllocationError::UnsupportedByPlatform);
+        }
         debug_assert!(
             suggested_range.start >= <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
-                || (suggested_range.start == 0
-                    && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
         );
         debug_assert!(
             suggested_range.end <= <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MAX

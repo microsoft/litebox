@@ -185,6 +185,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///   a page fault.
     /// - `fixed_address_behavior`: Specifies the required semantics of `suggested_range`.
     ///
+    /// # Errors
+    ///
+    /// Returns [`AllocationError::UnsupportedByPlatform`] when `suggested_range` starts at zero
+    /// and the platform cannot relocate the hint in the requested direction.
+    ///
     /// # Safety
     ///
     /// `suggested_range` must be nonempty and lie within
@@ -265,6 +270,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// # Returns
     ///
     /// On success, returns the exclusive reservation handle for the allocated extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllocationError::UnsupportedByPlatform`] when `suggested_range` starts at zero
+    /// and the platform cannot relocate the hint in the requested direction.
     ///
     /// # Safety
     ///
@@ -403,6 +413,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// - `source_data`: The static data to use as copy-on-write backing.
     /// - `permissions`: The permissions to apply to the allocated pages.
     /// - `fixed_address_behavior`: Specifies the required placement of `suggested_start`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CowAllocationError::UnsupportedByPlatform`] when `suggested_start` is zero and
+    /// the platform cannot relocate the hint in the requested direction.
     ///
     /// # Safety
     ///
