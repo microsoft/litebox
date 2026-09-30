@@ -6,6 +6,10 @@ on:
       - opened
       - synchronize
       - reopened
+  # Test-only trigger for PR #1344. Remove before merging the workflow.
+  pull_request:
+    types:
+      - synchronize
 
 permissions:
   contents: read
