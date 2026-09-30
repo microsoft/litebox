@@ -112,17 +112,27 @@ impl<T> ShimPlatform for T where
 {
 }
 
+// Linux-specific memory manager state and behavior.
+
+struct ProgramBreakState {
+    initial: usize,
+    current: usize,
+}
+
 /// Linux memory manager.
 pub struct MemoryManager<Platform: ShimPlatform> {
     vmem: VmemManager<Platform, PAGE_SIZE>,
-    brk: Mutex<Platform, usize>,
+    brk: Mutex<Platform, ProgramBreakState>,
 }
 
 impl<Platform: ShimPlatform> MemoryManager<Platform> {
     fn new(platform: &'static Platform) -> Self {
         Self {
             vmem: VmemManager::new(platform),
-            brk: Mutex::new(0),
+            brk: Mutex::new(ProgramBreakState {
+                initial: 0,
+                current: 0,
+            }),
         }
     }
 
@@ -130,11 +140,17 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     ///
     /// # Panics
     ///
-    /// Panics if the initial program break has already been set.
+    /// Panics if the initial program break has already been set or cannot be rounded up to a page
+    /// boundary.
     fn set_initial_brk(&self, brk: usize) {
-        let mut current = self.brk.lock();
-        assert_eq!(*current, 0, "initial brk is already set");
-        *current = brk;
+        let mut state = self.brk.lock();
+        assert_eq!(state.initial, 0, "initial brk is already set");
+        assert!(
+            brk.checked_next_multiple_of(PAGE_SIZE).is_some(),
+            "initial brk is too large"
+        );
+        state.initial = brk;
+        state.current = brk;
     }
 
     /// Sets or queries the Linux program break.
@@ -148,23 +164,28 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     /// If shrinking the program break, the caller must ensure that the released region is no
     /// longer used.
     unsafe fn brk(&self, requested: usize) -> Result<usize, MappingError> {
-        let mut current = self.brk.lock();
-        assert_ne!(*current, 0, "initial brk is not set yet");
+        let mut state = self.brk.lock();
+        assert_ne!(state.initial, 0, "initial brk is not set yet");
         if requested == 0 {
-            return Ok(*current);
+            return Ok(state.current);
+        }
+        if requested < state.initial {
+            return Ok(state.current);
         }
 
-        let old_page_end = current.next_multiple_of(PAGE_SIZE);
-        let new_page_end = requested.next_multiple_of(PAGE_SIZE);
-        if *current >= requested {
-            let length = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end)
-                .ok_or(MappingError::UnAligned)?;
-            let ptr =
-                <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(new_page_end);
-            if unsafe { self.vmem.remove_pages(ptr, length.as_usize()) }.is_err() {
-                return Ok(*current);
+        let old_page_end = state.current.next_multiple_of(PAGE_SIZE);
+        let new_page_end = requested
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(MappingError::OutOfMemory)?;
+        if state.current >= requested {
+            if let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end) {
+                let ptr =
+                    <Platform as RawPointerProvider>::RawMutPointer::<u8>::from_usize(new_page_end);
+                if unsafe { self.vmem.remove_pages(ptr, length.as_usize()) }.is_err() {
+                    return Ok(state.current);
+                }
             }
-            *current = requested;
+            state.current = requested;
             return Ok(requested);
         }
 
@@ -183,7 +204,7 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
                 )
             }?;
         }
-        *current = requested;
+        state.current = requested;
         Ok(requested)
     }
 
@@ -196,9 +217,10 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
         &self,
         releasable: fn(Range<usize>, VmFlags) -> bool,
     ) -> Result<(), VmemUnmapError> {
-        let mut current = self.brk.lock();
+        let mut state = self.brk.lock();
         unsafe { self.vmem.release_memory(releasable) }?;
-        *current = 0;
+        state.initial = 0;
+        state.current = 0;
         Ok(())
     }
 }

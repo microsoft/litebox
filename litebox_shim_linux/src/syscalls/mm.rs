@@ -2179,6 +2179,32 @@ mod tests {
     }
 
     #[test]
+    fn brk_respects_initial_break_and_shrinks_within_current_page() {
+        let task = init_platform();
+        let initial = 0x4000_0123;
+        let below_initial = 0x4000_0042;
+        let grown = 0x4000_0321;
+        let requested = 0x4000_0246;
+        task.global.mm.set_initial_brk(initial);
+
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(below_initial)),
+            Ok(initial)
+        );
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(usize::MAX)),
+            Ok(initial)
+        );
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(initial));
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(grown)), Ok(grown));
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(requested)),
+            Ok(requested)
+        );
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(requested));
+    }
+
+    #[test]
     fn test_anonymous_mmap() {
         let task = init_platform();
 
