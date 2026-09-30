@@ -3523,41 +3523,52 @@ mod tests {
     }
 
     #[test]
-    fn thread_exit_ends_a_blocked_standard_input_read() {
+    fn thread_exit_ends_a_blocked_console_read() {
         run_with_test_platform_pointers(|| {
             let stdio = Arc::new(
                 litebox_broker_core::test_support::TestStdioProvider::default().with_open_input(),
             );
             let parent = crate::tests::test_task_with_broker_files_and_stdio(&[], stdio);
+            let (status, input, _) = create_file(
+                &parent,
+                r"\Device\ConDrv\Input",
+                FILE_GENERIC_READ,
+                FILE_OPEN,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
             let (result_tx, result_rx) = std::sync::mpsc::channel();
             let (thread, reader_thread) = parent.spawn_clone_for_test(move |reader| {
-                let fd = reader
-                    .fs
-                    .open_file(
-                        &reader.fs_context,
-                        "/dev/stdin",
-                        FileAccessMode::ReadOnly,
-                        FileOpenFlags::NONE,
-                        Mode::empty(),
-                    )
+                let mut byte = [0u8];
+                let mut io_status = IoStatusBlock::default();
+                result_tx
+                    .send(reader.sys_nt_read_file(
+                        input,
+                        Handle::default(),
+                        None,
+                        None,
+                        mut_ptr(&mut io_status),
+                        mut_byte_ptr(&mut byte),
+                        1,
+                        None,
+                        None,
+                    ))
                     .unwrap();
-                let mut byte = [0];
-                let result =
-                    reader.wait_for_io(|cx| reader.fs.read_file(&fd, &mut byte, None, Some(cx)));
-                result_tx.send(result).unwrap();
             });
 
             std::thread::sleep(core::time::Duration::from_millis(20));
-            reader_thread.begin_exit(0);
             assert!(matches!(
+                result_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            reader_thread.begin_exit(0);
+            assert_eq!(
                 result_rx
                     .recv_timeout(core::time::Duration::from_secs(2))
                     .unwrap(),
-                Err(ReadError::WaitError(
-                    litebox::event::wait::WaitError::Interrupted
-                ))
-            ));
+                NtStatus::UNSUCCESSFUL
+            );
             thread.join().unwrap();
+            assert_eq!(parent.sys_nt_close(input), NtStatus::SUCCESS);
         });
     }
 
