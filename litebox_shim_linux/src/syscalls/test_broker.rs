@@ -16,7 +16,7 @@ use litebox_broker_core::{
     BrokerCore, BrokerCoreLimits, ObjectRights, PolicyEngine,
     fs::{in_mem::InitialNode, resolver::Resolver},
     stdio::StdioStream,
-    test_support::{FailingRandomProvider, TerminalOnlyStdioProvider, TestBrokerCoreBuilder},
+    test_support::{FailingRandomProvider, TestBrokerCoreBuilder, TestStdioProvider},
 };
 use litebox_broker_host::{
     BrokerHostError,
@@ -29,6 +29,23 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use crate::syscalls::tests::TestPlatform;
 
 pub(crate) const MAX_TEST_BROKER_REFERENCES: usize = 16;
+
+static BROKER: OnceLock<TestBroker> = OnceLock::new();
+
+struct TestBroker {
+    core: BrokerCore,
+    stdio: Arc<TestStdioProvider>,
+}
+
+/// Returns the standard-I/O provider of the process-wide test broker.
+///
+/// Standard input stays open, so reads wait for [`TestStdioProvider::push_input`].
+pub(crate) fn stdio() -> &'static TestStdioProvider {
+    &BROKER
+        .get()
+        .expect("the test broker must be initialized")
+        .stdio
+}
 
 /// Returns a LiteBox connected to the process-wide test broker.
 pub(crate) fn litebox(platform: &'static TestPlatform) -> (litebox::LiteBox<TestPlatform>, i32) {
@@ -57,7 +74,7 @@ pub(crate) fn litebox_with_channel<Channel>(
 where
     Channel: LocalCallChannel<Error = BrokerHostError<Infallible>> + Send + Sync + 'static,
 {
-    let setup = InProcessBrokerSetup::new(test_broker(limits).clone());
+    let setup = InProcessBrokerSetup::new(test_broker(limits).core.clone());
     let readiness = setup.readiness_sink();
     let (broker_local, _startup, ()) = BrokerLocal::negotiate(setup, |setup| {
         let memory = setup.shared_memory();
@@ -71,8 +88,7 @@ where
     (litebox, process_id)
 }
 
-fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
-    static BROKER: OnceLock<BrokerCore> = OnceLock::new();
+fn test_broker(limits: BrokerCoreLimits) -> &'static TestBroker {
     BROKER.get_or_init(|| {
         let root = InitialNode::Directory {
             mode: FileMode::RWXU | FileMode::RWXG | FileMode::RWXO,
@@ -82,25 +98,30 @@ fn test_broker(limits: BrokerCoreLimits) -> &'static BrokerCore {
             litebox_broker_core::fs::in_mem::InMem::<TestPlatform>::new_initialized(vec![(
                 "/", root,
             )]);
+        let stdio = Arc::new(
+            TestStdioProvider::default()
+                .with_open_input()
+                .with_terminal(StdioStream::Stdout),
+        );
+        let devices_stdio = Arc::clone(&stdio);
         let fs = litebox_broker_core::fs::composer::Composer::builder()
             .mount("/", |_| in_mem)
             .mount("/dev", |allocator| {
                 litebox_broker_core::fs::devices::Devices::new(
                     allocator,
-                    Arc::new(
-                        TerminalOnlyStdioProvider::default().with_terminal(StdioStream::Stdout),
-                    ),
+                    devices_stdio,
                     Arc::new(FailingRandomProvider),
                 )
             })
             .build()
             .expect("the test filesystem must be valid");
-        TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+        let core = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
         ))
         .with_limits(limits)
         .with_file_service(Arc::new(Resolver::<TestPlatform, _>::new(fs)))
         .build()
-        .expect("a test process may build only one broker core")
+        .expect("a test process may build only one broker core");
+        TestBroker { core, stdio }
     })
 }

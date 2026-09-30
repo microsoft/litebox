@@ -9,6 +9,7 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::rwlock::RwLock;
 
+use crate::Result;
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
@@ -16,7 +17,6 @@ use crate::process::ProcessObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::socket::SocketObject;
 use crate::timer::TimerObject;
-use crate::{BrokerError, Result};
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -36,8 +36,10 @@ pub(crate) struct ObjectReference {
     pub(crate) rights: ObjectRights,
     /// Position of this reference's handle in the owner's handle list.
     pub(crate) process_reference_index: usize,
-    /// Readiness publication once the object is shared, for kinds whose state
-    /// other processes change, retired when this reference drops.
+    /// Readiness publication for kinds whose state changes outside this
+    /// process's requests, retired when this reference drops. Pipes publish
+    /// once shared with another process; files whose reads or writes can
+    /// fail with `WouldBlock` publish from the start.
     pub(crate) readiness: Option<ReadinessRegistration>,
 }
 
@@ -66,25 +68,22 @@ impl ObjectEntry {
         }
     }
 
-    /// Returns a registration that publishes readiness changes to this shared
+    /// Returns a registration that publishes readiness changes to this
     /// object through `readiness_sink` for `handle` until it drops, or `None`
-    /// if references to this kind need none.
+    /// if references to this object need none.
     pub(crate) fn watch(
         &self,
         handle: ObjectHandle,
         readiness_sink: &Arc<dyn ReadinessSink>,
     ) -> Result<Option<ReadinessRegistration>> {
         match self {
+            Self::File(file) => file.watch(handle, readiness_sink),
             Self::Pipe(pipe) => {
                 let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
                 pipe.watch(&registration)?;
                 Ok(Some(registration))
             }
-            Self::Event(_)
-            | Self::File(_)
-            | Self::Socket(_)
-            | Self::Process(_)
-            | Self::Timer(_) => Ok(None),
+            Self::Event(_) | Self::Socket(_) | Self::Process(_) | Self::Timer(_) => Ok(None),
         }
     }
 }
@@ -97,7 +96,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
         let object = object.read();
         match &*object {
             ObjectEntry::Event(event) => return Ok(event.readiness()),
-            ObjectEntry::File(_) => return Err(BrokerError::InvalidRights),
+            ObjectEntry::File(file) => return file.readiness(),
             ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
             ObjectEntry::Process(process) => return Ok(process.readiness()),
             ObjectEntry::Timer(timer) => return Ok(timer.readiness()),

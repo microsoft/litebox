@@ -6,6 +6,7 @@
 use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::convert::Infallible;
@@ -20,6 +21,7 @@ use super::errors::{
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use crate::readiness::ReadinessSource;
 use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
@@ -716,6 +718,13 @@ impl Backend for Composer {
     fn is_terminal(&self, h: &FileHandle) -> bool {
         let h = h.get_typed::<Self>();
         self.mounts[h.mount_index].backend.is_terminal(&h.handle)
+    }
+
+    fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
+        let h = h.get_typed::<Self>();
+        self.mounts[h.mount_index]
+            .backend
+            .readiness_source(&h.handle)
     }
 
     fn create_file_at(

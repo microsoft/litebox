@@ -133,8 +133,6 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
         // prints, if the feature is enabled.
         #[cfg(feature = "lock_tracing")]
         litebox_platform::sync::init_lock_tracing(platform);
-        #[cfg(not(feature = "lock_tracing"))]
-        let _ = platform;
         let descriptors: RwLock<Platform, Descriptors<Platform>> =
             RwLock::new(Descriptors::new_from_litebox_creation());
 
@@ -142,6 +140,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 
         Self {
             x: Arc::new(LiteBoxX {
+                platform,
                 descriptors,
                 broker: broker_control,
                 broker_pollables,
@@ -180,6 +179,10 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 
     pub(crate) fn broker_control(&self) -> Option<Arc<dyn broker::BrokerControl>> {
         self.x.broker.clone()
+    }
+
+    pub(crate) fn platform(&self) -> &'static Platform {
+        self.x.platform
     }
 
     pub(crate) fn broker_pollable_registry(&self) -> Arc<broker::BrokerPollableRegistry<Platform>> {
@@ -230,6 +233,7 @@ impl<Platform: RawSyncPrimitivesProvider> LiteBox<Platform> {
 
 /// The actual body of [`LiteBox`], containing any components that might be shared.
 pub(crate) struct LiteBoxX<Platform: RawSyncPrimitivesProvider> {
+    platform: &'static Platform,
     descriptors: RwLock<Platform, Descriptors<Platform>>,
     broker: Option<Arc<dyn broker::BrokerControl>>,
     broker_pollables: Arc<broker::BrokerPollableRegistry<Platform>>,

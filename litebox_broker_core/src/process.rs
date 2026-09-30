@@ -983,6 +983,7 @@ impl BrokerProcess {
             handle,
             object,
             rights,
+            None,
         );
 
         Ok(handle)
@@ -1049,11 +1050,12 @@ impl BrokerProcess {
     /// `readiness_sink` for object kinds that need it, skipping references
     /// that already publish readiness.
     ///
-    /// References start publishing once the process shares objects, since
-    /// only then can another process change them. Sharing one reference can
-    /// expose objects behind others, such as a pipe's other endpoint, so all
-    /// of them register. Connection setup calls this for references
-    /// duplicated into the process before it connected, and
+    /// Pipe references start publishing once the process shares objects,
+    /// since only then can another process change them. Sharing one reference
+    /// can expose objects behind others, such as a pipe's other endpoint, so
+    /// all of them register. Connection setup calls this for references
+    /// duplicated into the process before it connected, including files whose
+    /// readiness changes outside broker requests, and
     /// [`Self::duplicate_object_references_to_child`] before sharing more.
     pub fn register_readiness(&self, readiness_sink: &Arc<dyn ReadinessSink>) -> Result<()> {
         let process_references = self.references.lock();
@@ -1125,6 +1127,7 @@ impl BrokerProcess {
                 handle,
                 object,
                 rights,
+                None,
             );
         }
         Ok((first_handle, second_handle))
@@ -1202,6 +1205,7 @@ impl BrokerProcess {
         handle: ObjectHandle,
         object: Arc<RwLock<ObjectEntry>>,
         rights: ObjectRights,
+        readiness: Option<ReadinessRegistration>,
     ) {
         let process_reference_index = reference_handles.len();
         references.insert(
@@ -1211,7 +1215,7 @@ impl BrokerProcess {
                 owner: self.id,
                 rights,
                 process_reference_index,
-                readiness: None,
+                readiness,
             },
         );
         reference_handles.push(handle);
@@ -1454,7 +1458,17 @@ impl PendingObjectReference<'_> {
         self.handle
     }
 
-    pub(crate) fn commit(mut self, object: ObjectEntry) -> Result<ObjectHandle> {
+    pub(crate) fn commit(self, object: ObjectEntry) -> Result<ObjectHandle> {
+        self.commit_with_readiness(object, None)
+    }
+
+    /// Commits `object`, whose reference publishes readiness through
+    /// `readiness`, if any.
+    pub(crate) fn commit_with_readiness(
+        mut self,
+        object: ObjectEntry,
+        readiness: Option<ReadinessRegistration>,
+    ) -> Result<ObjectHandle> {
         let mut process_references = self.process.references.lock();
         let mut references = self.process.core.references.write();
         if references.contains_key(&self.handle) {
@@ -1478,6 +1492,7 @@ impl PendingObjectReference<'_> {
             self.handle,
             Arc::new(RwLock::new(object)),
             self.rights,
+            readiness,
         );
         Ok(self.handle)
     }
@@ -2813,6 +2828,8 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         let mode = FileMode::from_bits(0o600).unwrap();
+        let sink = readiness_sink();
+        let readiness: Arc<dyn ReadinessSink> = sink.clone();
         let file = crate::fs::open(
             &source,
             "/file",
@@ -2820,6 +2837,7 @@ mod tests {
             FileAccessMode::ReadWrite,
             FileOpenFlags::CREATE,
             mode,
+            &readiness,
         )
         .unwrap()
         .unwrap();
@@ -2852,6 +2870,7 @@ mod tests {
                 FileAccessMode::ReadWrite,
                 FileOpenFlags::CREATE,
                 mode,
+                &readiness,
             ),
             Err(BrokerError::ResourceExhausted)
         );
@@ -2913,6 +2932,7 @@ mod tests {
             FileAccessMode::ReadOnly,
             FileOpenFlags::DIRECTORY,
             FileMode::default(),
+            &readiness,
         )
         .unwrap()
         .unwrap();
@@ -2930,6 +2950,7 @@ mod tests {
             FileAccessMode::WriteOnly,
             FileOpenFlags::DIRECTORY,
             FileMode::default(),
+            &readiness,
         )
         .unwrap()
         .unwrap();
@@ -2946,6 +2967,7 @@ mod tests {
             FileAccessMode::ReadOnly,
             FileOpenFlags::NONE,
             FileMode::default(),
+            &readiness,
         )
         .unwrap()
         .unwrap();
@@ -2997,6 +3019,7 @@ mod tests {
             FileAccessMode::WriteOnly,
             FileOpenFlags::NONE,
             FileMode::default(),
+            &readiness,
         )
         .unwrap()
         .unwrap();
@@ -3020,12 +3043,64 @@ mod tests {
         );
         assert_eq!(source.close_object_reference(stdout), Ok(()));
         assert_eq!(target.close_object_reference(duplicated_stdout), Ok(()));
+
+        let stdin = crate::fs::open(
+            &source,
+            "/dev/stdin",
+            ROOT,
+            FileAccessMode::ReadOnly,
+            FileOpenFlags::NONE,
+            FileMode::default(),
+            &readiness,
+        )
+        .unwrap()
+        .unwrap();
+        let duplicated_stdin = source
+            .duplicate_object_reference_to(stdin, &target, ObjectRights::WAIT)
+            .unwrap();
+        let target_sink = readiness_sink();
+        target
+            .register_readiness(&(target_sink.clone() as Arc<dyn ReadinessSink>))
+            .unwrap();
+        assert_eq!(
+            crate::fs::read(&source, stdin, &mut byte, None),
+            Err(BrokerError::WouldBlock)
+        );
+        assert_eq!(source.check_readiness(stdin), Ok(ReadinessFlags::default()));
+        take_republished(&sink);
+        stdio_provider.push_input(b"x");
+        assert_eq!(take_republished(&sink), [(stdin, ReadinessFlags::READ)]);
+        assert_eq!(
+            take_republished(&target_sink),
+            [(duplicated_stdin, ReadinessFlags::READ)]
+        );
+        assert_eq!(
+            target.check_readiness(duplicated_stdin),
+            Ok(ReadinessFlags::READ)
+        );
+        assert_eq!(
+            crate::fs::read(&target, duplicated_stdin, &mut byte, None),
+            Ok(Ok(1))
+        );
+        assert_eq!(&byte, b"x");
+        stdio_provider.close_input();
+        assert_eq!(crate::fs::read(&source, stdin, &mut byte, None), Ok(Ok(0)));
+        assert_eq!(source.close_object_reference(stdin), Ok(()));
+        assert_eq!(target.close_object_reference(duplicated_stdin), Ok(()));
+        assert!(sink.retired.lock().unwrap().contains(&stdin));
+        assert!(
+            target_sink
+                .retired
+                .lock()
+                .unwrap()
+                .contains(&duplicated_stdin)
+        );
     }
 
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
-        let stdio_provider = Arc::new(TestStdioProvider::default());
+        let stdio_provider = Arc::new(TestStdioProvider::default().with_open_input());
         let fs = crate::fs::composer::Composer::builder()
             .mount("/", crate::fs::in_mem::InMem::<TestPlatform>::new)
             .mount("/dev", |allocator| {

@@ -136,7 +136,10 @@ struct CliArgs {
     runner_arguments: Vec<OsString>,
 }
 
-fn create_file_service<Platform>(initial_files: Option<&Path>) -> IoResult<Arc<dyn FileService>>
+fn create_file_service<Platform>(
+    initial_files: Option<&Path>,
+    stdio: Arc<UserlandStdioProvider>,
+) -> IoResult<Arc<dyn FileService>>
 where
     Platform: RawSyncPrimitivesProvider,
 {
@@ -173,7 +176,7 @@ where
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(
                 allocator,
-                Arc::new(UserlandStdioProvider),
+                stdio,
                 Arc::new(UserlandRandomProvider),
             )
         })
@@ -324,14 +327,17 @@ fn accept_runner_channel<Channel>(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    linux::run(CliArgs::parse())
-}
-
-#[cfg(all(windows, target_arch = "x86_64"))]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    windows::run(CliArgs::parse())
+    let args = CliArgs::parse();
+    let stdio = Arc::new(UserlandStdioProvider::default());
+    #[cfg(target_os = "linux")]
+    let result = linux::run(args, Arc::clone(&stdio));
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    let result = windows::run(args, Arc::clone(&stdio));
+    // Guest output accepted before the runner exited must reach the host.
+    stdio.flush();
+    result
 }
 
 #[cfg(not(any(target_os = "linux", all(windows, target_arch = "x86_64"))))]

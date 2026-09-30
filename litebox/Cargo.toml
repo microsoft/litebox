@@ -7,7 +7,7 @@ edition = "2024"
 bitflags = "2.13.1"
 hashbrown = "0.15.2"
 smallvec = "1.13.2"
-spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
+spin = { version = "0.9.8", default-features = false, features = ["once", "spin_mutex"] }
 thiserror = { version = "2.0.6", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 rangemap = { version = "1.5.1", features = ["const_fn"] }

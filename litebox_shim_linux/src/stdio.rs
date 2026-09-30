@@ -5,14 +5,21 @@
 
 #[cfg(test)]
 mod tests {
-    use core::ffi::CStr;
+    extern crate std;
 
+    use core::{ffi::CStr, time::Duration};
+
+    use litebox::event::Events;
     use litebox_broker_protocol::fs::FileMode as Mode;
     use litebox_common_linux::{
-        FcntlArg, FileDescriptorFlags, IoctlArg, OFlags, Termios, errno::Errno,
+        EpollCreateFlags, EpollEvent, EpollOp, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags,
+        Termios, errno::Errno,
     };
 
-    use crate::{UserPtrMut, syscalls::tests::init_platform};
+    use crate::{
+        UserPtr, UserPtrMut,
+        syscalls::{test_broker, tests::init_platform},
+    };
 
     fn termios() -> Termios {
         Termios {
@@ -152,5 +159,95 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// Pushes `input` to standard input after the caller has had time to start waiting.
+    fn push_input_later(input: &'static [u8]) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            test_broker::stdio().push_input(input);
+        })
+    }
+
+    #[test]
+    fn test_stdin_read_waits_for_input() {
+        let task = init_platform();
+        let input = push_input_later(b"hi");
+
+        let mut buf = [0; 4];
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(2));
+        assert_eq!(&buf[..2], b"hi");
+        input.join().unwrap();
+    }
+
+    #[test]
+    fn test_stdin_nonblocking_read() {
+        let task = init_platform();
+        let mut buf = [0; 4];
+        let flags = OFlags::from_bits_retain(task.sys_fcntl(0, FcntlArg::GETFL).unwrap());
+
+        task.sys_fcntl(0, FcntlArg::SETFL(flags | OFlags::NONBLOCK))
+            .unwrap();
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
+
+        let disable = 0i32;
+        let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const disable as usize));
+        assert_eq!(task.sys_ioctl(0, arg), Ok(0));
+        assert_eq!(task.sys_fcntl(0, FcntlArg::GETFL), Ok(flags.bits()));
+
+        let enable = 1i32;
+        let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize));
+        assert_eq!(task.sys_ioctl(0, arg), Ok(0));
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
+
+        test_broker::stdio().push_input(b"x");
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(1));
+        assert_eq!(buf[0], b'x');
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_stdio_epoll_readiness() {
+        let task = init_platform();
+        let epfd =
+            i32::try_from(task.sys_epoll_create(EpollCreateFlags::empty()).unwrap()).unwrap();
+        let add = |fd: i32, events: Events| {
+            let event = EpollEvent::new(events.bits(), u64::try_from(fd).unwrap());
+            task.sys_epoll_ctl(
+                epfd,
+                EpollOp::EpollCtlAdd,
+                fd,
+                UserPtr::from_usize(&raw const event as usize),
+            )
+        };
+        let wait = |timeout: i32| {
+            let mut events = [EpollEvent::new(0, 0); 2];
+            let ready = task
+                .sys_epoll_pwait(
+                    epfd,
+                    UserPtrMut::from_usize(events.as_mut_ptr() as usize),
+                    2,
+                    timeout,
+                    None,
+                    0,
+                )
+                .unwrap();
+            events[..ready]
+                .iter()
+                .map(|event| (event.data, event.events))
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        add(0, Events::IN).unwrap();
+        assert!(wait(0).is_empty());
+
+        let input = push_input_later(b"x");
+        assert_eq!(wait(-1), [(0, Events::IN.bits())]);
+        input.join().unwrap();
+
+        let mut buf = [0; 1];
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(1));
+        add(1, Events::IN | Events::OUT).unwrap();
+        assert_eq!(wait(0), [(1, Events::OUT.bits())]);
     }
 }

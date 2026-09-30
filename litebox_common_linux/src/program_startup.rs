@@ -69,22 +69,6 @@ pub struct InheritedFd {
     pub kind: InheritedFdKind,
 }
 
-/// A Linux standard stream.
-///
-/// TODO: Remove this guest-side stream tag. The shim derives it by matching `/dev/std*` open
-/// paths, duplicating the broker `Devices` backend's own device identity, and uses it only for
-/// placeholder epoll readiness. Once broker files report real readiness, the shim should query
-/// the broker instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StdioStream {
-    /// Standard input.
-    Stdin,
-    /// Standard output.
-    Stdout,
-    /// Standard error.
-    Stderr,
-}
-
 /// The kind of object an [`InheritedFd`] refers to, with the metadata the runner tracks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InheritedFdKind {
@@ -92,10 +76,8 @@ pub enum InheritedFdKind {
     File,
     /// A file that refers to a standard stream.
     Stdio {
-        /// The standard stream.
-        stream: StdioStream,
-        /// Status flags the runner tracks for the stream, if any.
-        status_flags: Option<OFlags>,
+        /// Status flags the runner tracks for the stream.
+        status_flags: OFlags,
     },
     /// An end of a pipe.
     Pipe {
@@ -258,9 +240,7 @@ impl InheritedFd {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
                 InheritedFdKind::File => 0,
-                InheritedFdKind::Stdio { status_flags, .. } => {
-                    size_of::<[u8; 2]>() + status_flags.map_or(0, |_| size_of::<u32>())
-                }
+                InheritedFdKind::Stdio { .. } => size_of::<u32>(),
                 InheritedFdKind::Pipe { .. } => size_of::<u8>() + size_of::<u32>(),
             }
     }
@@ -270,20 +250,9 @@ impl InheritedFd {
         push_u64(output, self.handle.0);
         match self.kind {
             InheritedFdKind::File => output.push(FILE_TAG),
-            InheritedFdKind::Stdio {
-                stream,
-                status_flags,
-            } => {
+            InheritedFdKind::Stdio { status_flags } => {
                 output.push(STDIO_TAG);
-                output.push(match stream {
-                    StdioStream::Stdin => 0,
-                    StdioStream::Stdout => 1,
-                    StdioStream::Stderr => 2,
-                });
-                output.push(u8::from(status_flags.is_some()));
-                if let Some(flags) = status_flags {
-                    push_u32(output, flags.bits());
-                }
+                push_u32(output, status_flags.bits());
             }
             InheritedFdKind::Pipe {
                 endpoint,
@@ -305,17 +274,7 @@ impl InheritedFd {
         let kind = match read_u8(input)? {
             FILE_TAG => InheritedFdKind::File,
             STDIO_TAG => InheritedFdKind::Stdio {
-                stream: match read_u8(input)? {
-                    0 => StdioStream::Stdin,
-                    1 => StdioStream::Stdout,
-                    2 => StdioStream::Stderr,
-                    _ => return Err(LinuxProgramStartupError::Malformed),
-                },
-                status_flags: match read_u8(input)? {
-                    0 => None,
-                    1 => Some(OFlags::from_bits_retain(read_u32(input)?)),
-                    _ => return Err(LinuxProgramStartupError::Malformed),
-                },
+                status_flags: OFlags::from_bits_retain(read_u32(input)?),
             },
             PIPE_TAG => InheritedFdKind::Pipe {
                 endpoint: match read_u8(input)? {
@@ -454,16 +413,14 @@ mod tests {
                     fd: 1,
                     handle: ObjectHandle(7),
                     kind: InheritedFdKind::Stdio {
-                        stream: StdioStream::Stdout,
-                        status_flags: Some(OFlags::APPEND | OFlags::RDWR),
+                        status_flags: OFlags::APPEND | OFlags::RDWR,
                     },
                 },
                 InheritedFd {
                     fd: 2,
                     handle: ObjectHandle(10),
                     kind: InheritedFdKind::Stdio {
-                        stream: StdioStream::Stderr,
-                        status_flags: None,
+                        status_flags: OFlags::APPEND | OFlags::RDWR | OFlags::NONBLOCK,
                     },
                 },
                 InheritedFd {

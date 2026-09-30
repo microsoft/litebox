@@ -25,7 +25,7 @@ use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam,
     errno::Errno,
-    program_startup::{InheritedFd, InheritedFdKind, StdioStream},
+    program_startup::{InheritedFd, InheritedFdKind},
     signal::Signal,
     vmem::PAGE_SIZE,
 };
@@ -249,18 +249,15 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                 InheritedFdKind::File => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, adopt_file)?;
                 }
-                InheritedFdKind::Stdio {
-                    stream,
-                    status_flags,
-                } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                    let fd = adopt_file()?;
-                    let mut descriptors = litebox.descriptor_table_mut();
-                    descriptors.set_entry_metadata(&fd, stream);
-                    if let Some(flags) = status_flags {
-                        descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
-                    }
-                    Ok(fd)
-                })?,
+                InheritedFdKind::Stdio { status_flags } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        let fd = adopt_file()?;
+                        litebox
+                            .descriptor_table_mut()
+                            .set_entry_metadata(&fd, crate::StdioStatusFlags(status_flags));
+                        Ok(fd)
+                    })?;
+                }
                 InheritedFdKind::Pipe {
                     endpoint,
                     status_flags,
@@ -547,16 +544,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     if descriptors.with_metadata(&file, |_: &Diroff| ()).is_ok() {
                         return Err(Errno::EAGAIN);
                     }
-                    let kind =
-                        match descriptors.with_metadata(&file, |stream: &StdioStream| *stream) {
-                            Ok(stream) => InheritedFdKind::Stdio {
-                                stream,
-                                status_flags: descriptors
-                                    .with_metadata(&file, |crate::StdioStatusFlags(flags)| *flags)
-                                    .ok(),
-                            },
-                            Err(_) => InheritedFdKind::File,
-                        };
+                    let kind = match descriptors
+                        .with_metadata(&file, |crate::StdioStatusFlags(flags)| *flags)
+                    {
+                        Ok(status_flags) => InheritedFdKind::Stdio { status_flags },
+                        Err(_) => InheritedFdKind::File,
+                    };
                     (kind, InheritableFd::File(file))
                 }
                 AnyTypedFd::Pipes(pipe) => (
@@ -629,46 +622,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: Mode,
     ) -> Result<FileFd, Errno> {
         let mode = mode & !self.get_umask();
-        // TODO: Have the device backend attach stream identity once backends can set descriptor
-        // metadata for newly opened files.
-        let stream = path
-            .normalized_components()
-            .ok()
-            .and_then(|mut components| {
-                match (
-                    components.next(),
-                    components.next(),
-                    components.next(),
-                    components.next(),
-                ) {
-                    (Some(""), Some("dev"), Some("stdin"), None) => Some(StdioStream::Stdin),
-                    (Some(""), Some("dev"), Some("stdout"), None) => Some(StdioStream::Stdout),
-                    (Some(""), Some("dev"), Some("stderr"), None) => Some(StdioStream::Stderr),
-                    _ => None,
-                }
-            });
-        let file = {
-            let fs = self.fs.borrow();
-            let context = fs.context.read();
-            let path = path
-                .as_rust_str()
-                .map_err(litebox::fs::errors::PathError::from)?;
-            let (access, open_flags) =
-                file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
-            self.global
-                .litebox
-                .open_file(&context, path, access, open_flags, mode)
-                .map_err(Errno::from)
-        }?;
-        if let Some(stream) = stream {
-            let old = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_entry_metadata(&file, stream);
-            assert!(old.is_none());
-        }
-        Ok(file)
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        let path = path
+            .as_rust_str()
+            .map_err(litebox::fs::errors::PathError::from)?;
+        let (access, open_flags) =
+            file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
+        self.global
+            .litebox
+            .open_file(&context, path, access, open_flags, mode)
+            .map_err(Errno::from)
     }
 
     fn do_openat(
@@ -840,7 +804,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 self.global
                     .litebox
-                    .read_file(fd, &mut buf.borrow_mut(), offset)
+                    .read_file_with_wait(
+                        &self.wait_cx(),
+                        fd,
+                        &mut buf.borrow_mut(),
+                        offset,
+                        self.global.file_nonblocking(fd),
+                    )
                     .map_err(Errno::from)
             },
             |fd| {
@@ -940,7 +910,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| {
                 self.global
                     .litebox
-                    .write_file(fd, buf, offset)
+                    .write_file_with_wait(
+                        &self.wait_cx(),
+                        fd,
+                        buf,
+                        offset,
+                        self.global.file_nonblocking(fd),
+                    )
                     .map_err(Errno::from)
             },
             |fd| {
@@ -1066,7 +1042,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Some(fd) => self
                     .global
                     .litebox
-                    .read_file(fd, &mut kernel_buf[..to_read], cur_off)
+                    .read_file_with_wait(
+                        &self.wait_cx(),
+                        fd,
+                        &mut kernel_buf[..to_read],
+                        cur_off,
+                        self.global.file_nonblocking(fd),
+                    )
                     .map_err(Errno::from),
                 None => Err(non_fs_err),
             };
@@ -2397,11 +2379,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }};
                 }
                 fd.dispatch(
-                    |_file_fd| {
-                        // TODO: stdio NONBLOCK?
-                        #[cfg(debug_assertions)]
-                        litebox_util_log::debug!("set non-blocking on raw fd unimplemented");
-                        Ok(())
+                    |file_fd| {
+                        // Only stdio tracks status flags; other files never wait.
+                        match self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                            }) {
+                            Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                            Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
+                        }
                     },
                     |socket_fd| {
                         if let Err(e) = self

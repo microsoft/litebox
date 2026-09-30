@@ -10,6 +10,8 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use litebox_broker_protocol::readiness::ReadinessFlags;
+
 use super::backend::{
     Backend, BackendHandles, CreationMetadata, DirHandle, FileHandle, HandleRef, PermissionCheck,
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
@@ -21,7 +23,8 @@ use super::errors::{
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::random::RandomProvider;
-use crate::stdio::{StdioOutputStream, StdioProvider, StdioStream};
+use crate::readiness::{ReadinessRegistration, ReadinessSource};
+use crate::stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream};
 
 /// Block size for stdio devices
 const STDIO_BLOCK_SIZE: u64 = 1024;
@@ -80,6 +83,15 @@ impl Device {
         Self::ALL.iter().find(|(n, _)| *n == name).map(|(_, d)| *d)
     }
 
+    fn stdio_stream(self) -> Option<StdioStream> {
+        match self {
+            Device::Stdin => Some(StdioStream::Stdin),
+            Device::Stdout => Some(StdioStream::Stdout),
+            Device::Stderr => Some(StdioStream::Stderr),
+            Device::Null | Device::URandom => None,
+        }
+    }
+
     fn file_status(self) -> FileStatus {
         match self {
             Device::Stdin | Device::Stdout | Device::Stderr => FileStatus {
@@ -136,6 +148,22 @@ impl Devices {
             random,
             _alloc: allocator,
         }
+    }
+}
+
+/// Readiness of one standard stream, for files open on its device.
+struct StdioReadiness {
+    stdio: Arc<dyn StdioProvider>,
+    stream: StdioStream,
+}
+
+impl ReadinessSource for StdioReadiness {
+    fn readiness(&self) -> ReadinessFlags {
+        self.stdio.readiness(self.stream)
+    }
+
+    fn watch(&self, registration: &ReadinessRegistration) -> crate::Result<()> {
+        self.stdio.watch(self.stream, registration)
     }
 }
 
@@ -258,7 +286,10 @@ impl Backend for Devices {
             Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
             Device::Null => Ok(0),
             Device::Stdin if buf.is_empty() => Ok(0),
-            Device::Stdin => self.stdio.read(buf).map_err(|_| ReadError::Io),
+            Device::Stdin => self.stdio.read(buf).map_err(|error| match error {
+                StdioProviderError::WouldBlock => ReadError::WouldBlock,
+                _ => ReadError::Io,
+            }),
             Device::URandom => {
                 self.random.fill(buf).map_err(|_| ReadError::Io)?;
                 Ok(buf.len())
@@ -277,7 +308,10 @@ impl Backend for Devices {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.stdio.write(stream, buf).map_err(|_| WriteError::Io)
+        self.stdio.write(stream, buf).map_err(|error| match error {
+            StdioProviderError::WouldBlock => WriteError::WouldBlock,
+            _ => WriteError::Io,
+        })
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
@@ -293,13 +327,18 @@ impl Backend for Devices {
     }
 
     fn is_terminal(&self, h: &FileHandle) -> bool {
-        let stream = match h.get_typed::<Self>().device {
-            Device::Stdin => StdioStream::Stdin,
-            Device::Stdout => StdioStream::Stdout,
-            Device::Stderr => StdioStream::Stderr,
-            Device::Null | Device::URandom => return false,
-        };
-        self.stdio.is_terminal(stream)
+        h.get_typed::<Self>()
+            .device
+            .stdio_stream()
+            .is_some_and(|stream| self.stdio.is_terminal(stream))
+    }
+
+    fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
+        let stream = h.get_typed::<Self>().device.stdio_stream()?;
+        Some(Arc::new(StdioReadiness {
+            stdio: Arc::clone(&self.stdio),
+            stream,
+        }))
     }
 
     fn status(&self, h: HandleRef<'_>) -> Result<FileStatus, FileStatusError> {

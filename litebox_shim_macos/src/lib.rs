@@ -25,6 +25,7 @@ use litebox_common_macos::{
     KernReturn, PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
     VmProtection, errno::Errno, loader::MachoLoaderError,
 };
+use litebox_platform::time::TimeProvider;
 
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     #[cfg(target_os = "macos")]
@@ -39,10 +40,11 @@ pub mod syscalls;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 
-/// Platform capabilities required for descriptor, page, and gate management.
+/// Platform capabilities required for descriptor, page, gate, and wait management.
 pub trait ShimPlatform:
     PageManagementProvider<PAGE_SIZE>
     + RawSyncPrimitivesProvider
+    + TimeProvider
     + litebox::platform::SystemInfoProvider
     + litebox_common_macos::MachClock
     + 'static
@@ -51,6 +53,7 @@ pub trait ShimPlatform:
 impl<
     P: PageManagementProvider<PAGE_SIZE>
         + RawSyncPrimitivesProvider
+        + TimeProvider
         + litebox::platform::SystemInfoProvider
         + litebox_common_macos::MachClock
         + 'static,

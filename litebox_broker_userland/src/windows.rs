@@ -6,6 +6,7 @@
 use std::error::Error;
 use std::ffi::OsString;
 use std::io::Result as IoResult;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -19,15 +20,20 @@ use litebox_broker_transport_windows_userland::named_pipe::{
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::stdio::UserlandStdioProvider;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
 
-pub(super) fn run(args: super::CliArgs) -> Result<(), Box<dyn Error>> {
+pub(super) fn run(
+    args: super::CliArgs,
+    stdio: Arc<UserlandStdioProvider>,
+) -> Result<(), Box<dyn Error>> {
     let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
         configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
     );
     let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
+        stdio,
     )?;
     let broker = BrokerCoreBuilder::new(policy)
         .with_file_service(fs)

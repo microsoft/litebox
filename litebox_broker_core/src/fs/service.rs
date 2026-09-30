@@ -11,6 +11,7 @@ use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
     FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
 
 use super::OFlags;
@@ -20,6 +21,7 @@ use super::errors::{
 };
 use super::resolver::{Resolver, ResolverEntry};
 use crate::object::{ObjectEntry, ObjectRights};
+use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessSource};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Guest-visible result of a broker file operation.
@@ -33,11 +35,42 @@ type ServiceResult<T> = Result<FileResult<T>>;
 /// updates across duplicated broker references, while operations that cannot update position use
 /// shared access so blocking device I/O does not prevent status and other stateless operations.
 #[derive(Clone)]
-pub struct File(Arc<dyn Any + Send + Sync>);
+pub struct File {
+    state: Arc<dyn Any + Send + Sync>,
+    /// Readiness of a file whose reads or writes can fail with `WouldBlock`.
+    readiness: Option<Arc<dyn ReadinessSource>>,
+}
 
 impl File {
     fn state<State: Any + Send + Sync>(&self) -> Result<&State> {
-        self.0.as_ref().downcast_ref().ok_or(BrokerError::Internal)
+        self.state
+            .as_ref()
+            .downcast_ref()
+            .ok_or(BrokerError::Internal)
+    }
+
+    /// Returns a registration that publishes this file's readiness changes through
+    /// `readiness_sink` for `handle` until it drops, or `None` if its reads and writes always make
+    /// progress.
+    pub(crate) fn watch(
+        &self,
+        handle: ObjectHandle,
+        readiness_sink: &Arc<dyn ReadinessSink>,
+    ) -> Result<Option<ReadinessRegistration>> {
+        let Some(source) = &self.readiness else {
+            return Ok(None);
+        };
+        let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
+        source.watch(&registration)?;
+        Ok(Some(registration))
+    }
+
+    /// Returns this file's readiness, if its reads or writes can fail with `WouldBlock`.
+    pub(crate) fn readiness(&self) -> Result<ReadinessFlags> {
+        self.readiness
+            .as_ref()
+            .map(|source| source.readiness())
+            .ok_or(BrokerError::InvalidRights)
     }
 }
 
@@ -165,7 +198,11 @@ where
             Ok(entry) => entry,
             Err(error) => return Ok(Err(file_open_error(error))),
         };
-        Ok(Ok(File(Arc::new(RwLock::<Platform, _>::new(entry)))))
+        let readiness = Resolver::readiness_source(self, &entry);
+        Ok(Ok(File {
+            state: Arc::new(RwLock::<Platform, _>::new(entry)),
+            readiness,
+        }))
     }
 
     fn read(&self, file: &File, output: &mut [u8], offset: Option<u64>) -> ServiceResult<usize> {
@@ -190,6 +227,7 @@ where
         };
         let read = match read {
             Ok(read) => read,
+            Err(ReadError::WouldBlock) => return Err(BrokerError::WouldBlock),
             Err(error) => return Ok(Err(file_read_error(error))),
         };
         if read > output.len() {
@@ -220,6 +258,7 @@ where
         };
         let written = match written {
             Ok(written) => written,
+            Err(WriteError::WouldBlock) => return Err(BrokerError::WouldBlock),
             Err(error) => return Ok(Err(file_write_error(error))),
         };
         if written > input.len() {
@@ -349,6 +388,9 @@ where
 }
 
 /// Opens an absolute path and installs its broker-owned open state in `process`.
+///
+/// If reads or writes of the file can fail with [`BrokerError::WouldBlock`], the new reference
+/// publishes the file's readiness through `readiness_sink`.
 pub fn open(
     process: &BrokerProcess,
     path: &str,
@@ -356,6 +398,7 @@ pub fn open(
     access: FileAccessMode,
     flags: FileOpenFlags,
     mode: FileMode,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<FileResult<ObjectHandle>> {
     let rights = authorize(process, open_required_rights(access, flags)?)?;
     if let Err(error) = validate_path(path) {
@@ -366,10 +409,16 @@ pub fn open(
         Ok(file) => file,
         Err(error) => return Ok(Err(error)),
     };
-    reference.commit(ObjectEntry::File(file)).map(Ok)
+    let readiness = file.watch(reference.handle(), readiness_sink)?;
+    reference
+        .commit_with_readiness(ObjectEntry::File(file), readiness)
+        .map(Ok)
 }
 
 /// Reads bytes from a broker-owned open file.
+///
+/// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness has nothing to
+/// read.
 pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -384,6 +433,9 @@ pub fn read(
 }
 
 /// Writes bytes to a broker-owned open file.
+///
+/// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness cannot accept
+/// bytes.
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -640,7 +692,7 @@ fn file_read_error(error: ReadError) -> FileError {
     match error {
         ReadError::NotAFile => FileError::NotFile,
         ReadError::NotForReading => FileError::NotForReading,
-        ReadError::ClosedFd | ReadError::Io => FileError::Io,
+        ReadError::ClosedFd | ReadError::Io | ReadError::WouldBlock => FileError::Io,
     }
 }
 
@@ -648,7 +700,7 @@ fn file_write_error(error: WriteError) -> FileError {
     match error {
         WriteError::NotAFile => FileError::NotFile,
         WriteError::NotForWriting => FileError::NotForWriting,
-        WriteError::ClosedFd | WriteError::Io => FileError::Io,
+        WriteError::ClosedFd | WriteError::Io | WriteError::WouldBlock => FileError::Io,
     }
 }
 

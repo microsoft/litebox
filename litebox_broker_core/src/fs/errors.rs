@@ -38,6 +38,8 @@ pub enum ReadError {
     NotForReading,
     #[error("I/O error")]
     Io,
+    #[error("no data is available yet")]
+    WouldBlock,
 }
 
 /// Possible errors from [`super::resolver::Resolver::write`]
@@ -51,6 +53,8 @@ pub enum WriteError {
     NotForWriting,
     #[error("I/O error")]
     Io,
+    #[error("no space is available yet")]
+    WouldBlock,
 }
 
 /// Possible errors from [`super::resolver::Resolver::seek`]

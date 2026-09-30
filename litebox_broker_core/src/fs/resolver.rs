@@ -4,6 +4,7 @@
 //! Path management, permission checks, and open-state operations above [`super::backend`].
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -20,6 +21,7 @@ use super::{
     },
 };
 use super::{SeekWhence, UserInfo};
+use crate::readiness::ReadinessSource;
 
 /// The broker-core filesystem resolver, generic over its synchronization platform and
 /// [`Backend`](super::backend::Backend).
@@ -947,6 +949,18 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         match &entry.handle {
             Handle::File(file) if !entry.path_only => self.backend.is_terminal(file),
             Handle::File(_) | Handle::Dir(_) => false,
+        }
+    }
+
+    /// Readiness of an open entry whose reads or writes can fail with `WouldBlock`, or `None` if
+    /// they always make progress. Path-only entries never read or write.
+    pub fn readiness_source(
+        &self,
+        entry: &ResolverEntry<Backend>,
+    ) -> Option<Arc<dyn ReadinessSource>> {
+        match &entry.handle {
+            Handle::File(file) if !entry.path_only => self.backend.readiness_source(file),
+            Handle::File(_) | Handle::Dir(_) => None,
         }
     }
 

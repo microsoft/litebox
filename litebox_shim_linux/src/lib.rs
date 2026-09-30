@@ -538,6 +538,20 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
 #[derive(Clone)]
 pub(crate) struct StdioStatusFlags(OFlags);
 
+impl<Platform: ShimPlatform> GlobalState<Platform> {
+    /// Returns whether reads and writes of `fd` fail with `EAGAIN` instead of waiting.
+    ///
+    /// Only stdio tracks status flags; other files never wait.
+    pub(crate) fn file_nonblocking(&self, fd: &FileFd) -> bool {
+        self.litebox
+            .descriptor_table()
+            .with_metadata(fd, |StdioStatusFlags(flags)| {
+                flags.contains(OFlags::NONBLOCK)
+            })
+            .unwrap_or(false)
+    }
+}
+
 impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
     fn initialize_stdio_in_shared_descriptors_table(
         &self,
@@ -576,28 +590,10 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
             .unwrap();
         let mut dt = global.litebox.descriptor_table_mut();
         let mut rds = self.raw_descriptor_store.write();
-        for (raw_fd, fd, stream) in [
-            (
-                0,
-                stdin,
-                litebox_common_linux::program_startup::StdioStream::Stdin,
-            ),
-            (
-                1,
-                stdout,
-                litebox_common_linux::program_startup::StdioStream::Stdout,
-            ),
-            (
-                2,
-                stderr,
-                litebox_common_linux::program_startup::StdioStream::Stderr,
-            ),
-        ] {
+        for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
             let status_flags = OFlags::APPEND | OFlags::RDWR;
             debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
             let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
-            assert!(old.is_none());
-            let old = dt.set_entry_metadata(&fd, stream);
             assert!(old.is_none());
             let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
             assert!(success);
