@@ -62,7 +62,6 @@ thread_local! {
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct WindowsUserland<const ALIGN: usize = PAGE_SIZE> {
-    reserved_pages: alloc::vec::Vec<core::ops::Range<usize>>,
     sys_info: std::sync::RwLock<Win32_SysInfo::SYSTEM_INFO>,
 }
 
@@ -297,10 +296,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
             );
         }
 
-        let reserved_pages = Self::read_memory_maps();
-
         let platform = Self {
-            reserved_pages,
             sys_info: std::sync::RwLock::new(sys_info),
         };
 
@@ -322,39 +318,6 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
         }
 
         Box::leak(Box::new(platform))
-    }
-
-    fn read_memory_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-        let mut reserved_pages = alloc::vec::Vec::new();
-        let mut address = 0usize;
-
-        loop {
-            let mut mbi = Win32_Memory::MEMORY_BASIC_INFORMATION::default();
-            let ok = unsafe {
-                Win32_Memory::VirtualQuery(
-                    address as *const c_void,
-                    &raw mut mbi,
-                    core::mem::size_of::<Win32_Memory::MEMORY_BASIC_INFORMATION>(),
-                ) != 0
-            };
-            if !ok {
-                break;
-            }
-
-            if mbi.State == Win32_Memory::MEM_RESERVE || mbi.State == Win32_Memory::MEM_COMMIT {
-                reserved_pages.push(core::ops::Range {
-                    start: mbi.BaseAddress as usize,
-                    end: (mbi.BaseAddress as usize + mbi.RegionSize),
-                });
-            }
-
-            address = mbi.BaseAddress as usize + mbi.RegionSize;
-            if address == 0 {
-                break;
-            }
-        }
-
-        reserved_pages
     }
 
     /// Retrieves information about the host platform (Windows).

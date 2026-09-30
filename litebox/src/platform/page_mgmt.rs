@@ -387,11 +387,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         Err(RemapError::UnsupportedByPlatform)
     }
 
-    /// Return reserved pages that are not available for allocation.
-    ///
-    /// Note that the returned ranges should be `ALIGN`-aligned.
-    fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
-
     /// Attempt to allocate pages with copy-on-write semantics backed by static data.
     ///
     /// This method allows platforms that support it to create CoW mappings instead of performing

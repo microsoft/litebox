@@ -668,25 +668,11 @@ where
     pub(super) fn new(platform: &'static Platform) -> Self {
         assert!(Platform::RESERVATION_ALIGNMENT.is_power_of_two());
         assert!(Platform::RESERVATION_ALIGNMENT.is_multiple_of(ALIGN));
-        let mut vmem = Self {
+        Self {
             platform,
             vmas: RangeMap::new(),
             reservations: Platform::Reservations::default(),
-        };
-        for each in platform.reserved_pages() {
-            assert!(
-                each.start % ALIGN == 0 && each.end % ALIGN == 0,
-                "Vmem: reserved range is not aligned to {ALIGN} bytes"
-            );
-            vmem.vmas.insert(
-                each.start..each.end,
-                VmArea {
-                    flags: VmFlags::empty(),
-                    is_file_backed: false,
-                },
-            );
         }
-        vmem
     }
 
     /// Gets an iterator over all pairs of ([`Range<usize>`], [`VmArea`]),
@@ -1872,10 +1858,6 @@ mod tests {
             litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>: 'reservation,
         {
             Ok(())
-        }
-
-        fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
-            core::iter::empty()
         }
     }
 

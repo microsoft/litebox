@@ -249,10 +249,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
-    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        self.reserved_pages.iter()
-    }
-
     unsafe fn try_allocate_cow_pages<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
@@ -324,27 +320,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 Ok(unsafe { LinuxUserlandReservation::new(address..address + source_data.len()) })
             }
             Err(_) => Err(CowAllocationError::InternalFailure),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use litebox::platform::PageManagementProvider;
-
-    #[test]
-    fn test_reserved_pages() {
-        let platform = LinuxUserland::new(None);
-        let reserved_pages: Vec<_> =
-            <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
-
-        // Check that the reserved pages are in order and non-overlapping
-        let mut prev = 0;
-        for page in reserved_pages {
-            assert!(page.start >= prev);
-            assert!(page.end > page.start);
-            prev = page.end;
         }
     }
 }
