@@ -14,7 +14,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode as Mode, FileOpenFlags,
-    FileSeekWhence as SeekWhence, FileStatus, FileUser as UserInfo,
+    FileSeekWhence as SeekWhence, FileStatus, FileStatusFlags, FileUser as UserInfo,
 };
 
 use litebox_platform::time::TimeProvider;
@@ -30,8 +30,8 @@ use crate::{LiteBox, sync};
 
 use super::errors::{
     ChmodError, ChownError, CloseError, FileStatusError, IsTerminalError, MkdirError, OpenError,
-    PathError, ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError,
-    WriteError,
+    PathError, ReadDirError, ReadError, RmdirError, SeekError, StatusFlagsError, TruncateError,
+    UnlinkError, WriteError,
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -106,7 +106,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Read from a file descriptor at `offset` into a buffer.
     ///
     /// While the file has nothing to read, waits through `wait`, or fails with
-    /// [`ReadError::WouldBlock`] if `wait` is `None`.
+    /// [`ReadError::WouldBlock`] if `wait` is `None` or the file's status flags include
+    /// [`FileOpenFlags::NONBLOCKING`].
     pub fn read_file(
         &self,
         fd: &FileFd,
@@ -130,9 +131,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     /// Write from a buffer to a file descriptor at `offset`.
     ///
     /// While the file cannot accept bytes, waits through `wait`, or fails with
-    /// [`WriteError::WouldBlock`] if `wait` is `None`. When waiting, keeps writing until the whole
-    /// buffer is written or a failure or interruption follows partial progress, which then returns
-    /// the bytes written.
+    /// [`WriteError::WouldBlock`] if `wait` is `None` or the file's status flags include
+    /// [`FileOpenFlags::NONBLOCKING`]. Given `wait`, keeps writing until the whole buffer is
+    /// written or a failure or interruption follows partial progress, which then returns the bytes
+    /// written.
     pub fn write_file(
         &self,
         fd: &FileFd,
@@ -301,6 +303,26 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         file.broker
             .is_terminal_file(file.handle)?
             .map_err(|_| IsTerminalError::Io)
+    }
+
+    /// Returns the access mode and status flags of the open file description at `fd`.
+    pub fn file_status_flags(&self, fd: &FileFd) -> Result<FileStatusFlags, StatusFlagsError> {
+        let file = self.broker_file(fd).ok_or(StatusFlagsError::ClosedFd)?;
+        Ok(file.broker.status_flags(file.handle)?)
+    }
+
+    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`], of the open file
+    /// description at `fd` to their values in `flags`.
+    ///
+    /// Every descriptor and process sharing the open file description sees the change.
+    pub fn set_file_status_flags(
+        &self,
+        fd: &FileFd,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<(), StatusFlagsError> {
+        let file = self.broker_file(fd).ok_or(StatusFlagsError::ClosedFd)?;
+        Ok(file.broker.set_status_flags(file.handle, mask, flags)?)
     }
 
     /// Returns the readiness of the file in a descriptor `entry` for polling.
@@ -520,6 +542,9 @@ impl From<BrokerControlError> for TryOpError<ReadError> {
     fn from(error: BrokerControlError) -> Self {
         match error {
             BrokerControlError::Broker(ErrorCode::WouldBlock) => Self::TryAgain,
+            BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock) => {
+                Self::Other(ReadError::WouldBlock)
+            }
             error => Self::Other(error.into()),
         }
     }
@@ -529,6 +554,9 @@ impl From<BrokerControlError> for TryOpError<WriteError> {
     fn from(error: BrokerControlError) -> Self {
         match error {
             BrokerControlError::Broker(ErrorCode::WouldBlock) => Self::TryAgain,
+            BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock) => {
+                Self::Other(WriteError::WouldBlock)
+            }
             error => Self::Other(error.into()),
         }
     }
@@ -601,6 +629,12 @@ impl From<BrokerControlError> for FileStatusError {
 impl From<BrokerControlError> for IsTerminalError {
     fn from(error: BrokerControlError) -> Self {
         broker_fd_error(error, Self::ClosedFd, Self::Io, Self::Io)
+    }
+}
+
+impl From<BrokerControlError> for StatusFlagsError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::PathOnly, Self::Io)
     }
 }
 

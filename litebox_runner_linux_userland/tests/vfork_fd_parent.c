@@ -27,8 +27,9 @@ int main(int argc, char **argv) {
         return 3;
     }
 
-    // The child writes the log through its stdout and `log`, which share an offset, and checks
-    // that `hidden` stays behind.
+    // The child writes the log through its stdout and `log`, which share an offset, checks that
+    // `hidden` stays behind, and makes the stdin alias non-blocking, which the parent's stdin
+    // shares.
     char log_arg[16], stdin_alias_arg[16], hidden_arg[16];
     snprintf(log_arg, sizeof log_arg, "%d", log);
     snprintf(stdin_alias_arg, sizeof stdin_alias_arg, "%d", STDIN_ALIAS);
@@ -42,6 +43,7 @@ int main(int argc, char **argv) {
     int status = 0;
     pid_t waited = child < 0 ? -1 : waitpid(child, &status, 0);
     off_t offset = lseek(1, 0, SEEK_CUR);
+    int stdin_nonblock = (fcntl(0, F_GETFL) & O_NONBLOCK) != 0;
     dup2(saved_stdout, 1);
     if (child < 0) {
         perror("vfork");
@@ -50,8 +52,10 @@ int main(int argc, char **argv) {
 
     char contents[512];
     ssize_t length = pread(hidden, contents, sizeof contents, 0);
-    printf("parent child=%d waited=%d exited=%d code=%d offset=%lld length=%zd\n", child,
-           waited, WIFEXITED(status), WEXITSTATUS(status), (long long)offset, length);
+    printf("parent child=%d waited=%d exited=%d code=%d offset=%lld length=%zd "
+           "stdin_nonblock=%d\n",
+           child, waited, WIFEXITED(status), WEXITSTATUS(status), (long long)offset, length,
+           stdin_nonblock);
     if (length > 0) {
         fwrite(contents, 1, length, stdout);
     }

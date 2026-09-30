@@ -423,6 +423,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
         let append_mode = flags.contains(OFlags::APPEND);
+        let nonblocking = flags.contains(OFlags::NONBLOCK);
         let entry = |handle, seek_behavior| ResolverEntry {
             handle,
             _backend: core::marker::PhantomData,
@@ -430,6 +431,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
             write_allowed,
             position: 0,
             append_mode,
+            nonblocking,
             path_only,
             seek_behavior,
         };
@@ -990,6 +992,8 @@ pub struct ResolverEntry<Backend: super::backend::Backend> {
     write_allowed: bool,
     position: usize,
     append_mode: bool,
+    /// Whether reads and writes that would block fail instead of waiting.
+    nonblocking: bool,
     path_only: bool,
     seek_behavior: SeekBehavior,
 }
@@ -1001,6 +1005,26 @@ impl<Backend: super::backend::Backend> ResolverEntry<Backend> {
 
     pub(crate) const fn allows_read(&self) -> bool {
         self.read_allowed
+    }
+
+    pub(crate) const fn allows_write(&self) -> bool {
+        self.write_allowed
+    }
+
+    pub(crate) const fn is_append(&self) -> bool {
+        self.append_mode
+    }
+
+    pub(crate) fn set_append(&mut self, append: bool) {
+        self.append_mode = append;
+    }
+
+    pub(crate) const fn is_nonblocking(&self) -> bool {
+        self.nonblocking
+    }
+
+    pub(crate) fn set_nonblocking(&mut self, nonblocking: bool) {
+        self.nonblocking = nonblocking;
     }
 
     pub(crate) const fn uses_position(&self) -> bool {

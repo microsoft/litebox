@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::fs::FileMode as Mode;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence};
 use litebox_common_linux::{
     AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags, errno::Errno,
 };
@@ -224,6 +224,61 @@ fn test_fcntl() {
     let duplicated = i32::try_from(duplicated).unwrap();
 
     assert_eq!(duplicated, min_fd);
+}
+
+#[test]
+fn test_file_status_flags() {
+    let task = init_platform();
+    let path = "/status_flags_file";
+    let open = |flags| i32::try_from(task.sys_open(path, flags, Mode::RWXU).unwrap()).unwrap();
+    let getfl = |fd| OFlags::from_bits_retain(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap());
+    let fionbio = |fd, enable: i32| {
+        task.sys_ioctl(
+            fd,
+            IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize)),
+        )
+    };
+
+    assert_eq!(getfl(0), OFlags::RDONLY);
+    assert_eq!(getfl(1), OFlags::WRONLY);
+    assert_eq!(getfl(2), OFlags::WRONLY);
+
+    // Duplicates share the status flags of their open file description.
+    let fd = open(OFlags::CREAT | OFlags::RDWR | OFlags::NONBLOCK);
+    let dup = i32::try_from(task.sys_dup(fd, None, None).unwrap()).unwrap();
+    assert_eq!(getfl(dup), OFlags::RDWR | OFlags::NONBLOCK);
+    assert_eq!(task.sys_write(fd, b"ab", None), Ok(2));
+    assert_eq!(task.sys_fcntl(dup, FcntlArg::SETFL(OFlags::APPEND)), Ok(0));
+    assert_eq!(getfl(fd), OFlags::RDWR | OFlags::APPEND);
+    assert_eq!(fionbio(dup, 1), Ok(0));
+    assert_eq!(getfl(fd), OFlags::RDWR | OFlags::APPEND | OFlags::NONBLOCK);
+
+    // Appending writes go to the end regardless of the file offset.
+    assert_eq!(
+        task.sys_lseek(fd, 0, SeekWhence::RelativeToBeginning),
+        Ok(0)
+    );
+    assert_eq!(task.sys_write(fd, b"c", None), Ok(1));
+    let mut buf = [0; 4];
+    assert_eq!(task.sys_read(fd, &mut buf, Some(0)), Ok(3));
+    assert_eq!(&buf[..3], b"abc");
+
+    // Only the flags of the open file description that `F_SETFL` names change.
+    let other = open(OFlags::RDONLY);
+    assert_eq!(getfl(other), OFlags::RDONLY);
+
+    let path_fd = open(OFlags::PATH);
+    assert_eq!(getfl(path_fd), OFlags::PATH);
+    assert_eq!(
+        task.sys_fcntl(path_fd, FcntlArg::SETFL(OFlags::NONBLOCK)),
+        Err(Errno::EBADF)
+    );
+    assert_eq!(fionbio(path_fd, 1), Err(Errno::EBADF));
+
+    for fd in [fd, dup, other, path_fd] {
+        task.sys_close(fd).unwrap();
+    }
+    task.sys_unlinkat(0, path, AtFlags::empty()).unwrap();
 }
 
 #[test]
