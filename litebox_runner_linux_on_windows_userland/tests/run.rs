@@ -24,6 +24,55 @@ fn checked_output(command: &mut Command) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn stage_and_rewrite(rootfs: &Path, wsl_root: &Path, mut pending: BTreeSet<String>) {
+    let mut elf_paths = BTreeSet::new();
+    while let Some(guest_path) = pending.pop_first() {
+        if !elf_paths.insert(guest_path.clone()) {
+            continue;
+        }
+        let relative_path = guest_path.trim_start_matches('/');
+        let resolved_path =
+            checked_output(Command::new("wsl.exe").args(["--exec", "readlink", "-f", &guest_path]));
+        let source = wsl_root.join(resolved_path.trim().trim_start_matches('/'));
+        assert!(source.is_file(), "Missing ELF source: {}", source.display());
+        let destination = rootfs.join(relative_path);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::copy(source, destination).unwrap();
+        let dependencies =
+            checked_output(Command::new("wsl.exe").args(["--exec", "ldd", &guest_path]));
+        for line in dependencies.lines() {
+            assert!(
+                !line.contains("not found"),
+                "Missing dependency for {guest_path}: {line}",
+            );
+            let dependency = line.split_once("=>").map_or(line, |(_, path)| path);
+            if let Some(path) = dependency
+                .split_whitespace()
+                .next()
+                .filter(|path| path.starts_with('/'))
+            {
+                pending.insert(path.to_owned());
+            }
+        }
+    }
+
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    for guest_path in elf_paths {
+        let source = rootfs.join(guest_path.trim_start_matches('/'));
+        let rewritten = source.with_extension("hooked");
+        checked_output(
+            Command::new(&cargo)
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .args(["run", "-p", "litebox_syscall_rewriter", "--"])
+                .arg(&source)
+                .arg("-o")
+                .arg(&rewritten),
+        );
+        std::fs::remove_file(&source).unwrap();
+        std::fs::rename(rewritten, source).unwrap();
+    }
+}
+
 fn stage_path(source: &Path, destination: &Path) {
     if source.is_dir() {
         std::fs::create_dir_all(destination).unwrap();
@@ -113,50 +162,7 @@ fn test_runner_with_python() {
 
     let mut pending = BTreeSet::from([python_path.to_owned()]);
     find_elf_files(&rootfs, &rootfs, &mut pending);
-    let mut elf_paths = BTreeSet::new();
-    while let Some(guest_path) = pending.pop_first() {
-        if !elf_paths.insert(guest_path.clone()) {
-            continue;
-        }
-        let relative_path = guest_path.trim_start_matches('/');
-        let resolved_path =
-            checked_output(Command::new("wsl.exe").args(["--exec", "readlink", "-f", &guest_path]));
-        let source = wsl_root.join(resolved_path.trim().trim_start_matches('/'));
-        assert!(source.is_file(), "Missing ELF source: {}", source.display());
-        stage_path(&source, &rootfs.join(relative_path));
-        let dependencies =
-            checked_output(Command::new("wsl.exe").args(["--exec", "ldd", &guest_path]));
-        for line in dependencies.lines() {
-            assert!(
-                !line.contains("not found"),
-                "Missing dependency for {guest_path}: {line}",
-            );
-            let dependency = line.split_once("=>").map_or(line, |(_, path)| path);
-            if let Some(path) = dependency
-                .split_whitespace()
-                .next()
-                .filter(|path| path.starts_with('/'))
-            {
-                pending.insert(path.to_owned());
-            }
-        }
-    }
-
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    for guest_path in elf_paths {
-        let source = rootfs.join(guest_path.trim_start_matches('/'));
-        let rewritten = source.with_extension("hooked");
-        checked_output(
-            Command::new(&cargo)
-                .current_dir(env!("CARGO_MANIFEST_DIR"))
-                .args(["run", "-p", "litebox_syscall_rewriter", "--"])
-                .arg(&source)
-                .arg("-o")
-                .arg(&rewritten),
-        );
-        std::fs::remove_file(&source).unwrap();
-        std::fs::rename(rewritten, source).unwrap();
-    }
+    stage_and_rewrite(&rootfs, &wsl_root, pending);
 
     let tar_path = test_dir.join("rootfs.tar");
     checked_output(
@@ -200,5 +206,67 @@ fn test_runner_with_python() {
             .lines()
             .any(|line| line.trim() == "Hello, World from litebox!"),
         "Unexpected Python output:\n{output}",
+    );
+}
+
+#[test]
+#[ignore = "Requires WSL with bash, which, x86-64 Linux Node.js, ldd, and readlink"]
+fn test_node_with_rewriter() {
+    let node =
+        checked_output(Command::new("wsl.exe").args(["--exec", "bash", "-ic", "which node"]));
+    let configuration = checked_output(Command::new("wsl.exe").args([
+        "--exec",
+        node.trim(),
+        "-p",
+        "require('node:assert').strictEqual(process.arch, 'x64'); process.execPath",
+    ]));
+    let node_path = configuration.trim();
+    let test_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("windows_node_rewriter");
+    let rootfs = test_dir.join("rootfs");
+    if rootfs.exists() {
+        std::fs::remove_dir_all(&rootfs).unwrap();
+    }
+    std::fs::create_dir_all(rootfs.join("out")).unwrap();
+    let wsl_root = checked_output(Command::new("wsl.exe").args(["--exec", "wslpath", "-w", "/"]));
+    stage_and_rewrite(
+        &rootfs,
+        &PathBuf::from(wsl_root.trim()),
+        BTreeSet::from([node_path.to_owned()]),
+    );
+    std::fs::write(
+        rootfs.join("out/hello_world.js"),
+        "const fs = require('node:fs');\nconst content = 'Hello World!';\nconsole.log(content);\n",
+    )
+    .unwrap();
+    let tar_path = test_dir.join("rootfs.tar");
+    checked_output(
+        Command::new("tar")
+            .arg("-cf")
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&rootfs)
+            .arg("."),
+    );
+    let binary_path = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").into());
+    let output = checked_output(
+        Command::new(binary_path)
+            .args([
+                "--unstable",
+                "--env",
+                "LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib",
+                "--env",
+                &format!("LD_ORIGIN_PATH={}", node_path.rsplit_once('/').unwrap().0),
+                "--env",
+                "HOME=/",
+                "--initial-files",
+            ])
+            .arg(tar_path)
+            .args([node_path, "/out/hello_world.js"]),
+    );
+    print!("{output}");
+    assert!(
+        output.lines().any(|line| line.trim() == "Hello World!"),
+        "Unexpected Node output:\n{output}",
     );
 }
