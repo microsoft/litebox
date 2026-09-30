@@ -1211,6 +1211,10 @@ mod tests {
             task.sys_brk(UserPtrMut::from_usize(below_initial)),
             Ok(initial)
         );
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(usize::MAX)),
+            Ok(initial)
+        );
         assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(initial));
         assert_eq!(task.sys_brk(UserPtrMut::from_usize(grown)), Ok(grown));
         assert_eq!(

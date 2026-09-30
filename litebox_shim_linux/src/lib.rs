@@ -135,10 +135,15 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     ///
     /// # Panics
     ///
-    /// Panics if the initial program break has already been set.
+    /// Panics if the initial program break has already been set or cannot be rounded up to a page
+    /// boundary.
     pub fn set_initial_brk(&self, brk: usize) {
         let mut state = self.brk.lock();
         assert_eq!(state.initial, 0, "initial brk is already set");
+        assert!(
+            brk.checked_next_multiple_of(PAGE_SIZE).is_some(),
+            "initial brk is too large"
+        );
         state.initial = brk;
         state.current = brk;
     }
@@ -164,7 +169,9 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
         }
 
         let old_page_end = state.current.next_multiple_of(PAGE_SIZE);
-        let new_page_end = requested.next_multiple_of(PAGE_SIZE);
+        let new_page_end = requested
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(MappingError::OutOfMemory)?;
         if state.current >= requested {
             if let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end) {
                 let ptr =
