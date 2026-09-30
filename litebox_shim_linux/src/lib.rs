@@ -30,12 +30,10 @@ use litebox::{
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_broker_protocol::fs::{
-    FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence,
-};
+use litebox_broker_protocol::fs::FileSeekWhence as SeekWhence;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::{
-    FcntlArg, OFlags, SyscallRequest,
+    FcntlArg, SyscallRequest,
     errno::Errno,
     mm::VmemManager,
     user_pointers::{UserPtr, UserPtrMut},
@@ -530,73 +528,6 @@ impl<Platform: ShimPlatform> LinuxShimProcess<Platform> {
         match self.0.wait_for_exit() {
             syscalls::process::ExitStatus::Exit(v) => i32::from(v) & 0xff,
             syscalls::process::ExitStatus::Signal(signal) => signal.as_i32() + 128,
-        }
-    }
-}
-
-// Special override so that `GETFL` can return stdio-specific flags
-#[derive(Clone)]
-pub(crate) struct StdioStatusFlags(OFlags);
-
-impl<Platform: ShimPlatform> GlobalState<Platform> {
-    /// Returns whether reads and writes of `fd` fail with `EAGAIN` instead of waiting.
-    ///
-    /// Only stdio tracks status flags; other files never wait.
-    pub(crate) fn file_nonblocking(&self, fd: &FileFd) -> bool {
-        self.litebox
-            .descriptor_table()
-            .with_metadata(fd, |StdioStatusFlags(flags)| {
-                flags.contains(OFlags::NONBLOCK)
-            })
-            .unwrap_or(false)
-    }
-}
-
-impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
-    fn initialize_stdio_in_shared_descriptors_table(
-        &self,
-        global: &GlobalState<Platform>,
-        context: &litebox::fs::Context,
-    ) {
-        let stdin = global
-            .litebox
-            .open_file(
-                context,
-                "/dev/stdin",
-                FileAccessMode::ReadOnly,
-                FileOpenFlags::NONE,
-                Mode::empty(),
-            )
-            .unwrap();
-        let stdout = global
-            .litebox
-            .open_file(
-                context,
-                "/dev/stdout",
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::NONE,
-                Mode::empty(),
-            )
-            .unwrap();
-        let stderr = global
-            .litebox
-            .open_file(
-                context,
-                "/dev/stderr",
-                FileAccessMode::WriteOnly,
-                FileOpenFlags::NONE,
-                Mode::empty(),
-            )
-            .unwrap();
-        let mut dt = global.litebox.descriptor_table_mut();
-        let mut rds = self.raw_descriptor_store.write();
-        for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
-            let status_flags = OFlags::APPEND | OFlags::RDWR;
-            debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
-            let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
-            assert!(old.is_none());
-            let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
-            assert!(success);
         }
     }
 }

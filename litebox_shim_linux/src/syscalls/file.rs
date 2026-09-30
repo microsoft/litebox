@@ -254,7 +254,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                         let fd = adopt_file()?;
                         litebox
                             .descriptor_table_mut()
-                            .set_entry_metadata(&fd, crate::StdioStatusFlags(status_flags));
+                            .set_entry_metadata(&fd, crate::stdio::StdioStatusFlags(status_flags));
                         Ok(fd)
                     })?;
                 }
@@ -545,7 +545,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         return Err(Errno::EAGAIN);
                     }
                     let kind = match descriptors
-                        .with_metadata(&file, |crate::StdioStatusFlags(flags)| *flags)
+                        .with_metadata(&file, |crate::stdio::StdioStatusFlags(flags)| *flags)
                     {
                         Ok(status_flags) => InheritedFdKind::Stdio { status_flags },
                         Err(_) => InheritedFdKind::File,
@@ -791,6 +791,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_read(&fd, buf, offset)
     }
 
+    /// Returns whether reads and writes of `fd` fail with `EAGAIN` instead of waiting.
+    ///
+    /// Only the stdio descriptors installed at startup track status flags.
+    // TODO: Files opened by path, including `/dev/std*`, ignore `O_NONBLOCK` and always wait.
+    // Status flags belong to the open file description, so they should move into the broker.
+    fn file_nonblocking(&self, fd: &FileFd) -> bool {
+        self.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |crate::stdio::StdioStatusFlags(flags)| {
+                flags.contains(OFlags::NONBLOCK)
+            })
+            .unwrap_or(false)
+    }
+
     pub(crate) fn do_read(
         &self,
         fd: &AnyTypedFd<Platform>,
@@ -803,7 +818,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let result = fd.dispatch(
             |fd| {
                 let cx = self.wait_cx();
-                let wait = (!self.global.file_nonblocking(fd)).then_some(&cx);
+                let wait = (!self.file_nonblocking(fd)).then_some(&cx);
                 self.global
                     .litebox
                     .read_file(fd, &mut buf.borrow_mut(), offset, wait)
@@ -905,7 +920,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let result = fd.dispatch(
             |fd| {
                 let cx = self.wait_cx();
-                let wait = (!self.global.file_nonblocking(fd)).then_some(&cx);
+                let wait = (!self.file_nonblocking(fd)).then_some(&cx);
                 self.global
                     .litebox
                     .write_file(fd, buf, offset, wait)
@@ -1033,7 +1048,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let read_result = match typed_in_fd.as_fs() {
                 Some(fd) => {
                     let cx = self.wait_cx();
-                    let wait = (!self.global.file_nonblocking(fd)).then_some(&cx);
+                    let wait = (!self.file_nonblocking(fd)).then_some(&cx);
                     self.global
                         .litebox
                         .read_file(fd, &mut kernel_buf[..to_read], cur_off, wait)
@@ -2032,7 +2047,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Ok(fd
                     .dispatch(
-                        |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
+                        |fd| getfl_from_metadata!(fd, crate::stdio::StdioStatusFlags),
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| self.global.linux_pipe_status_flags(fd),
                         |fd| getfl_from_handle!(fd),
@@ -2095,7 +2110,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |fd| {
                         setfl_in_metadata!(
                             fd,
-                            crate::StdioStatusFlags,
+                            crate::stdio::StdioStatusFlags,
                             unimplemented!("SETFL on non-stdio")
                         )
                     },
@@ -2374,7 +2389,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             .global
                             .litebox
                             .descriptor_table_mut()
-                            .with_metadata_mut(file_fd, |crate::StdioStatusFlags(flags)| {
+                            .with_metadata_mut(file_fd, |crate::stdio::StdioStatusFlags(flags)| {
                                 flags.set(OFlags::NONBLOCK, val != 0);
                             }) {
                             Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),

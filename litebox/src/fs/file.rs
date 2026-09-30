@@ -23,7 +23,7 @@ use crate::broker::error::BrokerControlError;
 use crate::broker::{BrokerControl, BrokerPollableRegistry, readiness_events};
 use crate::event::observer::Observer;
 use crate::event::polling::{Pollee, TryOpError};
-use crate::event::wait::{WaitContext, WaitError};
+use crate::event::wait::WaitContext;
 use crate::event::{Events, IOPollable};
 use crate::path::Arg;
 use crate::{LiteBox, sync};
@@ -35,6 +35,74 @@ use super::errors::{
 };
 
 impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
+    pub(crate) fn broker_file(&self, fd: &FileFd) -> Option<Arc<BrokerFile>> {
+        self.descriptor_table()
+            .with_entry(fd, |entry| Arc::clone(&entry.entry))
+    }
+
+    fn broker_path(context: &Context, path: impl Arg) -> Result<String, PathError> {
+        Ok(context.resolve(path)?.to_string())
+    }
+
+    /// Opens a file.
+    ///
+    /// `access` and `flags` use the architecture-independent broker contract.
+    /// The `mode` is only significant when creating a file.
+    pub fn open_file(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        access: FileAccessMode,
+        flags: FileOpenFlags,
+        mode: Mode,
+    ) -> Result<FileFd, OpenError> {
+        let path = Self::broker_path(context, path)?;
+        if FileOpenFlags::from_bits(flags.bits()).is_none() {
+            return Err(OpenError::AccessNotAllowed);
+        }
+        let broker = self.broker_control().ok_or(OpenError::Io)?;
+        let handle = broker
+            .open_file(
+                &path,
+                context.acting_user(),
+                access,
+                flags,
+                mode & Mode::SUPPORTED,
+            )
+            .map_err(|_| OpenError::Io)??;
+        Ok(self
+            .descriptor_table_mut()
+            .insert(Arc::new(BrokerFile::new(broker, handle))))
+    }
+
+    /// Returns a descriptor for a file this process inherited from its parent
+    /// through [`Process::inherit`](crate::process::Process::inherit).
+    ///
+    /// The descriptor owns `handle`, so callers adopt each handle once and
+    /// duplicate the descriptor for every other use.
+    pub fn adopt_inherited_file(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<FileFd, crate::process::ProcessError> {
+        let broker = self
+            .broker_control()
+            .ok_or(crate::process::ProcessError::Unavailable)?;
+        Ok(self
+            .descriptor_table_mut()
+            .insert(Arc::new(BrokerFile::new(broker, handle))))
+    }
+
+    /// Close the file at `fd`.
+    ///
+    /// Future operations on the `fd` will start to return `ClosedFd` errors.
+    pub fn close_file(&self, fd: &FileFd) -> Result<(), CloseError> {
+        let mut descriptors = self.descriptor_table_mut();
+        let removed = descriptors.remove(fd);
+        drop(descriptors);
+        drop(removed);
+        Ok(())
+    }
+
     /// Read from a file descriptor at `offset` into a buffer.
     ///
     /// While the file has nothing to read, waits through `wait`, or fails with
@@ -47,10 +115,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, ReadError> {
         let file = self.broker_file(fd).ok_or(ReadError::ClosedFd)?;
+        let offset = offset
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| ReadError::Io)?;
         self.wait_on_file(wait, &file, Events::IN, || {
-            read_broker_file(&file, buf, offset)
+            file.broker
+                .read_file(file.handle, buf, offset)?
+                .map_err(|error| TryOpError::Other(error.into()))
         })
-        .map_err(|error| try_op_error(error, ReadError::WouldBlock, ReadError::WaitError))
+        .map_err(ReadError::from)
     }
 
     /// Write from a buffer to a file descriptor at `offset`.
@@ -67,12 +141,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         wait: Option<&WaitContext<'_, Platform>>,
     ) -> Result<usize, WriteError> {
         let file = self.broker_file(fd).ok_or(WriteError::ClosedFd)?;
+        let offset = offset
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| WriteError::Io)?;
         let mut written = 0;
         loop {
             let rest = &buf[written..];
-            let offset = offset.map(|offset| offset.saturating_add(written));
+            let offset = offset.map(|offset| offset.saturating_add(written as u64));
             match self.wait_on_file(wait, &file, Events::OUT, || {
-                write_broker_file(&file, rest, offset)
+                file.broker
+                    .write_file(file.handle, rest, offset)?
+                    .map_err(|error| TryOpError::Other(error.into()))
             }) {
                 Ok(count) => {
                     written += count;
@@ -81,15 +161,146 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
                     }
                 }
                 Err(_) if written != 0 => return Ok(written),
-                Err(error) => {
-                    return Err(try_op_error(
-                        error,
-                        WriteError::WouldBlock,
-                        WriteError::WaitError,
-                    ));
-                }
+                Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    /// Reposition the read/write file offset.
+    pub fn seek_file(
+        &self,
+        fd: &FileFd,
+        offset: isize,
+        whence: SeekWhence,
+    ) -> Result<usize, SeekError> {
+        let file = self.broker_file(fd).ok_or(SeekError::ClosedFd)?;
+        let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
+        let offset = file.broker.seek_file(file.handle, offset, whence)??;
+        usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
+    }
+
+    /// Truncate the file to the specified length.
+    pub fn truncate_file(
+        &self,
+        fd: &FileFd,
+        length: usize,
+        reset_offset: bool,
+    ) -> Result<(), TruncateError> {
+        let file = self.broker_file(fd).ok_or(TruncateError::ClosedFd)?;
+        file.broker
+            .truncate_file(
+                file.handle,
+                u64::try_from(length).map_err(|_| TruncateError::Io)?,
+                reset_offset,
+            )?
+            .map_err(TruncateError::from)
+    }
+
+    /// Change the permissions of a file.
+    pub fn chmod_file(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), ChmodError> {
+        let path = Self::broker_path(context, path)?;
+        self.broker_control()
+            .ok_or(ChmodError::Io)?
+            .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+            .map_err(|_| ChmodError::Io)?
+            .map_err(ChmodError::from)
+    }
+
+    /// Change the owner of a file.
+    pub fn chown_file(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        user: Option<u16>,
+        group: Option<u16>,
+    ) -> Result<(), ChownError> {
+        let path = Self::broker_path(context, path)?;
+        self.broker_control()
+            .ok_or(ChownError::Io)?
+            .chown_file(&path, context.acting_user(), user, group)
+            .map_err(|_| ChownError::Io)?
+            .map_err(ChownError::from)
+    }
+
+    /// Unlink a file.
+    pub fn unlink_file(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
+        let path = Self::broker_path(context, path)?;
+        self.broker_control()
+            .ok_or(UnlinkError::Io)?
+            .unlink_file(&path, context.acting_user())
+            .map_err(|_| UnlinkError::Io)?
+            .map_err(UnlinkError::from)
+    }
+
+    /// Create a new directory.
+    pub fn mkdir_file(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        mode: Mode,
+    ) -> Result<(), MkdirError> {
+        let path = Self::broker_path(context, path)?;
+        self.broker_control()
+            .ok_or(MkdirError::Io)?
+            .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
+            .map_err(|_| MkdirError::Io)?
+            .map_err(MkdirError::from)
+    }
+
+    /// Remove a directory.
+    pub fn rmdir_file(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
+        let path = Self::broker_path(context, path)?;
+        self.broker_control()
+            .ok_or(RmdirError::Io)?
+            .rmdir_file(&path, context.acting_user())
+            .map_err(|_| RmdirError::Io)?
+            .map_err(RmdirError::from)
+    }
+
+    /// Read directory entries from a directory file descriptor.
+    pub fn read_file_directory(
+        &self,
+        fd: &FileFd,
+    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
+        let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
+        file.broker
+            .read_directory(file.handle)?
+            .map_err(ReadDirError::from)
+    }
+
+    /// Obtain the status of a path.
+    pub fn path_file_status(
+        &self,
+        context: &Context,
+        path: impl Arg,
+    ) -> Result<FileStatus, FileStatusError> {
+        let path = Self::broker_path(context, path)?;
+        self.broker_control()
+            .ok_or(FileStatusError::Io)?
+            .path_file_status(&path, context.acting_user())
+            .map_err(|_| FileStatusError::Io)?
+            .map_err(FileStatusError::from)
+    }
+
+    /// Equivalent to [`Self::path_file_status`], but on an open `fd`.
+    pub fn file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
+        let file = self.broker_file(fd).ok_or(FileStatusError::ClosedFd)?;
+        file.broker
+            .handle_file_status(file.handle)?
+            .map_err(FileStatusError::from)
+    }
+
+    /// Determine whether an open `fd` is connected to a terminal.
+    pub fn is_terminal(&self, fd: &FileFd) -> Result<bool, IsTerminalError> {
+        let file = self.broker_file(fd).ok_or(IsTerminalError::ClosedFd)?;
+        file.broker
+            .is_terminal_file(file.handle)?
+            .map_err(|_| IsTerminalError::Io)
     }
 
     /// Returns the readiness of the file in a descriptor `entry` for polling.
@@ -146,236 +357,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
             .downcast_ref::<FilePollee<Platform>>()
             .expect("a broker file belongs to one LiteBox")
             .pollee
-    }
-}
-
-impl<Platform: sync::RawSyncPrimitivesProvider> LiteBox<Platform> {
-    pub(crate) fn broker_file(&self, fd: &FileFd) -> Option<Arc<BrokerFile>> {
-        self.descriptor_table()
-            .with_entry(fd, |entry| Arc::clone(&entry.entry))
-    }
-
-    fn broker_path(context: &Context, path: impl Arg) -> Result<String, PathError> {
-        Ok(context.resolve(path)?.to_string())
-    }
-
-    /// Opens a file.
-    ///
-    /// `access` and `flags` use the architecture-independent broker contract.
-    /// The `mode` is only significant when creating a file.
-    pub fn open_file(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        access: FileAccessMode,
-        flags: FileOpenFlags,
-        mode: Mode,
-    ) -> Result<FileFd, OpenError> {
-        let path = Self::broker_path(context, path)?;
-        if FileOpenFlags::from_bits(flags.bits()).is_none() {
-            return Err(OpenError::AccessNotAllowed);
-        }
-        let broker = self.broker_control().ok_or(OpenError::Io)?;
-        let handle = broker
-            .open_file(
-                &path,
-                context.acting_user(),
-                access,
-                flags,
-                mode & Mode::SUPPORTED,
-            )
-            .map_err(|_| OpenError::Io)?
-            .map_err(open_error)?;
-        Ok(self
-            .descriptor_table_mut()
-            .insert(Arc::new(BrokerFile::new(broker, handle))))
-    }
-
-    /// Returns a descriptor for a file this process inherited from its parent
-    /// through [`Process::inherit`](crate::process::Process::inherit).
-    ///
-    /// The descriptor owns `handle`, so callers adopt each handle once and
-    /// duplicate the descriptor for every other use.
-    pub fn adopt_inherited_file(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<FileFd, crate::process::ProcessError> {
-        let broker = self
-            .broker_control()
-            .ok_or(crate::process::ProcessError::Unavailable)?;
-        Ok(self
-            .descriptor_table_mut()
-            .insert(Arc::new(BrokerFile::new(broker, handle))))
-    }
-
-    /// Close the file at `fd`.
-    ///
-    /// Future operations on the `fd` will start to return `ClosedFd` errors.
-    pub fn close_file(&self, fd: &FileFd) -> Result<(), CloseError> {
-        let mut descriptors = self.descriptor_table_mut();
-        let removed = descriptors.remove(fd);
-        drop(descriptors);
-        drop(removed);
-        Ok(())
-    }
-
-    /// Reposition the read/write file offset.
-    pub fn seek_file(
-        &self,
-        fd: &FileFd,
-        offset: isize,
-        whence: SeekWhence,
-    ) -> Result<usize, SeekError> {
-        let file = self.broker_file(fd).ok_or(SeekError::ClosedFd)?;
-        let offset = i64::try_from(offset).map_err(|_| SeekError::InvalidOffset)?;
-        let offset = file
-            .broker
-            .seek_file(file.handle, offset, whence)
-            .map_err(seek_broker_error)?
-            .map_err(seek_error)?;
-        usize::try_from(offset).map_err(|_| SeekError::InvalidOffset)
-    }
-
-    /// Truncate the file to the specified length.
-    pub fn truncate_file(
-        &self,
-        fd: &FileFd,
-        length: usize,
-        reset_offset: bool,
-    ) -> Result<(), TruncateError> {
-        let file = self.broker_file(fd).ok_or(TruncateError::ClosedFd)?;
-        file.broker
-            .truncate_file(
-                file.handle,
-                u64::try_from(length).map_err(|_| TruncateError::Io)?,
-                reset_offset,
-            )
-            .map_err(truncate_broker_error)?
-            .map_err(truncate_error)
-    }
-
-    /// Change the permissions of a file.
-    pub fn chmod_file(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        mode: Mode,
-    ) -> Result<(), ChmodError> {
-        let path = Self::broker_path(context, path)?;
-        self.broker_control()
-            .ok_or(ChmodError::Io)?
-            .chmod_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
-            .map_err(|_| ChmodError::Io)?
-            .map_err(chmod_error)
-    }
-
-    /// Change the owner of a file.
-    pub fn chown_file(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        user: Option<u16>,
-        group: Option<u16>,
-    ) -> Result<(), ChownError> {
-        let path = Self::broker_path(context, path)?;
-        self.broker_control()
-            .ok_or(ChownError::Io)?
-            .chown_file(&path, context.acting_user(), user, group)
-            .map_err(|_| ChownError::Io)?
-            .map_err(chown_error)
-    }
-
-    /// Unlink a file.
-    pub fn unlink_file(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
-        let path = Self::broker_path(context, path)?;
-        self.broker_control()
-            .ok_or(UnlinkError::Io)?
-            .unlink_file(&path, context.acting_user())
-            .map_err(|_| UnlinkError::Io)?
-            .map_err(unlink_error)
-    }
-
-    /// Create a new directory.
-    pub fn mkdir_file(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        mode: Mode,
-    ) -> Result<(), MkdirError> {
-        let path = Self::broker_path(context, path)?;
-        self.broker_control()
-            .ok_or(MkdirError::Io)?
-            .mkdir_file(&path, context.acting_user(), mode & Mode::SUPPORTED)
-            .map_err(|_| MkdirError::Io)?
-            .map_err(mkdir_error)
-    }
-
-    /// Remove a directory.
-    pub fn rmdir_file(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
-        let path = Self::broker_path(context, path)?;
-        self.broker_control()
-            .ok_or(RmdirError::Io)?
-            .rmdir_file(&path, context.acting_user())
-            .map_err(|_| RmdirError::Io)?
-            .map_err(rmdir_error)
-    }
-
-    /// Read directory entries from a directory file descriptor.
-    pub fn read_file_directory(
-        &self,
-        fd: &FileFd,
-    ) -> Result<Vec<FileDirectoryEntry>, ReadDirError> {
-        let file = self.broker_file(fd).ok_or(ReadDirError::ClosedFd)?;
-        file.broker
-            .read_directory(file.handle)
-            .map_err(read_directory_broker_error)?
-            .map_err(read_dir_error)
-    }
-
-    /// Obtain the status of a path.
-    pub fn path_file_status(
-        &self,
-        context: &Context,
-        path: impl Arg,
-    ) -> Result<FileStatus, FileStatusError> {
-        let path = Self::broker_path(context, path)?;
-        self.broker_control()
-            .ok_or(FileStatusError::Io)?
-            .path_file_status(&path, context.acting_user())
-            .map_err(|_| FileStatusError::Io)?
-            .map_err(file_status_error)
-    }
-
-    /// Equivalent to [`Self::path_file_status`], but on an open `fd`.
-    pub fn file_status(&self, fd: &FileFd) -> Result<FileStatus, FileStatusError> {
-        let file = self.broker_file(fd).ok_or(FileStatusError::ClosedFd)?;
-        file.broker
-            .handle_file_status(file.handle)
-            .map_err(|error| {
-                broker_fd_error(
-                    error,
-                    FileStatusError::ClosedFd,
-                    FileStatusError::Io,
-                    FileStatusError::Io,
-                )
-            })?
-            .map_err(file_status_error)
-    }
-
-    /// Determine whether an open `fd` is connected to a terminal.
-    pub fn is_terminal(&self, fd: &FileFd) -> Result<bool, IsTerminalError> {
-        let file = self.broker_file(fd).ok_or(IsTerminalError::ClosedFd)?;
-        file.broker
-            .is_terminal_file(file.handle)
-            .map_err(|error| {
-                broker_fd_error(
-                    error,
-                    IsTerminalError::ClosedFd,
-                    IsTerminalError::Io,
-                    IsTerminalError::Io,
-                )
-            })?
-            .map_err(|_| IsTerminalError::Io)
     }
 }
 
@@ -535,48 +516,41 @@ where
     }
 }
 
-fn read_broker_file(
-    file: &BrokerFile,
-    buf: &mut [u8],
-    offset: Option<usize>,
-) -> Result<usize, TryOpError<ReadError>> {
-    let offset = offset
-        .map(u64::try_from)
-        .transpose()
-        .map_err(|_| TryOpError::Other(ReadError::Io))?;
-    match file.broker.read_file(file.handle, buf, offset) {
-        Ok(result) => result.map_err(|error| TryOpError::Other(read_error(error))),
-        Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Err(TryOpError::TryAgain),
-        Err(error) => Err(TryOpError::Other(read_broker_error(error))),
+impl From<BrokerControlError> for TryOpError<ReadError> {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::Broker(ErrorCode::WouldBlock) => Self::TryAgain,
+            error => Self::Other(error.into()),
+        }
     }
 }
 
-fn write_broker_file(
-    file: &BrokerFile,
-    buf: &[u8],
-    offset: Option<usize>,
-) -> Result<usize, TryOpError<WriteError>> {
-    let offset = offset
-        .map(u64::try_from)
-        .transpose()
-        .map_err(|_| TryOpError::Other(WriteError::Io))?;
-    match file.broker.write_file(file.handle, buf, offset) {
-        Ok(result) => result.map_err(|error| TryOpError::Other(write_error(error))),
-        Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Err(TryOpError::TryAgain),
-        Err(error) => Err(TryOpError::Other(write_broker_error(error))),
+impl From<BrokerControlError> for TryOpError<WriteError> {
+    fn from(error: BrokerControlError) -> Self {
+        match error {
+            BrokerControlError::Broker(ErrorCode::WouldBlock) => Self::TryAgain,
+            error => Self::Other(error.into()),
+        }
     }
 }
 
-/// Returns the error for a failed file operation that may have waited.
-fn try_op_error<E>(
-    error: TryOpError<E>,
-    would_block: E,
-    wait_error: impl FnOnce(WaitError) -> E,
-) -> E {
-    match error {
-        TryOpError::TryAgain => would_block,
-        TryOpError::WaitError(error) => wait_error(error),
-        TryOpError::Other(error) => error,
+impl From<TryOpError<ReadError>> for ReadError {
+    fn from(error: TryOpError<ReadError>) -> Self {
+        match error {
+            TryOpError::TryAgain => Self::WouldBlock,
+            TryOpError::WaitError(error) => Self::WaitError(error),
+            TryOpError::Other(error) => error,
+        }
+    }
+}
+
+impl From<TryOpError<WriteError>> for WriteError {
+    fn from(error: TryOpError<WriteError>) -> Self {
+        match error {
+            TryOpError::TryAgain => Self::WouldBlock,
+            TryOpError::WaitError(error) => Self::WaitError(error),
+            TryOpError::Other(error) => error,
+        }
     }
 }
 
@@ -588,49 +562,46 @@ fn broker_fd_error<T>(error: BrokerControlError, closed: T, invalid_rights: T, i
     }
 }
 
-fn read_broker_error(error: BrokerControlError) -> ReadError {
-    broker_fd_error(
-        error,
-        ReadError::ClosedFd,
-        ReadError::NotForReading,
-        ReadError::Io,
-    )
+impl From<BrokerControlError> for ReadError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForReading, Self::Io)
+    }
 }
 
-fn write_broker_error(error: BrokerControlError) -> WriteError {
-    broker_fd_error(
-        error,
-        WriteError::ClosedFd,
-        WriteError::NotForWriting,
-        WriteError::Io,
-    )
+impl From<BrokerControlError> for WriteError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForWriting, Self::Io)
+    }
 }
 
-fn truncate_broker_error(error: BrokerControlError) -> TruncateError {
-    broker_fd_error(
-        error,
-        TruncateError::ClosedFd,
-        TruncateError::NotForWriting,
-        TruncateError::Io,
-    )
+impl From<BrokerControlError> for TruncateError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForWriting, Self::Io)
+    }
 }
 
-fn seek_broker_error(error: BrokerControlError) -> SeekError {
-    broker_fd_error(
-        error,
-        SeekError::ClosedFd,
-        SeekError::NotForSeeking,
-        SeekError::Io,
-    )
+impl From<BrokerControlError> for SeekError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForSeeking, Self::Io)
+    }
 }
 
-fn read_directory_broker_error(error: BrokerControlError) -> ReadDirError {
-    broker_fd_error(
-        error,
-        ReadDirError::ClosedFd,
-        ReadDirError::NotForReading,
-        ReadDirError::Io,
-    )
+impl From<BrokerControlError> for ReadDirError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::NotForReading, Self::Io)
+    }
+}
+
+impl From<BrokerControlError> for FileStatusError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::Io, Self::Io)
+    }
+}
+
+impl From<BrokerControlError> for IsTerminalError {
+    fn from(error: BrokerControlError) -> Self {
+        broker_fd_error(error, Self::ClosedFd, Self::Io, Self::Io)
+    }
 }
 
 // TODO: Define canonical per-operation protocol errors so these conversions can be removed without
@@ -651,127 +622,151 @@ fn path_error(error: FileError) -> Option<PathError> {
     }
 }
 
-fn open_error(error: FileError) -> OpenError {
-    if let Some(error) = path_error(error) {
-        return error.into();
-    }
-    match error {
-        FileError::AccessNotAllowed => OpenError::AccessNotAllowed,
-        FileError::NoWritePermissions => OpenError::NoWritePerms,
-        FileError::ReadOnlyFs => OpenError::ReadOnlyFileSystem,
-        FileError::AlreadyExists => OpenError::AlreadyExists,
-        FileError::IsDirectory => OpenError::TruncateError(TruncateError::IsDirectory),
-        FileError::NotForWriting => OpenError::TruncateError(TruncateError::NotForWriting),
-        FileError::IsTerminalDevice => OpenError::TruncateError(TruncateError::IsTerminalDevice),
-        _ => OpenError::Io,
-    }
-}
-
-fn read_error(error: FileError) -> ReadError {
-    match error {
-        FileError::NotFile => ReadError::NotAFile,
-        FileError::AccessNotAllowed | FileError::NotForReading => ReadError::NotForReading,
-        _ => ReadError::Io,
+impl From<FileError> for OpenError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::AccessNotAllowed => Self::AccessNotAllowed,
+            FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            FileError::AlreadyExists => Self::AlreadyExists,
+            FileError::IsDirectory => Self::TruncateError(TruncateError::IsDirectory),
+            FileError::NotForWriting => Self::TruncateError(TruncateError::NotForWriting),
+            FileError::IsTerminalDevice => Self::TruncateError(TruncateError::IsTerminalDevice),
+            _ => Self::Io,
+        }
     }
 }
 
-fn write_error(error: FileError) -> WriteError {
-    match error {
-        FileError::NotFile => WriteError::NotAFile,
-        FileError::AccessNotAllowed | FileError::NotForWriting => WriteError::NotForWriting,
-        _ => WriteError::Io,
+impl From<FileError> for ReadError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::NotFile => Self::NotAFile,
+            FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,
+            _ => Self::Io,
+        }
     }
 }
 
-fn seek_error(error: FileError) -> SeekError {
-    match error {
-        FileError::NotFile => SeekError::NotAFile,
-        FileError::AccessNotAllowed => SeekError::NotForSeeking,
-        FileError::InvalidOffset => SeekError::InvalidOffset,
-        FileError::NonSeekable => SeekError::NonSeekable,
-        _ => SeekError::Io,
+impl From<FileError> for WriteError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::NotFile => Self::NotAFile,
+            FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
+            _ => Self::Io,
+        }
     }
 }
 
-fn truncate_error(error: FileError) -> TruncateError {
-    match error {
-        FileError::IsDirectory => TruncateError::IsDirectory,
-        FileError::AccessNotAllowed | FileError::NotForWriting => TruncateError::NotForWriting,
-        FileError::IsTerminalDevice => TruncateError::IsTerminalDevice,
-        _ => TruncateError::Io,
+impl From<FileError> for SeekError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::NotFile => Self::NotAFile,
+            FileError::AccessNotAllowed => Self::NotForSeeking,
+            FileError::InvalidOffset => Self::InvalidOffset,
+            FileError::NonSeekable => Self::NonSeekable,
+            _ => Self::Io,
+        }
     }
 }
 
-fn chmod_error(error: FileError) -> ChmodError {
-    if let Some(error) = path_error(error) {
-        return error.into();
-    }
-    match error {
-        FileError::NotOwner => ChmodError::NotTheOwner,
-        FileError::ReadOnlyFs => ChmodError::ReadOnlyFileSystem,
-        _ => ChmodError::Io,
-    }
-}
-
-fn chown_error(error: FileError) -> ChownError {
-    if let Some(error) = path_error(error) {
-        return error.into();
-    }
-    match error {
-        FileError::NotOwner => ChownError::NotTheOwner,
-        FileError::ReadOnlyFs => ChownError::ReadOnlyFileSystem,
-        _ => ChownError::Io,
+impl From<FileError> for TruncateError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::IsDirectory => Self::IsDirectory,
+            FileError::AccessNotAllowed | FileError::NotForWriting => Self::NotForWriting,
+            FileError::IsTerminalDevice => Self::IsTerminalDevice,
+            _ => Self::Io,
+        }
     }
 }
 
-fn unlink_error(error: FileError) -> UnlinkError {
-    if let Some(error) = path_error(error) {
-        return error.into();
-    }
-    match error {
-        FileError::NoWritePermissions => UnlinkError::NoWritePerms,
-        FileError::IsDirectory => UnlinkError::IsADirectory,
-        FileError::ReadOnlyFs => UnlinkError::ReadOnlyFileSystem,
-        _ => UnlinkError::Io,
-    }
-}
-
-fn mkdir_error(error: FileError) -> MkdirError {
-    if let Some(error) = path_error(error) {
-        return error.into();
-    }
-    match error {
-        FileError::NoWritePermissions => MkdirError::NoWritePerms,
-        FileError::AlreadyExists => MkdirError::AlreadyExists,
-        FileError::ReadOnlyFs => MkdirError::ReadOnlyFileSystem,
-        _ => MkdirError::Io,
+impl From<FileError> for ChmodError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NotOwner => Self::NotTheOwner,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
     }
 }
 
-fn rmdir_error(error: FileError) -> RmdirError {
-    if let Some(error) = path_error(error) {
-        return error.into();
-    }
-    match error {
-        FileError::NoWritePermissions => RmdirError::NoWritePerms,
-        FileError::Busy => RmdirError::Busy,
-        FileError::NotEmpty => RmdirError::NotEmpty,
-        FileError::NotDirectory => RmdirError::NotADirectory,
-        FileError::ReadOnlyFs => RmdirError::ReadOnlyFileSystem,
-        _ => RmdirError::Io,
-    }
-}
-
-fn read_dir_error(error: FileError) -> ReadDirError {
-    match error {
-        FileError::NotDirectory => ReadDirError::NotADirectory,
-        FileError::AccessNotAllowed | FileError::NotForReading => ReadDirError::NotForReading,
-        _ => ReadDirError::Io,
+impl From<FileError> for ChownError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NotOwner => Self::NotTheOwner,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
     }
 }
 
-fn file_status_error(error: FileError) -> FileStatusError {
-    path_error(error).map_or(FileStatusError::Io, Into::into)
+impl From<FileError> for UnlinkError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::IsDirectory => Self::IsADirectory,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for MkdirError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::AlreadyExists => Self::AlreadyExists,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for RmdirError {
+    fn from(error: FileError) -> Self {
+        if let Some(error) = path_error(error) {
+            return error.into();
+        }
+        match error {
+            FileError::NoWritePermissions => Self::NoWritePerms,
+            FileError::Busy => Self::Busy,
+            FileError::NotEmpty => Self::NotEmpty,
+            FileError::NotDirectory => Self::NotADirectory,
+            FileError::ReadOnlyFs => Self::ReadOnlyFileSystem,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for ReadDirError {
+    fn from(error: FileError) -> Self {
+        match error {
+            FileError::NotDirectory => Self::NotADirectory,
+            FileError::AccessNotAllowed | FileError::NotForReading => Self::NotForReading,
+            _ => Self::Io,
+        }
+    }
+}
+
+impl From<FileError> for FileStatusError {
+    fn from(error: FileError) -> Self {
+        path_error(error).map_or(Self::Io, Into::into)
+    }
 }
 
 crate::fd::enable_fds_for_subsystem! {

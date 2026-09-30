@@ -3,6 +3,65 @@
 
 //! Standard input/output streams.
 
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
+use litebox_common_linux::OFlags;
+
+use crate::syscalls::file::FilesState;
+use crate::{GlobalState, ShimPlatform};
+
+// Special override so that `GETFL` can return stdio-specific flags
+#[derive(Clone)]
+pub(crate) struct StdioStatusFlags(pub(crate) OFlags);
+
+impl<Platform: ShimPlatform> FilesState<Platform> {
+    pub(crate) fn initialize_stdio_in_shared_descriptors_table(
+        &self,
+        global: &GlobalState<Platform>,
+        context: &litebox::fs::Context,
+    ) {
+        let stdin = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stdin",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
+            .unwrap();
+        let stdout = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stdout",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
+            .unwrap();
+        let stderr = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stderr",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
+            .unwrap();
+        let mut dt = global.litebox.descriptor_table_mut();
+        let mut rds = self.raw_descriptor_store.write();
+        for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
+            let status_flags = OFlags::APPEND | OFlags::RDWR;
+            debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
+            let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+            assert!(old.is_none());
+            let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
+            assert!(success);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -167,6 +226,22 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             test_broker::stdio().push_input(input);
         })
+    }
+
+    #[test]
+    fn test_open_devices_nonblocking() {
+        let task = init_platform();
+        for (path, access) in [
+            ("/dev/stdin", OFlags::RDONLY),
+            ("/dev/stdout", OFlags::WRONLY),
+            ("/dev/stderr", OFlags::WRONLY),
+            ("/dev/urandom", OFlags::RDONLY),
+        ] {
+            let fd = task
+                .sys_open(path, access | OFlags::NONBLOCK, Mode::empty())
+                .unwrap();
+            task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+        }
     }
 
     #[test]

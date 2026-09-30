@@ -87,7 +87,7 @@ impl UserlandStdioProvider {
                 let input = Arc::clone(&self.input);
                 let spawned = std::thread::Builder::new()
                     .name("litebox-broker-stdin".to_owned())
-                    .spawn(move || read_host_input(&input, host));
+                    .spawn(move || input.read_host(host));
                 if spawned.is_err() {
                     state.end = Some(Err(StdioProviderError::Failed));
                 }
@@ -133,7 +133,7 @@ impl StdioProvider for UserlandStdioProvider {
     }
 
     fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        let index = output_index(stream);
+        let index = OutputState::index(stream);
         let mut state = self.output.lock();
         if let Some(error) = state.errors[index] {
             return Err(error);
@@ -150,7 +150,7 @@ impl StdioProvider for UserlandStdioProvider {
             let output = Arc::clone(&self.output);
             let spawned = std::thread::Builder::new()
                 .name("litebox-broker-stdout".to_owned())
-                .spawn(move || write_host_output(&output, hosts));
+                .spawn(move || output.write_host(hosts));
             if spawned.is_err() {
                 state.errors = [Some(StdioProviderError::Failed); 2];
                 return Err(StdioProviderError::Failed);
@@ -172,8 +172,8 @@ impl StdioProvider for UserlandStdioProvider {
                     ReadinessFlags::default()
                 };
             }
-            StdioStream::Stdout => output_index(StdioOutputStream::Stdout),
-            StdioStream::Stderr => output_index(StdioOutputStream::Stderr),
+            StdioStream::Stdout => OutputState::index(StdioOutputStream::Stdout),
+            StdioStream::Stderr => OutputState::index(StdioOutputStream::Stderr),
         };
         if self.output.lock().writable(index) {
             ReadinessFlags::WRITE
@@ -237,18 +237,29 @@ struct InputState {
 }
 
 struct OutputState {
-    /// Host standard output and error, until the output thread takes them.
+    /// Host standard output and error, in [`Self::index`] order, until the
+    /// output thread takes them.
     hosts: Option<[Box<dyn Write + Send>; 2]>,
-    /// Accepted chunks, tagged with their stream index, in write order.
+    /// Accepted chunks, tagged with their stream's [`Self::index`], in write
+    /// order.
     queue: VecDeque<(usize, Vec<u8>)>,
     /// Accepted bytes not yet written, including the chunk being written.
     queued: usize,
-    /// Each stream's first host write failure, which later writes report.
+    /// Each stream's first host write failure, in [`Self::index`] order, which
+    /// later writes report.
     errors: [Option<StdioProviderError>; 2],
     watchers: ReadinessWatchers,
 }
 
 impl OutputState {
+    /// Returns `stream`'s slot in `hosts` and `errors`.
+    fn index(stream: StdioOutputStream) -> usize {
+        match stream {
+            StdioOutputStream::Stdout => 0,
+            StdioOutputStream::Stderr => 1,
+        }
+    }
+
     /// Returns whether a write to the stream at `index` would not block, like
     /// Linux pipes, which report writable only when a `PIPE_BUF` write fits.
     fn writable(&self, index: usize) -> bool {
@@ -256,67 +267,67 @@ impl OutputState {
     }
 }
 
-fn read_host_input(input: &HostIo<InputState>, mut host: Box<dyn Read + Send>) {
-    let mut chunk = vec![0; INPUT_CHUNK_SIZE];
-    loop {
-        let mut state = input.lock();
-        while !state.wanted {
-            state = input.wait(state);
-        }
-        drop(state);
-        let result = loop {
-            match host.read(&mut chunk) {
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                result => break result,
+impl HostIo<InputState> {
+    /// Runs the input thread: reads host input whenever a reader wants more,
+    /// until the host input fails.
+    fn read_host(&self, mut host: Box<dyn Read + Send>) {
+        let mut chunk = vec![0; INPUT_CHUNK_SIZE];
+        loop {
+            let mut state = self.lock();
+            while !state.wanted {
+                state = self.wait(state);
             }
-        };
-        let mut state = input.lock();
-        state.wanted = false;
-        match result {
-            Ok(0) => state.end = Some(Ok(())),
-            Ok(count) => state.data.extend(&chunk[..count]),
-            Err(error) => state.end = Some(Err(map_stdio_error(&error))),
-        }
-        state.watchers.publish(ReadinessFlags::READ);
-        if matches!(state.end, Some(Err(_))) {
-            return;
+            drop(state);
+            let result = loop {
+                match host.read(&mut chunk) {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    result => break result,
+                }
+            };
+            let mut state = self.lock();
+            state.wanted = false;
+            match result {
+                Ok(0) => state.end = Some(Ok(())),
+                Ok(count) => state.data.extend(&chunk[..count]),
+                Err(error) => state.end = Some(Err(map_stdio_error(&error))),
+            }
+            state.watchers.publish(ReadinessFlags::READ);
+            if matches!(state.end, Some(Err(_))) {
+                return;
+            }
         }
     }
 }
 
-fn write_host_output(output: &HostIo<OutputState>, mut hosts: [Box<dyn Write + Send>; 2]) {
-    loop {
-        let mut state = output.lock();
-        let (index, chunk) = loop {
-            if let Some(entry) = state.queue.pop_front() {
-                break entry;
+impl HostIo<OutputState> {
+    /// Runs the output thread: writes accepted chunks to the host in order.
+    fn write_host(&self, mut hosts: [Box<dyn Write + Send>; 2]) {
+        loop {
+            let mut state = self.lock();
+            let (index, chunk) = loop {
+                if let Some(entry) = state.queue.pop_front() {
+                    break entry;
+                }
+                state = self.wait(state);
+            };
+            let failed = state.errors[index].is_some();
+            drop(state);
+            let result = if failed {
+                Ok(())
+            } else {
+                let host = &mut hosts[index];
+                host.write_all(&chunk).and_then(|()| host.flush())
+            };
+            let mut state = self.lock();
+            state.queued -= chunk.len();
+            if let Err(error) = result {
+                state.errors[index] = Some(map_stdio_error(&error));
             }
-            state = output.wait(state);
-        };
-        let failed = state.errors[index].is_some();
-        drop(state);
-        let result = if failed {
-            Ok(())
-        } else {
-            let host = &mut hosts[index];
-            host.write_all(&chunk).and_then(|()| host.flush())
-        };
-        let mut state = output.lock();
-        state.queued -= chunk.len();
-        if let Err(error) = result {
-            state.errors[index] = Some(map_stdio_error(&error));
+            self.changed.notify_all();
+            if state.writable(index) {
+                state.watchers.publish(ReadinessFlags::WRITE);
+            }
         }
-        output.changed.notify_all();
-        if state.writable(index) {
-            state.watchers.publish(ReadinessFlags::WRITE);
-        }
-    }
-}
-
-fn output_index(stream: StdioOutputStream) -> usize {
-    match stream {
-        StdioOutputStream::Stdout => 0,
-        StdioOutputStream::Stderr => 1,
     }
 }
 

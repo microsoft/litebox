@@ -241,14 +241,6 @@ impl Backend for Devices {
         if flags.contains(OFlags::DIRECTORY) {
             return Err(OpenError::PathError(PathError::ComponentNotADirectory));
         }
-        if flags.contains(OFlags::NONBLOCK)
-            && matches!(
-                device,
-                Device::Stdin | Device::Stdout | Device::Stderr | Device::URandom
-            )
-        {
-            unimplemented!("Non-blocking I/O is not yet supported for {:?}", device);
-        }
 
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
