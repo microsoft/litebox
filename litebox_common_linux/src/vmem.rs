@@ -542,13 +542,14 @@ where
                 | AllocationError::AddressInUseByPlatform
                 | AllocationError::AddressPartiallyInUse,
             ) if matches!(behavior, FixedAddressBehavior::Hint(_)) => {
-                // SAFETY: Hint permits the platform to relocate the complete requested extent.
-                let acquired = unsafe {
-                    self.reserve_gaps(platform, 0..range.len(), can_grow_down, behavior)
+                // SAFETY: A zero-address hint requests a fresh extent and cannot replace memory.
+                let reservation = unsafe {
+                    Self::reserve_gap(platform, 0..range.len(), can_grow_down, behavior)
                 }?;
-                debug_assert_eq!(acquired.len(), 1);
-                range = acquired[0]..acquired[0] + range.len();
-                acquired
+                let base = reservation.range().start;
+                assert!(self.insert(base, reservation).is_none());
+                range = base..base + range.len();
+                Vec::from([base])
             }
             Err(error) => return Err(error),
         };
