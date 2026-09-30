@@ -18,6 +18,9 @@ const INPUT_CHUNK_SIZE: usize = 64 * 1024;
 /// Accepted output bytes not yet written to the host, beyond which writes
 /// would block.
 const OUTPUT_CAPACITY: usize = 64 * 1024;
+/// Largest output write accepted whole or not at all, like Linux's `PIPE_BUF`,
+/// so small writes from concurrent writers never interleave.
+const ATOMIC_WRITE_SIZE: usize = 4096;
 
 /// Routes standard I/O for the broker's single child runner through inherited
 /// streams without blocking broker requests.
@@ -138,10 +141,11 @@ impl StdioProvider for UserlandStdioProvider {
         if input.is_empty() {
             return Ok(0);
         }
-        let count = input.len().min(OUTPUT_CAPACITY - state.queued);
-        if count == 0 {
+        let available = OUTPUT_CAPACITY - state.queued;
+        if available == 0 || (input.len() <= ATOMIC_WRITE_SIZE && available < input.len()) {
             return Err(StdioProviderError::WouldBlock);
         }
+        let count = input.len().min(available);
         if let Some(hosts) = state.hosts.take() {
             let output = Arc::clone(&self.output);
             let spawned = std::thread::Builder::new()
@@ -323,7 +327,7 @@ mod tests {
     use litebox_broker_core::stdio::{StdioOutputStream, StdioProvider, StdioProviderError};
     use litebox_broker_protocol::readiness::ReadinessFlags;
 
-    use super::{OUTPUT_CAPACITY, UserlandStdioProvider};
+    use super::{ATOMIC_WRITE_SIZE, OUTPUT_CAPACITY, UserlandStdioProvider};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -480,8 +484,17 @@ mod tests {
         assert_eq!(provider.write(StdioOutputStream::Stdout, b"a"), Ok(1));
         assert_eq!(provider.write(StdioOutputStream::Stderr, b"b"), Ok(1));
         assert_eq!(
-            provider.write(StdioOutputStream::Stdout, &fill),
-            Ok(OUTPUT_CAPACITY - 2)
+            provider.write(StdioOutputStream::Stdout, &fill[..OUTPUT_CAPACITY - 4]),
+            Ok(OUTPUT_CAPACITY - 4)
+        );
+        // Small writes are never split.
+        assert_eq!(
+            provider.write(StdioOutputStream::Stderr, b"cde"),
+            Err(StdioProviderError::WouldBlock)
+        );
+        assert_eq!(
+            provider.write(StdioOutputStream::Stdout, &fill[..=ATOMIC_WRITE_SIZE]),
+            Ok(2)
         );
         assert_eq!(
             provider.write(StdioOutputStream::Stderr, b"c"),
@@ -501,8 +514,9 @@ mod tests {
                 (StdioOutputStream::Stderr, b"b".to_vec()),
                 (
                     StdioOutputStream::Stdout,
-                    fill[..OUTPUT_CAPACITY - 2].to_vec()
+                    fill[..OUTPUT_CAPACITY - 4].to_vec()
                 ),
+                (StdioOutputStream::Stdout, fill[..2].to_vec()),
             ]
         );
         assert_eq!(
