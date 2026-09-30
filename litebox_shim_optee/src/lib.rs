@@ -272,41 +272,45 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     ///
     /// Raw ELF binaries are stored directly. Signed TAs are verified and unwrapped.
     pub(crate) fn store_embedded_ta(&self, ta_bin: &[u8]) -> bool {
-        if let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) {
-            return self
-                .ta_uuid_map
-                .insert(ta_head.uuid, ta_bin.into(), TaSource::BuiltIn);
-        }
-
-        let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
-            return false;
-        };
-        self.ta_uuid_map
-            .insert(ta_uuid, ta_elf.into(), TaSource::BuiltIn)
+        self.store_ta(None, ta_bin, TaSource::BuiltIn)
     }
 
     /// Store the TA binary associated with the given TA UUID.
     ///
-    /// Built-in binaries are trusted raw ELF files. Dynamic binaries must be signed
-    /// and are verified before their inner ELF is cached.
+    /// Built-in binaries are trusted raw ELF files or verified signed TAs.
+    /// Dynamic binaries must be signed and are verified before their inner ELF is cached.
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
     pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], source: TaSource) -> bool {
-        let ta_elf = match source {
-            TaSource::BuiltIn => ta_bin,
-            TaSource::Dynamic => {
-                let Some((verified_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key)
-                else {
+        self.store_ta(Some(*ta_uuid), ta_bin, source)
+    }
+
+    fn store_ta(&self, expected_uuid: Option<TeeUuid>, ta_bin: &[u8], source: TaSource) -> bool {
+        let (ta_uuid, ta_elf) = match (source, expected_uuid) {
+            (TaSource::BuiltIn, Some(ta_uuid)) => (ta_uuid, ta_bin),
+            (TaSource::BuiltIn, None) => {
+                if let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) {
+                    (ta_head.uuid, ta_bin)
+                } else {
+                    let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key)
+                    else {
+                        return false;
+                    };
+                    (ta_uuid, ta_elf)
+                }
+            }
+            (TaSource::Dynamic, expected_uuid) => {
+                let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
                     return false;
                 };
-                if verified_uuid != *ta_uuid {
+                if expected_uuid.is_some_and(|expected_uuid| expected_uuid != ta_uuid) {
                     return false;
                 }
-                ta_elf
+                (ta_uuid, ta_elf)
             }
         };
-        self.ta_uuid_map.insert(*ta_uuid, ta_elf.into(), source)
+        self.ta_uuid_map.insert(ta_uuid, ta_elf.into(), source)
     }
 
     /// Get the TA binary associated with the given TA UUID.
