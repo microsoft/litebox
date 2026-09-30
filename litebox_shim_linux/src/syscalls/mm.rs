@@ -2180,7 +2180,7 @@ mod tests {
 
     #[test]
     fn brk_respects_initial_break_and_shrinks_within_current_page() {
-        let task = init_platform(None);
+        let task = init_platform();
         let initial = 0x4000_0123;
         let below_initial = 0x4000_0042;
         let grown = 0x4000_0321;
