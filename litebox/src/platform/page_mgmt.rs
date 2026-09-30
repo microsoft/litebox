@@ -130,10 +130,10 @@ bitflags::bitflags! {
 /// Platforms that exclusively control their address space, such as the Linux kernel provider,
 /// need not allocate or track separate reservations.
 ///
-/// Committing supplies zero-filled backing for uncommitted pages and makes them accessible; already
-/// committed contents are preserved. [`Self::reserve_and_commit_pages`] combines these steps
-/// when supported. [`Self::protect_pages`] changes permissions without discarding contents or
-/// changing commitment.
+/// Committing makes pages accessible, with zero-filled contents for pages that were not previously
+/// committed; physical pages may be populated lazily. Already committed contents are preserved.
+/// [`Self::reserve_and_commit_pages`] combines these steps when supported. [`Self::protect_pages`]
+/// changes permissions without discarding contents or changing commitment.
 ///
 /// [`Self::decommit_pages`] discards contents and makes pages inaccessible while retaining the
 /// reservation; recommitting decommitted pages yields zeros. [`Self::release_pages`] relinquishes
@@ -171,6 +171,10 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 
     /// Reserve virtual address space and return its exclusive ownership handle.
     ///
+    /// The default calls [`Self::reserve_and_commit_pages`] with empty permissions and lazy
+    /// population, which also works for platforms that cannot reserve without creating a mapping.
+    /// Platforms that support native reservation operation must override this method.
+    ///
     /// # Parameters
     ///
     /// - `replaced_reservations`: On replacement, lazily transfers handles whose extents together
@@ -197,7 +201,21 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<ReservationOf<Self, ALIGN>, AllocationError>
     where
-        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>;
+        Reservations: Iterator<Item = ReservationOf<Self, ALIGN>>,
+    {
+        // SAFETY: The caller supplies the range and replacement ownership required by
+        // reserve_and_commit_pages; providers using this default leave the range inaccessible.
+        unsafe {
+            self.reserve_and_commit_pages(
+                replaced_reservations,
+                suggested_range,
+                MemoryRegionPermissions::empty(),
+                can_grow_down,
+                false,
+                fixed_address_behavior,
+            )
+        }
+    }
 
     /// Commit backing within live reservations.
     ///

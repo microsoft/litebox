@@ -1773,29 +1773,6 @@ mod tests {
                 AllocationDirection::BottomUp
             });
 
-        unsafe fn reserve_pages<Reservations>(
-            &self,
-            replaced_reservations: impl FnOnce() -> Reservations,
-            suggested_range: Range<usize>,
-            can_grow_down: bool,
-            fixed_address_behavior: FixedAddressBehavior,
-        ) -> Result<DummyReservation<PAGE_SIZE>, AllocationError>
-        where
-            Reservations: Iterator<Item = DummyReservation<PAGE_SIZE>>,
-        {
-            // SAFETY: The mock models ownership of the allocated range without real backing.
-            unsafe {
-                self.reserve_and_commit_pages(
-                    replaced_reservations,
-                    suggested_range,
-                    MemoryRegionPermissions::empty(),
-                    can_grow_down,
-                    false,
-                    fixed_address_behavior,
-                )
-            }
-        }
-
         unsafe fn commit_pages<'reservation, Reservations>(
             &self,
             _covering_reservations: impl FnOnce() -> Reservations,

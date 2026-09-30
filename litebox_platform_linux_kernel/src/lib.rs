@@ -416,28 +416,6 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     const HINT_PLACEMENT_BEHAVIOR: litebox::platform::page_mgmt::HintPlacementBehavior =
         litebox::platform::page_mgmt::HintPlacementBehavior::Exact;
 
-    unsafe fn reserve_pages<Reservations>(
-        &self,
-        replaced_reservations: impl FnOnce() -> Reservations,
-        suggested_range: core::ops::Range<usize>,
-        can_grow_down: bool,
-        fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<LinuxKernelReservation<ALIGN>, litebox::platform::page_mgmt::AllocationError>
-    where
-        Reservations: Iterator<Item = LinuxKernelReservation<ALIGN>>,
-    {
-        unsafe {
-            self.reserve_and_commit_pages(
-                replaced_reservations,
-                suggested_range,
-                litebox::platform::page_mgmt::MemoryRegionPermissions::empty(),
-                can_grow_down,
-                false,
-                fixed_address_behavior,
-            )
-        }
-    }
-
     unsafe fn commit_pages<'reservation, Reservations>(
         &self,
         _covering_reservations: impl FnOnce() -> Reservations,
