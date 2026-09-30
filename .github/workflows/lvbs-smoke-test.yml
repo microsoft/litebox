@@ -73,6 +73,7 @@ jobs:
             echo "Failed to get the build ID from the pipeline trigger."
             exit 1
           fi
+          echo "ADO_BUILD_ID=${BUILD_ID}" >> "${GITHUB_ENV}"
 
           BUILD_URL="https://msazure.visualstudio.com/${ADO_PROJECT}/_build/results?buildId=${BUILD_ID}"
           echo "Triggered ADO build ${BUILD_ID}: ${BUILD_URL}"
@@ -100,3 +101,18 @@ jobs:
 
             sleep 60
           done
+
+      - name: Cancel superseded ADO pipeline
+        if: cancelled() && env.ADO_BUILD_ID != ''
+        shell: bash
+        env:
+          ADO_ORGANIZATION: https://dev.azure.com/msazure
+          ADO_PROJECT: LSG-linux
+        run: |
+          echo "Cancelling superseded ADO build ${ADO_BUILD_ID}..."
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az pipelines build cancel \
+            --build-id "${ADO_BUILD_ID}" \
+            --organization "${ADO_ORGANIZATION}" \
+            --project "${ADO_PROJECT}" \
+            --output none
