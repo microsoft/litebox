@@ -70,6 +70,11 @@ pub struct InheritedFd {
 }
 
 /// A Linux standard stream.
+///
+/// TODO: Remove this guest-side stream tag. The shim derives it by matching `/dev/std*` open
+/// paths, duplicating the broker `Devices` backend's own device identity, and uses it only for
+/// placeholder epoll readiness. Once broker files report real readiness, the shim should query
+/// the broker instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StdioStream {
     /// Standard input.
