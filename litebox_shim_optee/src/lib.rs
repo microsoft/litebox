@@ -28,6 +28,7 @@ use litebox_common_optee::{
     TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
 };
 use litebox_platform::time::{Instant as _, TimeProvider};
+use sha2::{Digest, Sha256};
 
 pub mod loader;
 pub mod session;
@@ -41,6 +42,8 @@ pub mod idk;
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
+pub(crate) const TA_DIGEST_LEN: usize = 32;
+pub(crate) type TaDigest = [u8; TA_DIGEST_LEN];
 
 /// Platform capabilities required by the OP-TEE shim.
 pub trait OpteeShimPlatform:
@@ -171,6 +174,7 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
     platform: &'static Platform,
     session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
+    ta_signing_cert: &'static [u8],
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
@@ -194,7 +198,15 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             platform,
             session_manager,
             litebox,
+            ta_signing_cert: &[],
         }
+    }
+
+    /// A certificate for TA signature verification. Defaults to empty (no certificate).
+    #[must_use]
+    pub fn with_ta_signing_cert(mut self, ta_signing_cert: &'static [u8]) -> Self {
+        self.ta_signing_cert = ta_signing_cert;
+        self
     }
 
     /// Returns the litebox object for the shim.
@@ -211,6 +223,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             mm: MemoryManager::new(self.platform),
             litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
+            ta_signing_cert: self.ta_signing_cert,
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
         });
         OpteeShim(global)
@@ -233,6 +246,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     litebox: litebox::LiteBox<Platform>,
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: &'static TaUuidMap,
+    ta_signing_cert: &'static [u8],
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.
@@ -263,11 +277,6 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
             }
             Some(ta_bin)
         }
-    }
-
-    /// Get the TA flags associated with the given TA UUID.
-    pub(crate) fn get_ta_flags(&self, ta_uuid: &TeeUuid) -> TaFlags {
-        self.ta_uuid_map.get_flags(ta_uuid).unwrap_or_default()
     }
 
     /// Monotonic time elapsed since this instance was created, used as GP
@@ -314,7 +323,7 @@ impl<Platform: OpteeShimPlatform> Clone for OpteeShim<Platform> {
 
 impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Load the given `ldelf` binary into memory while making it ready to load the TA binary specified
-    /// by `ta_uuid` (and optionally `ta_bin`).
+    /// by `ta_uuid`.
     ///
     /// The loaded program is an *instance*: a single instance can serve many
     /// sessions. The active session id is supplied per entry via
@@ -326,12 +335,23 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         ldelf_bin: &[u8],
         ta_uuid: TeeUuid,
     ) -> Result<LoadedProgram<Platform>, loader::elf::ElfLoaderError> {
+        let (ta_binary, ta_flags) = self
+            .0
+            .ta_uuid_map
+            .get_with_flags(&ta_uuid)
+            .ok_or(loader::elf::ElfLoaderError::OpenError(Errno::ENOENT))?;
+        let ta_digest = Sha256::digest(&ta_binary).into();
         let entrypoints = crate::OpteeShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: ta_uuid,
+                // TODO: Populate this from trusted TA version metadata when available.
+                ta_svn: 0,
+                ta_digest,
+                // TODO: Set from the TA source when dynamic loading is supported.
+                ta_dynamic: false,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
@@ -358,8 +378,6 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         } else {
             None
         };
-        // Get TA flags from the stored binary
-        let ta_flags = entrypoints.task.global.get_ta_flags(&ta_uuid);
         Ok(LoadedProgram {
             entrypoints: Some(entrypoints),
             params_address,
@@ -1476,9 +1494,11 @@ impl TaUuidMap {
         self.inner.read().get(uuid).map(|info| info.binary.clone())
     }
 
-    /// Get the TA flags for a given UUID.
-    pub(crate) fn get_flags(&self, uuid: &TeeUuid) -> Option<TaFlags> {
-        self.inner.read().get(uuid).map(|info| info.flags)
+    fn get_with_flags(&self, uuid: &TeeUuid) -> Option<(Arc<[u8]>, TaFlags)> {
+        self.inner
+            .read()
+            .get(uuid)
+            .map(|info| (info.binary.clone(), info.flags))
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
@@ -1501,6 +1521,11 @@ struct Task<Platform: OpteeShimPlatform> {
     thread: ThreadState,
     /// TA UUID
     ta_app_id: TeeUuid,
+    /// TA security version number
+    ta_svn: u32,
+    /// SHA-256 digest of the raw TA binary.
+    ta_digest: TaDigest,
+    ta_dynamic: bool,
     /// TEE cryptography state map
     tee_cryp_state_map: TeeCrypStateMap,
     /// TEE object map
@@ -1668,6 +1693,9 @@ mod test_utils {
                 global: self.clone(),
                 thread: ThreadState::new(),
                 ta_app_id: TeeUuid::default(),
+                ta_svn: 0,
+                ta_digest: [0; TA_DIGEST_LEN],
+                ta_dynamic: false,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
                 tee_obj_map: TeeObjMap::new(),
                 ta_handle_map: TaHandleMap::new(),
