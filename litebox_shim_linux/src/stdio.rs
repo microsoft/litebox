@@ -66,7 +66,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 mod tests {
     extern crate std;
 
-    use core::{ffi::CStr, time::Duration};
+    use core::ffi::CStr;
 
     use litebox::event::Events;
     use litebox_broker_protocol::fs::FileMode as Mode;
@@ -220,14 +220,6 @@ mod tests {
         }
     }
 
-    /// Pushes `input` to standard input after the caller has had time to start waiting.
-    fn push_input_later(input: &'static [u8]) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(100));
-            test_broker::stdio().push_input(input);
-        })
-    }
-
     #[test]
     fn test_open_devices_nonblocking() {
         let task = init_platform();
@@ -247,7 +239,15 @@ mod tests {
     #[test]
     fn test_stdin_read_waits_for_input() {
         let task = init_platform();
-        let input = push_input_later(b"hi");
+        let reads = test_broker::stdio().blocked_input_reads();
+        // The reader reads again after it starts listening for input, so pushing input once
+        // its first read has blocked tests the wait without depending on timing.
+        let input = std::thread::spawn(move || {
+            while test_broker::stdio().blocked_input_reads() == reads {
+                std::thread::yield_now();
+            }
+            test_broker::stdio().push_input(b"hi");
+        });
 
         let mut buf = [0; 4];
         assert_eq!(task.sys_read(0, &mut buf, None), Ok(2));
@@ -331,9 +331,8 @@ mod tests {
         add(0, Events::IN).unwrap();
         assert!(wait(0).is_empty());
 
-        let input = push_input_later(b"x");
+        test_broker::stdio().push_input(b"x");
         assert_eq!(wait(-1), [(0, Events::IN.bits())]);
-        input.join().unwrap();
 
         let mut buf = [0; 1];
         assert_eq!(task.sys_read(0, &mut buf, None), Ok(1));

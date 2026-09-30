@@ -128,6 +128,7 @@ impl Default for TestStdioProvider {
             input: Mutex::new(TestStdioInput {
                 bytes: VecDeque::new(),
                 open: false,
+                blocked_reads: 0,
             }),
             input_watchers: Mutex::new(ReadinessWatchers::default()),
             writes: Mutex::new(Vec::new()),
@@ -172,6 +173,16 @@ impl TestStdioProvider {
         self.input_watchers.lock().publish(ReadinessFlags::READ);
     }
 
+    /// Returns how many standard-input reads have failed with
+    /// [`StdioProviderError::WouldBlock`].
+    ///
+    /// A waiting reader reads again after it starts listening for input, so a
+    /// test that waits for this count to advance before pushing input or
+    /// interrupting the reader does not depend on timing.
+    pub fn blocked_input_reads(&self) -> usize {
+        self.input.lock().blocked_reads
+    }
+
     /// Returns a snapshot of the recorded standard-output writes.
     pub fn writes(&self) -> Vec<(StdioOutputStream, Vec<u8>)> {
         self.writes.lock().clone()
@@ -187,6 +198,7 @@ impl StdioProvider for TestStdioProvider {
     fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
         if input.bytes.is_empty() && input.open {
+            input.blocked_reads += 1;
             return Err(StdioProviderError::WouldBlock);
         }
         let read = input.bytes.len().min(output.len());
@@ -239,6 +251,7 @@ impl StdioProvider for TestStdioProvider {
 struct TestStdioInput {
     bytes: VecDeque<u8>,
     open: bool,
+    blocked_reads: usize,
 }
 
 /// Timer provider for tests whose clock advances only through

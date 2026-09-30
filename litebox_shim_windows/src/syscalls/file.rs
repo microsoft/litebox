@@ -3523,12 +3523,12 @@ mod tests {
     }
 
     #[test]
-    fn thread_exit_ends_a_blocked_console_read() {
+    fn console_read_waits_until_input_or_thread_exit() {
         run_with_test_platform_pointers(|| {
             let stdio = Arc::new(
                 litebox_broker_core::test_support::TestStdioProvider::default().with_open_input(),
             );
-            let parent = crate::tests::test_task_with_broker_files_and_stdio(&[], stdio);
+            let parent = crate::tests::test_task_with_broker_files_and_stdio(&[], stdio.clone());
             let (status, input, _) = create_file(
                 &parent,
                 r"\Device\ConDrv\Input",
@@ -3536,12 +3536,15 @@ mod tests {
                 FILE_OPEN,
             );
             assert_eq!(status, NtStatus::SUCCESS);
-            let (result_tx, result_rx) = std::sync::mpsc::channel();
-            let (thread, reader_thread) = parent.spawn_clone_for_test(move |reader| {
-                let mut byte = [0u8];
-                let mut io_status = IoStatusBlock::default();
-                result_tx
-                    .send(reader.sys_nt_read_file(
+            // Starts a one-byte read on a sibling thread and returns once the read has blocked.
+            // The read reads again after it starts listening for input, so nothing that happens
+            // afterward can be missed.
+            let start_read = || {
+                let reads = stdio.blocked_input_reads();
+                let (thread, thread_object) = parent.spawn_clone_for_test(move |reader| {
+                    let mut byte = [0u8];
+                    let mut io_status = IoStatusBlock::default();
+                    let status = reader.sys_nt_read_file(
                         input,
                         Handle::default(),
                         None,
@@ -3551,23 +3554,22 @@ mod tests {
                         1,
                         None,
                         None,
-                    ))
-                    .unwrap();
-            });
+                    );
+                    (status, byte[0])
+                });
+                while stdio.blocked_input_reads() == reads {
+                    std::thread::yield_now();
+                }
+                (thread, thread_object)
+            };
 
-            std::thread::sleep(core::time::Duration::from_millis(20));
-            assert!(matches!(
-                result_rx.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ));
-            reader_thread.begin_exit(0);
-            assert_eq!(
-                result_rx
-                    .recv_timeout(core::time::Duration::from_secs(2))
-                    .unwrap(),
-                NtStatus::UNSUCCESSFUL
-            );
-            thread.join().unwrap();
+            let (thread, _) = start_read();
+            stdio.push_input(b"x");
+            assert_eq!(thread.join().unwrap(), (NtStatus::SUCCESS, b'x'));
+
+            let (thread, thread_object) = start_read();
+            thread_object.begin_exit(0);
+            assert_eq!(thread.join().unwrap().0, NtStatus::UNSUCCESSFUL);
             assert_eq!(parent.sys_nt_close(input), NtStatus::SUCCESS);
         });
     }
