@@ -515,7 +515,7 @@ fn handle_request<Memory: SharedMemory>(
             .map(BrokerResult::Readiness)
             .map_err(RequestFailure::from),
         BrokerOperation::GetStatusFlags(handle) => process
-            .status_flags(handle)
+            .get_status_flags(handle)
             .map(BrokerResult::StatusFlags)
             .map_err(RequestFailure::from),
         BrokerOperation::SetStatusFlags(request) => process

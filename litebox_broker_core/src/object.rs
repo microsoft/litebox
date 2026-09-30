@@ -108,12 +108,12 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
 }
 
 /// Returns the access mode and status flags of an object.
-pub(crate) fn status_flags(
+pub(crate) fn get_status_flags(
     process: &BrokerProcess,
     object: &RwLock<ObjectEntry>,
 ) -> Result<FileStatusFlags> {
     let file = status_flags_file(object)?;
-    crate::fs::status_flags(process, &file)
+    crate::fs::get_status_flags(process, &file)
 }
 
 /// Changes the status flags in `mask` of an object to their values in `flags`.

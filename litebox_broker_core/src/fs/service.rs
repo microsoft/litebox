@@ -134,7 +134,7 @@ mod private {
             Err(BrokerError::UnsupportedOperation)
         }
 
-        fn status_flags(&self, _file: &File) -> Result<FileStatusFlags> {
+        fn get_status_flags(&self, _file: &File) -> Result<FileStatusFlags> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -366,7 +366,7 @@ where
         Ok(Ok(Resolver::is_terminal(self, &entry)))
     }
 
-    fn status_flags(&self, file: &File) -> Result<FileStatusFlags> {
+    fn get_status_flags(&self, file: &File) -> Result<FileStatusFlags> {
         let entry = file
             .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
             .read();
@@ -554,8 +554,8 @@ pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<File
 }
 
 /// Returns the access mode and status flags of a broker-owned open file.
-pub(crate) fn status_flags(process: &BrokerProcess, file: &File) -> Result<FileStatusFlags> {
-    process.core.fs.status_flags(file)
+pub(crate) fn get_status_flags(process: &BrokerProcess, file: &File) -> Result<FileStatusFlags> {
+    process.core.fs.get_status_flags(file)
 }
 
 /// Changes the status flags in `mask` of a broker-owned open file to their values in `flags`.

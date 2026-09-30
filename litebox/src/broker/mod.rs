@@ -183,7 +183,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
 
-    fn status_flags(
+    fn get_status_flags(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<FileStatusFlags, BrokerControlError>;
@@ -757,11 +757,11 @@ where
         self.request(|local| local.check_readiness(handle))
     }
 
-    fn status_flags(
+    fn get_status_flags(
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<FileStatusFlags, BrokerControlError> {
-        self.request(|local| local.status_flags(handle))
+        self.request(|local| local.get_status_flags(handle))
     }
 
     fn set_status_flags(

@@ -306,9 +306,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Returns the access mode and status flags of the open file description at `fd`.
-    pub fn file_status_flags(&self, fd: &FileFd) -> Result<FileStatusFlags, StatusFlagsError> {
+    pub fn get_file_status_flags(&self, fd: &FileFd) -> Result<FileStatusFlags, StatusFlagsError> {
         let file = self.broker_file(fd).ok_or(StatusFlagsError::ClosedFd)?;
-        Ok(file.broker.status_flags(file.handle)?)
+        Ok(file.broker.get_status_flags(file.handle)?)
     }
 
     /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`], of the open file

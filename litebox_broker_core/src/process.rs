@@ -1268,10 +1268,10 @@ impl BrokerProcess {
     }
 
     /// Returns the access mode and status flags of a broker-owned object.
-    pub fn status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
+    pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
         let object = self
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
-        object::status_flags(self, &object)
+        object::get_status_flags(self, &object)
     }
 
     /// Changes status flags of a broker-owned object, which every reference to the object
@@ -3158,7 +3158,7 @@ mod tests {
             FileOpenFlags::NONBLOCKING,
         );
         assert_eq!(
-            source.status_flags(stdin),
+            source.get_status_flags(stdin),
             Ok(FileStatusFlags {
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::NONBLOCKING,
@@ -3181,7 +3181,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            source.status_flags(stdin).map(|status| status.flags),
+            source.get_status_flags(stdin).map(|status| status.flags),
             Ok(FileOpenFlags::NONE)
         );
         assert_eq!(
@@ -3206,7 +3206,7 @@ mod tests {
             Ok(())
         );
         assert_eq!(
-            source.status_flags(file),
+            source.get_status_flags(file),
             Ok(FileStatusFlags {
                 access: FileAccessMode::ReadWrite,
                 flags: FileOpenFlags::APPEND,
@@ -3233,7 +3233,10 @@ mod tests {
             Err(BrokerError::UnsupportedOperation)
         );
         let event = crate::event::create(&source, 0).unwrap();
-        assert_eq!(source.status_flags(event), Err(BrokerError::InvalidRights));
+        assert_eq!(
+            source.get_status_flags(event),
+            Err(BrokerError::InvalidRights)
+        );
         assert_eq!(
             set(
                 &source,
@@ -3252,7 +3255,7 @@ mod tests {
 
         let path = open("/", FileAccessMode::ReadOnly, FileOpenFlags::PATH);
         assert_eq!(
-            source.status_flags(path),
+            source.get_status_flags(path),
             Ok(FileStatusFlags {
                 access: FileAccessMode::ReadOnly,
                 flags: FileOpenFlags::PATH,

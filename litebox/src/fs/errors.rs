@@ -228,7 +228,7 @@ pub enum IsTerminalError {
     Io,
 }
 
-/// Possible errors from [`crate::LiteBox::file_status_flags`] and
+/// Possible errors from [`crate::LiteBox::get_file_status_flags`] and
 /// [`crate::LiteBox::set_file_status_flags`].
 #[non_exhaustive]
 #[derive(Error, Debug)]

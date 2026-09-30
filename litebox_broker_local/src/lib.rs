@@ -481,7 +481,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a
     /// response that does not match the issued status-flags request.
-    pub fn status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags, Channel::Error> {
+    pub fn get_status_flags(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<FileStatusFlags, Channel::Error> {
         match self.request(BrokerOperation::GetStatusFlags(handle))? {
             BrokerResult::StatusFlags(status) => Ok(status),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),

@@ -145,11 +145,11 @@ fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), O
 }
 
 /// Returns the `F_GETFL` flags of the open file description at `fd`.
-fn file_status_flags<Platform: ShimPlatform>(
+fn get_file_status_flags<Platform: ShimPlatform>(
     litebox: &litebox::LiteBox<Platform>,
     fd: &FileFd,
 ) -> Result<OFlags, Errno> {
-    let status = litebox.file_status_flags(fd)?;
+    let status = litebox.get_file_status_flags(fd)?;
     let mut flags = match status.access {
         FileAccessMode::ReadOnly => OFlags::RDONLY,
         FileAccessMode::WriteOnly => OFlags::WRONLY,
@@ -2064,7 +2064,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Ok(fd
                     .dispatch(
-                        |fd| file_status_flags(&self.global.litebox, fd),
+                        |fd| get_file_status_flags(&self.global.litebox, fd),
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| self.global.linux_pipe_status_flags(fd),
                         |fd| getfl_from_handle!(fd),
