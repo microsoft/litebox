@@ -893,13 +893,12 @@ where
                 Err(
                     AllocationError::AddressInUse
                     | AllocationError::AddressInUseByPlatform
-                    | AllocationError::AddressPartiallyInUse,
-                ) => return Err(VmemResizeError::RangeOccupied(range.into())),
-                Err(
-                    AllocationError::Unaligned
-                    | AllocationError::BelowMinAddress
+                    | AllocationError::AddressPartiallyInUse
                     | AllocationError::AboveMaxAddress,
-                ) => unreachable!(),
+                ) => return Err(VmemResizeError::RangeOccupied(range.into())),
+                Err(AllocationError::Unaligned | AllocationError::BelowMinAddress) => {
+                    unreachable!()
+                }
                 Err(_) => return Err(VmemResizeError::OutOfMemory),
             }
             return Ok(());
