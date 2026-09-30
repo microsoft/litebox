@@ -46,14 +46,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         buf: &mut [u8],
         offset: Option<usize>,
     ) -> Result<usize, ReadError> {
-        let file = self.broker_file(fd).ok_or(ReadError::ClosedFd)?;
-        let mut read = || read_broker_file(&file, buf, offset);
-        match read() {
-            Err(TryOpError::TryAgain) => {}
-            result => return result.map_err(uninterruptible),
-        }
         let wait_state = WaitState::new(self.platform());
-        self.wait_on_file(&wait_state.context(), &file, false, Events::IN, read)
+        self.read_file_with_wait(&wait_state.context(), fd, buf, offset, false)
             .map_err(uninterruptible)
     }
 
@@ -75,7 +69,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         })
     }
 
-    /// Write from a buffer to a file descriptor at `offset`.
+    /// Write all of a buffer to a file descriptor at `offset`.
     ///
     /// Waits, uninterruptibly, while the file cannot accept bytes; see
     /// [`write_file_with_wait`](Self::write_file_with_wait) for interruptible and nonblocking
@@ -86,19 +80,16 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, WriteError> {
-        let file = self.broker_file(fd).ok_or(WriteError::ClosedFd)?;
-        let write = || write_broker_file(&file, buf, offset);
-        match write() {
-            Err(TryOpError::TryAgain) => {}
-            result => return result.map_err(uninterruptible),
-        }
         let wait_state = WaitState::new(self.platform());
-        self.wait_on_file(&wait_state.context(), &file, false, Events::OUT, write)
+        self.write_file_with_wait(&wait_state.context(), fd, buf, offset, false)
             .map_err(uninterruptible)
     }
 
     /// Write from a buffer to a file descriptor at `offset`, waiting through `cx` while the file
     /// cannot accept bytes unless `nonblock` is set.
+    ///
+    /// Unless `nonblock` is set, keeps writing until the whole buffer is written or a failure or
+    /// interruption follows partial progress, which then returns the bytes written.
     pub fn write_file_with_wait(
         &self,
         cx: &WaitContext<'_, Platform>,
@@ -110,9 +101,23 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
         let file = self
             .broker_file(fd)
             .ok_or(TryOpError::Other(WriteError::ClosedFd))?;
-        self.wait_on_file(cx, &file, nonblock, Events::OUT, || {
-            write_broker_file(&file, buf, offset)
-        })
+        let mut written = 0;
+        loop {
+            let rest = &buf[written..];
+            let offset = offset.map(|offset| offset.saturating_add(written));
+            match self.wait_on_file(cx, &file, nonblock, Events::OUT, || {
+                write_broker_file(&file, rest, offset)
+            }) {
+                Ok(count) => {
+                    written += count;
+                    if nonblock || count == 0 || written == buf.len() {
+                        return Ok(written);
+                    }
+                }
+                Err(_) if written != 0 => return Ok(written),
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Returns the readiness of the file in a descriptor `entry` for polling.

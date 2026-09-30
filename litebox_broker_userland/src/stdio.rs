@@ -115,7 +115,12 @@ impl StdioProvider for UserlandStdioProvider {
             return Err(StdioProviderError::WouldBlock);
         }
         if state.data.is_empty() {
-            return state.end.unwrap_or(Ok(())).map(|()| 0);
+            let end = state.end.unwrap_or(Ok(()));
+            // Like a terminal's, end-of-file ends one read; later reads ask the host again.
+            if end.is_ok() {
+                state.end = None;
+            }
+            return end.map(|()| 0);
         }
         let count = output.len().min(state.data.len());
         for (output, input) in output.iter_mut().zip(state.data.drain(..count)) {
@@ -217,7 +222,8 @@ struct InputState {
     host: Option<Box<dyn Read + Send>>,
     /// Host input read but not yet delivered.
     data: VecDeque<u8>,
-    /// Outcome once host input ends: `Ok` at end-of-file.
+    /// Outcome of a host read that returned no data: `Ok` at end-of-file,
+    /// which the next read reports once, or a failure that persists.
     end: Option<Result<(), StdioProviderError>>,
     /// Whether a reader is waiting for the input thread to read more.
     wanted: bool,
@@ -258,7 +264,7 @@ fn read_host_input(input: &Shared<InputState>, mut host: Box<dyn Read + Send>) {
             Err(error) => state.end = Some(Err(map_stdio_error(&error))),
         }
         state.watchers.publish(ReadinessFlags::READ);
-        if state.end.is_some() {
+        if matches!(state.end, Some(Err(_))) {
             return;
         }
     }
@@ -321,7 +327,8 @@ mod tests {
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// Host standard input fed by a channel, reaching end-of-file once the
+    /// Host standard input fed by a channel. An empty message is one
+    /// end-of-file, like a terminal's; every read reaches end-of-file once the
     /// sender drops.
     struct ChannelInput(Receiver<Vec<u8>>);
 
@@ -442,9 +449,25 @@ mod tests {
             Err(StdioProviderError::WouldBlock)
         );
 
-        drop(sender);
+        sender.send(Vec::new()).unwrap();
         wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
         assert_eq!(provider.read(&mut output), Ok(0));
+        assert_eq!(
+            provider.read(&mut output),
+            Err(StdioProviderError::WouldBlock)
+        );
+        sender.send(b"again".to_vec()).unwrap();
+        wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
+        assert_eq!(provider.read(&mut output), Ok(4));
+        assert_eq!(&output, b"agai");
+
+        drop(sender);
+        assert_eq!(provider.read(&mut output), Ok(1));
+        assert_eq!(output[0], b'n');
+        for _ in 0..2 {
+            wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
+            assert_eq!(provider.read(&mut output), Ok(0));
+        }
     }
 
     #[test]

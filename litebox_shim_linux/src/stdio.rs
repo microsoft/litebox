@@ -207,6 +207,21 @@ mod tests {
     }
 
     #[test]
+    fn test_stdout_blocking_write_is_complete() {
+        let task = init_platform();
+        let len = usize::try_from(litebox_broker_protocol::fs::MAX_FILE_TRANSFER_SIZE).unwrap() + 1;
+        let buf = std::vec![b'x'; len];
+
+        assert_eq!(task.sys_write(1, &buf, None), Ok(len));
+        let writes = test_broker::stdio().writes();
+        assert!(writes.len() > 1);
+        assert_eq!(
+            writes.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+            len
+        );
+    }
+
+    #[test]
     fn test_stdio_epoll_readiness() {
         let task = init_platform();
         let epfd =
