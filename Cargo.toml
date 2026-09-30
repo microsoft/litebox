@@ -25,6 +25,7 @@ members = [
     "litebox_platform_macos_userland",
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
+    "litebox_platform_vm_kernel",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_macos_userland",
     "litebox_runner_linux_on_windows_userland",
@@ -32,6 +33,7 @@ members = [
     "litebox_runner_windows_on_linux_userland",
     "litebox_runner_windows_userland",
     "litebox_runner_lvbs",
+    "litebox_runner_optee_on_qemu",
     "litebox_runner_snp",
     "litebox_runner_optee_on_linux_userland",
     "litebox_shim_linux",
@@ -72,6 +74,7 @@ default-members = [
     "litebox_platform_macos_userland",
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
+    "litebox_platform_vm_kernel",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_macos_userland",
@@ -91,6 +94,8 @@ default-members = [
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because it requires
 # a custom target and `-Z build-std`, which requires a nightly toolchain.
+# `litebox_runner_optee_on_qemu` is excluded because it only builds for
+# `x86_64-unknown-none`.
 
 # Introduce all the pedantic clippy lints and remove ones I (jayb) think are
 # pushing it too far; this way we get something even further than default clippy

@@ -1,0 +1,8 @@
+[profile.ci]
+# Do not cancel the test run on the first failure.
+fail-fast = false
+# Show all tests _including_ skipped tests in output.
+status-level = "all"
+# Output failures as soon as they happen _and_ at the end of the test run;
+# combination of "immediate" and "final".
+failure-output = "immediate-final"
