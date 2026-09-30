@@ -197,6 +197,8 @@ impl<P: ShimPlatform> Task<P> {
 
     /// Read at an explicit offset without changing the shared offset, or use
     /// and advance the shared offset when `offset` is `None`.
+    // TODO: Reads and writes ignore `O_NONBLOCK` and always wait. Status flags belong to the
+    // open file description, so they should move into the broker.
     pub(crate) fn do_read(
         &self,
         fd: &FileFd,
