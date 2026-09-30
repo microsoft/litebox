@@ -766,7 +766,7 @@ where
         }
 
         match unsafe { self.remove_pages(addr.to_platform_ptr::<Platform>(), aligned_len) } {
-            Err(VmemUnmapError::UnAligned) => Err(Errno::EINVAL),
+            Err(VmemUnmapError::UnAligned | VmemUnmapError::InvalidRange(_)) => Err(Errno::EINVAL),
             Err(VmemUnmapError::UnmapError(e)) => match e {
                 DeallocationError::Unaligned => Err(Errno::EINVAL),
                 // It is not an error if the indicated range does not contain any mapped pages.

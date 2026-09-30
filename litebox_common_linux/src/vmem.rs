@@ -706,6 +706,9 @@ where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
         let range = Range::from(range);
+        if range.end > Platform::TASK_ADDR_MAX {
+            return Err(VmemUnmapError::InvalidRange(range));
+        }
         // SAFETY: The caller excludes all users of the removed range.
         unsafe {
             self.reservations.unmap(
@@ -1597,6 +1600,8 @@ where
 pub enum VmemUnmapError {
     #[error("arg is not aligned")]
     UnAligned,
+    #[error("range {0:?} extends outside user address space")]
+    InvalidRange(Range<usize>),
     #[error("failed to unmap pages: {0}")]
     UnmapError(#[from] litebox::platform::page_mgmt::DeallocationError),
 }
