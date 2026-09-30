@@ -1456,19 +1456,21 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
                 return NtStatus::ACCESS_VIOLATION;
             };
             let chunk_offset = offset.map(|offset| offset + total_written);
-            let write = file.with_entry(|file| match &file.backing {
-                FileObjectBacking::Filesystem { fd, is_directory } => {
-                    if *is_directory {
-                        return Err(WriteError::NotAFile);
+            let write = self.wait_for_io(|cx| {
+                file.with_entry(|file| match &file.backing {
+                    FileObjectBacking::Filesystem { fd, is_directory } => {
+                        if *is_directory {
+                            return Err(WriteError::NotAFile);
+                        }
+                        self.fs.write_file(fd, &bytes, chunk_offset, Some(cx))
                     }
-                    self.fs.write_file(fd, &bytes, chunk_offset)
-                }
-                FileObjectBacking::CondrvStream { fd, .. } => {
-                    self.fs.write_file(fd, &bytes, chunk_offset)
-                }
-                FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                    Err(WriteError::NotAFile)
-                }
+                    FileObjectBacking::CondrvStream { fd, .. } => {
+                        self.fs.write_file(fd, &bytes, chunk_offset, Some(cx))
+                    }
+                    FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
+                        Err(WriteError::NotAFile)
+                    }
+                })
             });
             let written = match write {
                 Ok(0) => break Ok(total_written),
@@ -1551,64 +1553,74 @@ impl<Platform: crate::ShimPlatform> Task<Platform> {
         };
         let mut total_read = 0;
         let mut guest_write_failed = false;
-        let result = file.with_entry(|file| {
-            loop {
-                if total_read == output_length {
-                    break;
-                }
-                let chunk_length = (output_length - total_read).min(bytes.len());
-                let chunk_offset = offset.map(|offset| offset + total_read);
-                let (read, continue_after_full_chunk) = match &file.backing {
-                    FileObjectBacking::Filesystem { fd, is_directory } => {
-                        if *is_directory {
+        let result = self.wait_for_io(|cx| {
+            file.with_entry(|file| {
+                loop {
+                    if total_read == output_length {
+                        break;
+                    }
+                    let chunk_length = (output_length - total_read).min(bytes.len());
+                    let chunk_offset = offset.map(|offset| offset + total_read);
+                    let (read, continue_after_full_chunk) = match &file.backing {
+                        FileObjectBacking::Filesystem { fd, is_directory } => {
+                            if *is_directory {
+                                return Err(ReadError::NotAFile);
+                            }
+                            (
+                                self.fs.read_file(
+                                    fd,
+                                    &mut bytes[..chunk_length],
+                                    chunk_offset,
+                                    Some(cx),
+                                ),
+                                true,
+                            )
+                        }
+                        // TODO(condrv-large-read): Continue with per-operation nonblocking reads
+                        // after the first chunk once FileSystem can report WouldBlock.
+                        FileObjectBacking::CondrvStream { fd, .. } => (
+                            self.fs.read_file(
+                                fd,
+                                &mut bytes[..chunk_length],
+                                chunk_offset,
+                                Some(cx),
+                            ),
+                            false,
+                        ),
+                        FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
                             return Err(ReadError::NotAFile);
                         }
-                        (
-                            self.fs
-                                .read_file(fd, &mut bytes[..chunk_length], chunk_offset),
-                            true,
-                        )
+                    };
+                    let read = match read {
+                        Ok(0) => break,
+                        Ok(read) => read,
+                        Err(_) if total_read != 0 => break,
+                        Err(error) => return Err(error),
+                    };
+                    if buffer.copy_from_slice(total_read, &bytes[..read]).is_none() {
+                        guest_write_failed = true;
+                        return Err(ReadError::Io);
                     }
-                    // TODO(condrv-large-read): Continue with per-operation nonblocking reads
-                    // after the first chunk once FileSystem can report WouldBlock.
-                    FileObjectBacking::CondrvStream { fd, .. } => (
-                        self.fs
-                            .read_file(fd, &mut bytes[..chunk_length], chunk_offset),
-                        false,
-                    ),
-                    FileObjectBacking::CondrvControl(_) | FileObjectBacking::KsecDevice => {
-                        return Err(ReadError::NotAFile);
+                    total_read += read;
+                    if read < chunk_length || !continue_after_full_chunk {
+                        break;
                     }
-                };
-                let read = match read {
-                    Ok(0) => break,
-                    Ok(read) => read,
-                    Err(_) if total_read != 0 => break,
-                    Err(error) => return Err(error),
-                };
-                if buffer.copy_from_slice(total_read, &bytes[..read]).is_none() {
-                    guest_write_failed = true;
-                    return Err(ReadError::Io);
                 }
-                total_read += read;
-                if read < chunk_length || !continue_after_full_chunk {
-                    break;
+                if let Some(offset) = offset
+                    && let FileObjectBacking::Filesystem { fd, .. } = &file.backing
+                    && file
+                        .create_options
+                        .intersects(FileCreateOptions::SYNCHRONOUS_IO)
+                    && output_length != 0
+                {
+                    let _ = self.fs.seek_file(
+                        fd,
+                        (offset + total_read).cast_signed(),
+                        SeekWhence::RelativeToBeginning,
+                    );
                 }
-            }
-            if let Some(offset) = offset
-                && let FileObjectBacking::Filesystem { fd, .. } = &file.backing
-                && file
-                    .create_options
-                    .intersects(FileCreateOptions::SYNCHRONOUS_IO)
-                && output_length != 0
-            {
-                let _ = self.fs.seek_file(
-                    fd,
-                    (offset + total_read).cast_signed(),
-                    SeekWhence::RelativeToBeginning,
-                );
-            }
-            Ok(total_read)
+                Ok(total_read)
+            })
         });
         if guest_write_failed {
             return NtStatus::ACCESS_VIOLATION;
@@ -2825,7 +2837,10 @@ mod tests {
                 Mode::RUSR | Mode::WUSR,
             )
             .unwrap();
-        assert_eq!(task.fs.write_file(&fd, data, Some(0)).unwrap(), data.len());
+        assert_eq!(
+            task.fs.write_file(&fd, data, Some(0), None).unwrap(),
+            data.len()
+        );
         task.fs.close_file(&fd).unwrap();
     }
 
@@ -3396,7 +3411,12 @@ mod tests {
                 )
                 .unwrap();
             let mut contents = [0; 5];
-            assert_eq!(task.fs.read_file(&fd, &mut contents, Some(0)).unwrap(), 5);
+            assert_eq!(
+                task.fs
+                    .read_file(&fd, &mut contents, Some(0), None)
+                    .unwrap(),
+                5
+            );
             assert_eq!(&contents, b"data!");
             task.fs.close_file(&fd).unwrap();
         });
@@ -3499,6 +3519,58 @@ mod tests {
             );
             assert_eq!(&output, b"45");
             assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
+        });
+    }
+
+    #[test]
+    fn console_read_waits_until_input_or_thread_exit() {
+        run_with_test_platform_pointers(|| {
+            let stdio = Arc::new(
+                litebox_broker_core::test_support::TestStdioProvider::default().with_open_input(),
+            );
+            let parent = crate::tests::test_task_with_broker_files_and_stdio(&[], stdio.clone());
+            let (status, input, _) = create_file(
+                &parent,
+                r"\Device\ConDrv\Input",
+                FILE_GENERIC_READ,
+                FILE_OPEN,
+            );
+            assert_eq!(status, NtStatus::SUCCESS);
+            // Starts a one-byte read on a sibling thread and returns once the read has blocked.
+            // The read reads again after it starts listening for input, so nothing that happens
+            // afterward can be missed.
+            let start_read = || {
+                let reads = stdio.blocked_input_reads();
+                let (thread, thread_object) = parent.spawn_clone_for_test(move |reader| {
+                    let mut byte = [0u8];
+                    let mut io_status = IoStatusBlock::default();
+                    let status = reader.sys_nt_read_file(
+                        input,
+                        Handle::default(),
+                        None,
+                        None,
+                        mut_ptr(&mut io_status),
+                        mut_byte_ptr(&mut byte),
+                        1,
+                        None,
+                        None,
+                    );
+                    (status, byte[0])
+                });
+                while stdio.blocked_input_reads() == reads {
+                    std::thread::yield_now();
+                }
+                (thread, thread_object)
+            };
+
+            let (thread, _) = start_read();
+            stdio.push_input(b"x");
+            assert_eq!(thread.join().unwrap(), (NtStatus::SUCCESS, b'x'));
+
+            let (thread, thread_object) = start_read();
+            thread_object.begin_exit(0);
+            assert_eq!(thread.join().unwrap().0, NtStatus::UNSUCCESSFUL);
+            assert_eq!(parent.sys_nt_close(input), NtStatus::SUCCESS);
         });
     }
 

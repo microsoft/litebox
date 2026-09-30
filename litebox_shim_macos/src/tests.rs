@@ -9,12 +9,13 @@ use litebox_common_linux::vmem::{CreatePagesFlags, NonZeroAddress, NonZeroPageSi
 use litebox_platform_macos_userland::MacosUserland as Platform;
 
 fn task(shim: MacosShim<Platform>) -> Task<Platform> {
+    let thread = ThreadState::new(1u64 << 32, shim.global.platform);
     Task {
         global: shim.global,
         files: shim.files,
         params: TaskParams::default(),
         process: Process(Arc::new(AtomicI32::new(-1))),
-        thread: ThreadState { id: 1u64 << 32 },
+        thread,
     }
 }
 

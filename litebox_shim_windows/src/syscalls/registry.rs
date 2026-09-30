@@ -2338,7 +2338,7 @@ fn read_exact_at<Platform: crate::ShimPlatform>(
     let mut offset = 0;
     while !data.is_empty() {
         let read = fs
-            .read_file(fd, data, Some(offset))
+            .read_file(fd, data, Some(offset), None)
             .map_err(map_read_error)?;
         if read == 0 {
             return Err(NtStatus::UNSUCCESSFUL);
@@ -2357,7 +2357,7 @@ fn write_all_at<Platform: crate::ShimPlatform>(
 ) -> Result<(), NtStatus> {
     while !data.is_empty() {
         let written = fs
-            .write_file(fd, data, Some(offset))
+            .write_file(fd, data, Some(offset), None)
             .map_err(map_write_error)?;
         if written == 0 {
             return Err(NtStatus::DISK_FULL);

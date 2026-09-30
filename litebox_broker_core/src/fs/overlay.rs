@@ -15,6 +15,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -33,6 +34,7 @@ use super::errors::{
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
+use crate::readiness::ReadinessSource;
 
 /// The reserved namespace prefix; no overlay-visible name may start with it.
 const MARKER_PREFIX: &str = ".litebox-overlay-";
@@ -941,6 +943,12 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     fn is_terminal(&self, h: &FileHandle) -> bool {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.is_terminal(handle)
+        })
+    }
+
+    fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
+        self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
+            backend.readiness_source(handle)
         })
     }
 

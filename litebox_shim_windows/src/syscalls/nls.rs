@@ -809,7 +809,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let chunk_len = remaining.min(PAGE_SIZE);
             let read = self
                 .fs
-                .read_file(fd, &mut chunk[..chunk_len], Some(offset))
+                .read_file(fd, &mut chunk[..chunk_len], Some(offset), None)
                 .map_err(map_nls_read_error)?;
             if read == 0 {
                 return Err(NtStatus::END_OF_FILE);

@@ -3,7 +3,11 @@
 
 //! Host standard streams behind the `/dev` stdio devices.
 
+use litebox_broker_protocol::readiness::ReadinessFlags;
 use thiserror::Error;
+
+use crate::Result;
+use crate::readiness::ReadinessRegistration;
 
 /// Standard stream selected by a terminal query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,14 +38,22 @@ pub enum StdioProviderError {
     /// The host standard-I/O operation failed internally.
     #[error("trusted standard-I/O provider failed")]
     Failed,
+    /// The operation cannot make progress until the stream becomes ready.
+    #[error("standard stream is not ready")]
+    WouldBlock,
     /// This broker deployment does not provide standard I/O.
     #[error("standard I/O is unsupported")]
     Unsupported,
 }
 
 /// Trusted provider of standard-I/O operations.
+///
+/// Operations never block. One that cannot make progress returns
+/// [`StdioProviderError::WouldBlock`], and the provider later publishes the
+/// stream's readiness to its watchers. Providers whose operations always make
+/// progress can keep the default readiness methods.
 pub trait StdioProvider: Send + Sync {
-    /// Blocks until bytes can be read from standard input, returning zero at
+    /// Reads available bytes from standard input, returning zero at
     /// end-of-file.
     fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError>;
 
@@ -55,6 +67,23 @@ pub trait StdioProvider: Send + Sync {
     /// Determines whether the selected standard stream is connected to a
     /// terminal.
     fn is_terminal(&self, stream: StdioStream) -> bool;
+
+    /// Returns the selected stream's readiness: [`ReadinessFlags::READ`] once
+    /// a standard-input read would not return
+    /// [`StdioProviderError::WouldBlock`], or [`ReadinessFlags::WRITE`] once
+    /// such a write would not.
+    fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
+        match stream {
+            StdioStream::Stdin => ReadinessFlags::READ,
+            StdioStream::Stdout | StdioStream::Stderr => ReadinessFlags::WRITE,
+        }
+    }
+
+    /// Publishes the selected stream's later readiness changes through
+    /// `registration` until every clone of it drops.
+    fn watch(&self, _stream: StdioStream, _registration: &ReadinessRegistration) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Standard-I/O provider for deployments that do not expose standard streams.

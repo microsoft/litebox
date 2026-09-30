@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResul
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -21,12 +22,16 @@ use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::stdio::UserlandStdioProvider;
 
 use super::{SETUP_TIMEOUT, configured_socket_policy};
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
+pub(super) fn run(
+    mut args: super::CliArgs,
+    stdio: Arc<UserlandStdioProvider>,
+) -> Result<(), Box<dyn Error>> {
     let proxy = if args.allow_host.is_empty() {
         None
     } else {
@@ -50,6 +55,7 @@ pub(super) fn run(mut args: super::CliArgs) -> Result<(), Box<dyn Error>> {
         .with_process_duplication_enabled(args.allow_process_duplication);
     let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
+        stdio,
     )?;
     let build_broker = || BrokerCoreBuilder::new(policy).with_file_service(fs).build();
     let broker = if args.in_process_runner {

@@ -228,6 +228,11 @@ impl From<litebox::fs::errors::ReadError> for Errno {
             litebox::fs::errors::ReadError::ClosedFd => Errno::EBADF,
             litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::ReadError::NotForReading => Errno::EBADF,
+            litebox::fs::errors::ReadError::WouldBlock => Errno::EAGAIN,
+            litebox::fs::errors::ReadError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
             litebox::fs::errors::ReadError::Io => Errno::EIO,
             _ => unimplemented!(),
         }
@@ -239,6 +244,11 @@ impl From<litebox::fs::errors::WriteError> for Errno {
         match value {
             litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
             litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
+            litebox::fs::errors::WriteError::WouldBlock => Errno::EAGAIN,
+            litebox::fs::errors::WriteError::WaitError(e) => match e {
+                litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
             litebox::fs::errors::WriteError::Io => Errno::EIO,
             _ => unimplemented!(),
         }

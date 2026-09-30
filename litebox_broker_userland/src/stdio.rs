@@ -3,18 +3,100 @@
 
 //! Inherited host standard streams for userland brokers.
 
-use std::io::{Error as IoError, ErrorKind, Read as _, Result as IoResult};
+use std::collections::VecDeque;
+use std::io::{Error as IoError, ErrorKind, Read, Write};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
+use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
 use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
+use litebox_broker_protocol::readiness::ReadinessFlags;
+
+/// Largest single host standard-input read.
+const INPUT_CHUNK_SIZE: usize = 64 * 1024;
+/// Accepted output bytes not yet written to the host, beyond which writes
+/// would block.
+const OUTPUT_CAPACITY: usize = 64 * 1024;
+/// Largest output write accepted whole or not at all, like Linux's `PIPE_BUF`,
+/// so small writes from concurrent writers never interleave.
+const ATOMIC_WRITE_SIZE: usize = 4096;
 
 /// Routes standard I/O for the broker's single child runner through inherited
-/// streams.
+/// streams without blocking broker requests.
+///
+/// Background threads perform the blocking host I/O and publish readiness as
+/// it completes. The input thread reads host standard input only after a read
+/// or readiness query finds no buffered input, so the broker never consumes
+/// input the guest has not asked for. The output thread writes accepted bytes
+/// to the host in order. Both threads start on first use and live for the rest
+/// of the process, since a blocked host read cannot be interrupted.
 ///
 /// A broker serving multiple runners will need association-specific stream
 /// endpoints instead of sharing process-wide standard streams.
-pub struct UserlandStdioProvider;
+pub struct UserlandStdioProvider {
+    input: Arc<HostIo<InputState>>,
+    output: Arc<HostIo<OutputState>>,
+}
+
+impl Default for UserlandStdioProvider {
+    fn default() -> Self {
+        Self::with_host(std::io::stdin(), std::io::stdout(), std::io::stderr())
+    }
+}
+
+impl UserlandStdioProvider {
+    fn with_host(
+        stdin: impl Read + Send + 'static,
+        stdout: impl Write + Send + 'static,
+        stderr: impl Write + Send + 'static,
+    ) -> Self {
+        Self {
+            input: Arc::new(HostIo::new(InputState {
+                host: Some(Box::new(stdin)),
+                data: VecDeque::new(),
+                end: None,
+                wanted: false,
+                watchers: ReadinessWatchers::default(),
+            })),
+            output: Arc::new(HostIo::new(OutputState {
+                hosts: Some([Box::new(stdout), Box::new(stderr)]),
+                queue: VecDeque::new(),
+                queued: 0,
+                errors: [None; 2],
+                watchers: ReadinessWatchers::default(),
+            })),
+        }
+    }
+
+    /// Blocks until every accepted output byte has been written to the host
+    /// or discarded after a host write failure.
+    pub fn flush(&self) {
+        let mut state = self.output.lock();
+        while state.queued != 0 {
+            state = self.output.wait(state);
+        }
+    }
+
+    /// Returns whether a standard-input read would not block, first asking the
+    /// input thread for more host input when none is buffered.
+    fn poll_input(&self, state: &mut InputState) -> bool {
+        if state.data.is_empty() && state.end.is_none() {
+            state.wanted = true;
+            if let Some(host) = state.host.take() {
+                let input = Arc::clone(&self.input);
+                let spawned = std::thread::Builder::new()
+                    .name("litebox-broker-stdin".to_owned())
+                    .spawn(move || input.read_host(host));
+                if spawned.is_err() {
+                    state.end = Some(Err(StdioProviderError::Failed));
+                }
+            }
+            self.input.changed.notify_all();
+        }
+        !state.data.is_empty() || state.end.is_some()
+    }
+}
 
 impl StdioProvider for UserlandStdioProvider {
     fn is_terminal(&self, stream: StdioStream) -> bool {
@@ -28,24 +110,228 @@ impl StdioProvider for UserlandStdioProvider {
     }
 
     fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
-        loop {
-            match std::io::stdin().read(output) {
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                result => return result.map_err(map_stdio_error),
-            }
+        if output.is_empty() {
+            return Ok(0);
         }
+        let mut state = self.input.lock();
+        if !self.poll_input(&mut state) {
+            return Err(StdioProviderError::WouldBlock);
+        }
+        if state.data.is_empty() {
+            let end = state.end.unwrap_or(Ok(()));
+            // Like a terminal's, end-of-file ends one read; later reads ask the host again.
+            if end.is_ok() {
+                state.end = None;
+            }
+            return end.map(|()| 0);
+        }
+        let count = output.len().min(state.data.len());
+        for (output, input) in output.iter_mut().zip(state.data.drain(..count)) {
+            *output = input;
+        }
+        Ok(count)
     }
 
     fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        match stream {
-            StdioOutputStream::Stdout => write_and_flush(std::io::stdout().lock(), input),
-            StdioOutputStream::Stderr => write_and_flush(std::io::stderr().lock(), input),
+        let index = OutputState::index(stream);
+        let mut state = self.output.lock();
+        if let Some(error) = state.errors[index] {
+            return Err(error);
         }
-        .map_err(map_stdio_error)
+        if input.is_empty() {
+            return Ok(0);
+        }
+        let available = OUTPUT_CAPACITY - state.queued;
+        if available == 0 || (input.len() <= ATOMIC_WRITE_SIZE && available < input.len()) {
+            return Err(StdioProviderError::WouldBlock);
+        }
+        let count = input.len().min(available);
+        if let Some(hosts) = state.hosts.take() {
+            let output = Arc::clone(&self.output);
+            let spawned = std::thread::Builder::new()
+                .name("litebox-broker-stdout".to_owned())
+                .spawn(move || output.write_host(hosts));
+            if spawned.is_err() {
+                state.errors = [Some(StdioProviderError::Failed); 2];
+                return Err(StdioProviderError::Failed);
+            }
+        }
+        state.queue.push_back((index, input[..count].to_vec()));
+        state.queued += count;
+        self.output.changed.notify_all();
+        Ok(count)
+    }
+
+    fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
+        let index = match stream {
+            StdioStream::Stdin => {
+                let mut state = self.input.lock();
+                return if self.poll_input(&mut state) {
+                    ReadinessFlags::READ
+                } else {
+                    ReadinessFlags::default()
+                };
+            }
+            StdioStream::Stdout => OutputState::index(StdioOutputStream::Stdout),
+            StdioStream::Stderr => OutputState::index(StdioOutputStream::Stderr),
+        };
+        if self.output.lock().writable(index) {
+            ReadinessFlags::WRITE
+        } else {
+            ReadinessFlags::default()
+        }
+    }
+
+    fn watch(
+        &self,
+        stream: StdioStream,
+        registration: &ReadinessRegistration,
+    ) -> litebox_broker_core::Result<()> {
+        match stream {
+            StdioStream::Stdin => self.input.lock().watchers.watch(registration),
+            StdioStream::Stdout | StdioStream::Stderr => {
+                self.output.lock().watchers.watch(registration)
+            }
+        }
     }
 }
 
-fn map_stdio_error(error: IoError) -> StdioProviderError {
+/// One direction of host standard I/O: its state, shared between broker
+/// requests and the thread performing the blocking host I/O, and a condition
+/// variable signalled when either side changes it.
+struct HostIo<State> {
+    state: Mutex<State>,
+    changed: Condvar,
+}
+
+impl<State> HostIo<State> {
+    fn new(state: State) -> Self {
+        Self {
+            state: Mutex::new(state),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn wait<'guard>(&self, guard: MutexGuard<'guard, State>) -> MutexGuard<'guard, State> {
+        self.changed
+            .wait(guard)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+struct InputState {
+    /// Host standard input, until the input thread takes it.
+    host: Option<Box<dyn Read + Send>>,
+    /// Host input read but not yet delivered.
+    data: VecDeque<u8>,
+    /// Outcome of a host read that returned no data: `Ok` at end-of-file,
+    /// which the next read reports once, or a failure that persists.
+    end: Option<Result<(), StdioProviderError>>,
+    /// Whether a reader is waiting for the input thread to read more.
+    wanted: bool,
+    watchers: ReadinessWatchers,
+}
+
+struct OutputState {
+    /// Host standard output and error, in [`Self::index`] order, until the
+    /// output thread takes them.
+    hosts: Option<[Box<dyn Write + Send>; 2]>,
+    /// Accepted chunks, tagged with their stream's [`Self::index`], in write
+    /// order.
+    queue: VecDeque<(usize, Vec<u8>)>,
+    /// Accepted bytes not yet written, including the chunk being written.
+    queued: usize,
+    /// Each stream's first host write failure, in [`Self::index`] order, which
+    /// later writes report.
+    errors: [Option<StdioProviderError>; 2],
+    watchers: ReadinessWatchers,
+}
+
+impl OutputState {
+    /// Returns `stream`'s slot in `hosts` and `errors`.
+    fn index(stream: StdioOutputStream) -> usize {
+        match stream {
+            StdioOutputStream::Stdout => 0,
+            StdioOutputStream::Stderr => 1,
+        }
+    }
+
+    /// Returns whether a write to the stream at `index` would not block, like
+    /// Linux pipes, which report writable only when a `PIPE_BUF` write fits.
+    fn writable(&self, index: usize) -> bool {
+        OUTPUT_CAPACITY - self.queued >= ATOMIC_WRITE_SIZE || self.errors[index].is_some()
+    }
+}
+
+impl HostIo<InputState> {
+    /// Runs the input thread: reads host input whenever a reader wants more,
+    /// until the host input fails.
+    fn read_host(&self, mut host: Box<dyn Read + Send>) {
+        let mut chunk = vec![0; INPUT_CHUNK_SIZE];
+        loop {
+            let mut state = self.lock();
+            while !state.wanted {
+                state = self.wait(state);
+            }
+            drop(state);
+            let result = loop {
+                match host.read(&mut chunk) {
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    result => break result,
+                }
+            };
+            let mut state = self.lock();
+            state.wanted = false;
+            match result {
+                Ok(0) => state.end = Some(Ok(())),
+                Ok(count) => state.data.extend(&chunk[..count]),
+                Err(error) => state.end = Some(Err(map_stdio_error(&error))),
+            }
+            state.watchers.publish(ReadinessFlags::READ);
+            if matches!(state.end, Some(Err(_))) {
+                return;
+            }
+        }
+    }
+}
+
+impl HostIo<OutputState> {
+    /// Runs the output thread: writes accepted chunks to the host in order.
+    fn write_host(&self, mut hosts: [Box<dyn Write + Send>; 2]) {
+        loop {
+            let mut state = self.lock();
+            let (index, chunk) = loop {
+                if let Some(entry) = state.queue.pop_front() {
+                    break entry;
+                }
+                state = self.wait(state);
+            };
+            let failed = state.errors[index].is_some();
+            drop(state);
+            let result = if failed {
+                Ok(())
+            } else {
+                let host = &mut hosts[index];
+                host.write_all(&chunk).and_then(|()| host.flush())
+            };
+            let mut state = self.lock();
+            state.queued -= chunk.len();
+            if let Err(error) = result {
+                state.errors[index] = Some(map_stdio_error(&error));
+            }
+            self.changed.notify_all();
+            if state.writable(index) {
+                state.watchers.publish(ReadinessFlags::WRITE);
+            }
+        }
+    }
+}
+
+fn map_stdio_error(error: &IoError) -> StdioProviderError {
     if error.kind() == ErrorKind::BrokenPipe {
         StdioProviderError::Closed
     } else {
@@ -53,41 +339,205 @@ fn map_stdio_error(error: IoError) -> StdioProviderError {
     }
 }
 
-fn write_and_flush(mut output: impl std::io::Write, input: &[u8]) -> IoResult<usize> {
-    let written = output.write(input)?;
-    output.flush()?;
-    Ok(written)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::io::{Read, Result as IoResult, Write};
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
-    #[derive(Default)]
-    struct RecordingOutput {
-        bytes: Vec<u8>,
-        flushes: usize,
+    use litebox_broker_core::stdio::StdioStream;
+    use litebox_broker_core::stdio::{StdioOutputStream, StdioProvider, StdioProviderError};
+    use litebox_broker_protocol::readiness::ReadinessFlags;
+
+    use super::{ATOMIC_WRITE_SIZE, OUTPUT_CAPACITY, UserlandStdioProvider};
+
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// Host standard input fed by a channel. An empty message is one
+    /// end-of-file, like a terminal's; every read reaches end-of-file once the
+    /// sender drops.
+    struct ChannelInput(Receiver<Vec<u8>>);
+
+    impl Read for ChannelInput {
+        fn read(&mut self, output: &mut [u8]) -> IoResult<usize> {
+            let Ok(input) = self.0.recv() else {
+                return Ok(0);
+            };
+            output[..input.len()].copy_from_slice(&input);
+            Ok(input.len())
+        }
     }
 
-    impl std::io::Write for RecordingOutput {
+    /// Host output that records writes to either stream in order once opened.
+    #[derive(Clone, Default)]
+    struct GatedOutput(Arc<(Mutex<GatedOutputState>, Condvar)>);
+
+    #[derive(Default)]
+    struct GatedOutputState {
+        open: bool,
+        writes: Vec<(StdioOutputStream, Vec<u8>)>,
+    }
+
+    impl GatedOutput {
+        fn open(&self) {
+            self.0.0.lock().unwrap().open = true;
+            self.0.1.notify_all();
+        }
+
+        fn writes(&self) -> Vec<(StdioOutputStream, Vec<u8>)> {
+            self.0.0.lock().unwrap().writes.clone()
+        }
+
+        fn stream(&self, stream: StdioOutputStream) -> GatedStream {
+            GatedStream {
+                output: self.clone(),
+                stream,
+            }
+        }
+    }
+
+    struct GatedStream {
+        output: GatedOutput,
+        stream: StdioOutputStream,
+    }
+
+    impl Write for GatedStream {
         fn write(&mut self, input: &[u8]) -> IoResult<usize> {
-            let written = input.len().min(3);
-            self.bytes.extend(&input[..written]);
-            Ok(written)
+            let (state, opened) = &*self.output.0;
+            let mut state = state.lock().unwrap();
+            while !state.open {
+                state = opened.wait(state).unwrap();
+            }
+            state.writes.push((self.stream, input.to_vec()));
+            Ok(input.len())
         }
 
         fn flush(&mut self) -> IoResult<()> {
-            self.flushes += 1;
             Ok(())
         }
     }
 
-    #[test]
-    fn write_reports_partial_writes_and_flushes() {
-        let mut output = RecordingOutput::default();
+    fn gated_provider(input: Receiver<Vec<u8>>, output: &GatedOutput) -> UserlandStdioProvider {
+        UserlandStdioProvider::with_host(
+            ChannelInput(input),
+            output.stream(StdioOutputStream::Stdout),
+            output.stream(StdioOutputStream::Stderr),
+        )
+    }
 
-        assert_eq!(write_and_flush(&mut output, b"prompt").unwrap(), 3);
-        assert_eq!(output.bytes, b"pro");
-        assert_eq!(output.flushes, 1);
+    fn wait_for_readiness(
+        provider: &UserlandStdioProvider,
+        stream: StdioStream,
+        expected: ReadinessFlags,
+    ) {
+        let deadline = std::time::Instant::now() + TEST_TIMEOUT;
+        while provider.readiness(stream) != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{stream:?} never ready"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn stdin_reads_host_input_on_demand_without_blocking() {
+        let (sender, receiver): (Sender<Vec<u8>>, _) = channel();
+        let provider = gated_provider(receiver, &GatedOutput::default());
+        let mut output = [0; 4];
+
+        assert_eq!(
+            provider.read(&mut output),
+            Err(StdioProviderError::WouldBlock)
+        );
+        assert_eq!(
+            provider.readiness(StdioStream::Stdin),
+            ReadinessFlags::default()
+        );
+        sender.send(b"hi".to_vec()).unwrap();
+        wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
+        assert_eq!(provider.read(&mut output), Ok(2));
+        assert_eq!(&output[..2], b"hi");
+        assert_eq!(
+            provider.read(&mut output),
+            Err(StdioProviderError::WouldBlock)
+        );
+
+        sender.send(Vec::new()).unwrap();
+        wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
+        assert_eq!(provider.read(&mut output), Ok(0));
+        assert_eq!(
+            provider.read(&mut output),
+            Err(StdioProviderError::WouldBlock)
+        );
+        sender.send(b"again".to_vec()).unwrap();
+        wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
+        assert_eq!(provider.read(&mut output), Ok(4));
+        assert_eq!(&output, b"agai");
+
+        drop(sender);
+        assert_eq!(provider.read(&mut output), Ok(1));
+        assert_eq!(output[0], b'n');
+        for _ in 0..2 {
+            wait_for_readiness(&provider, StdioStream::Stdin, ReadinessFlags::READ);
+            assert_eq!(provider.read(&mut output), Ok(0));
+        }
+    }
+
+    #[test]
+    fn output_is_written_in_order_with_bounded_buffering() {
+        let (_sender, receiver) = channel();
+        let output = GatedOutput::default();
+        let provider = gated_provider(receiver, &output);
+        let fill = vec![b'x'; OUTPUT_CAPACITY];
+
+        assert_eq!(provider.write(StdioOutputStream::Stdout, b"a"), Ok(1));
+        assert_eq!(provider.write(StdioOutputStream::Stderr, b"b"), Ok(1));
+        assert_eq!(
+            provider.write(StdioOutputStream::Stdout, &fill[..OUTPUT_CAPACITY - 4]),
+            Ok(OUTPUT_CAPACITY - 4)
+        );
+        // Small writes are never split.
+        assert_eq!(
+            provider.write(StdioOutputStream::Stderr, b"cde"),
+            Err(StdioProviderError::WouldBlock)
+        );
+        // Streams are writable only when any small write would fit.
+        assert_eq!(
+            provider.readiness(StdioStream::Stderr),
+            ReadinessFlags::default()
+        );
+        assert_eq!(
+            provider.write(StdioOutputStream::Stdout, &fill[..=ATOMIC_WRITE_SIZE]),
+            Ok(2)
+        );
+        assert_eq!(
+            provider.write(StdioOutputStream::Stderr, b"c"),
+            Err(StdioProviderError::WouldBlock)
+        );
+        assert_eq!(
+            provider.readiness(StdioStream::Stdout),
+            ReadinessFlags::default()
+        );
+
+        output.open();
+        provider.flush();
+        assert_eq!(
+            output.writes(),
+            [
+                (StdioOutputStream::Stdout, b"a".to_vec()),
+                (StdioOutputStream::Stderr, b"b".to_vec()),
+                (
+                    StdioOutputStream::Stdout,
+                    fill[..OUTPUT_CAPACITY - 4].to_vec()
+                ),
+                (StdioOutputStream::Stdout, fill[..2].to_vec()),
+            ]
+        );
+        assert_eq!(
+            provider.readiness(StdioStream::Stderr),
+            ReadinessFlags::WRITE
+        );
     }
 }

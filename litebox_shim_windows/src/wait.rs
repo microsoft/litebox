@@ -89,6 +89,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
+    /// Runs synchronous file I/O `io`, passing it a wait context that the thread's exit
+    /// interrupts.
+    ///
+    /// Like a Windows thread in synchronous I/O, which waits in the kernel, the thread stops
+    /// counting as an active worker of its I/O completion port for all of `io`.
+    pub(crate) fn wait_for_io<R>(
+        &self,
+        io: impl FnOnce(&litebox::event::wait::WaitContext<'_, Platform>) -> R,
+    ) -> R {
+        self.with_io_completion_worker_suspended(|| {
+            let interrupt = WaitInterrupt {
+                task: self,
+                alertable: false,
+            };
+            io(&self.wait_cx(&interrupt))
+        })
+    }
+
     pub(crate) fn wait_until(
         &self,
         timeout: Option<core::time::Duration>,

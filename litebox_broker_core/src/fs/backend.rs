@@ -4,6 +4,7 @@
 //! [`Backend`] for filesystems supported by [`super::resolver`]
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
@@ -13,6 +14,7 @@ use super::errors::{
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
+use crate::readiness::ReadinessSource;
 
 // This duplicates the cloneable type-erasure support from `litebox::utilities::anymap` because
 // broker core cannot depend on LiteBox. Keep it local unless broader reuse justifies a common home.
@@ -135,6 +137,13 @@ pub trait Backend: Send + Sync + Any {
     #[expect(unused_variables, reason = "default body, non-underscored param names")]
     fn is_terminal(&self, h: &FileHandle) -> bool {
         false
+    }
+
+    /// Readiness of an open file handle whose reads or writes can fail with `WouldBlock`, or
+    /// `None` if they always make progress.
+    #[expect(unused_variables, reason = "default body, non-underscored param names")]
+    fn readiness_source(&self, h: &FileHandle) -> Option<Arc<dyn ReadinessSource>> {
+        None
     }
 
     /// Create a new file at `parent` with the given `name` and metadata.

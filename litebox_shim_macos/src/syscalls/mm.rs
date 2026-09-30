@@ -527,7 +527,7 @@ impl<P: ShimPlatform> Task<P> {
                         let read = self
                             .global
                             .litebox
-                            .read_file(&file, &mut buffer[..chunk], Some(file_offset))
+                            .read_file(&file, &mut buffer[..chunk], Some(file_offset), None)
                             .map_err(|error| {
                                 initialization_error = Some(error);
                                 MappingError::NotForReading
@@ -1273,7 +1273,7 @@ impl<P: ShimPlatform> Task<P> {
             let read = self
                 .global
                 .litebox
-                .read_file(file, bytes, Some(offset))
+                .read_file(file, bytes, Some(offset), None)
                 .map_err(|_| Errno::EIO)?;
             if read == 0 || read > bytes.len() {
                 return Err(Errno::EIO);
@@ -1484,12 +1484,13 @@ mod tests {
             .unwrap();
         assert_eq!(builder.inherit_file(file), Ok(0));
         let shim = builder.build();
+        let thread = crate::ThreadState::new(1u64 << 32, shim.global.platform);
         Task {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
-            thread: crate::ThreadState { id: 1u64 << 32 },
+            thread,
         }
     }
 
@@ -1530,12 +1531,13 @@ mod tests {
     fn mprotect_validates_ranges() {
         let platform = Platform::new();
         let shim = MacosShimBuilder::new(platform).build();
+        let thread = crate::ThreadState::new(1u64 << 32, shim.global.platform);
         let task = Task {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
-            thread: crate::ThreadState { id: 1u64 << 32 },
+            thread,
         };
 
         assert_eq!(
@@ -1709,7 +1711,7 @@ mod tests {
         assert_eq!(
             task.global
                 .litebox
-                .write_file(&writer, &nop, Some(TEXT))
+                .write_file(&writer, &nop, Some(TEXT), None)
                 .unwrap(),
             4
         );

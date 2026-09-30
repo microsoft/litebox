@@ -25,6 +25,7 @@ use litebox_common_macos::{
     KernReturn, PAGE_SIZE, PtRegs, SIGINT, SIGSEGV, STACK_ALIGNMENT, SyscallRequest, TaskParams,
     VmProtection, errno::Errno, loader::MachoLoaderError,
 };
+use litebox_platform::time::TimeProvider;
 
 const fn aarch64_rewrite_options() -> litebox_syscall_rewriter::RewriteOptions {
     #[cfg(target_os = "macos")]
@@ -39,10 +40,12 @@ pub mod syscalls;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 
-/// Platform capabilities required for descriptor, page, and gate management.
+/// Platform capabilities required for descriptor, page, gate, and wait management.
 pub trait ShimPlatform:
     PageManagementProvider<PAGE_SIZE>
     + RawSyncPrimitivesProvider
+    + TimeProvider
+    + litebox::platform::SignalProvider
     + litebox::platform::SystemInfoProvider
     + litebox_common_macos::MachClock
     + 'static
@@ -51,6 +54,8 @@ pub trait ShimPlatform:
 impl<
     P: PageManagementProvider<PAGE_SIZE>
         + RawSyncPrimitivesProvider
+        + TimeProvider
+        + litebox::platform::SignalProvider
         + litebox::platform::SystemInfoProvider
         + litebox_common_macos::MachClock
         + 'static,
@@ -243,12 +248,13 @@ impl<P: ShimPlatform> MacosShim<P> {
     ) -> Result<LoadedProgram<P>, MachoLoaderError> {
         let process = Process(Arc::new(AtomicI32::new(-1)));
         let thread_id = self.global.next_thread_id.fetch_add(1, Ordering::Relaxed);
+        let thread = ThreadState::new(thread_id, self.global.platform);
         let task = Task {
             global: self.global,
             files: self.files,
             params,
             process: process.clone(),
-            thread: ThreadState { id: thread_id },
+            thread,
         };
         let initial_ctx = loader::load(&task, path, image, dyld, &argv, &envp)?;
         Ok(LoadedProgram {
@@ -409,8 +415,18 @@ impl<P: ShimPlatform> Drop for GlobalState<P> {
     }
 }
 
-struct ThreadState {
+struct ThreadState<P: ShimPlatform> {
     id: u64,
+    wait_state: litebox::event::wait::WaitState<P>,
+}
+
+impl<P: ShimPlatform> ThreadState<P> {
+    fn new(id: u64, platform: &'static P) -> Self {
+        Self {
+            id,
+            wait_state: litebox::event::wait::WaitState::new(platform),
+        }
+    }
 }
 
 struct Task<P: ShimPlatform> {
@@ -418,7 +434,30 @@ struct Task<P: ShimPlatform> {
     files: Arc<syscalls::file::FilesState<P>>,
     params: TaskParams,
     process: Process,
-    thread: ThreadState,
+    thread: ThreadState<P>,
+}
+
+impl<P: ShimPlatform> Task<P> {
+    /// Returns a wait context that a host signal, such as Ctrl-C, interrupts.
+    fn wait_cx(&self) -> litebox::event::wait::WaitContext<'_, P> {
+        self.thread
+            .wait_state
+            .context()
+            .with_check_for_interrupt(self)
+    }
+}
+
+impl<P: ShimPlatform> litebox::event::wait::CheckForInterrupt for Task<P> {
+    fn check_for_interrupt(&self) -> bool {
+        // Guest signal delivery is unsupported, so the signals themselves are dropped: the
+        // platform also marks the thread interrupted, which terminates the guest through
+        // `EnterShim::interrupt` once the interrupted syscall returns.
+        let mut pending = false;
+        self.global
+            .platform
+            .take_pending_signals(|_| pending = true);
+        pending
+    }
 }
 
 const MAX_KERNEL_BUF_SIZE: usize = 64 * 1024;

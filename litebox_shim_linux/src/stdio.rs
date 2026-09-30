@@ -3,16 +3,82 @@
 
 //! Standard input/output streams.
 
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode as Mode, FileOpenFlags};
+use litebox_common_linux::OFlags;
+
+use crate::syscalls::file::FilesState;
+use crate::{GlobalState, ShimPlatform};
+
+// Special override so that `GETFL` can return stdio-specific flags
+#[derive(Clone)]
+pub(crate) struct StdioStatusFlags(pub(crate) OFlags);
+
+impl<Platform: ShimPlatform> FilesState<Platform> {
+    pub(crate) fn initialize_stdio_in_shared_descriptors_table(
+        &self,
+        global: &GlobalState<Platform>,
+        context: &litebox::fs::Context,
+    ) {
+        let stdin = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stdin",
+                FileAccessMode::ReadOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
+            .unwrap();
+        let stdout = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stdout",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
+            .unwrap();
+        let stderr = global
+            .litebox
+            .open_file(
+                context,
+                "/dev/stderr",
+                FileAccessMode::WriteOnly,
+                FileOpenFlags::NONE,
+                Mode::empty(),
+            )
+            .unwrap();
+        let mut dt = global.litebox.descriptor_table_mut();
+        let mut rds = self.raw_descriptor_store.write();
+        for (raw_fd, fd) in [(0, stdin), (1, stdout), (2, stderr)] {
+            let status_flags = OFlags::APPEND | OFlags::RDWR;
+            debug_assert_eq!(OFlags::STATUS_FLAGS_MASK & status_flags, status_flags);
+            let old = dt.set_entry_metadata(&fd, StdioStatusFlags(status_flags));
+            assert!(old.is_none());
+            let success = rds.fd_into_specific_raw_integer(fd, raw_fd);
+            assert!(success);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use core::ffi::CStr;
 
+    use litebox::event::Events;
     use litebox_broker_protocol::fs::FileMode as Mode;
     use litebox_common_linux::{
-        FcntlArg, FileDescriptorFlags, IoctlArg, OFlags, Termios, errno::Errno,
+        EpollCreateFlags, EpollEvent, EpollOp, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags,
+        Termios, errno::Errno,
     };
 
-    use crate::{UserPtrMut, syscalls::tests::init_platform};
+    use crate::{
+        UserPtr, UserPtrMut,
+        syscalls::{test_broker, tests::init_platform},
+    };
 
     fn termios() -> Termios {
         Termios {
@@ -152,5 +218,125 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_open_devices_nonblocking() {
+        let task = init_platform();
+        for (path, access) in [
+            ("/dev/stdin", OFlags::RDONLY),
+            ("/dev/stdout", OFlags::WRONLY),
+            ("/dev/stderr", OFlags::WRONLY),
+            ("/dev/urandom", OFlags::RDONLY),
+        ] {
+            let fd = task
+                .sys_open(path, access | OFlags::NONBLOCK, Mode::empty())
+                .unwrap();
+            task.sys_close(i32::try_from(fd).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn test_stdin_read_waits_for_input() {
+        let task = init_platform();
+        let reads = test_broker::stdio().blocked_input_reads();
+        // The reader reads again after it starts listening for input, so pushing input once
+        // its first read has blocked tests the wait without depending on timing.
+        let input = std::thread::spawn(move || {
+            while test_broker::stdio().blocked_input_reads() == reads {
+                std::thread::yield_now();
+            }
+            test_broker::stdio().push_input(b"hi");
+        });
+
+        let mut buf = [0; 4];
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(2));
+        assert_eq!(&buf[..2], b"hi");
+        input.join().unwrap();
+    }
+
+    #[test]
+    fn test_stdin_nonblocking_read() {
+        let task = init_platform();
+        let mut buf = [0; 4];
+        let flags = OFlags::from_bits_retain(task.sys_fcntl(0, FcntlArg::GETFL).unwrap());
+
+        task.sys_fcntl(0, FcntlArg::SETFL(flags | OFlags::NONBLOCK))
+            .unwrap();
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
+
+        let disable = 0i32;
+        let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const disable as usize));
+        assert_eq!(task.sys_ioctl(0, arg), Ok(0));
+        assert_eq!(task.sys_fcntl(0, FcntlArg::GETFL), Ok(flags.bits()));
+
+        let enable = 1i32;
+        let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize));
+        assert_eq!(task.sys_ioctl(0, arg), Ok(0));
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
+
+        test_broker::stdio().push_input(b"x");
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(1));
+        assert_eq!(buf[0], b'x');
+        assert_eq!(task.sys_read(0, &mut buf, None), Err(Errno::EAGAIN));
+    }
+
+    #[test]
+    fn test_stdout_blocking_write_is_complete() {
+        let task = init_platform();
+        let len = usize::try_from(litebox_broker_protocol::fs::MAX_FILE_TRANSFER_SIZE).unwrap() + 1;
+        let buf = std::vec![b'x'; len];
+
+        assert_eq!(task.sys_write(1, &buf, None), Ok(len));
+        let writes = test_broker::stdio().writes();
+        assert!(writes.len() > 1);
+        assert_eq!(
+            writes.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+            len
+        );
+    }
+
+    #[test]
+    fn test_stdio_epoll_readiness() {
+        let task = init_platform();
+        let epfd =
+            i32::try_from(task.sys_epoll_create(EpollCreateFlags::empty()).unwrap()).unwrap();
+        let add = |fd: i32, events: Events| {
+            let event = EpollEvent::new(events.bits(), u64::try_from(fd).unwrap());
+            task.sys_epoll_ctl(
+                epfd,
+                EpollOp::EpollCtlAdd,
+                fd,
+                UserPtr::from_usize(&raw const event as usize),
+            )
+        };
+        let wait = |timeout: i32| {
+            let mut events = [EpollEvent::new(0, 0); 2];
+            let ready = task
+                .sys_epoll_pwait(
+                    epfd,
+                    UserPtrMut::from_usize(events.as_mut_ptr() as usize),
+                    2,
+                    timeout,
+                    None,
+                    0,
+                )
+                .unwrap();
+            events[..ready]
+                .iter()
+                .map(|event| (event.data, event.events))
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        add(0, Events::IN).unwrap();
+        assert!(wait(0).is_empty());
+
+        test_broker::stdio().push_input(b"x");
+        assert_eq!(wait(-1), [(0, Events::IN.bits())]);
+
+        let mut buf = [0; 1];
+        assert_eq!(task.sys_read(0, &mut buf, None), Ok(1));
+        add(1, Events::IN | Events::OUT).unwrap();
+        assert_eq!(wait(0), [(1, Events::OUT.bits())]);
     }
 }

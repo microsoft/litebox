@@ -111,18 +111,29 @@ impl ReadinessRegistration {
     }
 }
 
+/// Readiness of an object that changes outside broker requests, such as host
+/// standard input receiving data.
+pub trait ReadinessSource: Send + Sync {
+    /// Returns the object's current readiness.
+    fn readiness(&self) -> ReadinessFlags;
+
+    /// Publishes the object's later readiness changes through `registration`
+    /// until every clone of it drops.
+    fn watch(&self, registration: &ReadinessRegistration) -> Result<()>;
+}
+
 /// The registrations of every reference to one shared object, so a change
 /// made through any reference wakes waiters in every process holding one.
 ///
 /// Each registration belongs to its reference and retires when that reference
 /// drops, so watchers hold it weakly.
 #[derive(Default)]
-pub(crate) struct ReadinessWatchers(Vec<Weak<ReadinessRegistrationInner>>);
+pub struct ReadinessWatchers(Vec<Weak<ReadinessRegistrationInner>>);
 
 impl ReadinessWatchers {
     /// Adds `registration`, which receives publications until every clone of
     /// it drops.
-    pub(crate) fn watch(&mut self, registration: &ReadinessRegistration) -> Result<()> {
+    pub fn watch(&mut self, registration: &ReadinessRegistration) -> Result<()> {
         self.0.retain(|watcher| watcher.strong_count() != 0);
         self.0
             .try_reserve(1)
@@ -138,7 +149,7 @@ impl ReadinessWatchers {
     /// since a waiter may need more than the flags report, such as space for
     /// an atomic write. Failures are ignored because connection setup sizes
     /// every sink for all of its association's references.
-    pub(crate) fn publish(&self, readiness: ReadinessFlags) {
+    pub fn publish(&self, readiness: ReadinessFlags) {
         for watcher in &self.0 {
             if let Some(inner) = watcher.upgrade() {
                 let _ = ReadinessRegistration { inner }.republish(readiness);

@@ -131,6 +131,17 @@ pub(crate) fn test_task() -> Task<TestPlatform> {
 /// exactly one such task may be built per test process; `cargo nextest` runs each test in its own
 /// process.
 pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestPlatform> {
+    test_task_with_broker_files_and_stdio(
+        files,
+        Arc::new(litebox_broker_core::stdio::UnsupportedStdioProvider),
+    )
+}
+
+/// Like [`test_task_with_broker_files`], but the broker's `/dev` standard-I/O devices use `stdio`.
+pub(crate) fn test_task_with_broker_files_and_stdio(
+    files: &[(&str, &[u8])],
+    stdio: Arc<dyn litebox_broker_core::stdio::StdioProvider>,
+) -> Task<TestPlatform> {
     let directory = |owner| InitialNode::Directory {
         mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
         owner,
@@ -169,7 +180,7 @@ pub(crate) fn test_task_with_broker_files(files: &[(&str, &[u8])]) -> Task<TestP
     }));
 
     let (litebox, process_id) =
-        crate::test_broker::litebox_with_broker_files(test_platform(), entries);
+        crate::test_broker::litebox_with_broker_files_and_stdio(test_platform(), entries, stdio);
     test_task_from_litebox_with_process_id(litebox, process_id, None)
 }
 

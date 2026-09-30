@@ -25,7 +25,7 @@ use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam,
     errno::Errno,
-    program_startup::{InheritedFd, InheritedFdKind, StdioStream},
+    program_startup::{InheritedFd, InheritedFdKind},
     signal::Signal,
     vmem::PAGE_SIZE,
 };
@@ -249,18 +249,15 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                 InheritedFdKind::File => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, adopt_file)?;
                 }
-                InheritedFdKind::Stdio {
-                    stream,
-                    status_flags,
-                } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                    let fd = adopt_file()?;
-                    let mut descriptors = litebox.descriptor_table_mut();
-                    descriptors.set_entry_metadata(&fd, stream);
-                    if let Some(flags) = status_flags {
-                        descriptors.set_entry_metadata(&fd, crate::StdioStatusFlags(flags));
-                    }
-                    Ok(fd)
-                })?,
+                InheritedFdKind::Stdio { status_flags } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        let fd = adopt_file()?;
+                        litebox
+                            .descriptor_table_mut()
+                            .set_entry_metadata(&fd, crate::stdio::StdioStatusFlags(status_flags));
+                        Ok(fd)
+                    })?;
+                }
                 InheritedFdKind::Pipe {
                     endpoint,
                     status_flags,
@@ -547,16 +544,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     if descriptors.with_metadata(&file, |_: &Diroff| ()).is_ok() {
                         return Err(Errno::EAGAIN);
                     }
-                    let kind =
-                        match descriptors.with_metadata(&file, |stream: &StdioStream| *stream) {
-                            Ok(stream) => InheritedFdKind::Stdio {
-                                stream,
-                                status_flags: descriptors
-                                    .with_metadata(&file, |crate::StdioStatusFlags(flags)| *flags)
-                                    .ok(),
-                            },
-                            Err(_) => InheritedFdKind::File,
-                        };
+                    let kind = match descriptors
+                        .with_metadata(&file, |crate::stdio::StdioStatusFlags(flags)| *flags)
+                    {
+                        Ok(status_flags) => InheritedFdKind::Stdio { status_flags },
+                        Err(_) => InheritedFdKind::File,
+                    };
                     (kind, InheritableFd::File(file))
                 }
                 AnyTypedFd::Pipes(pipe) => (
@@ -629,46 +622,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         mode: Mode,
     ) -> Result<FileFd, Errno> {
         let mode = mode & !self.get_umask();
-        // TODO: Have the device backend attach stream identity once backends can set descriptor
-        // metadata for newly opened files.
-        let stream = path
-            .normalized_components()
-            .ok()
-            .and_then(|mut components| {
-                match (
-                    components.next(),
-                    components.next(),
-                    components.next(),
-                    components.next(),
-                ) {
-                    (Some(""), Some("dev"), Some("stdin"), None) => Some(StdioStream::Stdin),
-                    (Some(""), Some("dev"), Some("stdout"), None) => Some(StdioStream::Stdout),
-                    (Some(""), Some("dev"), Some("stderr"), None) => Some(StdioStream::Stderr),
-                    _ => None,
-                }
-            });
-        let file = {
-            let fs = self.fs.borrow();
-            let context = fs.context.read();
-            let path = path
-                .as_rust_str()
-                .map_err(litebox::fs::errors::PathError::from)?;
-            let (access, open_flags) =
-                file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
-            self.global
-                .litebox
-                .open_file(&context, path, access, open_flags, mode)
-                .map_err(Errno::from)
-        }?;
-        if let Some(stream) = stream {
-            let old = self
-                .global
-                .litebox
-                .descriptor_table_mut()
-                .set_entry_metadata(&file, stream);
-            assert!(old.is_none());
-        }
-        Ok(file)
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        let path = path
+            .as_rust_str()
+            .map_err(litebox::fs::errors::PathError::from)?;
+        let (access, open_flags) =
+            file_open_options(flags - OFlags::CLOEXEC).map_err(Errno::from)?;
+        self.global
+            .litebox
+            .open_file(&context, path, access, open_flags, mode)
+            .map_err(Errno::from)
     }
 
     fn do_openat(
@@ -827,6 +791,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_read(&fd, buf, offset)
     }
 
+    /// Returns whether reads and writes of `fd` fail with `EAGAIN` instead of waiting.
+    ///
+    /// Only the stdio descriptors installed at startup track status flags.
+    // TODO: Files opened by path, including `/dev/std*`, ignore `O_NONBLOCK` and always wait.
+    // Status flags belong to the open file description, so they should move into the broker.
+    fn file_nonblocking(&self, fd: &FileFd) -> bool {
+        self.global
+            .litebox
+            .descriptor_table()
+            .with_metadata(fd, |crate::stdio::StdioStatusFlags(flags)| {
+                flags.contains(OFlags::NONBLOCK)
+            })
+            .unwrap_or(false)
+    }
+
     pub(crate) fn do_read(
         &self,
         fd: &AnyTypedFd<Platform>,
@@ -838,9 +817,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let buf: core::cell::RefCell<&mut [u8]> = core::cell::RefCell::new(buf);
         let result = fd.dispatch(
             |fd| {
+                let cx = self.wait_cx();
+                let wait = (!self.file_nonblocking(fd)).then_some(&cx);
                 self.global
                     .litebox
-                    .read_file(fd, &mut buf.borrow_mut(), offset)
+                    .read_file(fd, &mut buf.borrow_mut(), offset, wait)
                     .map_err(Errno::from)
             },
             |fd| {
@@ -938,9 +919,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let is_inet_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| {
+                let cx = self.wait_cx();
+                let wait = (!self.file_nonblocking(fd)).then_some(&cx);
                 self.global
                     .litebox
-                    .write_file(fd, buf, offset)
+                    .write_file(fd, buf, offset, wait)
                     .map_err(Errno::from)
             },
             |fd| {
@@ -1063,11 +1046,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Errno::EINVAL
             };
             let read_result = match typed_in_fd.as_fs() {
-                Some(fd) => self
-                    .global
-                    .litebox
-                    .read_file(fd, &mut kernel_buf[..to_read], cur_off)
-                    .map_err(Errno::from),
+                Some(fd) => {
+                    let cx = self.wait_cx();
+                    let wait = (!self.file_nonblocking(fd)).then_some(&cx);
+                    self.global
+                        .litebox
+                        .read_file(fd, &mut kernel_buf[..to_read], cur_off, wait)
+                        .map_err(Errno::from)
+                }
                 None => Err(non_fs_err),
             };
             let read_n = match read_result {
@@ -2061,7 +2047,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Ok(fd
                     .dispatch(
-                        |fd| getfl_from_metadata!(fd, crate::StdioStatusFlags),
+                        |fd| getfl_from_metadata!(fd, crate::stdio::StdioStatusFlags),
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| self.global.linux_pipe_status_flags(fd),
                         |fd| getfl_from_handle!(fd),
@@ -2124,7 +2110,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     |fd| {
                         setfl_in_metadata!(
                             fd,
-                            crate::StdioStatusFlags,
+                            crate::stdio::StdioStatusFlags,
                             unimplemented!("SETFL on non-stdio")
                         )
                     },
@@ -2397,11 +2383,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }};
                 }
                 fd.dispatch(
-                    |_file_fd| {
-                        // TODO: stdio NONBLOCK?
-                        #[cfg(debug_assertions)]
-                        litebox_util_log::debug!("set non-blocking on raw fd unimplemented");
-                        Ok(())
+                    |file_fd| {
+                        // Only stdio tracks status flags; other files never wait.
+                        match self
+                            .global
+                            .litebox
+                            .descriptor_table_mut()
+                            .with_metadata_mut(file_fd, |crate::stdio::StdioStatusFlags(flags)| {
+                                flags.set(OFlags::NONBLOCK, val != 0);
+                            }) {
+                            Ok(()) | Err(MetadataError::NoSuchMetadata) => Ok(()),
+                            Err(MetadataError::ClosedFd) => Err(Errno::EBADF),
+                        }
                     },
                     |socket_fd| {
                         if let Err(e) = self

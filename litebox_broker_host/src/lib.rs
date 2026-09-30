@@ -262,9 +262,10 @@ where
         None => None,
     };
     let limits = core.limits();
-    // Sockets, child process handles, and shared object references (including
-    // timers) register readiness. Add future resource limits here so every
-    // live registration fits in the association's shared readiness sink.
+    // Sockets, child process handles, and object references (shared pipes,
+    // timers, and files such as stdio devices) register readiness. Add future
+    // resource limits here so every live registration fits in the
+    // association's shared readiness sink.
     let max_live_readiness_registrations = limits
         .max_sockets
         .min(limits.max_sockets_per_process)
@@ -559,7 +560,8 @@ fn handle_request<Memory: SharedMemory>(
             Ok(BrokerResult::RandomFilled)
         }
         BrokerOperation::File(request) => {
-            handle_file_request(process, request, shared_buffers).map(BrokerResult::File)
+            handle_file_request(process, request, shared_buffers, readiness_sink)
+                .map(BrokerResult::File)
         }
         BrokerOperation::StartChildProcess(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
@@ -616,6 +618,7 @@ fn handle_file_request<Memory: SharedMemory>(
     process: &BrokerProcess,
     request: FileRequest,
     shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<FileResponse> {
     match request {
         FileRequest::Open(OpenFileRequest {
@@ -626,8 +629,16 @@ fn handle_file_request<Memory: SharedMemory>(
             mode,
         }) => {
             let path = read_file_path(shared_buffers, path)?;
-            match litebox_broker_core::fs::open(process, &path, user, access, flags, mode)
-                .map_err(RequestFailure::from)?
+            match litebox_broker_core::fs::open(
+                process,
+                &path,
+                user,
+                access,
+                flags,
+                mode,
+                readiness_sink,
+            )
+            .map_err(RequestFailure::from)?
             {
                 Ok(handle) => Ok(FileResponse::Open(OpenFileResponse { handle })),
                 Err(error) => Ok(FileResponse::Failed(error)),

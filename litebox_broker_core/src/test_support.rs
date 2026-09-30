@@ -16,7 +16,7 @@ use crate::{
     BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
     fs::{FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
-    readiness::ReadinessRegistration,
+    readiness::{ReadinessRegistration, ReadinessWatchers},
     socket::{SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
@@ -110,8 +110,11 @@ impl RandomProvider for FailingRandomProvider {
 /// Functional standard-I/O provider for tests.
 ///
 /// Reads drain buffered input, and writes and terminal queries are recorded.
+/// Reads of empty input report end-of-file unless [`Self::with_open_input`]
+/// keeps standard input open.
 pub struct TestStdioProvider {
-    input: Mutex<VecDeque<u8>>,
+    input: Mutex<TestStdioInput>,
+    input_watchers: Mutex<ReadinessWatchers>,
     writes: Mutex<Vec<(StdioOutputStream, Vec<u8>)>>,
     terminal_queries: Mutex<Vec<StdioStream>>,
     stdin_terminal: bool,
@@ -122,7 +125,12 @@ pub struct TestStdioProvider {
 impl Default for TestStdioProvider {
     fn default() -> Self {
         Self {
-            input: Mutex::new(VecDeque::new()),
+            input: Mutex::new(TestStdioInput {
+                bytes: VecDeque::new(),
+                open: false,
+                blocked_reads: 0,
+            }),
+            input_watchers: Mutex::new(ReadinessWatchers::default()),
             writes: Mutex::new(Vec::new()),
             terminal_queries: Mutex::new(Vec::new()),
             stdin_terminal: false,
@@ -144,9 +152,35 @@ impl TestStdioProvider {
         self
     }
 
+    /// Keeps standard input open, so reads of empty input fail with
+    /// [`StdioProviderError::WouldBlock`] until [`Self::close_input`].
+    #[must_use]
+    pub fn with_open_input(self) -> Self {
+        self.input.lock().open = true;
+        self
+    }
+
     /// Appends bytes that subsequent standard-input reads will drain.
     pub fn push_input(&self, input: &[u8]) {
-        self.input.lock().extend(input.iter().copied());
+        self.input.lock().bytes.extend(input.iter().copied());
+        self.input_watchers.lock().publish(ReadinessFlags::READ);
+    }
+
+    /// Closes standard input, so reads report end-of-file once buffered input
+    /// drains.
+    pub fn close_input(&self) {
+        self.input.lock().open = false;
+        self.input_watchers.lock().publish(ReadinessFlags::READ);
+    }
+
+    /// Returns how many standard-input reads have failed with
+    /// [`StdioProviderError::WouldBlock`].
+    ///
+    /// A waiting reader reads again after it starts listening for input, so a
+    /// test that waits for this count to advance before pushing input or
+    /// interrupting the reader does not depend on timing.
+    pub fn blocked_input_reads(&self) -> usize {
+        self.input.lock().blocked_reads
     }
 
     /// Returns a snapshot of the recorded standard-output writes.
@@ -163,8 +197,12 @@ impl TestStdioProvider {
 impl StdioProvider for TestStdioProvider {
     fn read(&self, output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
         let mut input = self.input.lock();
-        let read = input.len().min(output.len());
-        for (destination, source) in output.iter_mut().zip(input.drain(..read)) {
+        if input.bytes.is_empty() && input.open {
+            input.blocked_reads += 1;
+            return Err(StdioProviderError::WouldBlock);
+        }
+        let read = input.bytes.len().min(output.len());
+        for (destination, source) in output.iter_mut().zip(input.bytes.drain(..read)) {
             *destination = source;
         }
         Ok(read)
@@ -187,52 +225,33 @@ impl StdioProvider for TestStdioProvider {
             StdioStream::Stderr => self.stderr_terminal,
         }
     }
-}
 
-/// Standard-I/O provider for tests that only exercise terminal detection.
-///
-/// Reads and writes panic so tests cannot accidentally use this as a functional
-/// standard-I/O implementation.
-#[derive(Default)]
-pub struct TerminalOnlyStdioProvider {
-    stdin_terminal: bool,
-    stdout_terminal: bool,
-    stderr_terminal: bool,
-}
-
-impl TerminalOnlyStdioProvider {
-    /// Marks `stream` as connected to a terminal.
-    #[must_use]
-    pub const fn with_terminal(mut self, stream: StdioStream) -> Self {
+    fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
         match stream {
-            StdioStream::Stdin => self.stdin_terminal = true,
-            StdioStream::Stdout => self.stdout_terminal = true,
-            StdioStream::Stderr => self.stderr_terminal = true,
-        }
-        self
-    }
-}
-
-impl StdioProvider for TerminalOnlyStdioProvider {
-    fn read(&self, _output: &mut [u8]) -> core::result::Result<usize, StdioProviderError> {
-        panic!("terminal-only test stdio must not read standard input")
-    }
-
-    fn write(
-        &self,
-        _stream: StdioOutputStream,
-        _input: &[u8],
-    ) -> core::result::Result<usize, StdioProviderError> {
-        panic!("terminal-only test stdio must not write standard output")
-    }
-
-    fn is_terminal(&self, stream: StdioStream) -> bool {
-        match stream {
-            StdioStream::Stdin => self.stdin_terminal,
-            StdioStream::Stdout => self.stdout_terminal,
-            StdioStream::Stderr => self.stderr_terminal,
+            StdioStream::Stdin => {
+                let input = self.input.lock();
+                if input.bytes.is_empty() && input.open {
+                    ReadinessFlags::default()
+                } else {
+                    ReadinessFlags::READ
+                }
+            }
+            StdioStream::Stdout | StdioStream::Stderr => ReadinessFlags::WRITE,
         }
     }
+
+    fn watch(&self, stream: StdioStream, registration: &ReadinessRegistration) -> Result<()> {
+        match stream {
+            StdioStream::Stdin => self.input_watchers.lock().watch(registration),
+            StdioStream::Stdout | StdioStream::Stderr => Ok(()),
+        }
+    }
+}
+
+struct TestStdioInput {
+    bytes: VecDeque<u8>,
+    open: bool,
+    blocked_reads: usize,
 }
 
 /// Timer provider for tests whose clock advances only through

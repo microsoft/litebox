@@ -197,6 +197,8 @@ impl<P: ShimPlatform> Task<P> {
 
     /// Read at an explicit offset without changing the shared offset, or use
     /// and advance the shared offset when `offset` is `None`.
+    // TODO: Reads and writes ignore `O_NONBLOCK` and always wait. Status flags belong to the
+    // open file description, so they should move into the broker.
     pub(crate) fn do_read(
         &self,
         fd: &FileFd,
@@ -206,7 +208,7 @@ impl<P: ShimPlatform> Task<P> {
         let size = self
             .global
             .litebox
-            .read_file(fd, buf, offset)
+            .read_file(fd, buf, offset, Some(&self.wait_cx()))
             .map_err(read_error)?;
         if size > buf.len() {
             return Err(Errno::EIO);
@@ -218,7 +220,7 @@ impl<P: ShimPlatform> Task<P> {
         let size = self
             .global
             .litebox
-            .write_file(fd, buf, None)
+            .write_file(fd, buf, None, Some(&self.wait_cx()))
             .map_err(write_error)?;
         if size > buf.len() {
             return Err(Errno::EIO);
@@ -272,6 +274,8 @@ fn read_error(error: ReadError) -> Errno {
     match error {
         ReadError::ClosedFd | ReadError::NotForReading => Errno::EBADF,
         ReadError::NotAFile => Errno::EISDIR,
+        ReadError::WouldBlock => Errno::EAGAIN,
+        ReadError::WaitError(_) => Errno::EINTR,
         _ => Errno::EIO,
     }
 }
@@ -280,6 +284,8 @@ fn write_error(error: WriteError) -> Errno {
     match error {
         WriteError::ClosedFd | WriteError::NotForWriting => Errno::EBADF,
         WriteError::NotAFile => Errno::EISDIR,
+        WriteError::WouldBlock => Errno::EAGAIN,
+        WriteError::WaitError(_) => Errno::EINTR,
         _ => Errno::EIO,
     }
 }
@@ -377,12 +383,13 @@ mod tests {
         assert_eq!(builder.inherit_file(rw), Ok(0));
         assert_eq!(builder.inherit_file(ro), Ok(1));
         let shim = builder.build();
+        let thread = crate::ThreadState::new(1u64 << 32, shim.global.platform);
         let task = Task {
             global: shim.global,
             files: shim.files,
             params: TaskParams::default(),
             process: Process(Arc::new(AtomicI32::new(-1))),
-            thread: crate::ThreadState { id: 1u64 << 32 },
+            thread,
         };
         // SAFETY: a fresh, non-fixed mapping owned by this task.
         let buf = unsafe {
@@ -601,7 +608,12 @@ mod tests {
         assert_eq!(
             task.global
                 .litebox
-                .read_file(&task.files.typed_fd(1).unwrap(), &mut contents, Some(0),)
+                .read_file(
+                    &task.files.typed_fd(1).unwrap(),
+                    &mut contents,
+                    Some(0),
+                    None
+                )
                 .unwrap(),
             6
         );
