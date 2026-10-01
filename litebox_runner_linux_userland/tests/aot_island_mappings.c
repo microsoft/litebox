@@ -49,7 +49,10 @@ int main(void) {
         CHECK(saved && second() == 201);
         uint32_t slot[6]; memcpy(slot, (void *)saved, sizeof slot);
         CHECK(mprotect(p, first_len, PROT_READ | PROT_EXEC) == 0);
-        CHECK(((uint32_t *)first)[1] == serialized_branch && first() == 200);
+        CHECK(target((const uint32_t *)first + 1) && first() == 200);
+        // The sparse instance leaves its canonical page free; the whole-span
+        // instance occupies it and must relocate the validated serialized pair.
+        if (i) CHECK(((uint32_t *)first)[1] == serialized_branch);
         if (!i) {
             uintptr_t near = target((const uint32_t *)first + 1) & ~4095UL;
             CHECK(*(const uint32_t *)near == 0x58000090);

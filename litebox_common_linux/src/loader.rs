@@ -602,36 +602,11 @@ impl ElfParsedFile {
                         .ok_or(ElfLoadError::InvalidProgramHeader)?,
                 );
             }
-            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
-            if let Some(payload) = &self.islands {
-                let granule = usize::try_from(payload.granule)
-                    .map_err(|_| ElfLoadError::InvalidProgramHeader)?;
-                for pair in &payload.pairs {
-                    let start = usize::try_from(pair.island_vaddr())
-                        .map_err(|_| ElfLoadError::InvalidProgramHeader)?;
-                    min = min.min(start);
-                    max = max.max(
-                        start
-                            .checked_add(granule)
-                            .ok_or(ElfLoadError::InvalidProgramHeader)?,
-                    );
-                }
-                align = align.max(granule);
-            }
-            let granule = PAGE_SIZE;
-            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
-            let granule = self
-                .islands
-                .as_ref()
-                .filter(|p| !p.pairs.is_empty())
-                .map_or(Ok(granule), |p| {
-                    usize::try_from(p.granule).map_err(|_| ElfLoadError::InvalidProgramHeader)
-                })?;
             // Subtract an equally aligned object-relative origin so the load
             // bias, not just the reservation address, preserves PT_LOAD alignment.
             let min = min & !(align - 1);
             let max = max
-                .checked_next_multiple_of(granule)
+                .checked_next_multiple_of(PAGE_SIZE)
                 .ok_or(ElfLoadError::InvalidProgramHeader)?;
             let span = max
                 .checked_sub(min)
@@ -658,16 +633,8 @@ impl ElfParsedFile {
             && !payload.pairs.is_empty()
         {
             mapper
-                .prepare_aarch64_islands(payload, base_addr, self.header.e_type == elf::abi::ET_DYN)
+                .prepare_aarch64_islands(payload, base_addr)
                 .map_err(ElfLoadError::Map)?;
-            for pair in &payload.pairs {
-                let end = usize::try_from(pair.island_vaddr())
-                    .ok()
-                    .and_then(|v| base_addr.checked_add(v))
-                    .and_then(|v| v.checked_add(usize::try_from(payload.granule).ok()?))
-                    .ok_or(ElfLoadError::InvalidProgramHeader)?;
-                brk = brk.max(end);
-            }
         }
         let mut phdrs_addr = 0;
         for ph in self.pt_loads() {
@@ -872,15 +839,13 @@ pub trait MapMemory {
     #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     const SUPPORTS_AARCH64_ISLANDS: bool = false;
 
-    /// Prepare an island image. `reserved` proves that this mapper just reserved
-    /// the ET_DYN envelope, including every island extent. Full chunks are not
-    /// part of that reservation. Called only for an explicitly capable mapper.
+    /// Prepare validated island metadata before LOADs become executable.
+    /// Called only for an explicitly capable mapper; transport uses fresh pages.
     #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     fn prepare_aarch64_islands(
         &mut self,
         _payload: &ElfIslands,
         _base: usize,
-        _reserved: bool,
     ) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -1280,21 +1245,8 @@ mod island_tests {
         fn release_reservation(&mut self, _: usize, _: usize) -> Result<(), ()> {
             panic!("unexpected reservation release")
         }
-        fn prepare_aarch64_islands(
-            &mut self,
-            p: &ElfIslands,
-            base: usize,
-            reserved: bool,
-        ) -> Result<(), ()> {
-            assert!(reserved && !p.pairs.is_empty());
-            for pair in &p.pairs {
-                self.mappings.push(
-                    base + usize::try_from(pair.island_vaddr()).unwrap()
-                        ..base
-                            + usize::try_from(pair.island_vaddr()).unwrap()
-                            + usize::try_from(p.granule).unwrap(),
-                );
-            }
+        fn prepare_aarch64_islands(&mut self, p: &ElfIslands, _base: usize) -> Result<(), ()> {
+            assert_ne!(p.pairs.len(), 0);
             self.prepared = true;
             Ok(())
         }
@@ -1317,7 +1269,7 @@ mod island_tests {
     }
 
     #[test]
-    fn island_reservation_and_brk_exclude_serialized_chunk_file_size() {
+    fn island_reservation_and_brk_depend_only_on_loads() {
         let mut file = file();
         let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
         parsed
@@ -1325,8 +1277,7 @@ mod island_tests {
             .unwrap();
         assert!(parsed.has_trampoline());
         assert!(parsed.trampoline_page_range(0).is_none());
-        let payload = parsed.aarch64_islands().unwrap();
-        let mut ranges: Vec<_> = parsed
+        let ranges: Vec<_> = parsed
             .pt_loads()
             .map(|ph| {
                 ph.p_vaddr / 4096 * 4096
@@ -1336,12 +1287,6 @@ mod island_tests {
                         .next_multiple_of(4096)
             })
             .collect();
-        ranges.extend(
-            payload
-                .pairs
-                .iter()
-                .map(|p| p.island_vaddr()..p.island_vaddr() + payload.granule),
-        );
         let min = usize::try_from(ranges.iter().map(|r| r.start).min().unwrap()).unwrap();
         let max = usize::try_from(ranges.iter().map(|r| r.end).max().unwrap()).unwrap();
         let mut mapper = Mapper::<true>::default();
@@ -1354,10 +1299,7 @@ mod island_tests {
             result.brk,
             (result.base_addr + max).next_multiple_of(HOST_PAGE_SIZE)
         );
-        assert_eq!(
-            mapper.mappings.len(),
-            payload.pairs.len() + parsed.pt_loads().count()
-        );
+        assert_eq!(mapper.mappings.len(), parsed.pt_loads().count());
         let mut unsupported = Mapper::<false>::default();
         assert!(matches!(
             parsed.load(&mut unsupported, &mut Memory, None),
@@ -1416,8 +1358,8 @@ mod island_tests {
                 usize::try_from(ph.p_offset).unwrap() % align
             );
         }
-        assert_eq!(mapper.reservation, 0x12000);
-        assert_eq!(result.base_addr, 0x10000000);
+        assert_eq!(mapper.reservation, 0x2000);
+        assert_eq!(result.base_addr, 0x0fff0000);
         for mapping in mapper.mappings {
             assert!(mapping.start >= 0x10000000);
             assert!(mapping.end <= 0x10000000 + mapper.reservation);

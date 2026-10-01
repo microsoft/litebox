@@ -49,16 +49,8 @@ static void *reader(void *unused) {
     atomic_store_explicit(&returned, 1, memory_order_release);
     return NULL;
 }
-// Retirement reclaims allocator pages, but must restore a surviving file gap.
-static int check_retired_near(uintptr_t near, const unsigned char *saved) {
-    if (ISLAND_MAPPING_PAGES == 4) {
-        if (memcmp((void *)near, saved, 4096) != 0) return 0;
-        errno = 0;
-        if (mmap((void *)near, 4096, PROT_NONE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) != MAP_FAILED
-            || errno != EEXIST) return 0;
-        return mprotect((void *)near, 4096, PROT_NONE) == 0;
-    }
+// Every executed near page is a private allocation, reclaimed at the last source.
+static int check_retired_near(uintptr_t near) {
     return mmap((void *)near, 4096, PROT_NONE,
         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == (void *)near;
 }
@@ -76,16 +68,17 @@ int main(int argc, char **argv) {
     const uint32_t *site = (const uint32_t *)(base + 8192 - 4);
     CHECK((*site & 0xfc000000) == 0x14000000);
     uintptr_t near = ((uintptr_t)site + ((int64_t)(int32_t)(*site << 6) >> 4)) & ~4095UL;
+    CHECK(near < (uintptr_t)base || near >= (uintptr_t)base + ISLAND_MAPPING_PAGES * 4096);
     if (ISLAND_MAPPING_PAGES == 4) {
-        // Rust validates the serialized chain and passes its expected near VA;
-        // runtime fallback to an arbitrary external island must not satisfy AOT.
-        CHECK(near == (uintptr_t)base + strtoull(argv[2], NULL, 0));
-    } else {
-        CHECK(near < (uintptr_t)base || near >= (uintptr_t)base + ISLAND_MAPPING_PAGES * 4096);
+        // The source was already a serialized branch, not an SVC rewritten here.
+        // Its canonical page is occupied by this file mapping, so installation
+        // must relocate the validated prebuilt pair to the executed near page.
+        uint32_t serialized;
+        CHECK(pread(fd, &serialized, 4, 8192 - 4) == 4);
+        CHECK((serialized & 0xfc000000) == 0x14000000);
+        uintptr_t canonical = (8192 - 4 + ((int64_t)(int32_t)(serialized << 6) >> 4)) & ~4095UL;
+        CHECK(canonical == strtoull(argv[2], NULL, 0));
     }
-    unsigned char saved[4096] = {0};
-    if (ISLAND_MAPPING_PAGES == 4)
-        CHECK(pread(fd, saved, sizeof saved, near - (uintptr_t)base) >= 0);
     CHECK(close(fd) == 0);
     errno = 0;
     CHECK(madvise(site_page, 1, MADV_DONTNEED) == -1 && errno == EBUSY);
@@ -98,7 +91,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "self") == 0) {
         entry((uintptr_t)site_page, 4096, 0, SYS_munmap, &entered, &observed);
         CHECK(observed.result == 0);
-        CHECK(check_retired_near(near, saved));
+        CHECK(check_retired_near(near));
     } else {
         CHECK(strcmp(argv[1], "thread") == 0);
         CHECK(pipe(pipefd) == 0);
@@ -114,8 +107,8 @@ int main(int argc, char **argv) {
         }
         CHECK(!atomic_load_explicit(&returned, memory_order_acquire));
         CHECK(munmap(site_page, 4096) == 0);
-        // Verify restoration/reclaim, then close the page against stale returns.
-        CHECK(check_retired_near(near, saved));
+        // Verify reclaim, then close the page against stale returns.
+        CHECK(check_retired_near(near));
         CHECK(write(pipefd[1], "x", 1) == 1);
         CHECK(pthread_join(thread, NULL) == 0);
         CHECK(atomic_load_explicit(&returned, memory_order_acquire));
@@ -126,7 +119,7 @@ int main(int argc, char **argv) {
     CHECK(observed.nzcv == 0xa0000000 && observed.sp == observed.original_sp);
     for (unsigned int i = 0; i < sizeof observed.vector; ++i) CHECK(observed.vector[i] == 0xa5);
     CHECK(munmap((void *)near, 4096) == 0);
-    CHECK(munmap(base, 4096) == 0 && munmap(base + 8192, 4096) == 0);
+    CHECK(munmap(base, ISLAND_MAPPING_PAGES * 4096) == 0);
     puts("retired sole-site callback resumed with registers, SP, NZCV and SIMD intact");
     return 0;
 }

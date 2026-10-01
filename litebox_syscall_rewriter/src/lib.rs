@@ -1765,24 +1765,6 @@ pub fn patch_aarch64_code_segment_with_options_and_ranges(
     Ok((outcome.trampoline, outcome.trapped_sites))
 }
 
-/// Slot upper bound for the current mapping's bytes, not a cached ELF pre-scan.
-/// Conditional x18 exits count twice. Unsupported sites may consume no slots.
-pub fn aarch64_island_slots_for_mapping(
-    code: &[u8],
-    code_vaddr: u64,
-    ranges: &aarch64::CodeScanRanges,
-    options: RewriteOptions,
-) -> Result<usize> {
-    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
-    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
-    aarch64::island::count_sites(
-        code,
-        &executable,
-        &identified,
-        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
-    )
-}
-
 /// Runtime AArch64 rewrite of one mapped code region through trampoline
 /// islands (see [`aarch64::island`]). Sites go to the nearest reachable island
 /// in `pairs` with a free slot; the rest are trapped. On error neither `code`

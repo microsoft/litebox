@@ -24,8 +24,6 @@ use alloc::vec::Vec;
 #[cfg(target_arch = "aarch64")]
 use core::ops::Range;
 use litebox::utils::TruncateExt as _;
-#[cfg(target_arch = "aarch64")]
-use litebox_common_linux::vmem::VmFlags;
 #[cfg(target_arch = "x86_64")]
 use object::elf::ET_DYN;
 use object::elf::{FileHeader64, PT_LOAD, ProgramHeader64};
@@ -257,22 +255,6 @@ impl ElfHeapPlacement {
             .unwrap_or(usize::MAX);
         Some(floor..ceiling)
     }
-
-    fn island_corridor(
-        &self,
-        file: &ElfPatchKey,
-        mapping_starts: impl Iterator<Item = usize>,
-    ) -> Option<islands::HeapCorridor> {
-        Some(islands::HeapCorridor {
-            range: self.corridor(mapping_starts)?,
-            heap_end: self
-                .current_brk
-                .unwrap_or(self.floor?)
-                .checked_next_multiple_of(HOST_PAGE_SIZE)?,
-            // Unknown main identity confers no permission to consume brk space.
-            dso: self.main.as_ref().is_some_and(|main| main != file),
-        })
-    }
 }
 
 /// Per-process ELF metadata keyed by retained descriptor identity. On AArch64,
@@ -454,47 +436,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let patch_key = ElfPatchKey(Arc::clone(file_fd));
         self.init_elf_patch_state(&patch_key, 0, offset);
-        let envelope =
-            self.reserve_mmap_island_envelope(&patch_key, suggested_addr, len, offset, flags)?;
-        let (suggested_addr, flags) = if let Some(envelope) = &envelope {
-            (Some(envelope.file_start), flags | MapFlags::MAP_FIXED)
-        } else {
-            (suggested_addr, flags)
-        };
-        let mapped =
-            self.do_mmap_file_memcpy(suggested_addr, len, staging_prot, flags, typed_fd, offset);
-        if let Some(envelope) = envelope {
-            if mapped.is_err() {
-                let _ = self.sys_munmap_raw(
-                    UserPtrMut::from_usize(envelope.range.start),
-                    envelope.range.len(),
-                );
-            } else {
-                let mut keep = envelope.islands.clone();
-                keep.push(envelope.file_start..envelope.file_start + len);
-                for part in subtract_ranges(envelope.range, &keep) {
-                    self.sys_munmap_raw(UserPtrMut::from_usize(part.start), part.len())
-                        .expect("trim owned mmap envelope");
-                }
-                self.global
-                    .elf_patch_cache
-                    .lock()
-                    .get_mut(&patch_key)
-                    .expect("initialized ELF")
-                    .islands
-                    .mmap_reservations
-                    .extend(
-                        envelope
-                            .islands
-                            .into_iter()
-                            .filter(|r| {
-                                r.start < envelope.file_start || r.end > envelope.file_start + len
-                            })
-                            .map(|r| (envelope.bias, r)),
-                    );
-            }
-        }
-        let result = mapped?;
+        let result =
+            self.do_mmap_file_memcpy(suggested_addr, len, staging_prot, flags, typed_fd, offset)?;
 
         if replaces_mapping {
             self.clear_file_mappings_for_range(result.as_usize(), len);
@@ -567,14 +510,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     self.clear_file_mappings_for_range(result.as_usize(), len);
                 }
                 return Err(MappingError::OutOfMemory);
-            }
-            #[cfg(target_arch = "aarch64")]
-            if let Some(state) = self.global.elf_patch_cache.lock().get_mut(patch_key) {
-                // mmap staged the whole image RW; displaced gaps inherit the
-                // guest's requested view, not those temporary staging permissions.
-                state
-                    .islands
-                    .protect_displaced(&(result.as_usize()..result.as_usize() + len), prot);
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
@@ -925,17 +860,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             });
         }
         #[cfg(target_arch = "aarch64")]
-        cache.retain(|_, state| {
-            !state.file_mappings.is_empty()
-                || !state.islands.pairs.is_empty()
-                || !state.islands.loader_reservations.is_empty()
-                || !state.islands.mmap_reservations.is_empty()
-        });
+        cache.retain(|_, state| !state.file_mappings.is_empty() || !state.islands.pairs.is_empty());
     }
 
     /// Handle syscall `mprotect`.
     ///
-    /// AArch64 rejects RWX transitions on tracked ELF mappings/reservations with
+    /// AArch64 rejects RWX transitions on tracked ELF mappings with
     /// `EACCES`, including data. RW then RX is supported.
     #[inline]
     pub(crate) fn sys_mprotect(
@@ -994,7 +924,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         result
     }
 
-    /// Applies `prot` excluding owned transport and its unpublished mmap reservations.
+    /// Applies `prot` excluding owned transport.
     #[cfg(target_arch = "aarch64")]
     fn mprotect_around_trampolines(
         &self,
@@ -1007,33 +937,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let cache = self.global.elf_patch_cache.lock();
             cache
                 .values()
-                .flat_map(|s| {
-                    s.islands
-                        .owned_ranges()
-                        .chain(s.islands.mmap_reservations.iter().map(|(_, r)| r.clone()))
-                })
+                .flat_map(|s| s.islands.owned_ranges())
                 .collect()
         };
 
-        // Walk in address order, so a failed earlier VMA does not update a
-        // later displaced page's deferred guest protection intent.
-        let mut boundaries = alloc::vec![range.start, range.end];
-        for r in &excluded {
-            if r.start < range.end && range.start < r.end {
-                boundaries.extend([r.start.max(range.start), r.end.min(range.end)]);
-            }
-        }
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        for pair in boundaries.windows(2) {
-            let part = pair[0]..pair[1];
-            if excluded.iter().any(|r| r.contains(&part.start)) {
-                for state in self.global.elf_patch_cache.lock().values_mut() {
-                    state.islands.protect_displaced(&part, prot);
-                }
-            } else {
-                self.sys_mprotect_raw(UserPtrMut::from_usize(part.start), part.len(), prot)?;
-            }
+        for part in subtract_ranges(range, &excluded) {
+            self.sys_mprotect_raw(UserPtrMut::from_usize(part.start), part.len(), prot)?;
         }
         Ok(())
     }
@@ -1733,8 +1642,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .flatten()
             .collect();
         #[cfg(target_arch = "aarch64")]
-        let heap_corridor = self.global.elf_heap_placement.lock().island_corridor(
-            fd,
+        let heap_corridor = self.global.elf_heap_placement.lock().corridor(
             self.global
                 .mm
                 .mappings()
@@ -2167,12 +2075,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Runtime metadata was captured before close. Keep its descriptor
             // identity (not the raw fd) until the last mapping disappears.
             let cache = self.global.elf_patch_cache.lock();
-            if cache.get(&ElfPatchKey(Arc::clone(&fd))).is_some_and(|s| {
-                !s.file_mappings.is_empty()
-                    || !s.islands.pairs.is_empty()
-                    || !s.islands.mmap_reservations.is_empty()
-                    || !s.islands.loader_reservations.is_empty()
-            }) {
+            if cache
+                .get(&ElfPatchKey(Arc::clone(&fd)))
+                .is_some_and(|s| !s.file_mappings.is_empty() || !s.islands.pairs.is_empty())
+            {
                 return;
             }
         }

@@ -100,13 +100,11 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
         &mut self,
         payload: &litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands,
         base: usize,
-        reserved: bool,
     ) -> Result<(), Self::Error> {
         self.task.prepare_serialized_islands(
             &crate::syscalls::mm::ElfPatchKey(alloc::sync::Arc::clone(&self.file_fd)),
             payload,
             base,
-            reserved,
         )
     }
 

@@ -5,7 +5,7 @@ use super::super::{ElfPatchKey, MRemapFlags, PAGE_SIZE};
 use super::*;
 use crate::syscalls::tests::{TestPlatform, create_file, init_platform};
 use litebox_broker_protocol::fs::FileMode;
-use litebox_common_linux::OFlags;
+use litebox_common_linux::{OFlags, vmem::VmFlags};
 
 // Keep the general fixtures guest-page-sized, including their file offsets.
 fn image() -> Vec<u8> {
@@ -219,62 +219,6 @@ fn failed_writable_mprotect_rescans_sites_without_retiring_pairs() {
 }
 
 #[test]
-fn unpublished_owned_gap_rollback_preserves_mapping_and_bytes() {
-    let task = init_platform();
-    let page = task
-        .do_mmap_anonymous(
-            None,
-            HOST_PAGE_SIZE,
-            ProtFlags::PROT_READ_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-        )
-        .unwrap();
-    let original = alloc::vec![0x5a; HOST_PAGE_SIZE];
-    page.copy_from_slice::<TestPlatform>(0, &original).unwrap();
-    let mut state = RuntimeIslands::default();
-    let base = page.as_usize() - HOST_PAGE_SIZE;
-    state.loads = alloc::vec![
-        Load {
-            file: 0..HOST_PAGE_SIZE,
-            address: 0..HOST_PAGE_SIZE
-        },
-        Load {
-            file: 2 * HOST_PAGE_SIZE..3 * HOST_PAGE_SIZE,
-            address: 2 * HOST_PAGE_SIZE..3 * HOST_PAGE_SIZE
-        },
-    ];
-    state.mappings.push(FileMapping {
-        range: page.as_usize()..page.as_usize() + HOST_PAGE_SIZE,
-        offset: HOST_PAGE_SIZE,
-        bias: Some(base),
-        loader_managed: false,
-    });
-    let staged = task
-        .allocate_island(
-            &state,
-            base,
-            IslandPlacement {
-                preferred: base,
-                allowed: base..=base + 3 * HOST_PAGE_SIZE,
-            },
-            &[],
-            &[],
-            None,
-        )
-        .unwrap();
-    assert_eq!(staged.range.start, page.as_usize());
-    assert!(staged.previous.is_some());
-    page.copy_from_slice::<TestPlatform>(0, &[1, 2, 3, 4])
-        .unwrap();
-    task.rollback_island_mapping(staged).unwrap();
-    assert_eq!(
-        &*page.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE).unwrap(),
-        original.as_slice()
-    );
-    task.sys_munmap(page, HOST_PAGE_SIZE).unwrap();
-}
-
-#[test]
 fn blocked_near_allocation_publishes_brk_without_transport() {
     for immediate in [false, true] {
         blocked_near_allocation(false, immediate);
@@ -439,151 +383,11 @@ fn blocked_near_allocation(serialized: bool, immediate: bool) {
     task.sys_close(fd).unwrap();
 }
 
-// A real VM pack with tracked ELF ownership, not numerical LOAD-span evidence.
-// The released prefix supplies deterministic free pages even on 16KiB hosts.
-fn packed_dso(task: &Task<TestPlatform>, name: &str, bytes: &[u8]) -> (usize, usize, i32) {
-    let main_path = alloc::format!("/{name}-main");
-    create_file(task, &main_path, &gapless_image());
-    let main = open(task, &main_path);
-    task.begin_main_elf_load(super::super::tests::elf_patch_key(task, main).0);
-    task.sys_close(main).unwrap();
-    let size = 512 * 1024 * 1024 + HOST_PAGE_SIZE;
-    let pack = task
-        .do_mmap_anonymous(
-            None,
-            size,
-            ProtFlags::PROT_NONE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-        )
-        .unwrap();
-    let base = align_up(pack.as_usize() + 256 * 1024 * 1024, HOST_PAGE_SIZE);
-    task.sys_munmap(pack, base - pack.as_usize()).unwrap();
-    let floor = base - 256 * 1024 * 1024;
-    task.global.mm.set_initial_brk(floor);
-    task.set_main_elf_heap_floor(floor);
-    let path = alloc::format!("/{name}-dso");
-    create_file(task, &path, bytes);
-    let fd = open(task, &path);
-    task.sys_mmap(
-        base,
-        3 * HOST_PAGE_SIZE,
-        ProtFlags::PROT_READ,
-        MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
-        fd,
-        0,
-    )
-    .unwrap();
-    (base, pack.as_usize() + size - base, fd)
-}
-
-fn packed_image(dense: bool) -> Vec<u8> {
+#[cfg(feature = "aarch64_virtualize_x18")]
+fn image_with_distant_load(distant: usize) -> Vec<u8> {
     let mut bytes = gapless_image();
     bytes.resize(3 * HOST_PAGE_SIZE, 0);
     bytes[PAGE_SIZE..].fill(0);
-    let len = bytes.len() as u64;
-    for field in [32, 40] {
-        bytes[64 + field..72 + field].copy_from_slice(&len.to_le_bytes());
-    }
-    let end = if dense {
-        2 * HOST_PAGE_SIZE
-    } else {
-        HOST_PAGE_SIZE + 4
-    };
-    for at in (HOST_PAGE_SIZE..end).step_by(4).chain([2 * HOST_PAGE_SIZE]) {
-        bytes[at..at + 4].copy_from_slice(&0xd4000001u32.to_le_bytes());
-    }
-    bytes
-}
-
-#[test]
-fn top_down_library_pack_heap_corridor_extends_owned_dso_prefix() {
-    let task = init_platform();
-    let (base, size, fd) = packed_dso(&task, "pack-runtime", &packed_image(true));
-    let key = super::super::tests::elf_patch_key(&task, fd);
-    task.sys_close(fd).unwrap();
-    let first = UserPtrMut::from_usize(base + HOST_PAGE_SIZE);
-    task.sys_mprotect(first, HOST_PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
-        .unwrap();
-    let (frontier, immutable) = {
-        let cache = task.global.elf_patch_cache.lock();
-        let pairs = &cache[&key].islands.pairs;
-        assert!(
-            pairs.len() > 1,
-            "multiple staged pages must extend one frontier"
-        );
-        for (i, pair) in pairs.iter().enumerate() {
-            assert_eq!(pair.prefix_bias, Some(base));
-            assert_eq!(
-                pair.near,
-                base - (i + 1) * HOST_PAGE_SIZE..base - i * HOST_PAGE_SIZE
-            );
-            assert!(!overlaps(&pair.far, &(base - 256 * 1024 * 1024..base)));
-        }
-        let frontier = pairs.last().unwrap().near.start;
-        (
-            frontier,
-            UserPtrMut::<u8>::from_usize(frontier)
-                .to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE)
-                .unwrap()
-                .into_vec(),
-        )
-    };
-    let second = UserPtrMut::from_usize(base + 2 * HOST_PAGE_SIZE);
-    task.sys_mprotect(second, HOST_PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
-        .unwrap();
-    let boundary = frontier - HOST_PAGE_SIZE;
-    {
-        let cache = task.global.elf_patch_cache.lock();
-        let pair = cache[&key].islands.pairs.last().unwrap();
-        assert_eq!(pair.near, boundary..frontier);
-        assert_eq!(pair.prefix_bias, Some(base));
-        assert!(!overlaps(&pair.far, &(base - 256 * 1024 * 1024..base)));
-    }
-    assert_eq!(
-        &*UserPtrMut::<u8>::from_usize(frontier)
-            .to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE)
-            .unwrap(),
-        immutable.as_slice()
-    );
-    assert_eq!(task.sys_brk(UserPtrMut::from_usize(boundary)), Ok(boundary));
-    assert_eq!(
-        task.sys_brk(UserPtrMut::from_usize(boundary + HOST_PAGE_SIZE)),
-        Ok(boundary)
-    );
-    let corridor = task
-        .global
-        .elf_heap_placement
-        .lock()
-        .corridor(task.global.mm.mappings().into_iter().map(|(r, _)| r.start))
-        .unwrap();
-    assert_eq!(
-        corridor.end, boundary,
-        "heap VMAs cannot hide the prefix barrier"
-    );
-    task.sys_munmap(second, HOST_PAGE_SIZE).unwrap();
-    assert_eq!(task.sys_brk(UserPtrMut::from_usize(frontier)), Ok(frontier));
-    // Last-site retirement reclaims only its prefix, not the adjacent live batch.
-    assert_eq!(
-        &*UserPtrMut::<u8>::from_usize(frontier)
-            .to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE)
-            .unwrap(),
-        immutable.as_slice()
-    );
-    task.sys_munmap(first, HOST_PAGE_SIZE).unwrap();
-    assert_eq!(task.sys_brk(UserPtrMut::from_usize(base)), Ok(base));
-    assert_eq!(
-        task.sys_brk(UserPtrMut::from_usize(base + HOST_PAGE_SIZE)),
-        Ok(base)
-    );
-    task.sys_munmap(UserPtrMut::from_usize(base), size).unwrap();
-    assert!(!task.global.elf_patch_cache.lock().contains_key(&key));
-    task.sys_brk(UserPtrMut::from_usize(base - 256 * 1024 * 1024))
-        .unwrap();
-}
-
-#[cfg(feature = "aarch64_virtualize_x18")]
-fn image_with_distant_load(distant: usize) -> Vec<u8> {
-    let mut bytes = packed_image(false);
     bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
     for field in [32, 40] {
         bytes[64 + field..72 + field].copy_from_slice(&(2 * HOST_PAGE_SIZE as u64).to_le_bytes());
@@ -611,18 +415,42 @@ fn boundary_inbound_reach_traps_unreachable_conditional_exit() {
     for mixed in [false, true] {
         let task = init_platform();
         let distant = (1 << 27) - HOST_PAGE_SIZE;
-        // One near LOAD attests ownership, one distant LOAD contains CBZ x18 whose
+        // One near LOAD and one distant LOAD containing CBZ x18 whose
         // primary entry fits at/near the boundary but whose taken exit is out of reach.
         let mut bytes = image_with_distant_load(distant);
         let conditional_offset = if mixed { 28 } else { 32 };
         let at = 2 * HOST_PAGE_SIZE + conditional_offset;
         bytes[at..at + 4].copy_from_slice(&0xb47ffff2u32.to_le_bytes()); // CBZ x18, PC + 1MiB - 4
         if mixed {
-            // This later site can use the heap prefix even though CBZ cannot.
+            // This later site can use the free page even though CBZ cannot.
             bytes[2 * HOST_PAGE_SIZE + 32..2 * HOST_PAGE_SIZE + 36]
                 .copy_from_slice(&0xd4000001u32.to_le_bytes());
         }
-        let (base, size, fd) = packed_dso(&task, &alloc::format!("pack-aux-exit-{mixed}"), &bytes);
+        let size = 512 * 1024 * 1024;
+        let pack = task
+            .do_mmap_anonymous(
+                None,
+                size,
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            )
+            .unwrap();
+        let base = align_up(pack.as_usize() + 128 * 1024 * 1024, HOST_PAGE_SIZE);
+        let (fd, _) = open_image(&task, &alloc::format!("/aux-exit-{mixed}"), &bytes);
+        task.sys_mmap(
+            base,
+            2 * HOST_PAGE_SIZE,
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            fd,
+            0,
+        )
+        .unwrap();
+        task.sys_munmap(
+            UserPtrMut::from_usize(base - HOST_PAGE_SIZE),
+            HOST_PAGE_SIZE,
+        )
+        .unwrap();
         // The first mapping covers only its LOAD, not the distant LOAD's file page.
         task.sys_mmap(
             base + 2 * HOST_PAGE_SIZE,
@@ -644,7 +472,7 @@ fn boundary_inbound_reach_traps_unreachable_conditional_exit() {
                 2 * HOST_PAGE_SIZE,
             )
             .unwrap();
-        // The numerical gap remains reserved. Only the owned heap prefix is free;
+        // The numerical gap remains reserved. Only one fresh page is free;
         // that page fails CBZ's auxiliary reach, so CBZ truly has no placement.
         let candidate = base - HOST_PAGE_SIZE;
         let pc = code.as_usize() + conditional_offset;
@@ -726,7 +554,7 @@ fn boundary_inbound_reach_traps_unreachable_conditional_exit() {
             }
             assert_eq!(task.global.mm.mappings(), expected);
         }
-        task.sys_munmap(UserPtrMut::from_usize(base), size).unwrap();
+        task.sys_munmap(pack, size).unwrap();
         assert!(
             !task
                 .global
@@ -758,15 +586,9 @@ fn whole_span_fixed_replacements_preserve_every_replacement_page() {
         let released = {
             let cache = task.global.elf_patch_cache.lock();
             let islands = &cache.get(&key).unwrap().islands;
-            assert!(
-                islands
-                    .pairs
-                    .iter()
-                    .any(|p| p.near.start == mapping.as_usize() + 2 * HOST_PAGE_SIZE),
-                "fixture must place transport in the replaced ELF gap"
-            );
             let span = mapping.as_usize()..mapping.as_usize() + span_len;
-            assert!(islands.pairs.iter().any(|p| !overlaps(&p.far, &span)));
+            assert_ne!(islands.pairs.len(), 0);
+            assert!(islands.owned_ranges().all(|r| !overlaps(&r, &span)));
             islands.owned_ranges().collect::<Vec<_>>()
         };
         let anonymous = if replacement_fd == -1 {
@@ -843,15 +665,6 @@ fn sparse_image() -> Vec<u8> {
     bytes
 }
 
-fn aot_image() -> Vec<u8> {
-    litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
-        &sparse_image(),
-        None,
-        crate::aarch64_rewrite_options(),
-    )
-    .unwrap()
-}
-
 // Parse the emitted payload rather than assuming that a guest-page hole can
 // hold an island. These small serialized fixtures deliberately use one pair.
 fn serialized_island_extent(bytes: &[u8], granule: usize) -> Range<usize> {
@@ -868,7 +681,18 @@ fn serialized_island_extent(bytes: &[u8], granule: usize) -> Range<usize> {
 #[test]
 fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_close() {
     let task = init_platform();
-    let bytes = aot_image();
+    let mut original = sparse_image();
+    // Nonzero LOAD origin gives a guest-aligned but not host-aligned bias on
+    // 16KiB hosts, even when the actual first LOAD is host-aligned.
+    for (at, vaddr) in [(80, 3 * PAGE_SIZE), (136, 6 * PAGE_SIZE)] {
+        original[at..at + 8].copy_from_slice(&(vaddr as u64).to_le_bytes());
+    }
+    let bytes = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
+        &original,
+        None,
+        crate::aarch64_rewrite_options(),
+    )
+    .unwrap();
     let island = serialized_island_extent(&bytes, HOST_PAGE_SIZE);
     let (fd, key) = open_image(&task, "/aot-collision", &bytes);
     let before = task.global.mm.mappings();
@@ -885,20 +709,38 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
             0,
         )
         .unwrap();
-    let bias = align_up(base.as_usize(), HOST_PAGE_SIZE);
-    let near = task
+    let load_start = align_up(base.as_usize(), HOST_PAGE_SIZE);
+    let bias = load_start - 3 * PAGE_SIZE;
+    let canonical = bias + island.start;
+    let neighbor = task
         .sys_mmap(
-            bias + island.start,
-            island.len(),
+            align_down(canonical, HOST_PAGE_SIZE),
+            PAGE_SIZE,
             ProtFlags::PROT_READ_WRITE,
             MapFlags::MAP_FIXED | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
             -1,
             0,
         )
         .unwrap();
-    let sentinel = alloc::vec![0x5a; island.len()];
-    near.copy_from_slice::<TestPlatform>(0, &sentinel).unwrap();
-    let code = UserPtrMut::from_usize(bias + 3 * PAGE_SIZE);
+    let sentinel = alloc::vec![0x5a; PAGE_SIZE];
+    neighbor
+        .copy_from_slice::<TestPlatform>(0, &sentinel)
+        .unwrap();
+    if HOST_PAGE_SIZE > PAGE_SIZE {
+        // Leave canonical guest subpages free beside unrelated RW data on the
+        // same native page. NoReplace alone would succeed at the unsafe address.
+        assert_eq!(canonical, neighbor.as_usize() + PAGE_SIZE);
+        task.sys_munmap(UserPtrMut::from_usize(canonical), HOST_PAGE_SIZE)
+            .unwrap();
+        assert!(
+            task.global
+                .mm
+                .mappings()
+                .iter()
+                .all(|(r, _)| { !overlaps(r, &(canonical..canonical + HOST_PAGE_SIZE)) })
+        );
+    }
+    let code = UserPtrMut::from_usize(load_start + 3 * PAGE_SIZE);
     task.sys_mmap(
         code.as_usize(),
         PAGE_SIZE,
@@ -913,11 +755,12 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
         let state = &cache[&key].islands;
         let mapping = state.mapping(code.as_usize(), PAGE_SIZE).unwrap();
         assert_eq!((mapping.offset, mapping.bias), (3 * PAGE_SIZE, Some(bias)));
-        assert!(state.loader_reservations.is_empty() && state.mmap_reservations.is_empty());
         assert!(
-            state.future_loads().unwrap().iter().all(|load| {
-                !overlaps(load, &(near.as_usize()..near.as_usize() + island.len()))
-            })
+            state
+                .future_loads()
+                .unwrap()
+                .iter()
+                .all(|load| { !overlaps(load, &(canonical..canonical + HOST_PAGE_SIZE)) })
         );
     }
     task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
@@ -926,13 +769,15 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
         let cache = task.global.elf_patch_cache.lock();
         let pairs = &cache[&key].islands.pairs;
         assert_eq!(pairs.len(), 1);
-        assert_ne!(pairs[0].near.start, near.as_usize());
+        assert_ne!(pairs[0].near.start, canonical);
+        assert!(pairs[0].near.start.is_multiple_of(HOST_PAGE_SIZE));
+        assert_eq!(pairs[0].serialized, Some((bias, 0)));
         (pairs[0].near.clone(), pairs[0].far.clone())
     };
     let transport = read_bytes(actual.start, actual.len());
     let first = task
         .sys_mmap(
-            bias + PAGE_SIZE,
+            load_start + PAGE_SIZE,
             PAGE_SIZE,
             ProtFlags::PROT_READ,
             MapFlags::MAP_FIXED | MapFlags::MAP_PRIVATE,
@@ -960,10 +805,11 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
         assert_eq!(pairs[0].sites, [first.as_usize()]);
     }
     assert_eq!(read_bytes(actual.start, actual.len()), transport);
-    assert_eq!(
-        &*near.to_owned_slice::<TestPlatform>(island.len()).unwrap(),
-        sentinel.as_slice()
-    );
+    assert_eq!(read_bytes(neighbor.as_usize(), PAGE_SIZE), sentinel);
+    assert!(task.global.mm.mappings().iter().any(|(r, flags)| {
+        r.contains(&neighbor.as_usize())
+            && flags.intersection(VmFlags::VM_ACCESS_FLAGS) == VmFlags::VM_READ | VmFlags::VM_WRITE
+    }));
     task.sys_munmap(first, PAGE_SIZE).unwrap();
     assert!(!task.global.elf_patch_cache.lock().contains_key(&key));
     task.sys_munmap(base, reserved_len).unwrap();
@@ -1052,7 +898,7 @@ fn source_publication_error_remains_invalidated() {
         )
         .unwrap();
     let code = UserPtrMut::from_usize(mapped.as_usize() + PAGE_SIZE);
-    let gap = UserPtrMut::<u8>::from_usize(mapped.as_usize() + 2 * HOST_PAGE_SIZE);
+    let near;
     let key = super::super::tests::elf_patch_key(&task, fd);
     {
         let mut cache = task.global.elf_patch_cache.lock();
@@ -1073,7 +919,8 @@ fn source_publication_error_remains_invalidated() {
         );
         assert!(state.trampoline_invalidated);
         assert_eq!(state.islands.pairs.len(), 1);
-        assert_eq!(state.islands.pairs[0].near.start, gap.as_usize());
+        near = state.islands.pairs[0].near.start;
+        assert!(!(mapped.as_usize()..mapped.as_usize() + bytes.len()).contains(&near));
         assert_eq!(state.islands.pairs[0].sites, [code.as_usize()]);
     }
     assert_eq!(
@@ -1089,21 +936,14 @@ fn source_publication_error_remains_invalidated() {
             .all(|(_, flags)| !flags.contains(VmFlags::VM_EXEC))
     );
     task.sys_munmap(code, PAGE_SIZE).unwrap();
-    assert_eq!(
-        &*gap.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE).unwrap(),
-        &bytes[2 * HOST_PAGE_SIZE..3 * HOST_PAGE_SIZE]
-    );
-    for offset in (0..HOST_PAGE_SIZE).step_by(PAGE_SIZE) {
-        let flags = task
+    assert!(
+        !task
             .global
             .mm
             .mappings()
-            .into_iter()
-            .find(|(r, _)| r.contains(&(gap.as_usize() + offset)))
-            .unwrap()
-            .1;
-        assert_eq!(flags & VmFlags::VM_ACCESS_FLAGS, VmFlags::VM_READ);
-    }
+            .iter()
+            .any(|(r, _)| r.contains(&near))
+    );
     task.sys_close(fd).unwrap();
     task.sys_munmap(mapped, bytes.len()).unwrap();
     assert!(!task.global.elf_patch_cache.lock().contains_key(&key));
@@ -1342,176 +1182,4 @@ fn dontneed_allows_ordinary_elf_data_but_not_rewritten_sources() {
         Err(Errno::EBUSY)
     );
     task.sys_munmap(base, bytes.len()).unwrap();
-}
-
-#[test]
-fn retired_loader_reservation_restores_hidden_bytes_and_guest_page_intent() {
-    use litebox_common_linux::MadviseBehavior::DontNeed;
-    let task = init_platform();
-    let bytes = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
-        &retirement_image(),
-        None,
-        crate::aarch64_rewrite_options(),
-    )
-    .unwrap();
-    let payload = litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands::parse(&bytes)
-        .unwrap()
-        .unwrap();
-    let extent = serialized_island_extent(&bytes, HOST_PAGE_SIZE);
-    let (fd, key) = open_image(&task, "/loader-retirement", &bytes);
-    let before = task.global.mm.mappings();
-    let base = task.allocate_chunk(4 * HOST_PAGE_SIZE, &[], None).unwrap();
-    let near = UserPtrMut::<u8>::from_usize(base.as_usize() + extent.start);
-    let saved = alloc::vec![0x5a; HOST_PAGE_SIZE];
-    near.copy_from_slice::<TestPlatform>(0, &saved).unwrap();
-    task.sys_mprotect(base, 4 * HOST_PAGE_SIZE, ProtFlags::PROT_NONE)
-        .unwrap();
-    task.prepare_serialized_islands(&key, &payload, base.as_usize(), true)
-        .unwrap();
-    assert_eq!(task.sys_madvise(near, 1, DontNeed), Err(Errno::EBUSY));
-    let code = task
-        .sys_mmap(
-            base.as_usize() + PAGE_SIZE,
-            PAGE_SIZE,
-            ProtFlags::PROT_READ_EXEC,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
-            fd,
-            PAGE_SIZE,
-        )
-        .unwrap();
-    assert_eq!(
-        task.global.elf_patch_cache.lock()[&key].islands.pairs[0]
-            .near
-            .start,
-        near.as_usize()
-    );
-    task.sys_close(fd).unwrap();
-    // A failed earlier shared VMA must not update a later shadow permission.
-    let path = "/loader-readonly";
-    create_file(&task, path, &alloc::vec![0; PAGE_SIZE]);
-    let readonly = open(&task, path);
-    task.sys_mmap(
-        base.as_usize(),
-        PAGE_SIZE,
-        ProtFlags::PROT_READ,
-        MapFlags::MAP_SHARED | MapFlags::MAP_FIXED,
-        readonly,
-        0,
-    )
-    .unwrap();
-    task.sys_close(readonly).unwrap();
-    assert_eq!(
-        task.sys_mprotect(base, extent.end, ProtFlags::PROT_READ_WRITE),
-        Err(Errno::EACCES)
-    );
-    assert!(
-        task.global.elf_patch_cache.lock()[&key].islands.pairs[0]
-            .previous
-            .as_ref()
-            .unwrap()
-            .protections
-            .iter()
-            .all(|p| *p == ProtFlags::PROT_NONE)
-    );
-    // On a 16KiB host, this changes only one guest page of the shadow view.
-    task.sys_mprotect(near, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
-        .unwrap();
-    task.sys_munmap(code, PAGE_SIZE).unwrap();
-    for offset in (0..HOST_PAGE_SIZE).step_by(PAGE_SIZE) {
-        let flags = task
-            .global
-            .mm
-            .mappings()
-            .into_iter()
-            .find(|(r, _)| r.contains(&(near.as_usize() + offset)))
-            .unwrap()
-            .1;
-        assert_eq!(
-            flags & VmFlags::VM_ACCESS_FLAGS,
-            if offset == 0 {
-                VmFlags::VM_READ | VmFlags::VM_WRITE
-            } else {
-                VmFlags::empty()
-            }
-        );
-    }
-    {
-        let cache = task.global.elf_patch_cache.lock();
-        let state = &cache[&key];
-        assert!(state.file_mappings.is_empty());
-        assert!(state.islands.pairs.is_empty());
-        assert_ne!(state.islands.loader_reservations, []);
-    }
-    assert!(task.global.elf_patch_cache.lock().contains_key(&key));
-    assert_eq!(task.sys_madvise(near, 1, DontNeed), Err(Errno::EBUSY));
-    task.sys_mprotect(near, HOST_PAGE_SIZE, ProtFlags::PROT_READ)
-        .unwrap();
-    assert_eq!(
-        &*near.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE).unwrap(),
-        &saved
-    );
-    task.sys_munmap(base, 4 * HOST_PAGE_SIZE).unwrap();
-    assert!(!task.global.elf_patch_cache.lock().contains_key(&key));
-    assert_eq!(task.global.mm.mappings(), before);
-}
-
-#[test]
-fn retired_gap_excludes_partial_unmap_and_new_fixed_bytes() {
-    for fixed in [false, true] {
-        let task = init_platform();
-        let bytes = retirement_image();
-        let path = if fixed {
-            "/fixed-retired-gap"
-        } else {
-            "/unmapped-retired-gap"
-        };
-        create_file(&task, path, &bytes);
-        let fd = open(&task, path);
-        let base = map_file(&task, fd, bytes.len(), ProtFlags::PROT_READ);
-        let code = UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE);
-        let gap = base.as_usize() + 2 * HOST_PAGE_SIZE;
-        task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
-            .unwrap();
-        let removed_len = 2 * HOST_PAGE_SIZE;
-        if fixed {
-            let replacement = task
-                .sys_mmap(
-                    code.as_usize(),
-                    removed_len,
-                    ProtFlags::PROT_READ_WRITE,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
-                    -1,
-                    0,
-                )
-                .unwrap();
-            assert!(
-                replacement
-                    .to_owned_slice::<TestPlatform>(removed_len)
-                    .unwrap()
-                    .iter()
-                    .all(|b| *b == 0)
-            );
-        } else {
-            task.sys_munmap(code, removed_len).unwrap();
-            assert!(
-                !task
-                    .global
-                    .mm
-                    .mappings()
-                    .iter()
-                    .any(|(r, _)| overlaps(r, &(code.as_usize()..gap + PAGE_SIZE)))
-            );
-        }
-        if HOST_PAGE_SIZE > PAGE_SIZE {
-            let tail = UserPtrMut::<u8>::from_usize(gap + PAGE_SIZE);
-            assert!(
-                tail.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE - PAGE_SIZE)
-                    .unwrap()
-                    .iter()
-                    .all(|b| *b == 0x5a)
-            );
-        }
-        task.sys_close(fd).unwrap();
-        task.sys_munmap(base, bytes.len()).unwrap();
-    }
 }
