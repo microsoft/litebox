@@ -292,13 +292,14 @@ fn run_dynamic_linked_prog_with_rewriter(
     let prog_name = exec_name;
     let prog_name_hooked = format!("{prog_name}.hooked");
 
+    let out_path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("dynamic_rewriter_{prog_name}"));
+    std::fs::create_dir_all(&out_path).unwrap();
     let path = test_dir.join(prog_name);
-
-    let out_path = std::env::var("OUT_DIR").unwrap();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
     // Create tar file containing all dependencies
-    let tar_src_path = std::path::Path::new(&out_path).join("test_program_tar");
+    let tar_src_path = out_path.join("test_program_tar");
     println!(
         "Creating tar source directory path: {}",
         tar_src_path.to_str().unwrap()
@@ -340,7 +341,7 @@ fn run_dynamic_linked_prog_with_rewriter(
     // Install the required files (e.g., scripts) to tar directory's /out
     install_files(tar_src_path.join("out"));
 
-    let tar_target_file = std::path::Path::new(&out_path).join("rootfs_rewriter.tar");
+    let tar_target_file = out_path.join("rootfs_rewriter.tar");
     let mut tar = tar::Builder::new(std::fs::File::create(&tar_target_file).unwrap());
     for directory in ["lib", "lib64", "out"] {
         tar.append_dir_all(directory, tar_src_path.join(directory))
