@@ -141,7 +141,7 @@ jobs:
 
   build_and_test_macos_arm64:
     name: Build and Test (macOS AArch64)
-    runs-on: macos-15
+    runs-on: macos-26
     env:
       RUSTFLAGS: -Dwarnings
       MACOS_AARCH64_CRATES: >-
