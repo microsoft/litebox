@@ -153,23 +153,29 @@ fn has_dedicated_c_test(path: &Path) -> bool {
 }
 
 #[test]
-fn island_fixtures_use_dedicated_harnesses() {
-    let fixtures: Vec<_> = find_c_test_files("./tests")
-        .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("island_") || name.starts_with("aot_island_"))
-        })
-        .collect();
-    assert!(!fixtures.is_empty(), "island fixtures must be discovered");
-    for path in fixtures {
-        assert!(
-            has_dedicated_c_test(&path),
-            "{} requires the island harness, not the argument-free C sweep",
-            path.display()
-        );
-    }
+fn wait_for_output_reports_early_exit_and_preserves_buffered_output() {
+    let mut pty = common::pty::Pty::open();
+    let (stdin, stdout, stderr) = pty.slave_stdio();
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "printf 'startup failed'; exit 7"])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+        .unwrap();
+    pty.close_slave();
+    let mut output = Vec::new();
+    // Buffered output satisfies a wait whether or not the child has exited.
+    pty.wait_for_output(&mut child, &mut output, b"startup failed");
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        pty.wait_for_output(&mut child, &mut output, b">>> ");
+    }))
+    .unwrap_err();
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(message.contains("exited with exit status: 7"), "{message}");
+    assert!(message.contains("startup failed"), "{message}");
+    assert!(!message.contains("timed out"), "{message}");
+    assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
 }
 
 #[cfg(target_os = "linux")]

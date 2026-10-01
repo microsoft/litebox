@@ -166,34 +166,3 @@ impl Pty {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Pty;
-
-    #[test]
-    fn wait_for_output_reports_early_exit_and_preserves_buffered_output() {
-        let mut pty = Pty::open();
-        let (stdin, stdout, stderr) = pty.slave_stdio();
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "printf 'startup failed'; exit 7"])
-            .stdin(stdin)
-            .stdout(stdout)
-            .stderr(stderr)
-            .spawn()
-            .unwrap();
-        pty.close_slave();
-        let mut output = Vec::new();
-        // Buffered output satisfies a wait whether or not the child has exited.
-        pty.wait_for_output(&mut child, &mut output, b"startup failed");
-        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            pty.wait_for_output(&mut child, &mut output, b">>> ");
-        }))
-        .unwrap_err();
-        let message = failure.downcast_ref::<String>().unwrap();
-        assert!(message.contains("exited with exit status: 7"), "{message}");
-        assert!(message.contains("startup failed"), "{message}");
-        assert!(!message.contains("timed out"), "{message}");
-        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
-    }
-}

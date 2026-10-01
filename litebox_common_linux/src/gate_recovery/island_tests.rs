@@ -309,11 +309,12 @@ fn production_island_every_emitted_boundary_both_hosts_and_far_directions() {
 fn production_island_populated_chunk_below_island() {
     for host in [TargetHost::Linux, TargetHost::MacOs] {
         let mut saw_1020 = false;
-        for &raw in OPERATIONS {
+        // Extent/placement is separate from the exhaustive operation matrix:
+        // SVC has the reported 0x1020 extent, MRS uses TLS, CBZ has both exits.
+        for raw in [0xd400_0001, 0xd53b_d040, 0xb400_0212] {
             let len = Fixture::new(raw, host, 0, false).chunk.len();
             saw_1020 |= len == 0x1020;
             for chunk in [
-                FAR,
                 ISLAND - 0x3000,
                 ISLAND - 0x5000,
                 ISLAND - len,
@@ -593,12 +594,35 @@ fn production_island_stack_store_faults_never_read_partial_destinations() {
 fn production_island_fault_attribution_pending_commits_and_brk_vs_async() {
     for host in [TargetHost::Linux, TargetHost::MacOs] {
         for &raw in OPERATIONS {
+            const FLAGS: usize = 0x9000_0000;
+            let completed_system_x18 = match raw {
+                0xd53b_4212 => Some(FLAGS),          // MRS x18,NZCV
+                0xd53b_e052 => Some(0xabcd_1234),    // MRS x18,CNTVCT_EL0
+                0xd50b_7b32 => Some(LOGICAL_BEFORE), // SYS leaves x18 unchanged
+                _ => None,
+            };
             let mut f = Fixture::new(raw, host, 0, false);
+            let mut saw_system_instruction = false;
+            let mut pending_boundaries = 0;
             for offset in (0..f.gate.size).step_by(4) {
                 let Some(stage) = island_gate_stage(&f.gate, offset) else {
                     continue;
                 };
-                let (ctx, expected) = f.boundary(offset);
+                let (mut ctx, mut expected) = f.boundary(offset);
+                if let Some(completed) = completed_system_x18 {
+                    // These operations preserve flags; their result is independent
+                    // of the generic fixture's synthetic LOGICAL_AFTER value.
+                    ctx.pstate = FLAGS as u64;
+                    expected.pstate = FLAGS as u64;
+                    if stage.phase == IslandPhase::After {
+                        expected.regs[18] = completed;
+                        if let Some(scratch) = stage.pending_x18 {
+                            ctx.regs[usize::from(scratch)] = completed;
+                        } else {
+                            f.tls[8..].copy_from_slice(&completed.to_le_bytes());
+                        }
+                    }
+                }
                 let descriptor = classify_island_signal_gate(
                     &f.chunk[f.gate.offset..f.gate.offset + f.gate.size],
                     (f.chunk_address + f.gate.offset) as u64,
@@ -606,6 +630,19 @@ fn production_island_fault_attribution_pending_commits_and_brk_vs_async() {
                     host,
                 )
                 .unwrap();
+                if completed_system_x18.is_some() && descriptor.guest_instruction {
+                    let GateMetadata::X18 { scratch } = f.gate.metadata else {
+                        panic!("system operation must use an ordinary x18 gate");
+                    };
+                    let at = f.gate.offset + offset;
+                    assert_eq!(
+                        &f.chunk[at..at + 4],
+                        &((raw & !31) | u32::from(scratch)).to_le_bytes()
+                    );
+                    assert_eq!(expected.pc, f.site);
+                    assert_eq!(expected.regs[18], LOGICAL_BEFORE);
+                    saw_system_instruction = true;
+                }
                 let result = f.run(&ctx, GateInterruption::Synchronous);
                 if descriptor.guest_instruction || descriptor.stack_store {
                     let mut expected = expected.clone();
@@ -644,109 +681,34 @@ fn production_island_fault_attribution_pending_commits_and_brk_vs_async() {
                         "async BRK boundary must not execute",
                     );
                 }
-                if stage.pending_x18.is_some() {
-                    // A completed load/store is never replayed, even if TLS is
-                    // stale or unreadable. No read of operand memory is made.
+                pending_boundaries += usize::from(stage.pending_x18.is_some());
+                if stage.pending_x18.is_some()
+                    || (completed_system_x18.is_some() && stage.phase == IslandPhase::After)
+                {
+                    // A completed operation is never replayed. Pending x18 must
+                    // come from the scratch, not a stale/unreadable TLS slot.
                     let result = canonicalize(
                         &ctx,
                         f.runtime(),
                         GateInterruption::Asynchronous,
                         host,
                         true,
-                        |a, b| a != TLS + 8 && f.read(a, b),
+                        |a, b| (stage.pending_x18.is_none() || a != TLS + 8) && f.read(a, b),
                     );
-                    equal(result, &expected, "pending commit with unreadable TLS");
+                    equal(
+                        result,
+                        &expected,
+                        "completed result, flags, and pending commit with unreadable TLS",
+                    );
                     assert_eq!(expected.pc, f.site + 4);
                 }
             }
-        }
-    }
-}
-
-#[test]
-fn production_island_mrs_nzcv_cntvct_and_sys_pending_commit_and_fault_attribution() {
-    const FLAGS: usize = 0x9000_0000;
-    for host in [TargetHost::Linux, TargetHost::MacOs] {
-        for (raw, completed_x18) in [
-            (0xd53b_4212, FLAGS),          // MRS x18,NZCV captures unchanged flags.
-            (0xd53b_e052, 0xabcd_1234),    // MRS x18,CNTVCT_EL0 captures a counter.
-            (0xd50b_7b32, LOGICAL_BEFORE), // SYS/DC CVAU,x18 does not write x18.
-        ] {
-            for reverse in [false, true] {
-                let mut f = Fixture::new(raw, host, 2, reverse);
-                let GateMetadata::X18 { scratch } = f.gate.metadata else {
-                    panic!("system operation must use an ordinary x18 gate");
-                };
-                let transformed = (raw & !31) | u32::from(scratch);
-                let execute = (0..f.gate.size / 4)
-                    .position(|i| {
-                        f.chunk[f.gate.offset + i * 4..f.gate.offset + i * 4 + 4]
-                            == transformed.to_le_bytes()
-                    })
-                    .unwrap()
-                    * 4;
-                // A system-register access can trap synchronously. Only the
-                // substituted guest instruction, never its TLS/spill/commit
-                // transport, is attributable to the original guest site.
-                let (ctx, expected) = f.boundary(execute);
-                assert_eq!(expected.pc, f.site);
-                assert_eq!(expected.regs[18], LOGICAL_BEFORE);
-                equal(
-                    f.run(&ctx, GateInterruption::Synchronous),
-                    &expected,
-                    "system guest-instruction fault",
+            if completed_system_x18.is_some() {
+                assert!(saw_system_instruction);
+                assert!(
+                    pending_boundaries > 0,
+                    "MRS/SYS pending boundary must be exercised"
                 );
-                let mut pending_boundaries = 0;
-                for offset in ((execute + 4)..f.gate.size).step_by(4) {
-                    let Some(stage) = island_gate_stage(&f.gate, offset) else {
-                        continue;
-                    };
-                    let (mut ctx, mut expected) = f.boundary(offset);
-                    expected.pstate = FLAGS as u64;
-                    ctx.pstate = FLAGS as u64;
-                    expected.regs[18] = completed_x18;
-                    if stage.pending_x18.is_some() {
-                        pending_boundaries += 1;
-                        ctx.regs[usize::from(scratch)] = completed_x18;
-                    } else {
-                        f.tls[8..].copy_from_slice(&completed_x18.to_le_bytes());
-                    }
-                    assert_eq!(expected.pc, f.site + 4);
-                    equal(
-                        canonicalize(
-                            &ctx,
-                            f.runtime(),
-                            GateInterruption::Asynchronous,
-                            host,
-                            true,
-                            // Pending results must come from the scratch, not
-                            // a stale/unreadable slot or a repeated MRS/SYS.
-                            |a, b| (stage.pending_x18.is_none() || a != TLS + 8) && f.read(a, b),
-                        ),
-                        &expected,
-                        "completed MRS/SYS result and unchanged NZCV",
-                    );
-                    let gate = classify_island_signal_gate(
-                        &f.chunk[f.gate.offset..f.gate.offset + f.gate.size],
-                        (f.chunk_address + f.gate.offset) as u64,
-                        offset,
-                        host,
-                    )
-                    .unwrap();
-                    if gate.stack_store {
-                        equal(
-                            f.run(&ctx, GateInterruption::Synchronous),
-                            &expected,
-                            "completed operation spill fault",
-                        );
-                    } else {
-                        assert!(matches!(
-                            f.run(&ctx, GateInterruption::Synchronous),
-                            Aarch64GateSignalResult::InvalidRuntimeState
-                        ));
-                    }
-                }
-                assert!(pending_boundaries > 0);
             }
         }
     }

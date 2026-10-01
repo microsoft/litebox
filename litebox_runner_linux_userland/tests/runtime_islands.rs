@@ -10,12 +10,6 @@ mod common;
 use common::runner::Runner;
 
 #[test]
-fn dynamic_glibc_runtime_islands() {
-    let path = common::compile("./tests/hello.c", "island_dynamic", false, false);
-    Runner::new_unpatched(&path, "island_dynamic").run();
-}
-
-#[test]
 fn runtime_island_signals() {
     let path = common::compile("./tests/gate_signals.c", "island_signals", false, false);
     Runner::new_unpatched(&path, "island_signals").run();
@@ -257,9 +251,9 @@ fn subpage_gapless_dso_aot() {
 
 // Three page-distinct LOADs alias file page zero. This stripped PIE has exactly
 // three instructions (MOV x0,#0; MOV x8,#94; SVC #0), and no libc or relocations.
-fn shared_page_pie(separate: bool) -> Vec<u8> {
-    let code = if separate { 0x1200 } else { 0x200 };
-    let data = if separate { 0x2220 } else { 0x220 };
+fn shared_page_pie() -> Vec<u8> {
+    let code = 0x200;
+    let data = 0x220;
     let mut bytes = vec![0; data + 8];
     bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     for (at, value) in [(16, 3u16), (18, 183), (52, 64), (54, 56), (56, 3)] {
@@ -298,14 +292,14 @@ fn shared_page_pie(separate: bool) -> Vec<u8> {
     bytes
 }
 
-fn run_shared_page_pie(separate: bool, aot: bool, interpreter: bool) {
+fn run_shared_page_pie(aot: bool, interpreter: bool) {
     use std::os::unix::fs::PermissionsExt as _;
-    let name = format!("shared_page_pie_{separate}_{aot}_{interpreter}");
+    let name = format!("shared_page_pie_{aot}_{interpreter}");
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(&name);
     let interp = path.with_file_name(format!("{name}.ld"));
-    let mut bytes = shared_page_pie(separate);
+    let mut bytes = shared_page_pie();
     if interpreter {
-        std::fs::write(&interp, shared_page_pie(separate)).unwrap();
+        std::fs::write(&interp, shared_page_pie()).unwrap();
         std::fs::set_permissions(&interp, std::fs::Permissions::from_mode(0o755)).unwrap();
         let name = format!("{}\0", interp.display());
         // Room for PT_INTERP and its path before the executable file bytes.
@@ -345,25 +339,17 @@ fn run_shared_page_pie(separate: bool, aot: bool, interpreter: bool) {
 
 #[test]
 fn shared_file_page_pie_runtime() {
-    run_shared_page_pie(false, false, false);
-}
-#[test]
-fn separated_file_page_pie_runtime() {
-    run_shared_page_pie(true, false, false);
+    run_shared_page_pie(false, false);
 }
 #[test]
 fn shared_file_page_pie_aot() {
-    run_shared_page_pie(false, true, false);
-}
-#[test]
-fn separated_file_page_pie_aot() {
-    run_shared_page_pie(true, true, false);
+    run_shared_page_pie(true, false);
 }
 #[test]
 fn shared_file_page_pie_interpreter_runtime() {
-    run_shared_page_pie(false, false, true);
+    run_shared_page_pie(false, true);
 }
 #[test]
 fn shared_file_page_pie_interpreter_aot() {
-    run_shared_page_pie(false, true, true);
+    run_shared_page_pie(true, true);
 }

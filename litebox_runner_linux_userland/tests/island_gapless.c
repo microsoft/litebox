@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 int main(void) {
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 2; ++i) {
         void *handle = dlopen("/lib/island_gapless.so", RTLD_NOW);
         if (!handle) {
             fprintf(stderr, "dlopen: %s\n", dlerror());

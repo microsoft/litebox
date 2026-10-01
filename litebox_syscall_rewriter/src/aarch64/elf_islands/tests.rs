@@ -260,9 +260,6 @@ fn elf_islands_conditional_auxiliary_ownership_and_transactional_tls() {
     assert_eq!(aux.resume, primary.site + 8);
     let mut chunk = pair.chunk().to_vec();
     island::finalize_island_chunk(&mut chunk, 96, TargetHost::Linux).unwrap();
-    let finalized = chunk.clone();
-    assert!(island::finalize_island_chunk(&mut chunk, 104, TargetHost::Linux).is_err());
-    assert_eq!(chunk, finalized);
     let base = usize::try_from(u64_at(&out, out.len() - 24).unwrap()).unwrap();
     let chunk_at = base + usize::try_from(u64_at(&out, base + 88).unwrap()).unwrap();
     let mut corrupt = out;

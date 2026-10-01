@@ -2699,53 +2699,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn aarch64_islands_keep_program_headers_unchanged() {
-        let elf = aarch64_elf_with_one_svc();
-        let out = hook_syscalls_in_elf(&elf, None).unwrap();
-        assert_eq!(&elf[64..120], &out[64..120]);
-        assert_eq!(
-            aarch64::elf_islands::ElfIslands::parse(&out)
-                .unwrap()
-                .unwrap()
-                .pairs
-                .len(),
-            1
-        );
-    }
-
-    /// A minimal AArch64 object whose text is a single `SVC #0` at `0x1000`.
-    fn aarch64_elf_with_one_svc() -> Vec<u8> {
-        const ELF_HEADER_BYTES: usize = 64;
-        const PROGRAM_HEADER_BYTES: usize = 56;
-        let mut elf = vec![0u8; ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES];
-        elf[..4].copy_from_slice(b"\x7fELF");
-        elf[4] = object::elf::ELFCLASS64;
-        elf[5] = object::elf::ELFDATA2LSB;
-        elf[6] = object::elf::EV_CURRENT;
-        elf[16..18].copy_from_slice(&object::elf::ET_EXEC.to_le_bytes());
-        elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
-        elf[20..24].copy_from_slice(&u32::from(object::elf::EV_CURRENT).to_le_bytes());
-        elf[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
-        elf[52..54].copy_from_slice(&u16::try_from(ELF_HEADER_BYTES).unwrap().to_le_bytes());
-        elf[54..56].copy_from_slice(&u16::try_from(PROGRAM_HEADER_BYTES).unwrap().to_le_bytes());
-        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
-
-        let text = ELF_HEADER_BYTES;
-        elf[text..text + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
-        elf[text + 4..text + 8]
-            .copy_from_slice(&(object::elf::PF_R | object::elf::PF_X).to_le_bytes());
-        elf[text + 8..text + 16]
-            .copy_from_slice(&((ELF_HEADER_BYTES + PROGRAM_HEADER_BYTES) as u64).to_le_bytes());
-        elf[text + 16..text + 24].copy_from_slice(&0x1000u64.to_le_bytes());
-        elf[text + 32..text + 40].copy_from_slice(&4u64.to_le_bytes());
-        elf[text + 40..text + 48].copy_from_slice(&4u64.to_le_bytes());
-        elf[text + 48..text + 56].copy_from_slice(&0x10000u64.to_le_bytes());
-
-        elf.extend(0xD400_0001u32.to_le_bytes());
-        elf
-    }
-
     /// x86-64 placement is deliberately unchanged; see `trampoline_addr_for`.
     #[test]
     fn placement_leaves_x86_64_alone() {

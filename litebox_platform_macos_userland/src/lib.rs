@@ -3784,26 +3784,27 @@ mod tests {
         assert_eq!(compat_memory.write_at_offset(0, 42), Some(()));
     }
 
+    struct InitOnly<F>(std::cell::RefCell<Option<F>>);
+    impl<F: FnOnce()> EnterShim for InitOnly<F> {
+        type ExecutionContext = PtRegs;
+
+        fn init(&self, _: &mut PtRegs) -> ContinueOperation {
+            self.0.borrow_mut().take().unwrap()();
+            ContinueOperation::Terminate
+        }
+        fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+            unreachable!()
+        }
+        fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+            unreachable!()
+        }
+        fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+            unreachable!()
+        }
+    }
+
     /// Run host-only test code with the same registration as a guest sibling.
     fn run_process_test_thread(process: Arc<ProcessState>, f: impl FnOnce()) {
-        struct InitOnly<F>(std::cell::RefCell<Option<F>>);
-        impl<F: FnOnce()> EnterShim for InitOnly<F> {
-            type ExecutionContext = PtRegs;
-
-            fn init(&self, _: &mut PtRegs) -> ContinueOperation {
-                self.0.borrow_mut().take().unwrap()();
-                ContinueOperation::Terminate
-            }
-            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
-                unreachable!()
-            }
-            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
-                unreachable!()
-            }
-            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
-                unreachable!()
-            }
-        }
         set_guest_abi(GuestAbi::Linux);
         run_thread_inner_with_process(
             &InitOnly(std::cell::RefCell::new(Some(f))),
@@ -3826,6 +3827,45 @@ mod tests {
             });
             assert_eq!(read_tls(tls_offset::RESET_SYSCALL_RETURN), 0);
             assert_eq!(read_tls(tls_offset::ACTIVE), 0);
+            // Own a separate context: never dereference ACTIVE while call_shim
+            // holds its exclusive borrow and the callback borrows shim/ctx.
+            let thread = ThreadHandle(Arc::new(ThreadState {
+                identity: Mutex::new(None),
+                interrupted: AtomicBool::new(false),
+                process: Arc::new(ProcessState::default()),
+                waker: Mutex::new(None),
+            }));
+            let mut context = ThreadContext {
+                guest_abi: GuestAbi::Linux,
+                shim: &InitOnly(std::cell::RefCell::new(None::<fn()>)),
+                ctx: &mut PtRegs::default(),
+                host_sp: 0,
+                outbound_stub: 0x1111,
+                outbound_pc: 0x2222,
+                outbound_island: 1,
+                outbound_x16: 0x4444,
+                svc_frame: 0x5555,
+                interrupted: &raw const thread.0.interrupted,
+                thread,
+                exit: GuestExit::Interrupt,
+            };
+            write_tls(tls_offset::RESET_SYSCALL_RETURN, usize::from(committed));
+            context.apply_syscall_return_reset();
+            assert_eq!(
+                [
+                    context.outbound_stub,
+                    context.outbound_pc,
+                    context.outbound_island,
+                    context.outbound_x16,
+                    context.svc_frame
+                ],
+                if committed {
+                    [0; 5]
+                } else {
+                    [0x1111, 0x2222, 1, 0x4444, 0x5555]
+                },
+            );
+            assert_eq!(read_tls(tls_offset::RESET_SYSCALL_RETURN), 0);
         }
         // Outside a guest callback there is no old return path to reset.
         platform.reset_syscall_return_state();

@@ -1868,25 +1868,6 @@ mod tests {
     }
 
     #[test]
-    fn outbound_transition_size_and_exception_store_range() {
-        unsafe extern "C" {
-            fn switch_to_guest_stage_x16();
-            fn switch_to_guest_stage_x16_end();
-        }
-        let size = super::super::switch_to_guest_via_outbound_stub_end as *const () as usize
-            - super::super::switch_to_guest_via_outbound_stub_start as *const () as usize;
-        assert_eq!(
-            size,
-            (66 - usize::from(cfg!(feature = "aarch64_virtualize_x18"))) * 4
-        );
-        assert_eq!(
-            switch_to_guest_stage_x16_end as *const () as usize
-                - switch_to_guest_stage_x16 as *const () as usize,
-            4
-        );
-    }
-
-    #[test]
     fn test_gate_patching_lands_in_the_runtime_tls_block() {
         const IMM12_SHIFT: u32 = 10;
         const IMM12_MASK: u32 = 0x003F_FC00;
@@ -3688,6 +3669,12 @@ mod tests {
     /// Without it, `in_switch_to_guest` routes the fault to `next_signal_handler`.
     #[test]
     fn test_switch_to_guest_stage_x16_has_exception_fixup() {
+        let size = super::super::switch_to_guest_via_outbound_stub_end as *const () as usize
+            - super::super::switch_to_guest_via_outbound_stub_start as *const () as usize;
+        assert_eq!(
+            size,
+            (66 - usize::from(cfg!(feature = "aarch64_virtualize_x18"))) * 4
+        );
         let stage = super::switch_to_guest_stage_x16 as *const () as usize;
         let end = super::switch_to_guest_stage_x16_end as *const () as usize;
         let fixup = super::switch_to_guest_stage_x16_fixup as *const () as usize;

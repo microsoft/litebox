@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use super::super::{MRemapFlags, PAGE_SIZE};
+use super::super::{ElfPatchKey, MRemapFlags, PAGE_SIZE};
 use super::*;
 use crate::syscalls::tests::{TestPlatform, create_file, init_platform};
 use litebox_broker_protocol::fs::FileMode;
@@ -51,10 +51,28 @@ fn open(task: &Task<TestPlatform>, path: &str) -> i32 {
     .unwrap()
 }
 
+fn open_image(task: &Task<TestPlatform>, path: &str, bytes: &[u8]) -> (i32, ElfPatchKey) {
+    create_file(task, path, bytes);
+    let fd = open(task, path);
+    (fd, super::super::tests::elf_patch_key(task, fd))
+}
+
+fn map_file(task: &Task<TestPlatform>, fd: i32, len: usize, prot: ProtFlags) -> UserPtrMut<u8> {
+    task.sys_mmap(0, len, prot, MapFlags::MAP_PRIVATE, fd, 0)
+        .unwrap()
+}
+
+fn read_bytes(address: usize, len: usize) -> Vec<u8> {
+    UserPtrMut::<u8>::from_usize(address)
+        .to_owned_slice::<TestPlatform>(len)
+        .unwrap()
+        .into_vec()
+}
+
 #[test]
 fn biased_load_overflow_does_not_poison_unrelated_exec_mappings() {
     let task = init_platform();
-    let mut malformed = image();
+    let mut malformed = sparse_image();
     // The second LOAD fits in u64 at bias zero, but not at the mapped bias.
     malformed[136..144].copy_from_slice(&(usize::MAX - 2 * PAGE_SIZE + 1).to_le_bytes());
     create_file(&task, "/overflow-load", &malformed);
@@ -70,7 +88,7 @@ fn biased_load_overflow_does_not_poison_unrelated_exec_mappings() {
         )
         .unwrap();
     let key = super::super::tests::elf_patch_key(&task, fd);
-    create_file(&task, "/valid-after-overflow", &image());
+    create_file(&task, "/valid-after-overflow", &sparse_image());
     let valid_fd = open(&task, "/valid-after-overflow");
     let valid = task
         .sys_mmap(
@@ -526,54 +544,44 @@ fn early_unused_island_rollback_failure_is_fatal_before_source_restore() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     let task = init_platform();
-    for pop in [true, false] {
-        let source = task.allocate_chunk(2 * HOST_PAGE_SIZE, &[], None).unwrap();
-        let native = 0xd4000001u32.to_le_bytes();
-        source.copy_from_slice::<TestPlatform>(0, &native).unwrap();
-        let address = source.as_usize() + HOST_PAGE_SIZE;
-        let staged = || StagedMapping {
-            range: address..address + HOST_PAGE_SIZE,
-            previous: Some(DisplacedMapping {
-                bytes: alloc::vec![0x5a; HOST_PAGE_SIZE],
-                protections: alloc::vec![ProtFlags::PROT_READ; HOST_PAGE_SIZE / PAGE_SIZE],
-                guest_owned: true,
-            }),
-            prefix_bias: None,
-        };
-        // Synthetic VM fault: revoke an unpublished reservation before cleanup.
-        // Its backup extent stays consistent; the real protection seam now fails.
-        task.sys_munmap_raw(UserPtrMut::from_usize(address), HOST_PAGE_SIZE)
+    let source = task.allocate_chunk(2 * HOST_PAGE_SIZE, &[], None).unwrap();
+    let native = 0xd4000001u32.to_le_bytes();
+    source.copy_from_slice::<TestPlatform>(0, &native).unwrap();
+    let address = source.as_usize() + HOST_PAGE_SIZE;
+    let staged = || StagedMapping {
+        range: address..address + HOST_PAGE_SIZE,
+        previous: Some(DisplacedMapping {
+            bytes: alloc::vec![0x5a; HOST_PAGE_SIZE],
+            protections: alloc::vec![ProtFlags::PROT_READ; HOST_PAGE_SIZE / PAGE_SIZE],
+            guest_owned: true,
+        }),
+        prefix_bias: None,
+    };
+    // Synthetic VM fault: revoke an unpublished reservation before cleanup.
+    // Its backup extent stays consistent; the real protection seam now fails.
+    task.sys_munmap_raw(UserPtrMut::from_usize(address), HOST_PAGE_SIZE)
+        .unwrap();
+    assert_eq!(task.rollback_island_mapping(staged()), Err(Errno::ENOMEM));
+    let mut restoration_reached = false;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        task.rollback_island_mapping_or_fatal(staged());
+        restoration_reached = true;
+        task.sys_mprotect_raw(source, HOST_PAGE_SIZE, ProtFlags::PROT_READ)
             .unwrap();
-        assert_eq!(task.rollback_island_mapping(staged()), Err(Errno::ENOMEM));
-        let mut reservations = alloc::vec![staged()];
-        let mut restoration_reached = false;
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            // Both early cleanup sites remove ownership before rolling back.
-            let unused = if pop {
-                reservations.pop().unwrap()
-            } else {
-                reservations.remove(0)
-            };
-            task.rollback_island_mapping_or_fatal(unused);
-            restoration_reached = true;
-            task.sys_mprotect_raw(source, HOST_PAGE_SIZE, ProtFlags::PROT_READ)
-                .unwrap();
-        }));
-        let panic = result.expect_err("indeterminate rollback must not return to retry logic");
-        assert_eq!(
-            panic.downcast_ref::<&str>().copied(),
-            Some("failed to roll back unpublished island mapping")
-        );
-        assert!(reservations.is_empty());
-        assert!(!restoration_reached);
-        assert!(task.global.mm.mappings().iter().any(|(range, flags)| {
-            range.contains(&source.as_usize())
-                && flags.contains(VmFlags::VM_READ | VmFlags::VM_WRITE)
-                && !flags.contains(VmFlags::VM_EXEC)
-        }));
-        assert_eq!(&*source.to_owned_slice::<TestPlatform>(4).unwrap(), &native);
-        task.sys_munmap_raw(source, HOST_PAGE_SIZE).unwrap();
-    }
+    }));
+    let panic = result.expect_err("indeterminate rollback must not return to retry logic");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("failed to roll back unpublished island mapping")
+    );
+    assert!(!restoration_reached);
+    assert!(task.global.mm.mappings().iter().any(|(range, flags)| {
+        range.contains(&source.as_usize())
+            && flags.contains(VmFlags::VM_READ | VmFlags::VM_WRITE)
+            && !flags.contains(VmFlags::VM_EXEC)
+    }));
+    assert_eq!(&*source.to_owned_slice::<TestPlatform>(4).unwrap(), &native);
+    task.sys_munmap_raw(source, HOST_PAGE_SIZE).unwrap();
 }
 
 #[test]
@@ -681,18 +689,9 @@ fn blocked_near_allocation(serialized: bool) {
 #[test]
 fn bad_fd_fixed_replacement_preserves_original_executable_mapping() {
     let task = init_platform();
-    create_file(&task, "/island-failed-fixed", &image());
+    create_file(&task, "/island-failed-fixed", &sparse_image());
     let fd = open(&task, "/island-failed-fixed");
-    let mapping = task
-        .sys_mmap(
-            0,
-            4 * PAGE_SIZE,
-            ProtFlags::PROT_READ_EXEC,
-            MapFlags::MAP_PRIVATE,
-            fd,
-            0,
-        )
-        .unwrap();
+    let mapping = map_file(&task, fd, 4 * PAGE_SIZE, ProtFlags::PROT_READ_EXEC);
     let key = super::super::tests::elf_patch_key(&task, fd);
     let code = mapping.as_usize() + PAGE_SIZE;
     let pair_count = task
@@ -887,6 +886,9 @@ fn top_down_library_pack_heap_corridor_extends_owned_dso_prefix() {
 
 #[test]
 fn heap_boundary_rejects_unproven_main_heap_reach_future_load_and_collision() {
+    use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions};
+    use litebox::platform::{PageManagementProvider, RawConstPointer as _, RawMutPointer as _};
+
     let task = init_platform();
     let (base, size, fd) = packed_dso(&task, "pack-negative", &packed_image(false));
     let key = super::super::tests::elf_patch_key(&task, fd);
@@ -977,24 +979,31 @@ fn heap_boundary_rejects_unproven_main_heap_reach_future_load_and_collision() {
         Err(Errno::ENOMEM)
     ));
     // An untracked host mapping exercises NOREPLACE, not just the PM snapshot.
-    let collision = unsafe {
-        libc::mmap(
-            candidate as *mut _,
-            HOST_PAGE_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    assert_eq!(collision as usize, candidate);
-    unsafe { collision.cast::<u8>().write(0x5a) };
+    let platform = crate::syscalls::tests::test_platform();
+    let collision = <TestPlatform as PageManagementProvider<PAGE_SIZE>>::allocate_pages(
+        platform,
+        candidate..candidate + HOST_PAGE_SIZE,
+        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+        false,
+        false,
+        FixedAddressBehavior::NoReplace,
+    )
+    .unwrap();
+    assert_eq!(collision.as_usize(), candidate);
+    assert_eq!(collision.write_at_offset(0, 0x5a), Some(()));
     assert!(matches!(
         attempt(state, &corridor, candidate..=candidate, &[]),
         Err(Errno::ENOMEM)
     ));
-    assert_eq!(unsafe { collision.cast::<u8>().read() }, 0x5a);
-    assert_eq!(unsafe { libc::munmap(collision, HOST_PAGE_SIZE) }, 0);
+    assert_eq!(read_bytes(candidate, 1), [0x5a]);
+    // SAFETY: this test owns the idle exact, non-replacing host allocation.
+    unsafe {
+        <TestPlatform as PageManagementProvider<PAGE_SIZE>>::deallocate_pages(
+            platform,
+            candidate..candidate + HOST_PAGE_SIZE,
+        )
+        .unwrap();
+    }
     assert_eq!(task.global.mm.mappings(), before);
     heap.main = main_identity;
     drop(heap);
@@ -1083,6 +1092,30 @@ fn serialized_pack_relocates_whole_pair_to_owned_boundary() {
 }
 
 #[cfg(feature = "aarch64_virtualize_x18")]
+fn image_with_distant_load(distant: usize) -> Vec<u8> {
+    let mut bytes = packed_image(false);
+    bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+    for field in [32, 40] {
+        bytes[64 + field..72 + field].copy_from_slice(&(2 * HOST_PAGE_SIZE as u64).to_le_bytes());
+    }
+    for (field, value) in [
+        (0, 1),
+        (4, 5),
+        (8, 2 * HOST_PAGE_SIZE),
+        (16, distant),
+        (32, HOST_PAGE_SIZE),
+        (40, HOST_PAGE_SIZE),
+        (48, HOST_PAGE_SIZE),
+    ] {
+        let width = if field < 8 { 4 } else { 8 };
+        bytes[120 + field..120 + field + width]
+            .copy_from_slice(&(value as u64).to_le_bytes()[..width]);
+    }
+    bytes[2 * HOST_PAGE_SIZE..].fill(0);
+    bytes
+}
+
+#[cfg(feature = "aarch64_virtualize_x18")]
 #[test]
 fn conditional_runtime_placement_skips_primary_only_gap_pages() {
     for (name, raw, displacement) in [
@@ -1091,27 +1124,8 @@ fn conditional_runtime_placement_skips_primary_only_gap_pages() {
     ] {
         for mixed in [false, true] {
             let task = init_platform();
-            let mut bytes = packed_image(false);
             let distant = (1 << 27) + 2 * HOST_PAGE_SIZE;
-            bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
-            for field in [32, 40] {
-                bytes[64 + field..72 + field]
-                    .copy_from_slice(&(2 * HOST_PAGE_SIZE as u64).to_le_bytes());
-            }
-            for (field, value) in [
-                (0, 1),
-                (4, 5),
-                (8, 2 * HOST_PAGE_SIZE),
-                (16, distant),
-                (32, HOST_PAGE_SIZE),
-                (40, HOST_PAGE_SIZE),
-                (48, HOST_PAGE_SIZE),
-            ] {
-                let width = if field < 8 { 4 } else { 8 };
-                bytes[120 + field..120 + field + width]
-                    .copy_from_slice(&(value as u64).to_le_bytes()[..width]);
-            }
-            bytes[2 * HOST_PAGE_SIZE..].fill(0);
+            let mut bytes = image_with_distant_load(distant);
             if mixed {
                 // Initial placement follows SVC's wider interval; the conditional
                 // then needs retry expansion and gets a nonzero primary slot.
@@ -1260,27 +1274,10 @@ fn conditional_runtime_placement_skips_primary_only_gap_pages() {
 #[test]
 fn boundary_inbound_reach_does_not_publish_unreachable_conditional_exit() {
     let task = init_platform();
-    let mut bytes = packed_image(false);
     let distant = (1 << 27) - HOST_PAGE_SIZE;
     // One near LOAD attests ownership, one distant LOAD contains CBZ x18 whose
     // primary entry fits exactly but whose taken auxiliary exit is out of reach.
-    bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
-    for field in [32, 40] {
-        bytes[64 + field..72 + field].copy_from_slice(&(2 * HOST_PAGE_SIZE as u64).to_le_bytes());
-    }
-    let at = 120;
-    bytes[at..at + 4].copy_from_slice(&1u32.to_le_bytes());
-    bytes[at + 4..at + 8].copy_from_slice(&5u32.to_le_bytes());
-    for (field, value) in [
-        (8, 2 * HOST_PAGE_SIZE),
-        (16, distant),
-        (32, HOST_PAGE_SIZE),
-        (40, HOST_PAGE_SIZE),
-        (48, HOST_PAGE_SIZE),
-    ] {
-        bytes[at + field..at + field + 8].copy_from_slice(&(value as u64).to_le_bytes());
-    }
-    bytes[2 * HOST_PAGE_SIZE..].fill(0);
+    let mut bytes = image_with_distant_load(distant);
     bytes[2 * HOST_PAGE_SIZE + 32..2 * HOST_PAGE_SIZE + 36]
         .copy_from_slice(&0xb47ffff2u32.to_le_bytes()); // CBZ x18, PC + 1MiB - 4
     let (base, size, fd) = packed_dso(&task, "pack-aux-exit", &bytes);
@@ -1380,16 +1377,7 @@ fn whole_span_fixed_replacements_preserve_every_replacement_page() {
     );
     let data_fd = open(&task, "/island-replacement-data");
     for replacement_fd in [-1, data_fd] {
-        let mapping = task
-            .sys_mmap(
-                0,
-                span_len,
-                ProtFlags::PROT_READ_EXEC,
-                MapFlags::MAP_PRIVATE,
-                fd,
-                0,
-            )
-            .unwrap();
+        let mapping = map_file(&task, fd, span_len, ProtFlags::PROT_READ_EXEC);
         let key = super::super::tests::elf_patch_key(&task, fd);
         let released = {
             let cache = task.global.elf_patch_cache.lock();
@@ -1473,7 +1461,7 @@ fn whole_span_fixed_replacements_preserve_every_replacement_page() {
 #[test]
 fn partial_overlap_fixed_failure_preserves_original_executable_mapping() {
     let task = init_platform();
-    create_file(&task, "/island-partial-fixed", &image());
+    create_file(&task, "/island-partial-fixed", &sparse_image());
     let fd = open(&task, "/island-partial-fixed");
     // Keep the page above the site occupied while publishing so it cannot
     // become transport. Then remove it to reproduce Vmem's partial overlap.
@@ -1554,7 +1542,7 @@ fn partial_overlap_fixed_failure_preserves_original_executable_mapping() {
 #[test]
 fn non_load_file_offset_maps_without_bias_or_gap_ownership() {
     let task = init_platform();
-    let mut bytes = image();
+    let mut bytes = sparse_image();
     bytes[2 * PAGE_SIZE..3 * PAGE_SIZE].fill(0x5a);
     create_file(&task, "/island-non-load", &bytes);
     let fd = open(&task, "/island-non-load");
@@ -1589,14 +1577,18 @@ fn non_load_file_offset_maps_without_bias_or_gap_ownership() {
     task.sys_munmap(mapping, PAGE_SIZE).unwrap();
 }
 
-fn aot_image() -> Vec<u8> {
+fn sparse_image() -> Vec<u8> {
     let mut bytes = image();
     for at in (PAGE_SIZE..2 * PAGE_SIZE).step_by(4) {
         bytes[at..at + 4].copy_from_slice(&0xd503201fu32.to_le_bytes());
     }
     bytes[PAGE_SIZE..PAGE_SIZE + 4].copy_from_slice(&0xd4000001u32.to_le_bytes());
+    bytes
+}
+
+fn aot_image() -> Vec<u8> {
     litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
-        &bytes,
+        &sparse_image(),
         None,
         crate::aarch64_rewrite_options(),
     )
@@ -1619,22 +1611,10 @@ fn serialized_island_extent(bytes: &[u8], granule: usize) -> Range<usize> {
 #[test]
 fn serialized_pairs_reuse_per_bias_after_close_and_retire_on_last_reference() {
     let task = init_platform();
-    create_file(&task, "/aot-lifecycle", &aot_image());
-    let fd = open(&task, "/aot-lifecycle");
-    let key = super::super::tests::elf_patch_key(&task, fd);
+    let (fd, key) = open_image(&task, "/aot-lifecycle", &aot_image());
     let mut bases = Vec::new();
     for _ in 0..2 {
-        bases.push(
-            task.sys_mmap(
-                0,
-                4 * PAGE_SIZE,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE,
-                fd,
-                0,
-            )
-            .unwrap(),
-        );
+        bases.push(map_file(&task, fd, 4 * PAGE_SIZE, ProtFlags::PROT_READ));
     }
     task.sys_close(fd).unwrap();
     for base in &bases {
@@ -1701,9 +1681,7 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
     let task = init_platform();
     let bytes = aot_image();
     let island = serialized_island_extent(&bytes, HOST_PAGE_SIZE);
-    create_file(&task, "/aot-collision", &bytes);
-    let fd = open(&task, "/aot-collision");
-    let key = super::super::tests::elf_patch_key(&task, fd);
+    let (fd, key) = open_image(&task, "/aot-collision", &bytes);
     let before = task.global.mm.mappings();
     // Reserve room for both LOADs AND the actual island, plus alignment slack.
     // On 16KiB hosts the island is above the image, not in its 4KiB file hole.
@@ -1762,9 +1740,7 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
         assert_ne!(pairs[0].near.start, near.as_usize());
         (pairs[0].near.clone(), pairs[0].far.clone())
     };
-    let transport = UserPtrMut::<u8>::from_usize(actual.start)
-        .to_owned_slice::<TestPlatform>(actual.len())
-        .unwrap();
+    let transport = read_bytes(actual.start, actual.len());
     let first = task
         .sys_mmap(
             bias + PAGE_SIZE,
@@ -1794,12 +1770,7 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
         );
         assert_eq!(pairs[0].sites, [first.as_usize()]);
     }
-    assert_eq!(
-        &*UserPtrMut::<u8>::from_usize(actual.start)
-            .to_owned_slice::<TestPlatform>(actual.len())
-            .unwrap(),
-        &*transport
-    );
+    assert_eq!(read_bytes(actual.start, actual.len()), transport);
     assert_eq!(
         &*near.to_owned_slice::<TestPlatform>(island.len()).unwrap(),
         sentinel.as_slice()
@@ -1813,19 +1784,8 @@ fn serialized_collision_relocates_and_reuses_pair_for_delayed_mapping_after_clos
 #[test]
 fn serialized_modified_code_reenable_still_uses_runtime_scanner() {
     let task = init_platform();
-    create_file(&task, "/aot-rescan", &aot_image());
-    let fd = open(&task, "/aot-rescan");
-    let key = super::super::tests::elf_patch_key(&task, fd);
-    let base = task
-        .sys_mmap(
-            0,
-            4 * PAGE_SIZE,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_PRIVATE,
-            fd,
-            0,
-        )
-        .unwrap();
+    let (fd, key) = open_image(&task, "/aot-rescan", &aot_image());
+    let base = map_file(&task, fd, 4 * PAGE_SIZE, ProtFlags::PROT_READ);
     let code = UserPtrMut::<u8>::from_usize(base.as_usize() + PAGE_SIZE);
     assert_eq!(
         task.sys_madvise(code, 1, litebox_common_linux::MadviseBehavior::DontNeed),
@@ -1836,10 +1796,7 @@ fn serialized_modified_code_reenable_still_uses_runtime_scanner() {
     let before = task.global.elf_patch_cache.lock()[&key].islands.pairs[0]
         .near
         .clone();
-    let slot_before = UserPtrMut::<u8>::from_usize(before.start)
-        .to_owned_slice::<TestPlatform>(PAGE_SIZE)
-        .unwrap()
-        .into_vec();
+    let slot_before = read_bytes(before.start, PAGE_SIZE);
     task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
         .unwrap();
     code.copy_from_slice::<TestPlatform>(4, &0xd4000001u32.to_le_bytes())
@@ -1852,12 +1809,7 @@ fn serialized_modified_code_reenable_still_uses_runtime_scanner() {
         task.global.elf_patch_cache.lock()[&key].islands.pairs.len(),
         2
     );
-    assert_eq!(
-        &*UserPtrMut::<u8>::from_usize(before.start)
-            .to_owned_slice::<TestPlatform>(PAGE_SIZE)
-            .unwrap(),
-        &slot_before
-    );
+    assert_eq!(read_bytes(before.start, PAGE_SIZE), slot_before);
     task.sys_munmap(base, 4 * PAGE_SIZE).unwrap();
     task.sys_close(fd).unwrap();
 }
@@ -1865,19 +1817,8 @@ fn serialized_modified_code_reenable_still_uses_runtime_scanner() {
 #[test]
 fn serialized_remap_reinstalls_retired_pair_and_reuses_surviving_reference() {
     let task = init_platform();
-    create_file(&task, "/aot-remap", &aot_image());
-    let fd = open(&task, "/aot-remap");
-    let key = super::super::tests::elf_patch_key(&task, fd);
-    let base = task
-        .sys_mmap(
-            0,
-            4 * PAGE_SIZE,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_PRIVATE,
-            fd,
-            0,
-        )
-        .unwrap();
+    let (fd, key) = open_image(&task, "/aot-remap", &aot_image());
+    let base = map_file(&task, fd, 4 * PAGE_SIZE, ProtFlags::PROT_READ);
     let first = UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE);
     let second = UserPtrMut::from_usize(base.as_usize() + 3 * PAGE_SIZE);
     task.sys_mprotect(first, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
@@ -2287,52 +2228,9 @@ fn mmap_envelope_nonzero_load_keeps_file_start_offset_and_aligned_bias() {
 }
 
 #[test]
-fn macos_libc_serialized_geometry() {
-    extern crate std;
-    use litebox_syscall_rewriter::{RewriteOptions, TargetHost};
-    let original = include_bytes!(
-        "../../../../../litebox_runner_linux_on_macos_userland/tests/test-bins/libc.so.6"
-    );
-    let bytes = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
-        original,
-        None,
-        RewriteOptions::new(TargetHost::MacOs, true),
-    )
-    .unwrap();
-    let payload = litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands::parse(&bytes)
-        .unwrap()
-        .unwrap();
-    assert_eq!(payload.granule, 0x4000);
-    assert_eq!(
-        payload.options,
-        RewriteOptions::new(TargetHost::MacOs, true)
-    );
-    let addresses: Vec<_> = payload.pairs.iter().map(IslandPair::island_vaddr).collect();
-    assert_eq!(
-        addresses,
-        [
-            0x184000, 0x188000, 0x18c000, 0x190000, 0x194000, 0x198000, 0x210000, 0x214000,
-            0x218000, 0x21c000, 0x220000, 0x224000, 0x228000, 0x22c000
-        ]
-    );
-    std::eprintln!(
-        "Mac libc AOT: granule={:#x}, pairs={:#x?}, slots={:?}",
-        payload.granule,
-        addresses,
-        payload
-            .pairs
-            .iter()
-            .map(IslandPair::slots_used)
-            .collect::<Vec<_>>()
-    );
-}
-
-#[test]
 fn serialized_large_alignment_probe_fixed_mapping() {
     let task = init_platform();
-    let mut original = image();
-    original.truncate(2 * PAGE_SIZE);
-    original[56..58].copy_from_slice(&1u16.to_le_bytes());
+    let mut original = gapless_image();
     original[112..120].copy_from_slice(&0x10000u64.to_le_bytes());
     let bytes = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
         &original,
@@ -2920,19 +2818,8 @@ fn retirement_image() -> Vec<u8> {
 fn retired_pair_restores_surviving_file_gap() {
     let task = init_platform();
     let bytes = retirement_image();
-    create_file(&task, "/retired-gap", &bytes);
-    let fd = open(&task, "/retired-gap");
-    let key = super::super::tests::elf_patch_key(&task, fd);
-    let base = task
-        .sys_mmap(
-            0,
-            bytes.len(),
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_PRIVATE,
-            fd,
-            0,
-        )
-        .unwrap();
+    let (fd, key) = open_image(&task, "/retired-gap", &bytes);
+    let base = map_file(&task, fd, bytes.len(), ProtFlags::PROT_READ);
     let code = UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE);
     let gap = UserPtrMut::<u8>::from_usize(base.as_usize() + 2 * HOST_PAGE_SIZE);
     task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
@@ -3111,9 +2998,7 @@ fn check_retired_loader_reservation(close_before_retirement: bool) {
     } else {
         "/loader-retirement-close-after"
     };
-    create_file(&task, path, &bytes);
-    let fd = open(&task, path);
-    let key = super::super::tests::elf_patch_key(&task, fd);
+    let (fd, key) = open_image(&task, path, &bytes);
     let before = task.global.mm.mappings();
     let base = task.allocate_chunk(4 * HOST_PAGE_SIZE, &[], None).unwrap();
     let near = UserPtrMut::<u8>::from_usize(base.as_usize() + extent.start);
@@ -3232,16 +3117,7 @@ fn retired_gap_excludes_partial_unmap_and_new_fixed_bytes() {
         };
         create_file(&task, path, &bytes);
         let fd = open(&task, path);
-        let base = task
-            .sys_mmap(
-                0,
-                bytes.len(),
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE,
-                fd,
-                0,
-            )
-            .unwrap();
+        let base = map_file(&task, fd, bytes.len(), ProtFlags::PROT_READ);
         let code = UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE);
         let gap = base.as_usize() + 2 * HOST_PAGE_SIZE;
         task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
@@ -3313,5 +3189,9 @@ fn retired_mapping_restore_failure_is_fatal() {
             &(0..0),
         );
     }));
-    assert!(result.is_err());
+    let panic = result.expect_err("indeterminate retirement must not return");
+    assert_eq!(
+        panic.downcast_ref::<&str>().copied(),
+        Some("failed to restore retired island mapping")
+    );
 }

@@ -496,10 +496,28 @@ fn signal_classifier_system_classes_match_offline_admission_exhaustively() {
         let (mut slot, execute, scratch) = ordinary_signal_template(host);
         let original_at = slot.len() - 8;
         let mut counts = [0usize; 8];
-        // Exhaust every system encoding's L:op0 and op1:CRn:CRm:op2 with
-        // Rt=x18: 131,072 words per host, including MSR/SYSL and TPIDR_EL0.
+        // Admission masks are host-independent: exhaust Linux's 131,072
+        // words, but check class edges and real MRS/SYS/TPIDR fields on macOS.
+        let fields: Vec<u32> = if host == TargetHost::Linux {
+            (0..(1 << 14)).collect()
+        } else {
+            vec![
+                0,
+                1,
+                0x1fff,
+                0x2000,
+                0x3ffe,
+                0x3fff,
+                (0xd53b_4212 >> 5) & 0x3fff, // NZCV
+                (0xd53b_e052 >> 5) & 0x3fff, // CNTVCT_EL0
+                (0xd50b_7b32 >> 5) & 0x3fff, // DC CVAU
+                ((0xd53b_d052 >> 5) & 0x3fff) - 1,
+                (0xd53b_d052 >> 5) & 0x3fff, // TPIDR_EL0, excluded only for MRS
+                ((0xd53b_d052 >> 5) & 0x3fff) + 1,
+            ]
+        };
         for l_op0 in 0u32..8 {
-            for fields in 0..(1u32 << 14) {
+            for &fields in &fields {
                 let raw = 0xd500_0012 | (l_op0 << 19) | (fields << 5);
                 let transformed = (raw & !31) | u32::from(scratch);
                 let admitted = x18::Spec::decode(raw, 0x40_0000);
@@ -527,7 +545,8 @@ fn signal_classifier_system_classes_match_offline_admission_exhaustively() {
         }
         // SYS is already admitted; MRS excludes only TPIDR_EL0,x18. MSR and
         // SYSL remain unsupported. This is not an EL0 executability claim.
-        assert_eq!(counts, [0, 16384, 0, 0, 0, 0, 16384, 16383]);
+        let n = fields.len();
+        assert_eq!(counts, [0, n, 0, 0, 0, 0, n, n - 1]);
     }
 }
 

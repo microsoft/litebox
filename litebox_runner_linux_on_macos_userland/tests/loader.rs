@@ -4,14 +4,13 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use litebox_syscall_rewriter::{RewriteOptions, TargetHost, hook_syscalls_in_elf_with_options};
-use std::{fmt::Write as _, path::Path, process::Command};
+use std::{path::Path, process::Command};
 
 // Prebuilt AArch64 Linux programs with their dynamic loader and glibc.
 fn run_program(name: &str, aot: bool) {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("root");
-    let mut aot_geometry = String::new();
     for (source, destination) in [
         (name, format!("bin/{name}")),
         ("ld-linux-aarch64.so.1", "lib/ld-linux-aarch64.so.1".into()),
@@ -32,26 +31,9 @@ fn run_program(name: &str, aot: bool) {
                 litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands::parse(&rewritten)
                     .unwrap()
                     .unwrap();
-            if payload.pairs.is_empty() {
-                writeln!(
-                    aot_geometry,
-                    "{source}: processed zero-size sentinel; no encoded host/granule"
-                )
+            payload
+                .check_compatibility(RewriteOptions::new(TargetHost::MacOs, true), 16384)
                 .unwrap();
-            } else {
-                writeln!(
-                    aot_geometry,
-                    "{source}: host={:?}, granule={:#x}, islands(vaddr,slots)={:#x?}",
-                    payload.options,
-                    payload.granule,
-                    payload
-                        .pairs
-                        .iter()
-                        .map(|pair| (pair.island_vaddr(), pair.slots_used()))
-                        .collect::<Vec<_>>()
-                )
-                .unwrap();
-            }
             std::fs::write(&path, rewritten).unwrap();
         }
     }
@@ -91,7 +73,7 @@ fn run_program(name: &str, aot: bool) {
         assert_eq!(
             output.status.code(),
             Some(0),
-            "{name} (aot={aot}, from_tar={from_tar}): {}\n{aot_geometry}\nstdout: {}\nstderr: {}",
+            "{name} (aot={aot}, from_tar={from_tar}): {}\nstdout: {}\nstderr: {}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
