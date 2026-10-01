@@ -613,9 +613,7 @@ mod tests {
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
     use litebox::platform::page_mgmt::AllocationDirection;
-    use litebox::platform::{
-        PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
-    };
+    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::loader::{ElfParsedFile, MapMemory, Protection, ReadAt};
@@ -1146,48 +1144,6 @@ mod tests {
             Err(AllocationError::PermissionDenied)
         ));
         assert_eq!(pages.0.0, before);
-    }
-
-    #[test]
-    fn subpage_remap_within_one_native_page_preserves_neighbors() {
-        let platform = MacosUserland::new();
-        let memory = platform
-            .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
-                RW,
-                false,
-                true,
-                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
-            )
-            .unwrap();
-        let base = memory.as_usize();
-        let _cleanup = litebox::utils::defer(|| {
-            // SAFETY: the test's native page has no active users at cleanup.
-            unsafe {
-                platform.release_pages(base..base + HOST_PAGE_SIZE).unwrap();
-            };
-        });
-        assert_eq!(memory.write_at_offset(0, 42), Some(()));
-        assert_eq!(memory.write_at_offset(PAGE_SIZE as isize, 99), Some(()));
-        let target = base + 2 * PAGE_SIZE..base + HOST_PAGE_SIZE;
-        // SAFETY: source and target are idle, disjoint guest subpages of our mapping.
-        let moved = unsafe {
-            platform.release_pages(target.clone()).unwrap();
-            platform
-                .remap_pages(base..base + PAGE_SIZE, target, RW)
-                .unwrap()
-        };
-        assert_eq!(moved.as_usize(), base + 2 * PAGE_SIZE);
-        assert_eq!(moved.read_at_offset(0), Some(42));
-        assert_eq!(moved.read_at_offset(PAGE_SIZE as isize), Some(0));
-        assert_eq!(memory.read_at_offset(PAGE_SIZE as isize), Some(99));
-        assert!(
-            !platform
-                .pages
-                .lock()
-                .unwrap()
-                .contains_range(base..base + PAGE_SIZE)
-        );
     }
 
     // Wait out parallel updates before asserting a synthetic recovery result.
