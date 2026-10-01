@@ -291,7 +291,7 @@ where
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError> {
-        assert!(!components.is_empty());
+        assert_ne!(components.len(), 0);
         let (from, _) = from.into_typed::<Self>().into_dir();
         // 9P walks happily into files, so the qids have to be inspected to find where this walk
         // must stop for the resolver's purposes.
