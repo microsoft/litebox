@@ -143,17 +143,16 @@ fn aarch64_hello_world_is_hooked() {
         "trampoline must end right before the 32-byte header"
     );
 
-    // --- Trampoline prologue invariants ---
-    let tramp = &out[file_offset as usize..(file_offset + size) as usize];
-    // Offset 0: callback slot holds the value we passed in.
-    assert_eq!(read_u64(tramp, 0), callback, "callback slot");
-    // Offset 8: deterministic NOP padding; each SVC slot dispatches through
-    // the single callback pointer directly.
-    assert_eq!(read_u32(tramp, 8), 0xD503_201F, "header NOP padding");
-    assert_eq!(read_u32(tramp, 12), 0xD503_201F, "header NOP padding");
-
-    // --- Every SVC became a branch into the trampoline region ---
-    let tramp_range = vaddr..(vaddr + size);
+    // The callback is deliberately not persisted: the loader must select the
+    // explicit island entry capability, not the old direct callback.
+    let payload = litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands::parse(&out)
+        .unwrap()
+        .unwrap();
+    assert_eq!(payload.pairs.len(), 1);
+    let pair = &payload.pairs[0];
+    assert_eq!(read_u64(pair.chunk(), 0), 0);
+    assert_eq!(pair.slots_used(), 5);
+    let tramp_range = pair.island_vaddr()..pair.island_vaddr() + 4096;
     for (file_off, site_vaddr) in &original_sites {
         let word = read_u32(&out, *file_off);
         assert_eq!(
@@ -235,7 +234,7 @@ fn aarch64_metadata_projects_text_into_file_mapping() {
 }
 
 #[test]
-fn aarch64_trampoline_size_bound_covers_emitted_fixture() {
+fn aarch64_island_slot_bound_covers_emitted_fixture() {
     let mut aligned = vec![0u64; HELLO_AARCH64.len().div_ceil(8)];
     zerocopy::IntoBytes::as_mut_bytes(aligned.as_mut_slice())[..HELLO_AARCH64.len()]
         .copy_from_slice(HELLO_AARCH64);
@@ -245,16 +244,23 @@ fn aarch64_trampoline_size_bound_covers_emitted_fixture() {
     )
     .unwrap();
     let bound = metadata
-        .trampoline_size_upper_bound(
+        .island_slot_upper_bound(
             &zerocopy::IntoBytes::as_bytes(aligned.as_slice())[..HELLO_AARCH64.len()],
             RewriteOptions::default(),
         )
         .unwrap();
 
     let out = hook_syscalls_in_elf(HELLO_AARCH64, Some(0)).unwrap();
-    let (_, _, emitted) = trampoline_header(&out);
-    assert!(emitted > 0, "fixture must emit a trampoline");
-    assert!(emitted <= bound as u64, "{emitted:#x} > {bound:#x}");
+    let payload = litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands::parse(&out)
+        .unwrap()
+        .unwrap();
+    let emitted: usize = payload
+        .pairs
+        .iter()
+        .map(litebox_syscall_rewriter::aarch64::island::IslandPair::slots_used)
+        .sum();
+    assert!(emitted > 0);
+    assert!(emitted <= bound, "{emitted:#x} > {bound:#x}");
 }
 
 #[test]

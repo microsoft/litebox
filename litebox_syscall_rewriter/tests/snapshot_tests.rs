@@ -25,7 +25,7 @@ fn objdump(objdump_cmd: &str, binary: &[u8]) -> String {
                 .rsplit_once(':')
                 .is_some_and(|(_, banner)| banner.trim_start().starts_with("file format "))
         })
-        .map(|line| normalize_objdump_line(line, trampoline_range.as_ref()))
+        .map(|line| normalize_objdump_line(line, &trampoline_range))
         .collect::<Vec<_>>();
     let first_content = lines
         .iter()
@@ -63,23 +63,39 @@ fn find_objdump(candidates: &[&str], arch_token: &str) -> Option<String> {
         .map(|cmd| (*cmd).to_owned())
 }
 
-fn trampoline_range(binary: &[u8]) -> Option<std::ops::Range<u64>> {
+fn trampoline_range(binary: &[u8]) -> Vec<std::ops::Range<u64>> {
     const MAGIC: &[u8; 8] = litebox_syscall_rewriter::TRAMPOLINE_MAGIC;
 
+    if binary.get(18..20) == Some(&183u16.to_le_bytes()) {
+        return litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands::parse(binary)
+            .unwrap()
+            .map_or_else(Vec::new, |payload| {
+                payload
+                    .pairs
+                    .iter()
+                    .map(|pair| pair.island_vaddr()..pair.island_vaddr() + payload.granule)
+                    .collect()
+            });
+    }
+
     if binary.len() < 32 {
-        return None;
+        return Vec::new();
     }
 
     let header = &binary[binary.len() - 32..];
     if &header[..8] != MAGIC {
-        return None;
+        return Vec::new();
     }
     let vaddr = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let size = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    (size != 0).then_some(vaddr..vaddr.checked_add(size)?)
+    if size == 0 {
+        Vec::new()
+    } else {
+        std::iter::once(vaddr..vaddr.checked_add(size).unwrap()).collect()
+    }
 }
 
-fn normalize_objdump_line(line: &str, trampoline_range: Option<&std::ops::Range<u64>>) -> String {
+fn normalize_objdump_line(line: &str, trampoline_ranges: &[std::ops::Range<u64>]) -> String {
     let Some((address, rest)) = line.split_once(':') else {
         return line.trim_end().to_owned();
     };
@@ -91,7 +107,7 @@ fn normalize_objdump_line(line: &str, trampoline_range: Option<&std::ops::Range<
     // trampoline base so the snapshot is independent of the trampoline's exact
     // address. Other branches (and same-mnemonic branches that stay in the
     // original code) are left untouched.
-    if let Some(trampoline_range) = trampoline_range {
+    for trampoline_range in trampoline_ranges {
         for (i, token) in tokens.iter().enumerate() {
             if !matches!(*token, "jmp" | "b" | "bl") {
                 continue;

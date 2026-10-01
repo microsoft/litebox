@@ -373,6 +373,10 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 }
 
 /// Rewrite an ELF with explicit architecture-specific options.
+///
+/// AArch64 Linux guests serialize near islands and position-independent chunks.
+/// Their callback and runtime chunk addresses are always loader supplied; the
+/// `trampoline` callback argument applies only to the x86 format.
 pub fn hook_syscalls_in_elf_with_options(
     input_binary: &[u8],
     trampoline: Option<u64>,
@@ -441,6 +445,22 @@ pub fn hook_syscalls_in_elf_with_options(
             _ => return Ok(input_binary.to_vec()),
         };
 
+        if arch == Arch::Aarch64 {
+            if let Some(payload) = aarch64::elf_islands::ElfIslands::parse(input_binary)? {
+                payload.check_compatibility(
+                    options,
+                    if options.target_host() == TargetHost::MacOs {
+                        16384
+                    } else {
+                        4096
+                    },
+                )?;
+                return Ok(input_binary.to_vec());
+            }
+        } else if is_already_hooked(&*buf, arch) {
+            return Ok(input_binary.to_vec());
+        }
+
         let (text_sections, aarch64_code_sections) = if arch == Arch::Aarch64 {
             let metadata = match aarch64::elf_code_metadata(&file) {
                 Ok(metadata) => metadata,
@@ -459,11 +479,11 @@ pub fn hook_syscalls_in_elf_with_options(
             (sections, Vec::new())
         };
 
-        if is_already_hooked(&*buf, arch) {
-            return Ok(input_binary.to_vec());
-        }
-
-        let placement = find_addr_for_trampoline_code(&file, options.target_host())?;
+        let placement = if arch == Arch::X86_64 {
+            Some(find_addr_for_trampoline_code(&file, options.target_host())?)
+        } else {
+            None
+        };
 
         (arch, text_sections, aarch64_code_sections, placement)
     };
@@ -473,20 +493,20 @@ pub fn hook_syscalls_in_elf_with_options(
     // x86-only work (iced-x86 decoding would misinterpret AArch64 bytes).
     // See the `aarch64` module docs.
     if arch == Arch::Aarch64 {
-        return hook_aarch64_elf(
+        return aarch64::elf_islands::rewrite(
             input_binary,
             buf,
             aarch64::ScanSections {
                 executable: &text_sections,
                 code: &aarch64_code_sections,
             },
-            placement,
-            trampoline.unwrap_or(0),
             options,
         );
     }
 
-    let trampoline_base_addr = placement.addr();
+    let trampoline_base_addr = placement
+        .ok_or_else(|| Error::TrampolinePatchFailure("missing x86 placement".into()))?
+        .addr();
     let control_transfer_targets = get_control_transfer_targets(arch, &*buf, &text_sections)?;
     let mut trampoline_data = Vec::from(trampoline.unwrap_or(0).to_le_bytes());
     let patch_result = patch_syscalls_in_sections(
@@ -1031,125 +1051,6 @@ fn append_trampoline_footer(
         trampoline_size: trampoline_size as u64,
     };
     out.extend_from_slice(header.as_bytes());
-}
-
-/// Rewrites an AArch64 ELF, honoring `placement`.
-///
-/// The address is baked into every rewritten site, so it has to be chosen
-/// before the trampoline's size is known. The rewrite therefore runs at the
-/// preferred address and, if the trampoline outgrew the object's inter-segment
-/// hole, runs again at the unreserved fallback address.
-fn hook_aarch64_elf(
-    input_binary: &[u8],
-    buf: &mut [u8],
-    sections: aarch64::ScanSections<'_>,
-    placement: TrampolinePlacement,
-    callback: u64,
-    options: RewriteOptions,
-) -> Result<Vec<u8>> {
-    if let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement {
-        let mut attempt = buf.to_vec();
-        let out = hook_aarch64_elf_at(
-            input_binary,
-            &mut attempt,
-            sections,
-            addr,
-            Some(limit),
-            callback,
-            options,
-        );
-        // A gap that is too small, or too far from the text for a gate's
-        // branch to reach back, is a property of this address rather than of
-        // the binary, so both are worth retrying elsewhere.
-        if !matches!(
-            out,
-            Err(Error::TrampolineTooLarge { .. } | Error::UnpatchableSyscalls(_))
-        ) {
-            buf.copy_from_slice(&attempt);
-            return out;
-        }
-        // Fall through to retry at the fallback address. `buf` is still
-        // pristine: only `attempt` was patched, and a rescan of already-patched
-        // bytes would find no sites.
-    }
-    hook_aarch64_elf_at(
-        input_binary,
-        buf,
-        sections,
-        placement.fallback_addr(),
-        None,
-        callback,
-        options,
-    )
-}
-
-/// Rewrites an AArch64 ELF at a fixed trampoline address, appending the
-/// trampoline and trailing header.
-///
-/// `input_binary` is the original, unmodified ELF; `buf` is the mutable copy
-/// (patched in place by the arm64 module). `callback` is the absolute address
-/// stored in the trampoline's callback slot (0 when the loader fills it in
-/// later). `trampoline_limit` bounds how many bytes the trampoline may occupy,
-/// or is `None` where nothing bounds it; overshooting a bound is reported as
-/// [`Error::TrampolineTooLarge`].
-///
-/// Like the x86-64 path, a binary with no patch sites is emitted as the
-/// original bytes followed by a size-0 trampoline sentinel header (the arm64
-/// module signals this by returning `None`). Otherwise the output layout is
-/// `[patched ELF][padding to page boundary][trampoline code][header]`.
-fn hook_aarch64_elf_at(
-    input_binary: &[u8],
-    buf: &mut [u8],
-    sections: aarch64::ScanSections<'_>,
-    trampoline_base_addr: u64,
-    trampoline_limit: Option<u64>,
-    callback: u64,
-    options: RewriteOptions,
-) -> Result<Vec<u8>> {
-    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
-        buf,
-        sections.executable,
-        sections.code,
-        trampoline_base_addr,
-        callback,
-        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
-    )?
-    else {
-        // No patch sites: emit the original binary with a size-0 sentinel
-        // header so the loader knows there is no trampoline to map.
-        let mut out = input_binary.to_vec();
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0,
-            vaddr: 0,
-            trampoline_size: 0,
-        };
-        out.extend_from_slice(header.as_bytes());
-        return Ok(out);
-    };
-
-    // Build output: [patched ELF][padding to page boundary][trampoline][header].
-    let mut trampoline_data = outcome.trampoline;
-    let needed = trampoline_data.len() as u64;
-    if let Some(limit) = trampoline_limit
-        && needed > limit
-    {
-        return Err(Error::TrampolineTooLarge {
-            needed,
-            available: limit,
-        });
-    }
-    if !outcome.trapped_sites.is_empty() {
-        return Err(Error::UnpatchableSyscalls(format!(
-            "{} unpatchable AArch64 patch site(s) (SVC / TPIDR_EL0 / x18) at {:?}",
-            outcome.trapped_sites.len(),
-            outcome.trapped_sites,
-        )));
-    }
-    let mut out = buf.to_vec();
-    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
-
-    Ok(out)
 }
 
 /// (private) Get metadata for executable sections
@@ -1864,6 +1765,50 @@ pub fn patch_aarch64_code_segment_with_options_and_ranges(
     Ok((outcome.trampoline, outcome.trapped_sites))
 }
 
+/// Slot upper bound for the current mapping's bytes, not a cached ELF pre-scan.
+/// Conditional x18 exits count twice. Unsupported sites may consume no slots.
+pub fn aarch64_island_slots_for_mapping(
+    code: &[u8],
+    code_vaddr: u64,
+    ranges: &aarch64::CodeScanRanges,
+    options: RewriteOptions,
+) -> Result<usize> {
+    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
+    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
+    aarch64::island::count_sites(
+        code,
+        &executable,
+        &identified,
+        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+    )
+}
+
+/// Runtime AArch64 rewrite of one mapped code region through trampoline
+/// islands (see [`aarch64::island`]). Sites go to the nearest reachable island
+/// in `pairs` with a free slot; the rest are trapped. On error neither `code`
+/// nor `pairs` is modified.
+///
+/// The caller must write the grown island/chunk images, finalize the chunk's
+/// TLS fields, make both executable and synchronize the instruction stream
+/// before writing `code` back.
+pub fn patch_aarch64_code_segment_with_islands(
+    code: &mut [u8],
+    code_vaddr: u64,
+    ranges: &aarch64::CodeScanRanges,
+    pairs: &mut [aarch64::island::IslandPair],
+    options: RewriteOptions,
+) -> Result<aarch64::island::IslandRewrite> {
+    let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
+    let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
+    aarch64::island::rewrite_sections(
+        code,
+        &executable,
+        &identified,
+        pairs,
+        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+    )
+}
+
 fn scan_sections(
     code_vaddr: u64,
     ranges: &[Range<usize>],
@@ -2523,29 +2468,6 @@ mod tests {
                 fallback_addr: 0x220000
             },
         );
-        let input = 0xd4000001u32.to_le_bytes();
-        let mut code = input;
-        let sections = [TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: 4,
-        }];
-        let output = hook_aarch64_elf(
-            &input,
-            &mut code,
-            aarch64::ScanSections {
-                executable: &sections,
-                code: &sections,
-            },
-            placement,
-            0,
-            RewriteOptions::new(TargetHost::MacOs, true),
-        )
-        .unwrap();
-        let footer = TrampolineHeader64::read_from_bytes(&output[output.len() - 32..]).unwrap();
-        let vaddr = footer.vaddr;
-        assert_eq!(vaddr, 0x184000);
-
         // A larger 4 KiB gap need not contain any complete 16 KiB page.
         let segments = [
             seg(0, 0x1000, 0x1000, 0x1000),
@@ -2778,61 +2700,17 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_fallback_keeps_program_headers_unchanged() {
-        const ELF_HEADER_BYTES: usize = 64;
-        const PROGRAM_HEADER_BYTES: usize = 56;
-        let mut elf = vec![0u8; ELF_HEADER_BYTES + 2 * PROGRAM_HEADER_BYTES];
-        elf[..4].copy_from_slice(b"\x7fELF");
-        elf[4] = object::elf::ELFCLASS64;
-        elf[5] = object::elf::ELFDATA2LSB;
-        elf[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes());
-        elf[32..40].copy_from_slice(&(ELF_HEADER_BYTES as u64).to_le_bytes());
-        elf[54..56].copy_from_slice(&u16::try_from(PROGRAM_HEADER_BYTES).unwrap().to_le_bytes());
-        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
-
-        let text = ELF_HEADER_BYTES;
-        elf[text..text + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
-        elf[text + 4..text + 8]
-            .copy_from_slice(&(object::elf::PF_R | object::elf::PF_X).to_le_bytes());
-        elf[text + 32..text + 40].copy_from_slice(&0x180000u64.to_le_bytes());
-        elf[text + 40..text + 48].copy_from_slice(&0x180000u64.to_le_bytes());
-        elf[text + 48..text + 56].copy_from_slice(&0x10000u64.to_le_bytes());
-
-        let data = text + PROGRAM_HEADER_BYTES;
-        elf[data..data + 4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
-        elf[data + 4..data + 8]
-            .copy_from_slice(&(object::elf::PF_R | object::elf::PF_W).to_le_bytes());
-        elf[data + 8..data + 16].copy_from_slice(&0x18d2b0u64.to_le_bytes());
-        elf[data + 16..data + 24].copy_from_slice(&0x19d2b0u64.to_le_bytes());
-        elf[data + 40..data + 48].copy_from_slice(&0x70d20u64.to_le_bytes());
-        elf[data + 48..data + 56].copy_from_slice(&0x10000u64.to_le_bytes());
-        let phdrs_before = elf[ELF_HEADER_BYTES..].to_vec();
-        let code_offset = elf.len();
-        elf.extend((0..1025).flat_map(|_| 0xD400_0001u32.to_le_bytes()));
-        let input = elf.clone();
-        let section = TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: code_offset as u64,
-            size: (elf.len() - code_offset) as u64,
-        };
-        let out = hook_aarch64_elf_at(
-            &input,
-            &mut elf,
-            aarch64::ScanSections {
-                executable: &[section],
-                code: &[section],
-            },
-            0x220000,
-            None,
-            0,
-            RewriteOptions::default(),
-        )
-        .unwrap();
-
+    fn aarch64_islands_keep_program_headers_unchanged() {
+        let elf = aarch64_elf_with_one_svc();
+        let out = hook_syscalls_in_elf(&elf, None).unwrap();
+        assert_eq!(&elf[64..120], &out[64..120]);
         assert_eq!(
-            &out[ELF_HEADER_BYTES..ELF_HEADER_BYTES + phdrs_before.len()],
-            phdrs_before,
-            "fixed slots must not modify program headers"
+            aarch64::elf_islands::ElfIslands::parse(&out)
+                .unwrap()
+                .unwrap()
+                .pairs
+                .len(),
+            1
         );
     }
 
@@ -2866,63 +2744,6 @@ mod tests {
 
         elf.extend(0xD400_0001u32.to_le_bytes());
         elf
-    }
-
-    /// A gap the gates cannot branch back from is retried at the fallback
-    /// address rather than failing the whole binary.
-    #[test]
-    fn an_out_of_branch_range_gap_falls_back_instead_of_rejecting() {
-        /// Comfortably past a `B`'s +-128MiB reach from the text at 0x1000.
-        const UNREACHABLE_GAP: u64 = 0x2000_0000;
-
-        let mut elf = aarch64_elf_with_one_svc();
-        let input = elf.clone();
-        let text_file_offset = (elf.len() - 4) as u64;
-        let section = || TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: text_file_offset,
-            size: 4,
-        };
-
-        // The gap alone cannot work: every site is out of range and trapped.
-        let mut direct = elf.clone();
-        assert!(
-            matches!(
-                hook_aarch64_elf_at(
-                    &input,
-                    &mut direct,
-                    aarch64::ScanSections {
-                        executable: &[section()],
-                        code: &[section()],
-                    },
-                    UNREACHABLE_GAP,
-                    None,
-                    0,
-                    RewriteOptions::default(),
-                ),
-                Err(Error::UnpatchableSyscalls(_))
-            ),
-            "the gap has to be genuinely unreachable for this test to mean anything"
-        );
-
-        // Offered the same gap plus a reachable fallback, rewriting succeeds.
-        let placement = TrampolinePlacement::InsideLoadSpan {
-            addr: UNREACHABLE_GAP,
-            limit: 0x10000,
-            fallback_addr: 0x20000,
-        };
-        hook_aarch64_elf(
-            &input,
-            &mut elf,
-            aarch64::ScanSections {
-                executable: &[section()],
-                code: &[section()],
-            },
-            placement,
-            0,
-            RewriteOptions::default(),
-        )
-        .expect("the reachable fallback address must be retried");
     }
 
     /// x86-64 placement is deliberately unchanged; see `trampoline_addr_for`.
@@ -3014,37 +2835,6 @@ mod tests {
     #[test]
     fn trampoline_addr_reports_overflow() {
         assert!(trampoline_addr_for(u64::MAX - 1, 0x10000, object::elf::EM_AARCH64).is_err());
-    }
-
-    #[test]
-    fn aarch64_out_of_range_site_is_rejected_as_unpatchable() {
-        // A trampoline mapped 256MB above the text is outside the site's ±128MB
-        // branch reach, so the `SVC` is trapped and the rewrite is rejected,
-        // mirroring the x86-64 unpatchable-syscall contract.
-        let mut buf = 0xD400_0001u32.to_le_bytes().to_vec(); // SVC #0
-        let input = buf.clone();
-        let sections = vec![TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: buf.len() as u64,
-        }];
-        let placement = TrampolinePlacement::PastLastSegment { addr: 0x1000_0000 };
-        let err = hook_aarch64_elf(
-            &input,
-            &mut buf,
-            aarch64::ScanSections {
-                executable: &sections,
-                code: &sections,
-            },
-            placement,
-            0,
-            RewriteOptions::default(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::UnpatchableSyscalls(_)),
-            "expected UnpatchableSyscalls, got {err:?}"
-        );
     }
 
     /// The runtime (mmap-time) AArch64 entry point: a bare code region with no
@@ -3139,7 +2929,7 @@ mod tests {
     }
 
     #[test]
-    fn aarch64_runtime_and_aot_emit_identical_slots() {
+    fn aarch64_direct_api_and_core_emit_identical_slots() {
         let words = [0xD400_0001, 0xD53B_D040 | 9, 0xD51B_D040 | 5];
         let mut runtime_code = words
             .into_iter()

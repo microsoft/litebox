@@ -125,6 +125,9 @@ use crate::{
     text_sections,
 };
 
+pub mod elf_islands;
+pub mod island;
+
 #[derive(Clone, Copy)]
 pub(crate) struct ScanSections<'a> {
     pub(crate) executable: &'a [TextSectionInfo],
@@ -219,6 +222,20 @@ impl ElfCodeMetadata {
                 .and_then(|total| total.checked_add(gate_bytes))
                 .ok_or_else(|| Error::AddressOverflow("AArch64 trampoline size".into()))
         })
+    }
+
+    /// Island slots needed to rewrite every site of this ELF; see [`island`].
+    pub fn island_slot_upper_bound(
+        &self,
+        elf: &[u8],
+        options: crate::RewriteOptions,
+    ) -> Result<usize> {
+        island::count_sites(
+            elf,
+            &self.executable,
+            &self.identified,
+            RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+        )
     }
 
     /// Total executable and identified-code bytes represented by this metadata.
@@ -824,15 +841,49 @@ fn decode_x18_stack_writeback(word: u32) -> Option<X18StackWritebackLayout> {
     })
 }
 
+#[cfg(test)]
 fn classify_x18_stack_writeback(word: u32) -> Option<X18StackWriteback> {
+    classify_decoded_x18_stack_writeback(word, decode_instruction(word).as_ref())
+}
+
+fn classify_decoded_x18_stack_writeback(
+    word: u32,
+    instruction: Option<&DecodedInstruction>,
+) -> Option<X18StackWriteback> {
     let layout = decode_x18_stack_writeback(word)?;
     if layout.rt != X18_ENCODED && layout.rt2 != X18_ENCODED {
         return None;
     }
-    let instruction = decode_instruction(word)?;
-    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    let (scratch, anchor_scratch) = select_x18_scratches(instruction?)?;
     Some(X18StackWriteback {
         word: substitute_x18(word, scratch)?,
+        scratch,
+        anchor_scratch,
+        layout,
+    })
+}
+
+// Fixed-field counterpart for signal recognition. The only operands in this
+// narrow integer SP-writeback pair family are Rt, Rt2 and SP. Keep offline
+// admission decoder-backed; exhaustively compare the two in tests.
+fn structural_x18_stack_writeback(word: u32) -> Option<X18StackWriteback> {
+    let layout = decode_x18_stack_writeback(word)?;
+    if layout.rt != X18_ENCODED && layout.rt2 != X18_ENCODED {
+        return None;
+    }
+    let mut available = (7u8..=17)
+        .rev()
+        .filter(|r| *r != layout.rt && *r != layout.rt2);
+    let scratch = available.next()?;
+    let anchor_scratch = available.next()?;
+    let mut transformed = word;
+    for shift in [0, RT2_SHIFT] {
+        if (word >> shift) & REG_MASK == u32::from(X18) {
+            transformed = (transformed & !(REG_MASK << shift)) | (u32::from(scratch) << shift);
+        }
+    }
+    Some(X18StackWriteback {
+        word: transformed,
         scratch,
         anchor_scratch,
         layout,
@@ -1027,11 +1078,11 @@ enum ExclusiveBoundary {
     Store,
 }
 
-fn exclusive_boundary(word: u32) -> Option<ExclusiveBoundary> {
+fn exclusive_boundary(instruction: Option<&DecodedInstruction>) -> Option<ExclusiveBoundary> {
     use DecodedOpcode::{LDAXP, LDAXR, LDAXRB, LDAXRH, LDXP, LDXR, LDXRB, LDXRH};
     use DecodedOpcode::{STLXP, STLXR, STLXRB, STLXRH, STXP, STXR, STXRB, STXRH};
 
-    let opcode = decode_instruction(word)?.opcode;
+    let opcode = instruction?.opcode;
     if matches!(
         opcode,
         LDAXP | LDAXR | LDAXRB | LDAXRH | LDXP | LDXR | LDXRB | LDXRH
@@ -1067,7 +1118,15 @@ fn classify_decoded_x18(instruction: &DecodedInstruction) -> DecodedX18Classific
     DecodedX18Classification::Ordinary
 }
 
+#[cfg(test)]
 fn classify_x18(word: u32) -> X18Classification {
+    classify_x18_with_decoded(word, decode_instruction(word).as_ref())
+}
+
+fn classify_x18_with_decoded(
+    word: u32,
+    instruction: Option<&DecodedInstruction>,
+) -> X18Classification {
     if let Some(kind) = [
         (Insn::Br(18), X18IndirectBranchKind::Br),
         (Insn::Blr(18), X18IndirectBranchKind::Blr),
@@ -1085,7 +1144,7 @@ fn classify_x18(word: u32) -> X18Classification {
             X18Unsupported::EncodingLayout,
         ));
     }
-    let Some(instruction) = decode_instruction(word) else {
+    let Some(instruction) = instruction else {
         return if has_possible_x18_field(word) {
             X18Classification::X18(X18TransformResult::Unsupported(
                 X18Unsupported::DecodeFailure,
@@ -1094,13 +1153,13 @@ fn classify_x18(word: u32) -> X18Classification {
             X18Classification::None
         };
     };
-    match classify_decoded_x18(&instruction) {
+    match classify_decoded_x18(instruction) {
         DecodedX18Classification::None => X18Classification::None,
         DecodedX18Classification::Unsupported(reason) => {
             X18Classification::X18(X18TransformResult::Unsupported(reason))
         }
-        DecodedX18Classification::Ordinary if x18_fixed_gate_can_execute(&instruction) => {
-            select_x18_scratches(&instruction)
+        DecodedX18Classification::Ordinary if x18_fixed_gate_can_execute(instruction) => {
+            select_x18_scratches(instruction)
                 .and_then(|(scratch, anchor_scratch)| {
                     substitute_x18(word, scratch).map(|word| (word, scratch, anchor_scratch))
                 })
@@ -1124,8 +1183,11 @@ fn classify_x18(word: u32) -> X18Classification {
     }
 }
 
-fn classify_x18_conditional_branch(word: u32, vaddr: u64) -> Option<X18CompareBranch> {
-    let instruction = decode_instruction(word)?;
+fn classify_x18_conditional_branch(
+    instruction: Option<&DecodedInstruction>,
+    vaddr: u64,
+) -> Option<X18CompareBranch> {
+    let instruction = instruction?;
     let (width, offset, test_bit) = match instruction.operands {
         [
             Operand::Register(width, X18),
@@ -1160,7 +1222,7 @@ fn classify_x18_conditional_branch(word: u32, vaddr: u64) -> Option<X18CompareBr
         (DecodedOpcode::TBNZ, _, Some(bit)) => X18BranchKind::Tbnz(bit),
         _ => return None,
     };
-    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    let (scratch, anchor_scratch) = select_x18_scratches(instruction)?;
     Some(X18CompareBranch {
         target: vaddr.checked_add_signed(offset)?,
         scratch,
@@ -1169,8 +1231,12 @@ fn classify_x18_conditional_branch(word: u32, vaddr: u64) -> Option<X18CompareBr
     })
 }
 
-fn classify_pc_relative_x18(word: u32, vaddr: u64) -> Option<X18Substitution> {
-    let instruction = decode_instruction(word)?;
+fn classify_pc_relative_x18(
+    word: u32,
+    instruction: Option<&DecodedInstruction>,
+    vaddr: u64,
+) -> Option<X18Substitution> {
+    let instruction = instruction?;
     let [
         Operand::Register(_, X18),
         Operand::PCOffset(offset),
@@ -1183,7 +1249,7 @@ fn classify_pc_relative_x18(word: u32, vaddr: u64) -> Option<X18Substitution> {
     if !matches!(instruction.opcode, DecodedOpcode::ADR | DecodedOpcode::ADRP) {
         return None;
     }
-    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    let (scratch, anchor_scratch) = select_x18_scratches(instruction)?;
     let target = if instruction.opcode == DecodedOpcode::ADR {
         vaddr.checked_add_signed(offset)?
     } else {
@@ -1201,8 +1267,8 @@ fn classify_pc_relative_x18(word: u32, vaddr: u64) -> Option<X18Substitution> {
     })
 }
 
-fn classify_adr_x18(word: u32, vaddr: u64) -> Option<X18Adr> {
-    let instruction = decode_instruction(word)?;
+fn classify_adr_x18(instruction: Option<&DecodedInstruction>, vaddr: u64) -> Option<X18Adr> {
+    let instruction = instruction?;
     let [
         Operand::Register(yaxpeax_arm::armv8::a64::SizeCode::X, X18),
         Operand::PCOffset(offset),
@@ -1215,7 +1281,7 @@ fn classify_adr_x18(word: u32, vaddr: u64) -> Option<X18Adr> {
     if instruction.opcode != DecodedOpcode::ADR {
         return None;
     }
-    let (scratch, anchor_scratch) = select_x18_scratches(&instruction)?;
+    let (scratch, anchor_scratch) = select_x18_scratches(instruction)?;
     Some(X18Adr {
         target: vaddr.checked_add_signed(offset)?,
         scratch,
@@ -2435,6 +2501,7 @@ enum Opcode {
     Movz = 0xD280_0000,
     SubImm = 0xD100_0000,
     AddImm = 0x9100_0000,
+    AddReg = 0x8B00_0000,
     AndImm = 0x9200_0000,
     StrUimm = 0xF900_0000,
     LdrUimm = 0xF940_0000,
@@ -2644,6 +2711,12 @@ enum Insn {
         rn: u8,
         imm12: u16,
     },
+    /// `ADD Xd, Xn, Xm` (64-bit, shifted register with zero shift).
+    AddReg {
+        rd: u8,
+        rn: u8,
+        rm: u8,
+    },
     /// `AND Xd, Xn, #imm`.
     AndImm {
         rd: u8,
@@ -2749,6 +2822,12 @@ impl Insn {
             Insn::SubSp(imm12) => data_imm12(Opcode::SubImm, SP, SP, imm12),
             Insn::AddSp(imm12) => data_imm12(Opcode::AddImm, SP, SP, imm12),
             Insn::AddImm { rd, rn, imm12 } => data_imm12(Opcode::AddImm, rd, rn, imm12),
+            Insn::AddReg { rd, rn, rm } => Some(
+                Opcode::AddReg.bits()
+                    | (u32::from(rm) << 16)
+                    | (u32::from(rn) << RN_SHIFT)
+                    | u32::from(rd),
+            ),
             Insn::AndImm { rd, rn, imm } => logical_imm64(Opcode::AndImm, rd, rn, imm),
             Insn::StrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::StrUimm, rt, rn, imm_bytes),
             Insn::LdrUimm { rt, rn, imm_bytes } => ldst_uimm12(Opcode::LdrUimm, rt, rn, imm_bytes),
@@ -3038,6 +3117,22 @@ fn find_patch_sites_with_code_ranges(
     buf: &[u8],
     config: RewriteConfig,
 ) -> Result<Vec<PatchSite>> {
+    find_patch_sites_with_decoder(
+        executable_sections,
+        code_sections,
+        buf,
+        config,
+        decode_instruction,
+    )
+}
+
+fn find_patch_sites_with_decoder(
+    executable_sections: &[TextSectionInfo],
+    code_sections: &[TextSectionInfo],
+    buf: &[u8],
+    config: RewriteConfig,
+    mut decode: impl FnMut(u32) -> Option<DecodedInstruction>,
+) -> Result<Vec<PatchSite>> {
     let mut sites = Vec::new();
 
     for section in executable_sections {
@@ -3085,8 +3180,11 @@ fn find_patch_sites_with_code_ranges(
             if !known_code || !was_known_code {
                 inside_exclusive_sequence = false;
             }
+            // Share the original word's decode across admission checks. Substitution
+            // still independently decodes transformed bytes to verify their semantics.
+            let decoded = known_code.then(|| decode(insn)).flatten();
             if known_code {
-                let exclusive_boundary = exclusive_boundary(insn);
+                let exclusive_boundary = exclusive_boundary(decoded.as_ref());
                 if exclusive_boundary == Some(ExclusiveBoundary::Load) {
                     inside_exclusive_sequence = true;
                 } else if exclusive_boundary == Some(ExclusiveBoundary::Store) {
@@ -3139,16 +3237,20 @@ fn find_patch_sites_with_code_ranges(
                     PatchKind::MrsTpidr(rd)
                 }
             } else if config.virtualize_x18 && known_code {
-                if let Some(pair) = classify_x18_stack_writeback(insn) {
+                if let Some(pair) = classify_decoded_x18_stack_writeback(insn, decoded.as_ref()) {
                     PatchKind::X18StackWriteback(pair)
-                } else if let Some(branch) = classify_x18_conditional_branch(insn, vaddr) {
+                } else if let Some(branch) =
+                    classify_x18_conditional_branch(decoded.as_ref(), vaddr)
+                {
                     PatchKind::X18CompareBranch(branch)
-                } else if let Some(adr) = classify_adr_x18(insn, vaddr) {
+                } else if let Some(adr) = classify_adr_x18(decoded.as_ref(), vaddr) {
                     PatchKind::X18Adr(adr)
-                } else if let Some(transformation) = classify_pc_relative_x18(insn, vaddr) {
+                } else if let Some(transformation) =
+                    classify_pc_relative_x18(insn, decoded.as_ref(), vaddr)
+                {
                     PatchKind::X18(X18TransformResult::Supported(transformation))
                 } else {
-                    match classify_x18(insn) {
+                    match classify_x18_with_decoded(insn, decoded.as_ref()) {
                         X18Classification::None => continue,
                         X18Classification::Branch(branch) => PatchKind::X18Branch(branch),
                         X18Classification::X18(result) => PatchKind::X18(result),
@@ -4635,7 +4737,7 @@ fn validate_gate_slot_inner_with_layout(
             if layout.rt2 == scratch {
                 original = (original & !(REG_MASK << RT2_SHIFT)) | (u32::from(X18) << RT2_SHIFT);
             }
-            let Some(derived) = classify_x18_stack_writeback(original) else {
+            let Some(derived) = structural_x18_stack_writeback(original) else {
                 return false;
             };
             let mode = (transformed >> 23) & 3;
@@ -7194,6 +7296,75 @@ mod tests {
     }
 
     #[test]
+    fn patch_site_scan_shares_one_decode_per_known_word() {
+        let words = [
+            0xd503_201f_u32, // nop
+            0x4eb2_1e50,     // vector x18 field is not a scalar register
+            0x3500_0332,     // cbnz w18, +0x64
+            0x1000_0072,     // adr x18, +0xc
+            0x9000_0012,     // adrp x18, current page
+            0xaa00_03f2,     // mov x18, x0
+            0xd51b_4412,     // msr fpcr, x18: decoder truncation guard
+            0xffff_fff2,     // undecodable, possible x18 field: fail closed
+            0xffff_ffff,     // undecodable, no possible x18 field
+            SVC_0,           // mandatory site even outside known code
+            0xaa00_03f2,     // unknown executable data: not an x18 site
+        ];
+        let bytes: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let executable = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: bytes.len() as u64,
+        }];
+        let code = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: 9 * INSN_BYTES_U64,
+        }];
+        let mut decoded_words = Vec::new();
+        let sites = find_patch_sites_with_decoder(
+            &executable,
+            &code,
+            &bytes,
+            x18_config(Host::Linux),
+            |word| {
+                decoded_words.push(word);
+                decode_instruction(word)
+            },
+        )
+        .unwrap();
+        assert_eq!(decoded_words, words[..9]);
+        assert_eq!(
+            sites.iter().map(|site| site.vaddr).collect::<Vec<_>>(),
+            [0x1008, 0x100c, 0x1010, 0x1014, 0x1018, 0x101c, 0x1024]
+        );
+        assert!(
+            matches!(sites[0].kind, PatchKind::X18CompareBranch(branch) if branch.target == 0x106c)
+        );
+        assert!(matches!(sites[1].kind, PatchKind::X18Adr(adr) if adr.target == 0x1018));
+        assert!(
+            matches!(sites[2].kind, PatchKind::X18(X18TransformResult::Supported(t)) if t.pc_relative == Some(X18PcRelative::Adrp(0x1000)))
+        );
+        assert!(matches!(
+            sites[3].kind,
+            PatchKind::X18(X18TransformResult::Supported(_))
+        ));
+        assert_eq!(
+            sites[4].kind,
+            PatchKind::X18(X18TransformResult::Unsupported(
+                X18Unsupported::EncodingLayout
+            ))
+        );
+        assert_eq!(
+            sites[5].kind,
+            PatchKind::X18(X18TransformResult::Unsupported(
+                X18Unsupported::DecodeFailure
+            ))
+        );
+        assert_eq!(sites[6].kind, PatchKind::Svc);
+    }
+
+    #[test]
     fn unknown_executable_bytes_scan_mandatory_sites_but_not_heuristic_x18() {
         let words: [u32; 2] = [0xd400_0001, 0x5d56_4f48];
         let bytes = words
@@ -8608,5 +8779,36 @@ mod tests {
         let immediate = u32::from(byte_offset / GUEST_TPIDR_OFFSET_ALIGN) << LDST_UIMM12_IMM_SHIFT;
         trampoline[offset..offset + 4]
             .copy_from_slice(&((word & !LDST_UIMM12_IMM_MASK) | immediate).to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod signal_stack_pair_tests {
+    use super::*;
+
+    #[test]
+    fn structural_pair_validation_matches_offline_decoder_for_all_fields() {
+        for width in [0u32, 1] {
+            for mode in [1u32, 3] {
+                for load in [0u32, 1] {
+                    for other in 0..32u32 {
+                        for (rt, rt2) in [(18, other), (other, 18)] {
+                            for imm in 0..128u32 {
+                                let raw = 0x2800_0000
+                                    | (width << 31)
+                                    | (mode << 23)
+                                    | (load << 22)
+                                    | (imm << 15)
+                                    | (rt2 << 10)
+                                    | (31 << 5)
+                                    | rt;
+                                let offline = classify_x18_stack_writeback(raw);
+                                assert_eq!(structural_x18_stack_writeback(raw), offline);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
