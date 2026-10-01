@@ -408,7 +408,7 @@ pub(super) fn decode_set_status_flags_request(
     })
 }
 
-fn decode_open_flags(decoder: &mut Decoder<'_>) -> Result<FileOpenFlags, WireError> {
+pub(super) fn decode_open_flags(decoder: &mut Decoder<'_>) -> Result<FileOpenFlags, WireError> {
     FileOpenFlags::from_bits(decoder.u16()?).ok_or(WireError::InvalidTag)
 }
 

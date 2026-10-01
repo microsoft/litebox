@@ -667,7 +667,7 @@ mod test {
         let (producer, consumer) = task
             .global
             .pipes
-            .create_pipe(2, litebox::pipes::Flags::empty(), None)
+            .create_pipe(2, litebox_broker_protocol::fs::FileOpenFlags::NONE, None)
             .unwrap();
         let consumer = Arc::new(consumer);
         let reader = super::EpollDescriptor::Pipe(Arc::clone(&consumer));

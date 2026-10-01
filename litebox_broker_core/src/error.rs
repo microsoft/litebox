@@ -33,6 +33,20 @@ pub enum BrokerError {
     UnsupportedOperation,
 }
 
+impl BrokerError {
+    /// Returns the error for an operation that would block on an object whose
+    /// [`FileOpenFlags::NONBLOCKING`] status flag is `nonblocking`.
+    ///
+    /// [`FileOpenFlags::NONBLOCKING`]: litebox_broker_protocol::fs::FileOpenFlags::NONBLOCKING
+    pub(crate) const fn would_block(nonblocking: bool) -> Self {
+        if nonblocking {
+            Self::NonBlockingWouldBlock
+        } else {
+            Self::WouldBlock
+        }
+    }
+}
+
 impl From<BrokerError> for ErrorCode {
     fn from(error: BrokerError) -> Self {
         match error {

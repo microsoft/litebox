@@ -1702,7 +1702,7 @@ mod tests {
         parent.complete_start().unwrap();
         let parent_sink = readiness_sink();
         let child_sink = readiness_sink();
-        let (reader, writer) = crate::pipe::create(&parent, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&parent, 4, 2, FileOpenFlags::NONE).unwrap();
         let CreatedProcess { identity, .. } =
             parent.allocate_child_process(parent_sink.clone()).unwrap();
         // Sharing only the write end still lets the child wake the parent's reader.
@@ -1785,7 +1785,7 @@ mod tests {
         );
         assert_eq!(root.check_readiness(handle), Ok(ReadinessFlags::default()));
         child.complete_start().unwrap();
-        let (read, write) = crate::pipe::create(&root, 1, 1).unwrap();
+        let (read, write) = crate::pipe::create(&root, 1, 1, FileOpenFlags::NONE).unwrap();
         root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
             .unwrap();
         root.close_object_reference(write).unwrap();
@@ -1845,7 +1845,7 @@ mod tests {
         let sink = readiness_sink();
         let (child, handle) = root.create_child_process(sink.clone()).unwrap();
         child.complete_start().unwrap();
-        let (read, write) = crate::pipe::create(&root, 1, 1).unwrap();
+        let (read, write) = crate::pipe::create(&root, 1, 1, FileOpenFlags::NONE).unwrap();
         root.duplicate_object_reference_to(write, &child, ObjectRights::WRITE)
             .unwrap();
         root.close_object_reference(write).unwrap();
@@ -2819,7 +2819,7 @@ mod tests {
         );
         assert_eq!(target.close_object_reference(duplicated_event), Ok(()));
 
-        let (reader, writer) = crate::pipe::create(&source, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&source, 4, 2, FileOpenFlags::NONE).unwrap();
         let duplicated_writer = source
             .duplicate_object_reference_to(writer, &target, ObjectRights::WRITE)
             .unwrap();
@@ -3218,7 +3218,7 @@ mod tests {
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
-            crate::pipe::create(&process, 4, 2),
+            crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(process.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
@@ -3258,11 +3258,11 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
-            crate::pipe::create(&process, 5, 2),
+            crate::pipe::create(&process, 5, 2, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-        let (reader, writer) = crate::pipe::create(&process, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
             process.check_readiness(reader),
@@ -3305,7 +3305,7 @@ mod tests {
         let process = broker
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let (reader, writer) = crate::pipe::create(&process, 4, 2).unwrap();
+        let (reader, writer) = crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE).unwrap();
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(process.close_object_reference(reader), Ok(()));
         assert_eq!(crate::pipe::write(&process, writer, &[]), Ok(0));
@@ -3434,10 +3434,15 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
 
-        let (greedy_reader, greedy_writer) =
-            crate::pipe::create(&greedy, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
+        let (greedy_reader, greedy_writer) = crate::pipe::create(
+            &greedy,
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64,
+            2,
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
         assert_eq!(
-            crate::pipe::create(&greedy, 1, 1),
+            crate::pipe::create(&greedy, 1, 1, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
@@ -3445,8 +3450,13 @@ mod tests {
             TEST_MAX_PIPE_CAPACITY_PER_PROCESS
         );
 
-        let (neighbor_reader, neighbor_writer) =
-            crate::pipe::create(&neighbor, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
+        let (neighbor_reader, neighbor_writer) = crate::pipe::create(
+            &neighbor,
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64,
+            2,
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
         assert_eq!(
             broker.reserved_pipe_capacity.load(Ordering::Relaxed),
             TEST_MAX_PIPE_CAPACITY
@@ -3456,7 +3466,7 @@ mod tests {
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
         assert_eq!(
-            crate::pipe::create(&latecomer, 1, 1),
+            crate::pipe::create(&latecomer, 1, 1, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(latecomer.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
@@ -3475,8 +3485,13 @@ mod tests {
         let process = broker
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let (reader, _writer) =
-            crate::pipe::create(&process, TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64, 2).unwrap();
+        let (reader, _writer) = crate::pipe::create(
+            &process,
+            TEST_MAX_PIPE_CAPACITY_PER_PROCESS as u64,
+            2,
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
         let object = process
             .authorized_object(reader, ObjectRights::WAIT)
             .unwrap();
@@ -3509,7 +3524,7 @@ mod tests {
             *next_reference_handle = u64::MAX - 1;
         }
         assert_eq!(
-            crate::pipe::create(&process, 4, 2),
+            crate::pipe::create(&process, 4, 2, FileOpenFlags::NONE),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(*broker.next_reference_handle.read(), u64::MAX - 1);

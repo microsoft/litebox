@@ -68,19 +68,23 @@ int main(int argc, char **argv) {
     printf("stdout-pipe code=%d eof=%d\n", exit_code(child), n == 0);
     printf("%s", text);
 
-    // The child reads its stdin, whose status flags it inherits, from a pipe the parent fills.
+    // The child reads its stdin, whose status flags it shares, from a pipe the parent fills.
     int in[2];
     if (pipe2(in, O_CLOEXEC) != 0 || fcntl(in[0], F_SETFL, O_NONBLOCK) != 0) {
         perror("pipe2");
         return 3;
     }
     child = spawn_with(path, "cat", in[0], 0);
-    close(in[0]);
     // Let the child block waiting for input, which only the parent's writes can end.
     usleep(100 * 1000);
     ssize_t written = write(in[1], stream, STREAM_SIZE);
     close(in[1]);
-    printf("stdin-pipe code=%d written=%zd\n", exit_code(child), written);
+    int code = exit_code(child);
+    // The child clears O_NONBLOCK on its stdin before exiting.
+    int flags = fcntl(in[0], F_GETFL);
+    close(in[0]);
+    printf("stdin-pipe code=%d written=%zd shared_setfl=%d\n", code, written,
+           flags >= 0 && (flags & O_NONBLOCK) == 0);
 
     // A reader that exits early ends the parent's blocked write.
     signal(SIGPIPE, SIG_IGN);

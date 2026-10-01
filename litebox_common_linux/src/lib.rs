@@ -157,17 +157,6 @@ bitflags::bitflags! {
     }
 }
 
-impl From<litebox::pipes::Flags> for OFlags {
-    fn from(flags: litebox::pipes::Flags) -> Self {
-        let mut oflags = OFlags::empty();
-        oflags.set(
-            OFlags::NONBLOCK,
-            flags.contains(litebox::pipes::Flags::NON_BLOCKING),
-        );
-        oflags
-    }
-}
-
 /// Encoding for ioctl commands.
 pub mod ioctl {
     /// The number of bits allocated for the ioctl command number field.

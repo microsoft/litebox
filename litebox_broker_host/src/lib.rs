@@ -1219,16 +1219,19 @@ fn handle_pipe_request<Memory: SharedMemory>(
     shared_buffers: &SharedBufferPool<Memory>,
 ) -> RequestResult<PipeResponse> {
     match request {
-        PipeRequest::Create(request) => {
-            litebox_broker_core::pipe::create(process, request.capacity, request.atomic_write_size)
-                .map(|(read_handle, write_handle)| {
-                    PipeResponse::Create(CreatePipeResponse {
-                        read_handle,
-                        write_handle,
-                    })
-                })
-                .map_err(RequestFailure::from)
-        }
+        PipeRequest::Create(request) => litebox_broker_core::pipe::create(
+            process,
+            request.capacity,
+            request.atomic_write_size,
+            request.flags,
+        )
+        .map(|(read_handle, write_handle)| {
+            PipeResponse::Create(CreatePipeResponse {
+                read_handle,
+                write_handle,
+            })
+        })
+        .map_err(RequestFailure::from),
         PipeRequest::Read(request) => {
             validate_shared_buffer(request.buffer, MAX_PIPE_TRANSFER_SIZE)?;
             let data =
@@ -2335,6 +2338,7 @@ mod tests {
                 PipeRequest::Create(CreatePipeRequest {
                     capacity: 64,
                     atomic_write_size: 16,
+                    flags: FileOpenFlags::NONE,
                 }),
             )))]),
         );
@@ -2510,6 +2514,7 @@ mod tests {
             BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                 capacity: 64,
                 atomic_write_size: 16,
+                flags: FileOpenFlags::NONE,
             })),
             &shared_buffers,
         );
@@ -2850,9 +2855,11 @@ mod tests {
         let shared_buffers = Arc::new(SharedBufferPool::new(memory, SHARED_BUFFER_LAYOUT).unwrap());
         let association = test_association(broker, Arc::clone(&shared_buffers));
         let (_, first_write_handle) =
-            litebox_broker_core::pipe::create(&association.process, 64, 16).unwrap();
+            litebox_broker_core::pipe::create(&association.process, 64, 16, FileOpenFlags::NONE)
+                .unwrap();
         let (_, second_write_handle) =
-            litebox_broker_core::pipe::create(&association.process, 64, 16).unwrap();
+            litebox_broker_core::pipe::create(&association.process, 64, 16, FileOpenFlags::NONE)
+                .unwrap();
 
         std::thread::scope(|scope| {
             let first_association = &association;

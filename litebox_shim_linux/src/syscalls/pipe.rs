@@ -3,33 +3,28 @@
 
 //! Linux ABI glue for the generic LiteBox pipe subsystem.
 //!
-//! `litebox::pipes` owns the in-process pipe buffer, endpoint, and readiness
-//! mechanics. This module owns Linux-specific presentation: `pipe2` flags,
-//! raw-fd metadata, `fcntl` status flags, and errno mapping.
+//! `litebox::pipes` owns the pipe endpoint and readiness mechanics, and the
+//! broker owns each end's status flags. This module owns Linux-specific
+//! presentation: `pipe2` flags, `fcntl` status flags, and errno mapping.
 
 use core::num::NonZero;
 
 use litebox::{
     event::wait::WaitContext,
-    fd::MetadataError,
-    pipes::{Flags, HalfPipeType, PipeFd},
+    pipes::{HalfPipeType, PipeFd},
 };
-use litebox_broker_protocol::{ObjectHandle, fs::FileMode as Mode};
+use litebox_broker_protocol::{
+    ObjectHandle,
+    fs::{FileMode as Mode, FileOpenFlags},
+};
 use litebox_common_linux::{
     FileDescriptorFlags, InodeType, OFlags, errno::Errno, program_startup::InheritedFdKind,
 };
 
+use super::file::status_flags_change;
 use crate::{GlobalState, ShimPlatform};
 
 const DEFAULT_PIPE_BUF_SIZE: usize = 64 * 1024;
-
-/// Status flags for Linux pipe file descriptions.
-///
-/// Access mode and Linux status flags are shim ABI state. The generic pipe
-/// backend only needs the subset that affects pipe behavior, such as
-/// nonblocking mode.
-#[derive(Clone)]
-pub(crate) struct PipeStatusFlags(OFlags);
 
 /// Both ends of a freshly created Linux pipe.
 ///
@@ -45,38 +40,26 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         &self,
         flags: OFlags,
     ) -> Result<LinuxPipeEnds<Platform>, Errno> {
-        let (pipe_flags, cloexec) = {
-            let mut pipe_flags = Flags::empty();
-            if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement())
-            {
-                return Err(Errno::EINVAL);
-            }
-            pipe_flags.set(Flags::NON_BLOCKING, flags.contains(OFlags::NONBLOCK));
-            if flags.contains(OFlags::DIRECT) {
-                todo!("O_DIRECT not supported");
-            }
-            (pipe_flags, flags.contains(OFlags::CLOEXEC))
+        if flags.intersects((OFlags::CLOEXEC | OFlags::NONBLOCK | OFlags::DIRECT).complement()) {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(OFlags::DIRECT) {
+            todo!("O_DIRECT not supported");
+        }
+        let status_flags = if flags.contains(OFlags::NONBLOCK) {
+            FileOpenFlags::NONBLOCKING
+        } else {
+            FileOpenFlags::NONE
         };
 
         let (writer, reader) = self.pipes.create_pipe(
             DEFAULT_PIPE_BUF_SIZE,
-            pipe_flags,
+            status_flags,
             // See `man 7 pipe` for `PIPE_BUF`. On Linux, this is 4096.
             NonZero::new(4096),
         )?;
 
-        let initial_status = OFlags::from(pipe_flags);
-        {
-            let mut dt = self.litebox.descriptor_table_mut();
-            let old =
-                dt.set_entry_metadata(&writer, PipeStatusFlags(initial_status | OFlags::WRONLY));
-            assert!(old.is_none());
-            let old =
-                dt.set_entry_metadata(&reader, PipeStatusFlags(initial_status | OFlags::RDONLY));
-            assert!(old.is_none());
-        }
-
-        if cloexec {
+        if flags.contains(OFlags::CLOEXEC) {
             let mut dt = self.litebox.descriptor_table_mut();
             let None = dt.set_fd_metadata(&writer, FileDescriptorFlags::FD_CLOEXEC) else {
                 unreachable!()
@@ -111,35 +94,17 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         self.pipes.write(cx, fd, buf).map_err(Errno::from)
     }
 
-    pub(crate) fn linux_pipe_status_flags(&self, fd: &PipeFd<Platform>) -> Result<OFlags, Errno> {
-        self.litebox
-            .descriptor_table()
-            .with_metadata(fd, |PipeStatusFlags(flags)| {
-                *flags & OFlags::STATUS_FLAGS_MASK
-            })
-            .map_err(metadata_to_errno)
-    }
-
+    /// Changes the status flags in `mask` of the pipe end at `fd` to their values in `flags`,
+    /// ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
     pub(crate) fn set_linux_pipe_status_flags(
         &self,
         fd: &PipeFd<Platform>,
+        mask: OFlags,
         flags: OFlags,
-        setfl_mask: OFlags,
     ) -> Result<(), Errno> {
-        self.pipes
-            .update_flags(fd, Flags::NON_BLOCKING, flags.intersects(OFlags::NONBLOCK))
-            .map_err(Errno::from)?;
-
-        self.litebox
-            .descriptor_table_mut()
-            .with_metadata_mut(fd, |PipeStatusFlags(current)| {
-                let diff = (*current & setfl_mask) ^ flags;
-                if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
-                    log_unsupported!("unsupported flags");
-                }
-                current.toggle(diff);
-            })
-            .map_err(metadata_to_errno)
+        let (mask, flags) = status_flags_change(mask, flags);
+        self.pipes.set_status_flags(fd, mask, flags)?;
+        Ok(())
     }
 
     pub(crate) fn linux_pipe_mode_bits(&self, fd: &PipeFd<Platform>) -> Result<u32, Errno> {
@@ -155,43 +120,17 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         &self,
         fd: &PipeFd<Platform>,
     ) -> Result<InheritedFdKind, Errno> {
-        let status_flags = self
-            .litebox
-            .descriptor_table()
-            .with_metadata(fd, |PipeStatusFlags(flags)| *flags)
-            .map_err(metadata_to_errno)?;
         Ok(InheritedFdKind::Pipe {
             endpoint: self.pipes.half_pipe_type(fd)?,
-            status_flags,
         })
     }
 
-    /// Adopts a pipe end this runner inherited across `execve` with `status_flags`.
+    /// Adopts a pipe end this runner inherited across `execve`.
     pub(crate) fn adopt_inherited_linux_pipe(
         &self,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,
-        status_flags: OFlags,
     ) -> Result<PipeFd<Platform>, litebox::process::ProcessError> {
-        let mut flags = Flags::empty();
-        flags.set(Flags::NON_BLOCKING, status_flags.contains(OFlags::NONBLOCK));
-        let fd = self
-            .litebox
-            .adopt_inherited_pipe(handle, endpoint_type, flags)?;
-        let old = self
-            .litebox
-            .descriptor_table_mut()
-            .set_entry_metadata(&fd, PipeStatusFlags(status_flags));
-        debug_assert!(old.is_none());
-        Ok(fd)
-    }
-}
-
-fn metadata_to_errno(err: MetadataError) -> Errno {
-    match err {
-        MetadataError::ClosedFd => Errno::EBADF,
-        MetadataError::NoSuchMetadata => {
-            unreachable!("Linux pipe descriptors always carry PipeStatusFlags")
-        }
+        self.litebox.adopt_inherited_pipe(handle, endpoint_type)
     }
 }

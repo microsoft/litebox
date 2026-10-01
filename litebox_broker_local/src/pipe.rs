@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{BrokerOperation, BrokerResult, PipeRequest, PipeResponse};
 use litebox_broker_protocol::pipe::{
     CreatePipeRequest, CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeRequest,
@@ -24,10 +25,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         &self,
         capacity: u64,
         atomic_write_size: u64,
+        flags: FileOpenFlags,
     ) -> Result<CreatePipeResponse, Channel::Error> {
         let response = self.request_pipe(PipeRequest::Create(CreatePipeRequest {
             capacity,
             atomic_write_size,
+            flags,
         }))?;
         let PipeResponse::Create(response) = response else {
             panic!("broker returned unexpected pipe create response: {response:?}");
@@ -162,7 +165,7 @@ mod tests {
         let write_buffer = sequence(2, 3);
         let read_buffer = sequence(4, 3);
 
-        local.create_pipe(64, 16).unwrap();
+        local.create_pipe(64, 16, FileOpenFlags::NONE).unwrap();
         assert_eq!(
             local
                 .write_pipe(write_handle, write_buffer, &[1, 2, 3])
@@ -190,6 +193,7 @@ mod tests {
                 BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                     capacity: 64,
                     atomic_write_size: 16,
+                    flags: FileOpenFlags::NONE,
                 })),
                 BrokerOperation::Pipe(PipeRequest::Write(WritePipeRequest {
                     handle: write_handle,

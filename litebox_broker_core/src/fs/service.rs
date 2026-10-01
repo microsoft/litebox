@@ -241,7 +241,7 @@ where
         };
         let read = match read {
             Ok(read) => read,
-            Err(ReadError::WouldBlock) => return Err(would_block(nonblocking)),
+            Err(ReadError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
             Err(error) => return Ok(Err(file_read_error(error))),
         };
         if read > output.len() {
@@ -273,7 +273,7 @@ where
         };
         let written = match written {
             Ok(written) => written,
-            Err(WriteError::WouldBlock) => return Err(would_block(nonblocking)),
+            Err(WriteError::WouldBlock) => return Err(BrokerError::would_block(nonblocking)),
             Err(error) => return Ok(Err(file_write_error(error))),
         };
         if written > input.len() {
@@ -677,16 +677,6 @@ fn validate_path(path: &str) -> FileResult<()> {
         Ok(())
     } else {
         Err(FileError::InvalidPathname)
-    }
-}
-
-/// Returns the error for a read or write that would block on a file whose
-/// [`FileOpenFlags::NONBLOCKING`] status flag is `nonblocking`.
-fn would_block(nonblocking: bool) -> BrokerError {
-    if nonblocking {
-        BrokerError::NonBlockingWouldBlock
-    } else {
-        BrokerError::WouldBlock
     }
 }
 

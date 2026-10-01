@@ -19,7 +19,7 @@ use litebox::{
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileMode as Mode, FileOpenFlags, FileSeekWhence as SeekWhence, FileStatus,
-    FileType, FileUser,
+    FileStatusFlags, FileType, FileUser,
 };
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
@@ -144,12 +144,22 @@ fn file_open_options(flags: OFlags) -> Result<(FileAccessMode, FileOpenFlags), O
     Ok((access, output))
 }
 
-/// Returns the `F_GETFL` flags of the open file description at `fd`.
-fn get_file_status_flags<Platform: ShimPlatform>(
+/// Changes the status flags in `mask` of the open file description at `fd` to their values in
+/// `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
+fn set_file_status_flags<Platform: ShimPlatform>(
     litebox: &litebox::LiteBox<Platform>,
     fd: &FileFd,
-) -> Result<OFlags, Errno> {
-    let status = litebox.get_file_status_flags(fd)?;
+    mask: OFlags,
+    flags: OFlags,
+) -> Result<(), Errno> {
+    let (mask, flags) = status_flags_change(mask, flags);
+    litebox.set_file_status_flags(fd, mask, flags)?;
+    Ok(())
+}
+
+/// Returns the `F_GETFL` flags for the access mode and status flags `status` of an open file
+/// description.
+fn linux_status_flags(status: FileStatusFlags) -> Result<OFlags, Errno> {
     let mut flags = match status.access {
         FileAccessMode::ReadOnly => OFlags::RDONLY,
         FileAccessMode::WriteOnly => OFlags::WRONLY,
@@ -168,14 +178,9 @@ fn get_file_status_flags<Platform: ShimPlatform>(
     Ok(flags)
 }
 
-/// Changes the status flags in `mask` of the open file description at `fd` to their values in
-/// `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
-fn set_file_status_flags<Platform: ShimPlatform>(
-    litebox: &litebox::LiteBox<Platform>,
-    fd: &FileFd,
-    mask: OFlags,
-    flags: OFlags,
-) -> Result<(), Errno> {
+/// Returns the broker mask and flags that change the status flags in `mask` of an open file
+/// description to their values in `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
+pub(crate) fn status_flags_change(mask: OFlags, flags: OFlags) -> (FileOpenFlags, FileOpenFlags) {
     let mut file_mask = FileOpenFlags::NONE;
     let mut file_flags = FileOpenFlags::NONE;
     for (linux, file) in [
@@ -189,8 +194,7 @@ fn set_file_status_flags<Platform: ShimPlatform>(
             }
         }
     }
-    litebox.set_file_status_flags(fd, file_mask, file_flags)?;
-    Ok(())
+    (file_mask, file_flags)
 }
 
 /// Task state shared by `CLONE_FILES`.
@@ -298,14 +302,13 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                 InheritedFdKind::File => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, adopt_file)?;
                 }
-                InheritedFdKind::Pipe {
-                    endpoint,
-                    status_flags,
-                } => self.install_inherited_fd(litebox, first_fd, raw_fd, || {
-                    global
-                        .adopt_inherited_linux_pipe(handle, endpoint, status_flags)
-                        .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
-                })?,
+                InheritedFdKind::Pipe { endpoint } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_linux_pipe(handle, endpoint)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
+                }
             }
             descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
@@ -556,10 +559,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
     ///   install.
     ///
-    /// Transferred descriptors also differ from Linux in two ways: the parent does not observe the
-    /// child's reads of an inherited directory, and pipe status flags, which this runner tracks
-    /// locally, are copied rather than shared, so an `F_SETFL` on a pipe in one process is not seen
-    /// by the other.
+    /// Transferred descriptors also differ from Linux in that the parent does not observe the
+    /// child's reads of an inherited directory.
     pub(crate) fn fds_inherited_across_exec(
         &self,
     ) -> Result<alloc::vec::Vec<(InheritedFd, InheritableFd<Platform>)>, Errno> {
@@ -2064,9 +2065,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Ok(fd
                     .dispatch(
-                        |fd| get_file_status_flags(&self.global.litebox, fd),
+                        |fd| linux_status_flags(self.global.litebox.get_file_status_flags(fd)?),
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
-                        |fd| self.global.linux_pipe_status_flags(fd),
+                        |fd| linux_status_flags(self.global.pipes.get_status_flags(fd)?),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
@@ -2138,8 +2139,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         )
                     },
                     |fd| {
+                        if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
                         self.global
-                            .set_linux_pipe_status_flags(fd, flags, setfl_mask)
+                            .set_linux_pipe_status_flags(fd, setfl_mask, flags)
                     },
                     |fd| {
                         toggle_flags!(fd);
@@ -2438,7 +2442,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             OFlags::empty()
                         };
                         self.global
-                            .set_linux_pipe_status_flags(fd, flags, OFlags::NONBLOCK)
+                            .set_linux_pipe_status_flags(fd, OFlags::NONBLOCK, flags)
                     },
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),
