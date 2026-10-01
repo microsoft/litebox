@@ -322,12 +322,6 @@ impl VmArea {
     }
 }
 
-fn remap_copy_flags(flags: VmFlags) -> VmFlags {
-    let mut temporary = flags | VmFlags::VM_READ | VmFlags::VM_WRITE;
-    temporary.remove(VmFlags::VM_EXEC);
-    temporary
-}
-
 pub(super) struct FindAreaRequest<const ALIGN: usize> {
     pub(super) suggested_address: Option<NonZeroAddress<ALIGN>>,
     pub(super) length: NonZeroPageSize<ALIGN>,
@@ -1022,7 +1016,10 @@ where
         const COPY_CHUNK_SIZE: usize = 1 << 16;
 
         let permissions = MemoryRegionPermissions::from(vma.flags());
-        let temporary = VmArea::new(remap_copy_flags(vma.flags()), false);
+        let temporary = VmArea::new(
+            (vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE) - VmFlags::VM_EXEC,
+            false,
+        );
         let length = NonZeroPageSize::new(new_range.len()).expect("remap destination is empty");
         // SAFETY: Hint placement never replaces existing mappings.
         let destination = unsafe {
@@ -1673,16 +1670,6 @@ mod tests {
             calls: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
         }))
-    }
-
-    #[test]
-    fn remap_copy_permissions_are_writable_but_not_executable() {
-        let original = VmFlags::VM_EXEC | VmFlags::VM_MAYEXEC;
-        let temporary = remap_copy_flags(original);
-
-        assert!(temporary.contains(VmFlags::VM_READ | VmFlags::VM_WRITE));
-        assert!(!temporary.contains(VmFlags::VM_EXEC));
-        assert!(temporary.contains(VmFlags::VM_MAYEXEC));
     }
 
     #[test]
