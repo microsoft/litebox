@@ -79,17 +79,19 @@ const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
 const TRAMPOLINE_FILE_ALIGNMENT: u64 = 4096;
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
+///
+/// AArch64 islands use `file_offset`/`trampoline_size` for serialized bytes and
+/// `vaddr` for the first island; these fields do not describe one virtual extent.
 #[repr(C, packed)]
 #[derive(FromBytes)]
 pub struct TrampolineHeader64 {
-    /// The unchanged outer format magic, `LITEBOX0`.
+    /// The format magic and version.
     pub magic: u64,
-    /// File offset of legacy code or the AArch64 island descriptor.
+    /// The file offset of the trampoline code.
     pub file_offset: u64,
-    /// Legacy code address, or minimum object-relative AArch64 island address.
+    /// The virtual address of the trampoline code.
     pub vaddr: u64,
-    /// Serialized bytes, not an AArch64 virtual span. Zero is the processed
-    /// sentinel and requires both offset and address to be zero.
+    /// The size of the trampoline code.
     pub trampoline_size: u64,
 }
 
@@ -150,6 +152,9 @@ pub enum ElfParseError<E> {
     Io(#[source] E),
     #[error("Bad trampoline section")]
     BadTrampoline,
+    #[error("Invalid trampoline version")]
+    BadTrampolineVersion,
+    #[cfg(target_arch = "aarch64")]
     #[error("Loader does not support this AArch64 ELF island ABI")]
     UnsupportedIslandAbi,
     #[error("Binary not patched for syscall rewriting")]
@@ -166,10 +171,12 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
             ElfParseError::Elf(_)
             | ElfParseError::BadFormat
             | ElfParseError::BadTrampoline
-            | ElfParseError::UnsupportedIslandAbi
+            | ElfParseError::BadTrampolineVersion
             | ElfParseError::UnpatchedBinary
             | ElfParseError::BadInterp
             | ElfParseError::UnsupportedType => Errno::ENOEXEC,
+            #[cfg(target_arch = "aarch64")]
+            ElfParseError::UnsupportedIslandAbi => Errno::ENOEXEC,
             ElfParseError::Io(err) => err.into(),
         }
     }
@@ -182,6 +189,9 @@ pub enum ElfLoadError<E> {
     Map(#[source] E),
     #[error("Invalid program header")]
     InvalidProgramHeader,
+    #[error("Invalid trampoline version")]
+    InvalidTrampolineVersion,
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     #[error("Loader does not support this AArch64 ELF island ABI")]
     UnsupportedIslandAbi,
     #[error(transparent)]
@@ -191,9 +201,11 @@ pub enum ElfLoadError<E> {
 impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
     fn from(value: ElfLoadError<E>) -> Self {
         match value {
-            ElfLoadError::InvalidProgramHeader | ElfLoadError::UnsupportedIslandAbi => {
+            ElfLoadError::InvalidProgramHeader | ElfLoadError::InvalidTrampolineVersion => {
                 Errno::ENOEXEC
             }
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
+            ElfLoadError::UnsupportedIslandAbi => Errno::ENOEXEC,
             ElfLoadError::Fault(Fault) => Errno::EFAULT,
             ElfLoadError::Map(err) => err.into(),
         }
@@ -313,9 +325,8 @@ impl ElfParsedFile {
     /// The pages the trampoline occupies when this ELF is loaded at `base_addr`;
     /// a zero `base_addr` yields the load-address-relative range.
     ///
-    /// This is the legacy contiguous range API, not an island-image envelope.
-    /// Island-capable AArch64 consumers use `aarch64_islands` instead.
-    /// `None` if the binary has no legacy trampoline or, like [`Self::has_trampoline`],
+    /// AArch64 island consumers use `aarch64_islands` for their separate extents.
+    /// `None` if the binary has no trampoline or, like [`Self::has_trampoline`],
     /// if [`Self::parse_trampoline`] has not run yet.
     pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
         let trampoline = self.trampoline.as_ref()?;
@@ -351,8 +362,7 @@ impl ElfParsedFile {
         }
     }
 
-    /// Parse with explicit delegation to an island-capable mapper. Generic
-    /// loaders (including OP-TEE) must not execute the descriptor as legacy code.
+    /// Parse AArch64 island images with explicit mapper capability.
     #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     pub fn parse_trampoline_with_islands<F: ReadAt>(
         &mut self,
@@ -426,14 +436,15 @@ impl ElfParsedFile {
         file.read_at(header_offset, &mut header_buf[..header_size])
             .map_err(ElfParseError::Io)?;
 
-        // LITEBOX0 is the only supported footer magic.
+        // Check magic and version. Format: "LITEBOX" + version byte.
         let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
         if magic != TRAMPOLINE_MAGIC {
-            return if &header_buf[..7] == b"LITEBOX" {
-                Err(ElfParseError::BadTrampoline)
-            } else {
-                unpatched()
-            };
+            // If the prefix matches but the version differs, fail explicitly.
+            if &header_buf[0..7] == b"LITEBOX" {
+                return Err(ElfParseError::BadTrampolineVersion);
+            }
+            // No trampoline found.
+            return unpatched();
         }
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
@@ -606,14 +617,13 @@ impl ElfParsedFile {
                 }
                 align = align.max(granule);
             }
-            #[cfg(not(all(target_arch = "aarch64", feature = "aarch64_islands")))]
             let granule = PAGE_SIZE;
             #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
             let granule = self
                 .islands
                 .as_ref()
                 .filter(|p| !p.pairs.is_empty())
-                .map_or(Ok(PAGE_SIZE), |p| {
+                .map_or(Ok(granule), |p| {
                     usize::try_from(p.granule).map_err(|_| ElfLoadError::InvalidProgramHeader)
                 })?;
             // Subtract an equally aligned object-relative origin so the load
@@ -1451,10 +1461,14 @@ mod island_tests {
                     .unwrap();
                 let tail = file.0.len() - 32;
                 file.0[tail + 7] = last;
-                assert!(matches!(
-                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
-                    Err(ElfParseError::BadTrampoline)
-                ));
+                let error = parsed
+                    .parse_trampoline_with_islands(&mut file, 1, true)
+                    .unwrap_err();
+                if machine == elf::abi::EM_X86_64 {
+                    assert!(matches!(error, ElfParseError::BadTrampolineVersion));
+                } else {
+                    assert!(matches!(error, ElfParseError::BadTrampoline));
+                }
                 file.0.push(0); // Displaced prefix is incidental data, not a footer.
                 assert!(matches!(
                     parsed.parse_trampoline_with_islands(&mut file, 1, true),
@@ -1750,7 +1764,7 @@ mod trampoline_footer_tests {
             file.0[tail + 7] = last;
             assert!(matches!(
                 parsed.parse_trampoline_footer(&mut file, 1),
-                Err(ElfParseError::BadTrampoline)
+                Err(ElfParseError::BadTrampolineVersion)
             ));
             file.0.push(0);
             assert!(matches!(
@@ -1802,7 +1816,7 @@ mod trampoline_footer_tests {
             file.0[tail + 7] = b'1';
             assert!(matches!(
                 parsed.parse_trampoline(&mut file, callback),
-                Err(ElfParseError::BadTrampoline)
+                Err(ElfParseError::BadTrampolineVersion)
             ));
             file.0[tail + 7] = b'0';
             file.0[tail + 24..].fill(0);
