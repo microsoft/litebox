@@ -397,7 +397,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         #[cfg(debug_assertions)] absolute_components: &[&str],
         scope: SearchScope,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
-        assert_ne!(components.len(), 0);
+        assert_ne!(components, [] as [&str; 0]);
         let mut from = from;
         let mut offset = 0;
         loop {

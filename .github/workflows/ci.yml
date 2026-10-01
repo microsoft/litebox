@@ -107,7 +107,7 @@ jobs:
     name: Build and Test LVBS
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -Dwarnings -Zcrate-attr=feature(atomic_try_update)
+      RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -192,7 +192,7 @@ jobs:
     name: Build and Test SNP
     runs-on: ubuntu-latest
     env:
-      RUSTFLAGS: -Dwarnings -Zcrate-attr=feature(atomic_try_update)
+      RUSTFLAGS: -Dwarnings
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
