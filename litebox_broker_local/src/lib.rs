@@ -392,17 +392,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match an active request.
-    #[allow(
-        deprecated,
-        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-    )]
     pub(crate) fn request(
         &self,
         operation: BrokerOperation,
     ) -> Result<BrokerResult, Channel::Error> {
         let request_id = self
             .next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |request_id| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |request_id| {
                 request_id.checked_add(1)
             })
             .map(RequestId)

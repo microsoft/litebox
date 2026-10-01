@@ -875,10 +875,6 @@ impl BrokerProcess {
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
-    #[allow(
-        deprecated,
-        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-    )]
     pub fn create_thread(&self) -> Result<ThreadId> {
         let mut threads = self.threads.lock();
         if threads.len() >= self.core.limits.max_threads_per_process {
@@ -889,7 +885,7 @@ impl BrokerProcess {
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
             .active_thread_count
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 (count < self.core.limits.max_threads).then(|| count + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
@@ -1138,10 +1134,6 @@ impl BrokerProcess {
         Ok((first_handle, second_handle))
     }
 
-    #[allow(
-        deprecated,
-        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-    )]
     pub(crate) fn reserve_object_reference(
         &self,
         rights: ObjectRights,
@@ -1170,7 +1162,7 @@ impl BrokerProcess {
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
             .pending_references
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
                 pending.checked_add(1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)?;
@@ -1547,17 +1539,13 @@ impl Drop for PendingObjectReference<'_> {
     }
 }
 
-#[allow(
-    deprecated,
-    reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-)]
 fn release_pending_reference(
     core_pending_references: &AtomicUsize,
     process_references: &mut ProcessReferences,
 ) -> bool {
     let next_pending_handles = process_references.pending_handles.checked_sub(1);
     let core_released = core_pending_references
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
             pending.checked_sub(1)
         })
         .is_ok();

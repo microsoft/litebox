@@ -486,13 +486,9 @@ impl ReactorClient {
         })
     }
 
-    #[allow(
-        deprecated,
-        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-    )]
     fn allocate_socket_id(&self) -> BrokerResult<u64> {
         self.next_socket_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
                 (id < UDP_EVENT_TOKEN_FLAG - 1).then_some(id + 1)
             })
             .map_err(|_| BrokerError::ResourceExhausted)
