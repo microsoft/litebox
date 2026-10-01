@@ -18,6 +18,7 @@ use thiserror::Error;
 use zerocopy::FromBytes;
 
 use crate::{HOST_PAGE_SIZE, errno::Errno, vmem::PAGE_SIZE};
+#[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
 use litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands;
 
 type Endian = elf::endian::LittleEndian;
@@ -30,6 +31,7 @@ pub struct ElfParsedFile {
     header: FileHeader<Endian>,
     phdrs: Vec<u8>,
     trampoline: Option<TrampolineInfo>,
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     islands: Option<ElfIslands>,
 }
 
@@ -286,18 +288,24 @@ impl ElfParsedFile {
             header,
             phdrs,
             trampoline: None,
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
             islands: None,
         })
     }
 
     /// Returns `true` if a trampoline was parsed and will be mapped by `load()`.
     pub fn has_trampoline(&self) -> bool {
-        self.trampoline.is_some() || self.islands.as_ref().is_some_and(|p| !p.pairs.is_empty())
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
+        if self.islands.as_ref().is_some_and(|p| !p.pairs.is_empty()) {
+            return true;
+        }
+        self.trampoline.is_some()
     }
 
     /// Validated AArch64 island images, including a possible empty sentinel.
     /// Only each pair's `island_vaddr..island_vaddr+granule` is a fixed virtual
     /// extent; descriptor bytes and full chunks never enlarge the image span.
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     pub fn aarch64_islands(&self) -> Option<&ElfIslands> {
         self.islands.as_ref()
     }
@@ -306,7 +314,7 @@ impl ElfParsedFile {
     /// a zero `base_addr` yields the load-address-relative range.
     ///
     /// This is the legacy contiguous range API, not an island-image envelope.
-    /// Island-capable consumers use [`Self::aarch64_islands`] instead.
+    /// Island-capable AArch64 consumers use `aarch64_islands` instead.
     /// `None` if the binary has no legacy trampoline or, like [`Self::has_trampoline`],
     /// if [`Self::parse_trampoline`] has not run yet.
     pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
@@ -325,21 +333,27 @@ impl ElfParsedFile {
     /// File layout: `[ELF][padding][trampoline code][header]`
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
-    /// into the trampoline at map time.
+    /// into the trampoline at map time. On AArch64, this generic entry rejects
+    /// nonempty island payloads even when the callback is zero; loading them
+    /// requires `aarch64_islands` and explicit delegation to a capable mapper.
     pub fn parse_trampoline<F: ReadAt>(
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
     ) -> Result<(), ElfParseError<F::Error>> {
-        self.parse_trampoline_with_islands(file, syscall_entry_point, false)
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
+        {
+            self.parse_trampoline_with_islands(file, syscall_entry_point, false)
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "aarch64_islands")))]
+        {
+            self.parse_trampoline_footer(file, syscall_entry_point)
+        }
     }
 
     /// Parse with explicit delegation to an island-capable mapper. Generic
     /// loaders (including OP-TEE) must not execute the descriptor as legacy code.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "cannot panic: array slices are always the correct size"
-    )]
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     pub fn parse_trampoline_with_islands<F: ReadAt>(
         &mut self,
         file: &mut F,
@@ -375,16 +389,35 @@ impl ElfParsedFile {
             self.islands = Some(payload);
             return Ok(());
         }
+        self.parse_trampoline_footer(file, syscall_entry_point)
+    }
+
+    // x86 retains its direct trampoline format and callback-zero fast path.
+    // Without island support, AArch64 checks only the outer footer and refuses
+    // nonempty payloads; it must never interpret a descriptor as direct code.
+    fn parse_trampoline_footer<F: ReadAt>(
+        &mut self,
+        file: &mut F,
+        syscall_entry_point: usize,
+    ) -> Result<(), ElfParseError<F::Error>> {
+        #[cfg(target_arch = "x86_64")]
         if syscall_entry_point == 0 {
             return Ok(());
         }
-
+        let file_size = file.size().map_err(ElfParseError::Io)?;
+        let unpatched = || {
+            if syscall_entry_point == 0 {
+                Ok(())
+            } else {
+                Err(ElfParseError::UnpatchedBinary)
+            }
+        };
         let header_size = TRAMPOLINE_HEADER_SIZE;
 
         // File must be large enough to contain the header
         if file_size < header_size as u64 {
             // Too small for a trampoline header — binary is unpatched.
-            return Err(ElfParseError::UnpatchedBinary);
+            return unpatched();
         }
 
         // Read the header from the end of the file
@@ -396,11 +429,11 @@ impl ElfParsedFile {
         // LITEBOX0 is the only supported footer magic.
         let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
         if magic != TRAMPOLINE_MAGIC {
-            return Err(if &header_buf[..7] == b"LITEBOX" {
-                ElfParseError::BadTrampoline
+            return if &header_buf[..7] == b"LITEBOX" {
+                Err(ElfParseError::BadTrampoline)
             } else {
-                ElfParseError::UnpatchedBinary
-            });
+                unpatched()
+            };
         }
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
@@ -447,6 +480,15 @@ impl ElfParsedFile {
         // The trampoline code should immediately precede the header.
         if file_offset.checked_add(trampoline_size as u64) != Some(header_offset) {
             return Err(ElfParseError::BadTrampoline);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if self.header.e_machine == elf::abi::EM_AARCH64 {
+            // Nonempty AArch64 payloads need the full island validator/mapper.
+            if file_offset == 0 || trampoline_size < 64 {
+                return Err(ElfParseError::BadTrampoline);
+            }
+            return Err(ElfParseError::UnsupportedIslandAbi);
         }
 
         // Reject a vaddr whose range cannot be represented, so that later
@@ -516,6 +558,7 @@ impl ElfParsedFile {
         mem: &mut impl AccessMemory,
         reserve_trampoline: Option<usize>,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
         if self.islands.as_ref().is_some_and(|p| !p.pairs.is_empty())
             && !M::SUPPORTS_AARCH64_ISLANDS
         {
@@ -547,6 +590,7 @@ impl ElfParsedFile {
                         .ok_or(ElfLoadError::InvalidProgramHeader)?,
                 );
             }
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
             if let Some(payload) = &self.islands {
                 let granule = usize::try_from(payload.granule)
                     .map_err(|_| ElfLoadError::InvalidProgramHeader)?;
@@ -562,6 +606,9 @@ impl ElfParsedFile {
                 }
                 align = align.max(granule);
             }
+            #[cfg(not(all(target_arch = "aarch64", feature = "aarch64_islands")))]
+            let granule = PAGE_SIZE;
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
             let granule = self
                 .islands
                 .as_ref()
@@ -595,6 +642,7 @@ impl ElfParsedFile {
         };
 
         let mut brk = 0;
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
         if let Some(payload) = &self.islands
             && !payload.pairs.is_empty()
         {
@@ -637,8 +685,13 @@ impl ElfParsedFile {
                 let offset = ph
                     .p_offset
                     .wrapping_sub((adjusted_vaddr - load_start) as u64);
+                #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
                 mapper
                     .map_elf_load(load_start, file_end - load_start, offset, &prot, base_addr)
+                    .map_err(ElfLoadError::Map)?;
+                #[cfg(not(all(target_arch = "aarch64", feature = "aarch64_islands")))]
+                mapper
+                    .map_file(load_start, file_end - load_start, offset, &prot)
                     .map_err(ElfLoadError::Map)?;
                 // Zero out the remaining part of the last page.
                 //
@@ -763,6 +816,7 @@ impl ElfParsedFile {
         mem: &mut impl AccessMemory,
         loaded_entry_point: usize,
     ) -> Result<(), ElfLoadError<M::Error>> {
+        #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
         if self.islands.as_ref().is_some_and(|p| !p.pairs.is_empty()) {
             return Err(ElfLoadError::UnsupportedIslandAbi);
         }
@@ -804,11 +858,13 @@ pub trait MapMemory {
     const POPULATES_TRAMPOLINE: bool = false;
 
     /// Explicit support for installing serialized pairs before any LOAD is executable.
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     const SUPPORTS_AARCH64_ISLANDS: bool = false;
 
     /// Prepare an island image. `reserved` proves that this mapper just reserved
     /// the ET_DYN envelope, including every island extent. Full chunks are not
     /// part of that reservation. Called only for an explicitly capable mapper.
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     fn prepare_aarch64_islands(
         &mut self,
         _payload: &ElfIslands,
@@ -846,6 +902,7 @@ pub trait MapMemory {
     /// Map a PT_LOAD at the bias chosen by this load, before publishing execute
     /// permission. Unlike arbitrary file mappings, aliased file pages have an
     /// unambiguous object identity here. The default needs no such provenance.
+    #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
     fn map_elf_load(
         &mut self,
         address: usize,
@@ -1160,7 +1217,7 @@ mod reserve_regions_tests {
     }
 }
 
-#[cfg(all(test, target_arch = "aarch64"))]
+#[cfg(all(test, target_arch = "aarch64", feature = "aarch64_islands"))]
 mod island_tests {
     use super::*;
 
@@ -1582,6 +1639,7 @@ mod non_island_geometry_tests {
             header: FileHeader::parse_tail(ident, &bytes[16..64]).unwrap(),
             phdrs: bytes[64..].to_vec(),
             trampoline: None,
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
             islands: None,
         };
         let mut mapper = Mapper {
@@ -1620,5 +1678,141 @@ mod non_island_geometry_tests {
             Err(ElfLoadError::Map(()))
         ));
         assert_eq!(mapper.released, [(0x10000, 0x45000)]);
+    }
+}
+
+#[cfg(test)]
+mod trampoline_footer_tests {
+    use super::*;
+
+    struct File(Vec<u8>);
+    impl ReadAt for File {
+        type Error = ();
+        fn read_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), ()> {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            bytes.copy_from_slice(self.0.get(start..start + bytes.len()).ok_or(())?);
+            Ok(())
+        }
+        fn size(&mut self) -> Result<u64, ()> {
+            Ok(self.0.len() as u64)
+        }
+    }
+
+    fn file(machine: u16, offset: u64, address: u64, size: u64) -> (ElfParsedFile, File) {
+        let mut bytes = alloc::vec![0; 0x1040];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&elf::abi::ET_DYN.to_le_bytes());
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        let ident = elf::file::parse_ident::<Endian>(&bytes).unwrap();
+        let parsed = ElfParsedFile {
+            header: FileHeader::parse_tail(ident, &bytes[16..64]).unwrap(),
+            phdrs: Vec::new(),
+            trampoline: None,
+            #[cfg(all(target_arch = "aarch64", feature = "aarch64_islands"))]
+            islands: None,
+        };
+        for field in [TRAMPOLINE_MAGIC, offset, address, size] {
+            bytes.extend_from_slice(&field.to_le_bytes());
+        }
+        (parsed, File(bytes))
+    }
+
+    #[test]
+    fn x86_direct_footer_checked_arithmetic_and_zero_sentinel() {
+        for (offset, address, size) in [
+            (0, 0, 0),
+            (0x1000, 0x2000, 64),
+            (1, 0, 0),
+            (0, 1, 0),
+            (u64::MAX - 4095, 0x2000, 0x2040),
+            (0x1000, u64::MAX - 4095, 64),
+            (0x1000, 0x2000, 63),
+        ] {
+            let (mut parsed, mut file) = file(elf::abi::EM_X86_64, offset, address, size);
+            let result = parsed.parse_trampoline_footer(&mut file, 1);
+            if (offset, address, size) == (0, 0, 0) {
+                result.unwrap();
+                assert!(!parsed.has_trampoline());
+            } else if (offset, address, size) == (0x1000, 0x2000, 64) {
+                result.unwrap();
+                assert_eq!(parsed.trampoline_page_range(0), Some(0x2000..0x3000));
+            } else {
+                assert!(matches!(result, Err(ElfParseError::BadTrampoline)));
+            }
+        }
+    }
+
+    #[test]
+    fn x86_footer_requires_exact_magic_at_fixed_tail() {
+        for last in [b'1', b'?', 0] {
+            let (mut parsed, mut file) = file(elf::abi::EM_X86_64, 0, 0, 0);
+            let tail = file.0.len() - 32;
+            file.0[tail + 7] = last;
+            assert!(matches!(
+                parsed.parse_trampoline_footer(&mut file, 1),
+                Err(ElfParseError::BadTrampoline)
+            ));
+            file.0.push(0);
+            assert!(matches!(
+                parsed.parse_trampoline_footer(&mut file, 1),
+                Err(ElfParseError::UnpatchedBinary)
+            ));
+            file.0.pop();
+            file.0[tail..].fill(0);
+            file.0[tail + 16..tail + 24].copy_from_slice(b"LITEBOX1");
+            assert!(matches!(
+                parsed.parse_trampoline_footer(&mut file, 1),
+                Err(ElfParseError::UnpatchedBinary)
+            ));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_zero_callback_does_not_query_file_size_or_read_footer() {
+        struct Unreadable;
+        impl ReadAt for Unreadable {
+            type Error = ();
+            fn read_at(&mut self, _: u64, _: &mut [u8]) -> Result<(), ()> {
+                panic!("unexpected read")
+            }
+            fn size(&mut self) -> Result<u64, ()> {
+                panic!("unexpected size query")
+            }
+        }
+        let (mut parsed, _) = file(elf::abi::EM_X86_64, 0, 0, 0);
+        parsed.parse_trampoline(&mut Unreadable, 0).unwrap();
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(feature = "aarch64_islands")))]
+    #[test]
+    fn aarch64_feature_off_rejects_payload_without_decoding_it() {
+        for callback in [0, 1] {
+            // Only the outer envelope is needed to reject this ABI. No payload
+            // reads, allocations, or rewriter dependency are needed to fail closed.
+            let (mut parsed, mut file) = file(elf::abi::EM_AARCH64, 0x1000, 0x2000, 64);
+            file.0[0x1000..0x1008].copy_from_slice(b"LBISLAND");
+            assert!(matches!(
+                parsed.parse_trampoline(&mut file, callback),
+                Err(ElfParseError::UnsupportedIslandAbi)
+            ));
+            assert!(!parsed.has_trampoline());
+            assert!(parsed.trampoline_page_range(0).is_none());
+            let tail = file.0.len() - 32;
+            file.0[tail + 7] = b'1';
+            assert!(matches!(
+                parsed.parse_trampoline(&mut file, callback),
+                Err(ElfParseError::BadTrampoline)
+            ));
+            file.0[tail + 7] = b'0';
+            file.0[tail + 24..].fill(0);
+            assert!(matches!(
+                parsed.parse_trampoline(&mut file, callback),
+                Err(ElfParseError::BadTrampoline)
+            ));
+            file.0[tail + 8..].fill(0);
+            parsed.parse_trampoline(&mut file, callback).unwrap();
+            assert!(!parsed.has_trampoline());
+        }
     }
 }

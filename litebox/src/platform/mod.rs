@@ -320,12 +320,14 @@ pub trait SystemInfoProvider {
     /// registers when returning through the island epilogue at guest SP - 16.
     /// `None` explicitly means this ABI is unavailable; callers must not install
     /// island SVC gates using the direct callback instead.
+    #[cfg(target_arch = "aarch64")]
     fn get_aarch64_island_entry_point(&self) -> Option<usize> {
         None
     }
 
     /// Forget current-thread syscall return transport at a committed exec reset.
     /// Failed exec preparation must not call this hook.
+    #[cfg(target_arch = "aarch64")]
     fn reset_syscall_return_state(&self) {}
 
     /// Get the address of the VDSO (Virtual Dynamic Shared Object).

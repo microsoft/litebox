@@ -92,7 +92,8 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
     type Error = Errno;
 
     // mmap and mprotect share serialized/runtime pair ownership and publication.
-    const SUPPORTS_AARCH64_ISLANDS: bool = cfg!(target_arch = "aarch64");
+    #[cfg(target_arch = "aarch64")]
+    const SUPPORTS_AARCH64_ISLANDS: bool = true;
 
     #[cfg(target_arch = "aarch64")]
     fn prepare_aarch64_islands(
@@ -275,16 +276,18 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // Parse the complete island payload before exec commits the new image.
         // mmap/mprotect installs its pairs through the same path as runtime code.
         if syscall_entry_point != 0 || cfg!(target_arch = "aarch64") {
-            match parsed.parse_trampoline_with_islands(
+            #[cfg(target_arch = "aarch64")]
+            let trampoline = parsed.parse_trampoline_with_islands(
                 &mut &file,
                 syscall_entry_point,
-                cfg!(target_arch = "aarch64")
-                    && task
-                        .global
-                        .platform
-                        .get_aarch64_island_entry_point()
-                        .is_some_and(|p| p != 0),
-            ) {
+                task.global
+                    .platform
+                    .get_aarch64_island_entry_point()
+                    .is_some_and(|p| p != 0),
+            );
+            #[cfg(target_arch = "x86_64")]
+            let trampoline = parsed.parse_trampoline(&mut &file, syscall_entry_point);
+            match trampoline {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.
@@ -319,20 +322,17 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // When the platform requires syscall rewriting but the binary has no
         // embedded trampoline, reserve space so that brk starts past the
         // runtime trampoline region.
-        let reserve = if syscall_entry_point != 0
-            && !self.parsed.has_trampoline()
+        let reserve = syscall_entry_point != 0 && !self.parsed.has_trampoline();
+        #[cfg(target_arch = "aarch64")]
+        let reserve = reserve
             && self
                 .file
                 .task
                 .global
                 .platform
                 .get_aarch64_island_entry_point()
-                .is_none()
-        {
-            Some(litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE)
-        } else {
-            None
-        };
+                .is_none();
+        let reserve = reserve.then_some(litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE);
         self.file.reserve_runtime_trampoline = reserve.is_some();
         let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
         #[cfg(target_arch = "aarch64")]

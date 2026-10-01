@@ -101,17 +101,17 @@ fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlag
 }
 
 /// Per-call source provenance, never cached as a descriptor's current bias.
+#[cfg(target_arch = "aarch64")]
 pub(crate) struct FileMappingSource {
     pub offset: usize,
-    #[cfg(target_arch = "aarch64")]
     pub load_bias: Option<usize>,
 }
 
+#[cfg(target_arch = "aarch64")]
 impl From<usize> for FileMappingSource {
     fn from(offset: usize) -> Self {
         Self {
             offset,
-            #[cfg(target_arch = "aarch64")]
             load_bias: None,
         }
     }
@@ -392,7 +392,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_mmap(suggested_addr, len, prot, flags, false, op)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_arch = "aarch64"))]
     fn do_mmap_file(
         &self,
         suggested_addr: Option<usize>,
@@ -406,6 +406,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.do_mmap_resolved_file(suggested_addr, len, prot, flags, &typed_fd, offset.into())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    fn do_mmap_file(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        let typed_fd = self.typed_fd(fd).map_err(|_| MappingError::BadFD(fd))?;
+        let AnyTypedFd::Fs(file_fd) = &typed_fd else {
+            return Err(MappingError::BadFD(fd));
+        };
+
+        let result =
+            self.do_mmap_file_memcpy(suggested_addr, len, prot, flags, &typed_fd, offset)?;
+
+        let patch_key = ElfPatchKey(Arc::clone(file_fd));
+
+        self.finish_file_mmap(result, len, prot, &patch_key, offset)
+    }
+
+    #[cfg(target_arch = "aarch64")]
     fn do_mmap_resolved_file(
         &self,
         suggested_addr: Option<usize>,
@@ -421,23 +445,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(MappingError::BadFD(-1));
         };
 
-        #[cfg(target_arch = "aarch64")]
         let replaces_mapping =
             flags.contains(MapFlags::MAP_FIXED) && !flags.contains(MapFlags::MAP_FIXED_NOREPLACE);
-        let staging_prot = prot;
-        #[cfg(target_arch = "aarch64")]
         let staging_prot = if is_exec {
-            (staging_prot | ProtFlags::PROT_READ | ProtFlags::PROT_WRITE) & !ProtFlags::PROT_EXEC
+            (prot | ProtFlags::PROT_READ | ProtFlags::PROT_WRITE) & !ProtFlags::PROT_EXEC
         } else {
-            staging_prot
+            prot
         };
         let patch_key = ElfPatchKey(Arc::clone(file_fd));
-        #[cfg(target_arch = "aarch64")]
         self.init_elf_patch_state(&patch_key, 0, offset);
-        #[cfg(target_arch = "aarch64")]
         let envelope =
             self.reserve_mmap_island_envelope(&patch_key, suggested_addr, len, offset, flags)?;
-        #[cfg(target_arch = "aarch64")]
         let (suggested_addr, flags) = if let Some(envelope) = &envelope {
             (Some(envelope.file_start), flags | MapFlags::MAP_FIXED)
         } else {
@@ -445,7 +463,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let mapped =
             self.do_mmap_file_memcpy(suggested_addr, len, staging_prot, flags, typed_fd, offset);
-        #[cfg(target_arch = "aarch64")]
         if let Some(envelope) = envelope {
             if mapped.is_err() {
                 let _ = self.sys_munmap_raw(
@@ -479,12 +496,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let result = mapped?;
 
-        #[cfg(target_arch = "aarch64")]
         if replaces_mapping {
             self.clear_file_mappings_for_range(result.as_usize(), len);
         }
         self.init_elf_patch_state(&patch_key, result.as_usize(), offset);
-        #[cfg(target_arch = "aarch64")]
         {
             let mut cache = self.global.elf_patch_cache.lock();
             if let Some(state) = cache.get_mut(&patch_key) {
@@ -512,6 +527,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
+        self.finish_file_mmap(result, len, prot, &patch_key, offset)
+    }
+
+    // Common publication tail: direct x86 patching and AArch64 island patching
+    // use the same requested-permission restoration and deferred mapping cache.
+    fn finish_file_mmap(
+        &self,
+        result: UserPtrMut<u8>,
+        len: usize,
+        prot: ProtFlags,
+        patch_key: &ElfPatchKey,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        let is_exec = prot.contains(ProtFlags::PROT_EXEC);
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
             let syscall_entry = self.global.platform.get_syscall_entry_point();
@@ -521,7 +550,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .maybe_patch_exec_segment(
                         result,
                         len,
-                        &patch_key,
+                        patch_key,
                         syscall_entry,
                         Some(offset),
                         &restore_protections,
@@ -530,12 +559,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             {
                 // Runtime patching, trampoline setup, or restoration of the
                 // requested permissions failed, so fail the mmap.
-                let _ = self.sys_munmap_raw(result, len);
-                self.clear_file_mappings_for_range(result.as_usize(), len);
+                #[cfg(target_arch = "x86_64")]
+                let _ = self.sys_munmap(result, len);
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let _ = self.sys_munmap_raw(result, len);
+                    self.clear_file_mappings_for_range(result.as_usize(), len);
+                }
                 return Err(MappingError::OutOfMemory);
             }
             #[cfg(target_arch = "aarch64")]
-            if let Some(state) = self.global.elf_patch_cache.lock().get_mut(&patch_key) {
+            if let Some(state) = self.global.elf_patch_cache.lock().get_mut(patch_key) {
                 // mmap staged the whole image RW; displaced gaps inherit the
                 // guest's requested view, not those temporary staging permissions.
                 state
@@ -544,11 +578,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
-            self.init_elf_patch_state(&patch_key, result.as_usize(), offset);
+            self.init_elf_patch_state(patch_key, result.as_usize(), offset);
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
             let mut cache = self.global.elf_patch_cache.lock();
-            if let Some(state) = cache.get_mut(&patch_key) {
+            if let Some(state) = cache.get_mut(patch_key) {
                 let mapping_key = (result.as_usize(), len);
                 // Overlapping entries are safe here: file_mappings is only used
                 // to know which (addr, len) ranges belong to this fd so we can
@@ -602,6 +636,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(copied)
         };
         let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
+        let ensure_space_after = offset == 0 && !fixed_addr;
+        #[cfg(target_arch = "aarch64")]
+        let ensure_space_after = ensure_space_after
+            && self
+                .global
+                .platform
+                .get_aarch64_island_entry_point()
+                .is_none();
         let ptr = self.do_mmap(
             suggested_addr,
             len,
@@ -609,13 +651,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             flags,
             // Note we need to ensure that the space after the mapping is available
             // so that we could load trampoline code right after the mapping.
-            offset == 0
-                && !fixed_addr
-                && self
-                    .global
-                    .platform
-                    .get_aarch64_island_entry_point()
-                    .is_none(),
+            ensure_space_after,
             op,
         )?;
         if prot != ProtFlags::PROT_READ_WRITE && self.sys_mprotect_raw(ptr, len, prot).is_err() {
@@ -628,37 +664,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(ptr)
     }
 
-    /// Handle syscall `mmap`
-    pub(crate) fn sys_mmap(
-        &self,
+    fn validate_mmap(
         addr: usize,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        fd: i32,
         offset: usize,
-    ) -> Result<UserPtrMut<u8>, Errno> {
-        self.mmap_with_source(addr, len, prot, flags, fd, offset.into())
-    }
-
-    pub(crate) fn mmap_with_source(
-        &self,
-        addr: usize,
-        len: usize,
-        prot: ProtFlags,
-        flags: MapFlags,
-        fd: i32,
-        source: FileMappingSource,
-    ) -> Result<UserPtrMut<u8>, Errno> {
-        #[cfg(target_arch = "aarch64")]
-        let _update = self.global.elf_mapping_update.lock();
-        let offset = source.offset;
+    ) -> Result<usize, Errno> {
         // check alignment
-        if !offset.is_multiple_of(PAGE_SIZE)
-            || !addr.is_multiple_of(PAGE_SIZE)
-            || len == 0
-            || prot.bits() & !ProtFlags::PROT_READ_WRITE_EXEC.bits() != 0
-        {
+        if !offset.is_multiple_of(PAGE_SIZE) || !addr.is_multiple_of(PAGE_SIZE) || len == 0 {
+            return Err(Errno::EINVAL);
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if prot.bits() & !ProtFlags::PROT_READ_WRITE_EXEC.bits() != 0 {
             return Err(Errno::EINVAL);
         }
 
@@ -689,6 +708,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             todo!("Unsupported flags {:?}", flags);
         }
 
+        #[cfg(target_arch = "x86_64")]
+        let aligned_len = align_up(len, PAGE_SIZE);
+        #[cfg(target_arch = "aarch64")]
         let aligned_len = len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::ENOMEM)?;
@@ -699,6 +721,58 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EOVERFLOW);
         }
 
+        Ok(aligned_len)
+    }
+
+    /// Direct x86 mmap keeps the existing fd/error path, without island preflight.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sys_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        let aligned_len = Self::validate_mmap(addr, len, prot, flags, offset)?;
+        let suggested_addr = if addr == 0 { None } else { Some(addr) };
+        if flags.contains(MapFlags::MAP_ANONYMOUS) {
+            self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
+        } else {
+            self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
+        }
+        .map_err(Errno::from)
+    }
+
+    /// Handle syscall `mmap`
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn sys_mmap(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        offset: usize,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        self.mmap_with_source(addr, len, prot, flags, fd, offset.into())
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn mmap_with_source(
+        &self,
+        addr: usize,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        fd: i32,
+        source: FileMappingSource,
+    ) -> Result<UserPtrMut<u8>, Errno> {
+        let _update = self.global.elf_mapping_update.lock();
+        let offset = source.offset;
+        let aligned_len = Self::validate_mmap(addr, len, prot, flags, offset)?;
+
         // Resolve the fd once and perform side-effect-free checks BEFORE
         // closing old executable sites. EBADF must leave a valid mapping usable.
         let typed_fd = if flags.contains(MapFlags::MAP_ANONYMOUS) {
@@ -708,9 +782,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let AnyTypedFd::Fs(file) = &typed else {
                 return Err(Errno::EBADF);
             };
-            #[cfg(target_arch = "aarch64")]
             self.do_read(&typed, &mut [], Some(offset))?;
-            #[cfg(target_arch = "aarch64")]
             if prot.contains(ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC) {
                 let mut magic = [0; 4];
                 if self
@@ -724,11 +796,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     return Err(Errno::EACCES);
                 }
             }
-            #[cfg(target_arch = "x86_64")]
-            let _ = file;
             Some(typed)
         };
-        #[cfg(target_arch = "aarch64")]
         if let Some(bias) = source.load_bias {
             let Some(AnyTypedFd::Fs(file)) = &typed_fd else {
                 return Err(Errno::ENOEXEC);
@@ -746,10 +815,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .islands
                 .validate_load_mapping(addr, aligned_len, offset, bias)?;
         }
-        #[cfg(target_arch = "aarch64")]
         let replaces_mapping =
             flags.contains(MapFlags::MAP_FIXED) && !flags.contains(MapFlags::MAP_FIXED_NOREPLACE);
-        #[cfg(target_arch = "aarch64")]
         if replaces_mapping {
             let end = addr.checked_add(aligned_len).ok_or(Errno::EINVAL)?;
             self.island_removal_allowed(addr..end)?;
@@ -775,7 +842,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             )
         }
         .map_err(Errno::from);
-        #[cfg(target_arch = "aarch64")]
         if replaces_mapping {
             if result.is_err() {
                 self.invalidate_failed_island_replacement(&(addr..addr + aligned_len));
@@ -1993,8 +2059,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
-                // Replace recognized sites with traps before discarding gates
-                // whose thread-pointer placeholder could not be finalized.
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
                     litebox_util_log::warn!("trampoline cursor overflow");
                     let restored = apply_trap_fallback(mapped_addr, len, true);
@@ -2106,12 +2170,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             let tramp_len = state.trampoline_mapped_len;
             if tramp_len > 0 {
+                let address = UserPtrMut::<u8>::from_usize(state.trampoline_addr);
+                #[cfg(target_arch = "x86_64")]
+                let _ = self.sys_munmap(address, tramp_len);
                 // The entry was removed above; fd close already holds the VM
                 // update lock on AArch64, so do not re-enter the syscall wrapper.
-                let _ = self.sys_munmap_raw(
-                    UserPtrMut::<u8>::from_usize(state.trampoline_addr),
-                    tramp_len,
-                );
+                #[cfg(target_arch = "aarch64")]
+                let _ = self.sys_munmap_raw(address, tramp_len);
             }
         }
     }

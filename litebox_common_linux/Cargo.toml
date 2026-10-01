@@ -16,10 +16,13 @@ rangemap = { version = "1.5.1", features = ["const_fn"] }
 syscalls = { version = "0.6", default-features = false }
 zerocopy = { version = "0.8", features = ["derive", "alloc"] }
 
-litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false }
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+litebox_syscall_rewriter = { path = "../litebox_syscall_rewriter", version = "0.1.0", default-features = false, optional = true }
 
 [features]
-aarch64_gate_recovery = []
+# Native AArch64 Linux-guest loaders opt in; other consumers reject island payloads.
+aarch64_islands = ["dep:litebox_syscall_rewriter"]
+aarch64_gate_recovery = ["aarch64_islands"]
 
 [lints]
 workspace = true
