@@ -89,6 +89,34 @@ mod in_mem {
     use super::{with_root_privileges, with_user};
 
     #[test]
+    fn file_offset_overflow() {
+        let ctx = crate::fs::resolver::Context::new();
+        let litebox = LiteBox::new(MockPlatform::new());
+        with_root_privileges(&mut super::in_mem_fs(&litebox), &ctx, |fs, ctx| {
+            let fd = fs
+                .open(ctx, "/overflow", OFlags::CREAT | OFlags::RDWR, Mode::RWXU)
+                .unwrap();
+            fs.write(&fd, b"abc", None).unwrap();
+            assert!(matches!(
+                fs.truncate(&fd, usize::MAX, false),
+                Err(crate::fs::errors::TruncateError::Io)
+            ));
+            for offset in [usize::MAX - 1, usize::MAX] {
+                let mut buffer = [0xa5; 2];
+                assert_eq!(fs.read(&fd, &mut buffer, Some(offset)).unwrap(), 0);
+                assert_eq!(buffer, [0xa5; 2]);
+                assert!(matches!(
+                    fs.write(&fd, b"xy", Some(offset)),
+                    Err(crate::fs::errors::WriteError::Io)
+                ));
+            }
+            let mut buffer = [0; 3];
+            assert_eq!(fs.read(&fd, &mut buffer, Some(0)).unwrap(), 3);
+            assert_eq!(&buffer, b"abc");
+        });
+    }
+
+    #[test]
     fn root_file_creation_and_deletion() {
         let ctx = crate::fs::resolver::Context::new();
         let litebox = LiteBox::new(MockPlatform::new());
@@ -1126,6 +1154,19 @@ mod tar_ro {
     extern crate std;
 
     const TEST_TAR_FILE: &[u8] = include_bytes!("./test.tar");
+
+    #[test]
+    fn file_offset_overflow() {
+        let ctx = crate::fs::resolver::Context::new();
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
+        let fd = fs.open(&ctx, "foo", OFlags::RDONLY, Mode::RWXU).unwrap();
+        for offset in [usize::MAX - 1, usize::MAX] {
+            let mut buffer = [0xa5; 2];
+            assert_eq!(fs.read(&fd, &mut buffer, Some(offset)).unwrap(), 0);
+            assert_eq!(buffer, [0xa5; 2]);
+        }
+    }
 
     #[test]
     fn file_read() {

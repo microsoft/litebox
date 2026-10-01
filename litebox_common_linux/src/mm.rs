@@ -882,11 +882,9 @@ where
         if len == 0 {
             return Ok(());
         }
-        let aligned_len = len.next_multiple_of(PAGE_SIZE);
-        if aligned_len == 0 {
-            // overflow
-            return Err(Errno::EINVAL);
-        }
+        let aligned_len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::EINVAL)?;
         let Some(_end) = addr.as_usize().checked_add(aligned_len) else {
             return Err(Errno::EINVAL);
         };

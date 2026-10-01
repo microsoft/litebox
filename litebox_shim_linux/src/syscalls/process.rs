@@ -649,6 +649,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
+        let sp = if stack != 0 {
+            let stack = usize::try_from(stack).map_err(|_| Errno::EINVAL)?;
+            let size = usize::try_from(stack_size).map_err(|_| Errno::EINVAL)?;
+            Some(stack.checked_add(size).ok_or(Errno::EINVAL)?)
+        } else {
+            None
+        };
+
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
@@ -696,13 +704,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
         }
-
-        let sp = if stack != 0 {
-            let stack: usize = stack.trunc();
-            Some(stack.wrapping_add(stack_size.trunc()))
-        } else {
-            None
-        };
 
         let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
         thread.init_state.set(ThreadInitState::NewThread {
@@ -1623,6 +1624,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(test)]
 mod tests {
     use crate::{UserPtr, UserPtrMut};
+
+    #[test]
+    fn test_clone_stack_overflow() {
+        use litebox_common_linux::{CloneArgs, CloneFlags, PtRegs, errno::Errno};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let args = CloneArgs {
+            flags: CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES,
+            stack: usize::MAX as u64,
+            stack_size: 1,
+            pidfd: 0,
+            child_tid: 0,
+            parent_tid: 0,
+            exit_signal: 0,
+            tls: 0,
+            set_tid: 0,
+            set_tid_size: 0,
+            cgroup: 0,
+        };
+        assert_eq!(
+            task.do_clone(&PtRegs::default(), &args, true),
+            Err(Errno::EINVAL)
+        );
+    }
 
     extern crate std;
 

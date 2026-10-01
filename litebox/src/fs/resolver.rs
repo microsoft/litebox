@@ -651,9 +651,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// offset to the end of the read.
     /// If `offset` is Some, the file offset is not changed.
     ///
-    /// # Panics
-    ///
-    /// Panics if the updated file offset would overflow `usize`.
+    /// Returns [`ReadError::Io`] if the updated file offset would overflow `usize`.
     pub fn read(
         &self,
         fd: &TypedFd<Self>,
@@ -687,7 +685,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         };
         let read = self.backend.read(file, buf, read_offset)?;
         if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
-            entry.entry.position = read_offset.checked_add(read).unwrap();
+            entry.entry.position = read_offset.checked_add(read).ok_or(ReadError::Io)?;
         }
         Ok(read)
     }
@@ -698,9 +696,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// offset to the end of the write.
     /// If `offset` is Some, the file offset is not changed.
     ///
-    /// # Panics
-    ///
-    /// Panics if the updated file offset would overflow `usize`.
+    /// Returns [`WriteError::Io`] if the updated file offset would overflow `usize`.
     pub fn write(
         &self,
         fd: &TypedFd<Self>,
@@ -740,7 +736,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         };
         let written = self.backend.write(file, buf, write_offset)?;
         if matches!(seek_behavior, SeekBehavior::PositionBased) && offset.is_none() {
-            entry.entry.position = write_offset.checked_add(written).unwrap();
+            entry.entry.position = write_offset.checked_add(written).ok_or(WriteError::Io)?;
         }
         Ok(written)
     }

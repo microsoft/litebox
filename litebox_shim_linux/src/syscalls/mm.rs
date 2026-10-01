@@ -101,9 +101,10 @@ impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
 pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, ElfPatchState>;
 
 #[inline]
-fn align_up(addr: usize, align: usize) -> usize {
+fn align_up(addr: usize, align: usize) -> Option<usize> {
     debug_assert!(align.is_power_of_two());
-    (addr + align - 1) & !(align - 1)
+    addr.checked_add(align - 1)
+        .map(|value| value & !(align - 1))
 }
 
 #[inline]
@@ -362,10 +363,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             todo!("Unsupported flags {:?}", flags);
         }
 
-        let aligned_len = align_up(len, PAGE_SIZE);
-        if aligned_len == 0 {
-            return Err(Errno::ENOMEM);
-        }
+        let aligned_len = align_up(len, PAGE_SIZE).ok_or(Errno::ENOMEM)?;
         if offset.checked_add(aligned_len).is_none() {
             return Err(Errno::EOVERFLOW);
         }
@@ -646,7 +644,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                base_addr = Some(mapped_addr.wrapping_sub(p_vaddr.trunc()));
+                let Ok(vaddr) = usize::try_from(p_vaddr) else {
+                    return;
+                };
+                let Some(base) = mapped_addr.checked_sub(vaddr) else {
+                    return;
+                };
+                base_addr = Some(base);
             }
         }
 
@@ -671,10 +675,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         "fatal: pre-patched ET_DYN binary but cannot determine load base address"
                     );
                 };
-                let vaddr: usize = tramp_vaddr.trunc();
-                base + vaddr
+                let Ok(vaddr) = usize::try_from(tramp_vaddr) else {
+                    return;
+                };
+                let Some(address) = base.checked_add(vaddr) else {
+                    return;
+                };
+                address
             } else {
-                tramp_vaddr.trunc()
+                let Ok(address) = usize::try_from(tramp_vaddr) else {
+                    return;
+                };
+                address
             }
         } else {
             let base = if e_type == ET_DYN {
@@ -682,8 +694,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } else {
                 0
             };
-            let max_end: usize = max_load_end.trunc();
-            base + max_end.next_multiple_of(PAGE_SIZE)
+            let Ok(max_end) = usize::try_from(max_load_end) else {
+                return;
+            };
+            let Some(address) = align_up(max_end, PAGE_SIZE).and_then(|end| base.checked_add(end))
+            else {
+                return;
+            };
+            address
         };
 
         cache.insert(
@@ -823,7 +841,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Pre-patched binary: map the trampoline data from the file.
             if !state.trampoline_mapped && state.trampoline_file_size > 0 {
                 let tramp_addr = state.trampoline_addr;
-                let tramp_len = align_up(state.trampoline_file_size, PAGE_SIZE);
+                let Some(tramp_len) = align_up(state.trampoline_file_size, PAGE_SIZE) else {
+                    return false;
+                };
 
                 // Allocate RW region at the trampoline address. Use MAP_FIXED
                 // because the code already contains JMPs to this exact address
@@ -1047,7 +1067,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     restore_trampoline_rx(self, state);
                     return true;
                 };
-                let tramp_pages_needed = align_up(new_cursor, PAGE_SIZE);
+                let Some(tramp_pages_needed) = align_up(new_cursor, PAGE_SIZE) else {
+                    self.apply_trap_fallback(mapped_addr, len, true);
+                    restore_trampoline_rx(self, state);
+                    return true;
+                };
                 if tramp_pages_needed > state.trampoline_mapped_len {
                     let extra_start = state.trampoline_addr + state.trampoline_mapped_len;
                     let extra_len = tramp_pages_needed - state.trampoline_mapped_len;
@@ -1192,6 +1216,55 @@ mod tests {
             Ok(requested)
         );
         assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(requested));
+    }
+
+    #[test]
+    fn test_brk_and_madvise_length_overflow() {
+        let task = init_platform(None);
+        task.global.mm.set_initial_brk(super::PAGE_SIZE);
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(usize::MAX)),
+            Ok(super::PAGE_SIZE)
+        );
+        assert_eq!(
+            task.sys_brk(UserPtrMut::from_usize(0)),
+            Ok(super::PAGE_SIZE)
+        );
+        for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 2] {
+            assert_eq!(
+                task.sys_madvise(
+                    UserPtrMut::from_usize(super::PAGE_SIZE),
+                    len,
+                    litebox_common_linux::MadviseBehavior::Normal
+                ),
+                Err(Errno::EINVAL)
+            );
+        }
+    }
+
+    #[test]
+    fn test_mmap_length_overflow() {
+        let task = init_platform(None);
+        for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 2] {
+            assert_eq!(
+                task.sys_mmap(
+                    0,
+                    len,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+                .unwrap_err(),
+                Errno::ENOMEM
+            );
+        }
+        assert_eq!(super::align_up(0, super::PAGE_SIZE), Some(0));
+        assert_eq!(super::align_up(1, super::PAGE_SIZE), Some(super::PAGE_SIZE));
+        assert_eq!(
+            super::align_up(usize::MAX - super::PAGE_SIZE + 1, super::PAGE_SIZE),
+            Some(usize::MAX - super::PAGE_SIZE + 1)
+        );
     }
 
     #[test]

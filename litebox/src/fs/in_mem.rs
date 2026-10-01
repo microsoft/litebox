@@ -394,9 +394,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
         let start = offset.min(file.data.len());
-        let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
-        debug_assert!(start <= end);
-        let len = end - start;
+        let len = buf.len().min(file.data.len() - start);
+        let end = start + len;
         buf[..len].copy_from_slice(&file.data[start..end]);
         Ok(len)
     }
@@ -407,10 +406,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         buf: &[u8],
         offset: usize,
     ) -> Result<usize, WriteError> {
+        let end = offset.checked_add(buf.len()).ok_or(WriteError::Io)?;
+        if end > isize::MAX as usize {
+            return Err(WriteError::Io);
+        }
         let mut file = h.get_typed::<Self>().file.write();
+        if end > file.data.len() {
+            let additional = end - file.data.len();
+            file.data
+                .to_mut()
+                .try_reserve(additional)
+                .map_err(|_| WriteError::Io)?;
+        }
         let overwritten_len = match offset.cmp(&file.data.len()) {
             core::cmp::Ordering::Less => {
-                let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
+                let end = end.min(file.data.len());
                 let overwritten_len = end - offset;
                 file.data.to_mut()[offset..end].copy_from_slice(&buf[..overwritten_len]);
                 overwritten_len
@@ -427,6 +437,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     }
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
+        if length > isize::MAX as usize {
+            return Err(TruncateError::Io);
+        }
         let mut file = h.get_typed::<Self>().file.write();
         match length.cmp(&file.data.len()) {
             core::cmp::Ordering::Less => match &mut file.data {
@@ -434,7 +447,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 alloc::borrow::Cow::Owned(d) => d.truncate(length),
             },
             core::cmp::Ordering::Equal => (),
-            core::cmp::Ordering::Greater => file.data.to_mut().resize(length, 0),
+            core::cmp::Ordering::Greater => {
+                let additional = length - file.data.len();
+                let data = file.data.to_mut();
+                data.try_reserve(additional)
+                    .map_err(|_| TruncateError::Io)?;
+                data.resize(length, 0);
+            }
         }
         Ok(())
     }

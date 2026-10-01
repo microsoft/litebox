@@ -169,7 +169,10 @@ impl<V, T> core::fmt::Debug for UserConstPtr<V, T> {
 /// Note that this is fallible only if recovering from exceptions (e.g., page fault or SIGSEGV)
 /// is supported.
 fn read_at_offset<V: ValidateAccess, T: FromBytes>(ptr: *const T, count: isize) -> Option<T> {
-    let src = ptr.wrapping_add(usize::try_from(count).ok()?);
+    let offset = usize::try_from(count).ok()?.checked_mul(size_of::<T>())?;
+    let addr = ptr.addr().checked_add(offset)?;
+    addr.checked_add(size_of::<T>())?;
+    let src = ptr.with_addr(addr);
     let src = V::validate(src.cast_mut())?.cast_const();
     // Match on the size of `T` to use the appropriate fallible read function to
     // ensure that small aligned reads are atomic (and faster than a full
@@ -219,16 +222,17 @@ fn to_owned_slice<V: ValidateAccess, T: FromBytes>(
     if len == 0 {
         return Some(alloc::boxed::Box::new([]));
     }
+    let byte_len = len.checked_mul(size_of::<T>())?;
+    if byte_len > isize::MAX as usize {
+        return None;
+    }
+    ptr.addr().checked_add(byte_len)?;
     let ptr = V::validate_slice(core::ptr::slice_from_raw_parts(ptr, len).cast_mut())?.cast_const();
     let mut data = alloc::boxed::Box::<[T]>::new_uninit_slice(len);
     // SAFETY: The FromBytes bound on T guarantees that any byte pattern is valid for T.
     // The memcpy_fallible operation returns None on invalid memory access.
     V::with_user_memory_access(|| unsafe {
-        memcpy_fallible(
-            data.as_mut_ptr().cast(),
-            ptr.cast(),
-            len * core::mem::size_of::<T>(),
-        )
+        memcpy_fallible(data.as_mut_ptr().cast(), ptr.cast(), byte_len)
     })
     .ok()?;
     Some(unsafe { data.assume_init() })
@@ -341,7 +345,10 @@ impl<V: ValidateAccess, T: FromBytes> RawConstPointer<T> for UserMutPtr<V, T> {
 
 impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPtr<V, T> {
     fn write_at_offset(self, count: isize, value: T) -> Option<()> {
-        let dst = self.as_ptr().wrapping_add(usize::try_from(count).ok()?);
+        let offset = usize::try_from(count).ok()?.checked_mul(size_of::<T>())?;
+        let addr = self.inner.checked_add(offset)?;
+        addr.checked_add(size_of::<T>())?;
+        let dst = self.as_ptr().with_addr(addr);
         let dst = V::validate(dst)?;
         // Match on the size of `T` to use the appropriate fallible write function to
         // ensure that small aligned writes are atomic (and faster than a full
@@ -395,11 +402,52 @@ impl<V: ValidateAccess, T: FromBytes + IntoBytes> RawMutPointer<T> for UserMutPt
         if buf.is_empty() {
             return Some(());
         }
-        let dst = self.as_ptr().wrapping_add(start_offset);
+        let offset = start_offset.checked_mul(size_of::<T>())?;
+        let addr = self.inner.checked_add(offset)?;
+        addr.checked_add(size_of_val(buf))?;
+        let dst = self.as_ptr().with_addr(addr);
         let dst = V::validate_slice(core::ptr::slice_from_raw_parts_mut(dst, buf.len()))?;
         V::with_user_memory_access(|| unsafe {
             memcpy_fallible(dst.cast(), buf.as_ptr().cast(), size_of_val(buf))
         })
         .ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UserConstPtr, UserMutPtr, ValidateAccess};
+    use crate::platform::{RawConstPointer, RawMutPointer};
+
+    struct NoAccess;
+
+    impl ValidateAccess for NoAccess {
+        fn validate<T>(_ptr: *mut T) -> Option<*mut T> {
+            panic!("overflowing pointer must not reach validation")
+        }
+
+        fn validate_slice<T>(_ptr: *mut [T]) -> Option<*mut T> {
+            panic!("overflowing slice must not reach validation")
+        }
+    }
+
+    #[test]
+    fn test_user_pointer_overflow() {
+        let ptr = UserConstPtr::<NoAccess, u64>::from_usize(usize::MAX - 7);
+        assert_eq!(ptr.read_at_offset(0), None);
+        assert_eq!(ptr.read_at_offset(1), None);
+        assert_eq!(ptr.read_at_offset(isize::MAX), None);
+        assert!(ptr.to_owned_slice(1).is_none());
+        let ptr = UserConstPtr::<NoAccess, u64>::from_usize(0);
+        assert!(ptr.to_owned_slice(usize::MAX).is_none());
+        assert!(ptr.to_owned_slice(isize::MAX as usize).is_none());
+
+        let ptr = UserMutPtr::<NoAccess, u64>::from_usize(usize::MAX - 7);
+        assert_eq!(ptr.write_at_offset(0, 0), None);
+        assert_eq!(ptr.write_at_offset(1, 0), None);
+        assert_eq!(ptr.write_at_offset(isize::MAX, 0), None);
+        assert_eq!(ptr.copy_from_slice(0, &[0]), None);
+        assert_eq!(ptr.copy_from_slice(1, &[0]), None);
+        assert_eq!(ptr.copy_from_slice(usize::MAX, &[0]), None);
     }
 }

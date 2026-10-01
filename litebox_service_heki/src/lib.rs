@@ -477,12 +477,15 @@ impl MemoryContainer {
         let mut len: usize = 0;
         if self.buf.is_empty() {
             for range in &self.range {
-                let range_len: usize = range.len.trunc();
+                let range_len =
+                    usize::try_from(range.len).map_err(|_| MemoryContainerError::Overflow)?;
                 len = len
                     .checked_add(range_len)
                     .ok_or(MemoryContainerError::Overflow)?;
             }
-            self.buf.reserve_exact(len);
+            self.buf
+                .try_reserve_exact(len)
+                .map_err(|_| MemoryContainerError::AllocationFailed)?;
         }
 
         let range = self.range.clone();
@@ -505,13 +508,23 @@ impl MemoryContainer {
         phys_start: PhysAddr,
         phys_end: PhysAddr,
     ) -> Result<(), MemoryContainerError> {
-        let bytes_to_copy: usize = (phys_end - phys_start).trunc();
+        let bytes_to_copy = phys_end
+            .as_u64()
+            .checked_sub(phys_start.as_u64())
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or(MemoryContainerError::Overflow)?;
         if bytes_to_copy == 0 {
             return Ok(());
         }
 
         let old_len = self.buf.len();
-        self.buf.resize(old_len + bytes_to_copy, 0);
+        let new_len = old_len
+            .checked_add(bytes_to_copy)
+            .ok_or(MemoryContainerError::Overflow)?;
+        self.buf
+            .try_reserve_exact(bytes_to_copy)
+            .map_err(|_| MemoryContainerError::AllocationFailed)?;
+        self.buf.resize(new_len, 0);
         if gate
             .read_vtl0_contiguous(phys_start.as_u64(), &mut self.buf[old_len..])
             .is_err()
@@ -539,6 +552,8 @@ pub(crate) enum MemoryContainerError {
     CopyFromVtl0Failed,
     #[error("integer overflow while processing VTL0 memory")]
     Overflow,
+    #[error("unable to allocate a VTL0 memory buffer")]
+    AllocationFailed,
 }
 
 pub(crate) struct KexecMemoryMetadataWrapper {
@@ -911,7 +926,7 @@ impl SymbolTable {
         let Some(range) = mem.get_range() else {
             return Err(VsmError::SymbolTableEmpty);
         };
-        if start < range.start || end > range.end {
+        if start > end || start < range.start || end > range.end {
             return Err(VsmError::SymbolTableOutOfRange);
         }
 
@@ -933,5 +948,119 @@ impl SymbolTable {
             kinfo_addr += HekiKernelSymbol::KSYM_LEN as u64;
         }
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod memory_container_tests {
+    use super::*;
+    use litebox_common_linux::{vmap::PhysPageAddr, vmem::PAGE_SIZE};
+    use litebox_common_lvbs::{FrameTxn, MemAttr};
+    use x86_64::structures::paging::{Size4KiB, frame::PhysFrameRange};
+
+    struct Gate;
+
+    impl Vtl0Gate for Gate {
+        fn read_vtl0_pages(
+            &self,
+            _pages: &[PhysPageAddr<PAGE_SIZE>],
+            _offset: usize,
+            out: &mut [u8],
+        ) -> Result<(), VsmError> {
+            out.fill(0x5a);
+            Ok(())
+        }
+
+        fn protect_frames(
+            &self,
+            _range: PhysFrameRange<Size4KiB>,
+            _attr: MemAttr,
+        ) -> Result<(), VsmError> {
+            unreachable!()
+        }
+
+        fn unprotect_frames(&self, _range: PhysFrameRange<Size4KiB>) -> Result<(), VsmError> {
+            unreachable!()
+        }
+
+        fn protect_frames_transactionally(
+            &self,
+            _initial: &[PhysFrameRange<Size4KiB>],
+            _operation: &mut dyn FnMut(&mut dyn FrameTxn) -> Result<(), VsmError>,
+        ) -> Result<(), VsmError> {
+            unreachable!()
+        }
+
+        fn install_ringbuffer(&self, _pa: u64, _size: u64) {
+            unreachable!()
+        }
+
+        fn end_of_boot_reached(&self) -> bool {
+            unreachable!()
+        }
+
+        fn lock_control_registers(&self) -> Result<(), VsmError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn rejects_reversed_symbol_table_range() {
+        let mut container = MemoryContainer::new();
+        container.range.push(MemoryRange {
+            addr: VirtAddr::new(0x1000),
+            phys_addr: PhysAddr::new(0x1000),
+            len: 16,
+        });
+        container.buf.resize(16, 0);
+        assert!(matches!(
+            SymbolTable::new().build_from_container(
+                VirtAddr::new(0x1008),
+                VirtAddr::new(0x1004),
+                &container,
+                &container
+            ),
+            Err(VsmError::SymbolTableOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn rejects_unrepresentable_capacity() {
+        let mut container = MemoryContainer::new();
+        container.range.push(MemoryRange {
+            addr: VirtAddr::zero(),
+            phys_addr: PhysAddr::zero(),
+            len: usize::MAX as u64,
+        });
+        assert_eq!(
+            container.write_bytes_from_heki_range(&Gate),
+            Err(MemoryContainerError::AllocationFailed)
+        );
+        assert!(container.is_empty());
+    }
+
+    #[test]
+    fn rejects_reversed_range_without_mutation() {
+        let mut container = MemoryContainer::new();
+        container.buf.push(1);
+        assert_eq!(
+            container.write_vtl0_phys_bytes(&Gate, PhysAddr::new(2), PhysAddr::new(1)),
+            Err(MemoryContainerError::Overflow)
+        );
+        assert_eq!(container.buf, alloc::vec![1]);
+    }
+
+    #[test]
+    fn appends_representable_range() {
+        let mut container = MemoryContainer::new();
+        container.buf.push(1);
+        container
+            .write_vtl0_phys_bytes(
+                &Gate,
+                PhysAddr::new(PAGE_SIZE as u64),
+                PhysAddr::new(PAGE_SIZE as u64 + 3),
+            )
+            .unwrap();
+        assert_eq!(container.buf, alloc::vec![1, 0x5a, 0x5a, 0x5a]);
     }
 }

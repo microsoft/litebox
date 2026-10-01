@@ -11,7 +11,6 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::mem::size_of;
 use litebox::platform::RawConstPointer as _;
-use litebox::utils::TruncateExt;
 use litebox_common_linux::{PtRegs, errno::Errno};
 use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
@@ -2461,14 +2460,8 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     for shdr in shdrs {
         let name = strtab.get(shdr.sh_name as usize).ok()?;
         if name == TA_HEAD_SECTION_NAME {
-            let offset: usize = shdr.sh_offset.trunc();
-            let size: usize = shdr.sh_size.trunc();
-
-            if size < size_of::<TaHead>() {
-                return None;
-            }
-
-            return TaHead::read_from_bytes(&elf_data[offset..offset + size_of::<TaHead>()]).ok();
+            let (section, _) = elf.section_data(&shdr).ok()?;
+            return TaHead::read_from_bytes(section.get(..size_of::<TaHead>())?).ok();
         }
     }
     None
@@ -2498,6 +2491,41 @@ pub const HUK_SUBKEY_MAX_LEN: usize = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ta_head_elf(offset: u64, size: u64) -> alloc::vec::Vec<u8> {
+        let mut bytes = alloc::vec![0; 320];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[40..48].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64u16.to_le_bytes());
+        bytes[60..62].copy_from_slice(&3u16.to_le_bytes());
+        bytes[62..64].copy_from_slice(&1u16.to_le_bytes());
+        let names = b"\0.shstrtab\0.ta_head\0";
+        bytes[128..132].copy_from_slice(&1u32.to_le_bytes());
+        bytes[132..136].copy_from_slice(&3u32.to_le_bytes());
+        bytes[152..160].copy_from_slice(&256u64.to_le_bytes());
+        bytes[160..168].copy_from_slice(&(names.len() as u64).to_le_bytes());
+        bytes[256..256 + names.len()].copy_from_slice(names);
+        bytes[192..196].copy_from_slice(&11u32.to_le_bytes());
+        bytes[196..200].copy_from_slice(&1u32.to_le_bytes());
+        bytes[216..224].copy_from_slice(&offset.to_le_bytes());
+        bytes[224..232].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn test_ta_head_section_range_overflow() {
+        let size = core::mem::size_of::<TaHead>() as u64;
+        assert!(parse_ta_head(&ta_head_elf(288, size)).is_some());
+        for offset in [u64::MAX, u64::MAX - 16, 319, 320] {
+            assert!(parse_ta_head(&ta_head_elf(offset, size)).is_none());
+        }
+        assert!(parse_ta_head(&ta_head_elf(288, size - 1)).is_none());
+        assert!(parse_ta_head(&ta_head_elf(288, u64::MAX)).is_none());
+    }
 
     #[test]
     fn test_optee_msg_args_header_size_and_layout() {

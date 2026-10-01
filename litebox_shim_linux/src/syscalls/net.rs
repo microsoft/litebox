@@ -1173,10 +1173,12 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
             size_of::<CSockInetAddr>()
         }
         SocketAddress::Unix(v) => {
-            let family_ptr = UserPtrMut::<u16>::from_usize(addr.as_usize());
-            family_ptr
-                .write_at_offset::<Platform>(0, AddressFamily::UNIX as u16)
-                .ok_or(Errno::EFAULT)?;
+            let family = (AddressFamily::UNIX as u16).to_ne_bytes();
+            let family_len = family.len().min(addrlen_val as usize);
+            if family_len != 0 {
+                addr.write_slice_at_offset::<Platform>(0, &family[..family_len])
+                    .ok_or(Errno::EFAULT)?;
+            }
             match v {
                 UnixSocketAddr::Unnamed => {
                     // only write family
@@ -1198,10 +1200,15 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
                 }
                 UnixSocketAddr::Path(path) => {
                     let offset = offset_of!(CSockUnixAddr, path);
-                    let max_len = addrlen_val as usize - offset;
+                    let max_len = (addrlen_val as usize).saturating_sub(offset);
                     let name = &path.as_bytes()[..path.len().min(max_len)];
-                    addr.write_slice_at_offset::<Platform>(isize::try_from(offset).unwrap(), name)
+                    if !name.is_empty() {
+                        addr.write_slice_at_offset::<Platform>(
+                            isize::try_from(offset).unwrap(),
+                            name,
+                        )
                         .ok_or(Errno::EFAULT)?;
+                    }
                     let null_offset = offset + name.len();
                     // write null terminator if there is space
                     if addrlen_val as usize > null_offset {
@@ -2868,6 +2875,37 @@ mod unix_tests {
     };
 
     extern crate std;
+
+    #[test]
+    fn test_unix_sockaddr_short_buffer() {
+        type Platform = crate::syscalls::tests::TestPlatform;
+        let _task = init_platform(None);
+        for address in [
+            UnixSocketAddr::Unnamed,
+            UnixSocketAddr::Abstract(alloc::vec![b'a', b'b']),
+            UnixSocketAddr::Path("ab".to_string()),
+        ] {
+            let expected_len = match &address {
+                UnixSocketAddr::Unnamed => 2,
+                UnixSocketAddr::Abstract(_) | UnixSocketAddr::Path(_) => 5,
+            };
+            for capacity in 0..=6u32 {
+                let mut buffer = [0xa5u8; 8];
+                let mut addrlen = capacity;
+                super::write_sockaddr_to_user::<Platform>(
+                    SocketAddress::Unix(address.clone()),
+                    UserPtrMut::from_ptr(buffer.as_mut_ptr()),
+                    UserPtrMut::from_ptr(&raw mut addrlen),
+                )
+                .unwrap();
+                assert_eq!(addrlen, expected_len);
+                assert!(buffer[capacity as usize..].iter().all(|byte| *byte == 0xa5));
+                let family = (AddressFamily::UNIX as u16).to_ne_bytes();
+                let family_len = (capacity as usize).min(family.len());
+                assert_eq!(&buffer[..family_len], &family[..family_len]);
+            }
+        }
+    }
 
     fn create_unix_socket(task: &TestTask, ty: SockType, flags: SockFlags) -> u32 {
         task.do_socket(AddressFamily::UNIX, ty, flags, 0).unwrap()
