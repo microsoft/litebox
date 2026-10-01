@@ -43,7 +43,8 @@ int main(int argc, char **argv) {
     int status = 0;
     pid_t waited = child < 0 ? -1 : waitpid(child, &status, 0);
     off_t offset = lseek(1, 0, SEEK_CUR);
-    int stdin_nonblock = (fcntl(0, F_GETFL) & O_NONBLOCK) != 0;
+    int stdin_flags = fcntl(0, F_GETFL);
+    int stdin_nonblock = stdin_flags < 0 ? -1 : (stdin_flags & O_NONBLOCK) != 0;
     dup2(saved_stdout, 1);
     if (child < 0) {
         perror("vfork");
