@@ -1163,7 +1163,10 @@ where
         const COPY_CHUNK_SIZE: usize = 1 << 16;
 
         let permissions = MemoryRegionPermissions::from(vma.flags());
-        let temporary = VmArea::new(vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE, false);
+        let temporary = VmArea::new(
+            (vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE) - VmFlags::VM_EXEC,
+            false,
+        );
         let length = NonZeroPageSize::new(new_range.len()).expect("remap destination is empty");
         // SAFETY: Hint placement never replaces existing mappings.
         let destination = unsafe {
@@ -1326,7 +1329,7 @@ where
         // only if the provider successfully performs a replacement.
         let reservation = unsafe {
             self.platform.try_allocate_cow_pages(
-                || self.reservations.take_overlapping(requested).into_iter(),
+                || self.reservations.take_replaced(requested).into_iter(),
                 suggested_start,
                 source_data,
                 permissions,
