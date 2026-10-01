@@ -126,6 +126,7 @@ int main(int argc, char **argv) {
             }
             total += n;
         }
+        ok &= fcntl(0, F_SETFL, flags & ~O_NONBLOCK) == 0;
         printf("child-cat bytes=%zu ok=%d rdonly=%d nonblock=%d\n", total, ok,
                (flags & O_ACCMODE) == O_RDONLY, (flags & O_NONBLOCK) != 0);
         return 42;

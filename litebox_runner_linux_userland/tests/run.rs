@@ -396,7 +396,8 @@ fn vfork_exec_children_share_pipes_with_their_parent() {
     assert_eq!(line("child-open-fds"), "child-open-fds 0 1 2");
 
     // Each process waits for the other to drain or fill the pipe, and the child's nonblocking
-    // read end sees end-of-file once the parent closes its write end.
+    // read end sees end-of-file once the parent closes its write end. Both processes share the
+    // read end's status flags, so the parent sees the child clear O_NONBLOCK.
     let cat_line = line("child-cat ");
     assert_eq!(numeric_field(cat_line, "bytes="), 256 * 1024);
     assert_eq!(numeric_field(cat_line, "ok="), 1);
@@ -405,6 +406,7 @@ fn vfork_exec_children_share_pipes_with_their_parent() {
     let stdin_line = line("stdin-pipe ");
     assert_eq!(numeric_field(stdin_line, "code="), 42);
     assert_eq!(numeric_field(stdin_line, "written="), 256 * 1024);
+    assert_eq!(numeric_field(stdin_line, "shared_setfl="), 1);
 
     // The child's exit wakes the parent blocked writing a full pipe.
     assert_eq!(line("child-read-byte "), "child-read-byte n=1 byte=a");

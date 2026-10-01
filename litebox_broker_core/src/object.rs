@@ -112,7 +112,14 @@ pub(crate) fn get_status_flags(
     process: &BrokerProcess,
     object: &RwLock<ObjectEntry>,
 ) -> Result<FileStatusFlags> {
-    let file = status_flags_file(object)?;
+    let file = match &*object.read() {
+        ObjectEntry::File(file) => file.clone(),
+        ObjectEntry::Pipe(pipe) => return Ok(pipe.get_status_flags()),
+        ObjectEntry::Event(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_)
+        | ObjectEntry::Timer(_) => return Err(BrokerError::InvalidRights),
+    };
     crate::fs::get_status_flags(process, &file)
 }
 
@@ -123,18 +130,16 @@ pub(crate) fn set_status_flags(
     mask: FileOpenFlags,
     flags: FileOpenFlags,
 ) -> Result<()> {
-    let file = status_flags_file(object)?;
-    crate::fs::set_status_flags(process, &file, mask, flags)
-}
-
-/// Returns the file whose status flags `object` holds, released from the object lock.
-fn status_flags_file(object: &RwLock<ObjectEntry>) -> Result<File> {
-    match &*object.read() {
-        ObjectEntry::File(file) => Ok(file.clone()),
+    let file = match &mut *object.write() {
+        ObjectEntry::File(file) => file.clone(),
+        ObjectEntry::Pipe(pipe) => {
+            pipe.set_status_flags(mask, flags);
+            return Ok(());
+        }
         ObjectEntry::Event(_)
-        | ObjectEntry::Pipe(_)
         | ObjectEntry::Socket(_)
         | ObjectEntry::Process(_)
-        | ObjectEntry::Timer(_) => Err(BrokerError::InvalidRights),
-    }
+        | ObjectEntry::Timer(_) => return Err(BrokerError::InvalidRights),
+    };
+    crate::fs::set_status_flags(process, &file, mask, flags)
 }

@@ -11,7 +11,6 @@ use litebox::pipes::HalfPipeType;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 
-use crate::OFlags;
 use crate::signal::SigSet;
 
 const HEADER_SIZE: usize = size_of::<[u32; 9]>() + size_of::<[u64; 2]>();
@@ -61,24 +60,24 @@ pub struct InheritedFd {
     /// The child's broker handle to the descriptor's object, as returned by
     /// [`litebox::process::Process::inherit`].
     ///
-    /// Descriptors with the same handle share one open file description, whose kind and metadata
-    /// are taken from the first of them.
+    /// Descriptors with the same handle share one open file description, whose kind is taken from
+    /// the first of them.
     pub handle: ObjectHandle,
     /// What the descriptor refers to.
     pub kind: InheritedFdKind,
 }
 
-/// The kind of object an [`InheritedFd`] refers to, with the metadata the runner tracks for it.
+/// The kind of object an [`InheritedFd`] refers to.
+///
+/// The broker keeps the access mode and status flags of every kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InheritedFdKind {
-    /// A file, including a standard stream, whose access mode and status flags the broker keeps.
+    /// A file, including a standard stream.
     File,
     /// An end of a pipe.
     Pipe {
         /// Which end.
         endpoint: HalfPipeType,
-        /// The end's access mode, which must match `endpoint`, and status flags.
-        status_flags: OFlags,
     },
 }
 
@@ -100,9 +99,6 @@ pub enum LinuxProgramStartupError {
     /// An argument or environment string contains an interior NUL.
     #[error("invalid Linux program string")]
     InvalidString,
-    /// An inherited descriptor's metadata does not match its kind.
-    #[error("invalid Linux program inherited descriptor")]
-    InvalidInheritedFd,
 }
 
 impl LinuxProgramStartup {
@@ -234,7 +230,7 @@ impl InheritedFd {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
                 InheritedFdKind::File => 0,
-                InheritedFdKind::Pipe { .. } => size_of::<u8>() + size_of::<u32>(),
+                InheritedFdKind::Pipe { .. } => size_of::<u8>(),
             }
     }
 
@@ -243,16 +239,12 @@ impl InheritedFd {
         push_u64(output, self.handle.0);
         match self.kind {
             InheritedFdKind::File => output.push(FILE_TAG),
-            InheritedFdKind::Pipe {
-                endpoint,
-                status_flags,
-            } => {
+            InheritedFdKind::Pipe { endpoint } => {
                 output.push(PIPE_TAG);
                 output.push(match endpoint {
                     HalfPipeType::ReceiverHalf => 0,
                     HalfPipeType::SenderHalf => 1,
                 });
-                push_u32(output, status_flags.bits());
             }
         }
     }
@@ -268,7 +260,6 @@ impl InheritedFd {
                     1 => HalfPipeType::SenderHalf,
                     _ => return Err(LinuxProgramStartupError::Malformed),
                 },
-                status_flags: OFlags::from_bits_retain(read_u32(input)?),
             },
             _ => return Err(LinuxProgramStartupError::Malformed),
         };
@@ -277,28 +268,11 @@ impl InheritedFd {
 }
 
 fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupError> {
-    const ACCESS_MODE: OFlags = OFlags::WRONLY.union(OFlags::RDWR);
-
     if startup.parent_process_id <= 0 {
         return Err(LinuxProgramStartupError::InvalidParentProcess);
     }
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
-    }
-    for inherited in &startup.inherited_fds {
-        if let InheritedFdKind::Pipe {
-            endpoint,
-            status_flags,
-        } = inherited.kind
-        {
-            let access_mode = match endpoint {
-                HalfPipeType::ReceiverHalf => OFlags::RDONLY,
-                HalfPipeType::SenderHalf => OFlags::WRONLY,
-            };
-            if status_flags & ACCESS_MODE != access_mode {
-                return Err(LinuxProgramStartupError::InvalidInheritedFd);
-            }
-        }
     }
     Ok(())
 }
@@ -410,7 +384,6 @@ mod tests {
                     handle: ObjectHandle(8),
                     kind: InheritedFdKind::Pipe {
                         endpoint: HalfPipeType::ReceiverHalf,
-                        status_flags: OFlags::RDONLY | OFlags::NONBLOCK,
                     },
                 },
                 InheritedFd {
@@ -418,7 +391,6 @@ mod tests {
                     handle: ObjectHandle(9),
                     kind: InheritedFdKind::Pipe {
                         endpoint: HalfPipeType::SenderHalf,
-                        status_flags: OFlags::WRONLY,
                     },
                 },
             ],

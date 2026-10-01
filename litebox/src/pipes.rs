@@ -3,14 +3,15 @@
 
 //! Unidirectional communication channels
 
-use core::{
-    num::NonZeroUsize,
-    sync::atomic::{AtomicBool, Ordering::Relaxed},
-};
+use core::num::NonZeroUsize;
 
 use alloc::sync::{Arc, Weak};
 use litebox_broker_protocol::{
-    ObjectHandle, pipe::MAX_PIPE_TRANSFER_SIZE, readiness::ReadinessFlags,
+    ObjectHandle,
+    error::ErrorCode,
+    fs::{FileOpenFlags, FileStatusFlags},
+    pipe::MAX_PIPE_TRANSFER_SIZE,
+    readiness::ReadinessFlags,
 };
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
@@ -28,6 +29,7 @@ use crate::{
         polling::{Pollee, TryOpError},
         wait::{WaitContext, WaitError},
     },
+    fs::errors::StatusFlagsError,
     sync::RawSyncPrimitivesProvider,
 };
 
@@ -51,10 +53,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     ///
     /// This function returns the sender and receiver halves respectively.
     ///
-    /// `capacity` defines the maximum capacity of the channel, beyond which it will block or refuse to
-    /// write, depending on flags.
+    /// `capacity` defines the maximum capacity of the channel, beyond which writes wait or, if the
+    /// writer is non-blocking, fail.
     ///
-    /// `flags` sets up the initial flags for the channel.
+    /// `flags` are the initial status flags of both halves, within [`FileOpenFlags::STATUS`].
     ///
     /// `atomic_slice_guarantee_size` (if provided) is the number of elements that are guaranteed to be
     /// written atomically (i.e., not interleaved with other writes) if a slice of those many (or fewer)
@@ -63,7 +65,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
     pub fn create_pipe(
         &self,
         capacity: usize,
-        flags: Flags,
+        flags: FileOpenFlags,
         atomic_slice_guarantee_size: Option<NonZeroUsize>,
     ) -> Result<(PipeFd<Platform>, PipeFd<Platform>), errors::CreateError> {
         let broker = self
@@ -151,40 +153,33 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Pipes<Platform> {
             .endpoint_type)
     }
 
-    /// Get the flags set on the pipe at `fd`.
-    pub fn get_flags(&self, fd: &PipeFd<Platform>) -> Result<Flags, errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
-        let p = &dt
-            .get_entry(fd)
-            .ok_or(errors::ClosedError::ClosedFd)?
-            .entry
-            .0;
-        Ok(if p.non_blocking.load(Relaxed) {
-            Flags::NON_BLOCKING
-        } else {
-            Flags::empty()
-        })
-    }
-
-    /// Update the flags set on the pipe at `fd`.
-    ///
-    /// Specifically, sets the bits in the `mask` to `on`, leaving the others unchanged.
-    pub fn update_flags(
+    /// Returns the access mode and status flags of the pipe half at `fd`.
+    pub fn get_status_flags(
         &self,
         fd: &PipeFd<Platform>,
-        mask: Flags,
-        on: bool,
-    ) -> Result<(), errors::ClosedError> {
-        let dt = self.litebox.descriptor_table();
-        let p = &dt
-            .get_entry(fd)
-            .ok_or(errors::ClosedError::ClosedFd)?
-            .entry
-            .0;
-        if mask.contains(Flags::NON_BLOCKING) {
-            p.non_blocking.store(on, Relaxed);
-        }
-        Ok(())
+    ) -> Result<FileStatusFlags, StatusFlagsError> {
+        let end = self
+            .litebox
+            .broker_pipe_end(fd)
+            .ok_or(StatusFlagsError::ClosedFd)?;
+        Ok(end.broker.get_status_flags(end.handle)?)
+    }
+
+    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`], of the pipe half at
+    /// `fd` to their values in `flags`.
+    ///
+    /// Every descriptor and process sharing the pipe half sees the change.
+    pub fn set_status_flags(
+        &self,
+        fd: &PipeFd<Platform>,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<(), StatusFlagsError> {
+        let end = self
+            .litebox
+            .broker_pipe_end(fd)
+            .ok_or(StatusFlagsError::ClosedFd)?;
+        Ok(end.broker.set_status_flags(end.handle, mask, flags)?)
     }
 
     /// Perform `f` with the [`IOPollable`] associated with the pipe at `fd`.
@@ -211,17 +206,6 @@ pub enum HalfPipeType {
 }
 
 struct PipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvider>(Arc<BrokerPipeEnd<Platform>>);
-
-bitflags::bitflags! {
-    /// Flags for controlling the pipe behaviors.
-    #[repr(transparent)]
-    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
-    pub struct Flags: u32 {
-        /// `NON_BLOCKING` impacts what happens when a full channel is written, or an empty channel
-        /// is read from. If set, the operations returns immediately with a `WouldBlock` error.
-        const NON_BLOCKING = 0x1;
-    }
-}
 
 pub mod errors {
     use crate::event::wait::WaitError;
@@ -347,7 +331,6 @@ pub(crate) struct BrokerPipeEnd<Platform: RawSyncPrimitivesProvider + TimeProvid
     pollee: Arc<Pollee<Platform>>,
     peer: Weak<Self>,
     endpoint_type: HalfPipeType,
-    non_blocking: AtomicBool,
 }
 
 #[expect(
@@ -358,7 +341,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
     broker: Arc<dyn BrokerControl>,
     pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
     capacity: usize,
-    flags: Flags,
+    flags: FileOpenFlags,
     atomic_slice_guarantee_size: Option<NonZeroUsize>,
 ) -> Result<(Arc<BrokerPipeEnd<Platform>>, Arc<BrokerPipeEnd<Platform>>), errors::CreateError> {
     let atomic_write_size = atomic_slice_guarantee_size
@@ -375,6 +358,7 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
             atomic_write_size
                 .try_into()
                 .map_err(|_| errors::CreateError::ResourceExhausted)?,
+            flags,
         )
         .map_err(BrokerObjectError::from)
         .map_err(errors::CreateError::from)?;
@@ -386,7 +370,6 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         pollee: Arc::new(Pollee::new()),
         peer: Weak::new(),
         endpoint_type: HalfPipeType::SenderHalf,
-        non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
     });
     let reader = Arc::new_cyclic(|weak_reader| {
         Arc::get_mut(&mut writer)
@@ -399,7 +382,6 @@ fn new_broker_pipe<Platform: RawSyncPrimitivesProvider + TimeProvider>(
             pollee: Arc::new(Pollee::new()),
             peer: Arc::downgrade(&writer),
             endpoint_type: HalfPipeType::ReceiverHalf,
-            non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
         }
     });
 
@@ -419,8 +401,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Returns a descriptor for a pipe end this process inherited from its
-    /// parent through [`Process::inherit`](crate::process::Process::inherit),
-    /// using `flags` as the end's initial flags.
+    /// parent through [`Process::inherit`](crate::process::Process::inherit).
     ///
     /// The descriptor owns `handle`, so callers adopt each handle once and
     /// duplicate the descriptor for every other use. The end has no peer in
@@ -429,7 +410,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         &self,
         handle: ObjectHandle,
         endpoint_type: HalfPipeType,
-        flags: Flags,
     ) -> Result<PipeFd<Platform>, crate::process::ProcessError> {
         let broker = self
             .broker_control()
@@ -442,7 +422,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
             pollee: Arc::new(Pollee::new()),
             peer: Weak::new(),
             endpoint_type,
-            non_blocking: AtomicBool::new(flags.contains(Flags::NON_BLOCKING)),
         });
         pollable_registry.register_pollable(handle, &end.pollee);
         Ok(self.descriptor_table_mut().insert(PipeEnd(end)))
@@ -464,8 +443,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
             .try_into()
             .expect("pipe transfer limit must fit in u32");
 
+        // The broker fails the read instead of returning `WouldBlock` if this end is non-blocking.
         self.pollee
-            .wait(cx, self.non_blocking.load(Relaxed), Events::IN, || {
+            .wait(cx, false, Events::IN, || {
                 let data = self
                     .broker
                     .read_pipe(self.handle, request_length)
@@ -488,15 +468,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         if buf.is_empty() {
             return Ok(0);
         }
-        let nonblock = self.non_blocking.load(Relaxed);
-        if nonblock {
-            let data = &buf[..buf.len().min(MAX_PIPE_TRANSFER_SIZE as usize)];
-            return self
-                .pollee
-                .wait(cx, nonblock, Events::OUT, || self.try_write(data))
-                .map_err(PipeError::from);
-        }
 
+        // The broker fails a write instead of returning `WouldBlock` if this end is non-blocking,
+        // which ends the loop with what was written so far.
         let mut total_written = 0;
         while total_written < buf.len() {
             let end = total_written
@@ -531,12 +505,15 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
         Ok(written)
     }
 
-    fn broker_request_error(&self, error: BrokerControlError) -> BrokerObjectError {
-        let error = error.into();
+    fn broker_request_error(&self, error: BrokerControlError) -> TryOpError<PipeError> {
+        if error == BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock) {
+            return TryOpError::Other(PipeError::WouldBlock);
+        }
+        let error = BrokerObjectError::from(error);
         if error != BrokerObjectError::WouldBlock {
             self.pollee.notify_observers(Events::ERR);
         }
-        error
+        error.into()
     }
 
     fn readiness(&self) -> Result<ReadinessFlags, BrokerControlError> {
@@ -609,6 +586,7 @@ mod tests {
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::error::ErrorCode;
+    use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::message::{
         BrokerNotification, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
         PipeRequest, ReadinessNotification,
@@ -639,7 +617,7 @@ mod tests {
         );
         let litebox = crate::LiteBox::new_with_broker_local(platform, local);
         let pipes = super::Pipes::new(&litebox);
-        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+        let (writer, reader) = pipes.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
         let writer_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
         let writer_observer_dyn: Arc<dyn Observer<Events>> = writer_observer.clone();
         pipes
@@ -684,7 +662,7 @@ mod tests {
         );
         let litebox = Arc::new(crate::LiteBox::new_with_broker_local(platform, local));
         let pipes = super::Pipes::new(&litebox);
-        let (writer, reader) = pipes.create_pipe(2, super::Flags::empty(), None).unwrap();
+        let (writer, reader) = pipes.create_pipe(2, FileOpenFlags::NONE, None).unwrap();
 
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let read_litebox = Arc::clone(&litebox);
@@ -762,7 +740,7 @@ mod tests {
         let litebox = crate::LiteBox::new(platform);
         let pipes = super::Pipes::new(&litebox);
         assert!(matches!(
-            pipes.create_pipe(2, super::Flags::empty(), None),
+            pipes.create_pipe(2, FileOpenFlags::NONE, None),
             Err(super::errors::CreateError::Io)
         ));
     }

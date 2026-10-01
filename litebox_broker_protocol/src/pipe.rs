@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
+use crate::fs::FileOpenFlags;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 
 /// Maximum pipe bytes transferred by one broker request.
@@ -21,6 +22,8 @@ pub struct CreatePipeRequest {
     pub capacity: u64,
     /// Maximum write size that must be accepted atomically.
     pub atomic_write_size: u64,
+    /// Initial status flags of both endpoints, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// Response to a pipe create request.

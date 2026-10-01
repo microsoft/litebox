@@ -226,6 +226,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         capacity: u64,
         atomic_write_size: u64,
+        flags: FileOpenFlags,
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError>;
 
     fn read_pipe(
@@ -816,8 +817,9 @@ where
         &self,
         capacity: u64,
         atomic_write_size: u64,
+        flags: FileOpenFlags,
     ) -> core::result::Result<CreatePipeResponse, BrokerControlError> {
-        self.request(|local| local.create_pipe(capacity, atomic_write_size))
+        self.request(|local| local.create_pipe(capacity, atomic_write_size, flags))
     }
 
     fn read_pipe(

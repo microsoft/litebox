@@ -962,6 +962,7 @@ mod tests {
             BrokerOperation::Pipe(PipeRequest::Create(CreatePipeRequest {
                 capacity: 4096,
                 atomic_write_size: 512,
+                flags: FileOpenFlags::STATUS,
             })),
             BrokerOperation::Pipe(PipeRequest::Read(ReadPipeRequest {
                 handle,

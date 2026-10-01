@@ -23,6 +23,7 @@ pub(super) fn encode_pipe_request(encoder: &mut Encoder, request: PipeRequest) {
             encoder.u8(PIPE_REQUEST_TAG_CREATE);
             encoder.u64(request.capacity);
             encoder.u64(request.atomic_write_size);
+            encoder.u16(request.flags.bits());
         }
         PipeRequest::Read(request) => {
             encoder.u8(PIPE_REQUEST_TAG_READ);
@@ -42,6 +43,7 @@ pub(super) fn decode_pipe_request(decoder: &mut Decoder<'_>) -> Result<PipeReque
         PIPE_REQUEST_TAG_CREATE => Ok(PipeRequest::Create(CreatePipeRequest {
             capacity: decoder.u64()?,
             atomic_write_size: decoder.u64()?,
+            flags: super::fs::decode_open_flags(decoder)?,
         })),
         PIPE_REQUEST_TAG_READ => Ok(PipeRequest::Read(ReadPipeRequest {
             handle: decoder.handle()?,

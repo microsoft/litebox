@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use litebox_broker_local::BrokerLocal;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::process::ProcessStartupData;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{
@@ -299,7 +300,7 @@ fn run_fake_runner(args: &[OsString]) {
         ReadinessFlags::READ | ReadinessFlags::WRITE
     );
 
-    let pipe = local.create_pipe(64, 16).unwrap();
+    let pipe = local.create_pipe(64, 16, FileOpenFlags::NONE).unwrap();
     let data = b"shared pipe data";
     let write_buffer =
         SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], data.len().try_into().unwrap())

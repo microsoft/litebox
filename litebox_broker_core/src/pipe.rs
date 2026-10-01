@@ -7,6 +7,7 @@ use alloc::{collections::VecDeque, sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
@@ -20,11 +21,17 @@ pub const MAX_PIPE_CAPACITY: usize = 1024 * 1024;
 
 /// Creates a broker-owned pipe and returns its read and write endpoint handles.
 ///
+/// Both endpoints start with the status flags `flags`, which must be within
+/// [`FileOpenFlags::STATUS`].
 pub fn create(
     process: &BrokerProcess,
     capacity: u64,
     atomic_write_size: u64,
+    flags: FileOpenFlags,
 ) -> Result<(ObjectHandle, ObjectHandle)> {
+    if !FileOpenFlags::STATUS.contains(flags) {
+        return Err(BrokerError::UnsupportedOperation);
+    }
     let capacity = usize::try_from(capacity).map_err(|_| BrokerError::ResourceExhausted)?;
     let atomic_write_size =
         usize::try_from(atomic_write_size).map_err(|_| BrokerError::ResourceExhausted)?;
@@ -51,8 +58,12 @@ pub fn create(
         _capacity_reservation: capacity_reservation,
     }));
     process.create_object_reference_pair(
-        ObjectEntry::Pipe(PipeObject::reader(Arc::clone(&state))),
-        ObjectEntry::Pipe(PipeObject::writer(state)),
+        ObjectEntry::Pipe(PipeObject::new(
+            Arc::clone(&state),
+            PipeEndpoint::Read,
+            flags,
+        )),
+        ObjectEntry::Pipe(PipeObject::new(state, PipeEndpoint::Write, flags)),
     )
 }
 
@@ -85,23 +96,51 @@ impl ObjectEntry {
     }
 }
 
+/// One endpoint of a pipe, whose references share its status flags.
 pub(crate) struct PipeObject {
     state: Arc<RwLock<PipeState>>,
     endpoint: PipeEndpoint,
+    /// Whether reads and writes that would block fail instead of waiting.
+    nonblocking: bool,
+    /// Whether `O_APPEND` is set, which Linux reports but which has no effect on a pipe.
+    append: bool,
 }
 
 impl PipeObject {
-    fn reader(state: Arc<RwLock<PipeState>>) -> Self {
+    fn new(state: Arc<RwLock<PipeState>>, endpoint: PipeEndpoint, flags: FileOpenFlags) -> Self {
         Self {
             state,
-            endpoint: PipeEndpoint::Read,
+            endpoint,
+            nonblocking: flags.contains(FileOpenFlags::NONBLOCKING),
+            append: flags.contains(FileOpenFlags::APPEND),
         }
     }
 
-    fn writer(state: Arc<RwLock<PipeState>>) -> Self {
-        Self {
-            state,
-            endpoint: PipeEndpoint::Write,
+    /// Returns the endpoint's access mode and status flags.
+    pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
+        let access = match self.endpoint {
+            PipeEndpoint::Read => FileAccessMode::ReadOnly,
+            PipeEndpoint::Write => FileAccessMode::WriteOnly,
+        };
+        let mut flags = FileOpenFlags::NONE;
+        for (set, flag) in [
+            (self.nonblocking, FileOpenFlags::NONBLOCKING),
+            (self.append, FileOpenFlags::APPEND),
+        ] {
+            if set {
+                flags = flags | flag;
+            }
+        }
+        FileStatusFlags { access, flags }
+    }
+
+    /// Changes the status flags in `mask` to their values in `flags`.
+    pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
+        if mask.contains(FileOpenFlags::NONBLOCKING) {
+            self.nonblocking = flags.contains(FileOpenFlags::NONBLOCKING);
+        }
+        if mask.contains(FileOpenFlags::APPEND) {
+            self.append = flags.contains(FileOpenFlags::APPEND);
         }
     }
 
@@ -126,7 +165,7 @@ impl PipeObject {
         let mut state = self.state.write();
         if state.data.is_empty() {
             return if state.write_open {
-                Err(BrokerError::WouldBlock)
+                Err(BrokerError::would_block(self.nonblocking))
             } else {
                 Ok(Vec::new())
             };
@@ -155,7 +194,7 @@ impl PipeObject {
 
         let available = state.capacity - state.data.len();
         if available == 0 || (data.len() <= state.atomic_write_size && available < data.len()) {
-            return Err(BrokerError::WouldBlock);
+            return Err(BrokerError::would_block(self.nonblocking));
         }
 
         let write_len = available.min(data.len());
