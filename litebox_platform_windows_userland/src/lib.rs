@@ -73,8 +73,6 @@ pub enum GuestTlsMode {
 const PAGE_SIZE: usize = 4096;
 
 mod page_mgmt;
-#[doc(hidden)]
-pub use page_mgmt::WindowsUserlandReservation;
 
 const GUEST_TLS_MODE_UNCONFIGURED: u8 = 0;
 static GUEST_TLS_MODE: AtomicU8 = AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);

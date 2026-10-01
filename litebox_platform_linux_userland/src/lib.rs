@@ -53,8 +53,6 @@ extern crate alloc;
 #[cfg(target_arch = "aarch64")]
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 mod page_mgmt;
-#[doc(hidden)]
-pub use page_mgmt::LinuxUserlandReservation;
 
 /// The admitted open syscall and its flags index must remain paired.
 #[cfg(target_arch = "x86_64")]

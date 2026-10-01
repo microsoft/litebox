@@ -2433,7 +2433,7 @@ mod tests {
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform();
-        let platform = task.global.platform;
+        let external_platform = Platform::new();
         let mut data = alloc::vec::Vec::new();
         let mut count = 0;
         // Model an external allocator allocation that LiteBox's page manager does not track.
@@ -2456,7 +2456,7 @@ mod tests {
                     <Platform as PageManagementProvider<4096>>::RESERVATION_ALIGNMENT;
                 let suggested_start = task_addr_min + count * reservation_alignment;
                 let allocation = <Platform as PageManagementProvider<4096>>::allocate_pages(
-                    platform,
+                    external_platform,
                     suggested_start..suggested_start + 0x1000,
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                     false,
@@ -2520,7 +2520,7 @@ mod tests {
             // SAFETY: The page belongs to the external provider and has no outstanding references.
             unsafe {
                 <Platform as PageManagementProvider<4096>>::release_pages(
-                    platform,
+                    external_platform,
                     allocation..allocation + 0x1000,
                 )
                 .unwrap();

@@ -70,7 +70,7 @@ mod wait;
 
 pub(crate) use litebox::fs::FileFd;
 
-pub use litebox_common_linux::vmem::ShimReservations;
+use litebox_common_linux::vmem::ShimReservations;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
