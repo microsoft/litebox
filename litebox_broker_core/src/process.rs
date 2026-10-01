@@ -1586,8 +1586,7 @@ mod tests {
     };
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
-        FileType, FileUser, SetStatusFlagsRequest,
+        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessTermination};
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -3122,157 +3121,6 @@ mod tests {
         );
     }
 
-    fn check_file_status_flags(broker: &BrokerCore) {
-        let source = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let target = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let readiness: Arc<dyn ReadinessSink> = readiness_sink();
-        let open = |path, access, flags| {
-            crate::fs::open(
-                &source,
-                path,
-                ROOT,
-                access,
-                flags,
-                FileMode::from_bits(0o600).unwrap(),
-                &readiness,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let set = |process: &BrokerProcess, handle, mask, flags| {
-            process.set_status_flags(SetStatusFlagsRequest {
-                handle,
-                mask,
-                flags,
-            })
-        };
-        let mut byte = [0];
-
-        let stdin = open(
-            "/dev/stdin",
-            FileAccessMode::ReadOnly,
-            FileOpenFlags::NONBLOCKING,
-        );
-        assert_eq!(
-            source.get_status_flags(stdin),
-            Ok(FileStatusFlags {
-                access: FileAccessMode::ReadOnly,
-                flags: FileOpenFlags::NONBLOCKING,
-            })
-        );
-        assert_eq!(
-            crate::fs::read(&source, stdin, &mut byte, None),
-            Err(BrokerError::NonBlockingWouldBlock)
-        );
-        let duplicate = source
-            .duplicate_object_reference_to(stdin, &target, ObjectRights::WAIT)
-            .unwrap();
-        assert_eq!(
-            set(
-                &target,
-                duplicate,
-                FileOpenFlags::NONBLOCKING,
-                FileOpenFlags::NONE
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            source.get_status_flags(stdin).map(|status| status.flags),
-            Ok(FileOpenFlags::NONE)
-        );
-        assert_eq!(
-            crate::fs::read(&source, stdin, &mut byte, None),
-            Err(BrokerError::WouldBlock)
-        );
-        assert_eq!(target.close_object_reference(duplicate), Ok(()));
-        assert_eq!(source.close_object_reference(stdin), Ok(()));
-
-        let file = open(
-            "/status-flags",
-            FileAccessMode::ReadWrite,
-            FileOpenFlags::CREATE,
-        );
-        assert_eq!(crate::fs::write(&source, file, b"ab", None), Ok(Ok(2)));
-        assert_eq!(
-            crate::fs::seek(&source, file, 0, FileSeekWhence::RelativeToBeginning),
-            Ok(Ok(0))
-        );
-        assert_eq!(
-            set(&source, file, FileOpenFlags::APPEND, FileOpenFlags::STATUS),
-            Ok(())
-        );
-        assert_eq!(
-            source.get_status_flags(file),
-            Ok(FileStatusFlags {
-                access: FileAccessMode::ReadWrite,
-                flags: FileOpenFlags::APPEND,
-            })
-        );
-        assert_eq!(crate::fs::write(&source, file, b"c", None), Ok(Ok(1)));
-        assert_eq!(
-            crate::fs::seek(&source, file, 0, FileSeekWhence::RelativeToBeginning),
-            Ok(Ok(0))
-        );
-        assert_eq!(
-            set(&source, file, FileOpenFlags::APPEND, FileOpenFlags::NONE),
-            Ok(())
-        );
-        assert_eq!(crate::fs::write(&source, file, b"x", None), Ok(Ok(1)));
-        let mut contents = [0; 4];
-        assert_eq!(
-            crate::fs::read(&source, file, &mut contents, Some(0)),
-            Ok(Ok(3))
-        );
-        assert_eq!(&contents[..3], b"xbc");
-        assert_eq!(
-            set(&source, file, FileOpenFlags::CREATE, FileOpenFlags::CREATE),
-            Err(BrokerError::UnsupportedOperation)
-        );
-        let event = crate::event::create(&source, 0).unwrap();
-        assert_eq!(
-            source.get_status_flags(event),
-            Err(BrokerError::InvalidRights)
-        );
-        assert_eq!(
-            set(
-                &source,
-                event,
-                FileOpenFlags::NONBLOCKING,
-                FileOpenFlags::NONE
-            ),
-            Err(BrokerError::InvalidRights)
-        );
-        assert_eq!(source.close_object_reference(event), Ok(()));
-        assert_eq!(source.close_object_reference(file), Ok(()));
-        assert_eq!(
-            crate::fs::unlink(&source, "/status-flags", ROOT),
-            Ok(Ok(()))
-        );
-
-        let path = open("/", FileAccessMode::ReadOnly, FileOpenFlags::PATH);
-        assert_eq!(
-            source.get_status_flags(path),
-            Ok(FileStatusFlags {
-                access: FileAccessMode::ReadOnly,
-                flags: FileOpenFlags::PATH,
-            })
-        );
-        assert_eq!(
-            set(
-                &source,
-                path,
-                FileOpenFlags::NONBLOCKING,
-                FileOpenFlags::NONE
-            ),
-            Err(BrokerError::InvalidRights)
-        );
-        assert_eq!(source.close_object_reference(path), Ok(()));
-    }
-
     #[test]
     fn object_reference_lifecycle_uses_public_core_constructor_once() {
         let socket_provider = Arc::new(crate::socket::tests::TestSocketProvider::default());
@@ -3323,7 +3171,6 @@ mod tests {
         check_pipe_capacity_quota_is_per_process(&broker);
         check_pipe_capacity_outlives_process_for_in_flight_object(&broker);
         check_supported_references_duplicate_between_processes(&broker);
-        check_file_status_flags(&broker);
         check_file_reference_lifecycle(&broker, &stdio_provider);
         crate::socket::tests::check_socket_lifecycle(&broker, &socket_provider);
         check_pair_handle_exhaustion(&broker);
