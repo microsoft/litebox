@@ -2117,7 +2117,7 @@ impl Drop for SocketQuotaReservation {
 
 fn reserve_socket(counter: &AtomicUsize, limit: usize) -> Result<()> {
     counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
             reserved.checked_add(1).filter(|next| *next <= limit)
         })
         .map(|_| ())

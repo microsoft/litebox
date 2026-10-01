@@ -205,7 +205,7 @@ impl PipeCapacityReservation {
     fn new(process: &BrokerProcess, capacity: usize) -> Result<Self> {
         let global_counter = Arc::clone(&process.core.reserved_pipe_capacity);
         global_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
                     .filter(|total| *total <= process.core.limits.max_total_pipe_capacity)
@@ -214,7 +214,7 @@ impl PipeCapacityReservation {
 
         let session_counter = Arc::clone(&process.reserved_pipe_capacity);
         if session_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved
                     .checked_add(capacity)
                     .filter(|total| *total <= process.core.limits.max_pipe_capacity_per_process)
@@ -222,7 +222,7 @@ impl PipeCapacityReservation {
             .is_err()
         {
             global_counter
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                     reserved.checked_sub(capacity)
                 })
                 .expect("reserved broker pipe capacity must include the pending pipe");
@@ -239,12 +239,12 @@ impl PipeCapacityReservation {
 impl Drop for PipeCapacityReservation {
     fn drop(&mut self) {
         self.session_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_sub(self.capacity)
             })
             .expect("reserved process pipe capacity must include every live pipe");
         self.global_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
                 reserved.checked_sub(self.capacity)
             })
             .expect("reserved broker pipe capacity must include every live pipe");

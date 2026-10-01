@@ -343,7 +343,7 @@ mod tests {
         };
 
         add(0, Events::IN).unwrap();
-        assert!(wait(0).is_empty());
+        assert_eq!(wait(0), []);
 
         test_broker::stdio().push_input(b"x");
         assert_eq!(wait(-1), [(0, Events::IN.bits())]);

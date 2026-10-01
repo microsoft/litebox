@@ -398,7 +398,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ) -> Result<BrokerResult, Channel::Error> {
         let request_id = self
             .next_request_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |request_id| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |request_id| {
                 request_id.checked_add(1)
             })
             .map(RequestId)
