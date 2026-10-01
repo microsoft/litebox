@@ -86,19 +86,42 @@ impl Pty {
             .expect("failed to write to pty");
     }
 
-    pub fn wait_for_output(&mut self, output: &mut Vec<u8>, needle: &[u8]) {
+    pub fn wait_for_output(
+        &mut self,
+        child: &mut std::process::Child,
+        output: &mut Vec<u8>,
+        needle: &[u8],
+    ) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             self.read_available(output);
             if output.windows(needle.len()).any(|window| window == needle) {
                 return;
             }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out waiting for {:?}; output so far:\n{}",
-                String::from_utf8_lossy(needle),
-                String::from_utf8_lossy(output)
-            );
+            if let Some(status) = child.try_wait().expect("failed to wait for child process") {
+                // Drain bytes written between the first read and observing exit.
+                self.read_available(output);
+                if output.windows(needle.len()).any(|window| window == needle) {
+                    return;
+                }
+                panic!(
+                    "child {} exited with {status} before {:?}; output so far:\n{}",
+                    child.id(),
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(output)
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                let killed = child.kill();
+                let reaped = child.wait();
+                self.read_available(output);
+                panic!(
+                    "live child {} timed out waiting for {:?}; kill: {killed:?}; reap: {reaped:?}; output so far:\n{}",
+                    child.id(),
+                    String::from_utf8_lossy(needle),
+                    String::from_utf8_lossy(output)
+                );
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
@@ -141,5 +164,36 @@ impl Pty {
                 Err(e) => panic!("failed to read from pty: {e}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Pty;
+
+    #[test]
+    fn wait_for_output_reports_early_exit_and_preserves_buffered_output() {
+        let mut pty = Pty::open();
+        let (stdin, stdout, stderr) = pty.slave_stdio();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "printf 'startup failed'; exit 7"])
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .unwrap();
+        pty.close_slave();
+        let mut output = Vec::new();
+        // Buffered output satisfies a wait whether or not the child has exited.
+        pty.wait_for_output(&mut child, &mut output, b"startup failed");
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pty.wait_for_output(&mut child, &mut output, b">>> ");
+        }))
+        .unwrap_err();
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("exited with exit status: 7"), "{message}");
+        assert!(message.contains("startup failed"), "{message}");
+        assert!(!message.contains("timed out"), "{message}");
+        assert_eq!(child.try_wait().unwrap().unwrap().code(), Some(7));
     }
 }

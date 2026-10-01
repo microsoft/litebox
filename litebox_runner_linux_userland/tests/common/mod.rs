@@ -158,6 +158,15 @@ pub fn compile(src_path: &str, unique_name: &str, exec_or_lib: bool, nolibc: boo
     sibling_headers.sort();
     let mut input_paths: Vec<&Path> = vec![src_path_buf];
     input_paths.extend(sibling_headers.iter().map(PathBuf::as_path));
+    // This wrapper includes C, not a header; keep its shared implementation in
+    // the cache key too (without fingerprinting unrelated fixtures).
+    let retirement = src_path_buf.with_file_name("island_retirement.c");
+    if src_path_buf
+        .file_name()
+        .is_some_and(|n| n == "aot_island_retirement.c")
+    {
+        input_paths.push(&retirement);
+    }
 
     if let Ok(true) = crate::cache::is_cached_and_valid(&input_paths, &path, &command) {
         println!("Using cached compilation result for: {unique_name}");

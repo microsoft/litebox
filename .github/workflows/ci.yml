@@ -142,7 +142,7 @@ jobs:
       - name: Test AArch64 x18 virtualization
         run: |
           ./.github/tools/github_actions_run_cargo nextest -p litebox_syscall_rewriter -p litebox_platform_linux_userland -p litebox_shim_linux --features litebox_platform_linux_userland/aarch64_virtualize_x18,litebox_shim_linux/aarch64_virtualize_x18
-          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 -E 'binary(run) or binary(rewritten_guests)'
+          ./.github/tools/github_actions_run_cargo nextest -p litebox_runner_linux_userland --features litebox_runner_linux_userland/aarch64_virtualize_x18 -E 'binary(run) or binary(rewritten_guests) or binary(runtime_islands)'
       # Nextest does not run doctests.
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc $AARCH64_CRATES --features litebox_common_linux/aarch64_gate_recovery

@@ -40,14 +40,23 @@ pub(crate) struct Runner {
 )]
 impl Runner {
     pub(crate) fn new(target: &Path, unique_name: &str) -> Self {
-        Self::new_inner(target, unique_name, true)
+        Self::new_inner(target, unique_name, true, true)
     }
 
     pub(crate) fn new_pre_rewritten(target: &Path, unique_name: &str) -> Self {
-        Self::new_inner(target, unique_name, false)
+        Self::new_inner(target, unique_name, false, true)
     }
 
-    fn new_inner(target: &Path, unique_name: &str, rewrite_target: bool) -> Self {
+    pub(crate) fn new_unpatched(target: &Path, unique_name: &str) -> Self {
+        Self::new_inner(target, unique_name, false, false)
+    }
+
+    fn new_inner(
+        target: &Path,
+        unique_name: &str,
+        rewrite_target: bool,
+        rewrite_libraries: bool,
+    ) -> Self {
         let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
 
         let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
@@ -71,6 +80,11 @@ impl Runner {
         for file in &libs {
             let file_path = Path::new(file.as_str());
             let dest_path = tar_dir.join(&file[1..]);
+            if !rewrite_libraries {
+                std::fs::create_dir_all(dest_path.parent().unwrap()).unwrap();
+                std::fs::copy(file_path, &dest_path).unwrap();
+                continue;
+            }
             let success = super::rewrite_with_cache(file_path, &dest_path, &[]);
             assert!(
                 success,
@@ -79,6 +93,14 @@ impl Runner {
             );
         }
 
+        Self::new_empty(target, unique_name)
+    }
+
+    /// Configure execution without prepopulating any rootfs payloads.
+    pub(crate) fn new_empty(target: &Path, unique_name: &str) -> Self {
+        let dir_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let tar_dir = dir_path.join(format!("tar_files_{unique_name}"));
+        let target_guest_path = std::path::absolute(target).unwrap();
         let binary_path = std::env::var("NEXTEST_BIN_EXE_litebox_runner_linux_userland")
             .unwrap_or_else(|_| env!("CARGO_BIN_EXE_litebox_runner_linux_userland").to_string());
 

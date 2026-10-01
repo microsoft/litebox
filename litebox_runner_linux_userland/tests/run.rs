@@ -57,9 +57,18 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
     }
 }
 
-// Dedicated fixtures build static binaries concurrently; exclude them to avoid
-// colliding with this sweep's dynamic `<stem>_rewriter` outputs.
+// Dedicated fixtures need their own arguments, guest files, DSOs, or build
+// options. Exclude them from both generic sweeps, also avoiding collisions with
+// dedicated static builds using this sweep's `<stem>_rewriter` output names.
 const DEDICATED_C_TESTS: &[&str] = &[
+    "aot_island_mappings.c",
+    "aot_island_retirement.c",
+    "island_far.c",
+    "island_gapless.c",
+    "island_mappings.c",
+    "island_mprotect.c",
+    "island_retirement.c",
+    "island_sparse.c",
     "async_x16.c",
     "gate_signals.c",
     "sigreturn.c",
@@ -141,6 +150,26 @@ fn has_dedicated_c_test(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| DEDICATED_C_TESTS.contains(&name))
+}
+
+#[test]
+fn island_fixtures_use_dedicated_harnesses() {
+    let fixtures: Vec<_> = find_c_test_files("./tests")
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("island_") || name.starts_with("aot_island_"))
+        })
+        .collect();
+    assert!(!fixtures.is_empty(), "island fixtures must be discovered");
+    for path in fixtures {
+        assert!(
+            has_dedicated_c_test(&path),
+            "{} requires the island harness, not the argument-free C sweep",
+            path.display()
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1850,7 +1879,12 @@ fn run_python(args: &[&str]) -> String {
         .args(args)
         .output()
         .expect("Failed to run Python");
-    assert!(output.status.success(), "Python script failed");
+    assert!(
+        output.status.success(),
+        "Python script failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     String::from_utf8(output.stdout).unwrap()
 }
 
@@ -1858,6 +1892,16 @@ fn run_python(args: &[&str]) -> String {
 fn python_runner(unique_name: &str) -> Runner {
     let python_path = run_which("python3");
     let python_guest_dir = python_path.parent().unwrap().to_str().unwrap().to_string();
+    println!("Python executable: {}", python_path.display());
+    println!(
+        "Python build:\n{}",
+        run_python(&[
+            "-c",
+            "import sys, sysconfig; print(sys.version); print('executable:', sys.executable); \
+             print({k: sysconfig.get_config_var(k) for k in \
+             ('CONFIG_ARGS', 'Py_ENABLE_SHARED', 'CC', 'CFLAGS')})",
+        ])
+    );
 
     let python_home = run_python(&["-c", "import sys; print(sys.prefix);"]);
     println!("Detected PYTHONHOME: {python_home}");
@@ -2046,7 +2090,7 @@ fn test_runner_with_python_repl_pty() {
     pty.close_slave();
 
     let mut output = Vec::new();
-    pty.wait_for_output(&mut output, b">>> ");
+    pty.wait_for_output(&mut child, &mut output, b">>> ");
     pty.write_all(b"print(\"hi\")\nexit()\n");
     let status = pty.wait_for_child_exit(&mut child, &mut output);
     assert!(
