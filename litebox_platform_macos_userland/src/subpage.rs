@@ -613,11 +613,14 @@ mod tests {
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
     use litebox::platform::page_mgmt::AllocationDirection;
-    use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
+    use litebox::platform::{
+        PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
+    };
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::loader::{ElfParsedFile, MapMemory, Protection, ReadAt};
     use litebox_common_linux::vmem::PAGE_SIZE;
+    use std::boxed::Box;
 
     const R: Perm = Perm::READ;
     const RW: Perm = Perm::READ.union(Perm::WRITE);
@@ -1144,6 +1147,57 @@ mod tests {
             Err(AllocationError::PermissionDenied)
         ));
         assert_eq!(pages.0.0, before);
+    }
+
+    #[test]
+    fn vmem_remap_preserves_subpage_neighbors() {
+        let platform: &'static MacosUserland = Box::leak(Box::new(MacosUserland::new()));
+        let mm: litebox_common_linux::mm::VmemManager<MacosUserland, PAGE_SIZE> =
+            litebox_common_linux::mm::VmemManager::new(platform);
+        // SAFETY: the mapping remains exclusively owned by this test.
+        let source = unsafe {
+            mm.create_writable_pages(
+                None,
+                litebox_common_linux::vmem::NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                litebox_common_linux::vmem::CreatePagesFlags::empty(),
+                |_| Ok(0),
+            )
+            .unwrap()
+        };
+        let source_range = source.as_usize()..source.as_usize() + PAGE_SIZE;
+        let neighbor_range = source_range.end..source_range.end + PAGE_SIZE;
+        assert_eq!(
+            host_base(source_range.start),
+            host_base(neighbor_range.start)
+        );
+        let neighbor = platform
+            .allocate_pages(
+                neighbor_range.clone(),
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            )
+            .unwrap();
+        assert_eq!(source.write_at_offset(0, 42), Some(()));
+        assert_eq!(neighbor.write_at_offset(0, 99), Some(()));
+
+        // SAFETY: the source is idle and the neighbor forces the shared Vmem copy fallback.
+        let moved = unsafe {
+            mm.remap_pages(source, PAGE_SIZE, 2 * PAGE_SIZE, true)
+                .unwrap()
+        };
+        assert_ne!(moved.as_usize(), source.as_usize());
+        assert_eq!(moved.read_at_offset(0), Some(42));
+        assert_eq!(moved.read_at_offset(PAGE_SIZE as isize), Some(0));
+        assert_eq!(neighbor.read_at_offset(0), Some(99));
+        assert!(!platform.pages.lock().unwrap().contains_range(source_range));
+
+        // SAFETY: both mappings are idle and exclusively owned by this test.
+        unsafe {
+            mm.remove_pages(moved, 2 * PAGE_SIZE).unwrap();
+            platform.release_pages(neighbor_range).unwrap();
+        }
     }
 
     // Wait out parallel updates before asserting a synthetic recovery result.
