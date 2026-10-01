@@ -585,21 +585,25 @@ fn early_unused_island_rollback_failure_is_fatal_before_source_restore() {
 }
 
 #[test]
-fn blocked_near_allocation_leaves_code_non_executable_and_no_pairs() {
-    blocked_near_allocation(false);
+fn blocked_near_allocation_publishes_brk_without_transport() {
+    for immediate in [false, true] {
+        blocked_near_allocation(false, immediate);
+    }
 }
 
 #[test]
 fn serialized_relocation_exhaustion_rolls_back_partial_batch() {
-    blocked_near_allocation(true);
+    blocked_near_allocation(true, false);
 }
 
-fn blocked_near_allocation(serialized: bool) {
+fn blocked_near_allocation(serialized: bool, immediate: bool) {
     let task = init_platform();
     let path = if serialized {
         "/serialized-island-exhaustion"
+    } else if immediate {
+        "/island-exhaustion-mmap"
     } else {
-        "/island-exhaustion"
+        "/island-exhaustion-mprotect"
     };
     let bytes = if serialized {
         litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
@@ -609,7 +613,9 @@ fn blocked_near_allocation(serialized: bool) {
         )
         .unwrap()
     } else {
-        image()
+        let mut bytes = image();
+        bytes[3 * PAGE_SIZE + 4..3 * PAGE_SIZE + 8].copy_from_slice(&0xd53bd040u32.to_le_bytes()); // MRS x0, TPIDR_EL0
+        bytes
     };
     create_file(&task, path, &bytes);
     let fd = open(&task, path);
@@ -645,6 +651,63 @@ fn blocked_near_allocation(serialized: bool) {
         .unwrap();
     let key = super::super::tests::elf_patch_key(&task, fd);
     let before = task.global.mm.mappings();
+    if !serialized {
+        if immediate {
+            assert_eq!(
+                task.sys_mmap(
+                    address,
+                    PAGE_SIZE,
+                    ProtFlags::PROT_READ_EXEC,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                    fd,
+                    3 * PAGE_SIZE,
+                )
+                .unwrap()
+                .as_usize(),
+                mapped.as_usize()
+            );
+        } else {
+            task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+                .unwrap();
+        }
+        let mut expected = before;
+        for (range, flags) in &mut expected {
+            if range.contains(&address) {
+                *flags = (*flags & !VmFlags::VM_ACCESS_FLAGS) | VmFlags::VM_READ | VmFlags::VM_EXEC;
+            }
+        }
+        assert_eq!(task.global.mm.mappings(), expected);
+        let code = read_bytes(address, PAGE_SIZE);
+        for word in code[..8].as_chunks::<4>().0 {
+            assert_eq!(u32::from_le_bytes(*word) & 0xffe0001f, 0xd4200000);
+        }
+        assert_eq!(&code[8..], &bytes[3 * PAGE_SIZE + 8..4 * PAGE_SIZE]);
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = &cache[&key];
+            assert!(!state.trampoline_invalidated);
+            assert!(state.islands.pairs.is_empty());
+            assert!(state.patched_ranges.contains(&(address, PAGE_SIZE)));
+        }
+        // A cached BRK remains a successful mapping even if placement later opens.
+        task.sys_munmap(
+            UserPtrMut::from_usize(address - 512 * HOST_PAGE_SIZE),
+            256 * HOST_PAGE_SIZE,
+        )
+        .unwrap();
+        task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        assert_eq!(read_bytes(address, PAGE_SIZE), code);
+        assert!(
+            task.global.elf_patch_cache.lock()[&key]
+                .islands
+                .pairs
+                .is_empty()
+        );
+        task.sys_munmap(reserved, length).unwrap();
+        task.sys_close(fd).unwrap();
+        return;
+    }
     assert_eq!(
         task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC),
         Err(Errno::ENOMEM)
@@ -1272,78 +1335,136 @@ fn conditional_runtime_placement_skips_primary_only_gap_pages() {
 
 #[cfg(feature = "aarch64_virtualize_x18")]
 #[test]
-fn boundary_inbound_reach_does_not_publish_unreachable_conditional_exit() {
-    let task = init_platform();
-    let distant = (1 << 27) - HOST_PAGE_SIZE;
-    // One near LOAD attests ownership, one distant LOAD contains CBZ x18 whose
-    // primary entry fits exactly but whose taken auxiliary exit is out of reach.
-    let mut bytes = image_with_distant_load(distant);
-    bytes[2 * HOST_PAGE_SIZE + 32..2 * HOST_PAGE_SIZE + 36]
-        .copy_from_slice(&0xb47ffff2u32.to_le_bytes()); // CBZ x18, PC + 1MiB - 4
-    let (base, size, fd) = packed_dso(&task, "pack-aux-exit", &bytes);
-    // The first mapping covers only its LOAD, not the distant LOAD's file page.
-    task.sys_mmap(
-        base + 2 * HOST_PAGE_SIZE,
-        HOST_PAGE_SIZE,
-        ProtFlags::PROT_NONE,
-        MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
-        -1,
-        0,
-    )
-    .unwrap();
-    let key = super::super::tests::elf_patch_key(&task, fd);
-    let code = task
-        .sys_mmap(
-            base + distant,
+fn boundary_inbound_reach_traps_unreachable_conditional_exit() {
+    for mixed in [false, true] {
+        let task = init_platform();
+        let distant = (1 << 27) - HOST_PAGE_SIZE;
+        // One near LOAD attests ownership, one distant LOAD contains CBZ x18 whose
+        // primary entry fits at/near the boundary but whose taken exit is out of reach.
+        let mut bytes = image_with_distant_load(distant);
+        let conditional_offset = if mixed { 28 } else { 32 };
+        let at = 2 * HOST_PAGE_SIZE + conditional_offset;
+        bytes[at..at + 4].copy_from_slice(&0xb47ffff2u32.to_le_bytes()); // CBZ x18, PC + 1MiB - 4
+        if mixed {
+            // This later site can use the heap prefix even though CBZ cannot.
+            bytes[2 * HOST_PAGE_SIZE + 32..2 * HOST_PAGE_SIZE + 36]
+                .copy_from_slice(&0xd4000001u32.to_le_bytes());
+        }
+        let (base, size, fd) = packed_dso(&task, &alloc::format!("pack-aux-exit-{mixed}"), &bytes);
+        // The first mapping covers only its LOAD, not the distant LOAD's file page.
+        task.sys_mmap(
+            base + 2 * HOST_PAGE_SIZE,
             HOST_PAGE_SIZE,
-            ProtFlags::PROT_READ,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
-            fd,
-            2 * HOST_PAGE_SIZE,
+            ProtFlags::PROT_NONE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
+            -1,
+            0,
         )
         .unwrap();
-    // packed_dso's PROT_NONE reservation still occupies the entire numerical
-    // gap. Unlike the free-gap regression, only the owned heap prefix is free;
-    // that page fails auxiliary reach, so this fixture truly has no placement.
-    let candidate = base - HOST_PAGE_SIZE;
-    let pc = code.as_usize() + 32;
-    assert!(
-        (pc - (1 << 27) - island::ISLAND_HEADER_BYTES
-            ..=pc + (1 << 27) - island::ISLAND_HEADER_BYTES - 16)
-            .contains(&candidate)
-    );
-    for _ in 0..2 {
-        assert_eq!(
-            task.sys_mprotect(code, HOST_PAGE_SIZE, ProtFlags::PROT_READ_EXEC),
-            Err(Errno::ENOMEM)
+        let key = super::super::tests::elf_patch_key(&task, fd);
+        let code = task
+            .sys_mmap(
+                base + distant,
+                HOST_PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                fd,
+                2 * HOST_PAGE_SIZE,
+            )
+            .unwrap();
+        // The numerical gap remains reserved. Only the owned heap prefix is free;
+        // that page fails CBZ's auxiliary reach, so CBZ truly has no placement.
+        let candidate = base - HOST_PAGE_SIZE;
+        let pc = code.as_usize() + conditional_offset;
+        assert!(
+            (pc - (1 << 27) - island::ISLAND_HEADER_BYTES
+                ..=pc + (1 << 27) - island::ISLAND_HEADER_BYTES - 16)
+                .contains(&candidate)
         );
-        let cache = task.global.elf_patch_cache.lock();
-        let state = &cache[&key];
-        assert!(state.islands.pairs.is_empty());
-        assert!(state.patched_ranges.is_empty());
-        assert!(!state.trampoline_invalidated);
+        let before = task.global.mm.mappings();
+        for _ in 0..2 {
+            task.sys_mprotect(code, HOST_PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+                .unwrap();
+            let cache = task.global.elf_patch_cache.lock();
+            let state = &cache[&key];
+            assert_eq!(state.islands.pairs.len(), usize::from(mixed));
+            assert!(
+                state
+                    .patched_ranges
+                    .contains(&(code.as_usize(), HOST_PAGE_SIZE))
+            );
+            assert!(!state.trampoline_invalidated);
+            let words = read_bytes(code.as_usize(), HOST_PAGE_SIZE);
+            assert_eq!(
+                u32::from_le_bytes(
+                    words[conditional_offset..conditional_offset + 4]
+                        .try_into()
+                        .unwrap()
+                ) & 0xffe0001f,
+                0xd4200000
+            );
+            assert_eq!(&words[..conditional_offset], &bytes[2 * HOST_PAGE_SIZE..at]);
+            assert_eq!(&words[36..], &bytes[2 * HOST_PAGE_SIZE + 36..]);
+            if mixed {
+                let pair = &state.islands.pairs[0];
+                assert_eq!(pair.near.start, candidate);
+                assert_eq!(pair.sites, [pc + 4]);
+                let branch = u32::from_le_bytes(words[32..36].try_into().unwrap());
+                assert_eq!(branch & 0xfc000000, 0x14000000);
+                let displacement = ((branch & 0x03ff_ffff) << 6).cast_signed() >> 4;
+                assert_eq!(
+                    (pc + 4) as i128 + i128::from(displacement),
+                    (candidate + island::ISLAND_HEADER_BYTES) as i128
+                );
+                let near = read_bytes(candidate, island::ISLAND_BYTES);
+                let slot = island::decode_island_slot(&near, candidate as u64, 0).unwrap();
+                assert_eq!(slot.site, (pc + 4) as u64);
+                assert_eq!(slot.resume, (pc + 8) as u64);
+                assert!(!slot.auxiliary);
+                for range in [&pair.near, &pair.far] {
+                    assert!(
+                        task.global
+                            .mm
+                            .mappings()
+                            .iter()
+                            .any(|(r, f)| r.start <= range.start
+                                && range.end <= r.end
+                                && f.intersection(VmFlags::VM_ACCESS_FLAGS)
+                                    == VmFlags::VM_READ | VmFlags::VM_EXEC)
+                    );
+                }
+            }
+        }
+        assert!(
+            task.global
+                .mm
+                .mappings()
+                .iter()
+                .any(|(r, f)| r.contains(&pc)
+                    && f.intersection(VmFlags::VM_ACCESS_FLAGS)
+                        == VmFlags::VM_READ | VmFlags::VM_EXEC)
+        );
+        if !mixed {
+            let mut expected = before;
+            for (range, flags) in &mut expected {
+                if range.contains(&pc) {
+                    *flags =
+                        (*flags & !VmFlags::VM_ACCESS_FLAGS) | VmFlags::VM_READ | VmFlags::VM_EXEC;
+                }
+            }
+            assert_eq!(task.global.mm.mappings(), expected);
+        }
+        task.sys_munmap(UserPtrMut::from_usize(base), size).unwrap();
+        assert!(
+            !task
+                .global
+                .mm
+                .mappings()
+                .iter()
+                .any(|(r, _)| r.contains(&candidate))
+        );
+        task.sys_close(fd).unwrap();
     }
-    assert!(
-        !task
-            .global
-            .mm
-            .mappings()
-            .iter()
-            .any(|(r, _)| r.contains(&candidate))
-    );
-    assert!(
-        task.global
-            .mm
-            .mappings()
-            .iter()
-            .any(|(r, f)| r.contains(&pc) && !f.contains(VmFlags::VM_EXEC))
-    );
-    assert_eq!(
-        &*code.to_owned_slice::<TestPlatform>(36).unwrap(),
-        &bytes[2 * HOST_PAGE_SIZE..2 * HOST_PAGE_SIZE + 36]
-    );
-    task.sys_munmap(UserPtrMut::from_usize(base), size).unwrap();
-    task.sys_close(fd).unwrap();
 }
 
 #[test]
@@ -2438,7 +2559,7 @@ fn source_publication_error_remains_invalidated() {
 }
 
 #[test]
-fn runtime_prefailure_retains_new_serialized_pairs_for_retry() {
+fn runtime_brk_fallback_preserves_new_serialized_pairs() {
     let task = init_platform();
     let mut bytes = image();
     bytes[PAGE_SIZE..2 * PAGE_SIZE].fill(0);
@@ -2448,8 +2569,8 @@ fn runtime_prefailure_retains_new_serialized_pairs_for_retry() {
         crate::aarch64_rewrite_options(),
     )
     .unwrap();
-    create_file(&task, "/serialized-runtime-retry", &bytes);
-    let fd = open(&task, "/serialized-runtime-retry");
+    create_file(&task, "/serialized-runtime-brk", &bytes);
+    let fd = open(&task, "/serialized-runtime-brk");
     let length = 256 * 1024 * 1024;
     let reserved = task
         .sys_mmap(
@@ -2482,32 +2603,40 @@ fn runtime_prefailure_retains_new_serialized_pairs_for_retry() {
     mapped
         .copy_from_slice::<TestPlatform>(4, &0xd4000001u32.to_le_bytes())
         .unwrap();
-    let original = mapped.to_owned_slice::<TestPlatform>(PAGE_SIZE).unwrap();
     let key = super::super::tests::elf_patch_key(&task, fd);
+    task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+        .unwrap();
+    let code = read_bytes(address, PAGE_SIZE);
+    let branch = u32::from_le_bytes(code[..4].try_into().unwrap());
+    assert_eq!(branch & 0xfc000000, 0x14000000);
     assert_eq!(
-        task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC),
-        Err(Errno::ENOMEM)
+        u32::from_le_bytes(code[4..8].try_into().unwrap()) & 0xffe0001f,
+        0xd4200000
     );
-    assert_eq!(
-        mapped.to_owned_slice::<TestPlatform>(PAGE_SIZE).unwrap(),
-        original
-    );
+    assert_eq!(&code[8..], &bytes[3 * PAGE_SIZE + 8..4 * PAGE_SIZE]);
     assert!(
         task.global
             .mm
             .mappings()
             .iter()
             .any(|(r, flags)| r.contains(&address)
-                && flags.contains(VmFlags::VM_READ | VmFlags::VM_WRITE)
-                && !flags.contains(VmFlags::VM_EXEC))
+                && flags.intersection(VmFlags::VM_ACCESS_FLAGS)
+                    == VmFlags::VM_READ | VmFlags::VM_EXEC)
     );
     let (near, far, sites) = {
         let cache = task.global.elf_patch_cache.lock();
         let state = &cache[&key];
         assert!(!state.trampoline_invalidated);
         assert_eq!(state.islands.pairs.len(), 1);
+        assert!(state.patched_ranges.contains(&(address, PAGE_SIZE)));
         let pair = &state.islands.pairs[0];
         assert!(pair.serialized.is_some());
+        assert_eq!(pair.sites, [address]);
+        let displacement = ((branch & 0x03ff_ffff) << 6).cast_signed() >> 4;
+        assert_eq!(
+            address as i128 + i128::from(displacement),
+            (pair.near.start + island::ISLAND_HEADER_BYTES) as i128
+        );
         (pair.near.clone(), pair.far.clone(), pair.sites.clone())
     };
     let transport: Vec<_> = [&near, &far]
@@ -2528,7 +2657,7 @@ fn runtime_prefailure_retains_new_serialized_pairs_for_retry() {
     {
         let cache = task.global.elf_patch_cache.lock();
         let state = &cache[&key];
-        assert_eq!(state.islands.pairs.len(), 2);
+        assert_eq!(state.islands.pairs.len(), 1);
         let pair = &state.islands.pairs[0];
         assert_eq!((&pair.near, &pair.far, &pair.sites), (&near, &far, &sites));
     }
@@ -2540,10 +2669,25 @@ fn runtime_prefailure_retains_new_serialized_pairs_for_retry() {
             bytes
         );
     }
-    let code = mapped.to_owned_slice::<TestPlatform>(8).unwrap();
-    for word in code.as_chunks::<4>().0 {
-        assert_eq!(u32::from_le_bytes(*word) & 0xfc000000, 0x14000000);
-    }
+    assert_eq!(read_bytes(address, PAGE_SIZE), code);
+    // Only an explicit writable edit supplies a fresh runtime instruction to scan.
+    task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
+        .unwrap();
+    mapped
+        .copy_from_slice::<TestPlatform>(4, &0xd4000001u32.to_le_bytes())
+        .unwrap();
+    task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+        .unwrap();
+    assert_eq!(
+        task.global.elf_patch_cache.lock()[&key].islands.pairs.len(),
+        2
+    );
+    let edited = read_bytes(address, 8);
+    assert_eq!(&edited[..4], &code[..4]);
+    assert_eq!(
+        u32::from_le_bytes(edited[4..8].try_into().unwrap()) & 0xfc000000,
+        0x14000000
+    );
     task.sys_munmap(reserved, length).unwrap();
     task.sys_close(fd).unwrap();
 }

@@ -1377,14 +1377,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // includes auxiliary x18 exits. Spread placement over the batch.
             let pair_count = slots.div_ceil(island::ISLAND_SLOTS - 1);
             for index in 0..pair_count {
-                let reservation = self.allocate_island(
+                let reservation = match self.allocate_island(
                     &state.islands,
                     mapping.bias.ok_or(Errno::ENOEXEC)?,
                     IslandPlacement::for_site(&sites[index * sites.len() / pair_count])?,
                     &reservations,
                     future_loads,
                     heap_corridor,
-                )?;
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(Errno::ENOMEM) => continue,
+                    Err(error) => return Err(error),
+                };
                 let address = reservation.range.start;
                 reservations.push(reservation);
                 pairs.push(IslandPair::new(address as u64).map_err(|_| Errno::ENOEXEC)?);
@@ -1406,14 +1410,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if !outcome.unplaced_sites.contains(&site) {
                     continue;
                 }
-                let reservation = self.allocate_island(
+                let reservation = match self.allocate_island(
                     &state.islands,
                     mapping.bias.ok_or(Errno::ENOEXEC)?,
                     IslandPlacement::for_site(&site)?,
                     &reservations,
                     future_loads,
                     heap_corridor,
-                )?;
+                ) {
+                    Ok(reservation) => reservation,
+                    Err(Errno::ENOMEM) => continue,
+                    Err(error) => return Err(error),
+                };
                 let mut expanded: Vec<_> = pairs
                     .iter()
                     .map(|p| IslandPair::new(p.island_vaddr()))
@@ -1442,11 +1450,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     );
                 }
             }
-            // Unsupported words may remain BRK, but supported sites must not
-            // become a cached success after a failed placement/slot assignment.
-            if !outcome.unplaced_sites.is_empty() {
-                return Err(Errno::ENOMEM);
-            }
+            // Runtime sites without a safe placement retain the rewriter's BRK,
+            // just like unsupported words. Publish/cache that fail-closed result
+            // alongside any successful branches, without emulating the traps.
             let mut published = Vec::new();
             for pair in pairs {
                 if pair.slots_used() == 0 {
@@ -1511,7 +1517,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             if !source_write_started {
                 // Installed serialized pairs are valid immutable state even if
-                // runtime allocation failed; never restore permissions over them.
+                // runtime patching failed; never restore permissions over them.
                 let excluded: Vec<_> = state.islands.owned_ranges().collect();
                 for (address, len, prot) in previous {
                     for part in subtract_ranges(address..address + len, &excluded) {
