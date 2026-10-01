@@ -530,7 +530,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
-        unsafe { self.page_table.remap_pages(old_range, new_range.clone()) }?;
+        unsafe { self.page_table.remap_pages(old_range, new_range) }?;
         source_reservations().for_each(drop);
         // SAFETY: Remapping transferred ownership to this exact destination extent.
         Ok(unsafe { LinuxKernelReservation::new(new_range.into()) })

@@ -1488,7 +1488,7 @@ mod tests {
             unsafe {
                 <Platform as PageManagementProvider<4096>>::release_pages(
                     external_platform,
-                    reservation,
+                    reservation.into(),
                 )
                 .unwrap();
             }
