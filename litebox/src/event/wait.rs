@@ -158,7 +158,7 @@ impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     /// Wakes up the thread if it is waiting (but not if it is running in the guest).
     fn wake(&self) {
         let condvar = &self.condvar;
-        let v = condvar.underlying_atomic().fetch_update(
+        let v = condvar.underlying_atomic().try_update(
             Ordering::Release,
             Ordering::Relaxed,
             |state| match ThreadState(state) {
@@ -218,7 +218,7 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// platform will interrupt the thread and re-enter the shim.
     pub fn interrupt(&self) {
         let condvar = &self.waker.0.condvar;
-        let v = condvar.underlying_atomic().fetch_update(
+        let v = condvar.underlying_atomic().try_update(
             Ordering::Release,
             Ordering::Relaxed,
             |state| match ThreadState(state) {

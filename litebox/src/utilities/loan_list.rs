@@ -158,7 +158,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
                 .data
                 .state
                 .underlying_atomic()
-                .fetch_update(
+                .try_update(
                     Ordering::SeqCst,
                     Ordering::Acquire,
                     |state| match EntryState(state) {
@@ -383,7 +383,7 @@ impl<Platform: RawSyncPrimitivesProvider, T> Drop for LoanedEntry<Platform, T> {
     fn drop(&mut self) {
         let entry = unsafe { &*self.entry };
         let state = entry.data.state.underlying_atomic();
-        let v = state.fetch_update(
+        let v = state.try_update(
             Ordering::Release,
             Ordering::Acquire,
             |state| match EntryState(state) {
