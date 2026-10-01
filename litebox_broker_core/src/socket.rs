@@ -2115,6 +2115,10 @@ impl Drop for SocketQuotaReservation {
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+)]
 fn reserve_socket(counter: &AtomicUsize, limit: usize) -> Result<()> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {

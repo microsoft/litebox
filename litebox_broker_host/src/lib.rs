@@ -2192,7 +2192,7 @@ mod tests {
             channel.handshake_responses,
             [BrokerHandshakeResponse::Error(ErrorCode::ProtocolState)]
         );
-        assert!(channel.results.is_empty());
+        assert_eq!(channel.results, []);
     }
 
     fn test_channel_rejects_handshake_request_after_negotiation(broker: &BrokerCore) {
@@ -2215,7 +2215,7 @@ mod tests {
                 startup: None,
             }]
         );
-        assert!(channel.results.is_empty());
+        assert_eq!(channel.results, []);
     }
 
     fn test_channel_returns_channel_error_when_response_send_fails(broker: &BrokerCore) {
@@ -2233,7 +2233,7 @@ mod tests {
             result => panic!("unexpected serve result: {result:?}"),
         }
         assert_eq!(channel.handshake_responses.len(), 1);
-        assert!(channel.results.is_empty());
+        assert_eq!(channel.results, []);
     }
 
     fn test_channel_returns_event_readiness_in_control_responses(broker: &BrokerCore) {
@@ -2382,7 +2382,7 @@ mod tests {
             Err(BrokerHostError::SharedBufferLayoutMismatch)
         ));
         assert!(!setup_called.get());
-        assert!(channel.handshake_responses.is_empty());
+        assert_eq!(channel.handshake_responses, []);
     }
 
     fn active_request_closes_object_reference(broker: &BrokerCore) {

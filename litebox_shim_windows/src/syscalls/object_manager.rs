@@ -921,7 +921,7 @@ fn reparse_tail<Platform: crate::ShimPlatform>(
 }
 
 fn unresolved_tail_status(remaining: &str, final_missing_status: NtStatus) -> NtStatus {
-    debug_assert!(!remaining.is_empty());
+    debug_assert_ne!(remaining, "");
     if remaining.split('\\').any(str::is_empty) {
         NtStatus::OBJECT_NAME_INVALID
     } else if remaining.contains('\\') {

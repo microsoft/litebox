@@ -171,7 +171,7 @@ fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     let metadata = CodeMetadata::parse(&input).unwrap();
     let ranges = metadata.ranges_for_mapping(TEXT as u64, 16).unwrap();
     assert_eq!(ranges, vec![0..8, 12..16]);
-    assert!(metadata.ranges_for_mapping(0x3000, 8).unwrap().is_empty());
+    assert_eq!(metadata.ranges_for_mapping(0x3000, 8).unwrap(), []);
 
     let callback = 0x1234_5678;
     let aot = rewrite_binary(&input, Some(callback)).unwrap();
@@ -182,7 +182,7 @@ fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     let (gates, trapped) = rewriter
         .patch_code_segment(&mut code, code_vaddr, &ranges, base + slide, callback, 96)
         .unwrap();
-    assert!(trapped.is_empty());
+    assert_eq!(trapped, []);
     assert_eq!(code, aot[TEXT..TEXT + 16]);
     assert_eq!(u32_at(&code, 8), SVC); // data-in-code is untouched
     assert!(

@@ -6731,7 +6731,7 @@ mod tests {
             },
         );
         let mut outcome = outcome.unwrap();
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_ne!(u32::from_le_bytes(patched.try_into().unwrap()), original);
         let gate = &outcome.trampoline[GATES_START_OFFSET..];
         assert_eq!(gate.len(), X18_STACK_WRITEBACK_SLOT_BYTES);
@@ -6915,7 +6915,7 @@ mod tests {
         );
         let outcome = outcome.unwrap();
 
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
         let gate = &outcome.trampoline[GATES_START_OFFSET..];
         assert_eq!(gate.len(), 48);
@@ -6950,7 +6950,7 @@ mod tests {
         );
         let outcome = outcome.unwrap();
 
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
         let gate = &outcome.trampoline[GATES_START_OFFSET..];
         assert_eq!(word_at(gate, 16), 0xb7f8_0091); // tbnz x17, #63, +16
@@ -6966,7 +6966,7 @@ mod tests {
         );
         let outcome = outcome.unwrap();
 
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
     }
 
@@ -6980,7 +6980,7 @@ mod tests {
         );
         let outcome = outcome.unwrap();
 
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
         let transformed_pc =
             0x400000 + GATES_START_OFFSET as u64 + X18GateOffset::Transform.as_usize() as u64;
@@ -7007,7 +7007,7 @@ mod tests {
         );
         let outcome = outcome.unwrap();
 
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_eq!(word_at(&patched, 0) & OPCODE_TOP6_MASK, Opcode::B.bits());
         assert_eq!(
             decode_adrp_add_target_for(
@@ -7186,7 +7186,7 @@ mod tests {
         assert_ne!(word_at(&patched, 0), trap);
         assert_ne!(word_at(&patched, 4), trap);
         let outcome = outcome.unwrap();
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_eq!(
             outcome.trampoline.len(),
             GATES_START_OFFSET + MSR_GATE_SIZE + MRS_GATE_SIZE

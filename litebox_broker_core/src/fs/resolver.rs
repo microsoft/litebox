@@ -313,7 +313,7 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
         #[cfg(debug_assertions)] absolute_components: &[&str],
         scope: SearchScope,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
-        assert!(!components.is_empty());
+        assert_ne!(components, [] as [&str; 0]);
         let outcome = self.backend.walk_directories(from, components)?;
         Self::check_walk_permissions(
             context,

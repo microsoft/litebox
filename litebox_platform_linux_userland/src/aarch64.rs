@@ -1759,7 +1759,7 @@ mod tests {
         let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
         let (mut tramp, trapped) =
             litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         assert_eq!(
             litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
             Some(16 + 4),
@@ -1947,7 +1947,7 @@ mod tests {
         let mut code = original.to_le_bytes().to_vec();
         let (trampoline, trapped) =
             litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
         for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
             *reg = 0xfeed_0000_0000_0000 | index as u64;
@@ -2455,7 +2455,7 @@ mod tests {
             options,
         )
         .unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
 
         let gate =
             litebox_syscall_rewriter::aarch64::classify_gate_pc(&trampoline, 0x400000, SLOT as u64)
@@ -2590,7 +2590,7 @@ mod tests {
                 options,
             )
             .unwrap();
-            assert!(trapped.is_empty());
+            assert_eq!(trapped, []);
 
             let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
             for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
@@ -2660,7 +2660,7 @@ mod tests {
             options,
         )
         .unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
         context.uc_mcontext.pc = SLOT as u64;
         context.uc_mcontext.sp = 0x8000;
@@ -3055,7 +3055,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         second_slot.copy_from_slice(&relocated[16..80]);
         context.uc_mcontext.pc = second_pc as u64;
         let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
