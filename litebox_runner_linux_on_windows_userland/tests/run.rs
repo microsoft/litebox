@@ -24,6 +24,37 @@ fn checked_output(command: &mut Command) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn brokered_runner_command(initial_files: &Path) -> Command {
+    let runner = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
+        .unwrap_or_else(|| env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").into());
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args([
+            "build",
+            "-p",
+            "litebox_broker_userland",
+            "--bin",
+            "litebox-broker-userland",
+        ])
+        .status()
+        .expect("failed to build litebox-broker-userland");
+    assert!(status.success(), "failed to build litebox-broker-userland");
+
+    let broker = PathBuf::from(&runner).with_file_name("litebox-broker-userland.exe");
+    assert!(
+        broker.is_file(),
+        "broker executable not found at {}",
+        broker.display()
+    );
+    let mut command = Command::new(broker);
+    command
+        .arg("--fs-initial-files")
+        .arg(initial_files)
+        .arg("--runner")
+        .arg(runner);
+    command
+}
+
 fn stage_and_rewrite(rootfs: &Path, wsl_root: &Path, mut pending: BTreeSet<String>) {
     let mut elf_paths = BTreeSet::new();
     while let Some(guest_path) = pending.pop_first() {
@@ -173,12 +204,9 @@ fn test_runner_with_python() {
             .arg(&rootfs)
             .arg("."),
     );
-    let binary_path = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").into());
     let output = checked_output(
-        Command::new(binary_path)
+        brokered_runner_command(&tar_path)
             .args([
-                "--unstable",
                 "--env",
                 "LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib",
                 "--env",
@@ -191,9 +219,7 @@ fn test_runner_with_python() {
                 "PYTHONDONTWRITEBYTECODE=1",
                 "--env",
                 "HOME=/",
-                "--initial-files",
             ])
-            .arg(tar_path)
             .args([
                 python_path,
                 "-c",
@@ -247,21 +273,16 @@ fn test_node_with_rewriter() {
             .arg(&rootfs)
             .arg("."),
     );
-    let binary_path = std::env::var_os("NEXTEST_BIN_EXE_litebox_runner_linux_on_windows_userland")
-        .unwrap_or_else(|| env!("CARGO_BIN_EXE_litebox_runner_linux_on_windows_userland").into());
     let output = checked_output(
-        Command::new(binary_path)
+        brokered_runner_command(&tar_path)
             .args([
-                "--unstable",
                 "--env",
                 "LD_LIBRARY_PATH=/lib64:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib",
                 "--env",
                 &format!("LD_ORIGIN_PATH={}", node_path.rsplit_once('/').unwrap().0),
                 "--env",
                 "HOME=/",
-                "--initial-files",
             ])
-            .arg(tar_path)
             .args([node_path, "/out/hello_world.js"]),
     );
     print!("{output}");
