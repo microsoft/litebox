@@ -1967,8 +1967,11 @@ mod tests {
                 .as_usize(),
             address.as_usize()
         );
-        task.sys_mprotect(address, 3 * PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
-            .expect("mapped portion should become executable");
+        assert_eq!(
+            task.sys_mprotect(address, 3 * PAGE_SIZE, ProtFlags::PROT_READ_EXEC),
+            Err(Errno::ENOMEM),
+            "mprotect should report the unmapped tail",
+        );
 
         let rewritten = UserPtrMut::<u8>::from_usize(address.as_usize() + PAGE_SIZE / 2)
             .to_owned_slice::<Platform>(2)
