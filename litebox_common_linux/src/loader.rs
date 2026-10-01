@@ -1606,7 +1606,7 @@ mod non_island_geometry_tests {
         assert_eq!(info.base_addr, 0x10000000 - 0x20000);
         assert_eq!(mapper.len, 0x65000 - 0x20000);
         assert_eq!(mapper.loads.len(), 2);
-        assert!(mapper.released.is_empty());
+        assert_eq!(mapper.released, []);
         for r in &mapper.loads {
             assert!(r.start >= 0x10000000 && r.end <= 0x10000000 + mapper.len);
         }
@@ -1622,7 +1622,7 @@ mod non_island_geometry_tests {
             parsed.load(&mut mapper, &mut Memory, None),
             Err(ElfLoadError::InvalidProgramHeader)
         ));
-        assert!(mapper.loads.is_empty());
+        assert_eq!(mapper.loads, []);
         assert_eq!(mapper.released, [(0x10000, 0x45000)]);
         mapper.released.clear();
         mapper.release_error = true;

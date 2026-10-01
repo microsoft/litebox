@@ -318,10 +318,9 @@ fn relocation_changes_only_placement_fields_and_redirects_transactionally() {
         // SVC, TP, ordinary x18, ADR x18, ADRP x18, CBZ x18 (two exits).
         let mut source = code(&[SVC, mrs(5), 0x91000652, 0x10000092, 0x90000012, 0xb4000052]);
         let mut pairs = vec![IslandPair::new(0x500000).unwrap()];
-        assert!(
-            rewrite(&mut source, site, &mut pairs, host, true)
-                .trapped_sites
-                .is_empty()
+        assert_eq!(
+            rewrite(&mut source, site, &mut pairs, host, true).trapped_sites,
+            []
         );
         let serialized = &pairs[0];
         for bias in [0, 0x100000000] {

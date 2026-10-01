@@ -108,7 +108,7 @@ fn biased_load_overflow_does_not_poison_unrelated_exec_mappings() {
         let cache = task.global.elf_patch_cache.lock();
         let state = &cache.get(&key).unwrap().islands;
         assert_eq!(state.mappings[0].bias, None);
-        assert!(state.future_loads().unwrap().is_empty());
+        assert_eq!(state.future_loads().unwrap(), []);
     }
     task.sys_munmap(valid, 4 * PAGE_SIZE).unwrap();
     task.sys_munmap(bad, PAGE_SIZE).unwrap();
@@ -1691,7 +1691,7 @@ fn non_load_file_offset_maps_without_bias_or_gap_ownership() {
         let record = state.mapping(mapping.as_usize(), PAGE_SIZE).unwrap();
         assert_eq!(record.offset, 2 * PAGE_SIZE);
         assert_eq!(record.bias, None);
-        assert!(state.future_loads().unwrap().is_empty());
+        assert_eq!(state.future_loads().unwrap(), []);
         assert!(state.pairs.is_empty());
     }
     task.sys_close(fd).unwrap();
@@ -2930,7 +2930,7 @@ fn explicit_load_bias_validation_and_retirement() {
     state.remove(&(base..base + 2 * HOST_PAGE_SIZE));
     state.record_mapping(base, PAGE_SIZE, 0, None).unwrap();
     assert_eq!(state.mappings[0].bias, None);
-    assert!(state.future_loads().unwrap().is_empty());
+    assert_eq!(state.future_loads().unwrap(), []);
     // Guest-page-aligned explicit loads need not have host-page-aligned bias.
     state.load_alignment = Some(PAGE_SIZE);
     state
@@ -3230,7 +3230,7 @@ fn check_retired_loader_reservation(close_before_retirement: bool) {
         let state = &cache[&key];
         assert!(state.file_mappings.is_empty());
         assert!(state.islands.pairs.is_empty());
-        assert!(!state.islands.loader_reservations.is_empty());
+        assert_ne!(state.islands.loader_reservations, []);
     }
     assert_eq!(task.sys_madvise(near, 1, DontNeed), Err(Errno::EBUSY));
     if !close_before_retirement {

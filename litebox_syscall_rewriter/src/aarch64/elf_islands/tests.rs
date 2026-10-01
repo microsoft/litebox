@@ -138,7 +138,7 @@ fn elf_islands_sentinel_and_host_compatibility() {
     }
     let out = hook_syscalls_in_elf(&no_sites, None).unwrap();
     assert_eq!(out.len(), no_sites.len() + 32);
-    assert!(ElfIslands::parse(&out).unwrap().unwrap().pairs.is_empty());
+    assert_eq!(ElfIslands::parse(&out).unwrap().unwrap().pairs, []);
     assert_eq!(hook_syscalls_in_elf(&out, None).unwrap(), out);
     let mut corrupt = out.clone();
     let at = corrupt.len() - 24;
@@ -276,13 +276,7 @@ fn unrewritten_elf_with_incidental_trailing_litebox_text() {
     elf.extend_from_slice(b"arbitrary trailing LITEBOX text!!");
     assert!(ElfIslands::parse(&elf).unwrap().is_none());
     let rewritten = hook_syscalls_in_elf(&elf, None).unwrap();
-    assert!(
-        !ElfIslands::parse(&rewritten)
-            .unwrap()
-            .unwrap()
-            .pairs
-            .is_empty()
-    );
+    assert_ne!(ElfIslands::parse(&rewritten).unwrap().unwrap().pairs, []);
 }
 
 #[test]
