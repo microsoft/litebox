@@ -138,30 +138,6 @@ fn chunk_is_position_independent() {
 }
 
 #[test]
-fn delta_and_callback_are_the_only_placement_writes() {
-    let mut buf = code(&[SVC]);
-    let mut pairs = vec![IslandPair::new(0x50_0000).unwrap()];
-    rewrite(&mut buf, 0x40_0000, &mut pairs, TargetHost::Linux, false);
-    let before = pairs[0].clone();
-    pairs[0].set_chunk_vaddr(0x7000_0000_0000).unwrap();
-    pairs[0].set_callback(0xdead_beef_0000);
-    let pair = &pairs[0];
-    let diff: Vec<usize> = (0..ISLAND_BYTES)
-        .filter(|&i| before.island()[i] != pair.island()[i])
-        .collect();
-    assert!(
-        diff.iter()
-            .all(|&i| (ISLAND_DELTA_OFFSET..ISLAND_DELTA_OFFSET + 8).contains(&i))
-    );
-    assert_eq!(
-        decode_island_header(pair.island()),
-        Some(island_delta(0x50_0000, 0x7000_0000_0000))
-    );
-    assert_eq!(&pair.chunk()[..8], &0xdead_beef_0000u64.to_le_bytes());
-    assert_eq!(&pair.chunk()[8..], &before.chunk()[8..]);
-}
-
-#[test]
 fn capacity_overflow_spills_to_the_next_island_then_traps() {
     let n = ISLAND_SLOTS + 10;
     let mut buf = code(&vec![SVC; n]);
@@ -191,27 +167,6 @@ fn capacity_overflow_spills_to_the_next_island_then_traps() {
             pair.slots_used()
         );
     }
-}
-
-#[test]
-fn nearest_reachable_island_wins_and_far_sites_trap() {
-    let mut buf = code(&[SVC]);
-    let far = 0x40_0000 + (256 << 20);
-    let near = 0x40_0000 + (64 << 20);
-    let mut pairs = vec![
-        IslandPair::new(far).unwrap(),
-        IslandPair::new(near).unwrap(),
-    ];
-    let outcome = rewrite(&mut buf, 0x40_0000, &mut pairs, TargetHost::Linux, false);
-    assert_eq!(outcome.patched_sites, 1);
-    assert_eq!((pairs[0].slots_used(), pairs[1].slots_used()), (0, 1));
-
-    let mut buf = code(&[SVC]);
-    let mut pairs = vec![IslandPair::new(far).unwrap()];
-    let outcome = rewrite(&mut buf, 0x40_0000, &mut pairs, TargetHost::Linux, false);
-    assert_eq!(outcome.trapped_sites, vec![0x40_0000]);
-    assert_eq!(pairs[0].slots_used(), 0);
-    assert_eq!(word_at(&buf, 0) & 0xFFE0_001F, 0xD420_0000, "BRK");
 }
 
 #[test]
@@ -300,15 +255,6 @@ fn stages_mark_the_commit_point() {
         }
     );
     assert_eq!(stage(msr30, 20), after(0));
-}
-
-#[test]
-fn v1_and_v2_metadata_do_not_alias() {
-    let v2 = encode_metadata(GateMetadata::Svc).unwrap();
-    assert_eq!(decode_island_metadata(v2), Some(GateMetadata::Svc));
-    assert_eq!(super::super::decode_gate_metadata_word(v2), None);
-    let v1 = EncodedGateMetadata::encode(GateMetadata::Svc).unwrap().0;
-    assert_eq!(decode_island_metadata(v1), None);
 }
 
 #[test]

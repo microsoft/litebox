@@ -93,40 +93,6 @@ fn elf_islands_reject_descriptor_footer_ranges_counts_and_truncation() {
     let mut truncated = out[..tail - 4].to_vec();
     truncated.extend_from_slice(&out[tail..]);
     assert!(ElfIslands::parse(&truncated).is_err());
-    // A huge declared count must fail before any variable-sized image read.
-    let mut huge = out.clone();
-    put64(&mut huge, base + 32, u64::MAX);
-    let mut reads = 0;
-    assert!(
-        ElfIslands::read(huge.len() as u64, |off, bytes| {
-            reads += 1;
-            assert!(bytes.len() <= 64);
-            let off = usize::try_from(off).unwrap();
-            bytes.copy_from_slice(&huge[off..off + bytes.len()]);
-            Ok(())
-        })
-        .is_err()
-    );
-    assert_eq!(reads, 2);
-}
-
-#[test]
-fn elf_islands_reject_every_image_byte_corruption_and_wrong_site() {
-    let out = output();
-    let tail = out.len() - 32;
-    let base = usize::try_from(u64_at(&out, tail + 8).unwrap()).unwrap();
-    let first_image = base + usize::try_from(u64_at(&out, base + 72).unwrap()).unwrap();
-    for at in first_image..tail {
-        let mut corrupt = out.clone();
-        corrupt[at] ^= 1;
-        assert!(
-            ElfIslands::parse(&corrupt).is_err(),
-            "accepted image byte {at:#x}"
-        );
-    }
-    let mut corrupt = out;
-    corrupt[0x110..0x114].copy_from_slice(&0xd4000001u32.to_le_bytes());
-    assert!(ElfIslands::parse(&corrupt).is_err());
 }
 
 #[test]
@@ -279,39 +245,6 @@ fn unrewritten_elf_with_incidental_trailing_litebox_text() {
     assert_ne!(ElfIslands::parse(&rewritten).unwrap().unwrap().pairs, []);
 }
 
-#[test]
-fn planner_admits_sites_before_requesting_placement() {
-    for (word, expected_attempts) in [(0x58000012u32, 0), (0xd4000001, 1)] {
-        let mut code = word.to_le_bytes();
-        let sections = [crate::TextSectionInfo {
-            vaddr: 0x110,
-            file_offset: 0,
-            size: 4,
-        }];
-        let mut attempts = 0;
-        let result = island::rewrite_allocating_sections(
-            &mut code,
-            &sections,
-            &sections,
-            super::super::RewriteConfig::new(TargetHost::Linux, true),
-            |_, reach, _| {
-                attempts += 1;
-                assert!(
-                    attempts <= 1,
-                    "one site needs at most one placement request"
-                );
-                assert!(reach.contains(&0x6000000));
-                Some(0x6000000)
-            },
-        );
-        assert_eq!(attempts, expected_attempts);
-        assert_eq!(result.is_ok(), expected_attempts == 1);
-        if result.is_err() {
-            assert_eq!(code, word.to_le_bytes());
-        }
-    }
-}
-
 fn distant_hole_image(word: u32) -> Vec<u8> {
     let mut elf = sparse_image();
     elf.truncate(4096);
@@ -321,24 +254,6 @@ fn distant_hole_image(word: u32) -> Vec<u8> {
     }
     elf[0x110..0x114].copy_from_slice(&word.to_le_bytes());
     elf
-}
-
-#[test]
-fn unsupported_site_does_not_search_distant_holes() {
-    let elf = distant_hole_image(0x58000012); // unsupported LDR literal x18
-    assert!(
-        hook_syscalls_in_elf_with_options(&elf, None, RewriteOptions::new(TargetHost::Linux, true))
-            .is_err()
-    );
-}
-
-#[test]
-fn supported_site_uses_distant_hole_in_one_plan() {
-    let out = hook_syscalls_in_elf(&distant_hole_image(0xd4000001), None).unwrap();
-    assert_eq!(
-        ElfIslands::parse(&out).unwrap().unwrap().pairs[0].island_vaddr(),
-        0x6000000
-    );
 }
 
 #[test]

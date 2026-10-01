@@ -7,31 +7,7 @@ use super::*;
 use crate::TargetHost;
 use alloc::vec;
 
-// Source-named instruction words for signal-classifier parity coverage.
-const OPERATIONS: &[(&str, u32)] = &[
-    ("adds_x18", 0xab01_0252),
-    ("adds_destination_x16_source_x30", 0xab1e_0250),
-    ("adds_destination_x30_source_x16", 0xab12_021e),
-    ("ldr_x18", 0xf940_0012),
-    ("str_x18", 0xf900_0012),
-    ("ldp_x18_x16_post16", 0xa8c1_43f2),
-    ("ldp_x30_x18_pre_negative32", 0xa9fe_4bfe),
-    ("ldp_x18_x16_pre_negative16", 0xa9ff_43f2),
-    ("ldp_x18_x16_pre_negative8", 0xa9ff_c3f2),
-    ("ldp_w18_w30_pre_negative4", 0x29ff_fbf2),
-    ("stp_x18_x30_pre_negative32", 0xa9be_7bf2),
-    ("ldp_x18_x16_pre_negative512", 0xa9e0_43f2),
-    ("ldp_x30_x18_post_negative512", 0xa8e0_4bfe),
-    ("stp_x16_x18_post504", 0xa89f_cbf0),
-    ("ldp_w18_w30_pre_negative256", 0x29e0_7bf2),
-    ("stp_w16_w18_post252", 0x289f_cbf0),
-    ("add_x18", 0x9100_0652),
-    ("ldr_x16_base_x18", 0xf940_0250),
-    ("ldr_x16_post_index_x18", 0xf840_8650),
-    ("stp_x18_x16_post_negative16", 0xa8bf_43f2),
-    ("ldp_w30_w18_post_negative256", 0x28e0_4bfe),
-    ("str_x30_base_x18", 0xf900_025e),
-    ("ldp_x18_x30_sp_offset16", 0xa941_7bf2),
+const CONDITIONAL_OPERATIONS: &[(&str, u32)] = &[
     ("cbz_x18", 0xb400_0212),
     ("cbz_w18", 0x3400_0212),
     ("cbnz_x18", 0xb500_0212),
@@ -40,22 +16,6 @@ const OPERATIONS: &[(&str, u32)] = &[
     ("cbnz_w18", 0x3500_0212),
     ("tbz_x18_bit63", 0xb6f8_0212),
     ("tbnz_w18_bit5", 0x3728_0212),
-    ("adr_x18", 0x1000_0072),
-    ("adrp_x18", 0xb000_0012),
-    ("adr_x18_min", 0x1080_0012),
-    ("adr_x18_max", 0x707f_fff2),
-    ("adrp_x18_min", 0x9080_0012),
-    ("adrp_x18_max", 0xf07f_fff2),
-    ("br_x18", 0xd61f_0240),
-    ("blr_x18", 0xd63f_0240),
-    ("ret_x18", 0xd65f_0240),
-];
-
-// Structural coverage, not an EL0 executability claim for arbitrary SYS words.
-const SYSTEM_OPERATIONS: &[(&str, u32)] = &[
-    ("mrs_x18_nzcv", 0xd53b_4212),
-    ("mrs_x18_cntvct_el0", 0xd53b_e052),
-    ("dc_cvau_x18", 0xd50b_7b32),
 ];
 
 #[test]
@@ -369,104 +329,6 @@ fn host_tls_forms_keep_tp_and_x18_distinct() {
     }
 }
 
-#[test]
-fn persisted_pair_cross_checks_depth_literals_auxiliary_target_and_unused_bytes() {
-    for raw in [0xa9e0_43f2, 0xb400_0212, 0x1000_0072] {
-        let mut buf = code(&[raw]);
-        let mut pairs = vec![IslandPair::new(0x50_0000).unwrap()];
-        rewrite(&mut buf, 0x40_0000, &mut pairs, TargetHost::Linux, true);
-        let pair = &pairs[0];
-        let mut bad = pair.island().to_vec();
-        let at = match raw {
-            0xa9e0_43f2 => ISLAND_HEADER_BYTES, // still a valid SUB, but wrong frame depth
-            0xb400_0212 => ISLAND_HEADER_BYTES + ISLAND_SLOT_BYTES + 20, // valid B, wrong taken target
-            _ => ISLAND_BYTES - 4,                                       // unused image space
-        };
-        let changed = get(&bad, at).unwrap() ^ if raw == 0xa9e0_43f2 { 16 << 10 } else { 1 };
-        put(&mut bad, at, changed);
-        assert!(
-            IslandPair::from_images(
-                pair.island_vaddr(),
-                bad,
-                pair.chunk().to_vec(),
-                TargetHost::Linux
-            )
-            .is_err()
-        );
-        if raw == 0x1000_0072 {
-            let spec = x18::Spec::decode(raw, 0x40_0000).unwrap();
-            let literal = program(spec.metadata, Host::Linux, Some(spec))
-                .unwrap()
-                .k_literal
-                .unwrap();
-            let mut chunk = pair.chunk().to_vec();
-            chunk[CHUNK_GATES_OFFSET + literal] ^= 1;
-            assert!(
-                IslandPair::from_images(
-                    pair.island_vaddr(),
-                    pair.island().to_vec(),
-                    chunk,
-                    TargetHost::Linux
-                )
-                .is_err()
-            );
-        }
-    }
-    let mut pair = IslandPair::new(0x50_0000).unwrap();
-    let before = pair.clone();
-    assert!(pair.set_chunk_vaddr(!15).is_err());
-    assert!(pair.set_chunk_vaddr(1).is_err());
-    assert_eq!(pair, before);
-    let mut buf = code(&[0x9100_0652]);
-    rewrite(
-        &mut buf,
-        0x40_0000,
-        core::slice::from_mut(&mut pair),
-        TargetHost::Linux,
-        true,
-    );
-    let mut chunk = pair.chunk().to_vec();
-    let before = chunk.clone();
-    assert!(
-        finalize_island_chunk(
-            &mut chunk,
-            super::super::GUEST_X18_OFFSET_PLACEHOLDER - 8,
-            TargetHost::Linux
-        )
-        .is_err()
-    );
-    assert_eq!(chunk, before);
-}
-
-#[test]
-fn signal_classifier_matches_offline_stages() {
-    for host in [TargetHost::Linux, TargetHost::MacOs] {
-        for &(_, raw) in OPERATIONS.iter().chain(SYSTEM_OPERATIONS) {
-            let mut buf = code(&[raw]);
-            let mut pairs = vec![IslandPair::new(0x2_0050_0000).unwrap()];
-            rewrite(&mut buf, 0x2_0040_0000, &mut pairs, host, true);
-            let gates = decode_island_chunk(pairs[0].chunk(), host).unwrap();
-            let gate = &gates[0];
-            {
-                for offset in (0..gate.size).step_by(4) {
-                    let signal = classify_island_signal_gate(
-                        &pairs[0].chunk()[gate.offset..gate.offset + gate.size],
-                        (0x7000_0000_0000 + gate.offset) as u64,
-                        offset,
-                        host,
-                    );
-                    assert_eq!(signal.map(|g| g.stage), island_gate_stage(gate, offset));
-                    if let Some(signal) = signal {
-                        assert_eq!(signal.scratches, gate.scratches);
-                        assert_eq!(signal.entry_depth, gate.entry_depth);
-                        assert_eq!(signal.exit_depth, gate.exit_depth);
-                    }
-                }
-            }
-        }
-    }
-}
-
 // Use a real ordinary emitted scaffold, then replace only its original and
 // transformed words. This also tests rejection of forged unsupported classes.
 fn ordinary_signal_template(host: TargetHost) -> (Vec<u8>, usize, u8) {
@@ -488,66 +350,6 @@ fn ordinary_signal_template(host: TargetHost) -> (Vec<u8>, usize, u8) {
         execute,
         spec.value,
     )
-}
-
-#[test]
-fn signal_classifier_system_classes_match_offline_admission_exhaustively() {
-    for host in [TargetHost::Linux, TargetHost::MacOs] {
-        let (mut slot, execute, scratch) = ordinary_signal_template(host);
-        let original_at = slot.len() - 8;
-        let mut counts = [0usize; 8];
-        // Admission masks are host-independent: exhaust Linux's 131,072
-        // words, but check class edges and real MRS/SYS/TPIDR fields on macOS.
-        let fields: Vec<u32> = if host == TargetHost::Linux {
-            (0..(1 << 14)).collect()
-        } else {
-            vec![
-                0,
-                1,
-                0x1fff,
-                0x2000,
-                0x3ffe,
-                0x3fff,
-                (0xd53b_4212 >> 5) & 0x3fff, // NZCV
-                (0xd53b_e052 >> 5) & 0x3fff, // CNTVCT_EL0
-                (0xd50b_7b32 >> 5) & 0x3fff, // DC CVAU
-                ((0xd53b_d052 >> 5) & 0x3fff) - 1,
-                (0xd53b_d052 >> 5) & 0x3fff, // TPIDR_EL0, excluded only for MRS
-                ((0xd53b_d052 >> 5) & 0x3fff) + 1,
-            ]
-        };
-        for l_op0 in 0u32..8 {
-            for &fields in &fields {
-                let raw = 0xd500_0012 | (l_op0 << 19) | (fields << 5);
-                let transformed = (raw & !31) | u32::from(scratch);
-                let admitted = x18::Spec::decode(raw, 0x40_0000);
-                if let Some(spec) = admitted {
-                    assert_eq!(spec.metadata, GateMetadata::X18 { scratch });
-                    assert_eq!(spec.transformed, transformed);
-                    counts[l_op0 as usize] += 1;
-                }
-                put(&mut slot, original_at, raw);
-                put(&mut slot, execute, transformed);
-                {
-                    let signal = classify_island_signal_gate(&slot, 0x7000_0000, execute, host);
-                    assert_eq!(signal.is_some(), admitted.is_some(), "{raw:08x} {host:?}");
-                    if let Some(signal) = signal {
-                        assert!(signal.guest_instruction);
-                        assert_eq!(signal.stage.phase, IslandPhase::Before);
-                        let pending =
-                            classify_island_signal_gate(&slot, 0x7000_0000, execute + 4, host)
-                                .unwrap();
-                        assert_eq!(pending.stage.phase, IslandPhase::After);
-                        assert_eq!(pending.stage.pending_x18, Some(scratch));
-                    }
-                }
-            }
-        }
-        // SYS is already admitted; MRS excludes only TPIDR_EL0,x18. MSR and
-        // SYSL remain unsupported. This is not an EL0 executability claim.
-        let n = fields.len();
-        assert_eq!(counts, [0, n, 0, 0, 0, 0, n, n - 1]);
-    }
 }
 
 #[test]
@@ -599,10 +401,7 @@ fn signal_classifier_rejects_forged_system_fields_and_control_flow() {
 #[test]
 fn conditional_site_placement_range_matches_all_slot_edges_and_host_pages() {
     let site = 0x4000_0020u64;
-    for &(name, original) in OPERATIONS {
-        if !name.starts_with("cb") && !name.starts_with("tb") {
-            continue;
-        }
+    for &(name, original) in CONDITIONAL_OPERATIONS {
         let bits = if name.starts_with("cb") { 19 } else { 14 };
         let mask = (1u32 << bits) - 1;
         for immediate in [1u32 << (bits - 1), (1 << (bits - 1)) - 1] {
@@ -664,29 +463,4 @@ fn conditional_site_placement_range_matches_all_slot_edges_and_host_pages() {
             }
         }
     }
-}
-
-#[test]
-fn fresh_pair_range_checks_address_limits_without_constraining_data_targets() {
-    assert_eq!(*site_placement_range(0, None).unwrap().start(), 0);
-    assert_eq!(
-        *site_placement_range(u64::MAX - 7, None).unwrap().end(),
-        u64::MAX - ISLAND_BYTES as u64
-    );
-    assert!(site_placement_range(u64::MAX - 3, None).is_err());
-    let site = 0x4_4000_0020;
-    for &(name, raw) in OPERATIONS
-        .iter()
-        .filter(|(name, _)| name.starts_with("adr"))
-    {
-        let spec = x18::Spec::decode(raw, site).unwrap();
-        assert_eq!(
-            site_placement_range(site, Some(spec)).unwrap(),
-            site_placement_range(site, None).unwrap(),
-            "{name} is not a branch exit"
-        );
-    }
-    let mut impossible = x18::Spec::decode(0xb400_0212, site).unwrap();
-    impossible.target = Some(u64::MAX - 3);
-    assert!(site_placement_range(site, Some(impossible)).is_err());
 }

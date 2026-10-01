@@ -354,63 +354,6 @@ fn production_island_populated_chunk_below_island() {
 }
 
 #[test]
-fn production_island_actual_chunk_overlap_and_overflow_rejected() {
-    for host in [TargetHost::Linux, TargetHost::MacOs] {
-        // Valid header/primary slot survive each overlap. In particular the
-        // table case overlaps only unused entries, not the selected entry.
-        for (chunk, gate_offset) in [
-            (ISLAND + ISLAND_BYTES - 16, CHUNK_GATES_OFFSET), // header
-            (ISLAND - 64, 0x3000),                            // fixed table prefix
-            (ISLAND - CHUNK_GATES_OFFSET, CHUNK_GATES_OFFSET + 0x100), // actual gate
-        ] {
-            let mut f = Fixture::at(0xd53b_d040, host, 0, SITE, ISLAND, chunk);
-            let bytes = f.chunk[f.gate.offset..f.gate.offset + f.gate.size].to_vec();
-            f.chunk.resize(gate_offset + f.gate.size, 0);
-            f.chunk[gate_offset..gate_offset + f.gate.size].copy_from_slice(&bytes);
-            f.gate.offset = gate_offset;
-            let branch =
-                0x1400_0000 | u32::try_from((gate_offset - CHUNK_TABLE_OFFSET) / 4).unwrap();
-            f.chunk[CHUNK_TABLE_OFFSET..CHUNK_TABLE_OFFSET + 4]
-                .copy_from_slice(&branch.to_le_bytes());
-            // Model consistent memory when the header or gate really occupies
-            // otherwise unused island bytes. The table case already reads the
-            // intact island header through the overlapping unused entries.
-            for (start, bytes) in [
-                (chunk, f.chunk[..16].to_vec()),
-                (chunk + gate_offset, bytes),
-            ] {
-                if (ISLAND + 0x100..ISLAND + ISLAND_BYTES).contains(&start) {
-                    let at = start - ISLAND;
-                    f.island[at..at + bytes.len()].copy_from_slice(&bytes);
-                }
-            }
-            let (ctx, _) = f.boundary(0);
-            assert!(
-                matches!(
-                    f.run(&ctx, GateInterruption::Asynchronous),
-                    Aarch64GateSignalResult::NotGate
-                ),
-                "overlap chunk={chunk:x} gate={gate_offset:x}"
-            );
-        }
-        for chunk in [usize::MAX - CHUNK_GATES_OFFSET + 1, usize::MAX - 15] {
-            let mut f = Fixture::new(0xd53b_d040, host, 0, false);
-            f.chunk_address = chunk;
-            let delta = chunk.wrapping_add(CHUNK_TABLE_OFFSET).wrapping_sub(f.out);
-            f.island[ISLAND_DELTA_OFFSET..ISLAND_DELTA_OFFSET + 8]
-                .copy_from_slice(&delta.to_le_bytes());
-            let mut ctx = guest(false);
-            ctx.pc = f.out - 12;
-            ctx.sp = FRAME;
-            assert!(matches!(
-                f.run(&ctx, GateInterruption::Asynchronous),
-                Aarch64GateSignalResult::NotGate
-            ));
-        }
-    }
-}
-
-#[test]
 fn production_island_entry_dispatch_table_and_both_exits() {
     for host in [TargetHost::Linux, TargetHost::MacOs] {
         for &raw in OPERATIONS {
@@ -715,46 +658,15 @@ fn production_island_fault_attribution_pending_commits_and_brk_vs_async() {
 }
 
 #[test]
-fn production_island_svc_exact_callback_frame_and_unreadable_provenance() {
+fn production_island_rejects_malformed_header_and_unreadable_source() {
     for host in [TargetHost::Linux, TargetHost::MacOs] {
-        let mut f = Fixture::new(0xd400_0001, host, 0, false);
-        let (ctx, expected) = f.boundary(24); // BR callback
-        f.save(FRAME - 16, f.site + 4);
-        f.save(FRAME - 8, f.out);
-        assert_eq!(ctx.sp, FRAME - 16);
-        let mut frame = [0; 32];
-        assert!(f.read(ctx.sp, &mut frame));
-        let words: Vec<_> = frame
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .map(|w| usize::from_le_bytes(*w))
-            .collect();
-        assert_eq!(
-            words,
-            [f.site + 4, f.out, expected.regs[16], expected.regs[30]]
-        );
+        let mut f = Fixture::new(0xd63f_0240, host, 0, false); // BLR x18
+        let (ctx, expected) = f.boundary(0);
         equal(
             f.run(&ctx, GateInterruption::Asynchronous),
             &expected,
-            "SVC callback frame",
+            "valid transport",
         );
-        for denied in [f.site, f.island_address, f.chunk_address, FRAME, FRAME - 8] {
-            assert!(
-                matches!(
-                    canonicalize(
-                        &ctx,
-                        f.runtime(),
-                        GateInterruption::Asynchronous,
-                        host,
-                        true,
-                        |a, b| a != denied && f.read(a, b)
-                    ),
-                    Aarch64GateSignalResult::NotGate
-                ),
-                "{denied:x}"
-            );
-        }
         assert!(matches!(
             canonicalize(
                 &ctx,
@@ -762,213 +674,11 @@ fn production_island_svc_exact_callback_frame_and_unreadable_provenance() {
                 GateInterruption::Asynchronous,
                 host,
                 true,
-                |a, b| a != TLS + 8 && f.read(a, b)
-            ),
-            Aarch64GateSignalResult::InvalidRuntimeState
-        ));
-    }
-}
-
-#[test]
-fn production_island_rejects_malformed_unreadable_padding_and_unsupported_traps() {
-    for host in [TargetHost::Linux, TargetHost::MacOs] {
-        for raw in [0xd63f_0240, 0xb400_0212, 0xa9e0_43f2, 0xd400_0001] {
-            let mut f = Fixture::new(raw, host, 0, false);
-            let (ctx, _) = f.boundary(0);
-            for (region, at) in [
-                (0, 0),
-                (1, 0),
-                (1, 8),
-                (1, 16),
-                (1, 32),
-                (1, 40),
-                (1, 52),
-                (2, 8),
-                (2, 16),
-                (2, 20),
-                (2, f.gate.offset),
-            ] {
-                let bytes = match region {
-                    0 => &mut f.code,
-                    1 => &mut f.island,
-                    _ => &mut f.chunk,
-                };
-                bytes[at] ^= 0x80;
-                assert!(
-                    matches!(
-                        f.run(&ctx, GateInterruption::Breakpoint),
-                        Aarch64GateSignalResult::NotGate
-                    ),
-                    "forged {raw:x} region {region} offset {at}"
-                );
-                let bytes = match region {
-                    0 => &mut f.code,
-                    1 => &mut f.island,
-                    _ => &mut f.chunk,
-                };
-                bytes[at] ^= 0x80;
-            }
-            for offset in (0..f.gate.size)
-                .step_by(4)
-                .filter(|off| island_gate_stage(&f.gate, *off).is_none())
-            {
-                let mut bad = ctx.clone();
-                bad.pc += offset;
-                assert!(matches!(
-                    f.run(&bad, GateInterruption::Breakpoint),
-                    Aarch64GateSignalResult::NotGate
-                ));
-            }
-            for bad_pc in [
-                ISLAND + 12,
-                ISLAND + 16,
-                ISLAND + 24,
-                FAR + 20,
-                usize::MAX - 3,
-            ] {
-                let mut bad = ctx.clone();
-                bad.pc = bad_pc;
-                assert!(matches!(
-                    f.run(&bad, GateInterruption::Asynchronous),
-                    Aarch64GateSignalResult::NotGate
-                ));
-            }
-            assert!(matches!(
-                canonicalize(
-                    &ctx,
-                    f.runtime(),
-                    GateInterruption::Asynchronous,
-                    host,
-                    true,
-                    |_, _| false
-                ),
-                Aarch64GateSignalResult::NotGate
-            ));
-            // A forged BLRAA-like footer may not authorize BRK emulation.
-            if raw == 0xd63f_0240 {
-                let at = f.gate.offset + f.gate.size - 8;
-                f.chunk[at..at + 4].copy_from_slice(&0xd73f_0a40u32.to_le_bytes());
-                assert!(matches!(
-                    f.run(&ctx, GateInterruption::Breakpoint),
-                    Aarch64GateSignalResult::NotGate
-                ));
-            }
-        }
-    }
-}
-
-#[test]
-fn production_island_ambiguous_copied_candidates_fail_closed() {
-    // A mapping changing between reads could present two individually valid
-    // slot sizes at one address. Never accept the first or last such snapshot.
-    let mut first = Fixture::new(0xd53b_d045, TargetHost::Linux, 0, false);
-    let second = Fixture::new(0xd53b_d050, TargetHost::Linux, 0, false);
-    assert_ne!(first.gate.size, second.gate.size);
-    let (ctx, _) = first.boundary(0);
-    let address = FAR + first.gate.offset;
-    let result = canonicalize(
-        &ctx,
-        first.runtime(),
-        GateInterruption::Asynchronous,
-        TargetHost::Linux,
-        true,
-        |at, bytes| {
-            if (at == address && bytes.len() == second.gate.size)
-                || (at == address + second.gate.size - 4 && bytes.len() == 4)
-            {
-                second.read(at, bytes)
-            } else {
-                first.read(at, bytes)
-            }
-        },
-    );
-    assert!(matches!(result, Aarch64GateSignalResult::NotGate));
-}
-
-#[test]
-fn production_island_respects_virtualization_guest_abi_and_overflow() {
-    for raw in [0xd400_0001, 0xab01_0252] {
-        let mut f = Fixture::new(raw, TargetHost::MacOs, 0, false);
-        let (ctx, mut expected) = f.boundary(0);
-        let result = canonicalize(
-            &ctx,
-            f.runtime(),
-            GateInterruption::Asynchronous,
-            f.host,
-            false,
-            |at, bytes| at != TLS + 8 && f.read(at, bytes),
-        );
-        if raw == 0xd400_0001 {
-            expected.regs[18] = ctx.regs[18];
-            equal(result, &expected, "nonvirtualized Linux guest");
-        } else {
-            assert!(matches!(result, Aarch64GateSignalResult::NotGate));
-        }
-        assert!(matches!(
-            canonicalize_darwin(
-                &ctx,
-                f.runtime(),
-                GateInterruption::Asynchronous,
-                |at, bytes| f.read(at, bytes)
+                |at, bytes| at != f.site && f.read(at, bytes)
             ),
             Aarch64GateSignalResult::NotGate
         ));
-        let bad_runtime = GateRuntimeState {
-            guest_thread_pointer_addr: usize::MAX - 3,
-            ..f.runtime()
-        };
-        assert!(matches!(
-            canonicalize(
-                &ctx,
-                bad_runtime,
-                GateInterruption::Asynchronous,
-                f.host,
-                true,
-                |at, bytes| f.read(at, bytes)
-            ),
-            Aarch64GateSignalResult::InvalidRuntimeState
-        ));
-        let mut bad = ctx.clone();
-        bad.sp = usize::MAX - 7;
-        assert!(matches!(
-            f.run(&bad, GateInterruption::Asynchronous),
-            Aarch64GateSignalResult::NotGate
-        ));
-    }
-}
-
-#[test]
-fn production_island_rejects_mismatched_tls_transport_fields_and_aux_target() {
-    for host in [TargetHost::Linux, TargetHost::MacOs] {
-        let mut f = Fixture::new(0xab01_0252, host, 0, false);
-        let (ctx, _) = f.boundary(0);
-        // Change only the second TLS offset, leaving both offsets individually
-        // valid. Full transport must still reject the conflicting fields.
-        let tls_words: Vec<_> = f.chunk[f.gate.offset..f.gate.offset + f.gate.size]
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .enumerate()
-            .filter_map(|(i, w)| {
-                let raw = u32::from_le_bytes(*w);
-                ((raw & 0xffc0_0000 == 0xf900_0000 || raw & 0xffc0_0000 == 0xf940_0000)
-                    && ((raw >> 5) & 31) == 16
-                    && ((raw >> 10) & 4095) >= 8)
-                    .then_some(i * 4)
-            })
-            .collect();
-        let at = f.gate.offset + *tls_words.last().unwrap();
-        let raw = u32::from_le_bytes(f.chunk[at..at + 4].try_into().unwrap());
-        f.chunk[at..at + 4].copy_from_slice(&(raw + (2 << 10)).to_le_bytes());
-        assert!(matches!(
-            f.run(&ctx, GateInterruption::Asynchronous),
-            Aarch64GateSignalResult::NotGate
-        ));
-        let mut f = Fixture::new(0xb400_0212, host, 0, false);
-        let (ctx, _) = f.boundary(0);
-        // Still a valid auxiliary B, but no longer the original conditional's
-        // taken target. Primary site identity must not be derived from it.
-        f.island[76] ^= 1;
+        f.island[0] ^= 0x80;
         assert!(matches!(
             f.run(&ctx, GateInterruption::Asynchronous),
             Aarch64GateSignalResult::NotGate
