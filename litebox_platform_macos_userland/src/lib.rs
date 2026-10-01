@@ -833,7 +833,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
                     temporary,
                     false,
                     true,
-                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                    FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
                 )
                 .map_err(map_error)?,
             Err(error) => return Err(map_error(error)),
@@ -2666,7 +2666,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap()
             .as_usize();
@@ -2724,7 +2724,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let compat_memory = compat
@@ -2733,7 +2733,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let base = native_memory.as_usize();
@@ -3380,7 +3380,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let base = memory.as_usize();
@@ -3567,7 +3567,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
@@ -3609,7 +3609,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let source_range = source.as_usize()..source.as_usize() + HOST_PAGE_SIZE;
@@ -3631,7 +3631,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let target_range = target.as_usize()..target.as_usize() + 2 * HOST_PAGE_SIZE;
@@ -3694,7 +3694,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
@@ -3748,7 +3748,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let base = ptr.as_usize();

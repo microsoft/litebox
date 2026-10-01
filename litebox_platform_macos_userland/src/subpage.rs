@@ -906,7 +906,7 @@ mod tests {
                 .allocate(
                     TASK_ADDR_MIN..TASK_ADDR_MIN + len,
                     permissions,
-                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                    FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
                 )
                 .unwrap()
         }
@@ -1157,7 +1157,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let base = memory.as_usize();

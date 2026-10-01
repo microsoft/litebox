@@ -12,7 +12,8 @@ use core::ops::Range;
 use litebox::{
     fs::errors::ReadError,
     platform::{
-        RawConstPointer as _, RawMutPointer as _, page_mgmt::MemoryRegionPermissions as Permissions,
+        RawConstPointer as _, RawMutPointer as _,
+        page_mgmt::{AllocationDirection, MemoryRegionPermissions as Permissions},
     },
     utils::TruncateExt as _,
 };
@@ -151,7 +152,11 @@ fn permissions(protection: VmProtection) -> Permissions {
     permissions
 }
 
-fn mapping_flags(flags: MmapFlags, file_backed: bool) -> CreatePagesFlags {
+fn mapping_flags(
+    flags: MmapFlags,
+    file_backed: bool,
+    direction: AllocationDirection,
+) -> CreatePagesFlags {
     let mut result = CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
     result.set(
         CreatePagesFlags::FIXED_ADDR,
@@ -159,6 +164,10 @@ fn mapping_flags(flags: MmapFlags, file_backed: bool) -> CreatePagesFlags {
     );
     result.set(CreatePagesFlags::SHARED, flags.contains(MmapFlags::SHARED));
     result.set(CreatePagesFlags::MAP_FILE, file_backed);
+    result.set(
+        CreatePagesFlags::TOP_DOWN,
+        direction == AllocationDirection::TopDown,
+    );
     result
 }
 
@@ -198,6 +207,15 @@ fn protection_error(error: VmemProtectError) -> Errno {
             _ => Errno::EINVAL,
         },
     }
+}
+
+struct MmapRequest {
+    address: usize,
+    length: usize,
+    protection: VmProtection,
+    flags: MmapFlags,
+    fd: i32,
+    offset: i64,
 }
 
 fn record_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usize>) {
@@ -435,6 +453,51 @@ impl<P: ShimPlatform> Task<P> {
         fd: i32,
         offset: i64,
     ) -> Result<usize, Errno> {
+        self.mmap_with_direction(
+            MmapRequest {
+                address,
+                length,
+                protection,
+                flags,
+                fd,
+                offset,
+            },
+            AllocationDirection::BottomUp,
+        )
+    }
+
+    pub(crate) fn reserve_anonymous(
+        &self,
+        address: usize,
+        length: usize,
+        direction: AllocationDirection,
+    ) -> Result<usize, Errno> {
+        self.mmap_with_direction(
+            MmapRequest {
+                address,
+                length,
+                protection: VmProtection::empty(),
+                flags: MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
+                fd: -1,
+                offset: 0,
+            },
+            direction,
+        )
+    }
+
+    fn mmap_with_direction(
+        &self,
+        request: MmapRequest,
+        direction: AllocationDirection,
+    ) -> Result<usize, Errno> {
+        let MmapRequest {
+            address,
+            length,
+            protection,
+            flags,
+            fd,
+            offset,
+        } = request;
         if length == 0
             || !address.is_multiple_of(PAGE_SIZE)
             || flags.contains(MmapFlags::SHARED) == flags.contains(MmapFlags::PRIVATE)
@@ -470,7 +533,7 @@ impl<P: ShimPlatform> Task<P> {
                 self.global.mm.create_pages_with_permissions(
                     suggested,
                     length,
-                    mapping_flags(flags, false),
+                    mapping_flags(flags, false, direction),
                     permissions(protection),
                     |_| Ok(0),
                 )
@@ -501,7 +564,7 @@ impl<P: ShimPlatform> Task<P> {
             Vec::new()
         };
         let final_permissions = permissions(protection);
-        let mut create_flags = mapping_flags(flags, true);
+        let mut create_flags = mapping_flags(flags, true, direction);
         if macho.is_some() && !flags.contains(MmapFlags::FIXED) {
             create_flags |= CreatePagesFlags::ENSURE_SPACE_AFTER;
         }

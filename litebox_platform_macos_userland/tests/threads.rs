@@ -110,7 +110,7 @@ fn spawned_threads_use_configured_darwin_gates() {
             Permissions::READ | Permissions::WRITE,
             false,
             true,
-            FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
         )
         .unwrap();
     let base = memory.as_usize();
