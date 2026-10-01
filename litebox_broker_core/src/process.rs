@@ -1749,8 +1749,8 @@ mod tests {
 
         assert_eq!(parent.close_object_reference(writer), Ok(()));
         assert_eq!(*parent_sink.retired.lock().unwrap(), [writer]);
-        assert!(take_republished(&parent_sink).is_empty());
-        assert!(take_republished(&child_sink).is_empty());
+        assert_eq!(take_republished(&parent_sink), []);
+        assert_eq!(take_republished(&child_sink), []);
 
         assert_eq!(child.close_object_reference(child_writer), Ok(()));
         let hangup = ReadinessFlags::READ | ReadinessFlags::HANGUP;
