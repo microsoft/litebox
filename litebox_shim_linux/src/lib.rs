@@ -70,6 +70,8 @@ mod wait;
 
 pub(crate) use litebox::fs::FileFd;
 
+pub use litebox_common_linux::vmem::ShimReservations;
+
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written
@@ -77,8 +79,10 @@ pub(crate) use litebox::fs::FileFd;
 pub trait ShimPlatform:
     litebox::platform::RawPointerProvider
     + TimeProvider
-    + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox_common_linux::vmem::VmemPageFaultHandler
+    + litebox::platform::PageManagementProvider<
+        { PAGE_SIZE },
+        Reservations = ShimReservations<Self::Reservation>,
+    > + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox_platform::sync::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::SystemInfoProvider
@@ -90,13 +94,18 @@ pub trait ShimPlatform:
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
     + 'static
 {
+    /// Opaque page-reservation ownership type supplied by the platform.
+    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
 }
 
-impl<T> ShimPlatform for T where
+impl<T, Reservation> ShimPlatform for T
+where
     T: litebox::platform::RawPointerProvider
         + TimeProvider
-        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox_common_linux::vmem::VmemPageFaultHandler
+        + litebox::platform::PageManagementProvider<
+            { PAGE_SIZE },
+            Reservations = ShimReservations<Reservation>,
+        > + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox_platform::sync::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::SystemInfoProvider
@@ -106,8 +115,10 @@ impl<T> ShimPlatform for T where
         > + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
-        + 'static
+        + 'static,
+    Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
 {
+    type Reservation = Reservation;
 }
 
 // Linux-specific memory manager state and behavior.

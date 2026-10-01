@@ -498,6 +498,9 @@ impl ElfParsedFile {
             let span = max
                 .checked_sub(min)
                 .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            if span == 0 {
+                return Err(ElfLoadError::InvalidProgramHeader);
+            }
             mapper.reserve(span, align).map_err(ElfLoadError::Map)?
         } else {
             // For ET_EXEC, load at the fixed addresses specified in the ELF.

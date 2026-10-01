@@ -3,6 +3,8 @@
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Windows.
 //!
+//! The guest shares the host process's address space, so this platform does not isolate host
+//! memory from the guest: guest code or fixed-address mappings can read or overwrite it.
 
 // Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
@@ -41,6 +43,7 @@ use windows_sys::Win32::{
         self as Win32_Memory, PrefetchVirtualMemory, VirtualAlloc2, VirtualFree, VirtualProtect,
     },
     System::SystemInformation::{self as Win32_SysInfo, GetSystemTimePreciseAsFileTime},
+    System::SystemServices::MEM_TOP_DOWN,
     System::Threading::{self as Win32_Threading, GetCurrentProcess},
     System::WindowsProgramming::QueryUnbiasedInterruptTimePrecise,
 };
@@ -70,6 +73,8 @@ pub enum GuestTlsMode {
 const PAGE_SIZE: usize = 4096;
 
 mod page_mgmt;
+#[doc(hidden)]
+pub use page_mgmt::WindowsUserlandReservation;
 
 const GUEST_TLS_MODE_UNCONFIGURED: u8 = 0;
 static GUEST_TLS_MODE: AtomicU8 = AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);
