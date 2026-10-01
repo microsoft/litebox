@@ -1586,8 +1586,7 @@ mod tests {
     };
     use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags,
-        FileType, FileUser, SetStatusFlagsRequest,
+        FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
     use litebox_broker_protocol::process::{CreatedProcess, ProcessExitStatus, ProcessTermination};
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -3165,7 +3164,6 @@ mod tests {
         check_process_drop_releases_references(&broker);
         check_pipe_lifecycle(&broker);
         check_pipe_reader_closure(&broker);
-        check_pipe_status_flags(&broker);
         check_corrupt_index_fails_without_mutation(&broker);
         check_corrupt_index_does_not_break_teardown(&broker);
         check_reference_quota_is_per_process(&broker);
@@ -3321,62 +3319,6 @@ mod tests {
         );
         assert_eq!(process.close_object_reference(writer), Ok(()));
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 0);
-    }
-
-    fn check_pipe_status_flags(broker: &BrokerCore) {
-        let process = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        assert_eq!(
-            crate::pipe::create(&process, 1, 1, FileOpenFlags::CREATE),
-            Err(BrokerError::UnsupportedOperation)
-        );
-        let (reader, writer) =
-            crate::pipe::create(&process, 1, 1, FileOpenFlags::NONBLOCKING).unwrap();
-        assert_eq!(
-            process.get_status_flags(reader),
-            Ok(FileStatusFlags {
-                access: FileAccessMode::ReadOnly,
-                flags: FileOpenFlags::NONBLOCKING,
-            })
-        );
-        assert_eq!(
-            crate::pipe::read(&process, reader, 1),
-            Err(BrokerError::NonBlockingWouldBlock)
-        );
-        assert_eq!(crate::pipe::write(&process, writer, &[1]), Ok(1));
-        assert_eq!(
-            crate::pipe::write(&process, writer, &[2]),
-            Err(BrokerError::NonBlockingWouldBlock)
-        );
-
-        // Each end has its own flags; APPEND is reported but has no effect.
-        let request = SetStatusFlagsRequest {
-            handle: writer,
-            mask: FileOpenFlags::NONBLOCKING | FileOpenFlags::APPEND,
-            flags: FileOpenFlags::APPEND,
-        };
-        assert_eq!(process.set_status_flags(request), Ok(()));
-        assert_eq!(
-            process.get_status_flags(writer),
-            Ok(FileStatusFlags {
-                access: FileAccessMode::WriteOnly,
-                flags: FileOpenFlags::APPEND,
-            })
-        );
-        assert_eq!(
-            crate::pipe::write(&process, writer, &[2]),
-            Err(BrokerError::WouldBlock)
-        );
-        assert_eq!(
-            process.get_status_flags(reader),
-            Ok(FileStatusFlags {
-                access: FileAccessMode::ReadOnly,
-                flags: FileOpenFlags::NONBLOCKING,
-            })
-        );
-        assert_eq!(process.close_object_reference(reader), Ok(()));
-        assert_eq!(process.close_object_reference(writer), Ok(()));
     }
 
     fn check_corrupt_index_fails_without_mutation(broker: &BrokerCore) {

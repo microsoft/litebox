@@ -443,7 +443,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
             .try_into()
             .expect("pipe transfer limit must fit in u32");
 
-        // The broker fails the read instead of returning `WouldBlock` if this end is non-blocking.
+        // On a non-blocking end, the broker returns `NonBlockingWouldBlock` instead of `WouldBlock`,
+        // so the wait returns `PipeError::WouldBlock` instead of blocking.
         self.pollee
             .wait(cx, false, Events::IN, || {
                 let data = self
@@ -469,8 +470,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerPipeEnd<Platform>
             return Ok(0);
         }
 
-        // The broker fails a write instead of returning `WouldBlock` if this end is non-blocking,
-        // which ends the loop with what was written so far.
+        // On a non-blocking end, the broker returns `NonBlockingWouldBlock` instead of `WouldBlock`,
+        // so the wait returns instead of blocking and the loop returns what was written so far, or
+        // `PipeError::WouldBlock` if nothing was written.
         let mut total_written = 0;
         while total_written < buf.len() {
             let end = total_written
