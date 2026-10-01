@@ -23,7 +23,7 @@
     },
     "panic-strategy": "abort",
     "disable-redzone": true,
-    "rustc-abi": "x86-softfloat",
+    "rustc-abi": "softfloat",
     "features": "-mmx,-sse,+soft-float",
     "relocation-model": "pic",
     "dynamic-linking": false,
