@@ -21,7 +21,7 @@ use litebox_common_linux::{
     FileDescriptorFlags, InodeType, OFlags, errno::Errno, program_startup::InheritedFdKind,
 };
 
-use super::file::{linux_status_flags, status_flags_change};
+use super::file::status_flags_change;
 use crate::{GlobalState, ShimPlatform};
 
 const DEFAULT_PIPE_BUF_SIZE: usize = 64 * 1024;
@@ -92,11 +92,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         buf: &[u8],
     ) -> Result<usize, Errno> {
         self.pipes.write(cx, fd, buf).map_err(Errno::from)
-    }
-
-    /// Returns the `F_GETFL` flags of the pipe end at `fd`.
-    pub(crate) fn linux_pipe_status_flags(&self, fd: &PipeFd<Platform>) -> Result<OFlags, Errno> {
-        linux_status_flags(self.pipes.get_status_flags(fd)?)
     }
 
     /// Changes the status flags in `mask` of the pipe end at `fd` to their values in `flags`,
