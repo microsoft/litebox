@@ -37,7 +37,7 @@ pub struct KernelPages;
 
 // Safety: the heap hands out disjoint, page-aligned buddy blocks (live ones
 // are never reused) carved only from RAM that `seed_heap` adds, which is inside
-// the RAM passed to `VmKernel::new` and mapped at `PA + KERNEL_OFFSET`.
+// `BootConfig::ram` and mapped at `PA + KERNEL_OFFSET`.
 unsafe impl litebox_platform_vm_kernel::mm::PageAllocator for KernelPages {
     fn allocate_pages(&self, order: u32) -> Option<*mut u8> {
         KERNEL_ALLOCATOR.allocate_pages(order)

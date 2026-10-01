@@ -73,10 +73,11 @@ pub fn run(platform: &'static VmKernel, info: &BootInfo) {
     let shim = shim_builder.build();
 
     // The address space lives until VM exit; no teardown is performed.
-    let task_pt = platform.create_task_page_table();
+    let address_space = platform.create_address_space();
     // Safety: nothing references user memory yet; the task table shares the
     // kernel mappings the kernel is running on.
-    unsafe { platform.switch_page_table(task_pt) }.expect("failed to load the task page table");
+    unsafe { platform.switch_address_space(address_space) }
+        .expect("failed to switch address space");
 
     match payload.command_sequence {
         None => run_ta_with_default_commands(&shim, payload.ldelf, payload.ta),

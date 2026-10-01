@@ -5,13 +5,10 @@
 //! allocators, logging, interrupt-controller setup, a [`clock::ClockSource`],
 //! and the root key ([`providers::set_platform_root_key`]).
 //!
-//! Required initialization order:
-//! [`arch::enable_fsgsbase`], [`arch::enable_extended_states`],
-//! [`per_cpu::allocate_per_cpu_variables`], [`per_cpu::init_per_cpu_variables`]
-//! (then switch to the kernel stack), [`VmKernel::new`],
-//! [`per_cpu::allocate_xsave_area`], [`arch::gdt::init`],
-//! [`arch::interrupts::init_idt`], [`VmKernel::enable_syscall_support`],
-//! [`clock::init`] and [`arch::enable_smep_smap`].
+//! After boot mappings and the heap are ready, [`VmKernel::boot`] owns CPU
+//! initialization and the kernel-stack handoff. Its continuation receives the
+//! initialized platform; key provisioning remains separate and must precede
+//! execution that needs derived keys.
 //!
 //! Assumptions: a single CPU, no scheduler, and not a confidential VM (no
 //! #VE/#VC/#HV).
@@ -57,23 +54,42 @@ use litebox_platform::time::{
 };
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::{
-    VirtAddr,
+    PhysAddr, VirtAddr,
     structures::paging::{PageSize, PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::{FromBytes, IntoBytes};
 
 extern crate alloc;
 
-pub mod arch;
+mod arch;
+mod boot;
 pub mod clock;
 pub mod mm;
-pub mod per_cpu;
+mod per_cpu;
 pub mod providers;
 
 mod syscall_entry;
 
-/// ID of the base page table. Task IDs are P4 frame addresses, never 0.
-pub const BASE_PAGE_TABLE_ID: usize = 0;
+/// Inputs to the single-CPU kernel handoff. The runner owns device setup and
+/// must keep the clock and allocator alive until reset.
+pub struct BootConfig<'a> {
+    pub page_allocator: &'static dyn mm::PageAllocator,
+    pub clock: &'static dyn clock::ClockSource,
+    /// Physical RAM to map; ranges are rounded inward to whole pages.
+    pub ram: &'a [core::ops::Range<PhysAddr>],
+    /// Physical executable kernel range; all other RAM is mapped RW/NX.
+    pub text: core::ops::Range<PhysAddr>,
+    /// External vectors that require neither handling nor acknowledgement.
+    pub ignored_vectors: &'a [u8],
+}
+
+/// Valid until unregistered; its representation is private to the platform.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AddressSpaceId(usize);
+
+impl AddressSpaceId {
+    pub const KERNEL: Self = Self(0);
+}
 
 // Virtual address space:
 //   0xFFFF_E200_0000_0000 ..  kernel: all owned RAM at PA + KERNEL_OFFSET
@@ -126,8 +142,7 @@ pub(crate) struct PageTableManager {
     /// Lives until reset; must never be dropped.
     base_page_table: mm::PageTable<PAGE_SIZE>,
     base_page_table_frame: PhysFrame<Size4KiB>,
-    /// Keyed by P4 frame address, which is the page table ID.
-    task_page_tables: spin::RwLock<HashMap<usize, Arc<mm::PageTable<PAGE_SIZE>>>>,
+    task_page_tables: spin::RwLock<HashMap<AddressSpaceId, Arc<mm::PageTable<PAGE_SIZE>>>>,
 }
 
 impl PageTableManager {
@@ -152,7 +167,9 @@ impl PageTableManager {
         }
 
         let cr3_id: usize = cr3_frame.start_address().as_u64().trunc();
-        if let Some(pt) = with_per_cpu_variables(|pcv| pcv.active_page_table(cr3_id)) {
+        if let Some(pt) =
+            with_per_cpu_variables(|pcv| pcv.active_page_table(AddressSpaceId(cr3_id)))
+        {
             return PageTableHandle::task(pt);
         }
 
@@ -187,8 +204,8 @@ impl PageTableManager {
     /// # Errors
     ///
     /// `EINVAL` for the base table ID, `ENOENT` for an unknown ID.
-    pub(crate) unsafe fn load_task(&self, task_pt_id: usize) -> Result<(), Errno> {
-        if task_pt_id == BASE_PAGE_TABLE_ID {
+    pub(crate) unsafe fn load_task(&self, task_pt_id: AddressSpaceId) -> Result<(), Errno> {
+        if task_pt_id == AddressSpaceId::KERNEL {
             return Err(Errno::EINVAL);
         }
 
@@ -212,14 +229,14 @@ impl PageTableManager {
     }
 
     /// Shares the base table's kernel P3/P2/P1 tables.
-    pub(crate) fn create_task_page_table(&self) -> usize {
+    pub(crate) fn create_task_page_table(&self) -> AddressSpaceId {
         let pt = mm::PageTable::new_top_level();
 
         // Sharing is safe because the kernel mappings are fixed after boot.
         pt.copy_pml4_entries_from(&self.base_page_table);
 
         let pt = Arc::new(pt);
-        let task_pt_id: usize = pt.physical_frame().start_address().as_u64().trunc();
+        let task_pt_id = AddressSpaceId(pt.physical_frame().start_address().as_u64().trunc());
 
         let mut task_pts = self.task_page_tables.write();
         task_pts.insert(task_pt_id, pt);
@@ -235,8 +252,11 @@ impl PageTableManager {
     /// exclusively owned and no access outlives all remaining handles.
     ///
     /// Returns `EINVAL` for the base ID and `ENOENT` if it is not registered.
-    pub(crate) unsafe fn unregister_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
-        if task_pt_id == BASE_PAGE_TABLE_ID {
+    pub(crate) unsafe fn unregister_task_page_table(
+        &self,
+        task_pt_id: AddressSpaceId,
+    ) -> Result<(), Errno> {
+        if task_pt_id == AddressSpaceId::KERNEL {
             return Err(Errno::EINVAL);
         }
 
@@ -252,6 +272,7 @@ impl PageTableManager {
 /// The LiteBox platform for a VM guest kernel.
 pub struct VmKernel {
     page_table_manager: PageTableManager,
+    clock: &'static dyn clock::ClockSource,
     /// Guest RAM owned by this kernel (mapped at `PA + KERNEL_OFFSET`).
     ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>>,
 }
@@ -348,24 +369,11 @@ impl ArchSpecificProvider for VmKernel {
 }
 
 impl VmKernel {
-    /// Initialize the kernel mapping once: text RX, other RAM RW/NX, guards unmapped.
-    ///
-    /// Requirements: running at `KERNEL_OFFSET` with relocations applied, a
-    /// working global allocator, `page_allocator` able to supply the page
-    /// tables (~2 KiB per MiB of RAM), [`per_cpu::allocate_per_cpu_variables`]
-    /// done on the only core, and the current page tables mapping the running
-    /// code and stack.
-    ///
-    /// `ram` is rounded inward to whole pages; `text_phys_*` bounds `.text`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `.text` is not inside `ram` or a page table allocation fails.
-    pub fn new(
-        page_allocator: &'static dyn mm::PageAllocator,
-        ram: &[core::ops::Range<x86_64::PhysAddr>],
-        text_phys_start: x86_64::PhysAddr,
-        text_phys_end: x86_64::PhysAddr,
+    fn initialize(
+        ram: &[core::ops::Range<PhysAddr>],
+        text_phys_start: PhysAddr,
+        text_phys_end: PhysAddr,
+        clock: &'static dyn clock::ClockSource,
     ) -> &'static Self {
         let ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>> = ram
             .iter()
@@ -383,7 +391,6 @@ impl VmKernel {
         );
 
         let text = text_phys_start..text_phys_end;
-        mm::set_page_allocator(page_allocator);
         let base_pt = mm::PageTable::new_top_level();
         for range in &ram_frame_ranges {
             if let Err(e) = base_pt.map_kernel_ram(*range, &text) {
@@ -401,21 +408,34 @@ impl VmKernel {
 
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             page_table_manager: PageTableManager::new(base_pt),
+            clock,
             ram_frame_ranges,
         }))
     }
 
-    pub fn ram_frame_ranges(&self) -> &[PhysFrameRange<Size4KiB>] {
-        &self.ram_frame_ranges
+    /// Only valid for addresses in the kernel's direct mapping.
+    pub fn va_to_pa(va: VirtAddr) -> PhysAddr {
+        <Self as mm::MemoryProvider>::va_to_pa(va)
     }
 
-    /// Create a task page table that shares the base table's kernel mappings,
-    /// and return its ID.
+    /// Only valid for physical addresses in the kernel's direct mapping.
+    pub fn pa_to_va(pa: PhysAddr) -> VirtAddr {
+        <Self as mm::MemoryProvider>::pa_to_va(pa)
+    }
+
+    pub fn contains_ram(&self, range: core::ops::Range<PhysAddr>) -> bool {
+        range.start < range.end
+            && self.ram_frame_ranges.iter().any(|r| {
+                r.start.start_address() <= range.start && range.end <= r.end.start_address()
+            })
+    }
+
+    /// The new address space shares kernel mappings but has no user mappings.
     ///
     /// # Panics
     ///
     /// Panics if the page allocator is exhausted.
-    pub fn create_task_page_table(&self) -> usize {
+    pub fn create_address_space(&self) -> AddressSpaceId {
         self.page_table_manager.create_task_page_table()
     }
 
@@ -427,7 +447,7 @@ impl VmKernel {
     /// exclusively owned and no access outlives all remaining handles.
     ///
     /// Returns `EINVAL` for the base ID and `ENOENT` if it is not registered.
-    pub unsafe fn unregister_task_page_table(&self, task_pt_id: usize) -> Result<(), Errno> {
+    pub unsafe fn unregister_address_space(&self, task_pt_id: AddressSpaceId) -> Result<(), Errno> {
         // Safety: the caller upholds the manager's destruction requirements.
         unsafe {
             self.page_table_manager
@@ -435,7 +455,7 @@ impl VmKernel {
         }
     }
 
-    /// Load a task page table, or the base one for [`BASE_PAGE_TABLE_ID`].
+    /// Switch to a registered address space, or [`AddressSpaceId::KERNEL`].
     ///
     /// # Safety
     ///
@@ -445,8 +465,8 @@ impl VmKernel {
     /// # Errors
     ///
     /// `ENOENT` for an unknown ID.
-    pub unsafe fn switch_page_table(&self, pt_id: usize) -> Result<(), Errno> {
-        if pt_id == BASE_PAGE_TABLE_ID {
+    pub unsafe fn switch_address_space(&self, pt_id: AddressSpaceId) -> Result<(), Errno> {
+        if pt_id == AddressSpaceId::KERNEL {
             // Safety: forwarded to the caller.
             unsafe { self.page_table_manager.load_base() };
             Ok(())
@@ -454,11 +474,6 @@ impl VmKernel {
             // Safety: forwarded to the caller.
             unsafe { self.page_table_manager.load_task(pt_id) }
         }
-    }
-
-    /// Enable `syscall` on the current core. Needs its GDT.
-    pub fn enable_syscall_support() {
-        syscall_entry::init();
     }
 }
 
@@ -534,7 +549,7 @@ impl TimeProvider for VmKernel {
     type SystemTime = SystemTime;
 
     fn now(&self) -> Self::Instant {
-        Instant(clock::monotonic_nanos())
+        Instant(self.clock.monotonic_nanos())
     }
 
     /// There is no wall clock (no RTC driver).

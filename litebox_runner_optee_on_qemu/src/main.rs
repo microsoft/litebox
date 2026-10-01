@@ -24,11 +24,8 @@ use boot::{BootInfo, Range};
 use core::panic::PanicInfo;
 use layout::{heap_start_address, text_end_address, text_start_address};
 use litebox_platform_vm_kernel::{
-    KERNEL_OFFSET, VmKernel,
-    arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, gdt, interrupts},
-    clock,
-    mm::MemoryProvider,
-    per_cpu::{self, PerCpuVariablesAsm, allocate_per_cpu_variables, init_per_cpu_variables},
+    BootConfig, KERNEL_OFFSET, VmKernel,
+    clock::TscClock,
     providers::{PRK_LEN, set_platform_root_key},
 };
 use serial::serial_println;
@@ -87,28 +84,8 @@ pub(crate) fn kernel_start(info: BootInfo) -> ! {
     }
     litebox_util_log::info!(cmdline:% = info.cmdline.as_str(); "boot");
 
-    enable_fsgsbase();
-    enable_extended_states();
     seed_heap(&info);
-    BOOT_INFO.call_once(|| info);
-
-    allocate_per_cpu_variables();
-    init_per_cpu_variables();
-    // Safety: the per-CPU kernel stack was just allocated; nothing on the boot
-    // stack is referenced after the switch.
-    unsafe {
-        core::arch::asm!(
-            "mov rsp, gs:[{kernel_sp_off}]",
-            "call {next}",
-            kernel_sp_off = const { PerCpuVariablesAsm::kernel_stack_ptr_offset() },
-            next = sym kernel_main,
-            options(noreturn),
-        );
-    }
-}
-
-extern "C" fn kernel_main() -> ! {
-    let info = BOOT_INFO.get().expect("boot info captured");
+    let info = BOOT_INFO.call_once(|| info);
     let ram_end = ram_end(info);
     report_unused_ram(info, ram_end);
     let ram: arrayvec::ArrayVec<_, { boot::MAX_RAM_REGIONS }> = info
@@ -118,36 +95,39 @@ extern "C" fn kernel_main() -> ! {
         .map(|r| x86_64::PhysAddr::new(r.start)..x86_64::PhysAddr::new(r.end.min(ram_end)))
         .collect();
     let to_pa = |va: u64| VmKernel::va_to_pa(x86_64::VirtAddr::new(va));
-    let platform = VmKernel::new(
-        &heap::KernelPages,
-        &ram,
-        to_pa(text_start_address()),
-        to_pa(text_end_address()),
-    );
-    // Modules are read through the kernel mapping, which covers only `ram`.
+    machine::init_legacy_pics();
+    let tsc_khz = machine::calibrate_tsc_khz();
+    litebox_util_log::info!(mhz:% = tsc_khz / 1000; "TSC calibrated against the PIT");
+    let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(TscClock::new(tsc_khz)));
+    // Safety: PVH boot established the direct mapping with IRQs off on one CPU.
+    // The heap contains only `ram`, text bounds come from the linker, and no
+    // live resource needs the boot stack after the handoff.
+    unsafe {
+        VmKernel::boot(
+            BootConfig {
+                page_allocator: &heap::KernelPages,
+                clock,
+                ram: &ram,
+                text: to_pa(text_start_address())..to_pa(text_end_address()),
+                ignored_vectors: &machine::SPURIOUS_VECTORS,
+            },
+            kernel_main,
+        )
+    }
+}
+
+fn kernel_main(platform: &'static VmKernel) -> ! {
+    let info = BOOT_INFO.get().expect("boot info captured");
+    // Modules are read through the kernel mapping, which covers only managed RAM.
     for m in &info.modules {
         assert!(
-            platform.ram_frame_ranges().iter().any(|r| {
-                r.start.start_address().as_u64() <= m.start
-                    && m.end <= r.end.start_address().as_u64()
-            }),
+            platform.contains_ram(x86_64::PhysAddr::new(m.start)..x86_64::PhysAddr::new(m.end)),
             "boot module {:#x}..{:#x} lies outside kernel-managed RAM",
             m.start,
             m.end
         );
     }
 
-    per_cpu::allocate_xsave_area();
-    gdt::init();
-    interrupts::init_idt(&machine::SPURIOUS_VECTORS);
-    machine::init_legacy_pics();
-    VmKernel::enable_syscall_support();
-    let tsc_khz = clock::calibrate_tsc_khz_with_pit();
-    litebox_util_log::info!(mhz:% = tsc_khz / 1000; "TSC calibrated against the PIT");
-    clock::init(alloc::boxed::Box::leak(alloc::boxed::Box::new(
-        clock::TscClock::new(tsc_khz),
-    )));
-    enable_smep_smap();
     install_development_platform_root_key();
 
     optee::run(platform, info);

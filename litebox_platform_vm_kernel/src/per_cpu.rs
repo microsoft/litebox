@@ -3,6 +3,7 @@
 
 //! Per-CPU kernel variables, reached through GSBASE.
 
+use crate::AddressSpaceId;
 use crate::arch::{gdt, mm::paging::UnmapOptions};
 use alloc::{
     alloc::{alloc_zeroed, handle_alloc_error},
@@ -32,7 +33,7 @@ pub(crate) struct PerCpuVariables {
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<*mut ()>,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
-    active_page_table: UnsafeCell<Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
+    active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
 }
 
@@ -96,7 +97,7 @@ impl PerCpuVariables {
 
     // Exclusive page-aligned ends satisfy the 16-byte stack alignment.
 
-    fn kernel_stack_top(&self) -> usize {
+    pub(crate) fn kernel_stack_top(&self) -> usize {
         self.stacks.base + KERNEL_STACK_OFFSET + KERNEL_STACK_SIZE
     }
 
@@ -131,7 +132,7 @@ impl PerCpuVariables {
 
     pub(crate) fn active_page_table(
         &self,
-        page_table_id: usize,
+        page_table_id: AddressSpaceId,
     ) -> Option<Arc<crate::mm::PageTable<PAGE_SIZE>>> {
         // Safety: only this core accesses the field.
         unsafe { &*self.active_page_table.get() }
@@ -146,8 +147,8 @@ impl PerCpuVariables {
     /// CR3. Interrupts must be disabled, and this must not run in exception context.
     pub(crate) unsafe fn replace_active_page_table(
         &self,
-        page_table: Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>,
-    ) -> Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)> {
+        page_table: Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>,
+    ) -> Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)> {
         // Safety: Core-local, IRQs are disabled, and the update cannot fault.
         // Return the old owner so the caller can drop it outside that section.
         unsafe { core::mem::replace(&mut *self.active_page_table.get(), page_table) }
@@ -177,8 +178,7 @@ const _: () = assert!(
 /// Assembly ABI: GS-relative offsets must match the `*_offset` accessors.
 #[repr(C)]
 #[derive(Default)]
-pub struct PerCpuVariablesAsm {
-    kernel_stack_ptr: Cell<usize>,
+pub(crate) struct PerCpuVariablesAsm {
     scratch: Cell<usize>,
     /// User-mode RFLAGS captured at `syscall` entry
     user_rflags: Cell<usize>,
@@ -202,9 +202,6 @@ pub struct PerCpuVariablesAsm {
 }
 
 impl PerCpuVariablesAsm {
-    pub(crate) fn set_kernel_stack_ptr(&self, sp: usize) {
-        self.kernel_stack_ptr.set(sp);
-    }
     pub(crate) fn set_kernel_xsave_area_addr(&self, addr: usize) {
         self.kernel_xsave_area_addr.set(addr);
     }
@@ -238,9 +235,6 @@ impl PerCpuVariablesAsm {
             area.add(PerCpuVariables::XSAVE_HEADER_OFFSET)
                 .write_bytes(0, PerCpuVariables::XSAVE_HEADER_SIZE);
         }
-    }
-    pub const fn kernel_stack_ptr_offset() -> usize {
-        offset_of!(PerCpuVariablesAsm, kernel_stack_ptr)
     }
     pub(crate) const fn scratch_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, scratch)
@@ -315,12 +309,11 @@ fn per_cpu_variables_ptr() -> *mut PerCpuVariables {
     gsbase as *mut PerCpuVariables
 }
 
-/// Call once per core after enabling FSGSBASE and seeding the global allocator,
-/// before [`init_per_cpu_variables`].
+/// Call once per core after enabling FSGSBASE and seeding the global allocator.
 ///
 /// # Panics
 /// Panics if the allocation fails.
-pub fn allocate_per_cpu_variables() {
+pub(crate) fn allocate_per_cpu_variables() {
     let pcv = Box::leak(Box::new(PerCpuVariables {
         asm: PerCpuVariablesAsm::default(),
         gdt: Cell::new(None),
@@ -352,13 +345,8 @@ pub(crate) fn unmap_stack_guards(page_table: &crate::mm::PageTable<PAGE_SIZE>) {
 
 /// Allocate the current core's XSAVE areas. Must run after
 /// [`allocate_per_cpu_variables`] and [`crate::arch::enable_extended_states`].
-pub fn allocate_xsave_area() {
+pub(crate) fn allocate_xsave_area() {
     with_per_cpu_variables(|pcv| {
         PerCpuVariables::allocate_xsave_area(&pcv.asm);
     });
-}
-
-/// Call before switching to the per-CPU kernel stack.
-pub fn init_per_cpu_variables() {
-    with_per_cpu_variables(|pcv| pcv.asm.set_kernel_stack_ptr(pcv.kernel_stack_top()));
 }

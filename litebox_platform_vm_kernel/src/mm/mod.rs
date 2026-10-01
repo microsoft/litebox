@@ -10,13 +10,13 @@ pub(crate) mod pgtable;
 #[cfg(test)]
 mod tests;
 
-/// Kernel-supplied page source for [`crate::VmKernel::new`].
+/// Kernel-supplied page source for [`crate::BootConfig`].
 ///
 /// # Safety
 ///
 /// Successful allocations must provide `1 << order` contiguous, page-aligned,
 /// readable/writable pages, exclusively owned until freed. They must lie in
-/// `VmKernel::new`'s RAM and remain accessible at `VA = PA + KERNEL_OFFSET`.
+/// `BootConfig::ram` and remain accessible at `VA = PA + KERNEL_OFFSET`.
 pub unsafe trait PageAllocator: Sync {
     /// Allocate `1 << order` pages, or `None` when out of memory.
     fn allocate_pages(&self, order: u32) -> Option<*mut u8>;
@@ -44,12 +44,12 @@ pub(crate) fn set_page_allocator(allocator: &'static dyn PageAllocator) {
 fn page_allocator() -> &'static dyn PageAllocator {
     *PAGE_ALLOCATOR
         .get()
-        .expect("page allocation before VmKernel::new")
+        .expect("page allocation before VmKernel::boot")
 }
 
 /// Physical memory for page tables and the VA/PA translation of the kernel
 /// mapping (`VA = PA + KERNEL_OFFSET`).
-pub trait MemoryProvider {
+pub(crate) trait MemoryProvider {
     /// Allocate `1 << order` virtually and physically contiguous pages.
     fn mem_allocate_pages(order: u32) -> Option<*mut u8>;
 
