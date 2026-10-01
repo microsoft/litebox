@@ -452,8 +452,10 @@ where
     ) -> Result<(), VmemProtectError> {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len)
-            .ok_or(VmemProtectError::InvalidRange(start..start + len))?;
+        let end = start
+            .checked_add(len)
+            .ok_or(VmemProtectError::InvalidRange(start..usize::MAX))?;
+        let range = PageRange::new(start, end).ok_or(VmemProtectError::InvalidRange(start..end))?;
         unsafe { vmem.protect_mapping(range, new_permissions) }
     }
 

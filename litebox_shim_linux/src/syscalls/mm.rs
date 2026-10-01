@@ -1243,6 +1243,25 @@ mod tests {
     }
 
     #[test]
+    fn test_mprotect_range_overflow() {
+        let task = init_platform(None);
+        for prot in [
+            ProtFlags::PROT_NONE,
+            ProtFlags::PROT_READ,
+            ProtFlags::PROT_READ_WRITE,
+            ProtFlags::PROT_READ_EXEC,
+            ProtFlags::PROT_READ_WRITE_EXEC,
+        ] {
+            for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 1] {
+                assert_eq!(
+                    task.sys_mprotect(UserPtrMut::from_usize(super::PAGE_SIZE), len, prot),
+                    Err(Errno::ENOMEM)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_mmap_length_overflow() {
         let task = init_platform(None);
         for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 2] {
