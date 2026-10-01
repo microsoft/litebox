@@ -313,6 +313,21 @@ pub trait SystemInfoProvider {
     /// execution context and transfer control to the syscall handler.
     fn get_syscall_entry_point(&self) -> usize;
 
+    /// Linux-guest AArch64 island callback, distinct from the direct/AOT entry.
+    ///
+    /// Entry SP points to `{resume_pc, outbound_stub, guest_x16, guest_x30}`.
+    /// The callback must capture logical guest LR and reconstruct both saved
+    /// registers when returning through the island epilogue at guest SP - 16.
+    /// `None` explicitly means this ABI is unavailable; callers must not install
+    /// island SVC gates using the direct callback instead.
+    fn get_aarch64_island_entry_point(&self) -> Option<usize> {
+        None
+    }
+
+    /// Forget current-thread syscall return transport at a committed exec reset.
+    /// Failed exec preparation must not call this hook.
+    fn reset_syscall_return_state(&self) {}
+
     /// Get the address of the VDSO (Virtual Dynamic Shared Object).
     ///
     /// Return `Some(address)` if the VDSO is available on the platform, or `None`

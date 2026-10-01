@@ -2291,9 +2291,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         self.global.elf_patch_cache.lock().clear();
 
-        // TODO: on AArch64, clear the platform's cached outbound stub and PC
-        // here. They address the discarded image, but the core platform API
-        // exposes no address-space-reset hook for transition metadata.
+        // Committed address-space reset only. Failed preparation and the
+        // constrained vfork transfer returned above without reaching this hook.
+        #[cfg(target_arch = "aarch64")]
+        self.global.platform.reset_syscall_return_state();
 
         #[cfg(target_arch = "x86_64")]
         let tls_reg = ArchSpecificRegister::FsBase;

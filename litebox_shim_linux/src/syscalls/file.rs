@@ -1273,6 +1273,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         match consumed {
             AnyTypedFd::Fs(fd) => {
+                // Runtime ELF initialization snapshots metadata from this
+                // descriptor. Do not invalidate its broker handle mid-mmap;
+                // the raw-fd table lock was released before this VM lock.
+                #[cfg(target_arch = "aarch64")]
+                let _update = self.global.elf_mapping_update.lock();
                 let result = self.global.litebox.close_file(&fd).map_err(Errno::from);
                 self.finalize_elf_patch(fd);
                 result

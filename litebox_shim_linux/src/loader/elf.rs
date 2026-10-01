@@ -91,9 +91,23 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::ReadAt for &'_ ElfFil
 impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile<'_, Platform> {
     type Error = Errno;
 
-    // TODO: move AArch64 gate finalization into the common loader, then remove
-    // this architecture-specific trampoline ownership split.
-    const POPULATES_TRAMPOLINE: bool = cfg!(target_arch = "aarch64");
+    // mmap and mprotect share serialized/runtime pair ownership and publication.
+    const SUPPORTS_AARCH64_ISLANDS: bool = cfg!(target_arch = "aarch64");
+
+    #[cfg(target_arch = "aarch64")]
+    fn prepare_aarch64_islands(
+        &mut self,
+        payload: &litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands,
+        base: usize,
+        reserved: bool,
+    ) -> Result<(), Self::Error> {
+        self.task.prepare_serialized_islands(
+            &crate::syscalls::mm::ElfPatchKey(alloc::sync::Arc::clone(&self.file_fd)),
+            payload,
+            base,
+            reserved,
+        )
+    }
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping which should be large enough to fit `len` bytes.
@@ -178,6 +192,29 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
         Ok(())
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn map_elf_load(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &litebox_common_linux::loader::Protection,
+        load_bias: usize,
+    ) -> Result<(), Self::Error> {
+        self.task.mmap_with_source(
+            address,
+            len,
+            prot.flags(),
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            self.fd,
+            crate::syscalls::mm::FileMappingSource {
+                offset: usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?,
+                load_bias: Some(load_bias),
+            },
+        )?;
+        Ok(())
+    }
+
     fn map_zero(
         &mut self,
         address: usize,
@@ -235,28 +272,39 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
             .map_err(ElfLoaderError::ParseError)?;
 
         let syscall_entry_point = task.global.platform.get_syscall_entry_point();
-        #[cfg(target_arch = "aarch64")]
-        let parse_entry_point = {
-            // TODO: split trampoline detection from x86 callback-slot setup in
-            // the common parser. AArch64 has no callback slot to initialize.
-            const AARCH64_UNUSED_ENTRY_POINT: usize = 1;
-            syscall_entry_point.max(AARCH64_UNUSED_ENTRY_POINT)
-        };
-        #[cfg(target_arch = "x86_64")]
-        let parse_entry_point = syscall_entry_point;
-
-        // Try to parse an embedded trampoline. For pre-patched binaries this
-        // succeeds and load_trampoline() will map it. For unpatched binaries
-        // (UnpatchedBinary error), the runtime patching during mmap will patch
-        // code segments as they are mapped.
-        if parse_entry_point != 0 {
-            match parsed.parse_trampoline(&mut &file, parse_entry_point) {
+        // Parse the complete island payload before exec commits the new image.
+        // mmap/mprotect installs its pairs through the same path as runtime code.
+        if syscall_entry_point != 0 || cfg!(target_arch = "aarch64") {
+            match parsed.parse_trampoline_with_islands(
+                &mut &file,
+                syscall_entry_point,
+                cfg!(target_arch = "aarch64")
+                    && task
+                        .global
+                        .platform
+                        .get_aarch64_island_entry_point()
+                        .is_some_and(|p| p != 0),
+            ) {
                 Ok(()) | Err(litebox_common_linux::loader::ElfParseError::UnpatchedBinary) => {
                     // Ok: pre-patched trampoline found, or unpatched binary
                     // that the runtime mmap hook will handle.
                 }
                 Err(e) => return Err(ElfLoaderError::ParseError(e)),
             }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        if let Some(payload) = parsed.aarch64_islands() {
+            payload
+                .check_compatibility(
+                    crate::aarch64_rewrite_options(),
+                    litebox_common_linux::HOST_PAGE_SIZE,
+                )
+                .map_err(|_| {
+                    ElfLoaderError::ParseError(
+                        litebox_common_linux::loader::ElfParseError::UnsupportedIslandAbi,
+                    )
+                })?;
         }
 
         Ok(Self { file, parsed })
@@ -271,7 +319,16 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // When the platform requires syscall rewriting but the binary has no
         // embedded trampoline, reserve space so that brk starts past the
         // runtime trampoline region.
-        let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
+        let reserve = if syscall_entry_point != 0
+            && !self.parsed.has_trampoline()
+            && self
+                .file
+                .task
+                .global
+                .platform
+                .get_aarch64_island_entry_point()
+                .is_none()
+        {
             Some(litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE)
         } else {
             None
@@ -331,8 +388,17 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
 
+        // Explicit main-image provenance protects the brk corridor during
+        // runtime near allocation, without treating every ET_DYN as a main ELF.
+        #[cfg(target_arch = "aarch64")]
+        self.main
+            .file
+            .task
+            .begin_main_elf_load(alloc::sync::Arc::clone(&self.main.file.file_fd));
         // Load the main ELF file first so that it gets privileged addresses.
         let info = self.main.load_mapped(global.platform)?;
+        #[cfg(target_arch = "aarch64")]
+        self.main.file.task.set_main_elf_heap_floor(info.brk);
 
         // Load the interpreter ELF file, if any.
         let interp = if let Some(interp) = &mut self.interp {
@@ -635,12 +701,14 @@ mod tests {
             .expect("the low ELF hint must be available for this test");
         crate::syscalls::tests::create_file(&task, "/pie", &minimal_elf(ET_DYN, None));
         let mut pie = ElfFile::new(&task, "/pie").expect("test PIE should open");
+        let before = task.global.mm.mappings();
         let reserved =
             litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
                 .expect("PIE reservation should retry in the low address space");
         assert!(reserved < addr_max / 2);
-        task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
+        litebox_common_linux::loader::MapMemory::release_reservation(&mut pie, reserved, PAGE_SIZE)
             .expect("failed to release test PIE reservation");
+        assert_eq!(task.global.mm.mappings(), before);
         task.sys_munmap(occupied, PAGE_SIZE)
             .expect("failed to release occupied hint");
 
@@ -656,6 +724,7 @@ mod tests {
             )
             .expect("failed to block the runtime-trampoline region");
         pie.reserve_runtime_trampoline = true;
+        let before = task.global.mm.mappings();
         let reserved =
             litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
                 .expect("PIE reservation should include runtime-trampoline space");
@@ -664,8 +733,9 @@ mod tests {
             reserved, hint,
             "trampoline space must force rejection of the hint"
         );
-        task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
+        litebox_common_linux::loader::MapMemory::release_reservation(&mut pie, reserved, PAGE_SIZE)
             .expect("failed to release trampoline-aware reservation");
+        assert_eq!(task.global.mm.mappings(), before);
         task.sys_munmap(trampoline_blocker, PAGE_SIZE)
             .expect("failed to release trampoline blocker");
 

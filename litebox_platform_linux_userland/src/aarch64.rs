@@ -81,6 +81,7 @@ struct TlsBlock {
     wait_waker_addr: usize,
     outbound_stub: usize,
     outbound_pc: usize,
+    outbound_island: usize,
     resume_frame_initialized: u8,
     host_fp_state: FpState,
     guest_vector_state: GuestVectorState,
@@ -103,6 +104,7 @@ pub(super) mod tls_offset {
     pub(crate) const WAIT_WAKER_ADDR: usize = offset_of!(TlsBlock, wait_waker_addr);
     pub(crate) const OUTBOUND_STUB: usize = offset_of!(TlsBlock, outbound_stub);
     pub(crate) const OUTBOUND_PC: usize = offset_of!(TlsBlock, outbound_pc);
+    pub(crate) const OUTBOUND_ISLAND: usize = offset_of!(TlsBlock, outbound_island);
     pub(crate) const RESUME_FRAME_INITIALIZED: usize =
         offset_of!(TlsBlock, resume_frame_initialized);
     pub(super) const HOST_FP_STATE: usize = offset_of!(TlsBlock, host_fp_state);
@@ -269,6 +271,21 @@ pub(super) fn get_guest_thread_pointer() -> usize {
     value
 }
 
+// The island callback below uses a 32-byte combined SVC/island frame.
+// These are NOT the direct callback's SVC_FRAME_* (or Darwin) offsets.
+const _: () = {
+    use litebox_syscall_rewriter::aarch64::island::{
+        ISLAND_FRAME_BYTES, ISLAND_SVC_FRAME_BYTES, ISLAND_SVC_FRAME_OFF_RETADDR,
+        ISLAND_SVC_FRAME_OFF_STUB, ISLAND_SVC_FRAME_OFF_X16, ISLAND_SVC_FRAME_OFF_X30,
+    };
+    assert!(ISLAND_FRAME_BYTES == 16 && ISLAND_SVC_FRAME_BYTES == 16);
+    assert!(ISLAND_FRAME_BYTES + ISLAND_SVC_FRAME_BYTES == 32);
+    assert!(ISLAND_SVC_FRAME_OFF_RETADDR == 0);
+    assert!(ISLAND_SVC_FRAME_OFF_STUB == 8);
+    assert!(ISLAND_SVC_FRAME_OFF_X16 == 16);
+    assert!(ISLAND_SVC_FRAME_OFF_X30 == 24);
+};
+
 #[unsafe(naked)]
 pub(super) unsafe extern "C-unwind" fn run_thread_arch(
     thread_ctx: &mut ThreadContext,
@@ -357,6 +374,74 @@ pub(super) unsafe extern "C-unwind" fn run_thread_arch(
     //   | sp                       | guest SP minus 32 (gate frame is live) |
     //   | x0-x15, x17-x30, NZCV    | pristine guest values                  |
     //   | TPIDR_EL0                | host anchor                            |
+    .globl island_syscall_callback
+island_syscall_callback:
+    // Clear `in_guest`. This takes four instructions, so a pc can sit inside
+    // the prologue with `in_guest` still 1. `in_island_syscall_callback_prologue`
+    // tests the half-open range up to the label below; keep that label
+    // immediately after the `strb`.
+    ",
+    load_tls_block_base!("x16"),
+    "
+    strb wzr, [x16, #{IN_GUEST}]
+    .globl island_syscall_callback_in_guest_cleared
+island_syscall_callback_in_guest_cleared:
+
+    // Literal `PtRegs` offsets below are pinned by `tests::test_ptregs_layout`.
+    ldr  x16, [x16, #{GUEST_CONTEXT_TOP}]
+    sub  x16, x16, #{GUEST_CONTEXT_SIZE}
+
+    stp  x0,  x1,  [x16]
+    stp  x2,  x3,  [x16, #16]
+    stp  x4,  x5,  [x16, #32]
+    stp  x6,  x7,  [x16, #48]
+    stp  x8,  x9,  [x16, #64]
+    stp  x10, x11, [x16, #80]
+    stp  x12, x13, [x16, #96]
+    stp  x14, x15, [x16, #112]
+
+    // Guest x16 and the resume PC come off the gate frame. The pair load
+    // spells the rewriter's two offsets implicitly, so they are asserted below.
+    ldr  x0, [sp, #16]
+    ldr  x1, [sp]
+    str  x0,  [x16, #128]         // regs[16] = guest x16
+    str  x17, [x16, #136]
+    .if {VIRTUALIZE_X18}
+    ",
+    load_tls_block_base!("x0"),
+    "
+    ldr  x0, [x0, #{GUEST_X18}]
+    str  x0, [x16, #144]
+    .else
+    str  x18, [x16, #144]
+    .endif
+    stp  x19, x20, [x16, #152]
+    stp  x21, x22, [x16, #168]
+    stp  x23, x24, [x16, #184]
+    stp  x25, x26, [x16, #200]
+    stp  x27, x28, [x16, #216]
+    str  x29, [x16, #232]
+    ldr  x0, [sp, #24]
+    str  x0, [x16, #240]
+
+    add  x0,  sp,  #{SVC_FRAME_BYTES}
+    str  x0,  [x16, #248]         // sp: undo the gate's frame, so `PtRegs::sp`
+                                  // is the true guest SP the shim expects
+    str  x1,  [x16, #256]         // pc
+
+    // Publish these before leaving the guest stack: the gate frame lies below
+    // guest SP and need not survive the shim round trip.
+    ldr  x0,  [sp, #8]
+    ",
+    load_tls_block_base!("x17"),
+    "
+    str  x0,  [x17, #{OUTBOUND_STUB}]
+    str  x1,  [x17, #{OUTBOUND_PC}]
+
+    mov x0, #1
+    str x0, [x17, #{OUTBOUND_ISLAND}]
+    b .Lsyscall_context_saved
+
     .globl syscall_callback
 syscall_callback:
     // Clear `in_guest`. This takes four instructions, so a pc can sit inside
@@ -418,6 +503,8 @@ syscall_callback_in_guest_cleared:
     str  x0,  [x17, #{OUTBOUND_STUB}]
     str  x1,  [x17, #{OUTBOUND_PC}]
 
+    str xzr, [x17, #{OUTBOUND_ISLAND}]
+.Lsyscall_context_saved:
     mrs  x0,  nzcv
     str  x0,  [x16, #264]         // pstate
     ldr  x0,  [x16]
@@ -536,6 +623,7 @@ interrupt_callback:
     IN_GUEST = const tls_offset::IN_GUEST,
     OUTBOUND_STUB = const tls_offset::OUTBOUND_STUB,
     OUTBOUND_PC = const tls_offset::OUTBOUND_PC,
+    OUTBOUND_ISLAND = const tls_offset::OUTBOUND_ISLAND,
     GUEST_X18 = const tls_offset::GUEST_X18,
     VIRTUALIZE_X18 = const cfg!(feature = "aarch64_virtualize_x18") as usize,
     SVC_FRAME_BYTES = const litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES,
@@ -1007,9 +1095,10 @@ pub(super) mod resume_frame {
 ///
 /// The generic resume mechanism restores the complete context through
 /// `rt_sigreturn`. As an optimization, a resume at the most recent rewritten
-/// syscall site uses its recorded outbound stub while that stub's guest-stack
-/// frame remains usable. A fault while staging that frame returns to the
-/// generic mechanism.
+/// direct/AOT syscall site uses its recorded outbound stub while that stub's
+/// guest-stack frame remains usable. Runtime islands always use generic restore:
+/// their transport can be retired by this or another thread during a callback,
+/// and there is no lifetime pin covering outstanding callback returns.
 pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     #[cfg(feature = "aarch64_virtualize_x18")]
     set_guest_x18(ctx.regs[18]);
@@ -1023,9 +1112,29 @@ pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRe
     }
 }
 
+/// Current-thread only; no other thread's saved callback context is touched.
+pub(super) fn reset_syscall_return_state() {
+    // SAFETY: these are permanent own-thread TLS fields; this hook runs on the
+    // host side of the committed exec boundary, not during a guest transition.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            "str xzr, [{block}, #{stub}]",
+            "str xzr, [{block}, #{pc}]",
+            "str xzr, [{block}, #{kind}]",
+            block = out(reg) _,
+            stub = const tls_offset::OUTBOUND_STUB,
+            pc = const tls_offset::OUTBOUND_PC,
+            kind = const tls_offset::OUTBOUND_ISLAND,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
 pub(super) fn outbound_stub_is_current(ctx: &litebox_common_linux::PtRegs) -> bool {
     let stub: usize;
     let pc: usize;
+    let island: usize;
     // SAFETY: own-thread [`tls_offset`] slot accesses. Read through `asm!`
     // rather than plain loads because the transition assembly writes these
     // slots behind the compiler's back.
@@ -1034,24 +1143,29 @@ pub(super) fn outbound_stub_is_current(ctx: &litebox_common_linux::PtRegs) -> bo
             load_tls_block_base!("{block}"),
             "ldr {stub}, [{block}, #{stub_off}]",
             "ldr {pc}, [{block}, #{pc_off}]",
+            "ldr {island}, [{block}, #{island_off}]",
             block = out(reg) _,
             stub = out(reg) stub,
             pc = out(reg) pc,
+            island = out(reg) island,
             stub_off = const tls_offset::OUTBOUND_STUB,
             pc_off = const tls_offset::OUTBOUND_PC,
+            island_off = const tls_offset::OUTBOUND_ISLAND,
             options(nostack, preserves_flags, readonly)
         );
     }
-    stub != 0 && pc == ctx.pc
+    // This is a callback-kind check, not a racy transport-validity check.
+    // Even a live island may be freed immediately after we inspect it.
+    island == 0 && stub != 0 && pc == ctx.pc
 }
 
 /// Re-enters the guest through the rewriter's per-site outbound stub, for a
 /// resume at the `SVC` site the guest left from.
 ///
 /// # Safety
-/// As [`switch_to_guest`], and additionally: a stub must be recorded in
-/// [`tls_offset::OUTBOUND_STUB`] and `ctx.pc` must be the PC it branches to.
-/// [`outbound_stub_is_current`] is the check.
+/// As [`switch_to_guest`], and additionally: a direct/AOT stub must be recorded
+/// in [`tls_offset::OUTBOUND_STUB`] and `ctx.pc` must be the PC it branches to.
+/// [`outbound_stub_is_current`] checks both the callback kind and the saved PC.
 ///
 /// Stages `PtRegs::regs[16]` in the stub frame before restoring guest state.
 /// If that guest-stack access faults (for example, because the stack was
@@ -1104,7 +1218,8 @@ switch_to_guest_via_outbound_stub_start:
     b    interrupt_callback
 3:
 
-    // Stage x16 while host SP and FP/SIMD state are intact.
+    // Direct callback only: island callbacks always use generic restore,
+    // because their transport may have retired during the syscall.
     ldr  x4, [x0, #248]
     sub  x4, x4, #{SVC_FRAME_BYTES}
     ldr  x5, [x0, #128]
@@ -1116,8 +1231,6 @@ switch_to_guest_stage_x16_end:
     b    4f
 .globl switch_to_guest_stage_x16_fixup
 switch_to_guest_stage_x16_fixup:
-    // Leave the syscall-specific fast path and use generic context restore;
-    // selecting the stub again would retry this store.
     strb wzr, [x17, #{IN_GUEST}]
     b    {resume_via_sigreturn}
 4:
@@ -1157,7 +1270,7 @@ switch_to_guest_stage_x16_fixup:
     // SP starts below the frame because the stub pops it before returning.
     ldr  x16, [x17, #{OUTBOUND_STUB}]
     ldr  x4,  [x0,  #248]
-    sub  x4,  x4,  #{SVC_FRAME_BYTES}
+    sub  x4, x4, #{SVC_FRAME_BYTES}
     mov  sp,  x4
 
     // `msr nzcv` writes only PSTATE 31:28. SSBS and DIT are carried in
@@ -1748,6 +1861,25 @@ mod tests {
         fn drop(&mut self) {
             set_live_fp_state(self.0);
         }
+    }
+
+    #[test]
+    fn outbound_transition_size_and_exception_store_range() {
+        unsafe extern "C" {
+            fn switch_to_guest_stage_x16();
+            fn switch_to_guest_stage_x16_end();
+        }
+        let size = super::super::switch_to_guest_via_outbound_stub_end as *const () as usize
+            - super::super::switch_to_guest_via_outbound_stub_start as *const () as usize;
+        assert_eq!(
+            size,
+            (66 - usize::from(cfg!(feature = "aarch64_virtualize_x18"))) * 4
+        );
+        assert_eq!(
+            switch_to_guest_stage_x16_end as *const () as usize
+                - switch_to_guest_stage_x16 as *const () as usize,
+            4
+        );
     }
 
     #[test]
@@ -3522,6 +3654,30 @@ mod tests {
             !is_guest_thread(),
             "the marker must be restored when the guest frame unwinds"
         );
+    }
+
+    #[test]
+    fn committed_exec_reset_prevents_outbound_pc_reuse() {
+        let block = tls_block_base();
+        for island in [0, 1] {
+            // SAFETY: this test owns its thread's TLS slots, with no guest running.
+            unsafe {
+                ((block + tls_offset::OUTBOUND_STUB) as *mut usize).write_volatile(0x123400);
+                ((block + tls_offset::OUTBOUND_PC) as *mut usize).write_volatile(0x567800);
+                ((block + tls_offset::OUTBOUND_ISLAND) as *mut usize).write_volatile(island);
+            }
+            let regs = PtRegs {
+                pc: 0x567800,
+                ..PtRegs::default()
+            };
+            // Even an exact PC match cannot enable the unpinned island path.
+            assert_eq!(super::outbound_stub_is_current(&regs), island == 0);
+            super::reset_syscall_return_state();
+            // New image reuses the same PC, but no transport from the old image.
+            assert!(!super::outbound_stub_is_current(&regs));
+            assert_eq!(read_tls_slot!(usize, tls_offset::OUTBOUND_PC), 0);
+            assert_eq!(read_tls_slot!(usize, tls_offset::OUTBOUND_ISLAND), 0);
+        }
     }
 
     /// The staging-store fixup enables fallback to generic context restore.

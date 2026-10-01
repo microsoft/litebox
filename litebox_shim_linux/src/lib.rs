@@ -390,6 +390,10 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
+            #[cfg(target_arch = "aarch64")]
+            elf_mapping_update: litebox::sync::Mutex::new(()),
+            #[cfg(target_arch = "aarch64")]
+            elf_heap_placement: litebox::sync::Mutex::new(syscalls::mm::ElfHeapPlacement::default()),
         });
         LinuxShim(global)
     }
@@ -1362,6 +1366,10 @@ struct GlobalState<Platform: ShimPlatform> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    #[cfg(target_arch = "aarch64")]
+    elf_mapping_update: litebox::sync::Mutex<Platform, ()>,
+    #[cfg(target_arch = "aarch64")]
+    elf_heap_placement: litebox::sync::Mutex<Platform, syscalls::mm::ElfHeapPlacement>,
 }
 
 struct Task<Platform: ShimPlatform> {

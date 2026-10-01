@@ -1420,6 +1420,7 @@ struct TlsBlock {
     pending_host_signals: AtomicU32,
     wait_waker_addr: AtomicPtr<core::task::Waker>,
     page_recovery_lock: usize,
+    reset_syscall_return: usize,
 }
 
 mod tls_offset {
@@ -1435,6 +1436,7 @@ mod tls_offset {
     pub const PENDING_HOST_SIGNALS: usize = core::mem::offset_of!(TlsBlock, pending_host_signals);
     pub const WAIT_WAKER_ADDR: usize = core::mem::offset_of!(TlsBlock, wait_waker_addr);
     pub const PAGE_RECOVERY_LOCK: usize = core::mem::offset_of!(TlsBlock, page_recovery_lock);
+    pub const RESET_SYSCALL_RETURN: usize = core::mem::offset_of!(TlsBlock, reset_syscall_return);
 }
 
 // The macOS rewriter gates encode these offsets directly after loading the
@@ -1601,6 +1603,7 @@ fn initialize_thread_tls() {
         pending_host_signals: AtomicU32::new(0),
         wait_waker_addr: AtomicPtr::new(core::ptr::null_mut()),
         page_recovery_lock: 0,
+        reset_syscall_return: 0,
     });
     let block = Box::into_raw(block);
     // SAFETY: block matches the key destructor's contract.
@@ -1714,6 +1717,7 @@ struct ThreadContext<'a> {
     outbound_x16: usize,
     outbound_pc: usize,
     outbound_stub: usize,
+    outbound_island: usize,
     interrupted: *const AtomicBool,
     thread: ThreadHandle,
     exit: GuestExit,
@@ -1976,6 +1980,18 @@ impl<const PAGE_SIZE: usize> litebox::platform::SystemInfoProvider
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
     }
+
+    fn reset_syscall_return_state(&self) {
+        if read_tls(tls_offset::ACTIVE) != 0 {
+            // call_shim still borrows ThreadContext and ctx exclusively. Request
+            // the reset in the separate TLS allocation; never reborrow ACTIVE.
+            write_tls(tls_offset::RESET_SYSCALL_RETURN, 1);
+        }
+    }
+
+    fn get_aarch64_island_entry_point(&self) -> Option<usize> {
+        Some(litebox_macos_island_syscall_callback as *const () as usize)
+    }
     fn guest_thread_pointer_offset(&self) -> Option<usize> {
         Some(guest_thread_pointer_tp_offset())
     }
@@ -1996,15 +2012,31 @@ const _: () = assert!(
         && MACOS_SVC_FRAME_OFF_SCRATCH + 8 == SVC_FRAME_BYTES
 );
 
-// SVC gate callback: the macOS signal frame captures the full register state at this PC.
+// The island callback below uses a 32-byte combined SVC/island frame.
+// These are NOT the direct callback's SVC_FRAME_* (or Darwin) offsets.
+const _: () = {
+    use litebox_syscall_rewriter::aarch64::island::{
+        ISLAND_FRAME_BYTES, ISLAND_SVC_FRAME_BYTES, ISLAND_SVC_FRAME_OFF_RETADDR,
+        ISLAND_SVC_FRAME_OFF_STUB, ISLAND_SVC_FRAME_OFF_X16, ISLAND_SVC_FRAME_OFF_X30,
+    };
+    assert!(ISLAND_FRAME_BYTES == 16 && ISLAND_SVC_FRAME_BYTES == 16);
+    assert!(ISLAND_FRAME_BYTES + ISLAND_SVC_FRAME_BYTES == 32);
+    assert!(ISLAND_SVC_FRAME_OFF_RETADDR == 0);
+    assert!(ISLAND_SVC_FRAME_OFF_STUB == 8);
+    assert!(ISLAND_SVC_FRAME_OFF_X16 == 16);
+    assert!(ISLAND_SVC_FRAME_OFF_X30 == 24);
+};
+
 unsafe extern "C" {
     fn litebox_macos_syscall_callback_in_guest_cleared();
+    fn litebox_macos_island_syscall_callback();
     fn switch_to_guest_via_sigreturn_start();
     fn switch_to_guest_via_sigreturn_end();
     fn switch_to_guest_via_outbound_stub_start();
     fn switch_to_guest_via_outbound_stub_end();
 }
 
+// SVC gate callback: the macOS signal frame captures the full register state at this PC.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_callback() {
     core::arch::naked_asm!(
@@ -2030,8 +2062,46 @@ unsafe extern "C" fn syscall_callback() {
         ".cfi_offset d13, -24",
         ".cfi_offset d14, -16",
         ".cfi_offset d15, -8",
+        // Separate Linux-island entry. Normalize its 32-byte callback frame
+        // to the direct capture layout using only transport x16/x30. Logical
+        // LR is loaded before its spill becomes the x17 scratch word.
+        "b 2f",
+        ".globl _litebox_macos_island_syscall_callback",
+        ".alt_entry _litebox_macos_island_syscall_callback",
+        "_litebox_macos_island_syscall_callback:",
+        "ldr x30, [sp, #24]",
+        "ldr x16, [sp, #16]",
+        "str x16, [sp, #24]",
+        "ldr x16, [sp, #8]",
+        "str x16, [sp, #16]",
+        "ldr x16, [sp]",
+        "str x16, [sp, #8]",
+        "ldr x16, [sp, #24]",
+        "str x16, [sp]",
+        "str x17, [sp, #{frame_scratch}]",
+        "mrs x16, tpidrro_el0",
+        "and x16, x16, #0xfffffffffffffff8",
+        "adrp x17, {tls_key_offset}@PAGE",
+        "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
+        "add x16, x16, x17",
+        "ldr x16, [x16]",
+        "ldr x17, [x16, #{active}]",
+        // x16 is transport scratch; reload the TLS root at the common entry.
+        "mov x16, #1",
+        "str x16, [x17, #{thread_outbound_island}]",
+        "b 3f",
+        "2:",
         // Preserve guest x17 in the unused SVC-frame word before using it as scratch.
         "str x17, [sp, #{frame_scratch}]",
+        "mrs x16, tpidrro_el0",
+        "and x16, x16, #0xfffffffffffffff8",
+        "adrp x17, {tls_key_offset}@PAGE",
+        "ldr x17, [x17, {tls_key_offset}@PAGEOFF]",
+        "add x16, x16, x17",
+        "ldr x16, [x16]",
+        "ldr x17, [x16, #{active}]",
+        "str xzr, [x17, #{thread_outbound_island}]",
+        "3:",
         "mrs x16, tpidrro_el0",
         "and x16, x16, #0xfffffffffffffff8",
         "adrp x17, {tls_key_offset}@PAGE",
@@ -2159,6 +2229,7 @@ unsafe extern "C" fn syscall_callback() {
         thread_outbound_x16 = const core::mem::offset_of!(ThreadContext, outbound_x16),
         thread_outbound_pc = const core::mem::offset_of!(ThreadContext, outbound_pc),
         thread_outbound_stub = const core::mem::offset_of!(ThreadContext, outbound_stub),
+        thread_outbound_island = const core::mem::offset_of!(ThreadContext, outbound_island),
         regs_sp = const core::mem::offset_of!(PtRegs, sp),
         regs_pc = const core::mem::offset_of!(PtRegs, pc),
         regs_pstate = const core::mem::offset_of!(PtRegs, pstate),
@@ -2340,6 +2411,7 @@ fn run_thread_inner_with_process(
     .expect("initialized thread TLS");
     set_guest_thread_pointer(0);
     set_guest_x18(0);
+    write_tls(tls_offset::RESET_SYSCALL_RETURN, 0);
     let thread = ThreadHandle(Arc::new(ThreadState {
         // Unregistered before thread exit.
         identity: Mutex::new(Some(current_host_thread_port())),
@@ -2356,6 +2428,7 @@ fn run_thread_inner_with_process(
         outbound_x16: 0,
         outbound_pc: 0,
         outbound_stub: 0,
+        outbound_island: 0,
         interrupted: &raw const thread.0.interrupted,
         thread,
         exit: GuestExit::Interrupt,
@@ -2408,7 +2481,12 @@ fn run_thread_inner_with_process(
 }
 
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    let alt_stack_size = (libc::SIGSTKSZ * 2).next_multiple_of(HOST_PAGE_SIZE);
+    // Linux activation measured >32KiB in the shared debug island recognizer.
+    // Use the same guarded minimum for this shared chain; native XNU execution
+    // still needs validation (including its own kernel vector signal frame).
+    let alt_stack_size = (libc::SIGSTKSZ * 2)
+        .max(128 * 1024)
+        .next_multiple_of(HOST_PAGE_SIZE);
     let mapping_size = HOST_PAGE_SIZE + alt_stack_size;
     // SAFETY: allocate fresh anonymous memory without replacing any existing mapping.
     let stack_base = unsafe {
@@ -2461,15 +2539,30 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
 }
 
 impl ThreadContext<'_> {
+    fn apply_syscall_return_reset(&mut self) {
+        // The callback's shim/ctx reborrows have ended. No reference to this
+        // separate TLS word escapes read_tls/write_tls, including across exec.
+        if read_tls(tls_offset::RESET_SYSCALL_RETURN) != 0 {
+            write_tls(tls_offset::RESET_SYSCALL_RETURN, 0);
+            self.outbound_stub = 0;
+            self.outbound_pc = 0;
+            self.outbound_island = 0;
+            self.outbound_x16 = 0;
+            self.svc_frame = 0;
+        }
+    }
+
     fn call_shim(
         &mut self,
         f: impl FnOnce(&dyn EnterShim<ExecutionContext = PtRegs>, &mut PtRegs) -> ContinueOperation,
     ) {
         let mut operation = f(self.shim, self.ctx);
+        self.apply_syscall_return_reset();
         if operation == ContinueOperation::Resume
             && self.thread.0.interrupted.swap(false, Ordering::AcqRel)
         {
             operation = self.shim.interrupt(self.ctx);
+            self.apply_syscall_return_reset();
         }
         if operation == ContinueOperation::Resume {
             // SAFETY: the shim prepared the guest context; no owned guards cross the switch.
@@ -2479,11 +2572,16 @@ impl ThreadContext<'_> {
 }
 
 unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
-    if thread_ctx.outbound_stub != 0
+    // Runtime transport has no lifetime pin across outstanding callbacks.
+    // Another thread (or this syscall) can retire it, so always restore island
+    // contexts generically; testing whether the saved stub is live would race.
+    if thread_ctx.outbound_island == 0
+        && thread_ctx.outbound_stub != 0
         && thread_ctx.ctx.sp == thread_ctx.svc_frame + thread_ctx.guest_abi as usize
         && thread_ctx.ctx.pc == thread_ctx.outbound_pc
         && thread_ctx.ctx.regs[16] == thread_ctx.outbound_x16
     {
+        let frame_address = thread_ctx.svc_frame;
         let frame = [
             thread_ctx.outbound_x16,
             thread_ctx.outbound_pc,
@@ -2495,7 +2593,7 @@ unsafe fn switch_to_guest(thread_ctx: &mut ThreadContext) -> ! {
         // exception-table handler and return failure instead of escaping to XNU.
         let frame_staged = unsafe {
             litebox::mm::exception_table::memcpy_fallible(
-                thread_ctx.svc_frame as *mut u8,
+                frame_address as *mut u8,
                 frame.as_ptr().cast(),
                 core::mem::size_of_val(&frame),
             )
@@ -2925,18 +3023,25 @@ unsafe extern "C" fn exception_signal_handler(
     // SAFETY: ACTIVE remains live while run_thread_arch is suspended; nested shim access is disabled.
     let thread_ctx = unsafe { &mut *ptr };
 
-    copy_signal_context(thread_ctx.ctx, mc);
+    let mut signal_ctx = PtRegs::default();
+    copy_signal_context(&mut signal_ctx, mc);
     let runtime = GateRuntimeState {
         guest_thread_pointer_addr: tls_address(tls_offset::GUEST_THREAD_POINTER) as usize,
-        // Signal exits have an authoritative XNU context and do not
-        // originate from the direct outbound-stub resume path.
-        expected_outbound_stub: 0,
-        expected_outbound_pc: 0,
+        expected_outbound_stub: if thread_ctx.outbound_island != 0 {
+            thread_ctx.outbound_stub
+        } else {
+            0
+        },
+        expected_outbound_pc: if thread_ctx.outbound_island != 0 {
+            thread_ctx.outbound_pc
+        } else {
+            0
+        },
     };
     let interruption = gate_interruption(signal, code, esr);
     let recovery = match thread_ctx.guest_abi {
         GuestAbi::Linux => canonicalize(
-            thread_ctx.ctx,
+            &signal_ctx,
             runtime,
             interruption,
             litebox_syscall_rewriter::TargetHost::MacOs,
@@ -2944,14 +3049,14 @@ unsafe extern "C" fn exception_signal_handler(
             read_guest,
         ),
         GuestAbi::Darwin => litebox_common_linux::gate_recovery::canonicalize_darwin(
-            thread_ctx.ctx,
+            &signal_ctx,
             runtime,
             interruption,
             read_guest,
         ),
     };
     match recovery {
-        Aarch64GateSignalResult::NotGate => {}
+        Aarch64GateSignalResult::NotGate => *thread_ctx.ctx = signal_ctx,
         Aarch64GateSignalResult::Canonicalized(ctx) => *thread_ctx.ctx = ctx,
         Aarch64GateSignalResult::ResumeGuest(ctx) => {
             *thread_ctx.ctx = ctx;
@@ -2961,11 +3066,8 @@ unsafe extern "C" fn exception_signal_handler(
         Aarch64GateSignalResult::InvalidRuntimeState => {
             fatal_signal(b"invalid AArch64 gate runtime state", pc)
         }
-        // With both expected outbound values zero, canonicalize cannot
-        // classify a macOS signal context as an interrupted outbound stub.
-        Aarch64GateSignalResult::PreserveSavedContext => {
-            fatal_signal(b"unreachable macOS outbound-stub recovery", pc)
-        }
+        // Outbound transport has not changed the authoritative callback result.
+        Aarch64GateSignalResult::PreserveSavedContext => {}
     }
     thread_ctx.exit = if signal == interrupt_signal() || forwarded_signal.is_some() {
         GuestExit::Interrupt
@@ -3710,6 +3812,26 @@ mod tests {
     }
 
     #[test]
+    fn syscall_return_reset_is_deferred_until_callback_borrows_end() {
+        let platform = MacosUserland::new();
+        for committed in [false, true] {
+            run_process_test_thread(Arc::new(ProcessState::default()), || {
+                assert_ne!(read_tls(tls_offset::ACTIVE), 0);
+                assert_eq!(read_tls(tls_offset::RESET_SYSCALL_RETURN), 0);
+                if committed {
+                    platform.reset_syscall_return_state();
+                    assert_eq!(read_tls(tls_offset::RESET_SYSCALL_RETURN), 1);
+                }
+            });
+            assert_eq!(read_tls(tls_offset::RESET_SYSCALL_RETURN), 0);
+            assert_eq!(read_tls(tls_offset::ACTIVE), 0);
+        }
+        // Outside a guest callback there is no old return path to reset.
+        platform.reset_syscall_return_state();
+        assert_eq!(read_tls(tls_offset::RESET_SYSCALL_RETURN), 0);
+    }
+
+    #[test]
     fn timer_notification_survives_targets_exiting_during_delivery() {
         use litebox_common_linux::signal::Signal;
         use std::sync::mpsc;
@@ -4157,7 +4279,10 @@ mod tests {
             ..switch_to_guest_via_sigreturn_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert_eq!(syscall_prologue.len(), 72 * size_of::<u32>());
+        assert!(
+            syscall_prologue
+                .contains(&(litebox_macos_island_syscall_callback as *const () as usize))
+        );
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
         assert_eq!(outbound.len(), 52 * size_of::<u32>());
     }

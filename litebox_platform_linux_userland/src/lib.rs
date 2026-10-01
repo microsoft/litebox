@@ -1523,6 +1523,10 @@ unsafe extern "C" {
     fn syscall_callback() -> isize;
     #[cfg(target_arch = "aarch64")]
     fn syscall_callback_in_guest_cleared();
+    #[cfg(target_arch = "aarch64")]
+    fn island_syscall_callback();
+    #[cfg(target_arch = "aarch64")]
+    fn island_syscall_callback_in_guest_cleared();
     fn exception_callback();
     fn interrupt_callback();
     #[cfg(target_arch = "x86_64")]
@@ -1597,6 +1601,9 @@ fn in_syscall_callback_prologue(ip: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         (start..syscall_callback_in_guest_cleared as *const () as usize).contains(&ip)
+            || (island_syscall_callback as *const () as usize
+                ..island_syscall_callback_in_guest_cleared as *const () as usize)
+                .contains(&ip)
     }
 }
 
@@ -1713,6 +1720,16 @@ impl ThreadContext<'_> {
 }
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
+    #[cfg(target_arch = "aarch64")]
+    fn reset_syscall_return_state(&self) {
+        aarch64::reset_syscall_return_state();
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn get_aarch64_island_entry_point(&self) -> Option<usize> {
+        Some(island_syscall_callback as *const () as usize)
+    }
+
     fn get_syscall_entry_point(&self) -> usize {
         syscall_callback as *const () as usize
     }
@@ -1860,6 +1877,19 @@ fn register_exception_handlers() {
 /// Runs `f` with an alternate signal stack set up.
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     let alt_stack_size = libc::SIGSTKSZ * 2;
+    // The bounded island recognizer's unoptimized call chain exhausted the
+    // old 32KiB stack in real runners. Also leave room for a bounded nested
+    // fallible-read fault; keep the guard and the kernel vector-frame minimum.
+    #[cfg(target_arch = "aarch64")]
+    let alt_stack_size = alt_stack_size
+        .max(128 * 1024)
+        .max(
+            // SAFETY: getauxval reads the process's immutable kernel aux vector.
+            usize::try_from(unsafe { libc::getauxval(libc::AT_MINSIGSTKSZ) })
+                .expect("64-bit aux vector")
+                .saturating_mul(2),
+        )
+        .next_multiple_of(0x1000);
     let guard_page_size = 0x1000;
     let stack_base = unsafe {
         libc::mmap(
