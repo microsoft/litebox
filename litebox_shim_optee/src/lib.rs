@@ -44,12 +44,16 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 pub(crate) const TA_DIGEST_LEN: usize = 32;
 pub(crate) type TaDigest = [u8; TA_DIGEST_LEN];
 
+pub use litebox_common_linux::vmem::ShimReservations;
+
 /// Platform capabilities required by the OP-TEE shim.
 pub trait OpteeShimPlatform:
     litebox::platform::RawPointerProvider
     + litebox::platform::TimeProvider
-    + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-    + litebox_common_linux::vmem::VmemPageFaultHandler
+    + litebox::platform::PageManagementProvider<
+        { PAGE_SIZE },
+        Reservations = ShimReservations<Self::Reservation>,
+    > + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
@@ -59,13 +63,18 @@ pub trait OpteeShimPlatform:
     + litebox_common_linux::vmap::VmapManager<{ PAGE_SIZE }>
     + 'static
 {
+    /// Opaque page-reservation ownership type supplied by the platform.
+    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
 }
 
-impl<T> OpteeShimPlatform for T where
+impl<T, Reservation> OpteeShimPlatform for T
+where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
-        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
-        + litebox_common_linux::vmem::VmemPageFaultHandler
+        + litebox::platform::PageManagementProvider<
+            { PAGE_SIZE },
+            Reservations = ShimReservations<Reservation>,
+        > + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider
@@ -73,8 +82,10 @@ impl<T> OpteeShimPlatform for T where
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::DerivedKeyProvider
         + litebox_common_linux::vmap::VmapManager<{ PAGE_SIZE }>
-        + 'static
+        + 'static,
+    Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
 {
+    type Reservation = Reservation;
 }
 
 // OP-TEE-specific memory manager.

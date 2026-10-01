@@ -1533,6 +1533,7 @@ dependencies = [
  "elf",
  "int-enum",
  "litebox",
+ "litebox_util_log",
  "rangemap",
  "spin 0.9.8",
  "syscalls",

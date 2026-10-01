@@ -5,22 +5,72 @@
 
 use alloc::vec::Vec;
 
-use crate::platform::{RawConstPointer as _, RawMutPointer as _};
-
 use super::RawPointerProvider;
 use core::ops::Range;
 use thiserror::Error;
 
 /// Exclusive ownership of a reserved virtual-address extent.
-pub trait PageReservation {
+pub trait PageReservation: Into<Range<usize>> {
     /// Return the owned address range.
     fn range(&self) -> Range<usize>;
+}
+
+/// Direction used to search for available virtual address space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationDirection {
+    /// Search from low addresses toward high addresses.
+    BottomUp,
+    /// Search from high addresses toward low addresses.
+    TopDown,
+}
+
+/// Placement behavior supported for hint allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HintPlacementBehavior {
+    /// The platform may relocate a hint without guaranteeing a search direction.
+    Unspecified,
+    /// The platform always uses the suggested address, so search direction is irrelevant.
+    Exact,
+    /// The platform can relocate a hint in one direction.
+    Directional(AllocationDirection),
+    /// The platform can relocate a hint in either direction.
+    Bidirectional,
+}
+
+impl HintPlacementBehavior {
+    /// Return whether this behavior preserves the requested placement direction.
+    pub const fn supports(self, direction: AllocationDirection) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Exact | Self::Bidirectional => true,
+            Self::Directional(supported) => matches!(
+                (supported, direction),
+                (AllocationDirection::BottomUp, AllocationDirection::BottomUp)
+                    | (AllocationDirection::TopDown, AllocationDirection::TopDown)
+            ),
+        }
+    }
 }
 
 /// Storage for reservations indexed by their starting address.
 pub trait ReservationStore {
     /// Reservation value retained by the store.
-    type Reservation: PageReservation;
+    type Reservation: PageReservation + Into<Self::ReleaseTarget>;
+    /// Ownership representation consumed when this store releases pages.
+    type ReleaseTarget;
+
+    /// Release every extent represented by this store.
+    ///
+    /// # Safety
+    ///
+    /// Every represented extent must belong to `platform` and have no remaining users.
+    unsafe fn release_all<Platform, const ALIGN: usize, V>(
+        &mut self,
+        vmas: &rangemap::RangeMap<usize, V>,
+        platform: &Platform,
+    ) -> Result<(), DeallocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>;
 
     /// Insert a reservation at `base`.
     fn insert(&mut self, base: usize, reservation: Self::Reservation) -> Option<Self::Reservation>;
@@ -37,6 +87,10 @@ pub trait ReservationStore {
     /// Remove and return every reservation overlapping `range` in ascending address order.
     fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Self::Reservation>;
 }
+
+/// Native release ownership selected by a page-management provider.
+pub type ReleaseTargetOf<Platform, const ALIGN: usize> =
+    <<Platform as PageManagementProvider<ALIGN>>::Reservations as ReservationStore>::ReleaseTarget;
 
 bitflags::bitflags! {
     /// Permissions for a memory region
@@ -59,6 +113,9 @@ bitflags::bitflags! {
 /// `ALIGN` as a parameter. In the future, this may be changed to an associated constant, since each
 /// platform has only one canonical alignment.
 pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
+    /// Reservation storage used by the virtual memory manager.
+    type Reservations: ReservationStore + Default;
+
     /// The lower bound (inclusive) for virtual addresses that can be allocated for task memory.
     ///
     /// Note it must be aligned to `ALIGN`.
@@ -67,6 +124,14 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// Note it must be aligned to `ALIGN`.
     const TASK_ADDR_MAX: usize;
+
+    /// Alignment of native reservation base addresses, in bytes.
+    ///
+    /// This must be a nonzero power of two and a multiple of `ALIGN`.
+    const RESERVATION_ALIGNMENT: usize = ALIGN;
+
+    /// Placement behavior supported by [`FixedAddressBehavior::Hint`].
+    const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
 
     /// Allocates new memory pages at the specified `suggested_range` with the given `initial_permissions`.
     ///
@@ -96,12 +161,15 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
         fixed_address_behavior: FixedAddressBehavior,
     ) -> Result<Self::RawMutPointer<u8>, AllocationError>;
 
-    /// De-allocated all pages in the given `range`.
+    /// Release all pages represented by `target`.
     ///
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
-    unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError>;
+    unsafe fn release_pages(
+        &self,
+        target: ReleaseTargetOf<Self, ALIGN>,
+    ) -> Result<(), DeallocationError>;
 
     /// Remap pages from `old_range` to `new_range`.
     ///
@@ -117,73 +185,14 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// The `new_range` must be larger than `old_range`, and must not overlap with `old_range`.
     ///
     /// Both ranges must be aligned to `ALIGN`.
+    #[expect(unused_variables, reason = "default body")]
     unsafe fn remap_pages(
         &self,
         old_range: Range<usize>,
         new_range: Range<usize>,
         permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, RemapError> {
-        debug_assert!(old_range.start.is_multiple_of(ALIGN));
-        debug_assert!(new_range.start.is_multiple_of(ALIGN));
-        debug_assert!(old_range.len().is_multiple_of(ALIGN));
-        debug_assert!(new_range.len().is_multiple_of(ALIGN));
-        debug_assert!(new_range.len() > old_range.len());
-        debug_assert!(old_range.start.max(new_range.start) >= old_range.end.min(new_range.end));
-        // Default implementation: allocate new pages, copy data, deallocate old pages
-        let temp_permissions = permissions | MemoryRegionPermissions::WRITE;
-        let new_ptr = self
-            .allocate_pages(
-                new_range.clone(),
-                temp_permissions,
-                false,
-                true,
-                FixedAddressBehavior::NoReplace,
-            )
-            .map_err(|e| match e {
-                AllocationError::OutOfMemory => RemapError::OutOfMemory,
-                AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform => {
-                    RemapError::AlreadyAllocated
-                }
-                AllocationError::Unaligned
-                | AllocationError::BelowMinAddress
-                | AllocationError::AboveMaxAddress
-                | AllocationError::AddressPartiallyInUse => unreachable!(),
-            })?;
-
-        // Copy memory from old range to new range
-        if !permissions.contains(MemoryRegionPermissions::READ) {
-            (unsafe {
-                self.update_permissions(
-                    old_range.clone(),
-                    permissions | MemoryRegionPermissions::READ,
-                )
-            })
-            .expect("failed to update permissions on old range for copying");
-        }
-        // Copy in chunks of ALIGN bytes to handle very large memory regions
-        let total_len = old_range.len();
-        let mut offset = 0;
-        while offset < total_len {
-            let chunk_len = (total_len - offset).min(ALIGN);
-            let old_ptr =
-                <Self as RawPointerProvider>::RawConstPointer::from_usize(old_range.start + offset);
-            new_ptr
-                .write_slice_at_offset(
-                    isize::try_from(offset).unwrap(),
-                    &old_ptr.to_owned_slice(chunk_len).unwrap(),
-                )
-                .unwrap();
-            offset += ALIGN;
-        }
-
-        if temp_permissions != permissions {
-            (unsafe { self.update_permissions(new_range.clone(), permissions) })
-                .expect("failed to restore permissions on new range");
-        }
-
-        (unsafe { self.deallocate_pages(old_range) }).expect("failed to deallocate old range");
-
-        Ok(new_ptr)
+        Err(RemapError::UnsupportedByPlatform)
     }
 
     /// Update the permissions on pages in `range` to `new_permissions`.
@@ -227,8 +236,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FixedAddressBehavior {
     /// The address is just a hint, and the platform may choose a different
-    /// address if the hint is not available.
-    Hint,
+    /// address in the specified direction if the hint is not available.
+    Hint(AllocationDirection),
     /// Allocate the pages at the specified address, replacing any existing
     /// mappings.
     Replace,
@@ -257,7 +266,7 @@ pub enum AllocationError {
     AddressPartiallyInUse,
 }
 
-/// Possible errors for [`PageManagementProvider::deallocate_pages`]
+/// Possible errors for [`PageManagementProvider::release_pages`]
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum DeallocationError {
@@ -271,6 +280,10 @@ pub enum DeallocationError {
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum RemapError {
+    #[error("native page remapping is not supported by this platform")]
+    UnsupportedByPlatform,
+    #[error("provided address range is invalid")]
+    InvalidRange,
     #[error("at least one of the provided ranges was not page-aligned")]
     Unaligned,
     #[error("provided old range contains unallocated pages")]

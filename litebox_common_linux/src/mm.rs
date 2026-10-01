@@ -11,7 +11,10 @@ use alloc::vec::Vec;
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::{DeallocationError, MemoryRegionPermissions, RemapError},
+        page_mgmt::{
+            AllocationDirection, CowAllocationError, DeallocationError, MemoryRegionPermissions,
+            RemapError,
+        },
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
@@ -20,9 +23,9 @@ use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,
     errno::Errno,
     vmem::{
-        self, CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE,
-        PageFaultError, PageRange, VmArea, VmFlags, Vmem, VmemPageFaultHandler, VmemProtectError,
-        VmemResetError, VmemUnmapError,
+        self, CreatePagesFlags, LinuxReservationStore, MappingError, NonZeroAddress,
+        NonZeroPageSize, PAGE_SIZE, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler,
+        VmemProtectError, VmemResetError, VmemUnmapError,
     },
 };
 
@@ -37,11 +40,41 @@ where
 impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
+    Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
 {
     /// Create a new `VmemManager` instance.
     pub fn new(platform: &'static Platform) -> Self {
         let vmem = RwLock::new(Vmem::new(platform));
         Self { vmem }
+    }
+
+    /// Attempt a native copy-on-write mapping backed by static data.
+    ///
+    /// `suggested_start` is the hint address for where to create the pages if it is not `None`.
+    ///
+    /// `flags` controls fixed-address placement, no-replace behavior, and whether the mapping is
+    /// shared. Other [`CreatePagesFlags`] options have no effect.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform cannot create a native copy-on-write mapping for
+    /// `source_data` or if the requested placement is invalid.
+    ///
+    /// # Safety
+    ///
+    /// For replacement, the caller must ensure overlapping mappings are not in use.
+    pub unsafe fn try_create_cow_pages(
+        &self,
+        suggested_start: Option<usize>,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        flags: CreatePagesFlags,
+    ) -> Result<Platform::RawMutPointer<u8>, CowAllocationError> {
+        unsafe {
+            self.vmem
+                .write()
+                .try_create_cow_pages(suggested_start, source_data, permissions, flags)
+        }
     }
 
     /// Create a mapping with the given flags.
@@ -96,9 +129,15 @@ where
         if before_perms != after_perms {
             let range =
                 PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
-            // `protect` should succeed, as we just created the mapping.
             let mut vmem = self.vmem.write();
-            unsafe { vmem.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
+            // `op` runs unlocked, so another thread may have unmapped or replaced part of the range.
+            if let Err(e) = unsafe { vmem.protect_mapping(range, after_perms) } {
+                // TODO: Another thread may have unmapped or replaced part of the range while `op` ran unlocked.
+                // We may end up removing another thread's mapping if another thread unmaps and remaps this
+                // range before cleanup.
+                let _ = unsafe { vmem.remove_mapping(range) };
+                return Err(e.into());
+            }
         }
         Ok(addr)
     }
@@ -299,11 +338,6 @@ where
         Ok(())
     }
 
-    /// Returns whether any tracked mapping overlaps `range`.
-    pub fn overlaps(&self, range: Range<usize>) -> bool {
-        self.vmem.read().overlapping(range).next().is_some()
-    }
-
     /// Expands (or shrinks) an existing memory mapping
     ///
     /// `old_addr` is the old address of the virtual memory block that you want to expand (or shrink).
@@ -330,8 +364,12 @@ where
         may_move: bool,
     ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
         let mut vmem = self.vmem.write();
-        let old_range = PageRange::new(old_addr.as_usize(), old_addr.as_usize() + old_size)
-            .ok_or(RemapError::Unaligned)?;
+        let old_end = old_addr
+            .as_usize()
+            .checked_add(old_size)
+            .ok_or(RemapError::InvalidRange)?;
+        let old_range =
+            PageRange::new(old_addr.as_usize(), old_end).ok_or(RemapError::Unaligned)?;
         match unsafe {
             vmem.resize_mapping(
                 old_range,
@@ -509,40 +547,6 @@ where
         )
     }
 
-    /// Register an already-allocated memory region in the VMA tracker.
-    ///
-    /// This is used when memory has been allocated by some means other than the normal
-    /// `create_*_pages` path (e.g., CoW mappings created directly by the platform), so that the
-    /// page manager tracks the region for future `mprotect`, `munmap`, etc.
-    ///
-    /// If `replace` is `true`, any overlapping tracked mappings are evicted from the tracker
-    /// (without calling the platform deallocator) before inserting. Otherwise, returns `None`
-    /// without registering if the provided `range` overlaps with any existing mapping.
-    ///
-    /// # Safety
-    ///
-    /// The `range` must be an already-mapped region with the given `permissions`.
-    #[must_use]
-    pub unsafe fn register_existing_mapping(
-        &self,
-        range: PageRange<ALIGN>,
-        permissions: MemoryRegionPermissions,
-        is_file_backed: bool,
-        replace: bool,
-        shared: bool,
-    ) -> Option<()> {
-        let vma = VmArea::new(
-            VmFlags::from(permissions) | VmFlags::may_flags_for_mapping(shared, is_file_backed),
-            is_file_backed,
-        );
-        let mut vmem = self.vmem.write();
-        if !replace && vmem.overlapping(range.into()).next().is_some() {
-            return None;
-        }
-        vmem.register_existing_mapping_overwrite(range, vma);
-        Some(())
-    }
-
     /// Returns all mappings in a vector.
     pub fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
         self.vmem
@@ -578,6 +582,7 @@ impl<Platform, const ALIGN: usize> VmemManager<Platform, ALIGN>
 where
     Platform: RawSyncPrimitivesProvider + PageManagementProvider<ALIGN>,
     Platform: VmemPageFaultHandler,
+    Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
 {
     /// Handle page fault at the given address.
     ///
@@ -651,48 +656,74 @@ where
 
 const PAGE_MASK: usize = !(PAGE_SIZE - 1);
 
+impl From<MapFlags> for CreatePagesFlags {
+    fn from(flags: MapFlags) -> Self {
+        let mut create_flags = Self::empty();
+        // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
+        create_flags.set(
+            Self::FIXED_ADDR,
+            flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
+        );
+        create_flags.set(
+            Self::NOREPLACE,
+            flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
+        );
+        create_flags.set(
+            Self::POPULATE_PAGES_IMMEDIATELY,
+            flags.contains(MapFlags::MAP_POPULATE),
+        );
+        create_flags.set(Self::MAP_FILE, !flags.contains(MapFlags::MAP_ANONYMOUS));
+        create_flags.set(Self::SHARED, flags.contains(MapFlags::MAP_SHARED));
+        create_flags
+    }
+}
+
+impl From<ProtFlags> for MemoryRegionPermissions {
+    fn from(prot: ProtFlags) -> Self {
+        let mut permissions = Self::empty();
+        permissions.set(Self::READ, prot.contains(ProtFlags::PROT_READ));
+        permissions.set(Self::WRITE, prot.contains(ProtFlags::PROT_WRITE));
+        permissions.set(Self::EXEC, prot.contains(ProtFlags::PROT_EXEC));
+        permissions
+    }
+}
+
+/// Address-selection policy for an mmap operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MmapPlacement {
+    /// Direction in which to search for free address space.
+    pub direction: AllocationDirection,
+    /// Whether to reserve additional growth space after the mapping.
+    pub ensure_space_after: bool,
+}
+
 impl<Platform> VmemManager<Platform, PAGE_SIZE>
 where
     Platform: litebox::platform::RawPointerProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::PageManagementProvider<PAGE_SIZE>,
+    Platform::Reservations: LinuxReservationStore<Platform, PAGE_SIZE>,
 {
+    /// Create an mmap-style mapping using the requested placement policy.
     pub fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        ensure_space_after: bool,
+        placement: MmapPlacement,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_platform_ptr::<Platform>(p));
-        let flags = {
-            let mut create_flags = CreatePagesFlags::empty();
-            // MAP_FIXED_NOREPLACE implies MAP_FIXED behavior (exact address, not a hint)
-            create_flags.set(
-                CreatePagesFlags::FIXED_ADDR,
-                flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE),
-            );
-            create_flags.set(
-                CreatePagesFlags::NOREPLACE,
-                flags.contains(MapFlags::MAP_FIXED_NOREPLACE),
-            );
-            create_flags.set(
-                CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
-                flags.contains(MapFlags::MAP_POPULATE),
-            );
-            create_flags.set(CreatePagesFlags::ENSURE_SPACE_AFTER, ensure_space_after);
-            create_flags.set(
-                CreatePagesFlags::MAP_FILE,
-                !flags.contains(MapFlags::MAP_ANONYMOUS),
-            );
-            create_flags.set(
-                CreatePagesFlags::SHARED,
-                flags.contains(MapFlags::MAP_SHARED),
-            );
-            create_flags
-        };
+        let mut flags = CreatePagesFlags::from(flags);
+        flags.set(
+            CreatePagesFlags::ENSURE_SPACE_AFTER,
+            placement.ensure_space_after,
+        );
+        flags.set(
+            CreatePagesFlags::TOP_DOWN,
+            placement.direction == AllocationDirection::TopDown,
+        );
         let suggested_addr = match suggested_addr {
             Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
             None => None,
@@ -712,20 +743,14 @@ where
                 self.create_inaccessible_pages(suggested_addr, length, flags, op)
             },
             _ => {
-                #[cfg(debug_assertions)]
-                todo!("Unsupported prot flags {:?}", prot);
-                // TODO: create inaccessible pages for now. Creating mapping
-                // for both executable and writable might be needed for JIT.
-                #[cfg(not(debug_assertions))]
-                unsafe {
-                    self.create_inaccessible_pages(suggested_addr, length, flags, op)
-                }
+                litebox_util_log::debug!(prot:? = prot; "unsupported mmap protection");
+                Err(VmemProtectError::UnsupportedProtection.into())
             }
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)
     }
 
-    /// Handle syscall `munmap`
+    /// Handle syscall `munmap`.
     pub fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         if addr.as_usize() & !PAGE_MASK != 0 {
             return Err(Errno::EINVAL);
@@ -752,7 +777,7 @@ where
         }
     }
 
-    /// Handle syscall `mprotect`
+    /// Handle syscall `mprotect`.
     pub fn sys_mprotect(
         &self,
         addr: UserPtrMut<u8>,
@@ -774,16 +799,14 @@ where
             ProtFlags::PROT_NONE => unsafe { self.make_pages_inaccessible(addr, len) },
             ProtFlags::PROT_READ_WRITE_EXEC => unsafe { self.make_pages_rwx(addr, len) },
             _ => {
-                #[cfg(debug_assertions)]
-                todo!("Unsupported prot flags {:?}", prot);
-                #[cfg(not(debug_assertions))]
-                return Err(Errno::EINVAL);
+                litebox_util_log::debug!(prot:? = prot; "unsupported mprotect protection");
+                Err(VmemProtectError::UnsupportedProtection)
             }
         }
         .map_err(Errno::from)
     }
 
-    /// Handle syscall `mremap`
+    /// Handle syscall `mremap`.
     pub fn sys_mremap(
         &self,
         old_addr: UserPtrMut<u8>,
@@ -846,6 +869,7 @@ where
         .map_err(Errno::from)
     }
 
+    /// Handle syscall `madvise`.
     pub fn sys_madvise(
         &self,
         addr: UserPtrMut<u8>,

@@ -358,7 +358,7 @@ pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
                     length,
                     // Pre-populate: stack initialization runs before run_thread_arch
                     // sets up the kernel-mode demand paging infrastructure.
-                    CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
+                    CreatePagesFlags::TOP_DOWN | CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
                 )
                 .ok()?
         }

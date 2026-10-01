@@ -2,6 +2,9 @@
 // Licensed under the MIT license.
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Linux.
+//!
+//! The guest shares the host process's address space, so this platform does not isolate host
+//! memory from the guest: guest code or fixed-address mappings can read or overwrite it.
 
 // Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
@@ -30,6 +33,8 @@ use zerocopy::{FromBytes, IntoBytes};
 extern crate alloc;
 
 mod page_mgmt;
+#[doc(hidden)]
+pub use page_mgmt::LinuxUserlandReservation;
 
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers

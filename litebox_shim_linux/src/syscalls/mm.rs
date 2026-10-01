@@ -7,15 +7,12 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::fs::errors::ReadError;
-use litebox::platform::{
-    PageManagementProvider, RawConstPointer,
-    page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions},
-};
+use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
-    vmem::{MappingError, PAGE_SIZE, PageRange},
+    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError},
 };
 
 use crate::FileFd;
@@ -126,9 +123,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         ensure_space_after: bool,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
-        self.global
-            .mm
-            .do_mmap(suggested_addr, len, prot, flags, ensure_space_after, op)
+        self.global.mm.do_mmap(
+            suggested_addr,
+            len,
+            prot,
+            flags,
+            litebox_common_linux::mm::MmapPlacement {
+                direction: litebox::platform::page_mgmt::AllocationDirection::TopDown,
+                ensure_space_after,
+            },
+            op,
+        )
     }
 
     #[inline]
@@ -235,61 +240,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return None;
         }
 
-        let fixed_behavior = if flags.contains(MapFlags::MAP_FIXED_NOREPLACE) {
-            FixedAddressBehavior::NoReplace
-        } else if flags.contains(MapFlags::MAP_FIXED) {
-            FixedAddressBehavior::Replace
-        } else {
-            FixedAddressBehavior::Hint
-        };
-
-        let permissions = {
-            let mut perms = MemoryRegionPermissions::empty();
-            perms.set(
-                MemoryRegionPermissions::READ,
-                prot.contains(ProtFlags::PROT_READ),
-            );
-            perms.set(
-                MemoryRegionPermissions::WRITE,
-                prot.contains(ProtFlags::PROT_WRITE),
-            );
-            perms.set(
-                MemoryRegionPermissions::EXEC,
-                prot.contains(ProtFlags::PROT_EXEC),
-            );
-            perms
-        };
-
-        // XXX: `try_allocate_cow_pages` and `register_existing_mapping` are not called under a
-        // unified lock, so there is a theoretical race if two threads concurrently attempt a
-        // fixed-address mapping with replacement at the same address. In practice this is benign:
-        // if a program races like this both threads will register the same mapping anyway. Updating
-        // to a begin/attempt/commit scheme could close this race window entirely.
-        match <_ as PageManagementProvider<{ PAGE_SIZE }>>::try_allocate_cow_pages(
-            self.global.platform,
-            suggested_addr.unwrap_or(0),
-            &static_data[offset..offset + len],
-            permissions,
-            fixed_behavior,
-        ) {
-            Ok(ptr) => {
-                let range =
-                    PageRange::new(ptr.as_usize(), ptr.as_usize().checked_add(len).unwrap())
-                        .unwrap();
-                // SAFETY: ptr is the freshly CoW-mapped region of exactly `len` bytes with
-                // `permissions`.
-                unsafe {
-                    self.global.mm.register_existing_mapping(
-                        range,
-                        permissions,
-                        true,
-                        fixed_behavior == FixedAddressBehavior::Replace,
-                        flags.contains(MapFlags::MAP_SHARED),
-                    )
-                }
-                .unwrap();
-                Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr)))
-            }
+        let create_flags = CreatePagesFlags::from(flags) | CreatePagesFlags::TOP_DOWN;
+        let permissions = MemoryRegionPermissions::from(prot);
+        match unsafe {
+            self.global.mm.try_create_cow_pages(
+                suggested_addr,
+                &static_data[offset..offset + len],
+                permissions,
+                create_flags,
+            )
+        } {
+            Ok(ptr) => Some(Ok(UserPtrMut::from_platform_ptr::<Platform>(ptr))),
             Err(_cow_not_supported) => None,
         }
     }
@@ -339,16 +300,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Ok(copied)
         };
         let fixed_addr = flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
-        self.do_mmap(
+        let ptr = self.do_mmap(
             suggested_addr,
             len,
-            prot,
+            ProtFlags::PROT_READ_WRITE,
             flags,
             // Note we need to ensure that the space after the mapping is available
             // so that we could load trampoline code right after the mapping.
             offset == 0 && !fixed_addr,
             op,
-        )
+        )?;
+        if prot != ProtFlags::PROT_READ_WRITE && self.sys_mprotect_raw(ptr, len, prot).is_err() {
+            // TODO: Protection may be unsupported (e.g. write-only), or another thread may
+            // have unmapped the range. Best-effort cleanup may unmap a replacement
+            // mapping if another thread unmaps and remaps this range before cleanup.
+            let _ = self.sys_munmap_raw(ptr, len);
+            return Err(VmemProtectError::UnsupportedProtection.into());
+        }
+        Ok(ptr)
     }
 
     /// Handle syscall `mmap`
@@ -495,6 +464,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `brk`
     #[inline]
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
+        // On failure, Linux returns the current break rather than a negative errno.
         unsafe {
             self.global
                 .mm
@@ -1425,67 +1395,59 @@ mod tests {
     #[test]
     fn test_collision_with_global_allocator() {
         let task = init_platform(None);
-        let platform = task.global.platform;
+        #[cfg(target_os = "linux")]
+        let external_platform = Platform::new(None);
+        #[cfg(target_os = "windows")]
+        let external_platform = Platform::new();
         let mut data = alloc::vec::Vec::new();
-        // Find an address that is allocated to the global allocator but not in reserved regions.
-        // LiteBox's page manager is not aware of the global allocator's allocations.
+        let mut count = 0;
+        // Model an external allocator allocation that LiteBox's page manager does not track.
         let addr = loop {
-            #[allow(
-                unused_variables,
-                reason = "the following features are mutually exclusive"
-            )]
-            #[cfg(target_os = "windows")]
+            assert!(
+                count < 100,
+                "Failed to find a suitable address after 100 attempts"
+            );
+            count += 1;
             let addr = {
-                let buf = alloc::vec::Vec::<u8>::with_capacity(0x10_0000);
-                let addr = buf.as_ptr() as usize;
-                data.push(buf);
-                addr
-            };
-            #[cfg(target_os = "linux")]
-            let addr = {
-                let addr = unsafe {
-                    libc::mmap(
-                        core::ptr::null_mut(),
-                        0x10_000,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    )
-                } as usize;
-                data.push(alloc::vec::Vec::<u8>::from(unsafe {
-                    core::slice::from_raw_parts(addr as *const u8, 0x10_000)
-                }));
-                addr
+                use litebox::platform::{
+                    RawConstPointer as _,
+                    page_mgmt::{
+                        AllocationDirection, FixedAddressBehavior, MemoryRegionPermissions,
+                    },
+                };
+
+                let task_addr_min = <Platform as PageManagementProvider<4096>>::TASK_ADDR_MIN;
+                let reservation_alignment =
+                    <Platform as PageManagementProvider<4096>>::RESERVATION_ALIGNMENT;
+                let suggested_start = task_addr_min + count * reservation_alignment;
+                let allocation = <Platform as PageManagementProvider<4096>>::allocate_pages(
+                    external_platform,
+                    suggested_start..suggested_start + 0x1000,
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                    false,
+                    false,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                )
+                .unwrap()
+                .as_usize();
+                data.push(allocation);
+                allocation
             };
 
-            let mut included = false;
-            for r in <crate::syscalls::tests::TestPlatform as PageManagementProvider<
-                4096,
-            >>::reserved_pages(platform)
-            {
-                if r.contains(&addr) {
-                    included = true;
-                    break;
+            // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
+            if let Ok(ptr) = task.sys_mmap(
+                addr - 0x1000,
+                0x1000,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
+                -1,
+                0,
+            ) {
+                if ptr.as_usize() != addr - 0x1000 {
+                    task.sys_munmap(ptr, 0x1000).unwrap();
+                    continue;
                 }
-            }
-
-            if !included {
-                // Also ensure that [addr - 0x1000, addr) is available, which is needed in the test below.
-                if let Ok(ptr) = task.sys_mmap(
-                    addr - 0x1000,
-                    0x1000,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANON,
-                    -1,
-                    0,
-                ) {
-                    if ptr.as_usize() != addr - 0x1000 {
-                        task.sys_munmap(ptr, 0x1000).unwrap();
-                        continue;
-                    }
-                    break addr;
-                }
+                break addr;
             }
         };
 
@@ -1503,7 +1465,8 @@ mod tests {
         assert_ne!(res.as_usize(), 0);
         assert_ne!(res.as_usize(), addr);
 
-        // grow the mapping without MREMAP_MAYMOVE should fail as the new region collides with the global allocator
+        // Growing without MREMAP_MAYMOVE must fail because the next page belongs to the
+        // independently managed external allocation.
         let err = task
             .sys_mremap(
                 UserPtrMut::from_usize(addr - 0x1000),
@@ -1514,6 +1477,20 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(err, Errno::ENOMEM);
+
+        task.sys_munmap(res, 0x1000).unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(addr - 0x1000), 0x1000)
+            .unwrap();
+        for allocation in data {
+            // SAFETY: The page belongs to the external provider and has no outstanding references.
+            unsafe {
+                <Platform as PageManagementProvider<4096>>::release_pages(
+                    external_platform,
+                    allocation..allocation + 0x1000,
+                )
+                .unwrap();
+            }
+        }
     }
 
     #[test]
