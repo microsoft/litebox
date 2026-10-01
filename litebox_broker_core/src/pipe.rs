@@ -202,6 +202,10 @@ struct PipeCapacityReservation {
 }
 
 impl PipeCapacityReservation {
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     fn new(process: &BrokerProcess, capacity: usize) -> Result<Self> {
         let global_counter = Arc::clone(&process.core.reserved_pipe_capacity);
         global_counter
@@ -237,6 +241,10 @@ impl PipeCapacityReservation {
 }
 
 impl Drop for PipeCapacityReservation {
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     fn drop(&mut self) {
         self.session_counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {

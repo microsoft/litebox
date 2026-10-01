@@ -152,6 +152,10 @@ impl<Platform: RawSyncPrimitivesProvider, T> LoanList<Platform, T> {
     }
 
     /// Removes a node from the list, waiting until it is no longer loaned out.
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     fn remove_node(&self, node: &Node<EntryData<Platform, T>>) {
         loop {
             let v = node
@@ -380,6 +384,10 @@ impl<Platform: RawSyncPrimitivesProvider, T> Deref for LoanedEntry<Platform, T> 
 }
 
 impl<Platform: RawSyncPrimitivesProvider, T> Drop for LoanedEntry<Platform, T> {
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     fn drop(&mut self) {
         let entry = unsafe { &*self.entry };
         let state = entry.data.state.underlying_atomic();

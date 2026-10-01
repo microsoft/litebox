@@ -392,6 +392,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match an active request.
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     pub(crate) fn request(
         &self,
         operation: BrokerOperation,

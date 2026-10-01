@@ -875,6 +875,10 @@ impl BrokerProcess {
     ///
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     pub fn create_thread(&self) -> Result<ThreadId> {
         let mut threads = self.threads.lock();
         if threads.len() >= self.core.limits.max_threads_per_process {
@@ -1134,6 +1138,10 @@ impl BrokerProcess {
         Ok((first_handle, second_handle))
     }
 
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     pub(crate) fn reserve_object_reference(
         &self,
         rights: ObjectRights,
@@ -1539,6 +1547,10 @@ impl Drop for PendingObjectReference<'_> {
     }
 }
 
+#[allow(
+    deprecated,
+    reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+)]
 fn release_pending_reference(
     core_pending_references: &AtomicUsize,
     process_references: &mut ProcessReferences,
