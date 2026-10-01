@@ -581,9 +581,8 @@ where
     /// The current implementation effectively re-inserts the mapping with the same
     /// `VmArea` properties, which will cause the pages to be unmapped and mapped again.
     ///
-    /// # Panics
-    ///
-    /// File-backed mapping is not supported yet.
+    /// File-backed reset is not supported yet, even when `anonymous_only` is false.
+    /// Such ranges return `FileBacked` before changing any pages.
     ///
     /// # Safety
     ///
@@ -592,7 +591,7 @@ where
     pub(super) unsafe fn reset_pages(
         &mut self,
         range: PageRange<ALIGN>,
-        anonymous_only: bool,
+        _anonymous_only: bool,
     ) -> Result<(), VmemResetError>
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
@@ -605,13 +604,13 @@ where
             .overlapping(range.clone())
             .map(|(r, vma)| (r.clone(), *vma))
             .collect();
+        if overlapping_ranges
+            .iter()
+            .any(|(_, vma)| vma.is_file_backed())
+        {
+            return Err(VmemResetError::FileBacked);
+        }
         for (r, vma) in overlapping_ranges {
-            if vma.is_file_backed() {
-                if anonymous_only {
-                    return Err(VmemResetError::FileBacked);
-                }
-                unimplemented!("resetting file-backed mappings is not supported yet");
-            }
             let start = r.start.max(range.start);
             let end = r.end.min(range.end);
             let new_range = PageRange::new(start, end).unwrap();

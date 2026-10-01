@@ -971,8 +971,9 @@ where
 
     /// Applies the supported Linux `madvise` behaviors to a mapped range.
     ///
-    /// `Normal`, `DontFork`, and `DoFork` are currently no-ops. `DontNeed` discards any mapping
-    /// contents, while `Free` only discards anonymous contents. Unsupported advice values panic.
+    /// `Normal`, `DontFork`, and `DoFork` are currently no-ops. `DontNeed` and `Free`
+    /// discard anonymous contents; file-backed ranges return `EINVAL` (reload is unsupported).
+    /// Unsupported advice values panic.
     pub fn sys_madvise(
         &self,
         addr: UserPtrMut<u8>,
