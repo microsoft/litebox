@@ -749,7 +749,7 @@ mod tests {
                 96,
             )
             .unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         let guest_tp = GUEST_TP.to_ne_bytes();
         let read = |address: usize, output: &mut [u8]| {
             for (base, bytes) in [
@@ -821,7 +821,7 @@ mod tests {
                 96,
             )
             .unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         let mut frame = [0u8; DARWIN_SVC_FRAME_BYTES as usize];
         frame[..8].copy_from_slice(&20usize.to_ne_bytes());
         let read = |address: usize, output: &mut [u8]| {

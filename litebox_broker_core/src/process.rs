@@ -1738,7 +1738,7 @@ mod tests {
             take_republished(&parent_sink),
             [(reader, ReadinessFlags::READ)]
         );
-        assert!(take_republished(&child_sink).is_empty());
+        assert_eq!(take_republished(&child_sink), []);
 
         // Freeing space that an atomic write still cannot use leaves `WRITE`
         // unchanged but must still wake writers.
@@ -1761,19 +1761,19 @@ mod tests {
 
         assert_eq!(parent.close_object_reference(writer), Ok(()));
         assert_eq!(*parent_sink.retired.lock().unwrap(), [writer]);
-        assert!(take_republished(&parent_sink).is_empty());
-        assert!(take_republished(&child_sink).is_empty());
+        assert_eq!(take_republished(&parent_sink), []);
+        assert_eq!(take_republished(&child_sink), []);
 
         assert_eq!(child.close_object_reference(child_writer), Ok(()));
         let hangup = ReadinessFlags::READ | ReadinessFlags::HANGUP;
         assert_eq!(take_republished(&parent_sink), [(reader, hangup)]);
-        assert!(take_republished(&child_sink).is_empty());
+        assert_eq!(take_republished(&child_sink), []);
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_writer]);
 
         assert_eq!(parent.close_object_reference(reader), Ok(()));
         assert_eq!(*parent_sink.retired.lock().unwrap(), [writer, reader]);
-        assert!(take_republished(&parent_sink).is_empty());
-        assert!(take_republished(&child_sink).is_empty());
+        assert_eq!(take_republished(&parent_sink), []);
+        assert_eq!(take_republished(&child_sink), []);
     }
 
     #[test]
@@ -2250,7 +2250,7 @@ mod tests {
             parent.duplicate_object_references_to_child(child_id, &[first, handle], &sink),
             Err(BrokerError::UnsupportedOperation)
         );
-        assert!(child.references.lock().handles.is_empty());
+        assert_eq!(child.references.lock().handles, []);
 
         let duplicates = parent
             .duplicate_object_references_to_child(child_id, &[first, second], &sink)
@@ -2266,7 +2266,7 @@ mod tests {
         );
 
         parent.exit_child_process(child_id, EXITED).unwrap();
-        assert!(child.references.lock().handles.is_empty());
+        assert_eq!(child.references.lock().handles, []);
         assert_eq!(
             parent.duplicate_object_references_to_child(child_id, &[first], &sink),
             Err(BrokerError::UnknownObject)
@@ -2283,7 +2283,7 @@ mod tests {
             failed.fail_start(BrokerError::PeerClosed, false, true),
             Err(BrokerError::PeerClosed)
         );
-        assert!(failed.references.lock().handles.is_empty());
+        assert_eq!(failed.references.lock().handles, []);
         assert_eq!(
             parent.check_readiness(first),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
@@ -2576,7 +2576,7 @@ mod tests {
                 .duplicate_object_references_to(&[source_handle, ObjectHandle(u64::MAX)], &target,),
             Err(BrokerError::UnknownObject)
         );
-        assert!(target.references.lock().handles.is_empty());
+        assert_eq!(target.references.lock().handles, []);
         assert_eq!(
             source.check_readiness(source_handle).unwrap(),
             ReadinessFlags::READ | ReadinessFlags::WRITE

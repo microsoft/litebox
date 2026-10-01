@@ -287,7 +287,7 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(args.program_and_arguments.is_empty());
+        assert_eq!(args.program_and_arguments, [] as [String; 0]);
     }
 
     #[test]

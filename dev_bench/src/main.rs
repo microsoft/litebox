@@ -86,7 +86,7 @@ enum Summarization {
 
 impl Summarization {
     fn summarize(self, durations: &[Duration]) -> Duration {
-        assert!(!durations.is_empty());
+        assert_ne!(durations, []);
         match self {
             Summarization::Min => *durations.iter().min().unwrap(),
             Summarization::Mean => {

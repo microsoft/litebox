@@ -129,7 +129,7 @@ fn spawned_threads_use_configured_darwin_gates() {
                 .unwrap(),
         )
         .unwrap();
-    assert!(trapped.is_empty());
+    assert_eq!(trapped, []);
     memory.copy_from_slice(0, &code).unwrap();
     memory.copy_from_slice(gate_offset, &gates).unwrap();
     // SAFETY: code and gates are initialized and have no active users.

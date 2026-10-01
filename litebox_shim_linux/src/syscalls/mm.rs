@@ -2053,7 +2053,7 @@ mod tests {
             let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
             let (tramp, trapped) =
                 patch_code_segment_with_options(&mut code, 0x1000, 0x400000, 0, options).unwrap();
-            assert!(trapped.is_empty());
+            assert_eq!(trapped, []);
             let classified = classify_copied_gate_slot_for_host(
                 &tramp[16..],
                 0x400010,
@@ -2080,7 +2080,7 @@ mod tests {
                 RewriteOptions::new(options.target_host(), true),
             )
             .unwrap();
-            assert!(trapped.is_empty());
+            assert_eq!(trapped, []);
             let before = trampoline.clone();
             let result =
                 super::super::finalize_trampoline_gates(&StubPlatform(Some(96)), &mut trampoline);
@@ -2117,7 +2117,7 @@ mod tests {
                 options,
             )
             .unwrap();
-            assert!(trapped.is_empty());
+            assert_eq!(trapped, []);
             assert_eq!(
                 u64::from_le_bytes(stubs[..8].try_into().unwrap()),
                 SYSCALL_ENTRY

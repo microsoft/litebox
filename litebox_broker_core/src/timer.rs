@@ -270,7 +270,7 @@ mod tests {
             process.check_readiness(handle),
             Ok(ReadinessFlags::default())
         );
-        assert!(republished().is_empty());
+        assert_eq!(republished(), []);
         clock.advance(Duration::from_nanos(60));
         assert_eq!(republished(), [(handle, ReadinessFlags::READ)]);
         assert_eq!(process.check_readiness(handle), Ok(ReadinessFlags::READ));

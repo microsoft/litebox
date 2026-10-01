@@ -3104,8 +3104,8 @@ mod tests {
             RewriteOptions::default(),
         )
         .unwrap();
-        assert!(trampoline.is_empty());
-        assert!(trapped.is_empty());
+        assert_eq!(trampoline, []);
+        assert_eq!(trapped, []);
         assert_eq!(code, before, "syscall-free code is left untouched");
     }
 
@@ -3126,7 +3126,7 @@ mod tests {
             RewriteOptions::default(),
         )
         .unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         assert!(
             aarch64::find_guest_tpidr_placeholder(&trampoline).is_some(),
             "a runtime-emitted thread-pointer gate must arrive unpatched"
@@ -3157,7 +3157,7 @@ mod tests {
             RewriteOptions::default(),
         )
         .unwrap();
-        assert!(skipped.is_empty());
+        assert_eq!(skipped, []);
         let section = TextSectionInfo {
             vaddr: code_vaddr,
             file_offset: 0,

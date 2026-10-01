@@ -3150,7 +3150,7 @@ mod tests {
             .read_value_at_path("/registry/machine/software/liteboxsetvaluekey", "Empty")
             .unwrap();
         assert_eq!(empty_value.value_type, custom_type);
-        assert!(empty_value.data.is_empty());
+        assert_eq!(empty_value.data, []);
 
         task.close_registry_key_handle(handle);
         let read_only_handle = open_key(&task, object_attributes).unwrap();

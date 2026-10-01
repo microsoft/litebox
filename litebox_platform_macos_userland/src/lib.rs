@@ -2884,7 +2884,7 @@ mod tests {
         >>::reserved_pages(platform)
         .collect();
 
-        assert!(!reserved_pages.is_empty());
+        assert_ne!(reserved_pages, [] as [&Range<usize>; 0]);
         let mut previous_end = 0;
         for range in &reserved_pages {
             assert!(range.start >= previous_end);
@@ -3387,7 +3387,7 @@ mod tests {
             RewriteOptions::new(TargetHost::MacOs, true),
         )
         .unwrap();
-        assert!(trapped.is_empty());
+        assert_eq!(trapped, []);
         assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
         assert_eq!(
             memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), &trampoline),
