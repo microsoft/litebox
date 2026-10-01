@@ -228,6 +228,19 @@ pub enum IsTerminalError {
     Io,
 }
 
+/// Possible errors from [`crate::LiteBox::get_file_status_flags`] and
+/// [`crate::LiteBox::set_file_status_flags`].
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum StatusFlagsError {
+    #[error("fd has been closed already")]
+    ClosedFd,
+    #[error("fd is open only for path-based operations")]
+    PathOnly,
+    #[error("I/O error")]
+    Io,
+}
+
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {

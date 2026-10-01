@@ -55,6 +55,8 @@ const REQUEST_TAG_REPORT_EXIT_STATUS: u8 = 14;
 const REQUEST_TAG_SET_CHILD_REAPING: u8 = 15;
 const REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 16;
 const REQUEST_TAG_TIMER: u8 = 17;
+const REQUEST_TAG_GET_STATUS_FLAGS: u8 = 18;
+const REQUEST_TAG_SET_STATUS_FLAGS: u8 = 19;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
@@ -82,6 +84,8 @@ const RESPONSE_TAG_EXIT_STATUS_REPORTED: u8 = 14;
 const RESPONSE_TAG_CHILD_REAPING_SET: u8 = 15;
 const RESPONSE_TAG_OBJECTS_DUPLICATED: u8 = 16;
 const RESPONSE_TAG_TIMER: u8 = 17;
+const RESPONSE_TAG_STATUS_FLAGS: u8 = 18;
+const RESPONSE_TAG_STATUS_FLAGS_SET: u8 = 19;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -146,7 +150,9 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_REPORT_EXIT_STATUS
         | REQUEST_TAG_SET_CHILD_REAPING
         | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD
-        | REQUEST_TAG_TIMER => {
+        | REQUEST_TAG_TIMER
+        | REQUEST_TAG_GET_STATUS_FLAGS
+        | REQUEST_TAG_SET_STATUS_FLAGS => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -188,6 +194,16 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.u8(REQUEST_TAG_CHECK_READINESS);
             encoder.request_id(request_id);
             encoder.handle(handle);
+        }
+        BrokerOperation::GetStatusFlags(handle) => {
+            encoder.u8(REQUEST_TAG_GET_STATUS_FLAGS);
+            encoder.request_id(request_id);
+            encoder.handle(handle);
+        }
+        BrokerOperation::SetStatusFlags(request) => {
+            encoder.u8(REQUEST_TAG_SET_STATUS_FLAGS);
+            encoder.request_id(request_id);
+            fs::encode_set_status_flags_request(&mut encoder, request);
         }
         BrokerOperation::Event(request) => {
             encoder.u8(REQUEST_TAG_EVENT);
@@ -292,7 +308,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_REPORT_EXIT_STATUS
         | REQUEST_TAG_SET_CHILD_REAPING
         | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD
-        | REQUEST_TAG_TIMER => {}
+        | REQUEST_TAG_TIMER
+        | REQUEST_TAG_GET_STATUS_FLAGS
+        | REQUEST_TAG_SET_STATUS_FLAGS => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -305,6 +323,10 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_EXIT_THREAD => BrokerOperation::ExitThread(decoder.thread_id()?),
         REQUEST_TAG_CLOSE_OBJECT => BrokerOperation::CloseObject(decoder.handle()?),
         REQUEST_TAG_CHECK_READINESS => BrokerOperation::CheckReadiness(decoder.handle()?),
+        REQUEST_TAG_GET_STATUS_FLAGS => BrokerOperation::GetStatusFlags(decoder.handle()?),
+        REQUEST_TAG_SET_STATUS_FLAGS => {
+            BrokerOperation::SetStatusFlags(fs::decode_set_status_flags_request(&mut decoder)?)
+        }
         REQUEST_TAG_EVENT => BrokerOperation::Event(event::decode_event_request(&mut decoder)?),
         REQUEST_TAG_PIPE => BrokerOperation::Pipe(pipe::decode_pipe_request(&mut decoder)?),
         REQUEST_TAG_SOCKET => BrokerOperation::Socket(socket::decode_socket_request(&mut decoder)?),
@@ -433,7 +455,9 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
         | RESPONSE_TAG_CHILD_REAPING_SET
         | RESPONSE_TAG_OBJECTS_DUPLICATED
-        | RESPONSE_TAG_TIMER => {
+        | RESPONSE_TAG_TIMER
+        | RESPONSE_TAG_STATUS_FLAGS
+        | RESPONSE_TAG_STATUS_FLAGS_SET => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -491,6 +515,15 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_READINESS);
             encoder.request_id(request_id);
             encoder.u32(readiness.0);
+        }
+        BrokerResult::StatusFlags(status) => {
+            encoder.u8(RESPONSE_TAG_STATUS_FLAGS);
+            encoder.request_id(request_id);
+            fs::encode_status_flags(&mut encoder, status);
+        }
+        BrokerResult::StatusFlagsSet => {
+            encoder.u8(RESPONSE_TAG_STATUS_FLAGS_SET);
+            encoder.request_id(request_id);
         }
         BrokerResult::Event(response) => {
             encoder.u8(RESPONSE_TAG_EVENT);
@@ -583,7 +616,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
         | RESPONSE_TAG_CHILD_REAPING_SET
         | RESPONSE_TAG_OBJECTS_DUPLICATED
-        | RESPONSE_TAG_TIMER => {}
+        | RESPONSE_TAG_TIMER
+        | RESPONSE_TAG_STATUS_FLAGS
+        | RESPONSE_TAG_STATUS_FLAGS_SET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -606,6 +641,10 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_THREAD_EXITED => BrokerResult::ThreadExited,
         RESPONSE_TAG_OBJECT_CLOSED => BrokerResult::ObjectClosed,
         RESPONSE_TAG_READINESS => BrokerResult::Readiness(ReadinessFlags(decoder.u32()?)),
+        RESPONSE_TAG_STATUS_FLAGS => {
+            BrokerResult::StatusFlags(fs::decode_status_flags(&mut decoder)?)
+        }
+        RESPONSE_TAG_STATUS_FLAGS_SET => BrokerResult::StatusFlagsSet,
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted,
@@ -669,6 +708,7 @@ fn encode_error_code(encoder: &mut Encoder, error: ErrorCode) {
         ErrorCode::WouldBlock => 10,
         ErrorCode::PeerClosed => 11,
         ErrorCode::OutOfMemory => 12,
+        ErrorCode::NonBlockingWouldBlock => 13,
     });
 }
 
@@ -686,6 +726,7 @@ fn decode_error_code(decoder: &mut Decoder<'_>) -> Result<ErrorCode, WireError> 
         10 => Ok(ErrorCode::WouldBlock),
         11 => Ok(ErrorCode::PeerClosed),
         12 => Ok(ErrorCode::OutOfMemory),
+        13 => Ok(ErrorCode::NonBlockingWouldBlock),
         _ => Err(WireError::InvalidTag),
     }
 }
@@ -730,11 +771,12 @@ mod tests {
     };
     use crate::fs::{
         ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-        FileOpenFlags, FileSeekWhence, FileStatus, FileType, FileUser, HandleFileStatusRequest,
-        IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-        PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-        ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
-        UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+        FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileType, FileUser,
+        HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
+        OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+        ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+        SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+        WriteFileResponse,
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
@@ -812,6 +854,8 @@ mod tests {
                 RESPONSE_TAG_CHILD_REAPING_SET,
                 RESPONSE_TAG_OBJECTS_DUPLICATED,
                 RESPONSE_TAG_TIMER,
+                RESPONSE_TAG_STATUS_FLAGS,
+                RESPONSE_TAG_STATUS_FLAGS_SET,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -831,6 +875,8 @@ mod tests {
                 REQUEST_TAG_SET_CHILD_REAPING,
                 REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD,
                 REQUEST_TAG_TIMER,
+                REQUEST_TAG_GET_STATUS_FLAGS,
+                REQUEST_TAG_SET_STATUS_FLAGS,
             ]
         );
         assert_eq!(
@@ -882,6 +928,12 @@ mod tests {
             BrokerOperation::ExitThread(thread_id(17)),
             BrokerOperation::CloseObject(handle),
             BrokerOperation::CheckReadiness(handle),
+            BrokerOperation::GetStatusFlags(handle),
+            BrokerOperation::SetStatusFlags(SetStatusFlagsRequest {
+                handle,
+                mask: FileOpenFlags::STATUS,
+                flags: FileOpenFlags::APPEND,
+            }),
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
             })),
@@ -1338,6 +1390,15 @@ mod tests {
             BrokerResult::ObjectClosed,
             BrokerResult::Readiness(ReadinessFlags::READ),
             BrokerResult::Readiness(ReadinessFlags::WRITE),
+            BrokerResult::StatusFlags(FileStatusFlags {
+                access: FileAccessMode::WriteOnly,
+                flags: FileOpenFlags::NONBLOCKING | FileOpenFlags::APPEND,
+            }),
+            BrokerResult::StatusFlags(FileStatusFlags {
+                access: FileAccessMode::ReadOnly,
+                flags: FileOpenFlags::PATH,
+            }),
+            BrokerResult::StatusFlagsSet,
             BrokerResult::Event(EventResponse::Create(CreateEventResponse { handle })),
             BrokerResult::Event(EventResponse::Add(AddEventResponse {
                 readiness: ReadinessFlags::READ | ReadinessFlags::WRITE,
@@ -1494,6 +1555,7 @@ mod tests {
             BrokerResult::ObjectsDuplicated,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
+            BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
             BrokerResult::Error(ErrorCode::PeerClosed),
             BrokerResult::Error(ErrorCode::OutOfMemory),
             BrokerResult::Error(ErrorCode::Internal),
@@ -1655,6 +1717,19 @@ mod tests {
         assert_eq!(
             decode_request(&truncated_timer_set[..truncated_timer_set.len() - 1]),
             Err(WireError::TruncatedFrame)
+        );
+        let mut unknown_status_flag = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::SetStatusFlags(SetStatusFlagsRequest {
+                handle: ObjectHandle(13),
+                mask: FileOpenFlags::NONBLOCKING,
+                flags: FileOpenFlags::NONE,
+            }),
+        });
+        *unknown_status_flag.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_request(&unknown_status_flag),
+            Err(WireError::InvalidTag)
         );
         let mut unknown_create_thread = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,

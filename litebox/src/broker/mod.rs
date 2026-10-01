@@ -15,7 +15,7 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{ConsumeEventResponse, EventConsumeMode};
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
@@ -182,6 +182,18 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError>;
+
+    fn get_status_flags(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<FileStatusFlags, BrokerControlError>;
+
+    fn set_status_flags(
+        &self,
+        handle: ObjectHandle,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn add_event(
         &self,
@@ -743,6 +755,22 @@ where
         handle: ObjectHandle,
     ) -> core::result::Result<ReadinessFlags, BrokerControlError> {
         self.request(|local| local.check_readiness(handle))
+    }
+
+    fn get_status_flags(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<FileStatusFlags, BrokerControlError> {
+        self.request(|local| local.get_status_flags(handle))
+    }
+
+    fn set_status_flags(
+        &self,
+        handle: ObjectHandle,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_status_flags(handle, mask, flags))
     }
 
     fn add_event(

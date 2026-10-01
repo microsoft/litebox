@@ -258,6 +258,8 @@ impl FileOpenFlags {
             | Self::APPEND.0
             | Self::PATH.0,
     );
+    /// Status flags that [`SetStatusFlagsRequest`] can change after open.
+    pub const STATUS: Self = Self(Self::NONBLOCKING.0 | Self::APPEND.0);
 
     /// Creates flags when every bit is defined by this protocol version.
     #[must_use]
@@ -294,6 +296,27 @@ impl core::ops::BitOr for FileOpenFlags {
     fn bitor(self, rhs: Self) -> Self::Output {
         Self(self.0 | rhs.0)
     }
+}
+
+/// Access mode and status flags of an open object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStatusFlags {
+    /// Access mode the object was opened with.
+    pub access: FileAccessMode,
+    /// Status flags within [`FileOpenFlags::STATUS`], plus [`FileOpenFlags::PATH`] for an object
+    /// opened only for path-based operations.
+    pub flags: FileOpenFlags,
+}
+
+/// Changes status flags of an open object, which every reference to the object shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetStatusFlagsRequest {
+    /// Broker object handle.
+    pub handle: ObjectHandle,
+    /// Status flags to change, within [`FileOpenFlags::STATUS`].
+    pub mask: FileOpenFlags,
+    /// New values of the flags in `mask`; flags outside `mask` are ignored.
+    pub flags: FileOpenFlags,
 }
 
 /// Opens or creates a fs object.

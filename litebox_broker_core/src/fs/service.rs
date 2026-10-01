@@ -9,7 +9,7 @@ use core::any::Any;
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileDirectoryEntry, FileError, FileMode, FileOpenFlags, FileSeekWhence,
-    FileStatus, FileUser, MAX_FILE_TRANSFER_SIZE,
+    FileStatus, FileStatusFlags, FileUser, MAX_FILE_TRANSFER_SIZE,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::sync::{RawSyncPrimitivesProvider, RwLock};
@@ -86,7 +86,7 @@ impl ObjectEntry {
 mod private {
     use super::{
         BrokerError, File, FileAccessMode, FileDirectoryEntry, FileMode, FileOpenFlags,
-        FileSeekWhence, FileStatus, FileUser, ServiceResult, Vec,
+        FileSeekWhence, FileStatus, FileStatusFlags, FileUser, Result, ServiceResult, Vec,
     };
 
     pub trait Service: Send + Sync {
@@ -131,6 +131,19 @@ mod private {
         }
 
         fn is_terminal(&self, _file: &File) -> ServiceResult<bool> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn get_status_flags(&self, _file: &File) -> Result<FileStatusFlags> {
+            Err(BrokerError::UnsupportedOperation)
+        }
+
+        fn set_status_flags(
+            &self,
+            _file: &File,
+            _mask: FileOpenFlags,
+            _flags: FileOpenFlags,
+        ) -> Result<()> {
             Err(BrokerError::UnsupportedOperation)
         }
 
@@ -211,6 +224,7 @@ where
         };
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
+        let nonblocking = entry.is_nonblocking();
         let read = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
@@ -227,7 +241,7 @@ where
         };
         let read = match read {
             Ok(read) => read,
-            Err(ReadError::WouldBlock) => return Err(BrokerError::WouldBlock),
+            Err(ReadError::WouldBlock) => return Err(would_block(nonblocking)),
             Err(error) => return Ok(Err(file_read_error(error))),
         };
         if read > output.len() {
@@ -242,6 +256,7 @@ where
         };
         let state = file.state::<RwLock<Platform, ResolverEntry<Backend>>>()?;
         let entry = state.read();
+        let nonblocking = entry.is_nonblocking();
         let written = if offset.is_some() || !entry.uses_position() {
             if entry.is_path_only() {
                 return Ok(Err(FileError::AccessNotAllowed));
@@ -258,7 +273,7 @@ where
         };
         let written = match written {
             Ok(written) => written,
-            Err(WriteError::WouldBlock) => return Err(BrokerError::WouldBlock),
+            Err(WriteError::WouldBlock) => return Err(would_block(nonblocking)),
             Err(error) => return Ok(Err(file_write_error(error))),
         };
         if written > input.len() {
@@ -351,6 +366,49 @@ where
         Ok(Ok(Resolver::is_terminal(self, &entry)))
     }
 
+    fn get_status_flags(&self, file: &File) -> Result<FileStatusFlags> {
+        let entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .read();
+        let access = match (entry.allows_read(), entry.allows_write()) {
+            (true, true) => FileAccessMode::ReadWrite,
+            (false, true) => FileAccessMode::WriteOnly,
+            _ => FileAccessMode::ReadOnly,
+        };
+        let mut flags = FileOpenFlags::NONE;
+        for (set, flag) in [
+            (entry.is_nonblocking(), FileOpenFlags::NONBLOCKING),
+            (entry.is_append(), FileOpenFlags::APPEND),
+            (entry.is_path_only(), FileOpenFlags::PATH),
+        ] {
+            if set {
+                flags = flags | flag;
+            }
+        }
+        Ok(FileStatusFlags { access, flags })
+    }
+
+    fn set_status_flags(
+        &self,
+        file: &File,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<()> {
+        let mut entry = file
+            .state::<RwLock<Platform, ResolverEntry<Backend>>>()?
+            .write();
+        if entry.is_path_only() {
+            return Err(BrokerError::InvalidRights);
+        }
+        if mask.contains(FileOpenFlags::NONBLOCKING) {
+            entry.set_nonblocking(flags.contains(FileOpenFlags::NONBLOCKING));
+        }
+        if mask.contains(FileOpenFlags::APPEND) {
+            entry.set_append(flags.contains(FileOpenFlags::APPEND));
+        }
+        Ok(())
+    }
+
     fn path_status(&self, path: &str, user: FileUser) -> ServiceResult<FileStatus> {
         let mut status = match Resolver::file_status(self, user, path) {
             Ok(status) => status,
@@ -418,7 +476,7 @@ pub fn open(
 /// Reads bytes from a broker-owned open file.
 ///
 /// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness has nothing to
-/// read.
+/// read, or with [`BrokerError::NonBlockingWouldBlock`] if the file is also non-blocking.
 pub fn read(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -435,7 +493,7 @@ pub fn read(
 /// Writes bytes to a broker-owned open file.
 ///
 /// Fails with [`BrokerError::WouldBlock`] while a file that publishes readiness cannot accept
-/// bytes.
+/// bytes, or with [`BrokerError::NonBlockingWouldBlock`] if the file is also non-blocking.
 pub fn write(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -493,6 +551,23 @@ pub fn handle_status(
 pub fn is_terminal(process: &BrokerProcess, handle: ObjectHandle) -> Result<FileResult<bool>> {
     let file = file_with_any_rights(process, handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
     process.core.fs.is_terminal(&file)
+}
+
+/// Returns the access mode and status flags of a broker-owned open file.
+pub(crate) fn get_status_flags(process: &BrokerProcess, file: &File) -> Result<FileStatusFlags> {
+    process.core.fs.get_status_flags(file)
+}
+
+/// Changes the status flags in `mask` of a broker-owned open file to their values in `flags`.
+///
+/// Fails with [`BrokerError::InvalidRights`] for a file opened only for path-based operations.
+pub(crate) fn set_status_flags(
+    process: &BrokerProcess,
+    file: &File,
+    mask: FileOpenFlags,
+    flags: FileOpenFlags,
+) -> Result<()> {
+    process.core.fs.set_status_flags(file, mask, flags)
 }
 
 /// Returns status for an absolute path.
@@ -602,6 +677,16 @@ fn validate_path(path: &str) -> FileResult<()> {
         Ok(())
     } else {
         Err(FileError::InvalidPathname)
+    }
+}
+
+/// Returns the error for a read or write that would block on a file whose
+/// [`FileOpenFlags::NONBLOCKING`] status flag is `nonblocking`.
+fn would_block(nonblocking: bool) -> BrokerError {
+    if nonblocking {
+        BrokerError::NonBlockingWouldBlock
+    } else {
+        BrokerError::WouldBlock
     }
 }
 

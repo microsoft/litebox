@@ -82,7 +82,8 @@ int main(int argc, char **argv) {
         fflush(stdout);
         dprintf(log, "child-fds via-log\n");
         int stdin_flags = fcntl(stdin_alias, F_GETFL);
-        int stdin_setfl = stdin_flags >= 0 && fcntl(stdin_alias, F_SETFL, stdin_flags) == 0;
+        int stdin_setfl =
+            stdin_flags >= 0 && fcntl(stdin_alias, F_SETFL, stdin_flags | O_NONBLOCK) == 0;
         int hidden_closed = fcntl(hidden, F_GETFD) == -1 && errno == EBADF;
         printf("child-fds stdin_setfl=%d hidden_closed=%d\n", stdin_setfl, hidden_closed);
         return 42;

@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::fs::FileMode as Mode;
+use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence};
 use litebox_common_linux::{
     AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags, errno::Errno,
 };
@@ -224,6 +224,43 @@ fn test_fcntl() {
     let duplicated = i32::try_from(duplicated).unwrap();
 
     assert_eq!(duplicated, min_fd);
+}
+
+#[test]
+fn test_file_status_flags() {
+    let task = init_platform();
+    let path = "/status_flags_file";
+    let open = |flags| i32::try_from(task.sys_open(path, flags, Mode::RWXU).unwrap()).unwrap();
+    let getfl = |fd| OFlags::from_bits_retain(task.sys_fcntl(fd, FcntlArg::GETFL).unwrap());
+
+    // Appending writes go to the end regardless of the file offset.
+    let fd = open(OFlags::CREAT | OFlags::RDWR);
+    assert_eq!(task.sys_write(fd, b"ab", None), Ok(2));
+    assert_eq!(task.sys_fcntl(fd, FcntlArg::SETFL(OFlags::APPEND)), Ok(0));
+    assert_eq!(getfl(fd), OFlags::RDWR | OFlags::APPEND);
+    assert_eq!(
+        task.sys_lseek(fd, 0, SeekWhence::RelativeToBeginning),
+        Ok(0)
+    );
+    assert_eq!(task.sys_write(fd, b"c", None), Ok(1));
+    let mut buf = [0; 4];
+    assert_eq!(task.sys_read(fd, &mut buf, Some(0)), Ok(3));
+    assert_eq!(&buf[..3], b"abc");
+
+    // Status flags of an `O_PATH` descriptor cannot change.
+    let path_fd = open(OFlags::PATH);
+    assert_eq!(getfl(path_fd), OFlags::PATH);
+    assert_eq!(
+        task.sys_fcntl(path_fd, FcntlArg::SETFL(OFlags::NONBLOCK)),
+        Err(Errno::EBADF)
+    );
+    let enable = 1i32;
+    let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize));
+    assert_eq!(task.sys_ioctl(path_fd, arg), Err(Errno::EBADF));
+
+    task.sys_close(fd).unwrap();
+    task.sys_close(path_fd).unwrap();
+    task.sys_unlinkat(0, path, AtFlags::empty()).unwrap();
 }
 
 #[test]

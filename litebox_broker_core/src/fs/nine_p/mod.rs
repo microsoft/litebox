@@ -655,9 +655,8 @@ fn oflags_to_lopen(flags: OFlags) -> fcall::LOpenFlags {
     if flags.contains(OFlags::TRUNC) {
         lflags |= fcall::LOpenFlags::O_TRUNC;
     }
-    if flags.contains(OFlags::APPEND) {
-        lflags |= fcall::LOpenFlags::O_APPEND;
-    }
+    // `O_APPEND` is not sent: the resolver writes appends at the end of the file itself, and
+    // `F_SETFL` can change the flag after the server has opened the file.
     if flags.contains(OFlags::DIRECTORY) {
         lflags |= fcall::LOpenFlags::O_DIRECTORY;
     }

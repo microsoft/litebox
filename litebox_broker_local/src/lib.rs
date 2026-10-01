@@ -35,6 +35,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
+use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
     BrokerRequest, BrokerResponse, BrokerResult,
@@ -425,6 +426,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 | ErrorCode::InvalidRights
                 | ErrorCode::ResourceExhausted
                 | ErrorCode::WouldBlock
+                | ErrorCode::NonBlockingWouldBlock
                 | ErrorCode::PeerClosed
                 | ErrorCode::OutOfMemory
                 | ErrorCode::UnsupportedOperation => Err(BrokerLocalError::Broker(error)),
@@ -470,6 +472,49 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             BrokerResult::Readiness(readiness) => Ok(readiness),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected readiness response: {response:?}"),
+        }
+    }
+
+    /// Reads the access mode and status flags of a broker-owned object.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a
+    /// response that does not match the issued status-flags request.
+    pub fn get_status_flags(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<FileStatusFlags, Channel::Error> {
+        match self.request(BrokerOperation::GetStatusFlags(handle))? {
+            BrokerResult::StatusFlags(status) => Ok(status),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected status-flags response: {response:?}"),
+        }
+    }
+
+    /// Changes the status flags in `mask` of a broker-owned object to their
+    /// values in `flags`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker reports an unrecoverable error or returns a
+    /// response that does not match the issued status-flags change.
+    pub fn set_status_flags(
+        &self,
+        handle: ObjectHandle,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::SetStatusFlags(SetStatusFlagsRequest {
+            handle,
+            mask,
+            flags,
+        }))? {
+            BrokerResult::StatusFlagsSet => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected status-flags change response: {response:?}")
+            }
         }
     }
 

@@ -11,6 +11,7 @@ use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
+use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
     CreatedProcess, ProcessExitStatus, ProcessIdentity, ProcessTermination,
 };
@@ -1264,6 +1265,29 @@ impl BrokerProcess {
     pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
         object::readiness(&object)
+    }
+
+    /// Returns the access mode and status flags of a broker-owned object.
+    pub fn get_status_flags(&self, handle: ObjectHandle) -> Result<FileStatusFlags> {
+        let object = self
+            .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?;
+        object::get_status_flags(self, &object)
+    }
+
+    /// Changes status flags of a broker-owned object, which every reference to the object
+    /// shares.
+    ///
+    /// Fails with [`BrokerError::UnsupportedOperation`] if `request.mask` has flags outside
+    /// [`FileOpenFlags::STATUS`].
+    pub fn set_status_flags(&self, request: SetStatusFlagsRequest) -> Result<()> {
+        if !FileOpenFlags::STATUS.contains(request.mask) {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        let object = self.authorized_object_with_any_rights(
+            request.handle,
+            ObjectRights::WAIT | ObjectRights::WRITE,
+        )?;
+        object::set_status_flags(self, &object, request.mask, request.flags)
     }
 
     /// Returns a process's termination status through a process handle.

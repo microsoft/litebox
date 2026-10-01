@@ -514,6 +514,14 @@ fn handle_request<Memory: SharedMemory>(
             .check_readiness(handle)
             .map(BrokerResult::Readiness)
             .map_err(RequestFailure::from),
+        BrokerOperation::GetStatusFlags(handle) => process
+            .get_status_flags(handle)
+            .map(BrokerResult::StatusFlags)
+            .map_err(RequestFailure::from),
+        BrokerOperation::SetStatusFlags(request) => process
+            .set_status_flags(request)
+            .map(|()| BrokerResult::StatusFlagsSet)
+            .map_err(RequestFailure::from),
         BrokerOperation::GetProcessExitStatus(handle) => process
             .process_exit_status(handle)
             .map(BrokerResult::ProcessExitStatus)
@@ -1332,9 +1340,9 @@ mod tests {
         AddEventRequest, ConsumeEventRequest, CreateEventRequest, EventConsumeMode,
     };
     use litebox_broker_protocol::fs::{
-        FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
-        OpenFileRequest, ReadDirectoryRequest, ReadFileRequest, SeekFileRequest, WriteFileRequest,
-        decode_directory_entries,
+        FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags, FileType,
+        FileUser, OpenFileRequest, ReadDirectoryRequest, ReadFileRequest, SeekFileRequest,
+        SetStatusFlagsRequest, WriteFileRequest, decode_directory_entries,
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
@@ -1695,6 +1703,7 @@ mod tests {
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
         active_request_queries_file_terminal(&broker, &stdio_provider);
+        active_requests_change_file_status_flags(&broker);
         association_shared_buffer_sequences_stage_file_data(&broker);
         shared_buffer_usage_rejects_invalid_sequences();
         association_executes_distinct_slots_concurrently(&broker);
@@ -2004,6 +2013,69 @@ mod tests {
         assert_eq!(
             provider.terminal_queries().as_slice(),
             [StdioStream::Stderr, StdioStream::Stdout]
+        );
+    }
+
+    fn active_requests_change_file_status_flags(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let path = b"/dev/stdout";
+        shared_buffers
+            .write(SharedBufferSlotIndex(0), path)
+            .unwrap();
+        let opened = handle_test_request_with_buffers(
+            &process,
+            BrokerOperation::File(FileRequest::Open(OpenFileRequest {
+                path: single_slot_sequence(0, u32::try_from(path.len()).unwrap()),
+                user: ROOT,
+                access: FileAccessMode::WriteOnly,
+                flags: FileOpenFlags::APPEND,
+                mode: FileMode::default(),
+            })),
+            &shared_buffers,
+        );
+        let BrokerResult::File(FileResponse::Open(opened)) = opened else {
+            panic!("expected successful file open");
+        };
+        let set = |mask, flags| {
+            handle_test_request(
+                &process,
+                BrokerOperation::SetStatusFlags(SetStatusFlagsRequest {
+                    handle: opened.handle,
+                    mask,
+                    flags,
+                }),
+            )
+        };
+
+        assert_eq!(
+            handle_test_request(&process, BrokerOperation::GetStatusFlags(opened.handle)),
+            BrokerResult::StatusFlags(FileStatusFlags {
+                access: FileAccessMode::WriteOnly,
+                flags: FileOpenFlags::APPEND,
+            })
+        );
+        assert_eq!(
+            set(FileOpenFlags::STATUS, FileOpenFlags::NONBLOCKING),
+            BrokerResult::StatusFlagsSet
+        );
+        assert_eq!(
+            handle_test_request(&process, BrokerOperation::GetStatusFlags(opened.handle)),
+            BrokerResult::StatusFlags(FileStatusFlags {
+                access: FileAccessMode::WriteOnly,
+                flags: FileOpenFlags::NONBLOCKING,
+            })
+        );
+        assert_eq!(
+            set(FileOpenFlags::PATH, FileOpenFlags::PATH),
+            BrokerResult::Error(ErrorCode::UnsupportedOperation)
+        );
+        process.close_object_reference(opened.handle).unwrap();
+        assert_eq!(
+            handle_test_request(&process, BrokerOperation::GetStatusFlags(opened.handle)),
+            BrokerResult::Error(ErrorCode::UnknownObject)
         );
     }
 

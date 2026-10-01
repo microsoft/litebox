@@ -27,6 +27,11 @@ pub enum ErrorCode {
     ResourceExhausted,
     #[error("broker operation would block")]
     WouldBlock,
+    /// The operation would block, and the object's
+    /// [`FileOpenFlags::NONBLOCKING`](crate::fs::FileOpenFlags::NONBLOCKING) status flag makes it
+    /// fail instead of waiting like [`Self::WouldBlock`].
+    #[error("broker operation would block a non-blocking object")]
+    NonBlockingWouldBlock,
     #[error("broker object peer is closed")]
     PeerClosed,
     #[error("broker memory allocation failed")]

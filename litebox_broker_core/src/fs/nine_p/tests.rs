@@ -992,3 +992,30 @@ fn test_nine_p_explicit_offset_read_write() {
 
     drop(fd);
 }
+
+#[test]
+fn test_nine_p_append_mode_changes_after_open() {
+    let server = DiodServer::start();
+    let fs = connect_9p(&server);
+    let host_path = server.export_path().join("append.txt");
+    std::fs::write(&host_path, "ab").unwrap();
+
+    let mut fd = fs
+        .open(
+            USER,
+            "/append.txt",
+            OFlags::WRONLY | OFlags::APPEND,
+            Mode::empty(),
+        )
+        .expect("failed to open for appending");
+    fs.write(&mut fd, b"c", None).unwrap();
+    assert_eq!(std::fs::read_to_string(&host_path).unwrap(), "abc");
+
+    // Clearing the status flag after open makes writes use the file offset again.
+    fd.set_append(false);
+    fs.seek(&mut fd, 0, SeekWhence::RelativeToBeginning)
+        .unwrap();
+    fs.write(&mut fd, b"x", None).unwrap();
+    assert_eq!(std::fs::read_to_string(&host_path).unwrap(), "xbc");
+    drop(fd);
+}

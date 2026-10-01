@@ -5,11 +5,12 @@ use core::num::NonZeroU64;
 
 use crate::fs::{
     ChmodFileRequest, ChownFileRequest, FileAccessMode, FileError, FileMode, FileNodeInfo,
-    FileOpenFlags, FileSeekWhence, FileStatus, FileUser, HandleFileStatusRequest,
+    FileOpenFlags, FileSeekWhence, FileStatus, FileStatusFlags, FileUser, HandleFileStatusRequest,
     IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
     PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse, file_type_from_raw, file_type_raw,
+    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, SetStatusFlagsRequest,
+    TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    file_type_from_raw, file_type_raw,
 };
 use crate::message::{FileRequest, FileResponse};
 
@@ -161,7 +162,7 @@ pub(super) fn decode_fs_request(decoder: &mut Decoder<'_>) -> Result<FileRequest
             path: decoder.shared_buffer_sequence()?,
             user: decode_user(decoder)?,
             access: decode_access_mode(decoder)?,
-            flags: FileOpenFlags::from_bits(decoder.u16()?).ok_or(WireError::InvalidTag)?,
+            flags: decode_open_flags(decoder)?,
             mode: decode_mode(decoder)?,
         })),
         REQUEST_TAG_READ => Ok(FileRequest::Read(ReadFileRequest {
@@ -374,6 +375,41 @@ fn decode_user(decoder: &mut Decoder<'_>) -> Result<FileUser, WireError> {
         user: decoder.u16()?,
         group: decoder.u16()?,
     })
+}
+
+pub(super) fn encode_status_flags(encoder: &mut Encoder, status: FileStatusFlags) {
+    encode_access_mode(encoder, status.access);
+    encoder.u16(status.flags.bits());
+}
+
+pub(super) fn decode_status_flags(decoder: &mut Decoder<'_>) -> Result<FileStatusFlags, WireError> {
+    Ok(FileStatusFlags {
+        access: decode_access_mode(decoder)?,
+        flags: decode_open_flags(decoder)?,
+    })
+}
+
+pub(super) fn encode_set_status_flags_request(
+    encoder: &mut Encoder,
+    request: SetStatusFlagsRequest,
+) {
+    encoder.handle(request.handle);
+    encoder.u16(request.mask.bits());
+    encoder.u16(request.flags.bits());
+}
+
+pub(super) fn decode_set_status_flags_request(
+    decoder: &mut Decoder<'_>,
+) -> Result<SetStatusFlagsRequest, WireError> {
+    Ok(SetStatusFlagsRequest {
+        handle: decoder.handle()?,
+        mask: decode_open_flags(decoder)?,
+        flags: decode_open_flags(decoder)?,
+    })
+}
+
+fn decode_open_flags(decoder: &mut Decoder<'_>) -> Result<FileOpenFlags, WireError> {
+    FileOpenFlags::from_bits(decoder.u16()?).ok_or(WireError::InvalidTag)
 }
 
 fn encode_access_mode(encoder: &mut Encoder, access: FileAccessMode) {

@@ -5,11 +5,11 @@
 
 use alloc::sync::Arc;
 
+use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::rwlock::RwLock;
 
-use crate::Result;
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
@@ -17,6 +17,7 @@ use crate::process::ProcessObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::socket::SocketObject;
 use crate::timer::TimerObject;
+use crate::{BrokerError, BrokerProcess, Result};
 
 bitflags::bitflags! {
     /// Broker rights attached to an object reference.
@@ -104,4 +105,36 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
         }
     };
     Ok(socket.readiness())
+}
+
+/// Returns the access mode and status flags of an object.
+pub(crate) fn get_status_flags(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+) -> Result<FileStatusFlags> {
+    let file = status_flags_file(object)?;
+    crate::fs::get_status_flags(process, &file)
+}
+
+/// Changes the status flags in `mask` of an object to their values in `flags`.
+pub(crate) fn set_status_flags(
+    process: &BrokerProcess,
+    object: &RwLock<ObjectEntry>,
+    mask: FileOpenFlags,
+    flags: FileOpenFlags,
+) -> Result<()> {
+    let file = status_flags_file(object)?;
+    crate::fs::set_status_flags(process, &file, mask, flags)
+}
+
+/// Returns the file whose status flags `object` holds, released from the object lock.
+fn status_flags_file(object: &RwLock<ObjectEntry>) -> Result<File> {
+    match &*object.read() {
+        ObjectEntry::File(file) => Ok(file.clone()),
+        ObjectEntry::Event(_)
+        | ObjectEntry::Pipe(_)
+        | ObjectEntry::Socket(_)
+        | ObjectEntry::Process(_)
+        | ObjectEntry::Timer(_) => Err(BrokerError::InvalidRights),
+    }
 }

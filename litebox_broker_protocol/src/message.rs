@@ -7,11 +7,12 @@ use crate::event::{
     CreateEventRequest, CreateEventResponse,
 };
 use crate::fs::{
-    ChmodFileRequest, ChownFileRequest, FileError, FileStatus, HandleFileStatusRequest,
-    IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest, OpenFileResponse,
-    PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse, ReadFileRequest,
-    ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse, TruncateFileRequest,
-    UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
+    ChmodFileRequest, ChownFileRequest, FileError, FileStatus, FileStatusFlags,
+    HandleFileStatusRequest, IsTerminalFileRequest, MkdirFileRequest, OpenFileRequest,
+    OpenFileResponse, PathFileStatusRequest, ReadDirectoryRequest, ReadDirectoryResponse,
+    ReadFileRequest, ReadFileResponse, RmdirFileRequest, SeekFileRequest, SeekFileResponse,
+    SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
+    WriteFileResponse,
 };
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -57,6 +58,10 @@ pub enum BrokerOperation {
     CloseObject(ObjectHandle),
     /// Check the current readiness of a broker-owned object.
     CheckReadiness(ObjectHandle),
+    /// Read the access mode and status flags of a broker-owned object.
+    GetStatusFlags(ObjectHandle),
+    /// Change status flags of a broker-owned object.
+    SetStatusFlags(SetStatusFlagsRequest),
     /// Event object request family.
     Event(EventRequest),
     /// Pipe object request family.
@@ -139,6 +144,8 @@ impl BrokerOperation {
             | Self::SetChildReaping(_)
             | Self::GetProcessExitStatus(_)
             | Self::CheckReadiness(_)
+            | Self::GetStatusFlags(_)
+            | Self::SetStatusFlags(_)
             | Self::Event(_)
             | Self::Timer(_)
             | Self::Pipe(PipeRequest::Create(_))
@@ -283,6 +290,10 @@ pub enum BrokerResult {
     ObjectClosed,
     /// Current readiness of a broker-owned object.
     Readiness(ReadinessFlags),
+    /// Access mode and status flags of a broker-owned object.
+    StatusFlags(FileStatusFlags),
+    /// Status flags of a broker-owned object were changed.
+    StatusFlagsSet,
     /// Event object response family.
     Event(EventResponse),
     /// Pipe object response family.

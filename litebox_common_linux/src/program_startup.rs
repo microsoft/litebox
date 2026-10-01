@@ -18,8 +18,7 @@ const HEADER_SIZE: usize = size_of::<[u32; 9]>() + size_of::<[u64; 2]>();
 /// Size of an inherited descriptor's number, handle, and kind tag, which precede its kind's fields.
 const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
 const FILE_TAG: u8 = 0;
-const STDIO_TAG: u8 = 1;
-const PIPE_TAG: u8 = 2;
+const PIPE_TAG: u8 = 1;
 
 /// Linux program state needed to load a child in a fresh runner.
 ///
@@ -72,13 +71,8 @@ pub struct InheritedFd {
 /// The kind of object an [`InheritedFd`] refers to, with the metadata the runner tracks for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InheritedFdKind {
-    /// A file, whose access mode and status flags the broker keeps.
+    /// A file, including a standard stream, whose access mode and status flags the broker keeps.
     File,
-    /// A file that refers to a standard stream.
-    Stdio {
-        /// Status flags the runner tracks for the stream.
-        status_flags: OFlags,
-    },
     /// An end of a pipe.
     Pipe {
         /// Which end.
@@ -240,7 +234,6 @@ impl InheritedFd {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
                 InheritedFdKind::File => 0,
-                InheritedFdKind::Stdio { .. } => size_of::<u32>(),
                 InheritedFdKind::Pipe { .. } => size_of::<u8>() + size_of::<u32>(),
             }
     }
@@ -250,10 +243,6 @@ impl InheritedFd {
         push_u64(output, self.handle.0);
         match self.kind {
             InheritedFdKind::File => output.push(FILE_TAG),
-            InheritedFdKind::Stdio { status_flags } => {
-                output.push(STDIO_TAG);
-                push_u32(output, status_flags.bits());
-            }
             InheritedFdKind::Pipe {
                 endpoint,
                 status_flags,
@@ -273,9 +262,6 @@ impl InheritedFd {
         let handle = ObjectHandle(read_u64(input)?);
         let kind = match read_u8(input)? {
             FILE_TAG => InheritedFdKind::File,
-            STDIO_TAG => InheritedFdKind::Stdio {
-                status_flags: OFlags::from_bits_retain(read_u32(input)?),
-            },
             PIPE_TAG => InheritedFdKind::Pipe {
                 endpoint: match read_u8(input)? {
                     0 => HalfPipeType::ReceiverHalf,
@@ -412,16 +398,7 @@ mod tests {
                 InheritedFd {
                     fd: 1,
                     handle: ObjectHandle(7),
-                    kind: InheritedFdKind::Stdio {
-                        status_flags: OFlags::APPEND | OFlags::RDWR,
-                    },
-                },
-                InheritedFd {
-                    fd: 2,
-                    handle: ObjectHandle(10),
-                    kind: InheritedFdKind::Stdio {
-                        status_flags: OFlags::APPEND | OFlags::RDWR | OFlags::NONBLOCK,
-                    },
+                    kind: InheritedFdKind::File,
                 },
                 InheritedFd {
                     fd: 4,

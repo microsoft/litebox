@@ -277,6 +277,8 @@ fn vfork_exec_child_inherits_descriptors_not_marked_close_on_exec() {
     );
     assert_eq!(numeric_field(parent_line, "exited="), 1);
     assert_eq!(numeric_field(parent_line, "code="), 42);
+    // The child's `F_SETFL` changed the open file description the parent's stdin shares.
+    assert_eq!(numeric_field(parent_line, "stdin_nonblock="), 1);
     // The parent's stdout and `log` share the offset the child advanced through both.
     let log: Vec<_> = lines.collect();
     assert_eq!(
