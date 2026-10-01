@@ -228,6 +228,10 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         }
     }
 
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     fn next_tag(&self) -> u16 {
         // NOTAG is reserved for Tversion/Rversion, so cycle through 1..NOTAG.
         // `fetch_update` returns the value before the update, which is the tag

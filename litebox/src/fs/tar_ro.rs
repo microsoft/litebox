@@ -346,7 +346,7 @@ impl TarIndex {
                 continue;
             };
             let path = normalize_tar_filename(path);
-            assert!(!path.is_empty());
+            assert_ne!(path, "");
 
             let data = entry.data();
             let start = (data.as_ptr() as usize).checked_sub(base_ptr).unwrap();

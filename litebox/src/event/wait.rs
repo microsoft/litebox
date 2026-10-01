@@ -160,6 +160,10 @@ impl<Platform: RawSyncPrimitivesProvider> WaitState<Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider> WaitStateInner<Platform> {
     /// Wakes up the thread if it is waiting (but not if it is running in the guest).
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     fn wake(&self) {
         let condvar = &self.condvar;
         let v = condvar.underlying_atomic().fetch_update(
@@ -210,6 +214,10 @@ impl<Platform: RawSyncPrimitivesProvider + ThreadProvider> ThreadHandle<Platform
     /// [`WaitContext::sleep`], it will be woken up to reevaluate its wait
     /// condition and interrupt condition. If it is running guest code, the
     /// platform will interrupt the thread and re-enter the shim.
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     pub fn interrupt(&self) {
         let condvar = &self.waker.0.condvar;
         let v = condvar.underlying_atomic().fetch_update(

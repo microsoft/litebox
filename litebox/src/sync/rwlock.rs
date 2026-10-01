@@ -85,6 +85,10 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     }
 
     #[expect(dead_code, reason = "we may need this eventually for RwLock::try_read")]
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
+    )]
     #[inline]
     fn try_read(&self) -> bool {
         self.state
@@ -179,6 +183,10 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     #[expect(
         dead_code,
         reason = "we may need this eventually for RwLock::try_write"
+    )]
+    #[allow(
+        deprecated,
+        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
     )]
     #[inline]
     fn try_write(&self) -> bool {
