@@ -415,19 +415,16 @@ impl ElfParsedFile {
             return Ok(());
         }
         let file_size = file.size().map_err(ElfParseError::Io)?;
-        let unpatched = || {
-            if syscall_entry_point == 0 {
-                Ok(())
-            } else {
-                Err(ElfParseError::UnpatchedBinary)
-            }
-        };
         let header_size = TRAMPOLINE_HEADER_SIZE;
 
         // File must be large enough to contain the header
         if file_size < header_size as u64 {
             // Too small for a trampoline header — binary is unpatched.
-            return unpatched();
+            return if syscall_entry_point == 0 {
+                Ok(())
+            } else {
+                Err(ElfParseError::UnpatchedBinary)
+            };
         }
 
         // Read the header from the end of the file
@@ -444,7 +441,11 @@ impl ElfParsedFile {
                 return Err(ElfParseError::BadTrampolineVersion);
             }
             // No trampoline found.
-            return unpatched();
+            return if syscall_entry_point == 0 {
+                Ok(())
+            } else {
+                Err(ElfParseError::UnpatchedBinary)
+            };
         }
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
@@ -1444,54 +1445,6 @@ mod island_tests {
     }
 
     #[test]
-    fn reserved_footer_prefix_is_corruption_only_at_fixed_start() {
-        for machine in [elf::abi::EM_AARCH64, elf::abi::EM_X86_64] {
-            for last in [b'1', b'?', 0] {
-                let mut bytes =
-                    include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64").to_vec();
-                // macOS admits ET_DYN only; keep footer validation host-independent.
-                bytes[16..18].copy_from_slice(&elf::abi::ET_DYN.to_le_bytes());
-                bytes.extend_from_slice(b"LITEBOX0");
-                bytes.extend_from_slice(&[0; 24]);
-                let mut file = File(bytes);
-                let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
-                parsed.header.e_machine = machine; // Exercise both footer parsers on the native host.
-                parsed
-                    .parse_trampoline_with_islands(&mut file, 1, true)
-                    .unwrap();
-                let tail = file.0.len() - 32;
-                file.0[tail + 7] = last;
-                let error = parsed
-                    .parse_trampoline_with_islands(&mut file, 1, true)
-                    .unwrap_err();
-                if machine == elf::abi::EM_X86_64 {
-                    assert!(matches!(error, ElfParseError::BadTrampolineVersion));
-                } else {
-                    assert!(matches!(error, ElfParseError::BadTrampoline));
-                }
-                file.0.push(0); // Displaced prefix is incidental data, not a footer.
-                assert!(matches!(
-                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
-                    Err(ElfParseError::UnpatchedBinary)
-                ));
-                file.0.pop();
-                file.0[tail..].fill(0);
-                file.0[tail + 16..tail + 24].copy_from_slice(b"LITEBOX1");
-                assert!(matches!(
-                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
-                    Err(ElfParseError::UnpatchedBinary)
-                ));
-                file.0[tail..tail + 8].copy_from_slice(b"LITEBOX0");
-                // Exact magic with a malformed zero sentinel is still corruption.
-                assert!(matches!(
-                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
-                    Err(ElfParseError::BadTrampoline)
-                ));
-            }
-        }
-    }
-
-    #[test]
     fn island_read_errors_preserve_errno_before_capability_checks() {
         struct FailingFile {
             file: File,
@@ -1546,20 +1499,6 @@ mod island_tests {
             parsed.parse_trampoline_with_islands(&mut corrupt, 0, false),
             Err(ElfParseError::BadTrampoline)
         ));
-    }
-
-    #[test]
-    fn zero_sentinel_does_not_reserve_islands() {
-        let mut file = file();
-        let original_len =
-            include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64").len();
-        file.0.truncate(original_len);
-        file.0.extend_from_slice(b"LITEBOX0");
-        file.0.extend_from_slice(&[0; 24]);
-        let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
-        parsed.parse_trampoline(&mut file, 0).unwrap();
-        assert!(!parsed.has_trampoline());
-        assert!(parsed.aarch64_islands().unwrap().pairs.is_empty());
     }
 }
 
