@@ -5,6 +5,22 @@
 //! batch owns fresh host pages, even when an older island has unused slots.
 //! The outer `elf_mapping_update` mutex serializes publication and VM mutation;
 //! it is never acquired by signal recovery.
+//!
+//! Compatibility limits (AArch64 Linux guests only):
+//! - `munmap`/`MAP_FIXED` return `EBUSY` if removing transport would strand a
+//!   surviving rewritten site. Live pairs are not relocated for these requests.
+//!   A loader that ignores a failed unmap can leave its mappings resident.
+//! - Destructive advice returns `EBUSY` for transport, rewrite-critical source
+//!   pages, and retained reservations. Ordinary data uses the common VM path.
+//! - Moving tracked ELF mappings or transport with `mremap` is rejected with
+//!   `EINVAL`; moving baked-in branches requires re-linking that is not implemented.
+//! - ELF mappings must not be simultaneously writable and executable. RWX
+//!   mappings/transitions return `EACCES`, including tracked data/reservations;
+//!   this excludes W+X LOADs and musl's RWX text-relocation sequence. RW then RX
+//!   transitions remain supported and rescan changed source bytes before execution.
+//!
+//! These are rewriter safeguards, not Linux syscall semantics. x86's direct
+//! trampoline path does not use these island-specific restrictions.
 
 use super::{
     ElfPatchState, Errno, HOST_PAGE_SIZE, MapFlags, ProtFlags, ProtectionRange, Range,

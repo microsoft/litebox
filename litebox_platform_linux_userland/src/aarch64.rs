@@ -280,6 +280,10 @@ const _: () = {
     };
     assert!(ISLAND_FRAME_BYTES == 16 && ISLAND_SVC_FRAME_BYTES == 16);
     assert!(ISLAND_FRAME_BYTES + ISLAND_SVC_FRAME_BYTES == 32);
+    assert!(
+        ISLAND_FRAME_BYTES + ISLAND_SVC_FRAME_BYTES
+            == litebox_syscall_rewriter::aarch64::SVC_FRAME_BYTES
+    );
     assert!(ISLAND_SVC_FRAME_OFF_RETADDR == 0);
     assert!(ISLAND_SVC_FRAME_OFF_STUB == 8);
     assert!(ISLAND_SVC_FRAME_OFF_X16 == 16);

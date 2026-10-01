@@ -2021,6 +2021,7 @@ const _: () = {
     };
     assert!(ISLAND_FRAME_BYTES == 16 && ISLAND_SVC_FRAME_BYTES == 16);
     assert!(ISLAND_FRAME_BYTES + ISLAND_SVC_FRAME_BYTES == 32);
+    assert!(ISLAND_FRAME_BYTES + ISLAND_SVC_FRAME_BYTES == SVC_FRAME_BYTES);
     assert!(ISLAND_SVC_FRAME_OFF_RETADDR == 0);
     assert!(ISLAND_SVC_FRAME_OFF_STUB == 8);
     assert!(ISLAND_SVC_FRAME_OFF_X16 == 16);
@@ -2481,9 +2482,9 @@ fn run_thread_inner_with_process(
 }
 
 fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
-    // Linux activation measured >32KiB in the shared debug island recognizer.
-    // Use the same guarded minimum for this shared chain; native XNU execution
-    // still needs validation (including its own kernel vector signal frame).
+    // The shared debug island recognizer exceeded 32KiB during Linux activation.
+    // Keep headroom for the host signal frame and a nested fallible-read fault.
+    // This guarded minimum is a budget, not a bound for every compiler/vector setup.
     let alt_stack_size = (libc::SIGSTKSZ * 2)
         .max(128 * 1024)
         .next_multiple_of(HOST_PAGE_SIZE);
@@ -4279,9 +4280,11 @@ mod tests {
             ..switch_to_guest_via_sigreturn_end as *const () as usize;
         let outbound = switch_to_guest_via_outbound_stub_start as *const () as usize
             ..switch_to_guest_via_outbound_stub_end as *const () as usize;
-        assert!(
-            syscall_prologue
-                .contains(&(litebox_macos_island_syscall_callback as *const () as usize))
+        // Includes the direct entry's branch, island normalization, and shared capture.
+        assert_eq!(syscall_prologue.len(), 101 * size_of::<u32>());
+        assert_eq!(
+            litebox_macos_island_syscall_callback as *const () as usize,
+            syscall_prologue.start + size_of::<u32>()
         );
         assert_eq!(sigreturn.len(), 3 * size_of::<u32>());
         assert_eq!(outbound.len(), 52 * size_of::<u32>());

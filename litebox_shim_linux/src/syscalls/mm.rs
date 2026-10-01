@@ -745,7 +745,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         .map_err(Errno::from)
     }
 
-    /// Handle syscall `mmap`
+    /// Handle syscall `mmap` for AArch64 guests.
+    ///
+    /// ELF RWX mappings return `EACCES`. A fixed replacement that would remove
+    /// transport used by surviving sites returns `EBUSY`; see [`islands`].
     #[cfg(target_arch = "aarch64")]
     pub(crate) fn sys_mmap(
         &self,
@@ -855,7 +858,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         result
     }
 
-    /// Handle syscall `munmap`
+    /// Handle syscall `munmap`.
+    ///
+    /// On AArch64, removing transport used by surviving sites returns `EBUSY`.
+    /// Unlike Linux, this can reject a partial image unmap.
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
         #[cfg(target_arch = "aarch64")]
@@ -927,7 +933,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         });
     }
 
-    /// Handle syscall `mprotect`
+    /// Handle syscall `mprotect`.
+    ///
+    /// AArch64 rejects RWX transitions on tracked ELF mappings/reservations with
+    /// `EACCES`, including data. RW then RX is supported.
     #[inline]
     pub(crate) fn sys_mprotect(
         &self,
@@ -1055,6 +1064,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     #[inline]
+    /// Remap memory. AArch64 rejects tracked ELF/transport remaps with `EINVAL`
+    /// until placement metadata and rewritten branches can move together.
     pub(crate) fn sys_mremap(
         &self,
         old_addr: UserPtrMut<u8>,
@@ -1110,7 +1121,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         result
     }
 
-    /// Handle syscall `madvise`
+    /// Handle syscall `madvise`.
+    ///
+    /// On AArch64, destructive advice on rewrite-critical source pages, transport
+    /// or retained reservations returns `EBUSY`; ordinary data is not excluded.
     #[inline]
     pub(crate) fn sys_madvise(
         &self,

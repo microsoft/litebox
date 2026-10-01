@@ -1273,9 +1273,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         match consumed {
             AnyTypedFd::Fs(fd) => {
-                // Runtime ELF initialization snapshots metadata from this
-                // descriptor. Do not invalidate its broker handle mid-mmap;
-                // the raw-fd table lock was released before this VM lock.
+                // Closing an exposed guest fd must not invalidate its broker
+                // handle during ELF mmap metadata capture. The raw-fd table
+                // lock was released before this VM lock. Private cleanup of
+                // never-exposed handles (failed open/dup insertion, mknod,
+                // shebang probes, socket paths) bypasses this path: those handles
+                // cannot have mapping state. This is not a lock on all close_file calls.
                 #[cfg(target_arch = "aarch64")]
                 let _update = self.global.elf_mapping_update.lock();
                 let result = self.global.litebox.close_file(&fd).map_err(Errno::from);

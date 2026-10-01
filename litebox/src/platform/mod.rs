@@ -313,11 +313,13 @@ pub trait SystemInfoProvider {
     /// execution context and transfer control to the syscall handler.
     fn get_syscall_entry_point(&self) -> usize;
 
-    /// Linux-guest AArch64 island callback, distinct from the direct/AOT entry.
+    /// Linux-guest AArch64 island callback, distinct from the direct entry.
     ///
     /// Entry SP points to `{resume_pc, outbound_stub, guest_x16, guest_x30}`.
-    /// The callback must capture logical guest LR and reconstruct both saved
-    /// registers when returning through the island epilogue at guest SP - 16.
+    /// The callback captures the logical guest registers, including x16 and LR.
+    /// Linux and macOS restore the complete saved context through their generic
+    /// signal-return paths, not `outbound_stub`: its island may have been retired
+    /// while the syscall was running.
     /// `None` explicitly means this ABI is unavailable; callers must not install
     /// island SVC gates using the direct callback instead.
     #[cfg(target_arch = "aarch64")]
