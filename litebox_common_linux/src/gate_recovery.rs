@@ -6,6 +6,10 @@
 // TODO: Move shared AArch64 gate recovery and register-context types into an
 // OS-neutral module/crate: both Linux and native Darwin guests use them.
 
+mod island;
+#[cfg(test)]
+mod island_tests;
+
 use crate::PtRegs;
 use litebox::utils::TruncateExt as _;
 use litebox_syscall_rewriter::TargetHost;
@@ -183,6 +187,20 @@ fn canonicalize_impl(
         return Aarch64GateSignalResult::NotGate;
     }
     let pc: usize = pc.trunc();
+
+    if matches!(abi, GateAbi::Linux { .. }) {
+        let result = island::canonicalize(
+            context,
+            runtime,
+            interruption,
+            host,
+            virtualize_x18,
+            &mut read,
+        );
+        if !matches!(result, Aarch64GateSignalResult::NotGate) {
+            return result;
+        }
+    }
 
     let aligned = pc & !(GATE_ALIGNMENT - 1);
     let mut found = None;

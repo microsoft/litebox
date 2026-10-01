@@ -153,6 +153,13 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
         Ok(regions.aligned_ptr)
     }
 
+    fn release_reservation(&mut self, address: usize, len: usize) -> Result<(), Self::Error> {
+        self.task.sys_munmap(
+            UserPtrMut::from_usize(address),
+            len.next_multiple_of(PAGE_SIZE),
+        )
+    }
+
     fn map_file(
         &mut self,
         address: usize,

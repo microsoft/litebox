@@ -18,6 +18,7 @@ use thiserror::Error;
 use zerocopy::FromBytes;
 
 use crate::{HOST_PAGE_SIZE, errno::Errno, vmem::PAGE_SIZE};
+use litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands;
 
 type Endian = elf::endian::LittleEndian;
 
@@ -29,6 +30,7 @@ pub struct ElfParsedFile {
     header: FileHeader<Endian>,
     phdrs: Vec<u8>,
     trampoline: Option<TrampolineInfo>,
+    islands: Option<ElfIslands>,
 }
 
 /// Information about the mapped ELF file. This is used to set up the process
@@ -78,13 +80,14 @@ const TRAMPOLINE_FILE_ALIGNMENT: u64 = 4096;
 #[repr(C, packed)]
 #[derive(FromBytes)]
 pub struct TrampolineHeader64 {
-    /// The format magic and version.
+    /// The unchanged outer format magic, `LITEBOX0`.
     pub magic: u64,
-    /// The file offset of the trampoline code.
+    /// File offset of legacy code or the AArch64 island descriptor.
     pub file_offset: u64,
-    /// The virtual address of the trampoline code.
+    /// Legacy code address, or minimum object-relative AArch64 island address.
     pub vaddr: u64,
-    /// The size of the trampoline code.
+    /// Serialized bytes, not an AArch64 virtual span. Zero is the processed
+    /// sentinel and requires both offset and address to be zero.
     pub trampoline_size: u64,
 }
 
@@ -145,8 +148,8 @@ pub enum ElfParseError<E> {
     Io(#[source] E),
     #[error("Bad trampoline section")]
     BadTrampoline,
-    #[error("Invalid trampoline version")]
-    BadTrampolineVersion,
+    #[error("Loader does not support this AArch64 ELF island ABI")]
+    UnsupportedIslandAbi,
     #[error("Binary not patched for syscall rewriting")]
     UnpatchedBinary,
     #[error("Unsupported ELF type")]
@@ -161,7 +164,7 @@ impl<E: Into<Errno>> From<ElfParseError<E>> for Errno {
             ElfParseError::Elf(_)
             | ElfParseError::BadFormat
             | ElfParseError::BadTrampoline
-            | ElfParseError::BadTrampolineVersion
+            | ElfParseError::UnsupportedIslandAbi
             | ElfParseError::UnpatchedBinary
             | ElfParseError::BadInterp
             | ElfParseError::UnsupportedType => Errno::ENOEXEC,
@@ -177,8 +180,8 @@ pub enum ElfLoadError<E> {
     Map(#[source] E),
     #[error("Invalid program header")]
     InvalidProgramHeader,
-    #[error("Invalid trampoline version")]
-    InvalidTrampolineVersion,
+    #[error("Loader does not support this AArch64 ELF island ABI")]
+    UnsupportedIslandAbi,
     #[error(transparent)]
     Fault(#[from] Fault),
 }
@@ -186,7 +189,7 @@ pub enum ElfLoadError<E> {
 impl<E: Into<Errno>> From<ElfLoadError<E>> for Errno {
     fn from(value: ElfLoadError<E>) -> Self {
         match value {
-            ElfLoadError::InvalidProgramHeader | ElfLoadError::InvalidTrampolineVersion => {
+            ElfLoadError::InvalidProgramHeader | ElfLoadError::UnsupportedIslandAbi => {
                 Errno::ENOEXEC
             }
             ElfLoadError::Fault(Fault) => Errno::EFAULT,
@@ -283,18 +286,28 @@ impl ElfParsedFile {
             header,
             phdrs,
             trampoline: None,
+            islands: None,
         })
     }
 
     /// Returns `true` if a trampoline was parsed and will be mapped by `load()`.
     pub fn has_trampoline(&self) -> bool {
-        self.trampoline.is_some()
+        self.trampoline.is_some() || self.islands.as_ref().is_some_and(|p| !p.pairs.is_empty())
+    }
+
+    /// Validated AArch64 island images, including a possible empty sentinel.
+    /// Only each pair's `island_vaddr..island_vaddr+granule` is a fixed virtual
+    /// extent; descriptor bytes and full chunks never enlarge the image span.
+    pub fn aarch64_islands(&self) -> Option<&ElfIslands> {
+        self.islands.as_ref()
     }
 
     /// The pages the trampoline occupies when this ELF is loaded at `base_addr`;
     /// a zero `base_addr` yields the load-address-relative range.
     ///
-    /// `None` if the binary has no trampoline or, like [`Self::has_trampoline`],
+    /// This is the legacy contiguous range API, not an island-image envelope.
+    /// Island-capable consumers use [`Self::aarch64_islands`] instead.
+    /// `None` if the binary has no legacy trampoline or, like [`Self::has_trampoline`],
     /// if [`Self::parse_trampoline`] has not run yet.
     pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
         let trampoline = self.trampoline.as_ref()?;
@@ -313,22 +326,58 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "cannot panic: array slices are always the correct size"
-    )]
     pub fn parse_trampoline<F: ReadAt>(
         &mut self,
         file: &mut F,
         syscall_entry_point: usize,
     ) -> Result<(), ElfParseError<F::Error>> {
-        if syscall_entry_point == 0 {
-            // Platform running in kernel mode does not need trampoline
-            // and may give zero as entry point.
+        self.parse_trampoline_with_islands(file, syscall_entry_point, false)
+    }
+
+    /// Parse with explicit delegation to an island-capable mapper. Generic
+    /// loaders (including OP-TEE) must not execute the descriptor as legacy code.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "cannot panic: array slices are always the correct size"
+    )]
+    pub fn parse_trampoline_with_islands<F: ReadAt>(
+        &mut self,
+        file: &mut F,
+        syscall_entry_point: usize,
+        island_capable: bool,
+    ) -> Result<(), ElfParseError<F::Error>> {
+        let file_size = file.size().map_err(ElfParseError::Io)?;
+        if self.header.e_machine == elf::abi::EM_AARCH64 {
+            let mut read_error = None;
+            let payload = ElfIslands::read(file_size, |offset, buf| {
+                file.read_at(offset, buf).map_err(|error| {
+                    if read_error.is_none() {
+                        read_error = Some(error);
+                    }
+                    litebox_syscall_rewriter::Error::ParseError(alloc::string::String::from(
+                        "ELF island read",
+                    ))
+                })
+            });
+            if let Some(error) = read_error {
+                return Err(ElfParseError::Io(error));
+            }
+            let Some(payload) = payload.map_err(|_| ElfParseError::BadTrampoline)? else {
+                return if syscall_entry_point == 0 {
+                    Ok(())
+                } else {
+                    Err(ElfParseError::UnpatchedBinary)
+                };
+            };
+            if !payload.pairs.is_empty() && !island_capable {
+                return Err(ElfParseError::UnsupportedIslandAbi);
+            }
+            self.islands = Some(payload);
             return Ok(());
         }
-
-        let file_size = file.size().map_err(ElfParseError::Io)?;
+        if syscall_entry_point == 0 {
+            return Ok(());
+        }
 
         let header_size = TRAMPOLINE_HEADER_SIZE;
 
@@ -344,15 +393,14 @@ impl ElfParsedFile {
         file.read_at(header_offset, &mut header_buf[..header_size])
             .map_err(ElfParseError::Io)?;
 
-        // Check magic and version. Format: "LITEBOX" + version byte.
+        // LITEBOX0 is the only supported footer magic.
         let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
         if magic != TRAMPOLINE_MAGIC {
-            // If the prefix matches but the version differs, fail explicitly.
-            if &header_buf[0..7] == b"LITEBOX" {
-                return Err(ElfParseError::BadTrampolineVersion);
-            }
-            // No trampoline found.
-            return Err(ElfParseError::UnpatchedBinary);
+            return Err(if &header_buf[..7] == b"LITEBOX" {
+                ElfParseError::BadTrampoline
+            } else {
+                ElfParseError::UnpatchedBinary
+            });
         }
 
         let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
@@ -380,6 +428,9 @@ impl ElfParsedFile {
         // trampoline_size == 0 means the rewriter checked this binary and found
         // no syscall instructions.
         if trampoline_size == 0 {
+            if file_offset != 0 || vaddr != 0 {
+                return Err(ElfParseError::BadTrampoline);
+            }
             return Ok(());
         }
 
@@ -394,7 +445,7 @@ impl ElfParsedFile {
         }
 
         // The trampoline code should immediately precede the header.
-        if file_offset + trampoline_size as u64 != header_offset {
+        if file_offset.checked_add(trampoline_size as u64) != Some(header_offset) {
             return Err(ElfParseError::BadTrampoline);
         }
 
@@ -465,6 +516,11 @@ impl ElfParsedFile {
         mem: &mut impl AccessMemory,
         reserve_trampoline: Option<usize>,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
+        if self.islands.as_ref().is_some_and(|p| !p.pairs.is_empty())
+            && !M::SUPPORTS_AARCH64_ISLANDS
+        {
+            return Err(ElfLoadError::UnsupportedIslandAbi);
+        }
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
             let mut min = usize::MAX;
@@ -491,9 +547,33 @@ impl ElfParsedFile {
                         .ok_or(ElfLoadError::InvalidProgramHeader)?,
                 );
             }
-            let min = page_align_down(min);
+            if let Some(payload) = &self.islands {
+                let granule = usize::try_from(payload.granule)
+                    .map_err(|_| ElfLoadError::InvalidProgramHeader)?;
+                for pair in &payload.pairs {
+                    let start = usize::try_from(pair.island_vaddr())
+                        .map_err(|_| ElfLoadError::InvalidProgramHeader)?;
+                    min = min.min(start);
+                    max = max.max(
+                        start
+                            .checked_add(granule)
+                            .ok_or(ElfLoadError::InvalidProgramHeader)?,
+                    );
+                }
+                align = align.max(granule);
+            }
+            let granule = self
+                .islands
+                .as_ref()
+                .filter(|p| !p.pairs.is_empty())
+                .map_or(Ok(PAGE_SIZE), |p| {
+                    usize::try_from(p.granule).map_err(|_| ElfLoadError::InvalidProgramHeader)
+                })?;
+            // Subtract an equally aligned object-relative origin so the load
+            // bias, not just the reservation address, preserves PT_LOAD alignment.
+            let min = min & !(align - 1);
             let max = max
-                .checked_next_multiple_of(PAGE_SIZE)
+                .checked_next_multiple_of(granule)
                 .ok_or(ElfLoadError::InvalidProgramHeader)?;
             let span = max
                 .checked_sub(min)
@@ -501,13 +581,35 @@ impl ElfParsedFile {
             if span == 0 {
                 return Err(ElfLoadError::InvalidProgramHeader);
             }
-            mapper.reserve(span, align).map_err(ElfLoadError::Map)?
+            let reserved = mapper.reserve(span, align).map_err(ElfLoadError::Map)?;
+            let Some(bias) = reserved.checked_sub(min) else {
+                mapper
+                    .release_reservation(reserved, span)
+                    .map_err(ElfLoadError::Map)?;
+                return Err(ElfLoadError::InvalidProgramHeader);
+            };
+            bias
         } else {
             // For ET_EXEC, load at the fixed addresses specified in the ELF.
             0
         };
 
         let mut brk = 0;
+        if let Some(payload) = &self.islands
+            && !payload.pairs.is_empty()
+        {
+            mapper
+                .prepare_aarch64_islands(payload, base_addr, self.header.e_type == elf::abi::ET_DYN)
+                .map_err(ElfLoadError::Map)?;
+            for pair in &payload.pairs {
+                let end = usize::try_from(pair.island_vaddr())
+                    .ok()
+                    .and_then(|v| base_addr.checked_add(v))
+                    .and_then(|v| v.checked_add(usize::try_from(payload.granule).ok()?))
+                    .ok_or(ElfLoadError::InvalidProgramHeader)?;
+                brk = brk.max(end);
+            }
+        }
         let mut phdrs_addr = 0;
         for ph in self.pt_loads() {
             let p_vaddr: usize = ph.p_vaddr.trunc();
@@ -536,7 +638,7 @@ impl ElfParsedFile {
                     .p_offset
                     .wrapping_sub((adjusted_vaddr - load_start) as u64);
                 mapper
-                    .map_file(load_start, file_end - load_start, offset, &prot)
+                    .map_elf_load(load_start, file_end - load_start, offset, &prot, base_addr)
                     .map_err(ElfLoadError::Map)?;
                 // Zero out the remaining part of the last page.
                 //
@@ -661,6 +763,9 @@ impl ElfParsedFile {
         mem: &mut impl AccessMemory,
         loaded_entry_point: usize,
     ) -> Result<(), ElfLoadError<M::Error>> {
+        if self.islands.as_ref().is_some_and(|p| !p.pairs.is_empty()) {
+            return Err(ElfLoadError::UnsupportedIslandAbi);
+        }
         // If there's no trampoline, nothing to do.
         if self.trampoline.is_none() {
             return Ok(());
@@ -698,12 +803,34 @@ pub trait MapMemory {
     /// loader only advances `brk` past the declared range.
     const POPULATES_TRAMPOLINE: bool = false;
 
+    /// Explicit support for installing serialized pairs before any LOAD is executable.
+    const SUPPORTS_AARCH64_ISLANDS: bool = false;
+
+    /// Prepare an island image. `reserved` proves that this mapper just reserved
+    /// the ET_DYN envelope, including every island extent. Full chunks are not
+    /// part of that reservation. Called only for an explicitly capable mapper.
+    fn prepare_aarch64_islands(
+        &mut self,
+        _payload: &ElfIslands,
+        _base: usize,
+        _reserved: bool,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Reserve a region of memory with the given length and alignment,
-    /// returning the chosen address.
+    /// returning the chosen address. On success the caller owns exactly
+    /// `address..address + len.next_multiple_of(PAGE_SIZE)`; any alignment or
+    /// placement-search slack must already have been released.
     ///
     /// `align` must be a power of two. Fails if any of the parameters are not
     /// page-aligned.
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error>;
+
+    /// Release an untouched reservation returned by [`Self::reserve`]. `address`
+    /// and `len` identify that exact page-rounded extent, not its search slack.
+    /// Called only before any LOAD or island has been installed into it.
+    fn release_reservation(&mut self, address: usize, len: usize) -> Result<(), Self::Error>;
 
     /// Map file data, replacing any existing mappings.
     ///
@@ -715,6 +842,20 @@ pub trait MapMemory {
         offset: u64,
         prot: &Protection,
     ) -> Result<(), Self::Error>;
+
+    /// Map a PT_LOAD at the bias chosen by this load, before publishing execute
+    /// permission. Unlike arbitrary file mappings, aliased file pages have an
+    /// unambiguous object identity here. The default needs no such provenance.
+    fn map_elf_load(
+        &mut self,
+        address: usize,
+        len: usize,
+        offset: u64,
+        prot: &Protection,
+        _load_bias: usize,
+    ) -> Result<(), Self::Error> {
+        self.map_file(address, len, offset, prot)
+    }
 
     /// Map zeroed memory, replacing any existing mappings.
     ///
@@ -1016,5 +1157,468 @@ mod reserve_regions_tests {
             assert_eq!(head + tail, align - PAGE_SIZE);
             assert_page_aligned(&r);
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod island_tests {
+    use super::*;
+
+    struct File(Vec<u8>);
+    impl ReadAt for File {
+        type Error = ();
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            buf.copy_from_slice(
+                self.0
+                    .get(start..start.checked_add(buf.len()).ok_or(())?)
+                    .ok_or(())?,
+            );
+            Ok(())
+        }
+        fn size(&mut self) -> Result<u64, ()> {
+            Ok(self.0.len() as u64)
+        }
+    }
+    struct Memory;
+    impl AccessMemory for Memory {
+        fn read(&mut self, _: usize, _: &mut [u8]) -> Result<usize, Fault> {
+            panic!("unexpected memory read")
+        }
+        fn write(&mut self, _: usize, _: &[u8]) -> Result<(), Fault> {
+            panic!("descriptor must not be mapped as code")
+        }
+        fn zero(&mut self, _: usize, _: usize) -> Result<(), Fault> {
+            Ok(())
+        }
+    }
+    #[derive(Default)]
+    struct Mapper<const CAPABLE: bool> {
+        reservation: usize,
+        reservation_align: usize,
+        prepared: bool,
+        mappings: Vec<Range<usize>>,
+    }
+    use core::ops::Range;
+    impl<const CAPABLE: bool> MapMemory for Mapper<CAPABLE> {
+        type Error = ();
+        const SUPPORTS_AARCH64_ISLANDS: bool = CAPABLE;
+        fn reserve(&mut self, len: usize, align: usize) -> Result<usize, ()> {
+            self.reservation = len;
+            self.reservation_align = align;
+            assert_eq!(0x10000000 % align, 0);
+            Ok(0x10000000)
+        }
+        fn release_reservation(&mut self, _: usize, _: usize) -> Result<(), ()> {
+            panic!("unexpected reservation release")
+        }
+        fn prepare_aarch64_islands(
+            &mut self,
+            p: &ElfIslands,
+            base: usize,
+            reserved: bool,
+        ) -> Result<(), ()> {
+            assert!(reserved && !p.pairs.is_empty());
+            for pair in &p.pairs {
+                self.mappings.push(
+                    base + usize::try_from(pair.island_vaddr()).unwrap()
+                        ..base
+                            + usize::try_from(pair.island_vaddr()).unwrap()
+                            + usize::try_from(p.granule).unwrap(),
+                );
+            }
+            self.prepared = true;
+            Ok(())
+        }
+        fn map_file(&mut self, start: usize, len: usize, _: u64, _: &Protection) -> Result<(), ()> {
+            assert!(self.prepared);
+            self.mappings.push(start..start + len);
+            Ok(())
+        }
+        fn map_zero(&mut self, _: usize, _: usize, _: &Protection) -> Result<(), ()> {
+            Ok(())
+        }
+        fn protect(&mut self, _: usize, _: usize, _: &Protection) -> Result<(), ()> {
+            panic!("legacy trampoline protect")
+        }
+    }
+    fn file() -> File {
+        let mut elf = include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64").to_vec();
+        elf[16..18].copy_from_slice(&elf::abi::ET_DYN.to_le_bytes());
+        File(litebox_syscall_rewriter::hook_syscalls_in_elf(&elf, None).unwrap())
+    }
+
+    #[test]
+    fn island_reservation_and_brk_exclude_serialized_chunk_file_size() {
+        let mut file = file();
+        let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
+        parsed
+            .parse_trampoline_with_islands(&mut file, 1, true)
+            .unwrap();
+        assert!(parsed.has_trampoline());
+        assert!(parsed.trampoline_page_range(0).is_none());
+        let payload = parsed.aarch64_islands().unwrap();
+        let mut ranges: Vec<_> = parsed
+            .pt_loads()
+            .map(|ph| {
+                ph.p_vaddr / 4096 * 4096
+                    ..ph.p_vaddr
+                        .checked_add(ph.p_memsz)
+                        .unwrap()
+                        .next_multiple_of(4096)
+            })
+            .collect();
+        ranges.extend(
+            payload
+                .pairs
+                .iter()
+                .map(|p| p.island_vaddr()..p.island_vaddr() + payload.granule),
+        );
+        let min = usize::try_from(ranges.iter().map(|r| r.start).min().unwrap()).unwrap();
+        let max = usize::try_from(ranges.iter().map(|r| r.end).max().unwrap()).unwrap();
+        let mut mapper = Mapper::<true>::default();
+        let result = parsed.load(&mut mapper, &mut Memory, None).unwrap();
+        assert_eq!(
+            mapper.reservation,
+            max - (min & !(mapper.reservation_align - 1))
+        );
+        assert_eq!(
+            result.brk,
+            (result.base_addr + max).next_multiple_of(HOST_PAGE_SIZE)
+        );
+        assert_eq!(
+            mapper.mappings.len(),
+            payload.pairs.len() + parsed.pt_loads().count()
+        );
+        let mut unsupported = Mapper::<false>::default();
+        assert!(matches!(
+            parsed.load(&mut unsupported, &mut Memory, None),
+            Err(ElfLoadError::UnsupportedIslandAbi)
+        ));
+        assert_eq!(unsupported.reservation, 0);
+    }
+
+    #[test]
+    fn island_below_nonzero_load_preserves_overaligned_dyn_load_bias() {
+        // One over-aligned LOAD with no internal gap. Its SVC is nearest to
+        // the page below the LOAD, which is not aligned to p_align.
+        let mut elf = alloc::vec![0; 0x2000];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, value) in [
+            (16, elf::abi::ET_DYN),
+            (18, elf::abi::EM_AARCH64),
+            (52, 64),
+            (54, 56),
+            (56, 1),
+        ] {
+            elf[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes());
+        elf[64..68].copy_from_slice(&elf::abi::PT_LOAD.to_le_bytes());
+        elf[68..72].copy_from_slice(&(elf::abi::PF_R | elf::abi::PF_X).to_le_bytes());
+        for (at, value) in [
+            (24, 0x10110u64),
+            (32, 64),
+            (80, 0x10000),
+            (96, 0x2000),
+            (104, 0x2000),
+            (112, 0x10000),
+        ] {
+            elf[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        elf[0x110..0x114].copy_from_slice(&0xd4000001u32.to_le_bytes());
+        let mut file = File(litebox_syscall_rewriter::hook_syscalls_in_elf(&elf, None).unwrap());
+        let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
+        parsed
+            .parse_trampoline_with_islands(&mut file, 1, true)
+            .unwrap();
+        let payload = parsed.aarch64_islands().unwrap();
+        assert_eq!(payload.granule, 0x1000);
+        assert_eq!(payload.pairs.len(), 1);
+        assert_eq!(payload.pairs[0].island_vaddr(), 0xf000);
+
+        let mut mapper = Mapper::<true>::default();
+        let result = parsed.load(&mut mapper, &mut Memory, None).unwrap();
+        assert_eq!(mapper.reservation_align, 0x10000);
+        for ph in parsed.pt_loads() {
+            let align = usize::try_from(ph.p_align).unwrap();
+            assert_eq!(result.base_addr % align, 0);
+            assert_eq!(
+                (result.base_addr + usize::try_from(ph.p_vaddr).unwrap()) % align,
+                usize::try_from(ph.p_offset).unwrap() % align
+            );
+        }
+        assert_eq!(mapper.reservation, 0x12000);
+        assert_eq!(result.base_addr, 0x10000000);
+        for mapping in mapper.mappings {
+            assert!(mapping.start >= 0x10000000);
+            assert!(mapping.end <= 0x10000000 + mapper.reservation);
+        }
+    }
+
+    #[test]
+    fn generic_loader_rejects_island_abi_even_without_syscall_callback() {
+        let mut file = file();
+        for callback in [0, 1] {
+            let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
+            assert!(matches!(
+                parsed.parse_trampoline(&mut file, callback),
+                Err(ElfParseError::UnsupportedIslandAbi)
+            ));
+        }
+        // Malformed recognized metadata cannot be hidden by callback == 0.
+        let end = file.0.len();
+        file.0[end - 1] = 0xff;
+        let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
+        assert!(matches!(
+            parsed.parse_trampoline(&mut file, 0),
+            Err(ElfParseError::BadTrampoline)
+        ));
+    }
+
+    #[test]
+    fn reserved_footer_prefix_is_corruption_only_at_fixed_start() {
+        for machine in [elf::abi::EM_AARCH64, elf::abi::EM_X86_64] {
+            for last in [b'1', b'?', 0] {
+                let mut bytes =
+                    include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64").to_vec();
+                // macOS admits ET_DYN only; keep footer validation host-independent.
+                bytes[16..18].copy_from_slice(&elf::abi::ET_DYN.to_le_bytes());
+                bytes.extend_from_slice(b"LITEBOX0");
+                bytes.extend_from_slice(&[0; 24]);
+                let mut file = File(bytes);
+                let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
+                parsed.header.e_machine = machine; // Exercise both footer parsers on the native host.
+                parsed
+                    .parse_trampoline_with_islands(&mut file, 1, true)
+                    .unwrap();
+                let tail = file.0.len() - 32;
+                file.0[tail + 7] = last;
+                assert!(matches!(
+                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
+                    Err(ElfParseError::BadTrampoline)
+                ));
+                file.0.push(0); // Displaced prefix is incidental data, not a footer.
+                assert!(matches!(
+                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
+                    Err(ElfParseError::UnpatchedBinary)
+                ));
+                file.0.pop();
+                file.0[tail..].fill(0);
+                file.0[tail + 16..tail + 24].copy_from_slice(b"LITEBOX1");
+                assert!(matches!(
+                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
+                    Err(ElfParseError::UnpatchedBinary)
+                ));
+                file.0[tail..tail + 8].copy_from_slice(b"LITEBOX0");
+                // Exact magic with a malformed zero sentinel is still corruption.
+                assert!(matches!(
+                    parsed.parse_trampoline_with_islands(&mut file, 1, true),
+                    Err(ElfParseError::BadTrampoline)
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn island_read_errors_preserve_errno_before_capability_checks() {
+        struct FailingFile {
+            file: File,
+            fail_at: u64,
+        }
+        impl ReadAt for FailingFile {
+            type Error = Errno;
+            fn size(&mut self) -> Result<u64, Errno> {
+                Ok(self.file.0.len() as u64)
+            }
+            fn read_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), Errno> {
+                if offset == self.fail_at {
+                    return Err(Errno::EIO);
+                }
+                self.file
+                    .read_at(offset, bytes)
+                    .map_err(|()| Errno::ENODATA)
+            }
+        }
+        let bytes = file().0;
+        let tail = bytes.len() - 32;
+        let descriptor = usize::try_from(u64::from_le_bytes(
+            bytes[tail + 8..tail + 16].try_into().unwrap(),
+        ))
+        .unwrap();
+        let image = descriptor
+            + usize::try_from(u64::from_le_bytes(
+                bytes[descriptor + 72..descriptor + 80].try_into().unwrap(),
+            ))
+            .unwrap();
+        for fail_at in [tail, descriptor, image, 0x110] {
+            for (callback, capable) in [(0, false), (0, true), (1, false), (1, true)] {
+                let mut file = FailingFile {
+                    file: File(bytes.clone()),
+                    fail_at: fail_at as u64,
+                };
+                let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
+                let error = parsed
+                    .parse_trampoline_with_islands(&mut file, callback, capable)
+                    .unwrap_err();
+                assert!(
+                    matches!(error, ElfParseError::Io(Errno::EIO)),
+                    "{fail_at:#x}: {error:?}"
+                );
+                assert_eq!(Errno::from(error), Errno::EIO);
+            }
+        }
+        let mut corrupt = File(bytes);
+        corrupt.0[image] ^= 1;
+        let mut parsed = ElfParsedFile::parse(&mut corrupt).unwrap();
+        assert!(matches!(
+            parsed.parse_trampoline_with_islands(&mut corrupt, 0, false),
+            Err(ElfParseError::BadTrampoline)
+        ));
+    }
+
+    #[test]
+    fn zero_sentinel_does_not_reserve_islands() {
+        let mut file = file();
+        let original_len =
+            include_bytes!("../../litebox_syscall_rewriter/tests/hello-aarch64").len();
+        file.0.truncate(original_len);
+        file.0.extend_from_slice(b"LITEBOX0");
+        file.0.extend_from_slice(&[0; 24]);
+        let mut parsed = ElfParsedFile::parse(&mut file).unwrap();
+        parsed.parse_trampoline(&mut file, 0).unwrap();
+        assert!(!parsed.has_trampoline());
+        assert!(parsed.aarch64_islands().unwrap().pairs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod non_island_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn x86_dyn_nonzero_minimum_overaligned_loads_stay_in_reservation() {
+        struct Mapper {
+            address: usize,
+            len: usize,
+            loads: Vec<core::ops::Range<usize>>,
+            released: Vec<(usize, usize)>,
+            release_error: bool,
+        }
+        impl MapMemory for Mapper {
+            type Error = ();
+            fn reserve(&mut self, len: usize, align: usize) -> Result<usize, ()> {
+                assert_eq!(align, 0x10000);
+                self.len = len;
+                Ok(self.address)
+            }
+            fn release_reservation(&mut self, address: usize, len: usize) -> Result<(), ()> {
+                self.released.push((address, len));
+                if self.release_error { Err(()) } else { Ok(()) }
+            }
+            fn map_file(
+                &mut self,
+                addr: usize,
+                len: usize,
+                offset: u64,
+                _: &Protection,
+            ) -> Result<(), ()> {
+                assert_eq!(addr % 0x10000, usize::try_from(offset).unwrap() % 0x10000);
+                self.loads.push(addr..addr + len);
+                Ok(())
+            }
+            fn map_zero(&mut self, _: usize, _: usize, _: &Protection) -> Result<(), ()> {
+                panic!("no bss")
+            }
+            fn protect(&mut self, _: usize, _: usize, _: &Protection) -> Result<(), ()> {
+                panic!("no trampoline")
+            }
+        }
+        struct Memory;
+        impl AccessMemory for Memory {
+            fn read(&mut self, _: usize, _: &mut [u8]) -> Result<usize, Fault> {
+                panic!("no read")
+            }
+            fn write(&mut self, _: usize, _: &[u8]) -> Result<(), Fault> {
+                panic!("no write")
+            }
+            fn zero(&mut self, _: usize, len: usize) -> Result<(), Fault> {
+                assert_eq!(len, 0);
+                Ok(())
+            }
+        }
+        // Exercise x86 headers with the common mapper even on an ARM host.
+        // Deliberately bypass only parse()'s native-machine admission check;
+        // no instructions, memory copies, or architecture emulation are used.
+        let mut bytes = alloc::vec![0; 64 + 2 * 56];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        for (at, value) in [
+            (16, elf::abi::ET_DYN),
+            (18, elf::abi::EM_X86_64),
+            (52, 64),
+            (54, 56),
+            (56, 2),
+        ] {
+            bytes[at..at + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        for (index, address, offset) in [(0, 0x23000u64, 0x3000u64), (1, 0x64000, 0x4000)] {
+            let at = 64 + index * 56;
+            bytes[at..at + 4].copy_from_slice(&elf::abi::PT_LOAD.to_le_bytes());
+            bytes[at + 4..at + 8].copy_from_slice(&elf::abi::PF_R.to_le_bytes());
+            for (field, value) in [
+                (8, offset),
+                (16, address),
+                (32, 0x1000),
+                (40, 0x1000),
+                (48, 0x10000),
+            ] {
+                bytes[at + field..at + field + 8].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let ident = elf::file::parse_ident::<Endian>(&bytes).unwrap();
+        let parsed = ElfParsedFile {
+            header: FileHeader::parse_tail(ident, &bytes[16..64]).unwrap(),
+            phdrs: bytes[64..].to_vec(),
+            trampoline: None,
+            islands: None,
+        };
+        let mut mapper = Mapper {
+            address: 0x10000000,
+            len: 0,
+            loads: Vec::new(),
+            released: Vec::new(),
+            release_error: false,
+        };
+        let info = parsed.load(&mut mapper, &mut Memory, None).unwrap();
+        assert_eq!(info.base_addr, 0x10000000 - 0x20000);
+        assert_eq!(mapper.len, 0x65000 - 0x20000);
+        assert_eq!(mapper.loads.len(), 2);
+        assert!(mapper.released.is_empty());
+        for r in &mapper.loads {
+            assert!(r.start >= 0x10000000 && r.end <= 0x10000000 + mapper.len);
+        }
+        // The writable heap must start on fresh host backing even when the
+        // ELF header is x86 and its LOAD/reservation ends on a guest page.
+        assert_eq!(
+            info.brk,
+            (0x10000000 + mapper.len).next_multiple_of(HOST_PAGE_SIZE)
+        );
+        mapper.address = 0x10000; // Lower than the aligned object-relative origin.
+        mapper.loads.clear();
+        assert!(matches!(
+            parsed.load(&mut mapper, &mut Memory, None),
+            Err(ElfLoadError::InvalidProgramHeader)
+        ));
+        assert!(mapper.loads.is_empty());
+        assert_eq!(mapper.released, [(0x10000, 0x45000)]);
+        mapper.released.clear();
+        mapper.release_error = true;
+        assert!(matches!(
+            parsed.load(&mut mapper, &mut Memory, None),
+            Err(ElfLoadError::Map(()))
+        ));
+        assert_eq!(mapper.released, [(0x10000, 0x45000)]);
     }
 }

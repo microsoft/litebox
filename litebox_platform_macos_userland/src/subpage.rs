@@ -648,6 +648,13 @@ mod tests {
             Ok(base)
         }
 
+        fn release_reservation(&mut self, address: usize, len: usize) -> Result<(), ()> {
+            self.pages
+                .0
+                .deallocate(address..address + len.next_multiple_of(PAGE_SIZE))
+                .map_err(|_| ())
+        }
+
         fn map_file(
             &mut self,
             address: usize,
