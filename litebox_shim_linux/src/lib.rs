@@ -1272,14 +1272,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.sys_getdirent64(fd, dirp, count)
             }
             SyscallRequest::SchedGetAffinity { pid, len, mask } => {
-                const BITS_PER_BYTE: usize = 8;
                 let cpuset = self.sys_sched_getaffinity(pid);
-                if len * BITS_PER_BYTE < cpuset.len()
-                    || len & (core::mem::size_of::<usize>() - 1) != 0
-                {
+                let raw_bytes = cpuset.as_bytes();
+                if len < raw_bytes.len() || len & (core::mem::size_of::<usize>() - 1) != 0 {
                     Err(Errno::EINVAL)
                 } else {
-                    let raw_bytes = cpuset.as_bytes();
                     mask.copy_from_slice::<Platform>(0, raw_bytes)
                         .map(|()| raw_bytes.len())
                         .ok_or(Errno::EFAULT)

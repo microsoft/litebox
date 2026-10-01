@@ -1262,6 +1262,49 @@ mod tests {
     }
 
     #[test]
+    fn test_mremap_range_overflow_preserves_mapping() {
+        let task = init_platform(None);
+        let huge_size = usize::MAX - super::PAGE_SIZE + 1;
+        assert_eq!(
+            task.sys_mremap(
+                UserPtrMut::from_usize(super::PAGE_SIZE),
+                huge_size,
+                super::PAGE_SIZE,
+                MRemapFlags::empty(),
+                0,
+            )
+            .unwrap_err(),
+            Errno::EFAULT
+        );
+        let mapping = task
+            .sys_mmap(
+                0,
+                2 * super::PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            task.sys_mremap(
+                UserPtrMut::from_usize(mapping.as_usize() + super::PAGE_SIZE),
+                super::PAGE_SIZE,
+                huge_size,
+                MRemapFlags::empty(),
+                0,
+            )
+            .unwrap_err(),
+            Errno::ENOMEM
+        );
+        assert_eq!(
+            task.sys_mprotect(mapping, 2 * super::PAGE_SIZE, ProtFlags::PROT_READ),
+            Ok(())
+        );
+        task.sys_munmap(mapping, 2 * super::PAGE_SIZE).unwrap();
+    }
+
+    #[test]
     fn test_mmap_length_overflow() {
         let task = init_platform(None);
         for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 2] {
@@ -1316,6 +1359,18 @@ mod tests {
             .unwrap();
         let fd = i32::try_from(fd).unwrap();
         assert_eq!(task.sys_write(fd, content, None).unwrap(), content.len());
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                usize::MAX - super::PAGE_SIZE + 1,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap_err(),
+            Errno::ENOMEM
+        );
         let addr = task
             .sys_mmap(
                 0,

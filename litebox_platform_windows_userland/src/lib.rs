@@ -1847,15 +1847,39 @@ pub struct Instant(u64);
 impl litebox::platform::Instant for Instant {
     fn checked_duration_since(&self, earlier: &Self) -> Option<core::time::Duration> {
         let diff = self.0.checked_sub(earlier.0)?;
-        // Convert from 100ns intervals to nanoseconds. This won't overflow in
-        // our lifetimes.
-        Some(Duration::from_nanos(diff * 100))
+        let secs = diff / 10_000_000;
+        let nanos = u32::try_from((diff % 10_000_000) * 100).ok()?;
+        Some(Duration::new(secs, nanos))
     }
 
     fn checked_add(&self, duration: core::time::Duration) -> Option<Self> {
         let duration_100ns: u64 = (duration.as_nanos() / 100).try_into().ok()?;
         let new = self.0.checked_add(duration_100ns)?;
         Some(Instant(new))
+    }
+}
+
+#[cfg(test)]
+mod instant_overflow_tests {
+    use super::Instant;
+    use core::time::Duration;
+    use litebox::platform::Instant as _;
+
+    #[test]
+    fn large_timeout_duration_does_not_overflow() {
+        let earlier = Instant(123);
+        let duration = Duration::from_secs(20_000_000_000);
+        let later = earlier.checked_add(duration).unwrap();
+        assert_eq!(later.checked_duration_since(&earlier), Some(duration));
+        assert_eq!(earlier.checked_duration_since(&later), None);
+        assert_eq!(
+            Instant(u64::MAX).checked_duration_since(&Instant(0)),
+            Some(Duration::new(u64::MAX / 10_000_000, 955_161_500))
+        );
+        assert_eq!(
+            Instant(10_000_001).checked_duration_since(&Instant(0)),
+            Some(Duration::new(1, 100))
+        );
     }
 }
 
