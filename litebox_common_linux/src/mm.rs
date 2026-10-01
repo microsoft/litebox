@@ -132,6 +132,9 @@ where
             let mut vmem = self.vmem.write();
             // `op` runs unlocked, so another thread may have unmapped or replaced part of the range.
             if let Err(e) = unsafe { vmem.protect_mapping(range, after_perms) } {
+                // TODO: Another thread may have unmapped or replaced part of the range while `op` ran unlocked.
+                // We may end up removing another thread's mapping if another thread unmaps and remaps this
+                // range before cleanup.
                 let _ = unsafe { vmem.remove_mapping(range) };
                 return Err(e.into());
             }

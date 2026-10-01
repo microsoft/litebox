@@ -311,6 +311,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             op,
         )?;
         if prot != ProtFlags::PROT_READ_WRITE && self.sys_mprotect_raw(ptr, len, prot).is_err() {
+            // TODO: Protection may be unsupported (e.g. write-only), or another thread may
+            // have unmapped the range. Best-effort cleanup may unmap a replacement
+            // mapping if another thread unmaps and remaps this range before cleanup.
             let _ = self.sys_munmap_raw(ptr, len);
             return Err(VmemProtectError::UnsupportedProtection.into());
         }
