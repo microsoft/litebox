@@ -146,7 +146,8 @@ impl<Platform: OpteeShimPlatform> litebox::shim::EnterShim for OpteeShimEntrypoi
                 return if result.is_ok() {
                     ContinueOperation::Resume
                 } else {
-                    self.task.clear_ta_context();
+                    // It is recoverable via exception-table fixup. The TA keeps
+                    // running, so we shouldn't clear the TA context.
                     ContinueOperation::Terminate
                 };
             } else if result.is_ok() {
