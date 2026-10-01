@@ -417,6 +417,7 @@ fn mapping_fragments_keep_offsets_and_pair_references() {
         near: 0x6000..0x7000,
         far: 0x1_0000_0000..0x1_0000_5000,
         sites: alloc::vec![0x1004, 0x4004],
+        previous: None,
         serialized: None,
         prefix_bias: None,
     });
@@ -532,7 +533,11 @@ fn early_unused_island_rollback_failure_is_fatal_before_source_restore() {
         let address = source.as_usize() + HOST_PAGE_SIZE;
         let staged = || StagedMapping {
             range: address..address + HOST_PAGE_SIZE,
-            previous: Some((alloc::vec![0x5a; HOST_PAGE_SIZE], ProtFlags::PROT_READ)),
+            previous: Some(DisplacedMapping {
+                bytes: alloc::vec![0x5a; HOST_PAGE_SIZE],
+                protections: alloc::vec![ProtFlags::PROT_READ; HOST_PAGE_SIZE / PAGE_SIZE],
+                guest_owned: true,
+            }),
             prefix_bias: None,
         };
         // Synthetic VM fault: revoke an unpublished reservation before cleanup.
@@ -1822,6 +1827,10 @@ fn serialized_modified_code_reenable_still_uses_runtime_scanner() {
         )
         .unwrap();
     let code = UserPtrMut::<u8>::from_usize(base.as_usize() + PAGE_SIZE);
+    assert_eq!(
+        task.sys_madvise(code, 1, litebox_common_linux::MadviseBehavior::DontNeed),
+        Err(Errno::EBUSY)
+    );
     task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
         .unwrap();
     let before = task.global.elf_patch_cache.lock()[&key].islands.pairs[0]
@@ -2001,6 +2010,10 @@ fn mmap_envelope_reservations_survive_close_split_and_multiple_biases() {
     }
     for instance in &instances {
         let extra = UserPtrMut::from_usize(instance.as_usize() + island.start);
+        assert_eq!(
+            task.sys_madvise(extra, 1, litebox_common_linux::MadviseBehavior::DontNeed),
+            Err(Errno::EBUSY)
+        );
         task.sys_mprotect(extra, island.len(), ProtFlags::PROT_READ_EXEC)
             .unwrap();
         assert!(task.global.mm.mappings().iter().any(|(r, f)| {
@@ -2438,26 +2451,38 @@ fn unsupported_sites_do_not_allocate_or_abort_supported_sites() {
             task.global.elf_patch_cache.lock()[&key].islands.pairs.len(),
             usize::from(supported)
         );
-        task.sys_munmap(reserved, length).unwrap();
         task.sys_close(fd).unwrap();
+        task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
+            .unwrap();
+        assert_eq!(
+            task.sys_madvise(mapped, 1, litebox_common_linux::MadviseBehavior::DontNeed),
+            Err(Errno::EBUSY)
+        ); // includes the no-pair, unsupported-only case
+        task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        assert_eq!(&*mapped.to_owned_slice::<TestPlatform>(8).unwrap(), &*code);
+        task.sys_munmap(reserved, length).unwrap();
     }
 }
 
 #[test]
 fn source_publication_error_remains_invalidated() {
     let task = init_platform();
-    create_file(&task, "/source-publication-failure", &image());
+    let bytes = retirement_image();
+    create_file(&task, "/source-publication-failure", &bytes);
     let fd = open(&task, "/source-publication-failure");
     let mapped = task
         .sys_mmap(
             0,
-            PAGE_SIZE,
+            bytes.len(),
             ProtFlags::PROT_READ,
             MapFlags::MAP_PRIVATE,
             fd,
-            3 * PAGE_SIZE,
+            0,
         )
         .unwrap();
+    let code = UserPtrMut::from_usize(mapped.as_usize() + PAGE_SIZE);
+    let gap = UserPtrMut::<u8>::from_usize(mapped.as_usize() + 2 * HOST_PAGE_SIZE);
     let key = super::super::tests::elf_patch_key(&task, fd);
     {
         let mut cache = task.global.elf_patch_cache.lock();
@@ -2469,7 +2494,7 @@ fn source_publication_error_remains_invalidated() {
             task.patch_exec_with_islands(
                 state,
                 mapped,
-                PAGE_SIZE,
+                bytes.len(),
                 &[(0, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)],
                 &loads,
                 None
@@ -2477,10 +2502,12 @@ fn source_publication_error_remains_invalidated() {
             .is_err()
         );
         assert!(state.trampoline_invalidated);
-        assert!(!state.islands.pairs.is_empty());
+        assert_eq!(state.islands.pairs.len(), 1);
+        assert_eq!(state.islands.pairs[0].near.start, gap.as_usize());
+        assert_eq!(state.islands.pairs[0].sites, [code.as_usize()]);
     }
     assert_eq!(
-        task.sys_mprotect(mapped, PAGE_SIZE, ProtFlags::PROT_READ_EXEC),
+        task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC),
         Err(Errno::ENOMEM)
     );
     assert!(
@@ -2488,11 +2515,28 @@ fn source_publication_error_remains_invalidated() {
             .mm
             .mappings()
             .iter()
-            .filter(|(r, _)| r.contains(&mapped.as_usize()))
+            .filter(|(r, _)| r.contains(&code.as_usize()))
             .all(|(_, flags)| !flags.contains(VmFlags::VM_EXEC))
     );
-    task.sys_munmap(mapped, PAGE_SIZE).unwrap();
+    task.sys_munmap(code, PAGE_SIZE).unwrap();
+    assert_eq!(
+        &*gap.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE).unwrap(),
+        &bytes[2 * HOST_PAGE_SIZE..3 * HOST_PAGE_SIZE]
+    );
+    for offset in (0..HOST_PAGE_SIZE).step_by(PAGE_SIZE) {
+        let flags = task
+            .global
+            .mm
+            .mappings()
+            .into_iter()
+            .find(|(r, _)| r.contains(&(gap.as_usize() + offset)))
+            .unwrap()
+            .1;
+        assert_eq!(flags & VmFlags::VM_ACCESS_FLAGS, VmFlags::VM_READ);
+    }
     task.sys_close(fd).unwrap();
+    task.sys_munmap(mapped, bytes.len()).unwrap();
+    assert!(!task.global.elf_patch_cache.lock().contains_key(&key));
 }
 
 #[test]
@@ -2862,4 +2906,412 @@ fn explicit_load_bias_validation_and_retirement() {
         Err(Errno::EOVERFLOW)
     );
     assert_eq!(state.mappings.len(), 1);
+}
+
+fn retirement_image() -> Vec<u8> {
+    let mut bytes = image_with_gap(HOST_PAGE_SIZE);
+    bytes[PAGE_SIZE + 4..2 * HOST_PAGE_SIZE].fill(0);
+    bytes[3 * HOST_PAGE_SIZE..].fill(0);
+    bytes[2 * HOST_PAGE_SIZE..3 * HOST_PAGE_SIZE].fill(0x5a);
+    bytes
+}
+
+#[test]
+fn retired_pair_restores_surviving_file_gap() {
+    let task = init_platform();
+    let bytes = retirement_image();
+    create_file(&task, "/retired-gap", &bytes);
+    let fd = open(&task, "/retired-gap");
+    let key = super::super::tests::elf_patch_key(&task, fd);
+    let base = task
+        .sys_mmap(
+            0,
+            bytes.len(),
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE,
+            fd,
+            0,
+        )
+        .unwrap();
+    let code = UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE);
+    let gap = UserPtrMut::<u8>::from_usize(base.as_usize() + 2 * HOST_PAGE_SIZE);
+    task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+        .unwrap();
+    let far = {
+        let cache = task.global.elf_patch_cache.lock();
+        let pair = &cache[&key].islands.pairs[0];
+        assert_eq!(pair.near.start, gap.as_usize());
+        pair.far.clone()
+    };
+    {
+        let mut cache = task.global.elf_patch_cache.lock();
+        let state = cache.get_mut(&key).unwrap();
+        let loads = state.islands.future_loads().unwrap();
+        // A later scan snapshots the existing near page as RX, but must not
+        // overwrite its deferred read-only guest intent during publication.
+        task.patch_exec_with_islands(
+            state,
+            base,
+            bytes.len(),
+            &[(base.as_usize(), bytes.len(), ProtFlags::PROT_READ)],
+            &loads,
+            None,
+        )
+        .unwrap();
+    }
+    task.sys_close(fd).unwrap();
+    task.sys_munmap(code, PAGE_SIZE).unwrap();
+    assert!(
+        task.global
+            .mm
+            .mappings()
+            .iter()
+            .any(|(r, f)| r.contains(&gap.as_usize())
+                && *f & VmFlags::VM_ACCESS_FLAGS == VmFlags::VM_READ)
+    );
+    assert_eq!(
+        &*gap.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE).unwrap(),
+        &bytes[2 * HOST_PAGE_SIZE..3 * HOST_PAGE_SIZE]
+    );
+    assert!(
+        !task
+            .global
+            .mm
+            .mappings()
+            .iter()
+            .any(|(r, _)| overlaps(r, &far))
+    );
+    // The borrow retained file-backed identity, not merely the access flags.
+    assert_eq!(
+        task.sys_madvise(gap, 1, litebox_common_linux::MadviseBehavior::DontNeed),
+        Err(Errno::EINVAL)
+    );
+    task.sys_munmap(base, bytes.len()).unwrap();
+    assert!(!task.global.elf_patch_cache.lock().contains_key(&key));
+}
+
+#[test]
+fn anonymous_mremap_ignores_overflowing_nonfixed_destination() {
+    let task = init_platform();
+    let base = task
+        .sys_mmap(
+            0,
+            2 * HOST_PAGE_SIZE,
+            ProtFlags::PROT_READ_WRITE,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        task.sys_mremap(
+            base,
+            2 * HOST_PAGE_SIZE,
+            HOST_PAGE_SIZE,
+            MRemapFlags::empty(),
+            usize::MAX
+        )
+        .unwrap()
+        .as_usize(),
+        base.as_usize()
+    );
+    assert!(matches!(
+        task.sys_mremap(
+            base,
+            HOST_PAGE_SIZE,
+            HOST_PAGE_SIZE,
+            MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_FIXED,
+            usize::MAX
+        ),
+        Err(Errno::EINVAL)
+    ));
+    task.sys_munmap(base, HOST_PAGE_SIZE).unwrap();
+}
+
+#[test]
+fn dontneed_allows_ordinary_elf_data_but_not_rewritten_sources() {
+    use litebox_common_linux::MadviseBehavior::DontNeed;
+    let task = init_platform();
+    let mut bytes = image_with_gap(HOST_PAGE_SIZE);
+    bytes[124..128].copy_from_slice(&6u32.to_le_bytes()); // second LOAD is data
+    create_file(&task, "/advice-data", &bytes);
+    let fd = open(&task, "/advice-data");
+    let base = task
+        .sys_mmap(
+            0,
+            bytes.len(),
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE,
+            fd,
+            0,
+        )
+        .unwrap();
+    let code = UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE);
+    let data = UserPtrMut::from_usize(base.as_usize() + 3 * HOST_PAGE_SIZE);
+    assert_eq!(task.sys_madvise(code, 1, DontNeed), Err(Errno::EINVAL)); // never-executable
+    // Whole ld.so RX spans must not permanently classify their data as source.
+    task.sys_mprotect(base, bytes.len(), ProtFlags::PROT_READ_EXEC)
+        .unwrap();
+    task.sys_mprotect(data, HOST_PAGE_SIZE, ProtFlags::PROT_READ)
+        .unwrap();
+    let key = super::super::tests::elf_patch_key(&task, fd);
+    task.sys_close(fd).unwrap();
+    let transport: Vec<_> = task.global.elf_patch_cache.lock()[&key]
+        .islands
+        .owned_ranges()
+        .collect();
+    for range in transport {
+        assert_eq!(
+            task.sys_madvise(UserPtrMut::from_usize(range.end - PAGE_SIZE), 1, DontNeed),
+            Err(Errno::EBUSY)
+        );
+    }
+    // File reset is unsupported by the underlying VM, not blocked by islands.
+    assert_eq!(task.sys_madvise(data, 1, DontNeed), Err(Errno::EINVAL));
+    assert_eq!(
+        &*data.to_owned_slice::<TestPlatform>(PAGE_SIZE).unwrap(),
+        &bytes[3 * HOST_PAGE_SIZE..3 * HOST_PAGE_SIZE + PAGE_SIZE]
+    );
+    assert_eq!(task.sys_madvise(code, 0, DontNeed), Ok(()));
+    assert_eq!(task.sys_madvise(code, 1, DontNeed), Err(Errno::EBUSY));
+    task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
+        .unwrap();
+    assert_eq!(
+        task.sys_madvise(code, PAGE_SIZE, DontNeed),
+        Err(Errno::EBUSY)
+    );
+    task.sys_munmap(base, bytes.len()).unwrap();
+}
+
+#[test]
+fn retired_loader_reservation_restores_hidden_bytes_and_guest_page_intent() {
+    check_retired_loader_reservation(true);
+}
+
+#[test]
+fn retired_loader_reservation_survives_close_after_source_unmap() {
+    check_retired_loader_reservation(false);
+}
+
+fn check_retired_loader_reservation(close_before_retirement: bool) {
+    use litebox_common_linux::MadviseBehavior::DontNeed;
+    let task = init_platform();
+    let bytes = litebox_syscall_rewriter::hook_syscalls_in_elf_with_options(
+        &retirement_image(),
+        None,
+        crate::aarch64_rewrite_options(),
+    )
+    .unwrap();
+    let payload = litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands::parse(&bytes)
+        .unwrap()
+        .unwrap();
+    let extent = serialized_island_extent(&bytes, HOST_PAGE_SIZE);
+    let path = if close_before_retirement {
+        "/loader-retirement"
+    } else {
+        "/loader-retirement-close-after"
+    };
+    create_file(&task, path, &bytes);
+    let fd = open(&task, path);
+    let key = super::super::tests::elf_patch_key(&task, fd);
+    let before = task.global.mm.mappings();
+    let base = task.allocate_chunk(4 * HOST_PAGE_SIZE, &[], None).unwrap();
+    let near = UserPtrMut::<u8>::from_usize(base.as_usize() + extent.start);
+    let saved = alloc::vec![0x5a; HOST_PAGE_SIZE];
+    near.copy_from_slice::<TestPlatform>(0, &saved).unwrap();
+    task.sys_mprotect(base, 4 * HOST_PAGE_SIZE, ProtFlags::PROT_NONE)
+        .unwrap();
+    task.prepare_serialized_islands(&key, &payload, base.as_usize(), true)
+        .unwrap();
+    assert_eq!(task.sys_madvise(near, 1, DontNeed), Err(Errno::EBUSY));
+    let code = task
+        .sys_mmap(
+            base.as_usize() + PAGE_SIZE,
+            PAGE_SIZE,
+            ProtFlags::PROT_READ_EXEC,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            fd,
+            PAGE_SIZE,
+        )
+        .unwrap();
+    assert_eq!(
+        task.global.elf_patch_cache.lock()[&key].islands.pairs[0]
+            .near
+            .start,
+        near.as_usize()
+    );
+    if close_before_retirement {
+        task.sys_close(fd).unwrap();
+    }
+    // A failed earlier shared VMA must not update a later shadow permission.
+    let path = if close_before_retirement {
+        "/loader-readonly"
+    } else {
+        "/loader-readonly-close-after"
+    };
+    create_file(&task, path, &alloc::vec![0; PAGE_SIZE]);
+    let readonly = open(&task, path);
+    task.sys_mmap(
+        base.as_usize(),
+        PAGE_SIZE,
+        ProtFlags::PROT_READ,
+        MapFlags::MAP_SHARED | MapFlags::MAP_FIXED,
+        readonly,
+        0,
+    )
+    .unwrap();
+    task.sys_close(readonly).unwrap();
+    assert_eq!(
+        task.sys_mprotect(base, extent.end, ProtFlags::PROT_READ_WRITE),
+        Err(Errno::EACCES)
+    );
+    assert!(
+        task.global.elf_patch_cache.lock()[&key].islands.pairs[0]
+            .previous
+            .as_ref()
+            .unwrap()
+            .protections
+            .iter()
+            .all(|p| *p == ProtFlags::PROT_NONE)
+    );
+    // On a 16KiB host, this changes only one guest page of the shadow view.
+    task.sys_mprotect(near, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
+        .unwrap();
+    task.sys_munmap(code, PAGE_SIZE).unwrap();
+    for offset in (0..HOST_PAGE_SIZE).step_by(PAGE_SIZE) {
+        let flags = task
+            .global
+            .mm
+            .mappings()
+            .into_iter()
+            .find(|(r, _)| r.contains(&(near.as_usize() + offset)))
+            .unwrap()
+            .1;
+        assert_eq!(
+            flags & VmFlags::VM_ACCESS_FLAGS,
+            if offset == 0 {
+                VmFlags::VM_READ | VmFlags::VM_WRITE
+            } else {
+                VmFlags::empty()
+            }
+        );
+    }
+    {
+        let cache = task.global.elf_patch_cache.lock();
+        let state = &cache[&key];
+        assert!(state.file_mappings.is_empty());
+        assert!(state.islands.pairs.is_empty());
+        assert!(!state.islands.loader_reservations.is_empty());
+    }
+    assert_eq!(task.sys_madvise(near, 1, DontNeed), Err(Errno::EBUSY));
+    if !close_before_retirement {
+        task.sys_close(fd).unwrap();
+    }
+    assert!(task.global.elf_patch_cache.lock().contains_key(&key));
+    assert_eq!(task.sys_madvise(near, 1, DontNeed), Err(Errno::EBUSY));
+    task.sys_mprotect(near, HOST_PAGE_SIZE, ProtFlags::PROT_READ)
+        .unwrap();
+    assert_eq!(
+        &*near.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE).unwrap(),
+        &saved
+    );
+    task.sys_munmap(base, 4 * HOST_PAGE_SIZE).unwrap();
+    assert!(!task.global.elf_patch_cache.lock().contains_key(&key));
+    assert_eq!(task.global.mm.mappings(), before);
+}
+
+#[test]
+fn retired_gap_excludes_partial_unmap_and_new_fixed_bytes() {
+    for fixed in [false, true] {
+        let task = init_platform();
+        let bytes = retirement_image();
+        let path = if fixed {
+            "/fixed-retired-gap"
+        } else {
+            "/unmapped-retired-gap"
+        };
+        create_file(&task, path, &bytes);
+        let fd = open(&task, path);
+        let base = task
+            .sys_mmap(
+                0,
+                bytes.len(),
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                fd,
+                0,
+            )
+            .unwrap();
+        let code = UserPtrMut::from_usize(base.as_usize() + PAGE_SIZE);
+        let gap = base.as_usize() + 2 * HOST_PAGE_SIZE;
+        task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        let removed_len = 2 * HOST_PAGE_SIZE;
+        if fixed {
+            let replacement = task
+                .sys_mmap(
+                    code.as_usize(),
+                    removed_len,
+                    ProtFlags::PROT_READ_WRITE,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
+                    -1,
+                    0,
+                )
+                .unwrap();
+            assert!(
+                replacement
+                    .to_owned_slice::<TestPlatform>(removed_len)
+                    .unwrap()
+                    .iter()
+                    .all(|b| *b == 0)
+            );
+        } else {
+            task.sys_munmap(code, removed_len).unwrap();
+            assert!(
+                !task
+                    .global
+                    .mm
+                    .mappings()
+                    .iter()
+                    .any(|(r, _)| overlaps(r, &(code.as_usize()..gap + PAGE_SIZE)))
+            );
+        }
+        if HOST_PAGE_SIZE > PAGE_SIZE {
+            let tail = UserPtrMut::<u8>::from_usize(gap + PAGE_SIZE);
+            assert!(
+                tail.to_owned_slice::<TestPlatform>(HOST_PAGE_SIZE - PAGE_SIZE)
+                    .unwrap()
+                    .iter()
+                    .all(|b| *b == 0x5a)
+            );
+        }
+        task.sys_close(fd).unwrap();
+        task.sys_munmap(base, bytes.len()).unwrap();
+    }
+}
+
+#[test]
+fn retired_mapping_restore_failure_is_fatal() {
+    extern crate std;
+    let task = init_platform();
+    let ptr = task.allocate_chunk(HOST_PAGE_SIZE, &[], None).unwrap();
+    let previous = task
+        .displace_island_mapping(
+            ptr.as_usize(),
+            VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAY_ACCESS_FLAGS,
+            true,
+        )
+        .unwrap();
+    task.sys_munmap_raw(ptr, HOST_PAGE_SIZE).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        task.retire_island_mapping(
+            StagedMapping {
+                range: ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE,
+                previous: Some(previous),
+                prefix_bias: None,
+            },
+            &(0..0),
+        );
+    }));
+    assert!(result.is_err());
 }

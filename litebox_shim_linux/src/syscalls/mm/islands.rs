@@ -39,6 +39,7 @@ pub(super) struct PublishedPair {
     pub serialized: Option<(usize, usize)>,
     /// This file/bias acquired the near page by extending an attested DSO boundary.
     pub prefix_bias: Option<usize>,
+    previous: Option<DisplacedMapping>,
 }
 
 /// Geometry of a validated ET_DYN whole-image file mapping (ld.so's first mmap).
@@ -52,7 +53,7 @@ pub(super) struct WholeSpan {
 #[derive(Default)]
 pub(super) struct RuntimeIslands {
     pub whole_span: Option<WholeSpan>,
-    /// Extra inaccessible pages explicitly reserved by a guest whole-span mmap.
+    /// Internal envelope pages outside the guest's requested whole-span mmap.
     pub mmap_reservations: Vec<(usize, Range<usize>)>,
     pub loads: Vec<Load>,
     /// Guest LOAD alignment, present only if every LOAD's geometry is valid.
@@ -61,8 +62,12 @@ pub(super) struct RuntimeIslands {
     pub mappings: Vec<FileMapping>,
     pub pairs: Vec<PublishedPair>,
     pub serialized: Option<litebox_syscall_rewriter::aarch64::elf_islands::ElfIslands>,
-    /// Only the main/interpreter mapper can attest to anonymous reservations.
+    /// Guest-owned anonymous reservations attested by the main/interpreter mapper.
+    /// Retain this provenance while published transport borrows their pages.
     pub loader_reservations: Vec<Range<usize>>,
+    /// Source pages scanned as executable, including unsupported BRK-only pages.
+    /// Unlike the patch cache, this survives writable protection transitions.
+    pub(super) rewrite_sources: Vec<Range<usize>>,
 }
 
 fn overlaps(a: &Range<usize>, b: &Range<usize>) -> bool {
@@ -161,6 +166,23 @@ impl RuntimeIslands {
             bias,
             loader_managed: load_bias.is_some(),
         });
+        if let (Some(payload), Some(bias)) = (&self.serialized, bias) {
+            let mut sources = Vec::new();
+            for pair in &payload.pairs {
+                for index in 0..pair.slots_used() {
+                    let slot =
+                        island::decode_island_slot(pair.island(), pair.island_vaddr(), index)
+                            .ok_or(Errno::ENOEXEC)?;
+                    let site = bias.checked_add(slot.site.trunc()).ok_or(Errno::ENOEXEC)?;
+                    if !slot.auxiliary && (start..start + len).contains(&site) {
+                        sources.push(align_down(site, super::PAGE_SIZE));
+                    }
+                }
+            }
+            for page in sources {
+                self.protect_source(page..page + super::PAGE_SIZE);
+            }
+        }
         self.refresh_serialized_sites()?;
         Ok(())
     }
@@ -219,14 +241,77 @@ impl RuntimeIslands {
     pub fn touches(&self, range: &Range<usize>) -> bool {
         self.mappings.iter().any(|m| overlaps(&m.range, range))
             || self.owned_ranges().any(|r| overlaps(&r, range))
+            || self.loader_reservations.iter().any(|r| overlaps(r, range))
             || self
                 .mmap_reservations
                 .iter()
                 .any(|(_, r)| overlaps(r, range))
     }
 
-    /// Split mappings, retaining the exact file offset in the right fragment.
-    pub fn remove(&mut self, range: &Range<usize>) -> Vec<Range<usize>> {
+    pub fn protects_advice(&self, range: &Range<usize>) -> bool {
+        self.owned_ranges().any(|r| overlaps(&r, range))
+            || self.rewrite_sources.iter().any(|r| overlaps(r, range))
+            || self.loader_reservations.iter().any(|r| overlaps(r, range))
+            || self
+                .mmap_reservations
+                .iter()
+                .any(|(_, r)| overlaps(r, range))
+    }
+
+    fn protect_source(&mut self, range: Range<usize>) {
+        self.rewrite_sources
+            .extend(subtract_ranges(range, &self.rewrite_sources));
+    }
+
+    fn publish(
+        &mut self,
+        mut pairs: Vec<PublishedPair>,
+        reservations: &mut Vec<StagedMapping>,
+        before_staging: &[ProtectionRange],
+    ) {
+        for pair in &mut pairs {
+            pair.previous = reservations
+                .iter_mut()
+                .find(|r| r.range == pair.near)
+                .expect("published near reservation")
+                .previous
+                .take()
+                .filter(|previous| previous.guest_owned);
+            // Runtime borrowing may see the patch span's temporary RW flags.
+            // Initialize only new pairs; existing pairs keep deferred guest intent.
+            if let Some(previous) = &mut pair.previous {
+                for &(address, len, prot) in before_staging {
+                    let start = address.max(pair.near.start);
+                    let end = (address + len).min(pair.near.end);
+                    for page in (start..end).step_by(super::PAGE_SIZE) {
+                        previous.protections[(page - pair.near.start) / super::PAGE_SIZE] = prot;
+                    }
+                }
+            }
+        }
+        self.pairs.extend(pairs);
+        reservations.clear();
+    }
+
+    pub fn protect_displaced(&mut self, range: &Range<usize>, prot: ProtFlags) {
+        for pair in &mut self.pairs {
+            if let Some(previous) = &mut pair.previous {
+                let start = range.start.max(pair.near.start);
+                let end = range.end.min(pair.near.end);
+                for page in (start..end).step_by(super::PAGE_SIZE) {
+                    previous.protections[(page - pair.near.start) / super::PAGE_SIZE] = prot;
+                }
+            }
+        }
+    }
+
+    /// Split mappings, retaining exact file offsets and displaced guest ownership.
+    pub fn remove(&mut self, range: &Range<usize>) -> Vec<StagedMapping> {
+        self.rewrite_sources = self
+            .rewrite_sources
+            .drain(..)
+            .flat_map(|r| subtract_ranges(r, core::slice::from_ref(range)))
+            .collect();
         let mut mappings = Vec::new();
         for m in self.mappings.drain(..) {
             for part in subtract_ranges(m.range.clone(), core::slice::from_ref(range)) {
@@ -253,7 +338,11 @@ impl RuntimeIslands {
                 if self.mappings.iter().any(|m| m.bias == Some(bias)) {
                     parts.into_iter().map(|r| (bias, r)).collect::<Vec<_>>()
                 } else {
-                    released.extend(parts);
+                    released.extend(parts.into_iter().map(|range| StagedMapping {
+                        range,
+                        previous: None,
+                        prefix_bias: None,
+                    }));
                     Vec::new()
                 }
             })
@@ -261,7 +350,16 @@ impl RuntimeIslands {
         self.pairs.retain_mut(|p| {
             p.sites.retain(|site| !range.contains(site));
             if p.sites.is_empty() {
-                released.extend([p.near.clone(), p.far.clone()]);
+                released.push(StagedMapping {
+                    range: p.near.clone(),
+                    previous: p.previous.take(),
+                    prefix_bias: None,
+                });
+                released.push(StagedMapping {
+                    range: p.far.clone(),
+                    previous: None,
+                    prefix_bias: None,
+                });
                 false
             } else {
                 true
@@ -299,13 +397,20 @@ impl RuntimeIslands {
     }
 }
 
-/// An unpublished mapping and, for a replaced owned file gap, its rollback
-/// image/protection. Releasing unused capacity must not punch holes in ld.so's
-/// still-live whole-span file mapping.
-struct StagedMapping {
+/// A transport allocation or a borrowed guest mapping with its original view.
+/// Both failed staging and retirement must preserve surviving guest ownership.
+pub(super) struct StagedMapping {
     range: Range<usize>,
-    previous: Option<(Vec<u8>, ProtFlags)>,
+    previous: Option<DisplacedMapping>,
     prefix_bias: Option<usize>,
+}
+
+#[derive(Debug)]
+struct DisplacedMapping {
+    bytes: Vec<u8>,
+    protections: Vec<ProtFlags>,
+    // Internal mmap-envelope pages roll back on failure, but retire by unmapping.
+    guest_owned: bool,
 }
 
 pub(super) struct HeapCorridor {
@@ -512,16 +617,74 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
     }
 
-    fn rollback_island_mapping(&self, mapping: StagedMapping) -> Result<(), Errno> {
-        let ptr = UserPtrMut::from_usize(mapping.range.start);
-        if let Some((bytes, prot)) = mapping.previous {
-            self.sys_mprotect_raw(ptr, mapping.range.len(), ProtFlags::PROT_READ_WRITE)?;
-            ptr.copy_from_slice::<Platform>(0, &bytes)
-                .ok_or(Errno::EFAULT)?;
-            self.sys_mprotect_raw(ptr, mapping.range.len(), prot)
-        } else {
-            self.sys_munmap_raw(ptr, mapping.range.len())
+    /// Borrow in place, preserving file-backed identity, shared and MAY flags.
+    fn displace_island_mapping(
+        &self,
+        address: usize,
+        flags: VmFlags,
+        guest_owned: bool,
+    ) -> Result<DisplacedMapping, Errno> {
+        if !flags.contains(VmFlags::VM_MAY_ACCESS_FLAGS) {
+            return Err(Errno::ENOMEM);
         }
+        let ptr = UserPtrMut::<u8>::from_usize(address);
+        let prot = prot_flags_from_permissions(flags.into());
+        if let Err(error) = self.sys_mprotect_raw(ptr, HOST_PAGE_SIZE, ProtFlags::PROT_READ_WRITE) {
+            assert!(
+                self.sys_mprotect_raw(ptr, HOST_PAGE_SIZE, prot).is_ok(),
+                "failed to restore island staging permissions"
+            );
+            return Err(error);
+        }
+        let Some(bytes) = ptr.to_owned_slice::<Platform>(HOST_PAGE_SIZE) else {
+            assert!(
+                self.sys_mprotect_raw(ptr, HOST_PAGE_SIZE, prot).is_ok(),
+                "failed to restore island staging permissions"
+            );
+            return Err(Errno::EFAULT);
+        };
+        Ok(DisplacedMapping {
+            bytes: bytes.into_vec(),
+            protections: alloc::vec![prot; HOST_PAGE_SIZE / super::PAGE_SIZE],
+            guest_owned,
+        })
+    }
+
+    fn restore_island_mapping(
+        &self,
+        mapping: StagedMapping,
+        removed: &Range<usize>,
+    ) -> Result<(), Errno> {
+        for part in subtract_ranges(mapping.range.clone(), core::slice::from_ref(removed)) {
+            let ptr = UserPtrMut::from_usize(part.start);
+            if let Some(previous) = &mapping.previous {
+                let offset = part.start - mapping.range.start;
+                self.sys_mprotect_raw(ptr, part.len(), ProtFlags::PROT_READ_WRITE)?;
+                ptr.copy_from_slice::<Platform>(0, &previous.bytes[offset..offset + part.len()])
+                    .ok_or(Errno::EFAULT)?;
+                for page in (part.start..part.end).step_by(super::PAGE_SIZE) {
+                    self.sys_mprotect_raw(
+                        UserPtrMut::from_usize(page),
+                        super::PAGE_SIZE,
+                        previous.protections[(page - mapping.range.start) / super::PAGE_SIZE],
+                    )?;
+                }
+            } else {
+                self.sys_munmap_raw(ptr, part.len())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn retire_island_mapping(&self, mapping: StagedMapping, removed: &Range<usize>) {
+        assert!(
+            self.restore_island_mapping(mapping, removed).is_ok(),
+            "failed to restore retired island mapping"
+        );
+    }
+
+    fn rollback_island_mapping(&self, mapping: StagedMapping) -> Result<(), Errno> {
+        self.restore_island_mapping(mapping, &(0..0))
     }
 
     fn rollback_island_mapping_or_fatal(&self, mapping: StagedMapping) {
@@ -562,39 +725,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if address < near_min || address > near_max {
                 return None;
             }
-            let previous = if owned {
+            if owned {
                 let (_, flags) = current
                     .iter()
                     .find(|(r, _)| r.start <= address && address + HOST_PAGE_SIZE <= r.end)?;
-                // If the gap is inaccessible, use NOREPLACE rather than read or
-                // change its protection merely to establish a staging backup.
-                if !flags.contains(VmFlags::VM_READ) {
-                    return None;
-                }
-                let bytes = UserPtrMut::<u8>::from_usize(address)
-                    .to_owned_slice::<Platform>(HOST_PAGE_SIZE)?
-                    .into_vec();
-                Some((bytes, prot_flags_from_permissions((*flags).into())))
+                let previous = self.displace_island_mapping(address, *flags, true).ok()?;
+                Some(StagedMapping {
+                    range: address..address + HOST_PAGE_SIZE,
+                    previous: Some(previous),
+                    prefix_bias: None,
+                })
             } else {
-                None
-            };
-            let flags = if owned {
-                MapFlags::MAP_FIXED
-            } else {
-                MapFlags::MAP_FIXED_NOREPLACE
-            };
-            self.do_mmap_anonymous(
-                Some(address),
-                HOST_PAGE_SIZE,
-                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | flags,
-            )
-            .ok()
-            .map(|p| StagedMapping {
-                range: p.as_usize()..p.as_usize() + HOST_PAGE_SIZE,
-                previous,
-                prefix_bias: None,
-            })
+                self.do_mmap_anonymous(
+                    Some(address),
+                    HOST_PAGE_SIZE,
+                    ProtFlags::PROT_READ_WRITE,
+                    MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED_NOREPLACE,
+                )
+                .ok()
+                .map(|p| StagedMapping {
+                    range: p.as_usize()..p.as_usize() + HOST_PAGE_SIZE,
+                    previous: None,
+                    prefix_bias: None,
+                })
+            }
         };
         // Every gap, after unioning filesz AND memsz coverage at host granularity.
         // Numerical inclusion in load_span is not ownership. A whole-page live
@@ -850,6 +1004,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             far: far.as_usize()..far.as_usize() + far_len,
             sites,
             serialized: None,
+            previous: None,
             prefix_bias: reservations
                 .iter()
                 .find(|r| r.range.start == near.as_usize())
@@ -954,15 +1109,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let loader_owned = state
                         .loader_reservations
                         .iter()
-                        .any(|r| r.start <= near && extent.end <= r.end)
-                        || state
-                            .mmap_reservations
-                            .iter()
-                            .any(|(b, r)| *b == bias && r.start <= near && extent.end <= r.end);
+                        .any(|r| r.start <= near && extent.end <= r.end);
+                    let envelope_owned = state
+                        .mmap_reservations
+                        .iter()
+                        .any(|(b, r)| *b == bias && r.start <= near && extent.end <= r.end);
                     let file_owned = state.mappings.iter().any(|m| {
                         m.bias == Some(bias) && m.range.start <= near && extent.end <= m.range.end
                     });
                     if !loader_owned
+                        && !envelope_owned
                         && !file_owned
                         && heap_corridor.is_some_and(|h| overlaps(&h.range, &extent))
                     {
@@ -971,36 +1127,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let owner = current
                         .iter()
                         .find(|(r, _)| r.start <= near && extent.end <= r.end);
-                    let previous = if loader_owned {
+                    let previous = if loader_owned || envelope_owned || file_owned {
                         let (_, flags) = owner.ok_or(Errno::ENOMEM)?;
-                        if flags.intersects(VmFlags::VM_ACCESS_FLAGS) {
+                        if (loader_owned || envelope_owned)
+                            && flags.intersects(VmFlags::VM_ACCESS_FLAGS)
+                        {
                             return Err(Errno::ENOMEM);
                         }
-                        Some((Vec::new(), ProtFlags::PROT_NONE))
-                    } else if file_owned
-                        && owner.is_some_and(|(_, flags)| flags.contains(VmFlags::VM_READ))
-                    {
-                        let (_, flags) = owner.ok_or(Errno::ENOMEM)?;
-                        let bytes = UserPtrMut::<u8>::from_usize(near)
-                            .to_owned_slice::<Platform>(HOST_PAGE_SIZE)
-                            .ok_or(Errno::EFAULT)?
-                            .into_vec();
-                        Some((bytes, prot_flags_from_permissions((*flags).into())))
+                        Some(self.displace_island_mapping(near, *flags, !envelope_owned)?)
                     } else {
+                        self.do_mmap_anonymous(
+                            Some(near),
+                            HOST_PAGE_SIZE,
+                            ProtFlags::PROT_READ_WRITE,
+                            MapFlags::MAP_PRIVATE
+                                | MapFlags::MAP_ANONYMOUS
+                                | MapFlags::MAP_FIXED_NOREPLACE,
+                        )
+                        .map_err(Errno::from)?;
                         None
                     };
-                    let flags = if previous.is_some() {
-                        MapFlags::MAP_FIXED
-                    } else {
-                        MapFlags::MAP_FIXED_NOREPLACE
-                    };
-                    self.do_mmap_anonymous(
-                        Some(near),
-                        HOST_PAGE_SIZE,
-                        ProtFlags::PROT_READ_WRITE,
-                        MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | flags,
-                    )
-                    .map_err(Errno::from)?;
                     Ok(StagedMapping {
                         range: extent,
                         previous,
@@ -1061,14 +1207,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             for pair in &published {
                 state
-                    .loader_reservations
-                    .retain(|r| !overlaps(r, &pair.near));
-                state
                     .mmap_reservations
                     .retain(|(_, r)| !overlaps(r, &pair.near));
             }
-            state.pairs.extend(published);
-            reservations.clear();
+            state.publish(published, &mut reservations, &[]);
             Ok(())
         })();
         if let Err(error) = &result {
@@ -1111,6 +1253,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .ok_or(Errno::ENOEXEC)?
             .ranges_for_mapping((mapping.offset + start - mapping.range.start) as u64, len)
             .map_err(|_| Errno::ENOEXEC)?;
+        for range in ranges.executable() {
+            state.islands.protect_source(
+                align_down(start + range.start, super::PAGE_SIZE)
+                    ..align_up(start + range.end, super::PAGE_SIZE),
+            );
+        }
         let callback = self
             .global
             .platform
@@ -1320,8 +1468,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         .ok_or(Errno::EFAULT)?;
                 }
             }
-            state.islands.pairs.extend(published);
-            reservations.clear(); // ownership transferred before code is executable
+            state
+                .islands
+                .publish(published, &mut reservations, &previous); // before source EXEC
             let excluded: Vec<_> = state.islands.owned_ranges().collect();
             for (address, len, prot) in restore {
                 for part in subtract_ranges(*address..*address + *len, &excluded) {

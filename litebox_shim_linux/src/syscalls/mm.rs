@@ -534,6 +534,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.clear_file_mappings_for_range(result.as_usize(), len);
                 return Err(MappingError::OutOfMemory);
             }
+            #[cfg(target_arch = "aarch64")]
+            if let Some(state) = self.global.elf_patch_cache.lock().get_mut(&patch_key) {
+                // mmap staged the whole image RW; displaced gaps inherit the
+                // guest's requested view, not those temporary staging permissions.
+                state
+                    .islands
+                    .protect_displaced(&(result.as_usize()..result.as_usize() + len), prot);
+            }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
             self.init_elf_patch_state(&patch_key, result.as_usize(), offset);
@@ -822,14 +830,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             #[cfg(target_arch = "aarch64")]
             {
                 for released in state.islands.remove(&(unmap_start..unmap_end)) {
-                    // The syscall already removed or replaced this interval.
-                    // In particular, MAP_FIXED installed NEW pages there; only
-                    // release transport outside it, never the replacement.
-                    for part in
-                        subtract_ranges(released, core::slice::from_ref(&(unmap_start..unmap_end)))
-                    {
-                        let _ = self.sys_munmap_raw(UserPtrMut::from_usize(part.start), part.len());
-                    }
+                    self.retire_island_mapping(released, &(unmap_start..unmap_end));
                 }
                 let mut surviving = BTreeSet::new();
                 for &(start, len) in &state.file_mappings {
@@ -939,13 +940,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .collect()
         };
 
-        let subranges = subtract_ranges(range.clone(), &excluded);
-        if subranges.is_empty() {
-            // Exclusions consume the whole request; no protection change is needed.
-            return self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(range.start), 0, prot);
+        // Walk in address order, so a failed earlier VMA does not update a
+        // later displaced page's deferred guest protection intent.
+        let mut boundaries = alloc::vec![range.start, range.end];
+        for r in &excluded {
+            if r.start < range.end && range.start < r.end {
+                boundaries.extend([r.start.max(range.start), r.end.min(range.end)]);
+            }
         }
-        for sub in subranges {
-            self.sys_mprotect_raw(UserPtrMut::<u8>::from_usize(sub.start), sub.len(), prot)?;
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for pair in boundaries.windows(2) {
+            let part = pair[0]..pair[1];
+            if excluded.iter().any(|r| r.contains(&part.start)) {
+                for state in self.global.elf_patch_cache.lock().values_mut() {
+                    state.islands.protect_displaced(&part, prot);
+                }
+            } else {
+                self.sys_mprotect_raw(UserPtrMut::from_usize(part.start), part.len(), prot)?;
+            }
         }
         Ok(())
     }
@@ -992,11 +1005,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .as_usize()
                 .checked_add(old_size)
                 .ok_or(Errno::EINVAL)?;
-            let new_end = new_addr.checked_add(new_size).ok_or(Errno::EINVAL)?;
+            let destination = if flags.contains(MRemapFlags::MREMAP_FIXED) {
+                Some(new_addr..new_addr.checked_add(new_size).ok_or(Errno::EINVAL)?)
+            } else {
+                None
+            };
             if self.global.elf_patch_cache.lock().values().any(|s| {
                 s.islands.touches(&(old_addr.as_usize()..old_end))
-                    || (flags.contains(MRemapFlags::MREMAP_FIXED)
-                        && s.islands.touches(&(new_addr..new_end)))
+                    || destination
+                        .as_ref()
+                        .is_some_and(|range| s.islands.touches(range))
             }) {
                 return Err(Errno::EINVAL);
             }
@@ -1037,11 +1055,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let _update = self.global.elf_mapping_update.lock();
         #[cfg(target_arch = "aarch64")]
-        if matches!(
-            advice,
-            litebox_common_linux::MadviseBehavior::DontNeed
-                | litebox_common_linux::MadviseBehavior::Free
-        ) {
+        if len != 0
+            && matches!(
+                advice,
+                litebox_common_linux::MadviseBehavior::DontNeed
+                    | litebox_common_linux::MadviseBehavior::Free
+            )
+        {
             let end = addr
                 .as_usize()
                 .checked_add(
@@ -1054,7 +1074,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .elf_patch_cache
                 .lock()
                 .values()
-                .any(|s| s.islands.touches(&(addr.as_usize()..end)))
+                .any(|s| s.islands.protects_advice(&(addr.as_usize()..end)))
             {
                 return Err(Errno::EBUSY);
             }
@@ -2073,6 +2093,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 !s.file_mappings.is_empty()
                     || !s.islands.pairs.is_empty()
                     || !s.islands.mmap_reservations.is_empty()
+                    || !s.islands.loader_reservations.is_empty()
             }) {
                 return;
             }
@@ -3181,6 +3202,31 @@ mod tests {
                 assert_eq!(x, 0); // Should be zeroed after MADV_DONTNEED
             });
 
+        create_file(&task, "/advice-file", &[0x5a; 0x1000]);
+        let fd = i32::try_from(
+            task.sys_open("/advice-file", OFlags::RDONLY, Mode::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        task.sys_mmap(
+            addr.as_usize() + 0x1000,
+            0x1000,
+            ProtFlags::PROT_READ,
+            MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            fd,
+            0,
+        )
+        .unwrap();
+        addr.write_slice_at_offset::<Platform>(0, &[0xff]).unwrap();
+        for advice in [
+            litebox_common_linux::MadviseBehavior::DontNeed,
+            litebox_common_linux::MadviseBehavior::Free,
+        ] {
+            // An unsupported later file VMA must not discard the anonymous prefix.
+            assert_eq!(task.sys_madvise(addr, 0x2000, advice), Err(Errno::EINVAL));
+            assert_eq!(addr.read_at_offset::<Platform>(0), Some(0xff));
+        }
+        task.sys_close(fd).unwrap();
         task.sys_munmap(addr, 0x2000).unwrap();
     }
 

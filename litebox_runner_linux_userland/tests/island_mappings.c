@@ -24,6 +24,13 @@ static uintptr_t island_entry(const uint32_t *site) {
     return (uintptr_t)entry;
 }
 int main(void) {
+    char *anon = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(anon != MAP_FAILED);
+    CHECK(mremap(anon, 8192, 4096, 0, (void *)UINTPTR_MAX) == anon);
+    errno = 0;
+    CHECK(mremap(anon, 4096, 4096, MREMAP_MAYMOVE | MREMAP_FIXED,
+        (void *)UINTPTR_MAX) == MAP_FAILED && errno == EINVAL);
+    CHECK(munmap(anon, 4096) == 0);
     int fd = open("/lib/island_growth.so", O_RDONLY);
     CHECK(fd >= 0);
     Elf64_Ehdr eh;

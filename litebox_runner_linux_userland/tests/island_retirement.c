@@ -49,6 +49,19 @@ static void *reader(void *unused) {
     atomic_store_explicit(&returned, 1, memory_order_release);
     return NULL;
 }
+// Retirement reclaims allocator pages, but must restore a surviving file gap.
+static int check_retired_near(uintptr_t near, const unsigned char *saved) {
+    if (ISLAND_MAPPING_PAGES == 4) {
+        if (memcmp((void *)near, saved, 4096) != 0) return 0;
+        errno = 0;
+        if (mmap((void *)near, 4096, PROT_NONE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) != MAP_FAILED
+            || errno != EEXIST) return 0;
+        return mprotect((void *)near, 4096, PROT_NONE) == 0;
+    }
+    return mmap((void *)near, 4096, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == (void *)near;
+}
 int main(int argc, char **argv) {
     CHECK(argc == (ISLAND_MAPPING_PAGES == 4 ? 3 : 2));
     int fd = open("/lib/island_retirement.so", O_RDONLY);
@@ -58,7 +71,6 @@ int main(int argc, char **argv) {
     CHECK(eh.e_entry == 4096);
     char *base = mmap(NULL, ISLAND_MAPPING_PAGES * 4096, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
     CHECK(base != MAP_FAILED);
-    CHECK(close(fd) == 0);
     entry = (entry_fn)(base + eh.e_entry);
     char *site_page = base + 4096;
     const uint32_t *site = (const uint32_t *)(base + 8192 - 4);
@@ -71,13 +83,22 @@ int main(int argc, char **argv) {
     } else {
         CHECK(near < (uintptr_t)base || near >= (uintptr_t)base + ISLAND_MAPPING_PAGES * 4096);
     }
+    unsigned char saved[4096] = {0};
+    if (ISLAND_MAPPING_PAGES == 4)
+        CHECK(pread(fd, saved, sizeof saved, near - (uintptr_t)base) >= 0);
+    CHECK(close(fd) == 0);
+    errno = 0;
+    CHECK(madvise(site_page, 1, MADV_DONTNEED) == -1 && errno == EBUSY);
+    errno = 0;
+    CHECK(madvise((void *)near, 1, MADV_DONTNEED) == -1 && errno == EBUSY);
+    CHECK(mprotect(base, 4096, PROT_READ) == 0);
+    errno = 0;
+    CHECK(madvise(base, 1, MADV_DONTNEED) == -1 && errno == EINVAL);
+    CHECK(memcmp(base, ELFMAG, SELFMAG) == 0); // unsupported file reset is non-destructive
     if (strcmp(argv[1], "self") == 0) {
         entry((uintptr_t)site_page, 4096, 0, SYS_munmap, &entered, &observed);
         CHECK(observed.result == 0);
-        // Successful continuation means returning did not depend on freed
-        // transport. NOREPLACE additionally proves retirement really freed it.
-        CHECK(mmap((void *)near, 4096, PROT_NONE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == (void *)near);
+        CHECK(check_retired_near(near, saved));
     } else {
         CHECK(strcmp(argv[1], "thread") == 0);
         CHECK(pipe(pipefd) == 0);
@@ -93,10 +114,8 @@ int main(int argc, char **argv) {
         }
         CHECK(!atomic_load_explicit(&returned, memory_order_acquire));
         CHECK(munmap(site_page, 4096) == 0);
-        // Poison the freed island to prevent allocator reuse from masking a
-        // stale outbound branch while the other thread's read is outstanding.
-        CHECK(mmap((void *)near, 4096, PROT_NONE,
-            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == (void *)near);
+        // Verify restoration/reclaim, then close the page against stale returns.
+        CHECK(check_retired_near(near, saved));
         CHECK(write(pipefd[1], "x", 1) == 1);
         CHECK(pthread_join(thread, NULL) == 0);
         CHECK(atomic_load_explicit(&returned, memory_order_acquire));
