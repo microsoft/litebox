@@ -493,7 +493,7 @@ fn loader_teardown_and_argument_limit() {
         assert_eq!(ptr.as_usize(), page);
         // SAFETY: this test owns the idle probe mapping.
         unsafe {
-            platform.deallocate_pages(page..page + PAGE_SIZE).unwrap();
+            platform.release_pages(page..page + PAGE_SIZE).unwrap();
         }
     }
 

@@ -186,7 +186,7 @@ fn protection_error(error: VmemProtectError) -> Errno {
     match error {
         VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
         VmemProtectError::NoAccess { .. } => Errno::EACCES,
-        VmemProtectError::UnAligned(_) => Errno::EINVAL,
+        VmemProtectError::UnAligned(_) | VmemProtectError::UnsupportedProtection => Errno::EINVAL,
         VmemProtectError::ProtectError(error) => match error {
             PermissionUpdateError::Unallocated | PermissionUpdateError::OutOfMemory => {
                 Errno::ENOMEM

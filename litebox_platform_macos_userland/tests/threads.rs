@@ -3,7 +3,9 @@
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
-use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions as Permissions};
+use litebox::platform::page_mgmt::{
+    AllocationDirection, FixedAddressBehavior, MemoryRegionPermissions as Permissions,
+};
 use litebox::platform::{
     PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _, SystemInfoProvider as _,
     ThreadProvider as _,
@@ -108,7 +110,7 @@ fn spawned_threads_use_configured_darwin_gates() {
             Permissions::READ | Permissions::WRITE,
             false,
             true,
-            FixedAddressBehavior::Hint,
+            FixedAddressBehavior::Hint(AllocationDirection::TopDown),
         )
         .unwrap();
     let base = memory.as_usize();
@@ -160,7 +162,7 @@ fn spawned_threads_use_configured_darwin_gates() {
     // SAFETY: receipt of Child::drop confirms guest execution has stopped.
     unsafe {
         platform
-            .deallocate_pages(base..base + 3 * HOST_PAGE_SIZE)
+            .release_pages(base..base + 3 * HOST_PAGE_SIZE)
             .unwrap();
     }
     assert_eq!(calls, 2);

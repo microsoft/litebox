@@ -207,7 +207,7 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
         }
         // Reject unsupported flags before allocating.
         let _ = prot_flags(permissions);
-        if behavior == FixedAddressBehavior::Hint {
+        if matches!(behavior, FixedAddressBehavior::Hint(_)) {
             let len = range.len().next_multiple_of(HOST_PAGE_SIZE);
             let mut error = AllocationError::OutOfMemory;
             for hint in [host_base(range.start), 0] {
@@ -612,6 +612,7 @@ mod tests {
     use super::*;
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
+    use litebox::platform::page_mgmt::AllocationDirection;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -905,7 +906,7 @@ mod tests {
                 .allocate(
                     TASK_ADDR_MIN..TASK_ADDR_MIN + len,
                     permissions,
-                    FixedAddressBehavior::Hint,
+                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
                 )
                 .unwrap()
         }
@@ -1156,16 +1157,14 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
             )
             .unwrap();
         let base = memory.as_usize();
         let _cleanup = litebox::utils::defer(|| {
             // SAFETY: the test's native page has no active users at cleanup.
             unsafe {
-                platform
-                    .deallocate_pages(base..base + HOST_PAGE_SIZE)
-                    .unwrap();
+                platform.release_pages(base..base + HOST_PAGE_SIZE).unwrap();
             };
         });
         assert_eq!(memory.write_at_offset(0, 42), Some(()));
@@ -1173,7 +1172,7 @@ mod tests {
         let target = base + 2 * PAGE_SIZE..base + HOST_PAGE_SIZE;
         // SAFETY: source and target are idle, disjoint guest subpages of our mapping.
         let moved = unsafe {
-            platform.deallocate_pages(target.clone()).unwrap();
+            platform.release_pages(target.clone()).unwrap();
             platform
                 .remap_pages(base..base + PAGE_SIZE, target, RW)
                 .unwrap()
