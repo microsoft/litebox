@@ -289,6 +289,7 @@ impl From<crate::vmem::MappingError> for Errno {
             crate::vmem::MappingError::NotAFile => Errno::EISDIR,
             crate::vmem::MappingError::NotForReading => Errno::EACCES,
             crate::vmem::MappingError::MapError(e) => e.into(),
+            crate::vmem::MappingError::ProtectError(e) => e.into(),
         }
     }
 }
@@ -324,6 +325,7 @@ impl From<crate::vmem::VmemProtectError> for Errno {
             crate::vmem::VmemProtectError::UnAligned(_) => Errno::EINVAL,
             crate::vmem::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
             crate::vmem::VmemProtectError::NoAccess { .. } => Errno::EACCES,
+            crate::vmem::VmemProtectError::UnsupportedProtection => Errno::EINVAL,
             crate::vmem::VmemProtectError::ProtectError(e) => e.into(),
         }
     }

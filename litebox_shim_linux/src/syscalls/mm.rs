@@ -12,7 +12,7 @@ use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
-    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE},
+    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError},
 };
 
 use crate::FileFd;
@@ -310,9 +310,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             offset == 0 && !fixed_addr,
             op,
         )?;
-        if prot != ProtFlags::PROT_READ_WRITE {
-            self.sys_mprotect_raw(ptr, len, prot)
-                .expect("failed to restore file mapping permissions after initialization");
+        if prot != ProtFlags::PROT_READ_WRITE && self.sys_mprotect_raw(ptr, len, prot).is_err() {
+            let _ = self.sys_munmap_raw(ptr, len);
+            return Err(VmemProtectError::UnsupportedProtection.into());
         }
         Ok(ptr)
     }

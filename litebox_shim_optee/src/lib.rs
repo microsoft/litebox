@@ -44,12 +44,7 @@ const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 pub(crate) const TA_DIGEST_LEN: usize = 32;
 pub(crate) type TaDigest = [u8; TA_DIGEST_LEN];
 
-/// Reservation store required of an OP-TEE shim platform.
-pub type ShimReservations<Reservation> =
-    litebox::platform::common_providers::reservations::NoTrackedReservations<
-        PAGE_SIZE,
-        Reservation,
-    >;
+pub use litebox_common_linux::vmem::ShimReservations;
 
 /// Platform capabilities required by the OP-TEE shim.
 pub trait OpteeShimPlatform:

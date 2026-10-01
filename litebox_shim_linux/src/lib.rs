@@ -64,12 +64,7 @@ pub(crate) type LinuxFS<Platform> =
 
 pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
 
-/// Reservation store required of a shim platform.
-pub type ShimReservations<Reservation> =
-    litebox::platform::common_providers::reservations::NoTrackedReservations<
-        PAGE_SIZE,
-        Reservation,
-    >;
+pub use litebox_common_linux::vmem::ShimReservations;
 
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///

@@ -129,9 +129,12 @@ where
         if before_perms != after_perms {
             let range =
                 PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
-            // `protect` should succeed, as we just created the mapping.
             let mut vmem = self.vmem.write();
-            unsafe { vmem.protect_mapping(range, after_perms) }.expect("failed to protect mapping");
+            // `op` runs unlocked, so another thread may have unmapped or replaced part of the range.
+            if let Err(e) = unsafe { vmem.protect_mapping(range, after_perms) } {
+                let _ = unsafe { vmem.remove_mapping(range) };
+                return Err(e.into());
+            }
         }
         Ok(addr)
     }
@@ -737,14 +740,8 @@ where
                 self.create_inaccessible_pages(suggested_addr, length, flags, op)
             },
             _ => {
-                #[cfg(debug_assertions)]
-                todo!("Unsupported prot flags {:?}", prot);
-                // TODO: create inaccessible pages for now. Creating mapping
-                // for both executable and writable might be needed for JIT.
-                #[cfg(not(debug_assertions))]
-                unsafe {
-                    self.create_inaccessible_pages(suggested_addr, length, flags, op)
-                }
+                litebox_util_log::debug!(prot:? = prot; "unsupported mmap protection");
+                Err(VmemProtectError::UnsupportedProtection.into())
             }
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)
@@ -799,10 +796,8 @@ where
             ProtFlags::PROT_NONE => unsafe { self.make_pages_inaccessible(addr, len) },
             ProtFlags::PROT_READ_WRITE_EXEC => unsafe { self.make_pages_rwx(addr, len) },
             _ => {
-                #[cfg(debug_assertions)]
-                todo!("Unsupported prot flags {:?}", prot);
-                #[cfg(not(debug_assertions))]
-                return Err(Errno::EINVAL);
+                litebox_util_log::debug!(prot:? = prot; "unsupported mprotect protection");
+                Err(VmemProtectError::UnsupportedProtection)
             }
         }
         .map_err(Errno::from)

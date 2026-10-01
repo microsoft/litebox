@@ -344,6 +344,9 @@ pub struct MmapRequest {
     pub behavior: FixedAddressBehavior,
 }
 
+/// Reservation store required of platforms used by Linux-style shims.
+pub type ShimReservations<Reservation> = NoTrackedReservations<PAGE_SIZE, Reservation>;
+
 /// Linux Vmem operations supported by a reservation store.
 pub trait LinuxReservationStore<Platform, const ALIGN: usize>:
     ReservationStore + Send + Sync
@@ -805,12 +808,13 @@ where
                     let rejected_hint = request
                         .suggested_address
                         .is_some_and(|address| address.as_usize() == new_addr);
-                    request.suggested_address = None;
                     if rejected_hint {
-                        // The user-provided hint was rejected, so retry the full address range.
+                        request = Self::build_unmapped_area_request(None, total_length, behavior);
                     } else if direction == Some(AllocationDirection::TopDown) {
+                        request.suggested_address = None;
                         request.address_range.end = new_addr;
                     } else {
+                        request.suggested_address = None;
                         request.address_range.start = new_addr
                             .checked_add(total_length.as_usize())
                             .ok_or(AllocationError::OutOfMemory)?;
@@ -1010,13 +1014,14 @@ where
 
         let permissions = MemoryRegionPermissions::from(vma.flags());
         let temporary = VmArea::new(vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE, false);
-        // SAFETY: Placement excludes mapped pages; Hint preserves other mappings and may relocate.
+        let length = NonZeroPageSize::new(new_range.len()).expect("remap destination is empty");
+        // SAFETY: Hint placement never replaces existing mappings.
         let destination = unsafe {
-            self.insert_mapping(
-                new_range,
+            self.create_mapping(
+                NonZeroAddress::new(new_range.start),
+                length,
                 temporary,
-                false,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                CreatePagesFlags::TOP_DOWN,
             )
         }
         .map_err(|error| {
@@ -1479,6 +1484,8 @@ pub enum VmemProtectError {
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
     NoAccess { old: VmFlags, new: VmFlags },
+    #[error("unsupported page protection")]
+    UnsupportedProtection,
     #[error("mprotect failed: {0}")]
     ProtectError(#[from] litebox::platform::page_mgmt::PermissionUpdateError),
 }
@@ -1502,6 +1509,8 @@ pub enum MappingError {
 
     #[error("mapping failed: {0}")]
     MapError(#[from] litebox::platform::page_mgmt::AllocationError),
+    #[error("protecting mapping failed: {0}")]
+    ProtectError(#[from] VmemProtectError),
 }
 
 /// Enable [`crate::mm::VmemManager`] to handle page faults if its platform implements this trait.

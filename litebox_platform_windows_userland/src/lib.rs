@@ -2,6 +2,9 @@
 // Licensed under the MIT license.
 
 //! A [LiteBox platform](../litebox/platform/index.html) for running LiteBox on userland Windows.
+//!
+//! The guest shares the host process's address space, so this platform does not isolate host
+//! memory from the guest: guest code or fixed-address mappings can read or overwrite it.
 
 // Restrict this crate to only work on Windows. For now, we are restricting this to only x86-64
 // Windows, but we _may_ allow for more in the future, if we find it useful to do so.
