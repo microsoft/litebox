@@ -1108,7 +1108,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         unsafe {
             self.page_table_manager
                 .current_page_table()
-                .remap_pages(old_range, new_range.clone())
+                .remap_pages(old_range, new_range)
         }?;
         source_reservations().for_each(drop);
         // SAFETY: Remapping transferred ownership to this exact destination extent.
