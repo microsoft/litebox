@@ -379,6 +379,14 @@ impl SiginfoData {
         Self { pad }
     }
 
+    /// Returns the fields of a signal sent by process `pid` of user `uid`.
+    pub fn new_kill(pid: i32, uid: u32) -> Self {
+        let mut pad = [0u32; 28];
+        pad[0] = pid.cast_unsigned();
+        pad[1] = uid;
+        Self { pad }
+    }
+
     /// Returns the `SIGCHLD` fields for child `pid` of user `uid` that terminated with `status`,
     /// reporting zero CPU time.
     pub fn new_child(pid: i32, uid: u32, status: i32) -> Self {

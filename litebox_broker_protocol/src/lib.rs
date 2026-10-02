@@ -25,6 +25,7 @@ pub mod process;
 pub mod random;
 pub mod readiness;
 pub mod shared_buffer;
+pub mod signal;
 pub mod socket;
 pub mod timer;
 pub mod wire;

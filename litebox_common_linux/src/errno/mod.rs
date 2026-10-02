@@ -146,6 +146,7 @@ impl From<litebox::process::ProcessError> for Errno {
             litebox::process::ProcessError::ServiceFailed
             | litebox::process::ProcessError::InvalidChild => Errno::EIO,
             litebox::process::ProcessError::ClosedDescriptor => Errno::EBADF,
+            litebox::process::ProcessError::NoSuchProcess => Errno::ESRCH,
         }
     }
 }
@@ -811,6 +812,7 @@ mod tests {
             (ProcessError::ServiceFailed, Errno::EIO),
             (ProcessError::InvalidChild, Errno::EIO),
             (ProcessError::ClosedDescriptor, Errno::EBADF),
+            (ProcessError::NoSuchProcess, Errno::ESRCH),
         ];
 
         for (error, expected) in cases {

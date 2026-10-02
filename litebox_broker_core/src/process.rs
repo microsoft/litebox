@@ -9,6 +9,7 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
+use crate::signal::ProcessSignals;
 use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
@@ -142,6 +143,8 @@ pub struct BrokerProcess {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    /// Signals sent to this process that it has not taken.
+    pub(crate) signals: Arc<ProcessSignals>,
     /// Cancellation state of this process's association.
     pub(crate) cancellation: AssociationCancellation,
 }
@@ -276,6 +279,7 @@ impl BrokerProcess {
             threads: Mutex::new(HashSet::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
         }
     }

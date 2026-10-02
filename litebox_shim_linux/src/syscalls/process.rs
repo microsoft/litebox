@@ -3,7 +3,7 @@
 
 //! Process/thread related syscalls.
 
-use crate::syscalls::signal::{child_termination, siginfo_child};
+use crate::syscalls::signal::{child_termination, siginfo_child, siginfo_kill_from};
 use crate::wait::wait_errno;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
@@ -168,6 +168,10 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
     /// Termination events of the children, shared with each child's watcher.
     child_events: Arc<ChildEvents<Platform>>,
+    /// Signals other processes send to this process, once opened.
+    received_signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
+    /// Watcher of `received_signals`.
+    signal_watcher: Arc<SignalWatcher<Platform>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
@@ -219,6 +223,25 @@ impl<Platform: ShimPlatform> Observer<Events> for ChildWatcher<Platform> {
         self.parent.changed.store(true, Ordering::SeqCst);
         self.parent.pollee.notify_observers(Events::IN);
         interrupt_threads(&self.parent.process, None);
+    }
+}
+
+/// Watcher of the signals other processes send to a process, which interrupts its threads to take
+/// them.
+struct SignalWatcher<Platform: ShimPlatform> {
+    /// Set when a signal may have been sent since signals were last taken.
+    changed: AtomicBool,
+    /// The process's locked state, to interrupt its threads.
+    process: Arc<Mutex<Platform, ProcessInner<Platform>>>,
+}
+
+impl<Platform: ShimPlatform> Observer<Events> for SignalWatcher<Platform> {
+    fn on_events(&self, events: &Events) {
+        if events.is_empty() {
+            return;
+        }
+        self.changed.store(true, Ordering::SeqCst);
+        interrupt_threads(&self.process, None);
     }
 }
 
@@ -293,6 +316,12 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             child_events: Arc::new(ChildEvents {
                 changed: AtomicBool::new(false),
                 pollee: Pollee::new(),
+                process: inner.clone(),
+            }),
+            received_signals: once_cell::race::OnceBox::new(),
+            // Signals sent before they are opened are taken at the first check.
+            signal_watcher: Arc::new(SignalWatcher {
+                changed: AtomicBool::new(true),
                 process: inner.clone(),
             }),
             inner,
@@ -546,6 +575,54 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             // Failure means the process service failed, so no termination can be observed.
             let _ = self.observe_child_terminations();
+        }
+    }
+
+    /// Opens the signals other processes send to this process, so its threads take them.
+    pub(crate) fn receive_signals(&self) {
+        let process = &self.thread.process;
+        // Failure means the process service is unavailable or has failed, so no signal can be
+        // received.
+        let Ok(signals) = self.global.litebox.open_signals() else {
+            return;
+        };
+        signals.register_observer(
+            Arc::downgrade(&process.signal_watcher) as Weak<dyn Observer<Events>>,
+            Events::IN,
+        );
+        assert!(
+            process.received_signals.set(Box::new(signals)).is_ok(),
+            "process signals were already opened"
+        );
+    }
+
+    /// Queues the signals other processes sent since signals were last taken.
+    ///
+    /// During a `vfork` window the signal state is the child's, so the parent takes the signals
+    /// once it resumes.
+    pub(crate) fn check_for_received_signals(&self) {
+        let process = &self.thread.process;
+        if self.vfork.borrow().is_some() {
+            return;
+        }
+        let Some(signals) = process.received_signals.get() else {
+            return;
+        };
+        if !process.signal_watcher.changed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        // Failure means the process service failed, so no more signals can be taken.
+        while let Ok(Some(received)) = signals.take() {
+            if let Ok(signal) = Signal::try_from(received.signal.cast_signed()) {
+                self.send_shared_signal(
+                    signal,
+                    siginfo_kill_from(
+                        signal,
+                        received.sender.0.cast_signed(),
+                        self.credentials.uid,
+                    ),
+                );
+            }
         }
     }
 
@@ -2995,6 +3072,66 @@ mod tests {
                 "SIGALRM must not be what woke pause()"
             );
         });
+    }
+
+    #[test]
+    fn kill_signals_other_processes() {
+        use litebox_broker_protocol::ProcessId;
+        use litebox_broker_protocol::signal::PendingSignal;
+        use litebox_common_linux::{
+            errno::Errno,
+            signal::{SI_USER, Signal},
+        };
+
+        let task = crate::syscalls::tests::init_platform();
+        let (other, other_pid) =
+            crate::syscalls::test_broker::litebox(crate::syscalls::tests::test_platform());
+        let pid = ProcessId(task.pid.cast_unsigned());
+        let number = |signal: Signal| signal.as_i32().cast_unsigned();
+
+        // A signal sent before the process opens its signals waits for it.
+        other.send_signal(pid, number(Signal::SIGUSR1)).unwrap();
+        task.check_for_received_signals();
+        assert!(task.pending_signal_set().is_empty());
+        task.receive_signals();
+        task.check_for_received_signals();
+        let siginfo = task.take_pending_shared_siginfo(Signal::SIGUSR1);
+        assert_eq!(siginfo.code, SI_USER);
+        let data = siginfo.data.pad;
+        assert_eq!(data[..2], [other_pid.cast_unsigned(), task.credentials.uid]);
+
+        // A later signal wakes the process to take it.
+        task.check_for_received_signals();
+        assert!(task.pending_signal_set().is_empty());
+        other.send_signal(pid, number(Signal::SIGUSR2)).unwrap();
+        task.check_for_received_signals();
+        assert!(task.pending_signal_set().contains(Signal::SIGUSR2));
+        task.take_pending_shared_siginfo(Signal::SIGUSR2);
+
+        // `kill` signals another process, or checks that it exists with signal zero.
+        let other_signals = other.open_signals().unwrap();
+        assert_eq!(task.sys_kill(other_pid, 0), Ok(0));
+        assert_eq!(task.sys_kill(other_pid, Signal::SIGTERM.as_i32()), Ok(0));
+        assert_eq!(
+            other_signals.take(),
+            Ok(Some(PendingSignal {
+                signal: number(Signal::SIGTERM),
+                sender: pid,
+            }))
+        );
+        assert_eq!(other_signals.take(), Ok(None));
+        assert_eq!(task.sys_kill(task.pid, 0), Ok(0));
+        assert_eq!(task.sys_kill(i32::MAX, 0), Err(Errno::ESRCH));
+        assert_eq!(
+            task.sys_kill(i32::MAX, Signal::SIGTERM.as_i32()),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(task.sys_kill(other_pid, 65), Err(Errno::EINVAL));
+        assert_eq!(
+            task.sys_tgkill(other_pid, other_pid, Signal::SIGTERM.as_i32()),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(other_signals.take(), Ok(None));
     }
 
     const SYSCALL_RETURN_IP: usize = 0x5000;

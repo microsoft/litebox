@@ -18,6 +18,20 @@ static int disposition_is(int signal, void (*handler)(int)) {
     return sigaction(signal, NULL, &action) == 0 && action.sa_handler == handler;
 }
 
+static volatile sig_atomic_t usr1_count;
+static volatile pid_t usr1_pid;
+static volatile int usr1_code;
+static volatile int usr1_uid_matches;
+
+static void on_usr1(int signal, siginfo_t *info, void *context) {
+    (void)signal;
+    (void)context;
+    usr1_count++;
+    usr1_pid = info->si_pid;
+    usr1_code = info->si_code;
+    usr1_uid_matches = info->si_uid == getuid();
+}
+
 // Returns whether a child exiting with `code` is reaped automatically instead of being waitable.
 static int child_is_reaped(int code) {
     pid_t child = vfork();
@@ -44,6 +58,27 @@ int main(int argc, char **argv) {
     }
     if (strcmp(marker, "sleep") == 0) {
         usleep(100 * 1000);
+        return 42;
+    }
+    if (strcmp(marker, "kill-wait") == 0) {
+        sleep(5);
+        return 42;
+    }
+    if (strcmp(marker, "kill-handshake") == 0) {
+        struct sigaction action = {.sa_sigaction = on_usr1, .sa_flags = SA_SIGINFO};
+        if (sigaction(SIGUSR1, &action, NULL) != 0) {
+            perror("sigaction");
+            return 3;
+        }
+        if (kill(getppid(), SIGUSR2) != 0) {
+            perror("kill");
+            return 4;
+        }
+        for (int i = 0; i < 5000 && usr1_count == 0; i++) {
+            usleep(1000);
+        }
+        printf("child-kill count=%d pid=%d ppid=%d code=%d uid=%d\n", usr1_count, usr1_pid,
+               getppid(), usr1_code, usr1_uid_matches);
         return 42;
     }
     if (strcmp(marker, "reap-inherited") == 0) {

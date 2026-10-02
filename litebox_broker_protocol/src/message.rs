@@ -25,6 +25,7 @@ use crate::process::{
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
+use crate::signal::{OpenSignalsResponse, PendingSignal, SendSignalRequest, TakeSignalRequest};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
@@ -96,6 +97,8 @@ pub enum BrokerOperation {
     DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
     /// Timer object request family.
     Timer(TimerRequest),
+    /// Signal request family.
+    Signal(SignalRequest),
 }
 
 impl BrokerOperation {
@@ -148,6 +151,7 @@ impl BrokerOperation {
             | Self::SetStatusFlags(_)
             | Self::Event(_)
             | Self::Timer(_)
+            | Self::Signal(_)
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
                 SocketRequest::Create(_)
@@ -237,6 +241,21 @@ pub enum TimerRequest {
     Read(ReadTimerRequest),
 }
 
+/// Request about signals sent between broker processes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignalRequest {
+    /// Open the caller's signals.
+    ///
+    /// Signals sent to the caller stay pending until it takes them, including
+    /// signals sent before it opens them. A process has at most one open
+    /// signals handle; the broker returns `ResourceExhausted` for another.
+    Open,
+    /// Send a signal to a process.
+    Send(SendSignalRequest),
+    /// Take one of the caller's pending signals, lowest-numbered first.
+    Take(TakeSignalRequest),
+}
+
 /// Broker-owned pipe object request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PipeRequest {
@@ -319,6 +338,8 @@ pub enum BrokerResult {
     ObjectsDuplicated,
     /// Timer object response family.
     Timer(TimerResponse),
+    /// Signal response family.
+    Signal(SignalResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -354,6 +375,17 @@ pub enum TimerResponse {
     Get(GetTimerResponse),
     /// Read operation response.
     Read(ReadTimerResponse),
+}
+
+/// Response to a signal request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SignalResponse {
+    /// Open operation response.
+    Open(OpenSignalsResponse),
+    /// The signal was sent.
+    Sent,
+    /// Take operation response.
+    Take(PendingSignal),
 }
 
 /// Broker-owned pipe object response.

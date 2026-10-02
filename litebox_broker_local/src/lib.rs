@@ -25,6 +25,7 @@ mod event;
 mod fs;
 mod pipe;
 mod random;
+mod signal;
 mod socket;
 mod timer;
 
