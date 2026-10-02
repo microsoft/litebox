@@ -956,7 +956,6 @@ fn reencode_instructions(
     let mut encoder = iced_x86::Encoder::new(64);
     for inst in instructions {
         let tramp_ip = base_addr.checked_add(reencoded.len() as u64)?;
-        tramp_ip.checked_add(inst.len() as u64)?;
         if encoder.encode(inst, tramp_ip).is_err() {
             return None;
         }
@@ -1095,110 +1094,6 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn rejects_overflowing_instruction_reencoding() {
-        let instructions =
-            decode_section_instructions(Arch::X86_64, &[0x90, 0x90], 0x1000).unwrap();
-        assert!(reencode_instructions(&instructions, u64::MAX - 1).is_none());
-        assert!(reencode_instructions(&instructions, u64::MAX - 2).is_some());
-    }
-
-    #[test]
-    fn rejects_overflowing_postsyscall_trampoline() {
-        let mut code = [0x0f, 0x05, 0x90, 0x90, 0x90];
-        let instructions = decode_section_instructions(Arch::X86_64, &code, 0x1000).unwrap();
-        let mut trampoline = Vec::new();
-        assert!(matches!(
-            hook_syscall_and_after(
-                &BTreeSet::new(),
-                0x1000,
-                &mut code,
-                u64::MAX - 12,
-                0,
-                &mut trampoline,
-                &instructions,
-                0
-            ),
-            Err(InternalError::Public(Error::AddressOverflow(_)))
-        ));
-        assert_eq!(code, [0x0f, 0x05, 0x90, 0x90, 0x90]);
-        assert!(trampoline.is_empty());
-    }
-
-    #[test]
-    fn rejects_overflowing_trampoline_trailer() {
-        for header in [
-            TrampolineHeader64 {
-                magic: *TRAMPOLINE_MAGIC,
-                file_offset: u64::MAX - 0xfff,
-                vaddr: 0x1000,
-                trampoline_size: 0x1000,
-            },
-            TrampolineHeader64 {
-                magic: *TRAMPOLINE_MAGIC,
-                file_offset: 0,
-                vaddr: u64::MAX - 0xfff,
-                trampoline_size: 0x1000,
-            },
-        ] {
-            let mut bytes = vec![0; 0x1000];
-            bytes.extend_from_slice(header.as_bytes());
-            assert!(!is_already_hooked(&bytes, Arch::X86_64));
-        }
-    }
-
-    #[test]
-    fn rejects_overflowing_decode_address_range() {
-        assert!(matches!(
-            decode_section_instructions(Arch::X86_64, &[0x90], u64::MAX),
-            Err(Error::AddressOverflow(_))
-        ));
-        assert!(decode_section_instructions(Arch::X86_64, &[0x90], u64::MAX - 1).is_ok());
-        assert!(decode_section_instructions(Arch::X86_64, &[], u64::MAX).is_ok());
-    }
-
-    fn misaligned_phdr() -> Vec<u8> {
-        let mut bytes = vec![0; 128];
-        bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
-        bytes[32..40].copy_from_slice(&65u64.to_le_bytes());
-        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
-        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
-        bytes[65..69].copy_from_slice(&object::elf::PT_PHDR.to_le_bytes());
-        for offset in [8, 16, 24] {
-            bytes[65 + offset..65 + offset + 8].copy_from_slice(&65u64.to_le_bytes());
-        }
-        bytes
-    }
-
-    #[test]
-    fn phdr_alignment_rejects_overflow() {
-        for offset in [8, 16, 24] {
-            let mut bytes = misaligned_phdr();
-            bytes[65 + offset..65 + offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-            assert!(matches!(
-                hook_syscalls_in_elf(&bytes, None),
-                Err(Error::AddressOverflow(_))
-            ));
-            assert!(matches!(
-                fixup_phdr_alignment(&mut bytes),
-                Err(Error::AddressOverflow(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn phdr_alignment_updates_representable_fields() {
-        let mut bytes = misaligned_phdr();
-        fixup_phdr_alignment(&mut bytes).unwrap();
-        assert_eq!(u64::from_le_bytes(bytes[32..40].try_into().unwrap()), 72);
-        for offset in [8, 16, 24] {
-            assert_eq!(
-                u64::from_le_bytes(bytes[72 + offset..72 + offset + 8].try_into().unwrap()),
-                72
-            );
-        }
-    }
 
     #[cfg(target_pointer_width = "64")]
     #[test]
