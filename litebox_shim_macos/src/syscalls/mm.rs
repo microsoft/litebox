@@ -216,6 +216,7 @@ struct MmapRequest {
     flags: MmapFlags,
     fd: i32,
     offset: i64,
+    direction: AllocationDirection,
 }
 
 fn record_patched_range(patched: &mut BTreeSet<(usize, usize)>, range: Range<usize>) {
@@ -453,17 +454,15 @@ impl<P: ShimPlatform> Task<P> {
         fd: i32,
         offset: i64,
     ) -> Result<usize, Errno> {
-        self.mmap_with_direction(
-            MmapRequest {
-                address,
-                length,
-                protection,
-                flags,
-                fd,
-                offset,
-            },
-            AllocationDirection::BottomUp,
-        )
+        self.mmap(MmapRequest {
+            address,
+            length,
+            protection,
+            flags,
+            fd,
+            offset,
+            direction: AllocationDirection::BottomUp,
+        })
     }
 
     pub(crate) fn reserve_anonymous(
@@ -472,24 +471,18 @@ impl<P: ShimPlatform> Task<P> {
         length: usize,
         direction: AllocationDirection,
     ) -> Result<usize, Errno> {
-        self.mmap_with_direction(
-            MmapRequest {
-                address,
-                length,
-                protection: VmProtection::empty(),
-                flags: MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
-                fd: -1,
-                offset: 0,
-            },
+        self.mmap(MmapRequest {
+            address,
+            length,
+            protection: VmProtection::empty(),
+            flags: MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
+            fd: -1,
+            offset: 0,
             direction,
-        )
+        })
     }
 
-    fn mmap_with_direction(
-        &self,
-        request: MmapRequest,
-        direction: AllocationDirection,
-    ) -> Result<usize, Errno> {
+    fn mmap(&self, request: MmapRequest) -> Result<usize, Errno> {
         let MmapRequest {
             address,
             length,
@@ -497,6 +490,7 @@ impl<P: ShimPlatform> Task<P> {
             flags,
             fd,
             offset,
+            direction,
         } = request;
         if length == 0
             || !address.is_multiple_of(PAGE_SIZE)
