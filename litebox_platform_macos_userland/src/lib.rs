@@ -123,9 +123,6 @@ pub const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000;
 /// `MacosUserland4K` (requires `subpage_compat`) for 4 KiB guests.
 pub struct MacosUserlandWithPageSize<const PAGE_SIZE: usize> {
     pages: Mutex<subpage::Pages<PAGE_SIZE>>,
-    /// One-time initialization snapshot of host mappings unavailable to guest programs.
-    /// Host mappings created after [`Self::new`] are not included.
-    reserved_pages: Vec<Range<usize>>,
 }
 
 impl<const PAGE_SIZE: usize> core::fmt::Debug for MacosUserlandWithPageSize<PAGE_SIZE> {
@@ -161,71 +158,9 @@ impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
             .unwrap_or_else(|error| panic!("failed to initialize macOS TLS: {error}"));
         initialize_thread_tls();
         register_exception_handlers().expect("failed to install macOS signal handlers");
-        let reserved_pages = Self::read_maps();
         Box::leak(Box::new(Self {
             pages: Mutex::new(subpage::Pages::default()),
-            reserved_pages,
         }))
-    }
-
-    /// Take the macOS equivalent of a `/proc/self/maps` snapshot.
-    fn read_maps() -> Vec<Range<usize>> {
-        // SAFETY: `mach_task_self` takes no arguments and returns the calling task's send right.
-        let task = unsafe { mach_task_self() };
-        let mut reserved_pages = Vec::new();
-        let mut cursor = 0_u64;
-
-        loop {
-            let mut address = cursor;
-            let mut size = 0_u64;
-            // Only the returned range matters: mappings with every protection, including
-            // PROT_NONE reservations, must remain unavailable to the guest.
-            let mut info = [0_i32; VM_REGION_BASIC_INFO_COUNT_64 as usize];
-            let mut info_count = VM_REGION_BASIC_INFO_COUNT_64;
-            let mut object_name = MACH_PORT_NULL;
-            // SAFETY: all output pointers refer to initialized, writable storage of the
-            // sizes required by VM_REGION_BASIC_INFO_64, and `task` is our task port.
-            let result = unsafe {
-                mach_vm_region(
-                    task,
-                    &raw mut address,
-                    &raw mut size,
-                    VM_REGION_BASIC_INFO_64,
-                    info.as_mut_ptr(),
-                    &raw mut info_count,
-                    &raw mut object_name,
-                )
-            };
-            if result == KernReturn::INVALID_ADDRESS {
-                break;
-            }
-            assert_eq!(result, KernReturn::SUCCESS, "mach_vm_region failed");
-            if object_name != MACH_PORT_NULL {
-                // `mach_vm_region` transfers this send right to the caller.
-                // SAFETY: `object_name` is the right returned by the successful call above.
-                let deallocate_result = unsafe { mach_port_deallocate(task, object_name) };
-                assert_eq!(
-                    deallocate_result,
-                    KernReturn::SUCCESS,
-                    "mach_port_deallocate failed"
-                );
-            }
-
-            let end = address
-                .checked_add(size)
-                .expect("mach_vm_region returned an overflowing range");
-            assert!(size != 0 && end > cursor, "mach_vm_region did not advance");
-            let start = usize::try_from(address).expect("mapping address does not fit usize");
-            let end = usize::try_from(end).expect("mapping end does not fit usize");
-            assert!(
-                start.is_multiple_of(HOST_PAGE_SIZE) && end.is_multiple_of(HOST_PAGE_SIZE),
-                "mach_vm_region returned an unaligned range"
-            );
-            reserved_pages.push(start..end);
-            cursor = end as u64;
-        }
-
-        reserved_pages
     }
 }
 
@@ -738,17 +673,11 @@ enum MachVmInheritance {
     None = 2,
 }
 
-const MACH_PORT_NULL: u32 = 0;
 const BSD_SYS_MMAP: usize = 197;
 const BSD_SYS_MPROTECT: usize = 74;
 const BSD_SYS_PTHREAD_SIGMASK: usize = 329;
 const BSD_SYS_SIGRETURN: usize = 184;
 const MACH_VM_DEALLOCATE_TRAP: usize = 0u32.wrapping_sub(12) as usize;
-const VM_REGION_BASIC_INFO_64: i32 = 9;
-// sizeof(vm_region_basic_info_data_64_t) / sizeof(integer_t) on macOS. The
-// SDK declares this structure with 4-byte packing, making it 36 bytes.
-const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
-
 // vm_region_submap_short_info_64, packed to 4-byte alignment by the Mach SDK.
 #[repr(C, packed(4))]
 struct MachVmSubmapInfo {
@@ -774,7 +703,6 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> KernReturn;
     fn mach_wait_until(deadline: u64) -> KernReturn;
     fn mach_task_self() -> u32;
-    fn mach_port_deallocate(task: u32, name: u32) -> KernReturn;
     fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: MachVmFlags) -> KernReturn;
     fn mach_vm_deallocate(task: u32, address: u64, size: u64) -> KernReturn;
     fn mach_vm_protect(
@@ -796,15 +724,6 @@ unsafe extern "C" {
         current_protection: *mut MachVmProtection,
         max_protection: *mut MachVmProtection,
         inheritance: MachVmInheritance,
-    ) -> KernReturn;
-    fn mach_vm_region(
-        task: u32,
-        address: *mut u64,
-        size: *mut u64,
-        flavor: i32,
-        info: *mut i32,
-        info_count: *mut u32,
-        object_name: *mut u32,
     ) -> KernReturn;
     fn mach_vm_region_recurse(
         task: u32,
@@ -1386,48 +1305,101 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
 
     const TASK_ADDR_MIN: usize = TASK_ADDR_MIN;
     const TASK_ADDR_MAX: usize = TASK_ADDR_MAX;
-    fn allocate_pages(
+    unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
-        range: Range<usize>,
+        replaced_reservations: impl FnOnce() -> Reservations,
+        suggested_range: Range<usize>,
         permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+    ) -> Result<MacosUserlandReservation<PAGE_SIZE>, AllocationError>
+    where
+        Reservations: Iterator<Item = MacosUserlandReservation<PAGE_SIZE>>,
+    {
         // TODO: grow the mapping from the signal path. macOS has no
         // MAP_GROWSDOWN equivalent, so the initial stack is currently fixed-size.
         let _ = can_grow_down;
         // Eager population is an optional performance hint.
         let _ = populate_pages_immediately;
-        if !is_page_aligned::<PAGE_SIZE>(&range) {
+        if !is_page_aligned::<PAGE_SIZE>(&suggested_range) {
             return Err(AllocationError::Unaligned);
         }
-        if range.start < TASK_ADDR_MIN {
+        if suggested_range.start < TASK_ADDR_MIN {
             return Err(AllocationError::BelowMinAddress);
         }
-        if range.end > TASK_ADDR_MAX {
+        if suggested_range.end > TASK_ADDR_MAX {
             return Err(AllocationError::AboveMaxAddress);
         }
         if permissions.contains(MemoryRegionPermissions::WRITE | MemoryRegionPermissions::EXEC) {
             return Err(AllocationError::PermissionDenied);
         }
+        let length = suggested_range.len();
+        let base = self
+            .pages
+            .lock()
+            .unwrap()
+            .allocate(suggested_range, permissions, behavior)?;
+        if behavior == FixedAddressBehavior::Replace {
+            replaced_reservations().for_each(drop);
+        }
+        // SAFETY: Pages successfully acquired exclusive ownership of this exact guest extent.
+        Ok(unsafe { MacosUserlandReservation::new(base..base + length) })
+    }
+
+    unsafe fn commit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+        populate_pages_immediately: bool,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation MacosUserlandReservation<PAGE_SIZE>>,
+        MacosUserlandReservation<PAGE_SIZE>: 'reservation,
+    {
+        let _ = populate_pages_immediately;
         self.pages
             .lock()
             .unwrap()
-            .allocate(range, permissions, behavior)
-            .map(Self::RawMutPointer::from_usize)
+            .update_permissions(range.clone(), permissions)
+            .map_err(|error| match error {
+                PermissionUpdateError::Unallocated => AllocationError::AddressInUse,
+                PermissionUpdateError::PermissionDenied => AllocationError::PermissionDenied,
+                _ => AllocationError::OutOfMemory,
+            })?;
+        Ok(Self::RawMutPointer::from_usize(range.start))
     }
+
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: Range<usize>,
+    ) -> Result<(), DeallocationError>
+    where
+        Reservations: Iterator<Item = &'reservation MacosUserlandReservation<PAGE_SIZE>>,
+        MacosUserlandReservation<PAGE_SIZE>: 'reservation,
+    {
+        self.pages.lock().unwrap().decommit(range)
+    }
+
     unsafe fn release_pages(&self, range: Range<usize>) -> Result<(), DeallocationError> {
         if !is_page_aligned::<PAGE_SIZE>(&range) {
             return Err(DeallocationError::Unaligned);
         }
         self.pages.lock().unwrap().deallocate(range)
     }
-    unsafe fn update_permissions(
+
+    unsafe fn protect_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
         range: Range<usize>,
         permissions: MemoryRegionPermissions,
-    ) -> Result<(), PermissionUpdateError> {
+    ) -> Result<(), PermissionUpdateError>
+    where
+        Reservations: Iterator<Item = &'reservation MacosUserlandReservation<PAGE_SIZE>>,
+        MacosUserlandReservation<PAGE_SIZE>: 'reservation,
+    {
         if !is_page_aligned::<PAGE_SIZE>(&range) {
             return Err(PermissionUpdateError::Unaligned);
         }
@@ -1439,8 +1411,51 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
             .unwrap()
             .update_permissions(range, permissions)
     }
-    fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
-        self.reserved_pages.iter()
+}
+
+#[cfg(test)]
+impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
+    fn allocate_pages(
+        &self,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+        can_grow_down: bool,
+        populate_pages_immediately: bool,
+        behavior: FixedAddressBehavior,
+    ) -> Result<<Self as litebox::platform::RawPointerProvider>::RawMutPointer<u8>, AllocationError>
+    {
+        let reservation = unsafe {
+            <Self as litebox::platform::PageManagementProvider<PAGE_SIZE>>::reserve_and_commit_pages(
+                self,
+                core::iter::empty,
+                range,
+                permissions,
+                can_grow_down,
+                populate_pages_immediately,
+                behavior,
+            )
+        }?;
+        let extent: Range<usize> = reservation.into();
+        Ok(
+            <Self as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                extent.start,
+            ),
+        )
+    }
+
+    unsafe fn update_permissions(
+        &self,
+        range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<(), PermissionUpdateError> {
+        unsafe {
+            <Self as litebox::platform::PageManagementProvider<PAGE_SIZE>>::protect_pages(
+                self,
+                core::iter::empty,
+                range,
+                permissions,
+            )
+        }
     }
 }
 
@@ -4168,37 +4183,6 @@ mod tests {
         run_process_test_thread(process, || {
             platform.take_pending_signals(|_| panic!("timer was delivered more than once"));
         });
-    }
-
-    #[test]
-    fn reserved_pages_snapshot_contains_host_mappings() {
-        let heap_value = Box::new(0_u8);
-        let stack_value = 0_u8;
-        let platform = MacosUserland::new();
-        let reserved_pages: Vec<_> = <MacosUserland as litebox::platform::PageManagementProvider<
-            HOST_PAGE_SIZE,
-        >>::reserved_pages(platform)
-        .collect();
-
-        assert_ne!(reserved_pages, [] as [&Range<usize>; 0]);
-        let mut previous_end = 0;
-        for range in &reserved_pages {
-            assert!(range.start >= previous_end);
-            assert!(range.end > range.start);
-            assert!(range.start.is_multiple_of(HOST_PAGE_SIZE));
-            assert!(range.end.is_multiple_of(HOST_PAGE_SIZE));
-            previous_end = range.end;
-        }
-        for address in [
-            reserved_pages_snapshot_contains_host_mappings as *const () as usize,
-            std::ptr::from_ref(&stack_value) as usize,
-            std::ptr::from_ref(heap_value.as_ref()) as usize,
-        ] {
-            assert!(
-                reserved_pages.iter().any(|range| range.contains(&address)),
-                "host address {address:#x} is absent from the snapshot"
-            );
-        }
     }
 
     #[test]

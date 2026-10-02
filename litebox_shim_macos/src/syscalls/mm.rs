@@ -1260,8 +1260,12 @@ impl<P: ShimPlatform> Task<P> {
         // lifetime. This platform-only transition intentionally bypasses the
         // guest mapping's VM_MAYWRITE restriction and is restored before the
         // guest-visible mprotect completes.
-        unsafe { self.global.platform.update_permissions(range, permissions) }
-            .map_err(|error| protection_error(VmemProtectError::ProtectError(error)))
+        unsafe {
+            self.global
+                .platform
+                .protect_pages(core::iter::empty, range, permissions)
+        }
+        .map_err(|error| protection_error(VmemProtectError::ProtectError(error)))
     }
 
     fn change_permissions(

@@ -104,16 +104,24 @@ fn spawned_threads_use_configured_darwin_gates() {
     // Executing the child's Darwin gates below verifies that it is retained.
     assert!(std::panic::catch_unwind(|| set_guest_abi(GuestAbi::Linux)).is_err());
     let platform = MacosUserland::new();
-    let memory = platform
-        .allocate_pages(
-            MacosUserland::TASK_ADDR_MIN..MacosUserland::TASK_ADDR_MIN + 3 * HOST_PAGE_SIZE,
-            Permissions::READ | Permissions::WRITE,
-            false,
-            true,
-            FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
-        )
-        .unwrap();
-    let base = memory.as_usize();
+    let reservation = unsafe {
+        platform
+            .reserve_and_commit_pages(
+                core::iter::empty,
+                MacosUserland::TASK_ADDR_MIN..MacosUserland::TASK_ADDR_MIN + 3 * HOST_PAGE_SIZE,
+                Permissions::READ | Permissions::WRITE,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+            .unwrap()
+    };
+    let extent: std::ops::Range<usize> = reservation.into();
+    let base = extent.start;
+    let memory =
+        <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+            base,
+        );
     let mut code = [0xd4001001u32.to_le_bytes(); 2].concat();
     let gate_offset = HOST_PAGE_SIZE / 2;
     let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
@@ -137,7 +145,8 @@ fn spawned_threads_use_configured_darwin_gates() {
     // SAFETY: code and gates are initialized and have no active users.
     unsafe {
         platform
-            .update_permissions(
+            .protect_pages(
+                core::iter::empty,
                 base..base + HOST_PAGE_SIZE,
                 Permissions::READ | Permissions::EXEC,
             )
