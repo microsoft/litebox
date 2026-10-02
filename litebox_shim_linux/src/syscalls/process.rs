@@ -3080,7 +3080,7 @@ mod tests {
         use litebox_broker_protocol::signal::PendingSignal;
         use litebox_common_linux::{
             errno::Errno,
-            signal::{SI_USER, Signal},
+            signal::{SigSet, Signal},
         };
 
         let task = crate::syscalls::tests::init_platform();
@@ -3095,18 +3095,15 @@ mod tests {
         assert!(task.pending_signal_set().is_empty());
         task.receive_signals();
         task.check_for_received_signals();
-        let siginfo = task.take_pending_shared_siginfo(Signal::SIGUSR1);
-        assert_eq!(siginfo.code, SI_USER);
-        let data = siginfo.data.pad;
-        assert_eq!(data[..2], [other_pid.cast_unsigned(), task.credentials.uid]);
+        let usr1 = SigSet::empty().with(Signal::SIGUSR1);
+        assert_eq!(task.pending_signal_set(), usr1);
 
         // A later signal wakes the process to take it.
         task.check_for_received_signals();
-        assert!(task.pending_signal_set().is_empty());
+        assert_eq!(task.pending_signal_set(), usr1);
         other.send_signal(pid, number(Signal::SIGUSR2)).unwrap();
         task.check_for_received_signals();
-        assert!(task.pending_signal_set().contains(Signal::SIGUSR2));
-        task.take_pending_shared_siginfo(Signal::SIGUSR2);
+        assert_eq!(task.pending_signal_set(), usr1.with(Signal::SIGUSR2));
 
         // `kill` signals another process, or checks that it exists with signal zero.
         let other_signals = other.open_signals().unwrap();

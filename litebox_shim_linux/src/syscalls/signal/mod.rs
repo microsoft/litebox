@@ -435,7 +435,7 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
-/// Creates a `Siginfo` for a signal process `pid` of user `uid` sent via `kill()`.
+/// Creates the `Siginfo` for `signal` sent via `kill()` by process `pid` of user `uid`.
 pub(crate) fn siginfo_kill_from(signal: Signal, pid: i32, uid: u32) -> Siginfo {
     Siginfo {
         signo: signal.as_i32(),
@@ -836,11 +836,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     #[cfg(test)]
     pub(crate) fn take_pending_siginfo(&self, signal: Signal) -> Siginfo {
         self.signals.pending.borrow_mut().remove(signal)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn take_pending_shared_siginfo(&self, signal: Signal) -> Siginfo {
-        self.signals.shared_pending.lock().remove(signal)
     }
 
     /// Deliver any pending signals.
