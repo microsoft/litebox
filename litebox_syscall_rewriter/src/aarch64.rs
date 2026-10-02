@@ -96,20 +96,16 @@
 //! trampoline is executable. A binary with no patch sites gets no trampoline,
 //! only a size-0 sentinel header, matching the x86-64 path.
 //!
-//! ### Split trampolines
+//! ### Sub-trampolines
 //!
-//! Gates cannot be deduplicated: recovery identifies a slot's original site
-//! from the slot's own return branch and checks that the site branches to the
-//! slot start, so every site needs its own slot. What can be divided is the
-//! trampoline. An ELF's trampoline may be emitted as several *sub-trampolines*,
-//! each a complete trampoline of its own -- callback header plus slots -- at a
-//! page-aligned address; see `hook_split_aarch64_with_code_ranges`. A slot
-//! only references its own sub-trampoline's header, and recovery, which works
-//! from the interrupted PC alone, needs no knowledge of the split. This lets
-//! gates fill every inter-segment hole before spilling past the last segment,
-//! and caps each sub-trampoline at [`MAX_SUB_TRAMPOLINE_BYTES`], so SVC
-//! callback literals stay in reach however many sites an object has. The file
-//! format is described at [`crate::MAX_AARCH64_TRAMPOLINE_REGIONS`].
+//! An ELF's gates are emitted as one or more *sub-trampolines*, each a
+//! callback header followed by slots at a page-aligned address; see
+//! `hook_split_aarch64_with_code_ranges`. A slot references only its own
+//! sub-trampoline's header, so each sub-trampoline is installed independently
+//! and recovery needs only the interrupted PC. Gates fill the object's
+//! inter-segment holes before the space past its last segment, and each
+//! sub-trampoline is capped at [`MAX_SUB_TRAMPOLINE_BYTES`]. The file format is
+//! described at [`crate::MAX_AARCH64_TRAMPOLINE_REGIONS`].
 //!
 //! `rt_sigreturn` needs no gate: the runtime installs its own trampoline
 //! address into the signal frame, and an absolute address is reachable
@@ -3535,23 +3531,19 @@ fn emit_site_gate(
 }
 
 // ============================================================
-// Split trampolines
+// Sub-trampolines
 // ============================================================
 
-/// Largest sub-trampoline, header included.
-///
-/// Every SVC gate loads the callback from its sub-trampoline's header with an
-/// `LDR` literal, which reaches back at most 1MiB. Capping each sub-trampoline
-/// there keeps every such load encodable, whatever the number of SVC sites.
+/// Largest sub-trampoline, header included. Every SVC gate loads the callback
+/// from its sub-trampoline's header with an `LDR` literal, which reaches back
+/// at most 1MiB.
 pub const MAX_SUB_TRAMPOLINE_BYTES: usize = 1 << 20;
 
 /// Furthest an `LDR` literal reaches back: `imm19` words.
 const LDR_LITERAL_MAX_BACKWARD_BYTES: usize = (1 << 18) * INSN_BYTES;
 
-// Every slot lies wholly below the cap, so an SVC slot starts at most
-// `SVC_SLOT_BYTES` before it, whatever mix of slot sizes precedes it. Its
-// callback load, `SvcGateOffset::LoadCallback` bytes in, must still reach the
-// header at offset 0.
+// Every slot lies wholly below the cap, so the callback load of the last SVC
+// slot must still reach the header at offset 0.
 const _: () = assert!(
     MAX_SUB_TRAMPOLINE_BYTES - SVC_SLOT_BYTES + (SvcGateOffset::LoadCallback as usize)
         <= LDR_LITERAL_MAX_BACKWARD_BYTES,
@@ -3567,12 +3559,9 @@ pub struct TrampolineSpace {
     pub end: Option<u64>,
 }
 
-/// One self-contained piece of a split trampoline: a callback header at
-/// `vaddr` followed by gate slots, exactly the layout of an unsplit trampoline.
-///
-/// Every gate is fully contained in one sub-trampoline and only references its
-/// own header, so a loader installs each sub-trampoline independently: write
-/// the callback into its first 8 bytes and finalize it as a whole trampoline.
+/// A callback header at `vaddr` followed by gate slots. Its gates reference
+/// only this header, so a loader installs each sub-trampoline independently:
+/// it writes the callback into the first 8 bytes and finalizes the rest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubTrampoline {
     /// Address of the callback header, aligned to the placement granule.
@@ -3599,17 +3588,11 @@ struct OpenSubTrampoline {
 
 /// Rewrites `sites`, spreading their gates over sub-trampolines in `spaces`.
 ///
-/// A single trampoline must fit one hole and keep every SVC callback literal
-/// within 1MiB of its header. Splitting lifts both limits: each site goes to
-/// the first space, in preference order, that has room for its gate and that
-/// its branches reach. Within a space, gates are packed into the open
-/// sub-trampoline until it reaches the space's end or
-/// [`MAX_SUB_TRAMPOLINE_BYTES`], and then into a new one starting at the next
-/// `granule` boundary. Sub-trampolines therefore never share a `granule`-sized
-/// page, so each can be mapped and protected on its own.
-///
-/// When everything fits the first space this emits exactly what
-/// [`hook_syscalls_aarch64_with_code_ranges`] emits at that space's start.
+/// Each site goes to the first space, in preference order, that has room for
+/// its gate and that its branches reach. Within a space, gates are packed into
+/// the open sub-trampoline until it reaches the space's end or
+/// [`MAX_SUB_TRAMPOLINE_BYTES`], then into a new one at the next `granule`
+/// boundary, so sub-trampolines never share a `granule`-sized page.
 pub(crate) fn hook_split_aarch64_with_code_ranges(
     buf: &mut [u8],
     sections: ScanSections<'_>,
@@ -3685,14 +3668,12 @@ fn hook_sites_split(
     }
 
     let mut trampolines: Vec<SubTrampoline> = Vec::new();
-    // The sub-trampoline currently accepting gates in each space, if any.
     let mut open: Vec<Option<OpenSubTrampoline>> = spaces.iter().map(|_| None).collect();
     let mut trapped_sites: Vec<u64> = Vec::new();
 
     'sites: for site in sites {
-        // Room is checked before emitting: a gate must lie wholly below its
-        // sub-trampoline's limit, or an SVC gate's callback literal could be
-        // out of reach of the header.
+        // Room is checked before emitting: an SVC gate past the limit would
+        // have its callback literal out of reach.
         let Some(slot_bytes) = site_slot_bytes(site, config) else {
             // An unsupported form no placement could fix.
             trap_site(buf, site.file_offset);
@@ -3701,13 +3682,11 @@ fn hook_sites_split(
         };
         for (space_index, space) in spaces.iter().enumerate() {
             let start = if let Some(current) = &open[space_index] {
-                // First try the space's open sub-trampoline.
                 let sub = &mut trampolines[current.index];
                 let before = checked_add_u64(sub.vaddr, sub.data.len() as u64, "sub-trampoline")?;
-                // When out of reach: sites come in ascending order, so a site
-                // above the space may still reach a fresh sub-trampoline
-                // further up it; one below will fail that too and move on to
-                // the next space, leaving this one open.
+                // Sites come in ascending order: one above the space that is
+                // out of reach here may reach a fresh sub-trampoline further
+                // up; one below fails that too and moves to the next space.
                 if before
                     .checked_add(slot_bytes as u64)
                     .is_some_and(|end| end <= current.limit)
@@ -3722,8 +3701,7 @@ fn hook_sites_split(
                         .copy_from_slice(&b_insn.to_le_bytes());
                     continue 'sites;
                 }
-                // Out of room or reach: try a successor on a fresh granule, so
-                // the two can be mapped independently.
+                // The successor starts on a fresh granule.
                 let Some(next) = before.checked_next_multiple_of(granule) else {
                     continue;
                 };
@@ -3732,7 +3710,6 @@ fn hook_sites_split(
                 space.start
             };
 
-            // Open a new sub-trampoline in this space, if it has room.
             let limit = start
                 .saturating_add(MAX_SUB_TRAMPOLINE_BYTES as u64)
                 .min(space.end.unwrap_or(u64::MAX));
@@ -8895,7 +8872,7 @@ mod tests {
             .copy_from_slice(&((word & !LDST_UIMM12_IMM_MASK) | immediate).to_le_bytes());
     }
 
-    // ---- Split trampolines ----
+    // ---- Sub-trampolines ----
 
     const SPLIT_PAGE: u64 = 0x1000;
 
@@ -9089,8 +9066,8 @@ mod tests {
         assert_eq!(word_at(&buf, 4), Insn::Brk(TRAP_BRK_IMM).encode().unwrap());
     }
 
-    /// One trampoline holds at most ~16K SVC slots before the last callback
-    /// literal is out of reach. Splitting caps each sub-trampoline instead.
+    /// SVC slots beyond one sub-trampoline's callback-literal reach are spread
+    /// over several.
     #[test]
     fn svc_sites_beyond_one_callback_literal_reach_split() {
         let count = MAX_SUB_TRAMPOLINE_BYTES / SVC_SLOT_BYTES + 8;

@@ -7,11 +7,9 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
-#[cfg_attr(target_arch = "aarch64", allow(unused_imports))]
 use litebox_common_linux::{
     HOST_PAGE_SIZE, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
-    loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
     vmem::{MappingError, PAGE_SIZE, VmemProtectError},
 };
 
@@ -27,11 +25,13 @@ use core::ops::Range;
 use litebox::utils::TruncateExt as _;
 #[cfg(target_arch = "aarch64")]
 use litebox_common_linux::loader::{ElfParseError, ReadAt, read_trampoline_regions};
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64};
 #[cfg(target_arch = "aarch64")]
 use litebox_common_linux::vmem::VmFlags;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
-#[cfg_attr(target_arch = "aarch64", allow(unused_imports))]
+#[cfg(target_arch = "x86_64")]
 use zerocopy::FromBytes as _;
 #[cfg(target_arch = "aarch64")]
 use zerocopy::FromZeros as _;
@@ -130,9 +130,9 @@ pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pre_patched: bool,
     /// For pre-patched binaries: file offset and size of the trampoline data.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     trampoline_file_offset: u64,
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     trampoline_file_size: usize,
     /// For pre-patched AArch64 binaries: the sub-trampolines to map, or `None`
     /// if the file's trampoline table is malformed and cannot be installed.
@@ -200,9 +200,8 @@ impl AotTrampoline {
     }
 }
 
-/// A host-page-aligned hole between an unpatched object's segments, used for
-/// runtime sub-trampolines. It lies inside the object's load span, which the
-/// dynamic loader reserves and leaves `PROT_NONE`, like an AOT trampoline's.
+/// A host-page-aligned hole between an unpatched object's segments, inside the
+/// load span the dynamic loader reserves, used for runtime sub-trampolines.
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Debug)]
 struct RuntimeHole {
@@ -404,8 +403,8 @@ fn area_unmap(area: &Range<usize>, unmapped: &Range<usize>) -> AreaUnmap {
 }
 
 /// Stops tracking trampoline areas -- AOT regions, holes, and the runtime
-/// region -- that `unmapped` removed, so later `mprotect` requests no longer
-/// exclude them. Each area is independent: unloading an object removes its
+/// region -- that `unmapped` removed, so later `mprotect` requests stop
+/// excluding them. Each area is independent: unloading an object removes its
 /// holes but not a region past its last segment. Only an area left partly
 /// mapped makes its gates unusable, which invalidates the trampoline.
 #[cfg(target_arch = "aarch64")]
@@ -1071,7 +1070,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
-        #[cfg(not(target_arch = "aarch64"))]
+        #[cfg(target_arch = "x86_64")]
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             self.check_trampoline_magic(&fd.0);
         // AArch64 trampolines are tables of sub-trampolines; the first one's
@@ -1168,13 +1167,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             };
             // On x86-64, the fallback is the page-aligned end of the highest
             // PT_LOAD segment.
-            // This is only the runtime region's address. Program headers alone
-            // cannot show that a hole is still reserved in a partially mapped
-            // file, so the region takes the `trampoline_addr_for` fallback
-            // rather than the hole `trampoline_placement_for` would pick. On
-            // AArch64, holes are offered to the rewriter separately, each only
-            // once the live mappings show it is reserved; see
-            // `runtime_hole_is_reserved`.
+            // Program headers alone cannot show that a hole is still reserved
+            // in a partially mapped file, so the runtime region takes the
+            // `trampoline_addr_for` fallback. AArch64 offers holes separately;
+            // see `runtime_hole_is_reserved`.
             let Ok(offset) = litebox_syscall_rewriter::trampoline_addr_for(
                 max_load_end,
                 max_load_align,
@@ -1231,9 +1227,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             None
         };
-        // Holes are relative to the load base, which must be known. Unlike the
-        // runtime region's address above, a hole is used only once the live
-        // mappings show it is still reserved; see `runtime_hole_is_reserved`.
+        // Holes are relative to the load base, which must be known.
         #[cfg(target_arch = "aarch64")]
         let runtime_holes = {
             let load_base = if e_type == ET_DYN { base_addr } else { Some(0) };
@@ -1261,9 +1255,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut cache = self.global.elf_patch_cache.lock();
         cache.entry(fd.clone()).or_insert(ElfPatchState {
             pre_patched,
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             trampoline_file_offset: tramp_file_offset,
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             trampoline_file_size: tramp_file_size.trunc(),
             #[cfg(target_arch = "aarch64")]
             aot_trampolines,
@@ -1345,7 +1339,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     fn check_trampoline_magic(&self, fd: &FileFd) -> (bool, u64, u64, u64) {
         let Ok(stat) = self.global.litebox.file_status(fd) else {
             return (false, 0, 0, 0);
@@ -1521,7 +1515,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Returns an error when a pre-patched binary's trampoline cannot be set
     /// up or the caller-selected code permissions cannot be restored.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: UserPtrMut<u8>,
@@ -1922,7 +1916,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENOMEM);
         }
 
-        // Read trampoline data from the file.
         let mut tramp_data = alloc::vec![0u8; region.size];
         let file_off = region.file_offset.trunc();
         let tramp_ptr = UserPtrMut::<u8>::from_usize(tramp_addr);
@@ -1934,7 +1927,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENOMEM);
         }
 
-        // Write syscall entry point to the first 8 bytes.
         if tramp_data.len() >= 8 {
             tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
         }
@@ -1946,7 +1938,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENOMEM);
         }
 
-        // Write to the mapped region.
         if tramp_ptr
             .copy_from_slice::<Platform>(0, &tramp_data)
             .is_none()
@@ -1955,7 +1946,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENOMEM);
         }
 
-        // Protect as RX immediately.
         if self
             .sys_mprotect_raw(
                 tramp_ptr,
@@ -1970,14 +1960,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
-    /// Patch an executable segment in-place after it has been mapped, for
-    /// AArch64: gates go to sub-trampolines in the object's holes and, when
-    /// needed, a lazily reserved runtime region.
+    /// Patch an AArch64 executable segment in place after it has been mapped.
     ///
-    /// For pre-patched binaries: maps the trampoline from the file and writes
-    /// the syscall entry point.
-    /// For unpatched binaries: calls `patch_code_segment()` to rewrite syscall
-    /// instructions and places the generated stubs in the trampoline region.
+    /// A pre-patched binary gets its sub-trampolines installed from the file;
+    /// otherwise the segment is rewritten by `install_aarch64_runtime_gates`.
     ///
     /// Returns an error when a pre-patched binary's trampoline cannot be set
     /// up or the caller-selected code permissions cannot be restored.
@@ -2010,13 +1996,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         if state.pre_patched {
-            // Pre-patched binary: map the trampoline regions from the file.
             let Some(regions) = state.aot_trampolines.clone() else {
                 litebox_util_log::error!(fd:? = fd; "refusing to execute a binary with a malformed trampoline");
                 return Err(Errno::ENOMEM);
             };
-            // Install every region not currently mapped: all of them the first
-            // time, and any an unmap removed while the code stayed mapped.
+            // Install every region not currently mapped.
             if !state.trampoline_mapped {
                 let missing: Vec<usize> = (0..regions.len())
                     .filter(|&index| !regions[index].mapped)
@@ -2069,7 +2053,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         state.patched_ranges.insert(mapping_key);
 
-        // Make the trampoline RW for writing stubs.
         for range in state.runtime_trampoline_ranges() {
             if self
                 .sys_mprotect_raw(
@@ -2094,7 +2077,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             panic!("fatal: failed to mprotect code segment to RW for patching");
         }
 
-        // Read the mapped code into a buffer, patch it, write back.
         let Some(code_owned) = mapped_addr.to_owned_slice::<Platform>(len) else {
             let _ = self.restore_page_permissions(restore_protections);
             self.restore_runtime_trampoline_rx(state);
@@ -2120,7 +2102,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return restored;
         }
 
-        // Restore the caller-selected code-segment permissions.
         let restored = self.restore_page_permissions(restore_protections);
         self.restore_runtime_trampoline_rx(state);
         restored
@@ -2140,13 +2121,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Rewrites one AArch64 batch in `code_buf` and installs its gates.
     ///
-    /// Gates are spread over sub-trampolines: first in the object's holes,
-    /// largest first, then in the runtime region. The region is reserved only
-    /// once a batch does not fit the holes; if it cannot be, the holes still
-    /// take what they can and the rest is trapped. A hole is mapped on first
-    /// use. Sub-trampolines are written before the code that branches to them,
-    /// and code bytes over a hole are never written back, since the hole now
-    /// holds trampolines rather than the file contents `code_buf` captured.
+    /// Gates go to sub-trampolines in the object's holes, largest first, then
+    /// in the runtime region, which is reserved only once a batch does not fit
+    /// the holes; if it cannot be, the remaining sites are trapped. A hole is
+    /// mapped on first use, and code bytes over it are never written back.
     ///
     /// Trampoline memory and `code_buf`'s mapping must already be writable.
     /// Returns `Err`, leaving holes and cursors as they were, when the batch
@@ -2382,11 +2360,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(())
     }
 
-    /// Whether `hole` is still reserved for its object, so mapping a
-    /// trampoline over it cannot clobber anything: every page must be mapped,
+    /// Whether `hole` is still reserved for its object: every page is mapped,
     /// either by `code`, the mapping being patched, or inaccessibly, as a
-    /// loader leaves the slack inside an object's reservation. Unmapped or live
-    /// memory there means the computed hole is not this object's to use.
+    /// loader leaves the slack inside an object's reservation.
     #[cfg(target_arch = "aarch64")]
     fn runtime_hole_is_reserved(&self, hole: &Range<usize>, code: &Range<usize>) -> bool {
         let mut covered: Vec<Range<usize>> = Vec::new();
@@ -2508,7 +2484,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Finalize the ELF patching state for `fd`.
     ///
     /// Removes the cache entry and unmaps any trampoline that was allocated but never used.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd>) {
         let state = self.global.elf_patch_cache.lock().remove(&ElfPatchKey(fd));
         if let Some(state) = state
@@ -2584,9 +2560,9 @@ mod tests {
     ) -> ElfPatchState {
         ElfPatchState {
             pre_patched: false,
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             trampoline_file_offset: 0,
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             trampoline_file_size: 0,
             #[cfg(target_arch = "aarch64")]
             aot_trampolines: None,

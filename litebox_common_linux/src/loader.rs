@@ -56,7 +56,7 @@ impl MappingInfo {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug)]
 struct TrampolineInfo {
     /// The virtual memory of the trampoline code.
@@ -361,7 +361,7 @@ impl ElfParsedFile {
     ///
     /// `None` if the binary has no trampoline or, like [`Self::has_trampoline`],
     /// if [`Self::parse_trampoline`] has not run yet.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
         let trampoline = self.trampoline.as_ref()?;
         let start = base_addr.checked_add(trampoline.vaddr)?;
@@ -409,7 +409,7 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     #[expect(
         clippy::missing_panics_doc,
         reason = "cannot panic: array slices are always the correct size"
@@ -609,7 +609,7 @@ impl ElfParsedFile {
                     align = align.max(ph.p_align.trunc());
                 }
             }
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(target_arch = "x86_64")]
             if let Some(trampoline) = &self.trampoline {
                 min = min.min(trampoline.vaddr);
                 max = max.max(
@@ -735,7 +735,7 @@ impl ElfParsedFile {
     }
 
     /// Load the LiteBox trampoline into memory.
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
     fn load_trampoline<M: MapMemory>(
         &self,
         mapper: &mut M,
@@ -825,16 +825,12 @@ impl ElfParsedFile {
                 )
                 .map_err(ElfLoadError::Map)?;
 
-            // Write the trampoline entry point at the start of the region.
-            // The first 8 bytes (64-bit) or 4 bytes (32-bit) are reserved for
-            // the entry point.
+            // Each region starts with its own callback slot.
             mem.write(
                 trampoline_start,
                 &trampoline.syscall_entry_point.to_ne_bytes(),
             )?;
 
-            // Now that the write is done, protect the trampoline code as
-            // read+execute only.
             mapper
                 .protect(
                     trampoline_start,
@@ -883,8 +879,7 @@ impl ElfParsedFile {
 /// ELF: `[ELF][padding][sub 0]...[sub N-1][table][footer]`, where the 32-byte
 /// footer is `(LITEBOX0, table_file_offset, N, 0)` and the table holds `N`
 /// `(file_offset, vaddr, size)` entries in file order. `N == 0` means nothing
-/// was patched. Branch reach forces AArch64 trampolines to be split into
-/// sub-trampolines placed near the code; see `litebox_syscall_rewriter`.
+/// was patched.
 ///
 /// Every region must start at a page-aligned file offset and virtual address,
 /// precede the table, and occupy pages no other region does.
@@ -987,11 +982,9 @@ fn check_trampoline_magic<E>(header_buf: &[u8]) -> Result<(), ElfParseError<E>> 
 
 #[cfg(target_arch = "aarch64")]
 fn validate_trampoline_region<E>(region: &TrampolineRegion) -> Result<(), ElfParseError<E>> {
-    // Verify the rewriter-defined file alignment.
     if !region.file_offset.is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT) {
         return Err(ElfParseError::BadTrampoline);
     }
-    // Verify the trampoline virtual address is page-aligned
     if !region.vaddr.is_multiple_of(PAGE_SIZE) {
         return Err(ElfParseError::BadTrampoline);
     }
