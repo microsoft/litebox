@@ -219,7 +219,66 @@ fn failed_writable_mprotect_rescans_sites_without_retiring_pairs() {
 }
 
 #[test]
+fn allocate_chunk_rollback_preserves_reclaimed_alignment_edge() {
+    let task = init_platform();
+    let update = task.global.elf_mapping_update.lock();
+    let mut owned = 0..0;
+    let mut reclaimed = UserPtrMut::from_usize(0);
+    let result = task.allocate_chunk(HOST_PAGE_SIZE, &[], None, |ptr, len| {
+        owned = ptr.as_usize()..ptr.as_usize() + len;
+        // The extra host page guarantees at least one guest-page suffix. Reuse
+        // it through the anonymous bypass while the publisher holds its lock,
+        // then inject a recoverable error at the final permission update.
+        reclaimed = task
+            .sys_mmap(
+                owned.end,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(reclaimed.as_usize(), owned.end);
+        reclaimed
+            .copy_from_slice::<TestPlatform>(0, b"edge")
+            .unwrap();
+        Err(Errno::EACCES)
+    });
+    assert!(matches!(result, Err(Errno::EACCES)));
+    let mappings = task.global.mm.mappings();
+    assert!(!mappings.iter().any(|(range, _)| overlaps(range, &owned)));
+    assert!(mappings.iter().any(|(range, flags)| {
+        range.contains(&reclaimed.as_usize())
+            && flags.contains(VmFlags::VM_READ | VmFlags::VM_WRITE)
+    }));
+    assert_eq!(read_bytes(reclaimed.as_usize(), 4), b"edge");
+    drop(update);
+    task.sys_munmap(reclaimed, PAGE_SIZE).unwrap();
+}
+
+#[test]
 fn blocked_near_allocation_publishes_brk_without_transport() {
+    let task = init_platform();
+    for allowed in [
+        0..=<TestPlatform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN - 1,
+        <TestPlatform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX..=usize::MAX,
+    ] {
+        assert!(matches!(
+            task.allocate_island(
+                &RuntimeIslands::default(),
+                0,
+                IslandPlacement {
+                    preferred: *allowed.start(),
+                    allowed,
+                },
+                &[],
+                &[],
+                None,
+            ),
+            Err(Errno::ENOMEM)
+        ));
+    }
     for immediate in [false, true] {
         blocked_near_allocation(false, immediate);
     }

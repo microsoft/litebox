@@ -659,6 +659,34 @@ fn production_island_fault_attribution_pending_commits_and_brk_vs_async() {
 
 #[test]
 fn production_island_rejects_malformed_header_and_unreadable_source() {
+    // Ordinary non-gate memory, including failed reads, must stay NotGate.
+    // Count guest reads only; this is not a whole-signal performance benchmark.
+    for readable in [false, true] {
+        let context = PtRegs {
+            pc: SITE,
+            ..PtRegs::default()
+        };
+        let mut reads = 0;
+        let result = canonicalize(
+            &context,
+            GateRuntimeState {
+                guest_thread_pointer_addr: TLS,
+                expected_outbound_stub: 0,
+                expected_outbound_pc: 0,
+            },
+            GateInterruption::Asynchronous,
+            TargetHost::Linux,
+            true,
+            |_, bytes| {
+                reads += 1;
+                bytes.fill(0);
+                readable
+            },
+        );
+        assert!(matches!(result, Aarch64GateSignalResult::NotGate));
+        // Previously 51: 36 island footer reads plus 15 direct-gate probes.
+        assert_eq!(reads, 26);
+    }
     for host in [TargetHost::Linux, TargetHost::MacOs] {
         let mut f = Fixture::new(0xd63f_0240, host, 0, false); // BLR x18
         let (ctx, expected) = f.boundary(0);

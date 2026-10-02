@@ -707,9 +707,22 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: i32,
         source: FileMappingSource,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        let _update = self.global.elf_mapping_update.lock();
         let offset = source.offset;
         let aligned_len = Self::validate_mmap(addr, len, prot, flags, offset)?;
+        if source.load_bias.is_none()
+            && flags.contains(MapFlags::MAP_ANONYMOUS)
+            && !flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE)
+            && (prot == ProtFlags::PROT_NONE || prot == ProtFlags::PROT_READ_WRITE)
+        {
+            // Vmem serializes fresh allocation. These permissions need no later
+            // protection pass, and the anonymous initializer cannot fail. Other
+            // permissions retain the lock: a delayed protection pass could touch
+            // transport allocated after a concurrent unmap of this address.
+            return self
+                .do_mmap_anonymous((addr != 0).then_some(addr), aligned_len, prot, flags)
+                .map_err(Errno::from);
+        }
+        let _update = self.global.elf_mapping_update.lock();
 
         // Resolve the fd once and perform side-effect-free checks BEFORE
         // closing old executable sites. EBADF must leave a valid mapping usable.
@@ -850,6 +863,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 state.file_mappings = surviving;
             }
+            #[cfg(target_arch = "x86_64")]
             state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
                 seg_end <= unmap_start || vaddr >= unmap_end
@@ -1014,6 +1028,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     #[inline]
     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
         #[cfg(target_arch = "aarch64")]
+        if addr.as_usize() == 0 {
+            // The break mutex serializes the query. Do not copy this snapshot
+            // into heap placement after a concurrent mutation has advanced it.
+            return unsafe { self.global.mm.brk(0) }.map_err(Errno::from);
+        }
+        #[cfg(target_arch = "aarch64")]
         let _update = self.global.elf_mapping_update.lock();
         // On failure, Linux returns the current break rather than a negative errno.
         let result = unsafe {
@@ -1032,8 +1052,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `madvise`.
     ///
-    /// On AArch64, destructive advice on rewrite-critical source pages, transport
-    /// or retained reservations returns `EBUSY`; ordinary data is not excluded.
+    /// On AArch64, destructive advice on rewrite-critical source pages or transport
+    /// returns `EBUSY`. Independently, the common VM returns `EINVAL` for file-backed
+    /// `DontNeed`/`Free`: Linux's file reload for `DontNeed` is unsupported.
     #[inline]
     pub(crate) fn sys_madvise(
         &self,
@@ -1042,15 +1063,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         advice: litebox_common_linux::MadviseBehavior,
     ) -> Result<(), Errno> {
         #[cfg(target_arch = "aarch64")]
+        if !matches!(
+            advice,
+            litebox_common_linux::MadviseBehavior::DontNeed
+                | litebox_common_linux::MadviseBehavior::Free
+        ) {
+            // Common VM no-ops (or unsupported advice panics) cannot change
+            // transport. Destructive advice keeps check + mutation serialized.
+            return self.global.mm.sys_madvise(addr, len, advice);
+        }
+        #[cfg(target_arch = "aarch64")]
         let _update = self.global.elf_mapping_update.lock();
         #[cfg(target_arch = "aarch64")]
-        if len != 0
-            && matches!(
-                advice,
-                litebox_common_linux::MadviseBehavior::DontNeed
-                    | litebox_common_linux::MadviseBehavior::Free
-            )
-        {
+        if len != 0 {
             let end = addr
                 .as_usize()
                 .checked_add(
@@ -2752,6 +2777,39 @@ mod tests {
             Ok(requested)
         );
         assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(requested));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn independent_vm_operations_do_not_take_elf_mapping_update() {
+        use litebox_common_linux::HOST_PAGE_SIZE;
+
+        let task = init_platform();
+        task.global.mm.set_initial_brk(0x4000_0000);
+        let update = task.global.elf_mapping_update.lock();
+        assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(0x4000_0000));
+        assert_eq!(task.global.elf_heap_placement.lock().current_brk, None);
+        for prot in [ProtFlags::PROT_NONE, ProtFlags::PROT_READ_WRITE] {
+            let addr = task
+                .sys_mmap(
+                    0,
+                    HOST_PAGE_SIZE,
+                    prot,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+                .unwrap();
+            for advice in [
+                litebox_common_linux::MadviseBehavior::Normal,
+                litebox_common_linux::MadviseBehavior::DontFork,
+                litebox_common_linux::MadviseBehavior::DoFork,
+            ] {
+                task.sys_madvise(addr, HOST_PAGE_SIZE, advice).unwrap();
+            }
+            task.sys_munmap_raw(addr, HOST_PAGE_SIZE).unwrap();
+        }
+        drop(update);
     }
 
     #[test]

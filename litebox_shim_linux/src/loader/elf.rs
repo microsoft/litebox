@@ -386,6 +386,9 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
     ) -> Result<ElfLoadInfo, ElfLoaderError> {
         let global = &self.main.file.task.global;
 
+        // Exec reaches load only after discarding the old image; errors here
+        // are fatal to exec, not returnable preflight failures (ElfLoader::new).
+        // Initial loads have no old image to resume.
         // Explicit main-image provenance protects the brk corridor during
         // runtime near allocation, without treating every ET_DYN as a main ELF.
         #[cfg(target_arch = "aarch64")]

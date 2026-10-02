@@ -1366,6 +1366,12 @@ struct GlobalState<Platform: ShimPlatform> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
+    /// Serializes ELF publication with file-backed/fixed mmap, unmap, protection,
+    /// remap, brk mutations and destructive advice, even for uncached ranges:
+    /// unpublished transport is already allocated but not yet in the cache.
+    /// Exposed file close also holds this across broker-handle release so metadata
+    /// capture cannot race it. Independent fresh NONE/RW allocation and queries
+    /// use the VM/break locks instead; signal recovery uses neither lock.
     #[cfg(target_arch = "aarch64")]
     elf_mapping_update: litebox::sync::Mutex<Platform, ()>,
     #[cfg(target_arch = "aarch64")]

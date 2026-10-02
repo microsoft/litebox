@@ -3,15 +3,19 @@
 
 //! Linux ELF runtime and serialized islands. Published pairs are immutable: every rewrite
 //! batch owns fresh host pages, even when an older island has unused slots.
-//! The outer `elf_mapping_update` mutex serializes publication and VM mutation;
-//! it is never acquired by signal recovery.
+//! The outer `elf_mapping_update` mutex serializes publication and potentially
+//! destructive VM mutation, including while transport is not yet in the cache.
+//! Non-fixed anonymous NONE/RW allocation, brk queries and non-destructive advice
+//! bypass it; signal recovery never acquires it.
 //!
 //! Compatibility limits (AArch64 Linux guests only):
 //! - `munmap`/`MAP_FIXED` return `EBUSY` if removing transport would strand a
 //!   surviving rewritten site. Live pairs are not relocated for these requests.
 //!   A loader that ignores a failed unmap can leave its mappings resident.
 //! - Destructive advice returns `EBUSY` for transport, rewrite-critical source
-//!   pages. Ordinary data uses the common VM path.
+//!   pages. Ordinary data uses the common VM path, which independently rejects
+//!   file-backed `DontNeed`/`Free` with `EINVAL`: `DontNeed` cannot reload files
+//!   as on Linux.
 //! - Moving tracked ELF mappings or transport with `mremap` is rejected with
 //!   `EINVAL`; moving baked-in branches requires re-linking that is not implemented.
 //! - ELF mappings must not be simultaneously writable and executable. RWX
@@ -23,11 +27,11 @@
 //! trampoline path does not use these island-specific restrictions.
 
 use super::{
-    ElfPatchState, Errno, HOST_PAGE_SIZE, MapFlags, ProtFlags, ProtectionRange, Range,
+    ElfPatchState, Errno, HOST_PAGE_SIZE, MapFlags, PAGE_SIZE, ProtFlags, ProtectionRange, Range,
     ShimPlatform, Task, UserPtrMut, Vec, align_down, align_up, prot_flags_from_permissions,
     subtract_ranges,
 };
-use litebox::utils::TruncateExt as _;
+use litebox::{platform::PageManagementProvider, utils::TruncateExt as _};
 use litebox_syscall_rewriter::aarch64::island::{self, IslandPair};
 
 #[derive(Clone, Debug)]
@@ -467,11 +471,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The rewriter supplies the common interval for every direct edge.
         // Later slot assignments are checked independently by the emitter.
         let site = placement.preferred;
-        let near_min = *placement.allowed.start();
-        let near_max = (*placement.allowed.end()).min(usize::MAX - HOST_PAGE_SIZE);
+        // TASK_ADDR_MAX is exclusive: the entire fresh host page must fit.
+        let near_min = (*placement.allowed.start())
+            .max(<Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN)
+            .max(HOST_PAGE_SIZE);
+        let near_max = (*placement.allowed.end()).min(
+            <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX
+                .checked_sub(HOST_PAGE_SIZE)
+                .ok_or(Errno::ENOMEM)?,
+        );
         if near_min > near_max {
             return Err(Errno::ENOMEM);
         }
+        let low = near_min
+            .checked_next_multiple_of(HOST_PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
+        let high = align_down(near_max, HOST_PAGE_SIZE)
+            .checked_add(HOST_PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
         let current = self.global.mm.mappings();
         let claim = |address: usize| {
             self.do_mmap_anonymous(
@@ -488,8 +505,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Search both sides within B reach. Only loader-supplied main-image
         // provenance excludes the current heap corridor; DSO size/address is
         // never used as a heuristic for main-image ownership.
-        let low = align_up(near_min.max(HOST_PAGE_SIZE), HOST_PAGE_SIZE);
-        let high = align_down(near_max, HOST_PAGE_SIZE).saturating_add(HOST_PAGE_SIZE);
         if low < high {
             let mut occupied: Vec<_> = current
                 .iter()
@@ -514,11 +529,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     }
                 }
             }
-            for range in free {
-                let start = range.start.max(align_up(site, HOST_PAGE_SIZE));
-                for address in (start..range.end).step_by(HOST_PAGE_SIZE) {
-                    if let Some(mapping) = claim(address) {
-                        return Ok(mapping);
+            if let Some(above) = site.checked_next_multiple_of(HOST_PAGE_SIZE) {
+                for range in free {
+                    let start = range.start.max(above);
+                    for address in (start..range.end).step_by(HOST_PAGE_SIZE) {
+                        if let Some(mapping) = claim(address) {
+                            return Ok(mapping);
+                        }
                     }
                 }
             }
@@ -534,6 +551,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         future_loads: &[Range<usize>],
         heap_corridor: Option<&Range<usize>>,
+        make_writable: impl FnOnce(UserPtrMut<u8>, usize) -> Result<(), Errno>,
     ) -> Result<UserPtrMut<u8>, Errno> {
         // Reserve inaccessible VA first: a guest-page allocator can return a
         // 4KiB-aligned address inside a 16KiB host page. Never make that edge RW
@@ -554,20 +572,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .chain(heap_corridor)
             .any(|load| overlaps(load, &range))
         {
+            let mut owned = candidate.as_usize()..candidate.as_usize() + reserved_len;
             let result = (|| {
-                if start > candidate.as_usize() {
-                    self.sys_munmap_raw(candidate, start - candidate.as_usize())?;
+                if start > owned.start {
+                    self.sys_munmap_raw(candidate, start - owned.start)?;
+                    owned.start = start;
                 }
-                let end = candidate.as_usize() + reserved_len;
-                if range.end < end {
-                    self.sys_munmap_raw(UserPtrMut::from_usize(range.end), end - range.end)?;
+                if range.end < owned.end {
+                    self.sys_munmap_raw(UserPtrMut::from_usize(range.end), owned.end - range.end)?;
+                    owned.end = range.end;
                 }
                 let ptr = UserPtrMut::from_usize(start);
-                self.sys_mprotect_raw(ptr, len, ProtFlags::PROT_READ_WRITE)?;
+                make_writable(ptr, len)?;
                 Ok(ptr)
             })();
             if result.is_err() {
-                let _ = self.sys_munmap_raw(candidate, reserved_len);
+                // Anonymous mmap can reclaim either released edge even while
+                // elf_mapping_update is held. Roll back only what we still own.
+                let _ = self.sys_munmap_raw(UserPtrMut::from_usize(owned.start), owned.len());
             }
             return result;
         }
@@ -583,7 +605,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .collect();
         unavailable.extend_from_slice(future_loads);
         unavailable.extend(heap_corridor.cloned());
-        for free in subtract_ranges(HOST_PAGE_SIZE..range.end, &unavailable)
+        let low = <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN
+            .max(HOST_PAGE_SIZE)
+            .checked_next_multiple_of(HOST_PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
+        for free in subtract_ranges(low..range.end, &unavailable)
             .into_iter()
             .rev()
         {
@@ -621,7 +647,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let options = crate::aarch64_rewrite_options();
         let far_len = align_up(pair.chunk().len(), HOST_PAGE_SIZE);
         // Deliberately no distance test: a full chunk is position independent.
-        let far = self.allocate_chunk(far_len, future_loads, heap_corridor)?;
+        let far = self.allocate_chunk(far_len, future_loads, heap_corridor, |ptr, len| {
+            self.sys_mprotect_raw(ptr, len, ProtFlags::PROT_READ_WRITE)
+        })?;
         reservations.push(StagedMapping {
             range: far.as_usize()..far.as_usize() + far_len,
         });

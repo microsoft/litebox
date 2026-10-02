@@ -5,7 +5,8 @@
 //! site -> entry -> dispatcher/table -> gate -> exit loop has been checked.
 
 use super::{
-    Aarch64GateSignalResult, GateInterruption, GateMetadata, GateRuntimeState, PtRegs, TargetHost,
+    Aarch64GateSignalResult, GATE_ALIGNMENT, GateInterruption, GateMetadata, GateRuntimeState,
+    PtRegs, TargetHost,
 };
 use litebox::utils::TruncateExt as _;
 use litebox_syscall_rewriter::aarch64::island::{
@@ -20,26 +21,47 @@ use litebox_syscall_rewriter::aarch64::island::{
 const READ_BUDGET: usize = 1024;
 const TABLE_PADDING: u32 = 0xd420_2b40;
 const AUX_MARKER: u32 = 0xd420_2b60;
+// Six overlapping candidate windows visit eleven distinct aligned footers.
+const FOOTER_CACHE_SIZE: usize = 2 * (MAX_ISLAND_GATE_BYTES / GATE_ALIGNMENT) - 1;
 
 struct Reader<F> {
     read: F,
     remaining: usize,
     exhausted: bool,
+    footers: [Option<(usize, Option<u32>)>; FOOTER_CACHE_SIZE],
 }
 impl<F: FnMut(usize, &mut [u8]) -> bool> Reader<F> {
+    fn charge_read(&mut self) -> Option<()> {
+        self.remaining = self.remaining.checked_sub(1).or_else(|| {
+            self.exhausted = true;
+            None
+        })?;
+        Some(())
+    }
     fn bytes<const N: usize>(&mut self, address: usize) -> Option<[u8; N]> {
         address.checked_add(N)?;
-        self.remaining = if let Some(n) = self.remaining.checked_sub(1) {
-            n
-        } else {
-            self.exhausted = true;
-            return None;
-        };
+        self.charge_read()?;
         let mut bytes = [0; N];
         (self.read)(address, &mut bytes).then_some(bytes)
     }
     fn word(&mut self, address: usize) -> Option<u32> {
         Some(u32::from_le_bytes(self.bytes(address)?))
+    }
+    fn footer(&mut self, address: usize) -> Option<u32> {
+        address.checked_add(4)?;
+        let index = (address / GATE_ALIGNMENT) % FOOTER_CACHE_SIZE;
+        if let Some((cached_address, value)) = self.footers[index]
+            && cached_address == address
+        {
+            // Cache hits still count against the original logical read budget.
+            self.charge_read()?;
+            return value;
+        }
+        let value = self.word(address);
+        // Cache failed reads too. Gate bodies are always read afresh and fully
+        // classified; a cached footer alone never establishes provenance.
+        self.footers[index] = Some((address, value));
+        value
     }
     fn pointer(&mut self, address: usize) -> Option<usize> {
         Some(usize::from_le_bytes(self.bytes(address)?))
@@ -78,8 +100,8 @@ impl<F: FnMut(usize, &mut [u8]) -> bool> Reader<F> {
         host: TargetHost,
     ) -> Option<IslandSignalGate> {
         let mut found = None;
-        for size in (16..=MAX_ISLAND_GATE_BYTES).step_by(16) {
-            let footer = self.word(address.checked_add(size - 4)?);
+        for size in (GATE_ALIGNMENT..=MAX_ISLAND_GATE_BYTES).step_by(GATE_ALIGNMENT) {
+            let footer = self.footer(address.checked_add(size - 4)?);
             if footer
                 .and_then(litebox_syscall_rewriter::aarch64::island::decode_island_metadata)
                 .is_none()
@@ -89,10 +111,7 @@ impl<F: FnMut(usize, &mut [u8]) -> bool> Reader<F> {
             let mut bytes = [0; MAX_ISLAND_GATE_BYTES];
             // Only read the actual candidate, not the mapping after its end.
             address.checked_add(size)?;
-            self.remaining = self.remaining.checked_sub(1).or_else(|| {
-                self.exhausted = true;
-                None
-            })?;
+            self.charge_read()?;
             if !(self.read)(address, bytes.get_mut(..size)?) {
                 continue;
             }
@@ -372,6 +391,7 @@ pub(super) fn canonicalize(
         read,
         remaining: READ_BUDGET,
         exhausted: false,
+        footers: [None; FOOTER_CACHE_SIZE],
     };
     let mut found = None;
     let mut ambiguous = false;
@@ -404,8 +424,8 @@ pub(super) fn canonicalize(
             accept(transport_candidate(context, l));
         }
     }
-    let aligned = context.pc & !15;
-    for back in (0..MAX_ISLAND_GATE_BYTES).step_by(16) {
+    let aligned = context.pc & !(GATE_ALIGNMENT - 1);
+    for back in (0..MAX_ISLAND_GATE_BYTES).step_by(GATE_ALIGNMENT) {
         let Some(address) = aligned.checked_sub(back) else {
             continue;
         };
