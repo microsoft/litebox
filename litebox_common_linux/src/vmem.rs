@@ -292,7 +292,7 @@ impl<const ALIGN: usize> NonZeroAddress<ALIGN> {
 
 /// Virtual memory area
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct VmArea {
+pub struct VmArea {
     /// Flags describing the properties of the memory region.
     flags: VmFlags,
     /// Whether this area is backed by a file
@@ -334,14 +334,24 @@ pub(super) struct FindAreaRequest<const ALIGN: usize> {
 pub struct MmapRequest {
     /// Requested address range.
     pub range: Range<usize>,
-    /// Initial page permissions.
-    pub permissions: MemoryRegionPermissions,
-    /// Whether the mapping may grow downward.
-    pub can_grow_down: bool,
+    /// Properties of the new virtual memory area.
+    pub vma: VmArea,
     /// Whether pages should be populated immediately.
     pub populate_pages_immediately: bool,
     /// Required fixed-address behavior.
     pub behavior: FixedAddressBehavior,
+}
+
+fn insert_mapped_vma<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize>(
+    vmas: &mut RangeMap<usize, VmArea>,
+    start: usize,
+    length: usize,
+    vma: VmArea,
+) {
+    let end = start + length;
+    debug_assert!(start >= Platform::TASK_ADDR_MIN);
+    debug_assert!(end <= Platform::TASK_ADDR_MAX);
+    vmas.insert(start..end, vma);
 }
 
 /// Reservation store required of platforms used by Linux-style shims.
@@ -353,7 +363,7 @@ pub trait LinuxReservationStore<Platform, const ALIGN: usize>:
 where
     Platform: PageManagementProvider<ALIGN, Reservations = Self>,
 {
-    /// Create a platform mapping and update reservation ownership.
+    /// Create a platform mapping, update reservation ownership, and insert its VMA.
     ///
     /// # Safety
     ///
@@ -362,20 +372,19 @@ where
     unsafe fn mmap(
         &mut self,
         platform: &Platform,
+        vmas: &mut RangeMap<usize, VmArea>,
         request: MmapRequest,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError>;
 
-    /// Release a range's platform backing and update reservation ownership.
-    ///
-    /// `has_mapping` reports whether a queried range is mapped.
+    /// Release a range's platform backing, update reservation ownership, and remove its VMAs.
     ///
     /// # Safety
     ///
     /// The caller must ensure that these pages are not in active use.
     unsafe fn unmap(
         &mut self,
-        has_mapping: impl Fn(&Range<usize>) -> bool,
         platform: &Platform,
+        vmas: &mut RangeMap<usize, VmArea>,
         range: Range<usize>,
     ) -> Result<(), DeallocationError>;
 
@@ -428,15 +437,18 @@ where
     unsafe fn mmap(
         &mut self,
         platform: &Platform,
+        vmas: &mut RangeMap<usize, VmArea>,
         request: MmapRequest,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let MmapRequest {
             range,
-            permissions,
-            can_grow_down,
+            vma,
             populate_pages_immediately,
             behavior,
         } = request;
+        let length = range.len();
+        let permissions = (vma.flags & VmFlags::VM_ACCESS_FLAGS).into();
+        let can_grow_down = vma.flags.contains(VmFlags::VM_GROWSDOWN);
         // SAFETY: The caller authorizes replacement and this handle-free store owns mapping ranges.
         let reservation = unsafe {
             platform.reserve_and_commit_pages(
@@ -448,19 +460,20 @@ where
                 behavior,
             )
         }?;
-        Ok(Platform::RawMutPointer::<u8>::from_usize(
-            reservation.range().start,
-        ))
+        let start = reservation.range().start;
+        insert_mapped_vma::<Platform, ALIGN>(vmas, start, length, vma);
+        Ok(Platform::RawMutPointer::<u8>::from_usize(start))
     }
 
     unsafe fn unmap(
         &mut self,
-        _has_mapping: impl Fn(&Range<usize>) -> bool,
         platform: &Platform,
+        vmas: &mut RangeMap<usize, VmArea>,
         range: Range<usize>,
     ) -> Result<(), DeallocationError> {
         // SAFETY: The caller excludes all users of the released range.
-        unsafe { platform.release_pages(range) }?;
+        unsafe { platform.release_pages(range.clone()) }?;
+        vmas.remove(range);
         Ok(())
     }
 
@@ -490,15 +503,17 @@ where
     unsafe fn mmap(
         &mut self,
         platform: &Platform,
+        vmas: &mut RangeMap<usize, VmArea>,
         request: MmapRequest,
     ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
         let MmapRequest {
             mut range,
-            permissions,
-            can_grow_down,
+            vma,
             populate_pages_immediately,
             behavior,
         } = request;
+        let permissions = (vma.flags & VmFlags::VM_ACCESS_FLAGS).into();
+        let can_grow_down = vma.flags.contains(VmFlags::VM_GROWSDOWN);
 
         if range.start.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
             && range.end.is_multiple_of(Platform::RESERVATION_ALIGNMENT)
@@ -520,6 +535,7 @@ where
                     let extent = reservation.range();
                     let address = extent.start;
                     assert!(self.insert(extent.start, reservation).is_none());
+                    insert_mapped_vma::<Platform, ALIGN>(vmas, address, range.len(), vma);
                     return Ok(Platform::RawMutPointer::<u8>::from_usize(address));
                 }
                 Err(AllocationError::UnsupportedByPlatform) => {}
@@ -554,20 +570,6 @@ where
             Err(error) => return Err(error),
         };
 
-        if behavior == FixedAddressBehavior::Replace {
-            // SAFETY: The caller authorized replacement and excludes users of the old mapping.
-            unsafe {
-                platform.decommit_pages(
-                    || {
-                        self.overlapping(range.clone())
-                            .map(|(_, reservation)| reservation)
-                    },
-                    range.clone(),
-                )
-            }
-            .expect("failed to decommit replacement backing");
-        }
-
         // SAFETY: The tracked reservations now completely cover the requested range.
         match unsafe {
             platform.commit_pages(
@@ -580,18 +582,68 @@ where
                 populate_pages_immediately,
             )
         } {
-            Ok(pointer) => Ok(pointer),
+            Ok(pointer) => {
+                // Committing already committed pages only changes their permissions but does not discard their contents.
+                if behavior == FixedAddressBehavior::Replace {
+                    let temporary_permissions = (permissions
+                        | MemoryRegionPermissions::READ
+                        | MemoryRegionPermissions::WRITE)
+                        - MemoryRegionPermissions::EXEC;
+                    let zeros = [0; PAGE_SIZE];
+                    for (mapped, _) in vmas.overlapping(range.clone()) {
+                        let overlap = mapped.start.max(range.start)..mapped.end.min(range.end);
+                        if !permissions.contains(MemoryRegionPermissions::WRITE) {
+                            // SAFETY: Commitment succeeded and the caller excludes replacement users.
+                            unsafe {
+                                self.protect(platform, overlap.clone(), temporary_permissions)
+                            }
+                            .expect("failed to make replacement pages writable");
+                        }
+                        let mut address = overlap.start;
+                        while address < overlap.end {
+                            let length = (overlap.end - address).min(zeros.len());
+                            pointer
+                                .copy_from_slice(address - range.start, &zeros[..length])
+                                .expect("failed to zero replacement pages");
+                            address += length;
+                        }
+                        if !permissions.contains(MemoryRegionPermissions::WRITE) {
+                            // SAFETY: Zeroing is complete and the caller excludes replacement users.
+                            unsafe { self.protect(platform, overlap, permissions) }
+                                .expect("failed to protect replacement pages");
+                        }
+                    }
+                }
+                insert_mapped_vma::<Platform, ALIGN>(vmas, pointer.as_usize(), range.len(), vma);
+                Ok(pointer)
+            }
             Err(error) => {
-                // SAFETY: No mapping is published yet, so all commitment from this attempt is unused.
-                let _ = unsafe {
-                    platform.decommit_pages(
-                        || {
-                            self.overlapping(range.clone())
-                                .map(|(_, reservation)| reservation)
-                        },
-                        range.clone(),
-                    )
-                };
+                // The backend commits one reservation at a time, so we need to rollback any changes.
+                // First rollback permission changes made to already committed VMAs.
+                for (mapped, mapped_vma) in vmas.overlapping(range.clone()) {
+                    let original_permissions =
+                        MemoryRegionPermissions::from(mapped_vma.flags & VmFlags::VM_ACCESS_FLAGS);
+                    if original_permissions != permissions {
+                        let overlap = mapped.start.max(range.start)..mapped.end.min(range.end);
+                        // SAFETY: Existing mappings remain committed and the caller excludes users.
+                        unsafe { self.protect(platform, overlap, original_permissions) }
+                            .expect("failed to restore replacement permissions");
+                    }
+                }
+                // Second rollback any partially committed reservations.
+                for gap in vmas.gaps(&range) {
+                    // SAFETY: These gaps have no published mappings or active users.
+                    let _ = unsafe {
+                        platform.decommit_pages(
+                            || {
+                                self.overlapping(gap.clone())
+                                    .map(|(_, reservation)| reservation)
+                            },
+                            gap.clone(),
+                        )
+                    };
+                }
+                // Lastly release any newly acquired reservations.
                 for base in acquired {
                     let reservation = self
                         .take_overlapping(base..base + 1)
@@ -607,18 +659,17 @@ where
 
     unsafe fn unmap(
         &mut self,
-        has_mapping: impl Fn(&Range<usize>) -> bool,
         platform: &Platform,
+        vmas: &mut RangeMap<usize, VmArea>,
         range: Range<usize>,
     ) -> Result<(), DeallocationError> {
+        vmas.remove(range.clone());
         let reservations = self.take_overlapping(range.clone());
         let last = reservations.len().saturating_sub(1);
         for (index, reservation) in reservations.into_iter().enumerate() {
             if index == 0 || index == last {
                 let extent = reservation.range();
-                if (extent.start < range.start && has_mapping(&(extent.start..range.start)))
-                    || (range.end < extent.end && has_mapping(&(range.end..extent.end)))
-                {
+                if vmas.overlaps(&extent) {
                     let segment = extent.start.max(range.start)..extent.end.min(range.end);
                     // SAFETY: The removed segment has no users and remains inside this reservation.
                     unsafe { platform.decommit_pages(|| core::iter::once(&reservation), segment) }
@@ -711,14 +762,10 @@ where
         }
         // SAFETY: The caller excludes all users of the removed range.
         unsafe {
-            self.reservations.unmap(
-                |candidate| self.vmas.overlaps(candidate),
-                self.platform,
-                range.clone(),
-            )
+            self.reservations
+                .unmap(self.platform, &mut self.vmas, range)
         }
         .map_err(VmemUnmapError::UnmapError)?;
-        self.vmas.remove(range);
         Ok(())
     }
 
@@ -836,27 +883,14 @@ where
                 }
             }
         };
-        let permissions: u8 = vma
-            .flags
-            .intersection(VmFlags::VM_ACCESS_FLAGS)
-            .bits()
-            .try_into()
-            .unwrap();
-        let max_permissions: u8 = (vma.flags.intersection(VmFlags::VM_MAY_ACCESS_FLAGS).bits()
-            >> 4)
-            .try_into()
-            .unwrap();
-        // The `max_permissions` is tracked by `Vmem::protect_mapping` and thus doesn't need to be
-        // passed to `allocate_pages`.
-        let _ = max_permissions;
         // SAFETY: The caller authorizes replacement, and the checks above preserve external gaps.
-        let ret = unsafe {
+        unsafe {
             self.reservations.mmap(
                 self.platform,
+                &mut self.vmas,
                 MmapRequest {
                     range: suggested_range.into(),
-                    permissions: MemoryRegionPermissions::from_bits(permissions).unwrap(),
-                    can_grow_down: vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                    vma,
                     populate_pages_immediately,
                     behavior: platform_fixed_address_behavior,
                 },
@@ -865,13 +899,7 @@ where
         .map_err(|err| match err {
             AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
             other => other,
-        })?;
-        let new_start = ret.as_usize();
-        let new_end = new_start + suggested_range.len();
-        self.vmas.insert(new_start..new_end, vma);
-        debug_assert!(new_start >= Platform::TASK_ADDR_MIN);
-        debug_assert!(new_end <= Platform::TASK_ADDR_MAX);
-        Ok(ret)
+        })
     }
 
     /// Create a new mapping in the virtual address space.
