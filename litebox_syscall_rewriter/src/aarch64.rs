@@ -166,7 +166,7 @@ impl ElfCodeMetadata {
                 "aligned ELF byte length exceeds storage".into(),
             ));
         }
-        fixup_phdr_alignment(&mut bytes[..byte_len]);
+        fixup_phdr_alignment(&mut bytes[..byte_len])?;
         let file = object::File::parse(&bytes[..byte_len])
             .map_err(|error| Error::ParseError(error.to_string()))?;
         if file.architecture() != object::Architecture::Aarch64 {
