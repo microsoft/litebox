@@ -9,6 +9,8 @@
 //! only for parameters sent as outputs whose type the runner kept, with memref
 //! data from the request's own buffers, never from runner-supplied references.
 
+pub mod ta_manager;
+
 use crate::{Dead, Process, layout};
 use alloc::vec::Vec;
 use litebox_common_optee::{

@@ -7,13 +7,17 @@
 # QEMU with stacked runners: litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_optee_on_vm_userland as a ring-3 process serving the TA.
 # ldelf and each TA are syscall-rewritten ahead of time (unless -u), then
-# packed with the userland runner and the TA's cmds.json into a tar passed as
-# the initrd.
+# packed with the userland runner and the test's cmds.json into a tar passed
+# as the initrd.
 #
-# Usage: dev_tools/run_optee_on_vm_userland.sh [-t <ta>]... [-u] [-r] [-v]
-#   -t   TA to run, e.g. hello-ta; append @default to omit its cmds.json
-#        (repeatable; default: every TA with a *-cmds.json, plus
-#        hello-ta@default for the default-commands path)
+# A test is either a TA with a *-cmds.json there, or a multi-TA test
+# litebox_runner_vm_kernel/tests/<test>-cmds.json, whose open_session
+# commands name the TAs it needs in their "ta" fields.
+#
+# Usage: dev_tools/run_optee_on_vm_userland.sh [-t <test>]... [-u] [-r] [-v]
+#   -t   test to run, e.g. hello-ta; append @default to a TA to omit its
+#        cmds.json (repeatable; default: every test, plus hello-ta@default
+#        for the default-commands path)
 #   -u   use unmodified ldelf and TAs; the kernel reflects their syscalls
 #   -r   build and run the release kernel
 #   -v   print the full guest log for passing runs too
@@ -34,6 +38,7 @@ REPO_DIR=$(dirname "$SCRIPT_DIR")
 KERNEL_DIR="$REPO_DIR/litebox_runner_vm_kernel"
 USERLAND_DIR="$REPO_DIR/litebox_runner_optee_on_vm_userland"
 TESTS_DIR="$REPO_DIR/litebox_runner_optee_on_linux_userland/tests"
+VM_TESTS_DIR="$KERNEL_DIR/tests"
 
 QEMU=${QEMU:-qemu-system-x86_64}
 if [[ -z ${QEMU_ACCEL:-} ]]; then
@@ -62,7 +67,7 @@ while getopts "t:urvh" opt; do
     esac
 done
 if [[ ${#tas[@]} -eq 0 ]]; then
-    for f in "$TESTS_DIR"/*-cmds.json; do
+    for f in "$TESTS_DIR"/*-cmds.json "$VM_TESTS_DIR"/*-cmds.json; do
         tas+=("$(basename "$f" -cmds.json)")
     done
     tas+=(hello-ta@default)
@@ -118,14 +123,23 @@ fail=0
 failed=()
 for ta in "${tas[@]}"; do
     name=${ta%@default}
-    cmds="$TESTS_DIR/$name-cmds.json"
-    [[ -f "$TESTS_DIR/$name.elf" ]] || { echo "error: no TA $TESTS_DIR/$name.elf" >&2; exit 2; }
+    if [[ -f "$VM_TESTS_DIR/$name-cmds.json" ]]; then
+        cmds="$VM_TESTS_DIR/$name-cmds.json"
+        mapfile -t test_tas < <(grep -o '"ta": *"[^"]*"' "$cmds" | sed 's/.*"\([^"]*\)"$/\1/' | sort -u)
+    else
+        test_tas=("$name")
+        cmds="$TESTS_DIR/$name-cmds.json"
+    fi
     payload="$WORK/$ta.tar"
-    mkdir -p "$WORK/$ta"
+    mkdir -p "$WORK/$ta/tas"
     cp "$USERLAND" "$WORK/$ta/runner.elf"
     prepare "$TESTS_DIR/ldelf.elf" "$WORK/$ta/ldelf.elf"
-    prepare "$TESTS_DIR/$name.elf" "$WORK/$ta/ta.elf"
-    files=(runner.elf ldelf.elf ta.elf)
+    files=(runner.elf ldelf.elf)
+    for t in "${test_tas[@]}"; do
+        [[ -f "$TESTS_DIR/$t.elf" ]] || { echo "error: no TA $TESTS_DIR/$t.elf" >&2; exit 2; }
+        prepare "$TESTS_DIR/$t.elf" "$WORK/$ta/tas/$t.elf"
+        files+=("tas/$t.elf")
+    done
     if [[ $ta != *@default && -f "$cmds" ]]; then
         cp "$cmds" "$WORK/$ta/cmds.json"
         files+=(cmds.json)

@@ -2,36 +2,66 @@
 // Licensed under the MIT license.
 
 //! Test driver. The first boot module is a tar with `runner.elf`,
-//! `ldelf.elf`, `ta.elf` (rewritten or not), and optionally `cmds.json`;
-//! without it, a session is opened and closed twice.
-//!
-//! One TA instance at a time, in its own runner process: a new process once
-//! the instance ends, which is when its last session closes (unless the TA
-//! is single-instance and keep-alive). Only the TA header is checked, not its
-//! signature, so a TA can claim any UUID and its derived keys.
+//! `ldelf.elf`, TAs as `tas/<name>.elf` (rewritten or not), and optionally
+//! `cmds.json`; without it, a session to the only TA is opened and closed
+//! twice. Only TA headers are checked, not signatures, so a TA can claim any
+//! UUID and its derived keys.
 //!
 //! `cmds.json` is the format of
-//! `litebox_runner_optee_on_linux_userland/tests/*-cmds.json`. Every command
-//! must succeed; TA outputs are logged, not checked.
+//! `litebox_runner_optee_on_linux_userland/tests/*-cmds.json` plus optional:
+//! - `ta`: the `open_session` target; required with more than one TA.
+//! - `session`: a label (default `default`).
+//! - `expect_result`: default success.
+//! - `expect_instances`: live instances after the command.
+//!
+//! TA outputs are logged, not checked.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use litebox_bootloader::handoff::BootInfo;
 use litebox_common_optee::{TeeLogin, TeeResult};
 use litebox_common_vm_abi::IDENTITY_LEN;
 use litebox_platform_vm_kernel::{KERNEL_OFFSET, VmKernel};
+use litebox_shim_vm_kernel::optee::ta_manager::{InstancePolicy, TaManager, TaUuid};
 use litebox_shim_vm_kernel::optee::{
-    self, Completion, EntryFunc, InParam, Invocation, LDELF_IMAGE, NUM_PARAMS, OutParam, TA_IMAGE,
+    Completion, EntryFunc, InParam, Invocation, LDELF_IMAGE, NUM_PARAMS, OutParam, TA_IMAGE,
 };
-use litebox_shim_vm_kernel::{Process, ProcessConfig};
+use litebox_shim_vm_kernel::{Dead, Process, ProcessConfig, SpawnError};
 use serde::Deserialize;
 use zerocopy::IntoBytes as _;
+
+const DEFAULT_SESSION: &str = "default";
+
+struct Ta {
+    name: &'static str,
+    uuid: TaUuid,
+    policy: InstancePolicy,
+    image: &'static [u8],
+}
 
 struct Payload {
     runner: &'static [u8],
     ldelf: &'static [u8],
-    ta: &'static [u8],
+    tas: Vec<Ta>,
     command_sequence: Option<&'static str>,
+}
+
+fn ta(name: &'static str, image: &'static [u8]) -> Result<Ta, &'static str> {
+    // Only the header is checked; signatures are not verified.
+    let head = litebox_common_optee::parse_ta_head(image).ok_or("malformed TA header")?;
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(head.uuid.as_bytes());
+    Ok(Ta {
+        name,
+        uuid,
+        policy: InstancePolicy {
+            single_instance: head.flags.is_single_instance(),
+            multi_session: head.flags.is_multi_session(),
+            keep_alive: head.flags.is_keep_alive(),
+        },
+        image,
+    })
 }
 
 fn payload(info: &BootInfo) -> Result<Payload, &'static str> {
@@ -46,59 +76,86 @@ fn payload(info: &BootInfo) -> Result<Payload, &'static str> {
         unsafe { core::slice::from_raw_parts((module.start + KERNEL_OFFSET) as *const u8, len) };
     let archive = tar_no_std::TarArchiveRef::new(data).map_err(|_| "payload is not a tar")?;
 
-    let (mut runner, mut ldelf, mut ta, mut command_sequence) = (None, None, None, None);
+    let (mut runner, mut ldelf, mut command_sequence) = (None, None, None);
+    let mut tas = Vec::new();
     for entry in archive.entries() {
         let filename = entry.filename();
         let Ok(name) = filename.as_str() else {
             continue;
         };
+        // `tar_no_std` names do not outlive the entry.
+        let name: &'static str = alloc::boxed::Box::leak(name.into());
         let bytes: &'static [u8] = entry.data();
         match name.trim_start_matches("./") {
             "runner.elf" => runner = Some(bytes),
             "ldelf.elf" => ldelf = Some(bytes),
-            "ta.elf" => ta = Some(bytes),
             "cmds.json" => {
                 command_sequence =
                     Some(core::str::from_utf8(bytes).map_err(|_| "cmds.json is not UTF-8")?);
             }
-            _ => {}
+            path => {
+                if let Some(ta_name) = path
+                    .strip_prefix("tas/")
+                    .and_then(|p| p.strip_suffix(".elf"))
+                {
+                    tas.push(ta(ta_name, bytes)?);
+                }
+            }
         }
+    }
+    if tas.is_empty() {
+        return Err("payload has no tas/<name>.elf");
     }
     Ok(Payload {
         runner: runner.ok_or("payload has no runner.elf")?,
         ldelf: ldelf.ok_or("payload has no ldelf.elf")?,
-        ta: ta.ok_or("payload has no ta.elf")?,
+        tas,
         command_sequence,
     })
 }
 
+#[derive(Debug)]
+#[expect(dead_code, reason = "only for `Debug`")]
+enum StartError {
+    UnknownTa,
+    Spawn(SpawnError),
+    Start(Dead),
+}
+
 /// # Panics
 ///
-/// On any failure, including a TA result other than success.
+/// On any failure, including an unexpected TA result.
 pub fn run(platform: &'static VmKernel, info: &BootInfo, tsc_khz: u64) {
     let payload = payload(info).unwrap_or_else(|e| panic!("payload: {e}"));
-    let head = litebox_common_optee::parse_ta_head(payload.ta).expect("malformed TA header");
-    let mut identity = [0u8; IDENTITY_LEN];
-    identity[..16].copy_from_slice(head.uuid.as_bytes());
-    let keep_alive = head.flags.is_single_instance() && head.flags.is_keep_alive();
-    let mut images = [&[][..]; 2];
-    images[LDELF_IMAGE] = payload.ldelf;
-    images[TA_IMAGE] = payload.ta;
-    let config = ProcessConfig {
-        runner: payload.runner,
-        images: &images,
-        identity,
-        tsc_khz,
-    };
     let broker_core = crate::broker::core();
-    let spawn = || {
-        let mut process = Process::spawn(platform, broker_core.clone(), &config)
-            .unwrap_or_else(|e| panic!("spawn: {e:?}"));
-        process
-            .start()
-            .unwrap_or_else(|dead| panic!("the runner died starting: {dead:?}"));
-        process
-    };
+    let (runner, ldelf) = (payload.runner, payload.ldelf);
+    let ta_images: BTreeMap<TaUuid, &'static [u8]> =
+        payload.tas.iter().map(|ta| (ta.uuid, ta.image)).collect();
+    let mut manager = TaManager::new(move |uuid: &TaUuid| {
+        let ta = ta_images.get(uuid).ok_or(StartError::UnknownTa)?;
+        let mut images = [&[][..]; 2];
+        images[LDELF_IMAGE] = ldelf;
+        images[TA_IMAGE] = ta;
+        let mut identity = [0u8; IDENTITY_LEN];
+        identity[..uuid.len()].copy_from_slice(uuid);
+        let mut process = Process::spawn(
+            platform,
+            broker_core.clone(),
+            &ProcessConfig {
+                runner,
+                images: &images,
+                identity,
+                tsc_khz,
+            },
+        )
+        .map_err(StartError::Spawn)?;
+        process.start().map_err(StartError::Start)?;
+        Ok::<_, StartError>(process)
+    });
+    for ta in &payload.tas {
+        litebox_util_log::info!(name:% = ta.name, policy:? = ta.policy; "TA");
+        manager.register(ta.uuid, ta.policy);
+    }
 
     let commands: Vec<TaCommand> = match payload.command_sequence {
         Some(json) => serde_json::from_str(json).expect("malformed cmds.json"),
@@ -109,14 +166,23 @@ pub fn run(platform: &'static VmKernel, info: &BootInfo, tsc_khz: u64) {
             TaCommand::new(TaEntryFunc::CloseSession),
         ],
     };
-    // The live instance's process and session count.
-    let mut instance: Option<(Process, usize)> = None;
-    let mut session = 0;
+    let mut sessions: BTreeMap<String, u32> = BTreeMap::new();
     for (index, cmd) in commands.iter().enumerate() {
         let func = cmd.func_id.into();
+        let label = cmd.session.as_deref().unwrap_or(DEFAULT_SESSION);
+        let uuid = if func == EntryFunc::OpenSession {
+            target_ta(&payload.tas, cmd.ta.as_deref()).uuid
+        } else {
+            [0; 16]
+        };
         let invocation = Invocation {
             func,
-            session,
+            session: if func == EntryFunc::OpenSession {
+                0
+            } else {
+                // An unknown label means an unknown session.
+                sessions.get(label).copied().unwrap_or(u32::MAX)
+            },
             cmd_id: cmd.cmd_id,
             login: cmd
                 .client_identity
@@ -129,28 +195,43 @@ pub fn run(platform: &'static VmKernel, info: &BootInfo, tsc_khz: u64) {
                 .map_or([0; 16], parse_uuid_or_panic),
             params: cmd.params(),
         };
-        let (process, sessions) = instance.get_or_insert_with(|| (spawn(), 0));
-        let completion = optee::call(process, invocation)
-            .unwrap_or_else(|dead| panic!("command {index} ({func:?}): the runner died: {dead:?}"));
+        let completion = manager.call(&uuid, invocation);
+        let expected = cmd.expect_result.unwrap_or(TeeResult::Success.into());
         assert!(
-            completion.result == u32::from(TeeResult::Success),
-            "command {index} ({func:?}): result {:#x} (origin {})",
+            completion.result == expected,
+            "command {index} ({func:?}, session {label:?}): result {:#x} (origin {}), expected {expected:#x}",
             completion.result,
             completion.origin
         );
         match func {
-            EntryFunc::OpenSession => {
-                *sessions += 1;
-                session = completion.session;
-                litebox_util_log::info!(session:% = session; "session opened");
+            EntryFunc::OpenSession if completion.result == 0 => {
+                sessions.insert(label.into(), completion.session);
+                litebox_util_log::info!(session:% = completion.session, label:% = label; "session opened");
             }
-            EntryFunc::CloseSession => *sessions = sessions.saturating_sub(1),
-            EntryFunc::InvokeCommand => {}
+            EntryFunc::CloseSession => {
+                sessions.remove(label);
+            }
+            _ => {}
+        }
+        if let Some(expected) = cmd.expect_instances {
+            assert_eq!(
+                manager.instance_count(),
+                expected,
+                "command {index}: live TA instances"
+            );
         }
         log_outputs(&completion);
-        if *sessions == 0 && !keep_alive {
-            instance = None;
-        }
+    }
+}
+
+fn target_ta<'a>(tas: &'a [Ta], name: Option<&str>) -> &'a Ta {
+    if let Some(name) = name {
+        tas.iter()
+            .find(|ta| ta.name == name)
+            .unwrap_or_else(|| panic!("no TA named {name:?}"))
+    } else {
+        assert!(tas.len() == 1, "`ta` is required with several TAs");
+        &tas[0]
     }
 }
 
@@ -183,6 +264,14 @@ struct TaCommand {
     args: Vec<TaCommandParam>,
     #[serde(default)]
     client_identity: Option<ClientIdentityJson>,
+    #[serde(default)]
+    ta: Option<String>,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    expect_result: Option<u32>,
+    #[serde(default)]
+    expect_instances: Option<usize>,
 }
 
 impl TaCommand {
@@ -192,6 +281,10 @@ impl TaCommand {
             cmd_id: 0,
             args: Vec::new(),
             client_identity: None,
+            ta: None,
+            session: None,
+            expect_result: None,
+            expect_instances: None,
         }
     }
 

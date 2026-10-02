@@ -416,6 +416,7 @@ impl Runner {
             );
             token.disarm();
         }
+        // On failure, the kernel ends this process.
         reply
     }
 
@@ -515,12 +516,13 @@ impl Runner {
                     session_manager.evict_cached_instance(instance);
                 }
             }
-            // Closing always succeeds (GlobalPlatform).
-            reply = Some(error_reply(
-                TeeResult::Success,
-                TeeOrigin::TrustedApp,
-                session,
-            ));
+            // Closing always succeeds for the client (GlobalPlatform), but the
+            // kernel must learn of a death to end the instance.
+            reply = Some(if is_target_dead(&r) {
+                r
+            } else {
+                error_reply(TeeResult::Success, TeeOrigin::TrustedApp, session)
+            });
             Ok(())
         });
         match (result, reply) {

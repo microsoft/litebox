@@ -1,0 +1,112 @@
+[
+  {
+    "func_id": "open_session",
+    "ta": "aes-ta",
+    "session": "a1",
+    "expect_instances": 1
+  },
+  {
+    "func_id": "open_session",
+    "ta": "aes-ta",
+    "session": "a2",
+    "expect_instances": 2
+  },
+  {
+    "_comment": "SET_IV before PREPARE: TEE_CipherInit on a null handle panics the TA.",
+    "func_id": "invoke_command",
+    "session": "a1",
+    "cmd_id": 2,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "EwBd8pG55XWwqyp6Cga19A=="
+      }
+    ],
+    "expect_result": 4294914084,
+    "expect_instances": 1
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "a1",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 2,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 16,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 0,
+        "value_b": 0
+      }
+    ],
+    "expect_result": 4294901768,
+    "expect_instances": 1
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "a2",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 2,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 16,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 0,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "close_session",
+    "session": "a2",
+    "expect_instances": 0
+  },
+  {
+    "func_id": "open_session",
+    "ta": "aes-ta",
+    "session": "a3",
+    "expect_instances": 1
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "a3",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 2,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 16,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_input",
+        "value_a": 0,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "close_session",
+    "session": "a3",
+    "expect_instances": 0
+  }
+]

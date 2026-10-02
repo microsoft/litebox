@@ -1,0 +1,247 @@
+[
+  {
+    "func_id": "open_session",
+    "ta": "hello-ta",
+    "session": "h1",
+    "client_identity": {
+      "login": "user"
+    },
+    "expect_instances": 1
+  },
+  {
+    "func_id": "open_session",
+    "ta": "hello-ta",
+    "session": "h2",
+    "client_identity": {
+      "login": "user"
+    },
+    "expect_instances": 2
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "h1",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_inout",
+        "value_a": 100,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "h2",
+    "cmd_id": 1,
+    "args": [
+      {
+        "param_type": "value_inout",
+        "value_a": 200,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "open_session",
+    "ta": "kmpp-ta",
+    "session": "k1",
+    "client_identity": {
+      "login": "user"
+    },
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 1,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_output"
+      }
+    ],
+    "expect_instances": 3
+  },
+  {
+    "func_id": "open_session",
+    "ta": "kmpp-ta",
+    "session": "k2",
+    "client_identity": {
+      "login": "user"
+    },
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 1,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_output"
+      }
+    ],
+    "expect_instances": 3
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "k1",
+    "cmd_id": 7,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "BAAAAAcAAADVbVcST7pTWSUYE/EyKlH1AQAAAEVDQzIDAAAAnwEAACAAAAAgAAAAIAAAAHjsdNQqqPaLXw1P1Fnhati6/oDk3OPVM1uT6COvFUuobePYUFdU1OfH/75ZPEcDPBZIT7RWxk3/AHuh05/4XHkEwt+usEI4oY93yjyBRXHzzf3BGOhEvsvXZr5XTYv4Yg=="
+      },
+      {
+        "param_type": "memref_output",
+        "buffer_size": 300
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "k2",
+    "cmd_id": 7,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "BAAAAAcAAADVbVcST7pTWSUYE/EyKlH1AQAAAEVDQzIDAAAAnwEAACAAAAAgAAAAIAAAAHjsdNQqqPaLXw1P1Fnhati6/oDk3OPVM1uT6COvFUuobePYUFdU1OfH/75ZPEcDPBZIT7RWxk3/AHuh05/4XHkEwt+usEI4oY93yjyBRXHzzf3BGOhEvsvXZr5XTYv4Yg=="
+      },
+      {
+        "param_type": "memref_output",
+        "buffer_size": 300
+      }
+    ]
+  },
+  {
+    "func_id": "open_session",
+    "ta": "random-ta",
+    "session": "r",
+    "client_identity": {
+      "login": "user"
+    },
+    "expect_instances": 4
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "r",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "memref_output",
+        "buffer_size": 64
+      }
+    ]
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "r",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "memref_output",
+        "buffer_size": 17825792
+      }
+    ],
+    "expect_result": 4294901766,
+    "expect_instances": 4
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "r",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "memref_output",
+        "buffer_size": 64
+      }
+    ],
+    "expect_instances": 4
+  },
+  {
+    "func_id": "close_session",
+    "session": "h1",
+    "expect_instances": 3
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "h1",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_inout",
+        "value_a": 1,
+        "value_b": 0
+      }
+    ],
+    "expect_result": 4294901768,
+    "expect_instances": 3
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "h2",
+    "cmd_id": 0,
+    "args": [
+      {
+        "param_type": "value_inout",
+        "value_a": 300,
+        "value_b": 0
+      }
+    ]
+  },
+  {
+    "func_id": "close_session",
+    "session": "h2",
+    "expect_instances": 2
+  },
+  {
+    "func_id": "close_session",
+    "session": "r",
+    "expect_instances": 1
+  },
+  {
+    "func_id": "close_session",
+    "session": "k1",
+    "expect_instances": 1
+  },
+  {
+    "func_id": "close_session",
+    "session": "k2",
+    "expect_instances": 1
+  },
+  {
+    "func_id": "open_session",
+    "ta": "kmpp-ta",
+    "session": "k3",
+    "client_identity": {
+      "login": "user"
+    },
+    "args": [
+      {
+        "param_type": "value_input",
+        "value_a": 1,
+        "value_b": 0
+      },
+      {
+        "param_type": "value_output"
+      }
+    ],
+    "expect_instances": 1
+  },
+  {
+    "func_id": "invoke_command",
+    "session": "k3",
+    "cmd_id": 7,
+    "args": [
+      {
+        "param_type": "memref_input",
+        "data_base64": "BAAAAAcAAADVbVcST7pTWSUYE/EyKlH1AQAAAEVDQzIDAAAAnwEAACAAAAAgAAAAIAAAAHjsdNQqqPaLXw1P1Fnhati6/oDk3OPVM1uT6COvFUuobePYUFdU1OfH/75ZPEcDPBZIT7RWxk3/AHuh05/4XHkEwt+usEI4oY93yjyBRXHzzf3BGOhEvsvXZr5XTYv4Yg=="
+      },
+      {
+        "param_type": "memref_output",
+        "buffer_size": 300
+      }
+    ]
+  },
+  {
+    "func_id": "close_session",
+    "session": "k3",
+    "expect_instances": 1
+  }
+]

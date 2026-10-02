@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! QEMU guest kernel running an OP-TEE TA in a ring-3 runner process
-//! (`litebox_runner_optee_on_vm_userland`). QEMU exits with 33 if all tests
-//! pass, 65 otherwise.
+//! QEMU guest kernel running OP-TEE TAs in ring-3 runner processes
+//! (`litebox_runner_optee_on_vm_userland`), one per TA instance. QEMU exits
+//! with 33 if all tests pass, 65 otherwise.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
