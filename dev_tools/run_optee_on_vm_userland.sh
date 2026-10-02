@@ -100,9 +100,14 @@ echo "[*] userland runner: $USERLAND"
 echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
 if [[ $rewrite -eq 1 ]]; then echo "[*] TAs: syscall-rewritten"; else echo "[*] TAs: unmodified"; fi
 
-# Copies a guest binary, syscall-rewritten unless -u.
+# Copies a guest binary, syscall-rewritten unless -u. Sites the rewriter
+# cannot patch stay `syscall`s, which the kernel reflects.
 prepare() {
-    if [[ $rewrite -eq 1 ]]; then "$REWRITER" "$1" -o "$2"; else cp "$1" "$2"; fi
+    if [[ $rewrite -eq 1 ]]; then
+        "$REWRITER" --keep-unpatchable "$1" -o "$2"
+    else
+        cp "$1" "$2"
+    fi
 }
 
 WORK=$(mktemp -d)

@@ -167,6 +167,19 @@ pub enum TargetHost {
     Windows,
 }
 
+/// What to do with an x86-64 ELF `syscall` that cannot be redirected to the
+/// trampoline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UnpatchableSyscalls {
+    /// Replace it with a trap and fail the rewrite: on a hosted platform, it
+    /// would reach the host kernel.
+    #[default]
+    Trap,
+    /// Keep it: for kernels that reflect stray `syscall`s to the shim (the
+    /// LiteBox VM kernel), where it only costs a kernel round trip.
+    Keep,
+}
+
 /// Options for architecture-specific rewriting.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RewriteOptions {
@@ -174,6 +187,7 @@ pub struct RewriteOptions {
     virtualize_x18: bool,
     preserve_host_thread_state: bool,
     native_guest_thread_pointer: bool,
+    unpatchable_syscalls: UnpatchableSyscalls,
 }
 
 impl RewriteOptions {
@@ -200,6 +214,7 @@ impl RewriteOptions {
             virtualize_x18: virtualize_x18 || !matches!(target_host, TargetHost::Linux),
             preserve_host_thread_state: false,
             native_guest_thread_pointer: false,
+            unpatchable_syscalls: UnpatchableSyscalls::Trap,
         }
     }
 
@@ -211,6 +226,7 @@ impl RewriteOptions {
             virtualize_x18: false,
             preserve_host_thread_state: true,
             native_guest_thread_pointer: false,
+            unpatchable_syscalls: UnpatchableSyscalls::Trap,
         }
     }
 
@@ -226,6 +242,7 @@ impl RewriteOptions {
             virtualize_x18: false,
             preserve_host_thread_state: false,
             native_guest_thread_pointer: true,
+            unpatchable_syscalls: UnpatchableSyscalls::Trap,
         }
     }
 
@@ -242,6 +259,17 @@ impl RewriteOptions {
     /// Returns whether AArch64 guest `x18` accesses must be virtualized.
     pub const fn virtualizes_x18(self) -> bool {
         self.virtualize_x18
+    }
+
+    /// Only x86-64 ELF rewriting honors this; other formats always trap.
+    #[must_use]
+    pub const fn with_unpatchable_syscalls(mut self, policy: UnpatchableSyscalls) -> Self {
+        self.unpatchable_syscalls = policy;
+        self
+    }
+
+    pub const fn unpatchable_syscalls(self) -> UnpatchableSyscalls {
+        self.unpatchable_syscalls
     }
 
     pub(crate) const fn preserves_host_thread_state(self) -> bool {
@@ -269,15 +297,48 @@ pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Ve
 
 /// Rewrite a supported binary with explicit architecture-specific options.
 ///
-/// The options affect AArch64 ELF and Mach-O rewriting and are ignored for PE input.
+/// The options affect ELF and Mach-O rewriting and are ignored for PE input.
+/// Sites kept under [`UnpatchableSyscalls::Keep`] are not reported; see
+/// [`rewrite_binary_reporting`].
 pub fn rewrite_binary_with_options(
     input_binary: &[u8],
     trampoline: Option<u64>,
     options: RewriteOptions,
 ) -> Result<Vec<u8>> {
-    if is_pe_binary(input_binary) {
-        rewrite_pe_for_litebox(input_binary, trampoline)
-    } else if matches!(
+    rewrite_binary_reporting(input_binary, trampoline, options).map(|rewrite| rewrite.binary)
+}
+
+/// A rewritten binary and the `syscall` sites kept under
+/// [`UnpatchableSyscalls::Keep`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rewrite {
+    pub binary: Vec<u8>,
+    /// Virtual addresses; empty unless kept.
+    pub kept_syscalls: Vec<u64>,
+}
+
+/// [`rewrite_binary_with_options`], also reporting kept `syscall` sites.
+pub fn rewrite_binary_reporting(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    options: RewriteOptions,
+) -> Result<Rewrite> {
+    let mut kept_syscalls = Vec::new();
+    let binary = if is_pe_binary(input_binary) {
+        rewrite_pe_for_litebox(input_binary, trampoline)?
+    } else if is_macho_binary(input_binary) {
+        hook_syscalls_in_macho_with_options(input_binary, trampoline, options)?
+    } else {
+        hook_syscalls_in_elf_inner(input_binary, trampoline, options, &mut kept_syscalls)?
+    };
+    Ok(Rewrite {
+        binary,
+        kept_syscalls,
+    })
+}
+
+fn is_macho_binary(input_binary: &[u8]) -> bool {
+    matches!(
         input_binary
             .first_chunk::<4>()
             .copied()
@@ -292,11 +353,7 @@ pub fn rewrite_binary_with_options(
                 | object::macho::FAT_MAGIC_64
                 | object::macho::FAT_CIGAM_64
         )
-    ) {
-        hook_syscalls_in_macho_with_options(input_binary, trampoline, options)
-    } else {
-        hook_syscalls_in_elf_with_options(input_binary, trampoline, options)
-    }
+    )
 }
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
@@ -373,10 +430,23 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
 }
 
 /// Rewrite an ELF with explicit architecture-specific options.
+///
+/// Sites kept under [`UnpatchableSyscalls::Keep`] are not reported; see
+/// [`rewrite_binary_reporting`].
 pub fn hook_syscalls_in_elf_with_options(
     input_binary: &[u8],
     trampoline: Option<u64>,
     options: RewriteOptions,
+) -> Result<Vec<u8>> {
+    hook_syscalls_in_elf_inner(input_binary, trampoline, options, &mut Vec::new())
+}
+
+/// `kept_syscalls` receives the sites kept under [`UnpatchableSyscalls::Keep`].
+fn hook_syscalls_in_elf_inner(
+    input_binary: &[u8],
+    trampoline: Option<u64>,
+    options: RewriteOptions,
+    kept_syscalls: &mut Vec<u64>,
 ) -> Result<Vec<u8>> {
     if input_binary.ends_with(BUN_FOOTER_MARKER) {
         return Err(Error::UnsupportedExecutable(
@@ -497,6 +567,7 @@ pub fn hook_syscalls_in_elf_with_options(
         trampoline_base_addr,
         trampoline_base_addr,
         &mut trampoline_data,
+        options.unpatchable_syscalls(),
     )?;
 
     if !patch_result.found_syscall {
@@ -515,7 +586,9 @@ pub fn hook_syscalls_in_elf_with_options(
     let mut out = buf.to_vec();
     append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
 
-    if !patch_result.skipped_addrs.is_empty() {
+    if options.unpatchable_syscalls() == UnpatchableSyscalls::Keep {
+        *kept_syscalls = patch_result.skipped_addrs;
+    } else if !patch_result.skipped_addrs.is_empty() {
         return Err(Error::UnpatchableSyscalls(format!(
             "{} unpatchable syscall instruction(s) at {skipped_addrs:?}",
             patch_result.skipped_addrs.len(),
@@ -607,6 +680,7 @@ pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> R
         trampoline_base_addr,
         trampoline_base_addr,
         &mut trampoline_data,
+        UnpatchableSyscalls::Trap,
     )?;
 
     if !patched_dense_windows_stubs && !patch_result.found_syscall {
@@ -924,6 +998,7 @@ fn instruction_writes_eax(
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 fn patch_syscalls_in_sections(
     arch: Arch,
     buf: &mut [u8],
@@ -932,6 +1007,7 @@ fn patch_syscalls_in_sections(
     trampoline_base_addr: u64,
     syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
+    unpatchable: UnpatchableSyscalls,
 ) -> Result<SyscallPatchResult> {
     let mut found_syscall = false;
     let mut skipped_addrs = Vec::new();
@@ -946,6 +1022,7 @@ fn patch_syscalls_in_sections(
             trampoline_base_addr,
             syscall_entry_addr,
             trampoline_data,
+            unpatchable,
         ) {
             Ok(addrs) => {
                 found_syscall = true;
@@ -1240,6 +1317,9 @@ enum Arch {
 /// `trampoline_base_addr` is the virtual address corresponding to `trampoline_data[0]`.
 /// `syscall_entry_addr` is the address of the 8-byte entry-point value that each trampoline
 /// stub jumps to (via `JMP [RIP+disp32]` on x86-64).
+///
+/// Returns the unpatchable sites, trapped or kept per `unpatchable`.
+#[allow(clippy::too_many_arguments)]
 fn hook_syscalls_in_section(
     arch: Arch,
     control_transfer_targets: &BTreeSet<u64>,
@@ -1248,6 +1328,7 @@ fn hook_syscalls_in_section(
     trampoline_base_addr: u64,
     syscall_entry_addr: u64,
     trampoline_data: &mut Vec<u8>,
+    unpatchable: UnpatchableSyscalls,
 ) -> core::result::Result<Vec<u64>, InternalError> {
     let instructions = decode_section_instructions(arch, section_data, section_base_addr)?;
     let mut found_any = false;
@@ -1302,9 +1383,9 @@ fn hook_syscalls_in_section(
             ) {
                 Ok(()) => {}
                 Err(InternalError::InsufficientBytesBeforeOrAfter) => {
-                    // Replace the unpatchable syscall with ICEBP;HLT so it
-                    // traps instead of escaping to the host kernel.
-                    replace_with_trap(section_data, section_base_addr, inst);
+                    if unpatchable == UnpatchableSyscalls::Trap {
+                        replace_with_trap(section_data, section_base_addr, inst);
+                    }
                     skipped_addrs.push(inst.ip());
                 }
                 Err(e) => return Err(e),
@@ -1341,7 +1422,9 @@ fn hook_syscalls_in_section(
                 ) {
                     Ok(()) => {}
                     Err(InternalError::InsufficientBytesBeforeOrAfter) => {
-                        replace_with_trap(section_data, section_base_addr, inst);
+                        if unpatchable == UnpatchableSyscalls::Trap {
+                            replace_with_trap(section_data, section_base_addr, inst);
+                        }
                         skipped_addrs.push(inst.ip());
                     }
                     Err(e) => return Err(e),
@@ -1796,6 +1879,7 @@ fn patch_x86_64_code_segment(
         trampoline_write_vaddr,
         syscall_entry_addr,
         &mut trampoline_data,
+        UnpatchableSyscalls::Trap,
     ) {
         Ok(skipped_addrs) => Ok((trampoline_data, skipped_addrs)),
         Err(InternalError::NoSyscallInstructionsFound) => Ok((Vec::new(), Vec::new())),
@@ -2502,6 +2586,39 @@ fn hook_syscall_and_after(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lone `syscall` leaves no room for a jump to the trampoline.
+    fn hook_lone_syscall(unpatchable: UnpatchableSyscalls) -> (Vec<u8>, Vec<u64>) {
+        let mut code = vec![0x0f, 0x05];
+        let kept = hook_syscalls_in_section(
+            Arch::X86_64,
+            &BTreeSet::new(),
+            0x1000,
+            &mut code,
+            0x10_0000,
+            0x10_0000,
+            &mut Vec::new(),
+            unpatchable,
+        )
+        .unwrap();
+        (code, kept)
+    }
+
+    #[test]
+    fn unpatchable_syscalls_are_trapped_or_kept() {
+        assert_eq!(
+            hook_lone_syscall(UnpatchableSyscalls::Trap),
+            (vec![0xf1, 0xf4], vec![0x1000])
+        );
+        assert_eq!(
+            hook_lone_syscall(UnpatchableSyscalls::Keep),
+            (vec![0x0f, 0x05], vec![0x1000])
+        );
+        assert_eq!(
+            RewriteOptions::default().unpatchable_syscalls(),
+            UnpatchableSyscalls::Trap
+        );
+    }
 
     #[test]
     fn macos_trampolines_use_owned_native_page_holes() {
