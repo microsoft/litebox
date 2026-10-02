@@ -134,7 +134,7 @@ fn get_test_pgtable<'a>(
 ) -> X64PageTable<'a, MockKernel, PAGE_SIZE> {
     let p4 = PageTableAllocator::<MockKernel>::allocate_frame(true).unwrap();
     let pgtable = unsafe { X64PageTable::<MockKernel, PAGE_SIZE>::init(p4.start_address()) };
-    pgtable.map_pages(range, flags, true);
+    pgtable.map_pages(range, flags, true).unwrap();
 
     let fault_flags = vmflags_to_pteflags(flags) | PageTableFlags::PRESENT;
     for page in range {

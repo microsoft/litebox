@@ -366,7 +366,7 @@ impl PageTableManager {
     /// The ID of the newly created task page table (its P4 frame start address),
     /// or `Err(Errno::ENOMEM)` if the P4 frame allocation fails.
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
-        let pt = unsafe { mm::PageTable::new_top_level() };
+        let pt = unsafe { mm::PageTable::new_top_level() }.ok_or(Errno::ENOMEM)?;
 
         // Share the fixed kernel hierarchy; CPU startup only unmaps guard leaves.
         // Lower slots stay private (see `copy_pml4_entries_from`).
@@ -601,7 +601,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             exec_ranges.push(hvcall_phys..hvcall_phys + PAGE_SIZE as u64);
         }
 
-        let base_pt = unsafe { mm::PageTable::new_top_level() };
+        let base_pt = unsafe { mm::PageTable::new_top_level() }
+            .expect("Failed to allocate the base page table frame");
         if base_pt
             .map_phys_frame_range(
                 vtl1_range,
@@ -980,7 +981,8 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { current_pt.unmap_pages(range, true, true, false).unwrap() };
+                unsafe { current_pt.unmap_pages(range, true, true, false) }
+                    .map_err(|_| litebox::platform::page_mgmt::AllocationError::Unaligned)?;
             }
         }
         let flags = u32::from(initial_permissions.bits())
@@ -990,7 +992,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox_common_linux::vmem::VmFlags::from_bits(flags).unwrap();
-        Ok(current_pt.map_pages(range, flags, populate_pages_immediately))
+        current_pt.map_pages(range, flags, populate_pages_immediately)
     }
 
     unsafe fn release_pages(
