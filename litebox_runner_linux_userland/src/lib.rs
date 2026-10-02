@@ -140,8 +140,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         )
     })?;
     let shim_builder =
-        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
-            .enable_fork(address_randomization_disabled());
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
 
     let shim = shim_builder.build();
     let startup = match startup {
@@ -291,14 +290,6 @@ fn run_program(
         .litebox()
         .report_exit_status(program.process.wait_for_exit_status());
     program.process.wait_for_unix_shell_exit_code()
-}
-
-/// Returns whether host address space randomization is disabled, so that every runner in the
-/// process tree lays out its address space identically, as `fork` requires.
-fn address_randomization_disabled() -> bool {
-    // SAFETY: Querying the persona changes nothing.
-    let persona = unsafe { libc::personality(0xffff_ffff) };
-    persona != -1 && persona & libc::ADDR_NO_RANDOMIZE != 0
 }
 
 /// Continues the process a parent duplicated by `fork`, whose memory contents are in

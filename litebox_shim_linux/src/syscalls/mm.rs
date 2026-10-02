@@ -2317,6 +2317,71 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn self_placed_mappings_stay_below_placement_limit() {
+        let task = init_platform();
+        let limit = <Platform as PageManagementProvider<PAGE_SIZE>>::PLACEMENT_ADDR_MAX;
+        assert!(limit < <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX);
+        let below_limit = |address: UserPtrMut<u8>, len: usize| {
+            assert!(
+                address.as_usize() + len <= limit,
+                "mapping at {:#x} crosses the placement limit {limit:#x}",
+                address.as_usize(),
+            );
+        };
+        let read_write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let anonymous = MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
+
+        let unhinted = task
+            .sys_mmap(0, 2 * PAGE_SIZE, read_write, anonymous, -1, 0)
+            .unwrap();
+        below_limit(unhinted, 2 * PAGE_SIZE);
+
+        let hinted = task
+            .sys_mmap(limit, PAGE_SIZE, read_write, anonymous, -1, 0)
+            .unwrap();
+        below_limit(hinted, PAGE_SIZE);
+
+        // Native remapping must honor the destination vmem chose instead of letting the host
+        // kernel pick one, and must still carry the contents along.
+        unhinted
+            .write_slice_at_offset::<Platform>(0, &[0xa5; 0x10])
+            .unwrap();
+        let moved = task
+            .sys_mremap(
+                unhinted,
+                PAGE_SIZE,
+                4 * PAGE_SIZE,
+                MRemapFlags::MREMAP_MAYMOVE,
+                0,
+            )
+            .unwrap();
+        below_limit(moved, 4 * PAGE_SIZE);
+        assert_eq!(moved.read_at_offset::<Platform>(0).unwrap(), 0xa5_u8);
+
+        let fixed = task
+            .sys_mmap(
+                limit,
+                PAGE_SIZE,
+                read_write,
+                anonymous | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(fixed.as_usize(), limit);
+
+        for (address, len) in [
+            (unhinted, 2 * PAGE_SIZE),
+            (hinted, PAGE_SIZE),
+            (moved, 4 * PAGE_SIZE),
+            (fixed, PAGE_SIZE),
+        ] {
+            task.sys_munmap(address, len).unwrap();
+        }
+    }
+
+    #[test]
     #[cfg_attr(
         target_os = "macos",
         ignore = "fixed address lies in Darwin's PAGEZERO"

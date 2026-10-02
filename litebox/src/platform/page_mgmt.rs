@@ -124,6 +124,14 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// Note it must be aligned to `ALIGN`.
     const TASK_ADDR_MAX: usize;
+    /// The upper bound (exclusive) for addresses that the memory manager chooses itself.
+    ///
+    /// Mappings at caller-specified fixed addresses may still extend up to
+    /// [`Self::TASK_ADDR_MAX`]. Platforms whose host allocates in the upper part of the task
+    /// range can lower this to keep self-placed task memory clear of host memory.
+    ///
+    /// Note it must be aligned to `ALIGN` and greater than [`Self::TASK_ADDR_MIN`].
+    const PLACEMENT_ADDR_MAX: usize = Self::TASK_ADDR_MAX;
 
     /// Alignment of native reservation base addresses, in bytes.
     ///

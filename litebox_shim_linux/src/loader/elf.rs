@@ -588,6 +588,8 @@ mod tests {
     fn initial_stack_is_placed_top_down() {
         let task = crate::syscalls::tests::init_platform();
         let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
+        let placement_max =
+            <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::PLACEMENT_ADDR_MAX;
         crate::syscalls::tests::create_file(&task, "/stack-pie", &minimal_elf(ET_DYN, None));
 
         let mut elf_loader =
@@ -605,6 +607,11 @@ mod tests {
             "initial stack ended at {:#x}, below the top-down address range (>= {:#x})",
             load_info.user_stack_top,
             addr_max / 2,
+        );
+        assert!(
+            load_info.user_stack_top <= placement_max,
+            "initial stack ended at {:#x}, above the placement limit {placement_max:#x}",
+            load_info.user_stack_top,
         );
     }
 

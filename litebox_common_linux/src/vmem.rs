@@ -1307,17 +1307,21 @@ where
         length: NonZeroPageSize<ALIGN>,
         behavior: FixedAddressBehavior,
     ) -> FindAreaRequest<ALIGN> {
-        let (address_range_end, alignment) = if suggested_address.is_none() {
-            (
+        // Only fixed-address requests may go above the placement limit; addresses chosen here,
+        // including fallbacks for unusable hints, stay below it.
+        let (address_range_end, alignment) = match (suggested_address, behavior) {
+            (None, _) => (
                 // Some platform may allocate more than requested to satisfy alignment requirements,
                 // so we restrict the maximum address to avoid exceeding the platform's addressable range.
-                Platform::TASK_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1),
+                Platform::PLACEMENT_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1),
                 // When no specific address is suggested, use the platform's reservation alignment
                 // to minimize fragmentation and number of system calls.
                 Platform::RESERVATION_ALIGNMENT,
-            )
-        } else {
-            (Platform::TASK_ADDR_MAX, ALIGN)
+            ),
+            (Some(_), FixedAddressBehavior::Hint(_)) => (Platform::PLACEMENT_ADDR_MAX, ALIGN),
+            (Some(_), FixedAddressBehavior::NoReplace | FixedAddressBehavior::Replace) => {
+                (Platform::TASK_ADDR_MAX, ALIGN)
+            }
         };
         FindAreaRequest {
             suggested_address,

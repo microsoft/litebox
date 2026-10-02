@@ -1004,7 +1004,7 @@ fn fork_requires_process_duplication() {
         .lines()
         .find(|line| line.starts_with("fork-failed "))
         .unwrap_or_else(|| panic!("missing fork failure in {output:?}"));
-    assert_eq!(numeric_field(line, "errno="), libc::EINVAL);
+    assert_eq!(numeric_field(line, "errno="), libc::EPERM);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

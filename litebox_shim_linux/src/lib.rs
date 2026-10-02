@@ -370,7 +370,6 @@ pub struct LinuxShimBuilder<Platform: ShimPlatform> {
     platform: &'static Platform,
     litebox: LiteBox<Platform>,
     process_id: i32,
-    fork_enabled: bool,
 }
 
 impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
@@ -389,20 +388,7 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             platform,
             litebox,
             process_id,
-            fork_enabled: false,
         }
-    }
-
-    /// Sets whether `fork` is enabled, which continues each child in a fresh runner at the
-    /// parent's addresses.
-    ///
-    /// Enable it only if every runner in the process tree lays out its host address space
-    /// identically, as it does with address space randomization disabled. Otherwise, `fork` is
-    /// unsupported, as it is by default.
-    #[must_use]
-    pub fn enable_fork(mut self, enabled: bool) -> Self {
-        self.fork_enabled = enabled;
-        self
     }
 
     /// Returns the litebox object for the shim.
@@ -425,7 +411,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             litebox,
             unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
-            fork_enabled: self.fork_enabled,
         });
         LinuxShim(global)
     }
@@ -1605,12 +1590,6 @@ struct GlobalState<Platform: ShimPlatform> {
     unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
-    /// Whether `fork` is enabled; see [`LinuxShimBuilder::enable_fork`].
-    #[cfg_attr(
-        not(target_arch = "x86_64"),
-        expect(dead_code, reason = "fork is supported only on x86-64")
-    )]
-    fork_enabled: bool,
 }
 
 struct Task<Platform: ShimPlatform> {

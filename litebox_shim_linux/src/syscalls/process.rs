@@ -1076,9 +1076,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `fork`.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_fork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
-        if !self.global.fork_enabled {
-            return Err(Errno::ENOSYS);
-        }
         self.fork(ctx, 0, 0)
     }
 
@@ -1361,9 +1358,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         #[cfg(target_arch = "x86_64")]
-        if self.global.fork_enabled
-            && !flags.intersects(CloneFlags::VM | CloneFlags::THREAD | CloneFlags::VFORK)
-        {
+        if !flags.intersects(CloneFlags::VM | CloneFlags::THREAD | CloneFlags::VFORK) {
             let supported_fork_flags = CloneFlags::CHILD_SETTID | CloneFlags::CHILD_CLEARTID;
             if flags.intersects(!supported_fork_flags) {
                 log_unsupported!("fork clone with flags: {:?}", flags);

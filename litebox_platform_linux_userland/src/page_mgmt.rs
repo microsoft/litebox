@@ -54,6 +54,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     /// the allocator to place into a region holding no existing mapping.
     #[cfg(target_arch = "aarch64")]
     const TASK_ADDR_MAX: usize = 0x0000_FFFF_FFFF_F000; // (1 << 48) - PAGE_SIZE;
+    /// With ASLR disabled the host's top-down mmap area begins just below
+    /// `0x7FFF_F800_0000`; with ASLR enabled it is randomized by at most 1 TiB
+    /// below that. Placing guest memory under this limit keeps it out of the
+    /// host's way, so `fork` can restore the guest at the parent's addresses
+    /// in a fresh runner without colliding with that runner's host mappings.
+    #[cfg(target_arch = "x86_64")]
+    const PLACEMENT_ADDR_MAX: usize = 0x7000_0000_0000;
+    /// The kernel may place a rejected hint anywhere, including inside the
+    /// host's mmap area, so vmem must pick exact addresses itself.
+    #[cfg(target_arch = "x86_64")]
+    const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
+    /// Exact `MAP_FIXED_NOREPLACE` placement would fail on hosts with fewer
+    /// than 48 VA bits; see the `TASK_ADDR_MAX` note above.
+    #[cfg(target_arch = "aarch64")]
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
@@ -128,13 +142,36 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         new_range: core::ops::Range<usize>,
         _permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+        // Without `MREMAP_FIXED` the kernel ignores `new_range` and may move the pages into the
+        // host's mmap area. `MREMAP_FIXED` replaces whatever is mapped at the destination, and the
+        // host may hold mappings vmem does not know about, so claim the destination first.
+        #[cfg(target_arch = "x86_64")]
+        let flags = {
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
+                self,
+                new_range.clone(),
+                MemoryRegionPermissions::empty(),
+                false,
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+            .map_err(|error| match error {
+                litebox::platform::page_mgmt::AllocationError::AddressInUse => {
+                    litebox::platform::page_mgmt::RemapError::AlreadyAllocated
+                }
+                _ => litebox::platform::page_mgmt::RemapError::OutOfMemory,
+            })?;
+            MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_FIXED
+        };
+        #[cfg(target_arch = "aarch64")]
+        let flags = MRemapFlags::MREMAP_MAYMOVE;
         let res = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::mremap,
                 old_range.start,
                 old_range.len(),
                 new_range.len(),
-                MRemapFlags::MREMAP_MAYMOVE.bits() as usize,
+                flags.bits() as usize,
                 new_range.start,
             )
             .expect("mremap failed")
