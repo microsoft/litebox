@@ -354,6 +354,9 @@ where
             .as_usize()
             .checked_add(old_size)
             .ok_or(RemapError::InvalidRange)?;
+        if old_end > Platform::TASK_ADDR_MAX {
+            return Err(RemapError::InvalidRange);
+        }
         let old_range =
             PageRange::new(old_addr.as_usize(), old_end).ok_or(RemapError::Unaligned)?;
         match unsafe {
@@ -383,6 +386,7 @@ where
             }
             Err(vmem::VmemResizeError::NotExist(_)) => Err(RemapError::AlreadyUnallocated),
             Err(vmem::VmemResizeError::InvalidAddr { .. }) => Err(RemapError::AlreadyAllocated),
+            Err(vmem::VmemResizeError::InvalidRange(_)) => Err(RemapError::InvalidRange),
             Err(vmem::VmemResizeError::OutOfMemory) => Err(RemapError::OutOfMemory),
         }
     }
@@ -399,7 +403,10 @@ where
     ) -> Result<(), VmemUnmapError> {
         let mut vmem = self.vmem.write();
         let start = ptr.as_usize();
-        let range = PageRange::new(start, start + len).ok_or(VmemUnmapError::UnAligned)?;
+        let end = start
+            .checked_add(len)
+            .ok_or(VmemUnmapError::InvalidRange(start..usize::MAX))?;
+        let range = PageRange::new(start, end).ok_or(VmemUnmapError::UnAligned)?;
         unsafe { vmem.remove_mapping(range) }
     }
 

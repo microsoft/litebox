@@ -1026,6 +1026,9 @@ where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
         let range = range.start..range.end;
+        if range.end > Platform::TASK_ADDR_MAX {
+            return Err(VmemResizeError::InvalidRange(range));
+        }
         // `cur_range` contains `range.start`
         let (cur_range, cur_vma) = self
             .vmas
@@ -1654,6 +1657,8 @@ pub enum VmemResetError {
 pub(super) enum VmemResizeError {
     #[error("no mapping containing the address {0:?}")]
     NotExist(usize),
+    #[error("range {0:?} extends outside user address space")]
+    InvalidRange(Range<usize>),
     #[error("invalid address {addr:?} exceeds range {range:?}")]
     InvalidAddr { range: Range<usize>, addr: usize },
     #[error("range {0:?} is already (partially) occupied")]
