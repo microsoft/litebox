@@ -147,7 +147,9 @@ fn serve_association(
         control_channel,
         || MemfdSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         MemfdSharedMemory::create_control_ring,
-        |channel, shared_memory, control_memory| {
+        // Moving `image` into this one-shot closure releases the broker's
+        // snapshot as soon as setup ends; the runner owns its copy after that.
+        move |channel, shared_memory, control_memory| {
             channel.send_memfd(shared_memory, Some(setup_deadline))?;
             channel.send_memfd(control_memory, Some(setup_deadline))?;
             channel.send_process_image(image.as_ref().map(|image| &image.0), Some(setup_deadline))

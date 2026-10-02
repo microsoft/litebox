@@ -28,6 +28,8 @@ use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::ProcessExitStatus;
 #[cfg(target_arch = "x86_64")]
+use litebox_common_linux::ProtFlags;
+#[cfg(target_arch = "x86_64")]
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
@@ -1207,15 +1209,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
         const CHUNK_SIZE: usize = MAX_CHILD_MEMORY_WRITE_SIZE as usize;
         let mut image_offset = 0u64;
         for region in regions.iter().filter(|region| region.has_contents()) {
-            for start in region.range.clone().step_by(CHUNK_SIZE) {
-                let len = CHUNK_SIZE.min(region.range.end - start);
-                let chunk = UserPtr::<u8>::from_usize(start)
-                    .to_owned_slice::<Platform>(len)
-                    .ok_or(Errno::ENOMEM)?;
-                if chunk.iter().any(|&byte| byte != 0) {
-                    let offset = image_offset + (start - region.range.start) as u64;
-                    child.write_memory(offset, &chunk).map_err(Errno::from)?;
+            let write_region = || -> Result<(), Errno> {
+                for start in region.range.clone().step_by(CHUNK_SIZE) {
+                    let len = CHUNK_SIZE.min(region.range.end - start);
+                    let chunk = UserPtr::<u8>::from_usize(start)
+                        .to_owned_slice::<Platform>(len)
+                        .ok_or(Errno::ENOMEM)?;
+                    if chunk.iter().any(|&byte| byte != 0) {
+                        let offset = image_offset + (start - region.range.start) as u64;
+                        child.write_memory(offset, &chunk).map_err(Errno::from)?;
+                    }
                 }
+                Ok(())
+            };
+            // Host protection keys can make execute-only pages unreadable, so they are
+            // readable only while copied.
+            if region.flags & VmFlags::VM_ACCESS_FLAGS == VmFlags::VM_EXEC {
+                let start = UserPtrMut::from_usize(region.range.start);
+                let len = region.range.len();
+                self.sys_mprotect_raw(start, len, ProtFlags::PROT_READ_EXEC)?;
+                let written = write_region();
+                self.sys_mprotect_raw(start, len, ProtFlags::PROT_EXEC)?;
+                written?;
+            } else {
+                write_region()?;
             }
             image_offset += region.range.len() as u64;
         }

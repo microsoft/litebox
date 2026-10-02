@@ -1016,13 +1016,18 @@ echo "substitution=$value"
 echo piped | { read line; echo "pipeline=$line"; }
 (exit 3)
 echo "subshell=$?"
-cd /tmp && umask 027 && (echo "nested cwd=$(pwd) umask=$(umask)")
+cd /tmp && umask 027 && (read marker < cwd-marker; echo "nested cwd=$marker umask=$(umask)")
 "#;
     let mut runner = Runner::new(Path::new("/usr/bin/dash"), "fork_dash");
     runner
         .allow_process_duplication()
         .args(["-c", SCRIPT])
-        .with_fs_path(|root| std::fs::create_dir_all(root.join("tmp")).unwrap());
+        .with_fs_path(|root| {
+            // dash's `pwd` prints its own copy of the cwd, so the forked subshell opens a
+            // relative path to check the cwd the child actually restored.
+            std::fs::create_dir_all(root.join("tmp")).unwrap();
+            std::fs::write(root.join("tmp/cwd-marker"), "tmp\n").unwrap();
+        });
 
     let output = String::from_utf8(runner.output()).unwrap();
     let lines: Vec<&str> = output.lines().collect();
@@ -1030,7 +1035,7 @@ cd /tmp && umask 027 && (echo "nested cwd=$(pwd) umask=$(umask)")
         "substitution=substituted",
         "pipeline=piped",
         "subshell=3",
-        "nested cwd=/tmp umask=0027",
+        "nested cwd=tmp umask=0027",
     ] {
         assert!(
             lines.contains(&expected),

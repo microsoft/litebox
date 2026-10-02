@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -48,11 +49,14 @@ static int wait_for(pid_t child, const char *name) {
 }
 
 // Runs in the child returned by glibc's `fork`.
-static int run_child(pid_t parent, unsigned char *buffer, unsigned long expected_sum, int pipe_fd) {
+static int run_child(pid_t parent, unsigned char *buffer, unsigned long expected_sum, int pipe_fd,
+                     int (*exec_only)(void)) {
     int failures = 0;
     // The child sees the parent's memory as of the fork.
     failures += global_value != 2;
     failures += checksum(buffer, BUFFER_SIZE) != expected_sum;
+    // Execute-only memory keeps its code.
+    failures += exec_only() != 42;
     // Writes stay in the child.
     global_value = 3;
     memset(buffer, 0x5a, BUFFER_SIZE);
@@ -96,13 +100,25 @@ int main(void) {
     if (pipe2(pipe_fds, O_CLOEXEC) != 0) {
         return 3;
     }
+    // `mov eax, 42; ret`
+    static const unsigned char return_42[] = {0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3};
+    unsigned char *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                               -1, 0);
+    if (code == MAP_FAILED) {
+        return 3;
+    }
+    memcpy(code, return_42, sizeof return_42);
+    if (mprotect(code, 4096, PROT_EXEC) != 0) {
+        return 3;
+    }
+    int (*exec_only)(void) = (int (*)(void))(void *)code;
     global_value = 2;
     fflush(stdout);
 
     pid_t child = fork();
     if (child == 0) {
         close(pipe_fds[0]);
-        exit(run_child(parent, buffer, expected_sum, pipe_fds[1]));
+        exit(run_child(parent, buffer, expected_sum, pipe_fds[1], exec_only));
     }
     if (child < 0) {
         printf("fork-failed errno=%d\n", errno);
@@ -135,7 +151,7 @@ int main(void) {
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
     printf("parent pid=%d global=%d intact=%d usr1=%d sigchld=%d echild=%d\n", getpid(),
-           global_value, checksum(buffer, BUFFER_SIZE) == expected_sum, usr1_count,
-           sigchld_count > 0, again == -1 && again_errno == ECHILD);
+           global_value, checksum(buffer, BUFFER_SIZE) == expected_sum && exec_only() == 42,
+           usr1_count, sigchld_count > 0, again == -1 && again_errno == ECHILD);
     return failures;
 }
