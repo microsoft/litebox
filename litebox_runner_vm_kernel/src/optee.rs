@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! Test driver. The first boot module is a tar with `runner.elf`,
-//! `ldelf.elf`, `ta.elf` (syscall-rewritten), and optionally `cmds.json`;
+//! `ldelf.elf`, `ta.elf` (rewritten or not), and optionally `cmds.json`;
 //! without it, a session is opened and closed twice.
 //!
 //! One TA instance at a time, in its own runner process: a new process once

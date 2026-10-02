@@ -26,13 +26,15 @@
 //! - The reply is written only on [`Status::Ok`].
 //! - Reserved fields must be zero ([`Status::InvalidArgument`]), so that they
 //!   can gain a meaning later.
-//! - Only a `syscall` in the runner's [`GATE_SECTION`] is a call; any other
-//!   kills the process.
+//! - Only a `syscall` in the runner's [`GATE_SECTION`] is a call; any other is
+//!   a guest's and becomes an upcall.
 //!
 //! # Upcalls
 //!
 //! The kernel enters [`ReadyRequest::upcall_entry`] with an [`UpcallFrame`]:
 //!
+//! - [`UpcallKind::Syscall`]: registers as `syscall` leaves them (`rcx` =
+//!   return address, `r11` = flags), number in `orig_rax`.
 //! - [`UpcallKind::Exception`]: an exception the kernel could not resolve;
 //!   `rip` is the faulting instruction.
 //!
@@ -515,6 +517,7 @@ pub struct Registers {
 #[repr(u32)]
 pub enum UpcallKind {
     Exception = 0,
+    Syscall = 1,
 }
 
 /// See [Upcalls](crate#upcalls). An upcall while `rsp` is on the upcall stack
@@ -611,7 +614,7 @@ mod tests {
     #[test]
     fn upcall_frames_validate_their_kind() {
         let frame = UpcallFrame {
-            kind: UpcallKind::Exception,
+            kind: UpcallKind::Syscall,
             reserved: 0,
             regs: Registers::default(),
             vector: 0,
@@ -621,7 +624,7 @@ mod tests {
         let mut bytes = [0u8; size_of::<UpcallFrame>()];
         bytes.copy_from_slice(frame.as_bytes());
         assert_eq!(UpcallFrame::try_read_from_bytes(&bytes).unwrap(), frame);
-        bytes[0] = 1;
+        bytes[0] = 2;
         assert!(UpcallFrame::try_read_from_bytes(&bytes).is_err());
     }
 
