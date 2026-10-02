@@ -105,18 +105,18 @@ impl fmt::Write for ComPort {
     }
 }
 
-pub(crate) fn print(args: core::fmt::Arguments) {
+pub fn print(args: core::fmt::Arguments) {
     use core::fmt::Write;
     let _ = com().lock().write_fmt(args);
 }
 
-pub(crate) fn print_str(s: &str) {
+pub fn print_str(s: &str) {
     com().lock().write_string(s);
 }
 
 /// Panic may interrupt a locked or initializing console. Never wait for it
 /// or alias its mutable handle; emergency output may interleave.
-pub(crate) fn panic_print(args: core::fmt::Arguments) {
+pub fn panic_print(args: core::fmt::Arguments) {
     use core::fmt::Write;
     if let Some(mut com) = COM_ONCE.get().and_then(Mutex::try_lock) {
         let _ = com.write_fmt(args);
@@ -129,8 +129,9 @@ pub(crate) fn panic_print(args: core::fmt::Arguments) {
     let _ = com.write_fmt(args);
 }
 
+/// `println!` to the serial console.
+#[macro_export]
 macro_rules! serial_println {
     () => ($crate::serial::print(format_args!("\n")));
     ($($arg:tt)*) => ($crate::serial::print(format_args!("{}\n", format_args!($($arg)*))));
 }
-pub(crate) use serial_println;

@@ -1,4 +1,4 @@
-/* Linked at 0 as PIE; the boot stub (src/boot.rs) relocates the image to
+/* Linked at 0 as PIE; the PVH boot stub (src/pvh.rs) relocates the image to
  * its KERNEL_OFFSET alias. */
 OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
@@ -11,7 +11,7 @@ SECTIONS
 
     . = 0x200000;
 
-    /* `_start` must be at PVH_ENTRY_ADDR (src/boot.rs); see the ASSERT. */
+    /* `_start` must be at PVH_ENTRY_ADDR (src/pvh.rs); see the ASSERT. */
     .text : ALIGN(0x200000) {
         _text_start = .;
         KEEP(*(.text._start))
@@ -66,7 +66,7 @@ SECTIONS
 
     ASSERT(_start == 0x200000, "_start is not at PVH_ENTRY_ADDR (0x200000)")
 
-    /* Must match BOOT_SCRATCH_BASE in src/boot.rs. In use until the heap is
+    /* Must match BOOT_SCRATCH_BASE in src/pvh.rs. In use until the heap is
        seeded, so the heap starts above it. */
     ASSERT(_image_end <= 0x1000000, "image has grown into the boot scratch region at 0x1000000")
     . = 0x1000000;

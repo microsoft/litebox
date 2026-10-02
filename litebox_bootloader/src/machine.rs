@@ -1,8 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! QEMU machine control. Power-off needs
-//! `-device isa-debug-exit,iobase=0xf4,iosize=0x04`.
+//! PC machine control: legacy PICs, TSC calibration, and power-off.
 
 pub(crate) const DEBUG_EXIT_PORT: u16 = 0xf4;
 
@@ -11,8 +10,10 @@ const DEBUG_EXIT_SUCCESS: u32 = 0x10;
 /// Written on failure; QEMU exits with status 65.
 pub(crate) const DEBUG_EXIT_FAILURE: u32 = 0x20;
 
-/// QEMU exits with status `(value << 1) | 1`. Without the device the machine
-/// resets instead (use `-no-reboot` to make QEMU exit).
+/// Through QEMU's `isa-debug-exit` device
+/// (`-device isa-debug-exit,iobase=0xf4,iosize=0x04`): QEMU exits with status
+/// `(value << 1) | 1`. Without the device, the machine resets instead (use
+/// `-no-reboot` to make QEMU exit).
 pub fn exit(success: bool) -> ! {
     let value = if success {
         DEBUG_EXIT_SUCCESS
@@ -43,14 +44,14 @@ fn reset() -> ! {
 const LEGACY_PIC_VECTOR_BASE: u8 = 0x20;
 
 /// PIC IRQ7/IRQ15 can arrive while masked; SeaBIOS leaves LAPIC SVR at 0xff.
-pub const SPURIOUS_VECTORS: [u8; 3] = [
+pub(crate) const SPURIOUS_VECTORS: [u8; 3] = [
     LEGACY_PIC_VECTOR_BASE + 7,
     LEGACY_PIC_VECTOR_BASE + 15,
     0xff,
 ];
 
 /// Must precede user entry (IF=1). PVH's PIC vectors overlap CPU exceptions.
-pub fn init_legacy_pics() {
+pub(crate) fn init_legacy_pics() {
     use x86_64::instructions::port::Port;
     const MASTER_CMD: u16 = 0x20;
     const MASTER_DATA: u16 = 0x21;
@@ -78,8 +79,12 @@ const PIT_HZ: u64 = 1_193_182;
 const CALIBRATION_MS: u64 = 50;
 const CALIBRATION_TIMEOUT_CYCLES: u64 = 1 << 36;
 
-/// Uses PIT channel 2 exclusively for ~50 ms; panics if calibration fails.
-pub fn calibrate_tsc_khz() -> u64 {
+/// Uses PIT channel 2 exclusively for ~50 ms.
+///
+/// # Panics
+///
+/// Panics if calibration fails.
+pub(crate) fn calibrate_tsc_khz() -> u64 {
     use x86_64::instructions::port::Port;
 
     const PORT_B: u16 = 0x61; // gate: bit 0, speaker: bit 1, OUT2: bit 5
@@ -87,7 +92,7 @@ pub fn calibrate_tsc_khz() -> u64 {
     const PIT_CH2: u16 = 0x42;
     let latch = u16::try_from(PIT_HZ * CALIBRATION_MS / 1000).expect("PIT latch fits in 16 bits");
 
-    // Safety: the runner exclusively owns PIT channel 2 and port B.
+    // Safety: during boot, nothing else uses PIT channel 2 or port B.
     unsafe {
         let mut port_b = Port::<u8>::new(PORT_B);
         let v = port_b.read();

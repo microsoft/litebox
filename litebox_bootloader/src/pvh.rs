@@ -1,56 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! PVH boot (`qemu -kernel`).
+//! PVH front end: direct kernel boot (e.g. `qemu -kernel`) through the
+//! `XEN_ELFNOTE_PHYS32_ENTRY` note. Maps the low 4 GiB, applies relocations,
+//! and hands off (see `handoff`) on the boot stack in the scratch region.
 //!
-//! On entry to [`crate::kernel_start`]: long mode, interrupts off, running at
-//! `PA + KERNEL_OFFSET` with the low 4 GiB mapped read/write there,
-//! relocations applied, on the boot stack in the scratch region. The linker
-//! script must define `_memory_base`, `_rela_start` and `_rela_end`.
+//! The linker script must define `_memory_base`, `_rela_start` and
+//! `_rela_end`.
 
+use crate::handoff::{BootInfo, MAX_MODULES, MAX_RAM_REGIONS, MAX_RESERVED, Range};
 use arrayvec::{ArrayString, ArrayVec};
 use core::arch::global_asm;
 use litebox_platform_vm_kernel::KERNEL_OFFSET;
 use zerocopy::FromBytes;
 
-/// A half-open physical range `[start, end)`.
-#[derive(Clone, Copy, Debug)]
-pub struct Range {
-    pub start: u64,
-    pub end: u64,
-}
-
-// Boot fails rather than dropping entries beyond these limits.
-pub const MAX_RAM_REGIONS: usize = 32;
-pub const MAX_RESERVED: usize = 16;
-pub const MAX_MODULES: usize = 8;
-pub const MAX_CMDLINE: usize = 1024;
-
-pub struct BootInfo {
-    /// Usable RAM from the memory map, not clamped to `mapped_limit`.
-    pub usable: ArrayVec<Range, MAX_RAM_REGIONS>,
-    /// Boot structures and modules inside `usable` that must not reach the heap.
-    pub reserved: ArrayVec<Range, MAX_RESERVED>,
-    /// Boot modules (`-initrd`), in order.
-    pub modules: ArrayVec<Range, MAX_MODULES>,
-    pub cmdline: ArrayString<MAX_CMDLINE>,
-    /// Physical memory below this is mapped at `PA + KERNEL_OFFSET` on entry.
-    pub mapped_limit: u64,
-}
-
-impl BootInfo {
-    pub fn cmdline_value(&self, key: &str) -> Option<&str> {
-        self.cmdline.split_ascii_whitespace().find_map(|arg| {
-            arg.strip_prefix(key)
-                .and_then(|rest| rest.strip_prefix('='))
-        })
-    }
-}
-
 /// Physical address of `_start`; must match the linker script.
 const PVH_ENTRY_ADDR: u32 = 0x0020_0000;
 
-/// ELF note type that makes QEMU boot the image via PVH.
+/// ELF note type that makes a VMM boot the image via PVH.
 const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18;
 
 /// `KERNEL_OFFSET` must be 512 GiB aligned so the identity map and the
@@ -62,7 +29,7 @@ const _: () = assert!(KERNEL_OFFSET.trailing_zeros() >= 39);
 const PD_COUNT: u32 = 4;
 const PD_ENTRIES: u32 = PD_COUNT * 512;
 /// Covers every address PVH hands over (all are 32-bit).
-pub const MAPPED_LIMIT: u64 = 1 << 32;
+const MAPPED_LIMIT: u64 = 1 << 32;
 
 /// Must match `.boot_scratch` in the linker script. Everything below lives
 /// there; the region is `NOLOAD`, so the stub initializes what it uses.
@@ -312,7 +279,7 @@ extern "C" fn pvh_entry() -> ! {
 /// # Panics
 ///
 /// Panics on a malformed or unsupported `hvm_start_info`.
-pub fn boot_info() -> BootInfo {
+fn boot_info() -> BootInfo {
     let slot = u64::from(BOOT_SCRATCH_BASE + OFF_HVM_START_INFO) + KERNEL_OFFSET;
     // Safety: written by the entry stub before any Rust code ran.
     let start_info_pa = unsafe { (slot as *const u64).read() };

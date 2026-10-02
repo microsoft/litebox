@@ -6,8 +6,8 @@
 //! `litebox_runner_optee_on_linux_userland/tests/*-cmds.json`). Without
 //! `cmds.json`, only a session is opened.
 
-use crate::boot::BootInfo;
 use alloc::boxed::Box;
+use litebox_bootloader::handoff::BootInfo;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
 use litebox_platform_vm_kernel::{KERNEL_OFFSET, VmKernel};
