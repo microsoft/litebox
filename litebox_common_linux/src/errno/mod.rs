@@ -315,6 +315,7 @@ impl From<crate::vmem::VmemUnmapError> for Errno {
     fn from(value: crate::vmem::VmemUnmapError) -> Self {
         match value {
             crate::vmem::VmemUnmapError::UnAligned => Errno::EINVAL,
+            crate::vmem::VmemUnmapError::InvalidRange(_) => Errno::EINVAL,
             crate::vmem::VmemUnmapError::UnmapError(e) => e.into(),
         }
     }
