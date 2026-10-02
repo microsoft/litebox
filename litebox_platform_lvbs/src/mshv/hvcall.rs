@@ -152,9 +152,10 @@ pub fn init(is_bsp: bool) -> Result<(), HypervError> {
     if is_bsp {
         debug_serial_println!("HV_X64_MSR_SINT0: {:#x}", rdmsr(HV_X64_MSR_SINT0));
     }
-
-    wrmsr(HV_X64_MSR_SCONTROL, u64::from(HV_X64_MSR_SCONTROL_ENABLE));
-
+    let scontrol = rdmsr(HV_X64_MSR_SCONTROL);
+    if scontrol & u64::from(HV_X64_MSR_SCONTROL_ENABLE) == 0 {
+        wrmsr(HV_X64_MSR_SCONTROL, u64::from(HV_X64_MSR_SCONTROL_ENABLE));
+    }
     vsm::init(is_bsp);
 
     Ok(())
