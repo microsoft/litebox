@@ -321,7 +321,8 @@ impl SyscallRequest {
                 address: args[0],
                 length: args[1],
                 protection: VmProtection::from_bits(int_arg(2)).ok_or(Errno::EINVAL)?,
-                flags: MmapFlags::from_bits(int_arg(3)).ok_or(Errno::EINVAL)?,
+                flags: MmapFlags::from_bits(int_arg(3) & !crate::MAP_UNIX03)
+                    .ok_or(Errno::EINVAL)?,
                 fd: int_arg(4),
                 offset: args[5].reinterpret_as_signed() as i64,
             },
@@ -409,7 +410,7 @@ mod tests {
         }
         let request = SyscallRequest::from_args(
             nr::MMAP,
-            [0x4000, 0x8000, 5, 0x12, usize::MAX, 0x1234, 0, 0],
+            [0x4000, 0x8000, 5, 0x40012, usize::MAX, 0x1234, 0, 0],
         )
         .unwrap();
         assert!(matches!(

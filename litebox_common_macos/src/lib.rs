@@ -114,6 +114,10 @@ bitflags::bitflags! {
     }
 }
 
+/// libSystem's UNIX03 mmap conformance flag. The shim already enforces its
+/// nonzero-length, aligned-offset and mapping-kind checks.
+pub const MAP_UNIX03: core::ffi::c_int = 0x40000;
+
 /// Native Apple Silicon page size.
 pub const PAGE_SIZE: usize = 16384;
 
