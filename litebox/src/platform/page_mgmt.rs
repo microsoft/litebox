@@ -187,8 +187,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Errors
     ///
-    /// Returns [`AllocationError::UnsupportedByPlatform`] when `suggested_range` starts at zero
-    /// and the platform cannot relocate the hint in the requested direction.
+    /// Returns [`AllocationError::UnsupportedByPlatform`] when the platform cannot implement the
+    /// requested operation or placement behavior, such as replacement or relocating a zero-address
+    /// hint in the requested direction.
     ///
     /// # Safety
     ///
@@ -273,8 +274,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Errors
     ///
-    /// Returns [`AllocationError::UnsupportedByPlatform`] when `suggested_range` starts at zero
-    /// and the platform cannot relocate the hint in the requested direction.
+    /// Returns [`AllocationError::UnsupportedByPlatform`] when the platform cannot implement the
+    /// requested operation or placement behavior, such as replacement or relocating a zero-address
+    /// hint in the requested direction.
     ///
     /// # Safety
     ///
@@ -411,8 +413,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Errors
     ///
-    /// Returns [`CowAllocationError::UnsupportedByPlatform`] when `suggested_start` is zero and
-    /// the platform cannot relocate the hint in the requested direction.
+    /// Returns [`CowAllocationError::UnsupportedByPlatform`] when the platform cannot implement
+    /// copy-on-write allocation with the requested placement behavior.
     ///
     /// # Safety
     ///
