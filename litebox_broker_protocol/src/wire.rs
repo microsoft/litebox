@@ -99,7 +99,7 @@ const RESPONSE_TAG_VERSION_MISMATCH: u8 = 255;
 const NOTIFICATION_TAG_READINESS: u8 = 0;
 
 /// Maximum byte length of any encoded active request or response.
-pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 67;
+pub const MAX_ENCODED_ACTIVE_MESSAGE_SIZE: usize = 99;
 
 /// Maximum byte length of any encoded broker notification.
 pub const MAX_ENCODED_NOTIFICATION_SIZE: usize = 13;
@@ -832,7 +832,10 @@ mod tests {
         ProcessTermination, StartChildProcessRequest, StartChildProcessSource,
         WriteChildMemoryRequest,
     };
-    use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
+    use crate::shared_buffer::{
+        MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
+        SharedBufferSlotIndex,
+    };
     use crate::signal::{OpenSignalsResponse, PendingSignal, SendSignalRequest, TakeSignalRequest};
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
@@ -954,18 +957,13 @@ mod tests {
         let handle = ObjectHandle(13);
         // The wire bound covers encodable requests before operation-specific
         // transfer limits are validated.
+        let largest_slots: [SharedBufferSlotIndex; MAX_SHARED_BUFFER_SEQUENCE_SLOTS] =
+            core::array::from_fn(|index| {
+                SharedBufferSlotIndex(u32::try_from(2 * index + 1).unwrap())
+            });
         let largest_sequence = SharedBufferSequence::new(
-            &[
-                SharedBufferSlotIndex(2),
-                SharedBufferSlotIndex(5),
-                SharedBufferSlotIndex(7),
-                SharedBufferSlotIndex(9),
-                SharedBufferSlotIndex(10),
-                SharedBufferSlotIndex(11),
-                SharedBufferSlotIndex(13),
-                SharedBufferSlotIndex(15),
-            ],
-            512 * 1024,
+            &largest_slots,
+            u32::try_from(MAX_SHARED_BUFFER_SEQUENCE_SLOTS).unwrap() * SHARED_BUFFER_SLOT_SIZE,
         )
         .unwrap();
         let operations = [

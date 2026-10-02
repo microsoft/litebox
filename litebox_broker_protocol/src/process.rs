@@ -129,7 +129,7 @@ pub struct DuplicateObjectsToChildRequest {
 }
 
 /// Number of shared-buffer slots one [`WriteChildMemoryRequest`] fills at most.
-const MAX_CHILD_MEMORY_WRITE_SLOT_COUNT: u32 = 8;
+const MAX_CHILD_MEMORY_WRITE_SLOT_COUNT: u32 = 16;
 
 const _: () =
     assert!(MAX_CHILD_MEMORY_WRITE_SLOT_COUNT as usize <= MAX_SHARED_BUFFER_SEQUENCE_SLOTS);

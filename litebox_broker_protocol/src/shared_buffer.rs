@@ -20,7 +20,7 @@ pub const SHARED_BUFFER_SLOT_SIZE: u32 = 64 * 1024;
 pub const SHARED_BUFFER_SLOT_COUNT: u32 = 256;
 
 /// Maximum number of slots named by one operation-scoped sequence.
-pub const MAX_SHARED_BUFFER_SEQUENCE_SLOTS: usize = 8;
+pub const MAX_SHARED_BUFFER_SEQUENCE_SLOTS: usize = 16;
 
 const _: () = assert!(MAX_SHARED_BUFFER_SEQUENCE_SLOTS <= SHARED_BUFFER_SLOT_COUNT as usize);
 

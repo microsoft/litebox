@@ -839,7 +839,8 @@ where
     /// next mapping after the expansion.
     ///
     /// It fails if it resizes more than one mapping or needs to split the current mapping
-    /// (due to enlarging).
+    /// (due to enlarging). When enlarging, adjacent mappings that differ only in
+    /// [`VmFlags::VM_HAS_CONTENTS`] count as one, which may hold data.
     ///
     /// See <https://elixir.bootlin.com/linux/v5.19.17/source/mm/mremap.c#L886> for reference.
     ///
@@ -856,9 +857,10 @@ where
     {
         let range = range.start..range.end;
         // `cur_range` contains `range.start`
-        let (cur_range, cur_vma) = self
+        let (mut cur_range, mut cur_vma) = self
             .vmas
             .get_key_value(&range.start)
+            .map(|(cur_range, cur_vma)| (cur_range.clone(), *cur_vma))
             .ok_or(VmemResizeError::NotExist(range.start))?;
 
         let new_end = range
@@ -881,11 +883,37 @@ where
 
         // grow
         if range.end > cur_range.end {
-            // we can't remap across vm area boundaries
-            return Err(VmemResizeError::InvalidAddr {
-                range: cur_range.clone(),
-                addr: range.end,
-            });
+            // Areas that differ only in whether they may hold data, such as those left by making
+            // part of an inaccessible area accessible and back, are one area to Linux.
+            let mut flags = cur_vma.flags();
+            let mut end = cur_range.end;
+            while end < range.end
+                && let Some((next_range, next_vma)) = self.vmas.get_key_value(&end)
+                && next_vma.is_file_backed() == cur_vma.is_file_backed()
+                && ((next_vma.flags() ^ cur_vma.flags()) - VmFlags::VM_HAS_CONTENTS).is_empty()
+            {
+                flags |= next_vma.flags();
+                end = next_range.end;
+            }
+            if end < range.end {
+                // we can't remap across vm area boundaries
+                return Err(VmemResizeError::InvalidAddr {
+                    range: cur_range,
+                    addr: range.end,
+                });
+            }
+            self.vmas.insert(
+                range.clone(),
+                VmArea {
+                    flags,
+                    is_file_backed: cur_vma.is_file_backed(),
+                },
+            );
+            (cur_range, cur_vma) = self
+                .vmas
+                .get_key_value(&range.start)
+                .map(|(cur_range, cur_vma)| (cur_range.clone(), *cur_vma))
+                .unwrap();
         }
 
         if range.end == cur_range.end {
@@ -902,7 +930,7 @@ where
             // litebox mappings in this range, this may fail if there are
             // platform mappings in the way.
             match unsafe {
-                self.insert_mapping(range, *cur_vma, false, FixedAddressBehavior::NoReplace)
+                self.insert_mapping(range, cur_vma, false, FixedAddressBehavior::NoReplace)
             } {
                 Ok(_) => {}
                 Err(AllocationError::PermissionDenied) => {
@@ -1023,7 +1051,7 @@ where
     {
         const COPY_CHUNK_SIZE: usize = 1 << 16;
 
-        let permissions = MemoryRegionPermissions::from(vma.flags());
+        let permissions = MemoryRegionPermissions::from(vma.flags() & VmFlags::VM_ACCESS_FLAGS);
         let temporary = VmArea::new(
             (vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE) - VmFlags::VM_EXEC,
             false,
@@ -1578,14 +1606,17 @@ mod tests {
     use super::*;
 
     type AllocationCall = (Range<usize>, FixedAddressBehavior);
+    type PermissionUpdate = (Range<usize>, MemoryRegionPermissions);
 
     litebox::define_page_reservation!(DummyReservation);
 
     /// A configurable dummy page-management backend.
     struct DummyVmemBackend<const TOP_DOWN: bool = false> {
         rejected_address: Option<usize>,
+        remap_unsupported: bool,
         calls: Mutex<Vec<AllocationCall>>,
         releases: Mutex<Vec<Range<usize>>>,
+        permission_updates: Mutex<Vec<PermissionUpdate>>,
     }
 
     impl<const TOP_DOWN: bool> litebox::platform::RawPointerProvider for DummyVmemBackend<TOP_DOWN> {
@@ -1653,6 +1684,9 @@ mod tests {
             new_range: Range<usize>,
             permissions: MemoryRegionPermissions,
         ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+            if self.remap_unsupported {
+                return Err(litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform);
+            }
             Ok(TransparentMutPtr::from_usize(new_range.start))
         }
 
@@ -1661,6 +1695,9 @@ mod tests {
             range: Range<usize>,
             new_permissions: MemoryRegionPermissions,
         ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+            self.permission_updates
+                .lock()
+                .push((range, new_permissions));
             Ok(())
         }
 
@@ -1674,8 +1711,10 @@ mod tests {
     ) -> &'static DummyVmemBackend<TOP_DOWN> {
         Box::leak(Box::new(DummyVmemBackend {
             rejected_address,
+            remap_unsupported: false,
             calls: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
+            permission_updates: Mutex::new(Vec::new()),
         }))
     }
 
@@ -2110,5 +2149,88 @@ mod tests {
                 (start + 2 * PAGE_SIZE..start + 3 * PAGE_SIZE, false),
             ]
         );
+
+        // Growing treats areas that differ only in whether they may hold data as one.
+        unsafe {
+            vmm.resize_mapping(
+                PageRange::new(start, start + 3 * PAGE_SIZE).unwrap(),
+                NonZeroPageSize::new(4 * PAGE_SIZE).unwrap(),
+            )
+        }
+        .unwrap();
+        let areas = vmm
+            .iter()
+            .map(|(range, vma)| (range.clone(), vma.flags()))
+            .collect::<Vec<_>>();
+        assert_eq!(areas.len(), 1);
+        assert_eq!(areas[0].0, start..start + 4 * PAGE_SIZE);
+        assert!(areas[0].1.contains(VmFlags::VM_HAS_CONTENTS));
+        assert!(!areas[0].1.intersects(VmFlags::VM_ACCESS_FLAGS));
+    }
+
+    #[test]
+    fn copying_remap_of_shared_mapping_passes_only_access_permissions() {
+        let backend: &'static DummyVmemBackend = Box::leak(Box::new(DummyVmemBackend {
+            rejected_address: None,
+            remap_unsupported: true,
+            calls: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
+            permission_updates: Mutex::new(Vec::new()),
+        }));
+        let data = (0..2 * PAGE_SIZE)
+            .map(|i| u8::try_from(i % 251).unwrap() + 1)
+            .collect::<Vec<_>>();
+        // The copy goes through the mapped addresses, so back them with real memory.
+        let memory = vec![0u8; 9 * PAGE_SIZE].leak();
+        let aligned = memory.as_ptr().align_offset(PAGE_SIZE);
+        let pages = &mut memory[aligned..aligned + 8 * PAGE_SIZE];
+        pages[..data.len()].copy_from_slice(&data);
+        let start = pages.as_mut_ptr() as usize;
+        let flags = VmFlags::VM_READ
+            | VmFlags::VM_WRITE
+            | VmFlags::VM_SHARED
+            | VmFlags::VM_MAYREAD
+            | VmFlags::VM_MAYWRITE
+            | VmFlags::VM_MAYSHARE;
+        let mut vmm = Vmem::new(backend);
+        unsafe {
+            vmm.create_mapping(
+                NonZeroAddress::new(start),
+                NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+                VmArea::new(flags, false),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+
+        let destination = unsafe {
+            vmm.move_mappings(
+                PageRange::new(start, start + 2 * PAGE_SIZE).unwrap(),
+                NonZeroAddress::new(start + 4 * PAGE_SIZE),
+                NonZeroPageSize::new(4 * PAGE_SIZE).unwrap(),
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(destination, start + 4 * PAGE_SIZE);
+        assert_eq!(
+            TransparentConstPtr::<u8>::from_usize(destination)
+                .to_owned_slice(data.len())
+                .unwrap()[..],
+            data[..]
+        );
+        assert_eq!(
+            *backend.permission_updates.lock(),
+            [(
+                destination..destination + 4 * PAGE_SIZE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            )]
+        );
+        let vmas = vmm
+            .iter()
+            .map(|(range, vma)| (range.clone(), vma.flags().contains(VmFlags::VM_SHARED)))
+            .collect::<Vec<_>>();
+        assert_eq!(vmas, [(destination..destination + 4 * PAGE_SIZE, true)]);
     }
 }

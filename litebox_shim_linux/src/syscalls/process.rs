@@ -1315,7 +1315,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Writes the contents of each of `regions` that has contents to the pending `child`'s
-    /// process image, back to back, skipping zero-filled chunks.
+    /// process image, back to back, skipping zero-filled pages at the ends of each chunk.
     #[cfg(target_arch = "x86_64")]
     fn write_fork_image(
         &self,
@@ -1323,6 +1323,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         regions: &[ForkMemoryRegion],
     ) -> Result<(), Errno> {
         const CHUNK_SIZE: usize = MAX_CHILD_MEMORY_WRITE_SIZE as usize;
+        // Folding a page vectorizes, unlike stopping at its first nonzero byte.
+        let has_data = |page: &[u8]| page.iter().fold(0, |acc, &byte| acc | byte) != 0;
         let mut image_offset = 0u64;
         for region in regions.iter().filter(|region| region.has_contents()) {
             let write_region = || -> Result<(), Errno> {
@@ -1331,10 +1333,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let chunk = UserPtr::<u8>::from_usize(start)
                         .to_owned_slice::<Platform>(len)
                         .ok_or(Errno::ENOMEM)?;
-                    if chunk.iter().any(|&byte| byte != 0) {
-                        let offset = image_offset + (start - region.range.start) as u64;
-                        child.write_memory(offset, &chunk).map_err(Errno::from)?;
-                    }
+                    let Some(first) = chunk.chunks(PAGE_SIZE).position(has_data) else {
+                        continue;
+                    };
+                    let last = chunk.chunks(PAGE_SIZE).rposition(has_data).unwrap();
+                    let data = &chunk[first * PAGE_SIZE..(last + 1) * PAGE_SIZE];
+                    let offset =
+                        image_offset + (start - region.range.start + first * PAGE_SIZE) as u64;
+                    child.write_memory(offset, data).map_err(Errno::from)?;
                 }
                 Ok(())
             };
