@@ -169,8 +169,8 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Termination events of the children, shared with each child's watcher.
     child_events: Arc<ChildEvents<Platform>>,
     /// Signals other processes send to this process, once opened.
-    received_signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
-    /// Watcher of `received_signals`.
+    signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
+    /// Watcher of `signals`.
     signal_watcher: Arc<SignalWatcher<Platform>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
@@ -318,7 +318,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 pollee: Pollee::new(),
                 process: inner.clone(),
             }),
-            received_signals: once_cell::race::OnceBox::new(),
+            signals: once_cell::race::OnceBox::new(),
             // Signals sent before they are opened are taken at the first check.
             signal_watcher: Arc::new(SignalWatcher {
                 changed: AtomicBool::new(true),
@@ -579,7 +579,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Opens the signals other processes send to this process, so its threads take them.
-    pub(crate) fn receive_signals(&self) {
+    pub(crate) fn open_signals(&self) {
         let process = &self.thread.process;
         // Failure means the process service is unavailable or has failed, so no signal can be
         // received.
@@ -591,7 +591,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Events::IN,
         );
         assert!(
-            process.received_signals.set(Box::new(signals)).is_ok(),
+            process.signals.set(Box::new(signals)).is_ok(),
             "process signals were already opened"
         );
     }
@@ -600,12 +600,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// During a `vfork` window the signal state is the child's, so the parent takes the signals
     /// once it resumes.
-    pub(crate) fn check_for_received_signals(&self) {
+    pub(crate) fn take_signals(&self) {
         let process = &self.thread.process;
         if self.vfork.borrow().is_some() {
             return;
         }
-        let Some(signals) = process.received_signals.get() else {
+        let Some(signals) = process.signals.get() else {
             return;
         };
         if !process.signal_watcher.changed.swap(false, Ordering::SeqCst) {

@@ -469,7 +469,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         if entrypoints.task.signals.reaps_children() {
             entrypoints.task.set_child_reaping(true);
         }
-        entrypoints.task.receive_signals();
+        entrypoints.task.open_signals();
 
         let (path, argv) = entrypoints
             .task
