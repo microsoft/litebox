@@ -153,11 +153,8 @@ pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
 /// Most sub-trampolines an AArch64 ELF footer may describe.
 ///
-/// Unlike x86-64, whose single trampoline is reached by a `JMP rel32` from
-/// anywhere within +-2GiB, an AArch64 gate is reached by a `B` and loads the
-/// callback with an `LDR` literal. Its trampoline is therefore split into
-/// sub-trampolines that fit the object's holes and keep every literal in
-/// reach. An AArch64 ELF's file layout is
+/// An AArch64 ELF's gates are split into sub-trampolines; see
+/// [`aarch64`]. Its file layout is
 /// `[ELF][padding][sub 0][padding][sub 1]...[sub N-1][table][footer]`: every
 /// sub-trampoline starts at a [`TRAMPOLINE_FILE_ALIGNMENT`]-aligned file
 /// offset and a page-aligned virtual address, the table holds `N` 24-byte
@@ -168,9 +165,8 @@ pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 /// Each sub-trampoline has the layout of a whole trampoline: the loader writes
 /// the callback into its first 8 bytes and finalizes it independently.
 ///
-/// The footer's last word is zero where the single-trampoline header holds its
-/// size, so the rewriter's already-hooked check treats any AArch64 output as
-/// processed without parsing the table.
+/// The footer's last word is zero where the single-header trailer holds its size,
+/// so the already-hooked check treats any AArch64 output as processed.
 pub const MAX_AARCH64_TRAMPOLINE_REGIONS: usize = 4096;
 
 /// Required file alignment of the appended trampoline payload.
@@ -1094,8 +1090,8 @@ fn hook_aarch64_elf(
     callback: u64,
     options: RewriteOptions,
 ) -> Result<Vec<u8>> {
-    // The caller's parse is shared with x86-64 and returns only `placement`;
-    // re-reading the program headers here keeps that path unchanged.
+    // The shared caller provides only `placement`; holes come from the
+    // program headers.
     let granule = aarch64_trampoline_page_size(options.target_host());
     let spaces = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
@@ -1114,11 +1110,10 @@ fn hook_aarch64_elf(
 
 /// Rewrites an AArch64 ELF, spreading its gates over `spaces`.
 ///
-/// The addresses are baked into every rewritten site, so they have to be
-/// chosen before the trampoline's size is known. Each site's gate therefore
-/// goes to the first space, in preference order, with room for it and in its
-/// branch reach; see [`aarch64::hook_split_aarch64_with_code_ranges`]. The
-/// output layout is described at [`MAX_AARCH64_TRAMPOLINE_REGIONS`].
+/// Each site's gate goes to the first space, in preference order, with room
+/// for it and in its branch reach; see
+/// [`aarch64::hook_split_aarch64_with_code_ranges`]. The output layout is
+/// described at [`MAX_AARCH64_TRAMPOLINE_REGIONS`].
 fn hook_aarch64_elf_in_spaces(
     input_binary: &[u8],
     buf: &mut [u8],
@@ -1971,8 +1966,8 @@ fn whole_code_scan_ranges(code_len: usize) -> aarch64::CodeScanRanges {
 }
 
 /// Runtime AArch64 rewriting of one mapped code region, spreading its gates
-/// over sub-trampolines in `spaces` exactly like the ahead-of-time path; see
-/// [`aarch64::TrampolineSpace`] and [`aarch64::SubTrampoline`].
+/// over sub-trampolines in `spaces`; see [`aarch64::TrampolineSpace`] and
+/// [`aarch64::SubTrampoline`].
 ///
 /// `ranges` constrains scanning to mapping-relative ELF code ranges; `None`
 /// scans all of `code`. `callback` is written into every sub-trampoline's
@@ -2172,11 +2167,8 @@ pub struct LoadSegment {
 
 /// Where an object's appended trampoline goes, and how large it may grow.
 ///
-/// AArch64 does not commit to one placement: one trampoline per object would
-/// bound every gate twice over -- by the hole it is placed in, and by the
-/// callback literal's +-1MiB reach from the single header. It instead splits
-/// its gates into sub-trampolines, each with its own header, over every hole
-/// and then this placement's fallback; see [`aarch64_trampoline_spaces`].
+/// On AArch64 only the fallback address is used; gates go to sub-trampolines
+/// in every hole first; see [`aarch64_trampoline_spaces`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrampolinePlacement {
     /// A hole between two `PT_LOAD` segments, inside the object's own load
@@ -2345,10 +2337,7 @@ pub fn inter_segment_holes(segments: &[LoadSegment], page: u64) -> Vec<(u64, u64
 /// the last segment, which nothing bounds.
 ///
 /// Holes come first because they lie inside the object's own load span, which
-/// the dynamic loader reserves for it; see [`trampoline_placement_for`]. Taking
-/// the largest first keeps a trampoline that fits one hole exactly where an
-/// unsplit trampoline would go. The fallback is used only for what the holes
-/// cannot hold or reach.
+/// the dynamic loader reserves for it; see [`trampoline_placement_for`].
 pub(crate) fn aarch64_trampoline_spaces(
     segments: &[LoadSegment],
     page_size: u64,
@@ -2805,7 +2794,7 @@ mod tests {
         trampoline_placement_for(segments, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE).unwrap()
     }
 
-    /// The spaces an unsplit `placement` offered: its hole, then its fallback.
+    /// The spaces a `placement` describes: its hole, then its fallback.
     fn spaces_of(placement: TrampolinePlacement) -> Vec<aarch64::TrampolineSpace> {
         let fallback = aarch64::TrampolineSpace {
             start: placement.fallback_addr(),
@@ -3216,7 +3205,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        // The first space is the hole an unsplit trampoline would have used.
+        // The first space is the hole `trampoline_placement_for` picks.
         let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } =
             trampoline_placement_for(&segments, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE)
                 .unwrap()
