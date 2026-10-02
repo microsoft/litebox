@@ -4514,17 +4514,50 @@ mod tests {
         let p: &'static MacosUserland = Box::leak(Box::new(MacosUserland::new()));
         let mm: litebox_common_linux::mm::VmemManager<MacosUserland, HOST_PAGE_SIZE> =
             litebox_common_linux::mm::VmemManager::new(p);
-        // SAFETY: the mapping remains exclusively owned by this test.
-        let source = unsafe {
-            mm.create_writable_pages(
-                None,
-                litebox_common_linux::vmem::NonZeroPageSize::new(HOST_PAGE_SIZE).unwrap(),
-                litebox_common_linux::vmem::CreatePagesFlags::empty(),
-                |_| Ok(0),
-            )
-            .unwrap()
+        // Find a source whose next page we can claim as the blocker; keep rejected sources
+        // mapped so each retry lands at a new address.
+        let mut rejected_sources = Vec::new();
+        let (source, blocker) = loop {
+            assert!(
+                rejected_sources.len() < 64,
+                "failed to place an owned blocker after the source mapping"
+            );
+            // SAFETY: the mapping remains exclusively owned by this test.
+            let source = unsafe {
+                mm.create_writable_pages(
+                    None,
+                    litebox_common_linux::vmem::NonZeroPageSize::new(HOST_PAGE_SIZE).unwrap(),
+                    litebox_common_linux::vmem::CreatePagesFlags::empty(),
+                    |_| Ok(0),
+                )
+                .unwrap()
+            };
+            let end = source.as_usize() + HOST_PAGE_SIZE;
+            match p.allocate_pages(
+                end..end + HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            ) {
+                Ok(blocker) => break (source, blocker),
+                Err(AllocationError::AddressInUseByPlatform) => {
+                    rejected_sources.push(source);
+                }
+                Err(err) => panic!("failed to allocate blocker: {err:?}"),
+            }
         };
-        let source_range = source.as_usize()..source.as_usize() + HOST_PAGE_SIZE;
+        let _rejected_cleanup = litebox::utils::defer(|| {
+            for rejected in rejected_sources {
+                // SAFETY: the test owns these idle mappings and never accessed them.
+                unsafe { mm.remove_pages(rejected, HOST_PAGE_SIZE).unwrap() };
+            }
+        });
+        let blocker_range = blocker.as_usize()..blocker.as_usize() + HOST_PAGE_SIZE;
+        let _blocker_cleanup = litebox::utils::defer(|| {
+            // SAFETY: the test owns the external blocker and no longer accesses it.
+            unsafe { p.release_pages(blocker_range).unwrap() };
+        });
         assert_eq!(
             source.write_slice_at_offset(0, &[0x40, 0x05, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6]),
             Some(())
@@ -4538,20 +4571,6 @@ mod tests {
             )
             .unwrap();
         }
-        let blocker = p
-            .allocate_pages(
-                source_range.end..source_range.end + HOST_PAGE_SIZE,
-                RW,
-                false,
-                true,
-                FixedAddressBehavior::NoReplace,
-            )
-            .unwrap();
-        let blocker_range = blocker.as_usize()..blocker.as_usize() + HOST_PAGE_SIZE;
-        let _blocker_cleanup = litebox::utils::defer(|| {
-            // SAFETY: the test owns the external blocker and no longer accesses it.
-            unsafe { p.release_pages(blocker_range).unwrap() };
-        });
         // SAFETY: the source is idle and the external blocker forces the shared Vmem copy fallback.
         let remapped = unsafe {
             mm.remap_pages(source, HOST_PAGE_SIZE, 2 * HOST_PAGE_SIZE, true)
