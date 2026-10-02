@@ -150,7 +150,7 @@ pub fn hook_syscalls_in_elf(input_binary: &[u8], trampoline: Option<u64>) -> Res
     // Some ELF files (e.g. Node.js SEA binaries) have a program header table at an offset that
     // is not 8-byte aligned, which the `object` crate rejects. Fix this by relocating the phdr
     // table within our mutable copy so it sits at an 8-byte aligned offset.
-    fixup_phdr_alignment(buf);
+    fixup_phdr_alignment(buf)?;
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
     let (arch, text_sections, control_transfer_targets, trampoline_base_addr) = {
@@ -526,15 +526,15 @@ fn hook_syscalls_in_section(
 /// The function modifies the buffer in-place: it moves the phdr table contents and updates
 /// `e_phoff` in the ELF header. Only ELF64 files are handled (ELF32 requires 4-byte alignment
 /// which is always satisfied when `e_phoff` is within a valid file).
-fn fixup_phdr_alignment(buf: &mut [u8]) {
+fn fixup_phdr_alignment(buf: &mut [u8]) -> Result<()> {
     // Minimum ELF header size for ELF64
     if buf.len() < 64 {
-        return;
+        return Ok(());
     }
 
     // Check ELF magic, class (must be ELF64), and byte order (must be little-endian).
     if &buf[0..4] != b"\x7fELF" || buf[4] != 2 || buf[5] != 1 {
-        return;
+        return Ok(());
     }
 
     let e_phoff = u64::from_le_bytes(buf[32..40].try_into().unwrap());
@@ -542,66 +542,46 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
     let e_phnum = u64::from(u16::from_le_bytes(buf[56..58].try_into().unwrap()));
 
     if e_phoff == 0 || e_phnum == 0 || e_phentsize == 0 {
-        return;
+        return Ok(());
     }
 
     let misalignment = e_phoff % 8;
     if misalignment == 0 {
-        return; // already aligned
+        return Ok(()); // already aligned
     }
 
     let Some(phdr_size) = e_phentsize.checked_mul(e_phnum) else {
-        return;
+        return Ok(());
     };
     let Ok(old_start) = usize::try_from(e_phoff) else {
-        return;
+        return Ok(());
     };
     let Ok(phdr_size) = usize::try_from(phdr_size) else {
-        return;
+        return Ok(());
     };
     let Some(old_end) = old_start.checked_add(phdr_size) else {
-        return;
+        return Ok(());
     };
 
     // Shift forward to align: new offset is the next 8-byte boundary.
     let Ok(padding) = usize::try_from(8 - misalignment) else {
-        return;
+        return Ok(());
     };
     let Some(new_start) = old_start.checked_add(padding) else {
-        return;
+        return Ok(());
     };
     let Some(new_end) = new_start.checked_add(phdr_size) else {
-        return;
+        return Ok(());
     };
 
     if new_end > buf.len() {
-        return; // not enough room
+        return Ok(()); // not enough room
     }
 
     // Only relocate when the overwritten bytes are padding. Otherwise this would corrupt the file
     // by destroying whatever payload follows the existing program header table.
     if !buf[old_end..new_end].iter().all(|&byte| byte == 0) {
-        return;
-    }
-
-    let Ok(entry_size) = usize::try_from(e_phentsize) else {
-        return;
-    };
-    if entry_size
-        < core::mem::size_of::<object::elf::ProgramHeader64<object::endian::LittleEndian>>()
-    {
-        return;
-    }
-    for entry in buf[old_start..old_end].chunks_exact(entry_size) {
-        let p_type = u32::from_le_bytes(entry[..4].try_into().unwrap());
-        if p_type == object::elf::PT_PHDR {
-            for field in entry[8..32].as_chunks::<8>().0 {
-                let value = u64::from_le_bytes(*field);
-                if value.checked_add(padding as u64).is_none() {
-                    return;
-                }
-            }
-        }
+        return Ok(());
     }
 
     // Move the phdr table forward (use copy_within since src and dst overlap).
@@ -620,10 +600,10 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
     // Shifting the phdr table forward in the file shifts it within the PT_LOAD
     // mapping by the same amount, so all three fields need the same adjustment.
     let Ok(e_phentsize_usize) = usize::try_from(e_phentsize) else {
-        return;
+        return Ok(());
     };
     let Ok(e_phnum_usize) = usize::try_from(e_phnum) else {
-        return;
+        return Ok(());
     };
     for i in 0..e_phnum_usize {
         let Some(i_times_size) = i.checked_mul(e_phentsize_usize) else {
@@ -648,12 +628,14 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
             ] {
                 let off = entry_off + field_off;
                 let old_val = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-                let new_val = (old_val + padding as u64).to_le_bytes();
+                let new_val =
+                    checked_add_u64(old_val, padding as u64, "PT_PHDR relocation")?.to_le_bytes();
                 buf[off..off + 8].copy_from_slice(&new_val);
             }
             // The PHDR segment size should match the phdr table; no change needed.
         }
     }
+    Ok(())
 }
 
 /// Replace an unpatchable syscall instruction with `ICEBP; HLT` (`F1 F4`) so
@@ -1190,20 +1172,25 @@ mod tests {
     }
 
     #[test]
-    fn phdr_alignment_rejects_overflow_without_mutation() {
+    fn phdr_alignment_rejects_overflow() {
         for offset in [8, 16, 24] {
             let mut bytes = misaligned_phdr();
             bytes[65 + offset..65 + offset + 8].copy_from_slice(&u64::MAX.to_le_bytes());
-            let original = bytes.clone();
-            fixup_phdr_alignment(&mut bytes);
-            assert_eq!(bytes, original);
+            assert!(matches!(
+                hook_syscalls_in_elf(&bytes, None),
+                Err(Error::AddressOverflow(_))
+            ));
+            assert!(matches!(
+                fixup_phdr_alignment(&mut bytes),
+                Err(Error::AddressOverflow(_))
+            ));
         }
     }
 
     #[test]
     fn phdr_alignment_updates_representable_fields() {
         let mut bytes = misaligned_phdr();
-        fixup_phdr_alignment(&mut bytes);
+        fixup_phdr_alignment(&mut bytes).unwrap();
         assert_eq!(u64::from_le_bytes(bytes[32..40].try_into().unwrap()), 72);
         for offset in [8, 16, 24] {
             assert_eq!(
