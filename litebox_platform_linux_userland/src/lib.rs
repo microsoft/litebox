@@ -513,7 +513,8 @@ impl LinuxUserland {
         // TODO: bpf program can be compiled offline
         let bpf_prog: BpfProgram = filter.try_into().unwrap();
 
-        seccompiler::apply_filter(&bpf_prog).unwrap();
+        // seccomp TSYNC to confine all pre-existing threads (e.g., the network worker).
+        seccompiler::apply_filter_all_threads(&bpf_prog).unwrap();
     }
 }
 
@@ -2315,8 +2316,24 @@ mod tests {
     #[test]
     fn test_seccomp_filter() {
         let _platform: &LinuxUserland = LinuxUserland::new(None);
-        LinuxUserland::enable_seccomp_filter();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        let worker = super::spawn_host_thread(move || {
+            worker_barrier.wait();
+            worker_barrier.wait();
+            assert_seccomp_filter();
+        });
 
+        // Finish worker setup before filtering; release it only after installation.
+        barrier.wait();
+        LinuxUserland::enable_seccomp_filter();
+        barrier.wait();
+
+        assert_seccomp_filter();
+        worker.join().unwrap();
+    }
+
+    fn assert_seccomp_filter() {
         let pathname = c"/tmp/test_seccomp";
         let mkdir_res = unsafe {
             syscalls::syscall2(syscalls::Sysno::mkdir, pathname.as_ptr() as usize, 0o755)
