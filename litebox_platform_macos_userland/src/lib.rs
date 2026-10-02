@@ -671,18 +671,64 @@ impl<const PAGE_SIZE: usize> litebox_common_linux::vmem::VmemPageFaultHandler
 bitflags::bitflags! {
     #[repr(transparent)]
     struct MachVmFlags: i32 {
+        /// Mach uses zero to request the supplied fixed address.
         const FIXED = 0;
         const ANYWHERE = 0x0000_0001;
-        const RANDOM_ADDRESS = 0x0000_0008;
-        const OVERWRITE = 0x0000_4000;
+    }
+
+    #[repr(transparent)]
+    struct MachVmProtection: i32 {
+        const READ = libc::VM_PROT_READ;
+        const WRITE = libc::VM_PROT_WRITE;
+        const EXECUTE = libc::VM_PROT_EXECUTE;
+        const COPY = 0x10;
     }
 }
 
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct MachBoolean(i32);
+
+impl MachBoolean {
+    const FALSE: Self = Self(0);
+    const TRUE: Self = Self(1);
+}
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum MachVmInheritance {
+    None = 2,
+}
+
 const MACH_PORT_NULL: u32 = 0;
+const BSD_SYS_MMAP: usize = 197;
+const BSD_SYS_MPROTECT: usize = 74;
+const BSD_SYS_PTHREAD_SIGMASK: usize = 329;
+const MACH_VM_DEALLOCATE_TRAP: usize = 0u32.wrapping_sub(12) as usize;
 const VM_REGION_BASIC_INFO_64: i32 = 9;
 // sizeof(vm_region_basic_info_data_64_t) / sizeof(integer_t) on macOS. The
 // SDK declares this structure with 4-byte packing, making it 36 bytes.
 const VM_REGION_BASIC_INFO_COUNT_64: u32 = 9;
+
+// vm_region_submap_short_info_64, packed to 4-byte alignment by the Mach SDK.
+#[repr(C, packed(4))]
+struct MachVmSubmapInfo {
+    protection: MachVmProtection,
+    max_protection: MachVmProtection,
+    inheritance: i32,
+    offset: u64,
+    user_tag: u32,
+    ref_count: u32,
+    shadow_depth: u16,
+    external_pager: u8,
+    share_mode: u8,
+    is_submap: MachBoolean,
+    behavior: i32,
+    object_id: u32,
+    user_wired_count: u16,
+    flags: u16,
+}
+const _: () = assert!(size_of::<MachVmSubmapInfo>() == 48);
 
 unsafe extern "C" {
     fn mach_absolute_time() -> u64;
@@ -691,6 +737,27 @@ unsafe extern "C" {
     fn mach_task_self() -> u32;
     fn mach_port_deallocate(task: u32, name: u32) -> KernReturn;
     fn mach_vm_allocate(task: u32, address: *mut u64, size: u64, flags: MachVmFlags) -> KernReturn;
+    fn mach_vm_deallocate(task: u32, address: u64, size: u64) -> KernReturn;
+    fn mach_vm_protect(
+        task: u32,
+        address: u64,
+        size: u64,
+        set_maximum: MachBoolean,
+        protection: MachVmProtection,
+    ) -> KernReturn;
+    fn mach_vm_remap(
+        task: u32,
+        target: *mut u64,
+        size: u64,
+        mask: u64,
+        flags: MachVmFlags,
+        source_task: u32,
+        source: u64,
+        copy: MachBoolean,
+        current_protection: *mut MachVmProtection,
+        max_protection: *mut MachVmProtection,
+        inheritance: MachVmInheritance,
+    ) -> KernReturn;
     fn mach_vm_region(
         task: u32,
         address: *mut u64,
@@ -699,6 +766,14 @@ unsafe extern "C" {
         info: *mut i32,
         info_count: *mut u32,
         object_name: *mut u32,
+    ) -> KernReturn;
+    fn mach_vm_region_recurse(
+        task: u32,
+        address: *mut u64,
+        size: *mut u64,
+        depth: *mut u32,
+        info: *mut i32,
+        info_count: *mut u32,
     ) -> KernReturn;
     fn mach_vm_read_overwrite(
         task: u32,
@@ -709,6 +784,535 @@ unsafe extern "C" {
     ) -> KernReturn;
     fn sys_icache_invalidate(start: *mut libc::c_void, size: usize);
 }
+/// Failure while staging or publishing private dyld shared-cache mappings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharedCacheMappingError {
+    /// A requested range is empty or not aligned to the native host page size.
+    Unaligned,
+    /// A Mach VM operation returned this kernel status.
+    Mach(KernReturn),
+    /// A raw BSD VM syscall returned this errno.
+    Errno(i32),
+    /// A Mach VM address is unrepresentable or differs from the requested fixed target.
+    UnexpectedAddress,
+    /// The range is not the inaccessible leading padding of the live cache submap.
+    InvalidCachePadding,
+}
+
+impl core::fmt::Display for SharedCacheMappingError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unaligned => formatter.write_str("shared-cache range is not host-page aligned"),
+            Self::Mach(value) => write!(formatter, "Mach VM operation failed: {value:?}"),
+            Self::Errno(value) => write!(formatter, "Darwin VM syscall failed with errno {value}"),
+            Self::UnexpectedAddress => {
+                formatter.write_str("unexpected or unrepresentable Mach VM address")
+            }
+            Self::InvalidCachePadding => {
+                formatter.write_str("range is not shared-cache ASLR padding")
+            }
+        }
+    }
+}
+
+impl core::error::Error for SharedCacheMappingError {}
+
+/// Stage a private writable copy of an existing host mapping.
+///
+/// The source remains unchanged until [`SharedCacheWriteAlias::commit`] replaces
+/// it under its own safety contract. Publishing at the original cache address
+/// preserves the boot-local ASLR slide and arm64e pointer signatures.
+///
+/// # Safety
+///
+/// The caller must keep `range` mapped and readable, and prevent concurrent
+/// writes or mapping changes while staging the copy.
+pub unsafe fn prepare_shared_cache_copy(
+    range: Range<usize>,
+) -> Result<SharedCacheWriteAlias, SharedCacheMappingError> {
+    if !is_page_aligned::<HOST_PAGE_SIZE>(&range) {
+        return Err(SharedCacheMappingError::Unaligned);
+    }
+    let mut alias = 0u64;
+    let mut current = MachVmProtection::empty();
+    let mut maximum = MachVmProtection::empty();
+    // SAFETY: output fields are writable, the source range is caller-validated,
+    // and Mach validates both task-relative address ranges.
+    let remapped = unsafe {
+        mach_vm_remap(
+            mach_task_self(),
+            &raw mut alias,
+            range.len() as u64,
+            0,
+            MachVmFlags::ANYWHERE,
+            mach_task_self(),
+            range.start as u64,
+            MachBoolean::TRUE, // private COW copy
+            &raw mut current,
+            &raw mut maximum,
+            MachVmInheritance::None,
+        )
+    };
+    if remapped != KernReturn::SUCCESS {
+        return Err(SharedCacheMappingError::Mach(remapped));
+    }
+    // VM_PROT_COPY permits a writable COW staging view of code-signed cache
+    // pages. Commit copies these bytes into a separate anonymous mapping.
+    // SAFETY: alias is the live mapping returned by mach_vm_remap above.
+    let writable = unsafe {
+        mach_vm_protect(
+            mach_task_self(),
+            alias,
+            range.len() as u64,
+            MachBoolean::FALSE,
+            MachVmProtection::READ | MachVmProtection::WRITE | MachVmProtection::COPY,
+        )
+    };
+    if writable != KernReturn::SUCCESS {
+        // SAFETY: alias is still exclusively owned after the failed protection change.
+        unsafe { mach_vm_deallocate(mach_task_self(), alias, range.len() as u64) };
+        return Err(SharedCacheMappingError::Mach(writable));
+    }
+    Ok(SharedCacheWriteAlias {
+        address: usize::try_from(alias).map_err(|_| SharedCacheMappingError::UnexpectedAddress)?,
+        target: SharedCacheTarget::Existing(range.start),
+        len: range.len(),
+    })
+}
+
+/// Make shared-cache data privately writable in the forked runner.
+///
+/// # Safety
+///
+/// The caller must exclusively control `range`, ensure that it belongs to the
+/// current process's shared cache, and prevent concurrent access while its
+/// mapping protections are changed.
+pub unsafe fn make_shared_cache_range_writable(
+    range: Range<usize>,
+) -> Result<(), SharedCacheMappingError> {
+    if !is_page_aligned::<HOST_PAGE_SIZE>(&range) {
+        return Err(SharedCacheMappingError::Unaligned);
+    }
+    // SAFETY: the caller guarantees exclusive control and validity of range;
+    // Mach validates the task-relative mapping and requested protections.
+    let result = unsafe {
+        mach_vm_protect(
+            mach_task_self(),
+            range.start as u64,
+            range.len() as u64,
+            MachBoolean::FALSE,
+            MachVmProtection::READ | MachVmProtection::WRITE | MachVmProtection::COPY,
+        )
+    };
+    if result == KernReturn::SUCCESS {
+        Ok(())
+    } else {
+        Err(SharedCacheMappingError::Mach(result))
+    }
+}
+
+/// Release leading ASLR padding from the inherited shared-cache submap.
+///
+/// This does not reserve the freed range. Follow it with
+/// [`prepare_private_cache_mapping`], which must still fail if another allocation
+/// occupies the hole before it can be reserved.
+///
+/// # Safety
+///
+/// `cache_base` must be the actual live shared-cache base in the current process.
+/// The caller must prevent concurrent changes to the inspected mappings.
+pub unsafe fn release_shared_cache_padding(
+    range: Range<usize>,
+    cache_base: usize,
+) -> Result<(), SharedCacheMappingError> {
+    if !is_page_aligned::<HOST_PAGE_SIZE>(&range) {
+        return Err(SharedCacheMappingError::Unaligned);
+    }
+    if range.end != cache_base {
+        return Err(SharedCacheMappingError::InvalidCachePadding);
+    }
+    let (outer, info) = shared_cache_submap_region(range.start, 0)?;
+    if info.is_submap.0 == 0 || outer.start > range.start || !outer.contains(&cache_base) {
+        return Err(SharedCacheMappingError::InvalidCachePadding);
+    }
+    let (padding, info) = shared_cache_submap_region(range.start, 1)?;
+    if info.is_submap.0 != 0
+        || padding.start > range.start
+        || padding.end != cache_base
+        || !info.protection.is_empty()
+        || !info.max_protection.is_empty()
+        || info.external_pager != 0
+        || info.ref_count != 0
+    {
+        return Err(SharedCacheMappingError::InvalidCachePadding);
+    }
+    // SAFETY: the caller identifies the live cache and excludes mapping races.
+    // The range is wholly within its inaccessible, objectless leading padding.
+    let result =
+        unsafe { mach_vm_deallocate(mach_task_self(), range.start as u64, range.len() as u64) };
+    if result == KernReturn::SUCCESS {
+        Ok(())
+    } else {
+        Err(SharedCacheMappingError::Mach(result))
+    }
+}
+
+fn shared_cache_submap_region(
+    address: usize,
+    depth: u32,
+) -> Result<(Range<usize>, MachVmSubmapInfo), SharedCacheMappingError> {
+    let mut base = address as u64;
+    let mut len = 0;
+    let mut actual_depth = depth;
+    let mut count = (size_of::<MachVmSubmapInfo>() / size_of::<i32>()).trunc();
+    let expected_count = count;
+    // SAFETY: the Mach ABI structure consists entirely of zero-valid scalar fields.
+    let mut info = unsafe { core::mem::zeroed::<MachVmSubmapInfo>() };
+    // SAFETY: all outputs are live and sized for VM_REGION_SUBMAP_SHORT_INFO_COUNT_64.
+    let result = unsafe {
+        mach_vm_region_recurse(
+            mach_task_self(),
+            &raw mut base,
+            &raw mut len,
+            &raw mut actual_depth,
+            (&raw mut info).cast(),
+            &raw mut count,
+        )
+    };
+    if result != KernReturn::SUCCESS {
+        return Err(SharedCacheMappingError::Mach(result));
+    }
+    let end = base
+        .checked_add(len)
+        .ok_or(SharedCacheMappingError::InvalidCachePadding)?;
+    if actual_depth != depth || count != expected_count || len == 0 {
+        return Err(SharedCacheMappingError::InvalidCachePadding);
+    }
+    Ok((base.trunc()..end.trunc(), info))
+}
+
+/// Reserve an unoccupied target and prepare zero-filled RW staging for it.
+///
+/// The target remains reserved until commit publishes it as RX or drop releases it.
+pub fn prepare_private_cache_mapping(
+    range: Range<usize>,
+) -> Result<SharedCacheWriteAlias, SharedCacheMappingError> {
+    if !is_page_aligned::<HOST_PAGE_SIZE>(&range) {
+        return Err(SharedCacheMappingError::Unaligned);
+    }
+    let len = range.len();
+    let mut target = range.start as u64;
+    // SAFETY: FIXED without OVERWRITE fails if any part of the target is occupied.
+    // The output is writable, and the range is nonempty and page-aligned.
+    let reserved = unsafe {
+        mach_vm_allocate(
+            mach_task_self(),
+            &raw mut target,
+            len as u64,
+            MachVmFlags::FIXED,
+        )
+    };
+    if reserved != KernReturn::SUCCESS {
+        return Err(SharedCacheMappingError::Mach(reserved));
+    }
+    if target != range.start as u64 {
+        // SAFETY: release only the allocation returned by Mach, not the requested range.
+        unsafe { mach_vm_deallocate(mach_task_self(), target, len as u64) };
+        return Err(SharedCacheMappingError::UnexpectedAddress);
+    }
+    // mach_vm_allocate gives the anonymous object an RWX maximum protection.
+    let mut temporary = 0u64;
+    // SAFETY: temporary is writable and ANYWHERE requests a fresh mapping.
+    let allocated = unsafe {
+        mach_vm_allocate(
+            mach_task_self(),
+            &raw mut temporary,
+            len as u64,
+            MachVmFlags::ANYWHERE,
+        )
+    };
+    if allocated != KernReturn::SUCCESS {
+        // SAFETY: staging failed, but the target reservation is still exclusively owned.
+        unsafe { mach_vm_deallocate(mach_task_self(), target, len as u64) };
+        return Err(SharedCacheMappingError::Mach(allocated));
+    }
+    Ok(SharedCacheWriteAlias {
+        address: temporary.trunc(),
+        target: SharedCacheTarget::Reserved(range.start),
+        len,
+    })
+}
+
+/// Invoke `mmap(MAP_FIXED)` without entering potentially replaced libSystem code.
+///
+/// # Safety
+///
+/// The caller must own the target range and permit its existing mapping to be
+/// destroyed. `address..address + length` must not overflow.
+unsafe fn raw_fixed_anonymous(address: usize, length: usize) -> Result<usize, i32> {
+    let result: usize;
+    let failed: usize;
+    // SAFETY: registers follow the Darwin mmap syscall ABI; the caller supplies
+    // the ownership and range validity required by MAP_FIXED.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            "cset {failed}, cs",
+            in("x0") address,
+            inlateout("x1") length => _,
+            in("x2") (libc::PROT_READ | libc::PROT_WRITE) as usize,
+            in("x3") (libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED) as usize,
+            in("x4") usize::MAX,
+            in("x5") 0usize,
+            in("x16") BSD_SYS_MMAP,
+            lateout("x0") result,
+            failed = lateout(reg) failed,
+            options(nostack),
+        );
+    }
+    if failed == 0 {
+        Ok(result)
+    } else {
+        Err(i32::try_from(result).unwrap_or(i32::MAX))
+    }
+}
+
+/// Invoke `mprotect` without entering potentially replaced libSystem code.
+///
+/// # Safety
+///
+/// The range must be a live mapping controlled by the caller, and changing its
+/// protections must not race any access from another thread.
+unsafe fn raw_protect(address: usize, length: usize, protection: i32) -> Result<(), i32> {
+    let result: usize;
+    let failed: usize;
+    // SAFETY: registers follow the Darwin mprotect syscall ABI and the caller
+    // guarantees exclusive control of the live mapping.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            "cset {failed}, cs",
+            in("x0") address,
+            inlateout("x1") length => _,
+            in("x2") protection.cast_unsigned() as usize,
+            in("x16") BSD_SYS_MPROTECT,
+            lateout("x0") result,
+            failed = lateout(reg) failed,
+            options(nostack),
+        );
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(i32::try_from(result).unwrap_or(i32::MAX))
+    }
+}
+
+unsafe fn raw_signal_mask(
+    how: i32,
+    set: &libc::sigset_t,
+    previous: *mut libc::sigset_t,
+) -> Result<(), i32> {
+    let result: usize;
+    let failed: usize;
+    // Use __pthread_sigmask: Darwin sigprocmask changes every thread's mask.
+    // SAFETY: pointers reference live signal-mask storage for this thread.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            "cset {failed}, cs",
+            in("x0") how.cast_unsigned() as usize,
+            inlateout("x1") core::ptr::from_ref(set) as usize => _,
+            in("x2") previous as usize,
+            in("x16") BSD_SYS_PTHREAD_SIGMASK,
+            lateout("x0") result,
+            failed = lateout(reg) failed,
+            options(nostack),
+        );
+    }
+    if failed == 0 {
+        Ok(())
+    } else {
+        Err(i32::try_from(result).unwrap_or(i32::MAX))
+    }
+}
+
+unsafe fn raw_deallocate(task: u32, address: usize, length: usize) -> KernReturn {
+    let result: usize;
+    // SAFETY: arguments follow the mach_vm_deallocate trap ABI.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            inlateout("x0") task as usize => result,
+            in("x1") address,
+            in("x2") length,
+            in("x16") MACH_VM_DEALLOCATE_TRAP,
+            options(nostack),
+        );
+    }
+    KernReturn::from_raw(i32::try_from(result).unwrap_or(i32::MAX))
+}
+
+/// Copy bytes without allowing LLVM to introduce a libSystem call.
+///
+/// # Safety
+///
+/// Both ranges must be valid for `length` bytes and must not overlap.
+unsafe fn raw_copy(destination: *mut u8, source: *const u8, length: usize) {
+    // SAFETY: the caller guarantees both ranges; the loop accesses exactly
+    // length bytes and uses no stack or external code.
+    unsafe {
+        core::arch::asm!(
+            "cbz {length}, 2f",
+            "1:",
+            "ldrb {byte:w}, [{source}], #1",
+            "strb {byte:w}, [{destination}], #1",
+            "subs {length}, {length}, #1",
+            "b.ne 1b",
+            "2:",
+            destination = inlateout(reg) destination => _,
+            source = inlateout(reg) source => _,
+            length = inlateout(reg) length => _,
+            byte = lateout(reg) _,
+            options(nostack),
+        );
+    }
+}
+
+const RAW_FATAL_MESSAGE: [u8; 48] = *b"fatal shared-cache publication errno=0x00000000\n";
+
+/// Report an unrecoverable post-publication errno and terminate via raw `_exit`.
+///
+/// # Safety
+///
+/// This unconditionally terminates the process and therefore may only be used
+/// after shared-cache publication has made ordinary unwinding unsafe.
+unsafe fn raw_fatal_exit(error: i32, message: &mut [u8; RAW_FATAL_MESSAGE.len()]) -> ! {
+    let value = error.cast_unsigned();
+    for (index, byte) in message[39..47].iter_mut().enumerate() {
+        let nibble = ((value >> ((7 - index) * 4)) & 0xf) as usize;
+        *byte = b"0123456789abcdef"[nibble];
+    }
+    raw_signal_write(message);
+    // SAFETY: SYS_exit accepts the status in x0 and never returns.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            in("x0") (128 + libc::SIGABRT) as usize,
+            in("x16") 1usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// Writable staging alias for a private shared-cache mapping.
+///
+/// Drop releases staging and any unpublished target reservation, but never an
+/// existing cache mapping. Commit transfers the published target to the caller.
+pub struct SharedCacheWriteAlias {
+    address: usize,
+    target: SharedCacheTarget,
+    len: usize,
+}
+
+enum SharedCacheTarget {
+    Existing(usize),
+    Reserved(usize),
+}
+
+impl SharedCacheWriteAlias {
+    /// Return the writable staging mapping's base address.
+    pub fn address(&self) -> usize {
+        self.address
+    }
+
+    /// Publish the fully rewritten staging copy at its target address.
+    ///
+    /// # Safety
+    ///
+    /// The caller must exclusively own the target address range and ensure no
+    /// thread can execute from or otherwise access it until publication ends.
+    pub unsafe fn commit(self) -> Result<(), SharedCacheMappingError> {
+        // Materialize diagnostics while every libSystem mapping is still executable.
+        let mut fatal_message = RAW_FATAL_MESSAGE;
+        // SAFETY: mach_task_self has no preconditions.
+        let task = unsafe { mach_task_self() };
+        let all_signals = !0;
+        let mut previous_signals = 0;
+        // SAFETY: both masks are live and no mapping has been replaced yet.
+        unsafe {
+            raw_signal_mask(libc::SIG_BLOCK, &all_signals, &raw mut previous_signals)
+                .map_err(SharedCacheMappingError::Errno)?;
+        }
+        // Move into its final storage before replacement. No Rust move, Drop,
+        // allocation, or libc call is permitted after the target may disappear.
+        let this = core::mem::ManuallyDrop::new(self);
+        let (SharedCacheTarget::Existing(target) | SharedCacheTarget::Reserved(target)) =
+            this.target;
+        let len = this.len;
+        let address = this.address;
+        // Use raw syscalls: the mapping being replaced contains the libc
+        // wrappers for mmap/mprotect themselves. Returning through those
+        // wrappers while the page is RW or empty is not safe.
+        // SAFETY: commit's contract grants exclusive ownership of target.
+        let mapped = match unsafe { raw_fixed_anonymous(target, len) } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                // SAFETY: no mapping was replaced; staging is no longer needed.
+                unsafe {
+                    let _ = raw_deallocate(task, address, len);
+                    if matches!(this.target, SharedCacheTarget::Reserved(_)) {
+                        let _ = raw_deallocate(task, target, len);
+                    }
+                    raw_signal_mask(libc::SIG_SETMASK, &previous_signals, core::ptr::null_mut())
+                        .map_err(SharedCacheMappingError::Errno)?;
+                }
+                return Err(SharedCacheMappingError::Errno(error));
+            }
+        };
+        if mapped != target {
+            // SAFETY: MAP_FIXED already destroyed the old mapping, so unwinding is unsafe.
+            unsafe { raw_fatal_exit(libc::EFAULT, &mut fatal_message) }
+        }
+        // SAFETY: commit's contract covers the source and destination ranges;
+        // post-replacement failures terminate without unwinding through the cache.
+        unsafe {
+            let destination = target as *mut u8;
+            let source = address as *const u8;
+            raw_copy(destination, source, len);
+            if let Err(error) = raw_protect(target, len, libc::PROT_READ | libc::PROT_EXEC) {
+                raw_fatal_exit(error, &mut fatal_message);
+            }
+            // The complete page is RX before this call. If this routine's own
+            // cache page was replaced, stale instructions are byte-identical.
+            sys_icache_invalidate(target as *mut libc::c_void, len);
+            // Release staging with a raw trap because its wrapper may have been replaced.
+            let _ = raw_deallocate(task, address, len);
+            if let Err(error) =
+                raw_signal_mask(libc::SIG_SETMASK, &previous_signals, core::ptr::null_mut())
+            {
+                raw_fatal_exit(error, &mut fatal_message);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SharedCacheWriteAlias {
+    fn drop(&mut self) {
+        // Best effort during setup failure. The runner child is short-lived and
+        // the kernel reclaims any surviving staging mapping on exit.
+        // SAFETY: an unpublished alias exclusively owns this live Mach allocation.
+        let _ =
+            unsafe { mach_vm_deallocate(mach_task_self(), self.address as u64, self.len as u64) };
+        if let SharedCacheTarget::Reserved(target) = self.target {
+            // SAFETY: only prepare_private_cache_mapping reserves a target; commit
+            // consumes self without Drop, so this reservation is still unpublished.
+            let _ = unsafe { mach_vm_deallocate(mach_task_self(), target as u64, self.len as u64) };
+        }
+    }
+}
+
 fn is_page_aligned<const PAGE_SIZE: usize>(range: &Range<usize>) -> bool {
     range.start < range.end
         && range.start.is_multiple_of(PAGE_SIZE)
@@ -1270,9 +1874,24 @@ impl ProcessState {
     }
 }
 
+/// Signal a host thread without libpthread's thread-list lock, which guest code
+/// may hold because it shares the host libpthread.
+fn signal_host_thread(port: libc::mach_port_t, signal: i32) {
+    unsafe extern "C" {
+        fn __pthread_kill(port: libc::mach_port_t, signal: i32) -> i32;
+    }
+    // SAFETY: callers hold the port's identity lock, so the thread is live.
+    unsafe { __pthread_kill(port, signal) };
+}
+
+fn current_host_thread_port() -> libc::mach_port_t {
+    // SAFETY: pthread_self has no preconditions.
+    unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) }
+}
+
 struct ThreadState {
-    // Cleared before thread exit to prevent pthread ID-reuse races.
-    identity: Mutex<Option<usize>>,
+    // Mach thread port, cleared before thread exit to prevent name-reuse races.
+    identity: Mutex<Option<libc::mach_port_t>>,
     interrupted: AtomicBool,
     /// State shared by all host threads belonging to one guest process.
     process: Arc<ProcessState>,
@@ -1314,9 +1933,9 @@ impl ThreadHandle {
         self.0.interrupted.store(true, Ordering::Release);
         {
             let identity = self.0.identity.lock().unwrap();
-            if let Some(identity) = *identity {
-                // SAFETY: this lock prevents unregistering/reusing the saved pthread_t during delivery.
-                unsafe { libc::pthread_kill(identity as libc::pthread_t, interrupt_signal()) };
+            if let Some(port) = *identity {
+                // This lock prevents unregistering/reusing the port during delivery.
+                signal_host_thread(port, interrupt_signal());
             }
         }
         let waker = self.0.waker.lock().unwrap().clone();
@@ -1375,8 +1994,7 @@ impl<const PAGE_SIZE: usize> litebox::platform::ThreadProvider
         })
         .expect("initialized thread TLS");
         let handle = ThreadHandle(Arc::new(ThreadState {
-            // SAFETY: pthread_self has no preconditions.
-            identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
+            identity: Mutex::new(Some(current_host_thread_port())),
             interrupted: AtomicBool::new(false),
             process: Arc::new(ProcessState::default()),
             waker: Mutex::new(None),
@@ -1837,8 +2455,8 @@ fn run_thread_inner_with_process(
     set_guest_thread_pointer(0);
     set_guest_x18(0);
     let thread = ThreadHandle(Arc::new(ThreadState {
-        // SAFETY: pthread_self has no preconditions; unregister before thread exit.
-        identity: Mutex::new(Some(unsafe { libc::pthread_self() } as usize)),
+        // Unregistered before thread exit.
+        identity: Mutex::new(Some(current_host_thread_port())),
         interrupted: AtomicBool::new(false),
         process,
         waker: Mutex::new(None),
@@ -2134,6 +2752,24 @@ fn restore_signal_context(regs: &PtRegs, mc: &mut libc::__darwin_mcontext64) {
     mc.__ns.__fpcr = state.fpcr;
 }
 
+fn raw_signal_write(bytes: &[u8]) {
+    let result: usize;
+    // SAFETY: bytes is readable for x2 bytes; registers follow Darwin SYS_write,
+    // and x1 is declared inlateout because XNU may overwrite it on return.
+    unsafe {
+        core::arch::asm!(
+            "svc #0x80",
+            in("x0") libc::STDERR_FILENO as usize,
+            inlateout("x1") bytes.as_ptr() => _,
+            in("x2") bytes.len(),
+            in("x16") 4usize,
+            lateout("x0") result,
+            options(nostack),
+        );
+    }
+    let _ = result;
+}
+
 fn fatal_signal(message: &[u8], pc: usize) -> ! {
     const DIGITS: usize = size_of::<usize>() * 2;
     let mut address = [b'0'; DIGITS + 1];
@@ -2141,12 +2777,17 @@ fn fatal_signal(message: &[u8], pc: usize) -> ! {
         *byte = b"0123456789abcdef"[(pc >> ((DIGITS - index - 1) * 4)) & 15];
     }
     address[DIGITS] = b'\n';
-    // SAFETY: all buffers are live for their lengths; write and _exit are async-signal-safe.
+    raw_signal_write(message);
+    raw_signal_write(b" pc=0x");
+    raw_signal_write(&address);
+    // SAFETY: SYS_exit accepts the status in x0 and never returns.
     unsafe {
-        libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len());
-        libc::write(libc::STDERR_FILENO, b" pc=0x".as_ptr().cast(), 6);
-        libc::write(libc::STDERR_FILENO, address.as_ptr().cast(), address.len());
-        libc::_exit(128 + libc::SIGABRT);
+        core::arch::asm!(
+            "svc #0x80",
+            in("x0") (128 + libc::SIGABRT) as usize,
+            in("x16") 1usize,
+            options(noreturn),
+        );
     }
 }
 
@@ -2649,6 +3290,402 @@ mod tests {
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
 
     #[test]
+    fn publication_signal_mask_is_thread_local() {
+        fn current_mask() -> libc::sigset_t {
+            let mut mask = 0;
+            // SAFETY: null requests a query and mask is writable thread-local output.
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(libc::SIG_SETMASK, core::ptr::null(), &raw mut mask)
+                },
+                0
+            );
+            mask
+        }
+        let original = current_mask();
+        let _restore = litebox::utils::defer(|| {
+            // SAFETY: original was queried on this thread and stays live.
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(
+                        libc::SIG_SETMASK,
+                        &raw const original,
+                        core::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+        });
+        let usr1 = 1 << (libc::SIGUSR1 - 1);
+        let usr2 = 1 << (libc::SIGUSR2 - 1);
+        // Distinct from both the original mask and the all-blocked mask.
+        let sibling_mask = (original & !usr1) ^ usr2;
+        let (request, requests) = std::sync::mpsc::channel();
+        let (response, responses) = std::sync::mpsc::channel();
+        let sibling = std::thread::spawn(move || {
+            // SAFETY: only this sibling's mask is changed; it exits after the queries.
+            assert_eq!(
+                unsafe {
+                    libc::pthread_sigmask(
+                        libc::SIG_SETMASK,
+                        &raw const sibling_mask,
+                        core::ptr::null_mut(),
+                    )
+                },
+                0
+            );
+            response.send(current_mask()).unwrap();
+            for _ in 0..2 {
+                requests.recv_timeout(Duration::from_secs(5)).unwrap();
+                response.send(current_mask()).unwrap();
+            }
+        });
+        let before = responses.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut saved = 0;
+        // SAFETY: both masks are live; raw_signal_mask changes only this calling thread.
+        unsafe { raw_signal_mask(libc::SIG_BLOCK, &!0, &raw mut saved) }.unwrap();
+        let blocked = current_mask();
+        request.send(()).unwrap();
+        let during = responses.recv_timeout(Duration::from_secs(5)).unwrap();
+        // SAFETY: saved is this thread's mask returned by the preceding call.
+        unsafe { raw_signal_mask(libc::SIG_SETMASK, &saved, core::ptr::null_mut()) }.unwrap();
+        request.send(()).unwrap();
+        let after = responses.recv_timeout(Duration::from_secs(5)).unwrap();
+        sibling.join().unwrap();
+        assert_eq!(saved, original);
+        assert_eq!(current_mask(), original);
+        assert_eq!(blocked & (usr1 | usr2), usr1 | usr2);
+        assert_eq!([before, during, after], [sibling_mask; 3]);
+    }
+
+    #[test]
+    fn shared_cache_copy_stages_then_replaces_an_existing_mapping() {
+        let len = 3 * HOST_PAGE_SIZE;
+        let mut base = 0u64;
+        // SAFETY: ANYWHERE allocates fresh pages and base is writable output.
+        assert_eq!(
+            unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut base,
+                    len as u64,
+                    MachVmFlags::ANYWHERE,
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: this test owns the surrounding pages and the replacement mapping.
+            unsafe { mach_vm_deallocate(mach_task_self(), base, len as u64) };
+        });
+        let base: usize = base.trunc();
+        let target = base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE;
+        let original = [0x5280_00e0u32, 0xd65f_03c0]; // mov w0, #7; ret
+        // SAFETY: all writes are within the fresh RW allocation.
+        unsafe {
+            (base as *mut u8).write(0x51);
+            (target.end as *mut u8).write(0x72);
+            core::ptr::copy_nonoverlapping(
+                original.as_ptr(),
+                target.start as *mut u32,
+                original.len(),
+            );
+        }
+        // SAFETY: the middle page is idle and initialized before publication as RX.
+        assert_eq!(
+            unsafe {
+                mach_vm_protect(
+                    mach_task_self(),
+                    target.start as u64,
+                    HOST_PAGE_SIZE as u64,
+                    MachBoolean::FALSE,
+                    MachVmProtection::READ | MachVmProtection::EXECUTE,
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        // SAFETY: the target is the initialized executable page owned by this test.
+        unsafe { sys_icache_invalidate(target.start as *mut libc::c_void, HOST_PAGE_SIZE) };
+        let execute = || {
+            let value: usize;
+            // SAFETY: the test retains a complete RX mov/ret stub at this address.
+            unsafe {
+                core::arch::asm!("blr {entry}", entry = in(reg) target.start,
+                lateout("x0") value, clobber_abi("C"));
+            }
+            value
+        };
+        assert_eq!(execute(), 7);
+        // SAFETY: the source is test-owned RX memory with no concurrent writers.
+        let staging = unsafe { prepare_shared_cache_copy(target.clone()) }.unwrap();
+        // SAFETY: staging exclusively owns this writable copy of the first instruction.
+        unsafe { (staging.address() as *mut u32).write(0x5280_0540) }; // mov w0, #42
+        // SAFETY: the original mapping remains readable and live throughout staging.
+        assert_eq!(unsafe { (target.start as *const u32).read() }, original[0]);
+        assert_eq!(
+            shared_cache_submap_region(target.start, 0)
+                .unwrap()
+                .1
+                .protection
+                .bits(),
+            libc::VM_PROT_READ | libc::VM_PROT_EXECUTE
+        );
+        let mut alias = staging.address() as u64;
+        drop(staging);
+        assert_eq!(execute(), 7); // Dropping staging must not unmap the source.
+        // SAFETY: non-overwriting allocation verifies that staging was released.
+        assert_eq!(
+            unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut alias,
+                    HOST_PAGE_SIZE as u64,
+                    MachVmFlags::FIXED,
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        // SAFETY: release the allocation just returned by Mach.
+        unsafe { mach_vm_deallocate(mach_task_self(), alias, HOST_PAGE_SIZE as u64) };
+        // SAFETY: the original RX source is still owned, live and unchanged.
+        let staging = unsafe { prepare_shared_cache_copy(target.clone()) }.unwrap();
+        // SAFETY: this word belongs to the live writable staging allocation.
+        unsafe { (staging.address() as *mut u32).write(0x5280_0540) };
+        assert_eq!(execute(), 7);
+        // SAFETY: no thread executes or accesses the exclusively owned target during replacement.
+        unsafe { staging.commit() }.unwrap();
+        assert_eq!(execute(), 42);
+        assert_eq!(
+            shared_cache_submap_region(target.start, 0)
+                .unwrap()
+                .1
+                .protection
+                .bits(),
+            libc::VM_PROT_READ | libc::VM_PROT_EXECUTE
+        );
+        // SAFETY: the surrounding pages are still live and owned by the test.
+        assert_eq!(unsafe { (base as *const u8).read() }, 0x51);
+        // SAFETY: this is the test-owned trailing page's canary.
+        assert_eq!(unsafe { (target.end as *const u8).read() }, 0x72);
+    }
+
+    #[test]
+    fn shared_cache_padding_release_preserves_nonpadding_mappings() {
+        const CHILD: &str = "LITEBOX_TEST_CACHE_PADDING";
+        unsafe extern "C" {
+            fn _dyld_get_shared_cache_range(size: *mut usize) -> *const libc::c_void;
+        }
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::shared_cache_padding_release_preserves_nonpadding_mappings",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            // Preserve diagnostics when this host has no applicable padding layout.
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let mut size = 0;
+        // SAFETY: dyld reports the live cache; size is writable output storage.
+        let base = unsafe { _dyld_get_shared_cache_range(&raw mut size) } as usize;
+        assert!(base >= 3 * HOST_PAGE_SIZE && size >= HOST_PAGE_SIZE);
+        let range = base - 2 * HOST_PAGE_SIZE..base;
+        // Some cache layouts have no leading ASLR padding. No valid release is
+        // possible there; normal occupied-mapping rejection is tested separately.
+        let Ok((padding, info)) = shared_cache_submap_region(range.start, 1) else {
+            eprintln!("no cache ASLR padding on this host");
+            return;
+        };
+        if padding.start > range.start
+            || padding.end != base
+            || !info.protection.is_empty()
+            || !info.max_protection.is_empty()
+            || info.is_submap.0 != 0
+        {
+            eprintln!("no suitable leading cache ASLR padding on this host");
+            return;
+        }
+        // SAFETY: this isolated test child has the actual cache base and no
+        // other thread changes its cache mappings. Invalid requests must not release anything.
+        unsafe {
+            assert_eq!(
+                release_shared_cache_padding(range.start + 1..base, base),
+                Err(SharedCacheMappingError::Unaligned)
+            );
+            assert_eq!(
+                release_shared_cache_padding(range.start..base - HOST_PAGE_SIZE, base),
+                Err(SharedCacheMappingError::InvalidCachePadding)
+            );
+        }
+        assert!(prepare_private_cache_mapping(range.clone()).is_err());
+        // SAFETY: only this test child changes the inspected, inaccessible cache prefix.
+        unsafe { release_shared_cache_padding(range.clone(), base) }.unwrap();
+        let mut claimed = range.start as u64;
+        // SAFETY: FIXED without OVERWRITE verifies release of precisely the requested range.
+        assert_eq!(
+            unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut claimed,
+                    range.len() as u64,
+                    MachVmFlags::FIXED,
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: the allocation remains test-owned; rejected releases must preserve it.
+            unsafe { mach_vm_deallocate(mach_task_self(), claimed, range.len() as u64) };
+        });
+        // SAFETY: the allocation is writable and large enough for this canary.
+        unsafe { (range.start as *mut u8).write(0x51) };
+        // SAFETY: the cache identity and exclusive-mapping contract still hold.
+        assert_eq!(
+            unsafe { release_shared_cache_padding(range.clone(), base) },
+            Err(SharedCacheMappingError::InvalidCachePadding)
+        );
+        // SAFETY: change only the idle, test-owned allocation into a guard mapping.
+        assert_eq!(
+            unsafe {
+                mach_vm_protect(
+                    mach_task_self(),
+                    claimed,
+                    range.len() as u64,
+                    MachBoolean::FALSE,
+                    MachVmProtection::empty(),
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        // SAFETY: a private guard mapping below the real cache is not its ASLR padding.
+        assert_eq!(
+            unsafe { release_shared_cache_padding(range.clone(), base) },
+            Err(SharedCacheMappingError::InvalidCachePadding)
+        );
+        // SAFETY: restore read access to the test-owned canary.
+        assert_eq!(
+            unsafe {
+                mach_vm_protect(
+                    mach_task_self(),
+                    claimed,
+                    range.len() as u64,
+                    MachBoolean::FALSE,
+                    MachVmProtection::READ,
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        // SAFETY: the canary page remains live and is readable again.
+        assert_eq!(unsafe { (range.start as *const u8).read() }, 0x51);
+        let (cache, info) = shared_cache_submap_region(base, 0).unwrap();
+        assert!(cache.contains(&base));
+        assert!(info.protection.contains(MachVmProtection::READ));
+    }
+
+    #[test]
+    fn private_cache_trampoline_reserves_its_target() {
+        let len = 3 * HOST_PAGE_SIZE;
+        let mut base = 0u64;
+        // SAFETY: ANYWHERE allocates fresh pages and base is writable output.
+        assert_eq!(
+            unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut base,
+                    len as u64,
+                    MachVmFlags::ANYWHERE,
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        let _cleanup = litebox::utils::defer(|| {
+            // SAFETY: the test owns the surrounding pages and any published trampoline.
+            unsafe { mach_vm_deallocate(mach_task_self(), base, len as u64) };
+        });
+        let base: usize = base.trunc();
+        let target = base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE;
+        // SAFETY: both canaries are within the fresh RW mapping, outside the target.
+        unsafe {
+            (base as *mut u8).write(0x51);
+            (target.end as *mut u8).write(0x72);
+        }
+        assert!(prepare_private_cache_mapping(target.clone()).is_err());
+        // SAFETY: the idle middle page is exclusively owned by this test.
+        assert_eq!(
+            unsafe {
+                mach_vm_protect(
+                    mach_task_self(),
+                    target.start as u64,
+                    HOST_PAGE_SIZE as u64,
+                    MachBoolean::FALSE,
+                    MachVmProtection::empty(),
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        // PROT_NONE is occupied too; it is not permission to replace a host guard page.
+        assert!(prepare_private_cache_mapping(target.clone()).is_err());
+        // SAFETY: release only the idle middle page to leave a bounded hole.
+        assert_eq!(
+            unsafe {
+                mach_vm_deallocate(mach_task_self(), target.start as u64, HOST_PAGE_SIZE as u64)
+            },
+            KernReturn::SUCCESS
+        );
+        // A partly free range must not replace its occupied tail either.
+        assert!(prepare_private_cache_mapping(target.start..base + len).is_err());
+        let staging = prepare_private_cache_mapping(target.clone()).unwrap();
+        assert!(prepare_private_cache_mapping(target.clone()).is_err());
+        let mut alias = staging.address() as u64;
+        drop(staging);
+        // SAFETY: FIXED without OVERWRITE tests that drop released the staging mapping.
+        assert_eq!(
+            unsafe {
+                mach_vm_allocate(
+                    mach_task_self(),
+                    &raw mut alias,
+                    HOST_PAGE_SIZE as u64,
+                    MachVmFlags::FIXED,
+                )
+            },
+            KernReturn::SUCCESS
+        );
+        // SAFETY: release the allocation just returned by Mach.
+        unsafe { mach_vm_deallocate(mach_task_self(), alias, HOST_PAGE_SIZE as u64) };
+        // Successful preparation here also proves drop released the target reservation.
+        let staging = prepare_private_cache_mapping(target.clone()).unwrap();
+        let code = [0x5280_0540u32, 0xd65f_03c0]; // mov w0, #42; ret
+        // SAFETY: staging owns at least one writable page; no code is executing there.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                code.as_ptr(),
+                staging.address() as *mut u32,
+                code.len(),
+            );
+        };
+        // SAFETY: the reservation is exclusively owned and no thread accesses the target.
+        unsafe { staging.commit() }.unwrap();
+        assert!(prepare_private_cache_mapping(target.clone()).is_err());
+        let value: usize;
+        // SAFETY: commit published the complete RX mov/ret stub above. The call
+        // has no arguments and declares its C-ABI register clobbers.
+        unsafe {
+            core::arch::asm!("blr {entry}", entry = in(reg) target.start,
+                lateout("x0") value, clobber_abi("C"));
+        }
+        assert_eq!(value, 42);
+        // SAFETY: the live surrounding pages remain owned by the test.
+        assert_eq!(unsafe { (base as *const u8).read() }, 0x51);
+        // SAFETY: this is the second canary in the live trailing page.
+        assert_eq!(unsafe { (target.end as *const u8).read() }, 0x72);
+    }
+
+    #[test]
     fn native_page_size_rejects_subpage_operations() {
         let platform = MacosUserland::new();
         assert_eq!(HOST_PAGE_SIZE, 16384);
@@ -2957,7 +3994,7 @@ mod tests {
     #[test]
     fn signal_waker_replacement_and_clear_release_ownership() {
         let platform = MacosUserland::new();
-        MacosUserland::run_test_thread(|| {
+        run_process_test_thread(Arc::default(), || {
             let first = Arc::new(SignalWakeCounter::default());
             let second = Arc::new(SignalWakeCounter::default());
             let first_weak = Arc::downgrade(&first);
@@ -2996,11 +4033,11 @@ mod tests {
         }
 
         let platform = MacosUserland::new();
-        MacosUserland::run_test_thread(|| {
+        run_process_test_thread(Arc::default(), || {
             platform.update_waker(Some(core::task::Waker::from(Arc::new(ErrnoWaker))));
             // SAFETY: __error returns this thread's live errno slot.
             unsafe { *libc::__error() = libc::ETIMEDOUT };
-            // SAFETY: run_test_thread initializes this thread's platform TLS.
+            // SAFETY: run_process_test_thread initializes this thread's platform TLS.
             unsafe { record_pending_host_signal(litebox_common_linux::signal::Signal::SIGINT) };
             // SAFETY: __error returns this thread's live errno slot.
             assert_eq!(unsafe { *libc::__error() }, libc::ETIMEDOUT);
@@ -3672,15 +4709,6 @@ mod tests {
 
     #[test]
     fn permission_denials_are_not_reported_as_missing_pages() {
-        unsafe extern "C" {
-            fn mach_vm_protect(
-                task: u32,
-                address: u64,
-                size: u64,
-                set_maximum: i32,
-                protection: i32,
-            ) -> i32;
-        }
         let p = MacosUserland::new();
         let ptr = p
             .allocate_pages(
@@ -3720,10 +4748,10 @@ mod tests {
                     mach_task_self(),
                     range.start as u64,
                     HOST_PAGE_SIZE as u64,
-                    1,
-                    libc::PROT_READ
+                    MachBoolean::TRUE,
+                    MachVmProtection::READ
                 ),
-                0
+                KernReturn::SUCCESS
             );
             assert!(matches!(
                 p.update_permissions(range.clone(), RW),

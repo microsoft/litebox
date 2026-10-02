@@ -14,8 +14,9 @@ use std::ops::Range;
 
 use super::{
     AllocationError, DeallocationError, FixedAddressBehavior, HOST_PAGE_SIZE, KernReturn,
-    MachVmFlags, MemoryRegionPermissions as Perm, PermissionUpdateError, TASK_ADDR_MAX,
-    TASK_ADDR_MIN, mach_task_self, mach_vm_allocate, prot_flags, sys_icache_invalidate,
+    MachBoolean, MachVmFlags, MachVmInheritance, MachVmProtection, MemoryRegionPermissions as Perm,
+    PermissionUpdateError, TASK_ADDR_MAX, TASK_ADDR_MIN, mach_task_self, mach_vm_allocate,
+    mach_vm_remap, prot_flags, sys_icache_invalidate,
 };
 
 // Fixed-capacity storage for the smallest supported granularity.
@@ -88,28 +89,12 @@ impl Drop for Mapping {
     }
 }
 
-unsafe extern "C" {
-    fn mach_vm_remap(
-        task: u32,
-        target: *mut u64,
-        size: u64,
-        mask: u64,
-        flags: MachVmFlags,
-        source_task: u32,
-        source: u64,
-        copy: i32,
-        current_protection: *mut i32,
-        max_protection: *mut i32,
-        inheritance: u32,
-    ) -> KernReturn;
-}
-
 impl Mapping {
     /// Writable alias for zeroing without revoking a neighbor's execute access.
     fn write_alias(base: usize) -> Result<Self, AllocationError> {
         let mut target = 0;
-        let mut current = 0;
-        let mut maximum = 0;
+        let mut current = MachVmProtection::empty();
+        let mut maximum = MachVmProtection::empty();
         // SAFETY: the registry owns the source; all outputs are valid. copy=false
         // shares the backing storage, and ANYWHERE cannot overwrite host memory.
         let result = unsafe {
@@ -121,10 +106,10 @@ impl Mapping {
                 MachVmFlags::ANYWHERE,
                 mach_task_self(),
                 base as u64,
-                0,
+                MachBoolean::FALSE,
                 &raw mut current,
                 &raw mut maximum,
-                2, // VM_INHERIT_NONE
+                MachVmInheritance::None,
             )
         };
         if result != KernReturn::SUCCESS {
@@ -1103,29 +1088,20 @@ mod tests {
 
     #[test]
     fn native_protection_failure_rolls_back_permissions_and_metadata() {
-        unsafe extern "C" {
-            fn mach_vm_protect(
-                task: u32,
-                address: u64,
-                size: u64,
-                maximum: i32,
-                protection: i32,
-            ) -> i32;
-        }
         let mut pages = TestPages::new();
         let base = pages.allocate(2 * HOST_PAGE_SIZE, R);
         // SAFETY: the second native page is test-owned and no access requires W/X.
         assert_eq!(
             unsafe {
-                mach_vm_protect(
+                crate::mach_vm_protect(
                     mach_task_self(),
                     (base + HOST_PAGE_SIZE) as u64,
                     HOST_PAGE_SIZE as u64,
-                    1,
-                    libc::PROT_READ,
+                    MachBoolean::TRUE,
+                    MachVmProtection::READ,
                 )
             },
-            0
+            KernReturn::SUCCESS
         );
         let before = pages.0.0.clone();
         assert!(matches!(
@@ -1303,29 +1279,20 @@ mod tests {
 
     #[test]
     fn failed_replacement_does_not_publish_reserved_host_ownership() {
-        unsafe extern "C" {
-            fn mach_vm_protect(
-                task: u32,
-                address: u64,
-                size: u64,
-                maximum: i32,
-                protection: i32,
-            ) -> i32;
-        }
         let mut pages = TestPages::new();
         let base = pages.allocate(2 * HOST_PAGE_SIZE, R);
         // SAFETY: this test owns both idle native pages; the second needs only READ.
         assert_eq!(
             unsafe {
-                mach_vm_protect(
+                crate::mach_vm_protect(
                     mach_task_self(),
                     (base + HOST_PAGE_SIZE) as u64,
                     HOST_PAGE_SIZE as u64,
-                    1,
-                    libc::PROT_READ,
+                    MachBoolean::TRUE,
+                    MachVmProtection::READ,
                 )
             },
-            0
+            KernReturn::SUCCESS
         );
         pages.0.deallocate(base..base + HOST_PAGE_SIZE).unwrap();
         // Roll back the first reservation when the second page's write alias fails.
@@ -1369,15 +1336,6 @@ mod tests {
 
     #[test]
     fn failed_update_preserves_mixed_recovery_state() {
-        unsafe extern "C" {
-            fn mach_vm_protect(
-                task: u32,
-                address: u64,
-                size: u64,
-                maximum: i32,
-                protection: i32,
-            ) -> i32;
-        }
         let mut pages = TestPages::new();
         let base = pages.allocate(2 * HOST_PAGE_SIZE, RW);
         assert_eq!(ptr(base).write_slice_at_offset(0, STUB), Some(()));
@@ -1393,15 +1351,15 @@ mod tests {
         // SAFETY: this test owns the second native page and only needs READ there.
         assert_eq!(
             unsafe {
-                mach_vm_protect(
+                crate::mach_vm_protect(
                     mach_task_self(),
                     (base + HOST_PAGE_SIZE) as u64,
                     HOST_PAGE_SIZE as u64,
-                    1,
-                    libc::PROT_READ,
+                    MachBoolean::TRUE,
+                    MachVmProtection::READ,
                 )
             },
-            0
+            KernReturn::SUCCESS
         );
         let before = pages.0.0.clone();
         assert!(matches!(
@@ -1426,29 +1384,20 @@ mod tests {
 
     #[test]
     fn failed_signal_recovery_preserves_errno() {
-        unsafe extern "C" {
-            fn mach_vm_protect(
-                task: u32,
-                address: u64,
-                size: u64,
-                maximum: i32,
-                protection: i32,
-            ) -> i32;
-        }
         let mut pages = TestPages::new();
         let base = pages.allocate(HOST_PAGE_SIZE, RX);
         // SAFETY: the idle test-owned native page is made readable but incapable
         // of execution, forcing recovery's mprotect to fail without a cache fault.
         unsafe {
             assert_eq!(
-                mach_vm_protect(
+                crate::mach_vm_protect(
                     mach_task_self(),
                     base as u64,
                     HOST_PAGE_SIZE as u64,
-                    1,
-                    libc::PROT_READ
+                    MachBoolean::TRUE,
+                    MachVmProtection::READ
                 ),
-                0
+                KernReturn::SUCCESS
             );
             let errno = libc::__error();
             let previous = *errno;
