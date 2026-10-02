@@ -207,7 +207,7 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
         }
         // Reject unsupported flags before allocating.
         let _ = prot_flags(permissions);
-        if behavior == FixedAddressBehavior::Hint {
+        if matches!(behavior, FixedAddressBehavior::Hint(_)) {
             let len = range.len().next_multiple_of(HOST_PAGE_SIZE);
             let mut error = AllocationError::OutOfMemory;
             for hint in [host_base(range.start), 0] {
@@ -612,6 +612,7 @@ mod tests {
     use super::*;
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
+    use litebox::platform::page_mgmt::AllocationDirection;
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -619,6 +620,7 @@ mod tests {
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::loader::{ElfParsedFile, MapMemory, Protection, ReadAt};
     use litebox_common_linux::vmem::PAGE_SIZE;
+    use std::boxed::Box;
 
     const R: Perm = Perm::READ;
     const RW: Perm = Perm::READ.union(Perm::WRITE);
@@ -905,7 +907,7 @@ mod tests {
                 .allocate(
                     TASK_ADDR_MIN..TASK_ADDR_MIN + len,
                     permissions,
-                    FixedAddressBehavior::Hint,
+                    FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
                 )
                 .unwrap()
         }
@@ -1148,47 +1150,54 @@ mod tests {
     }
 
     #[test]
-    fn subpage_remap_within_one_native_page_preserves_neighbors() {
-        let platform = MacosUserland::new();
-        let memory = platform
+    fn vmem_remap_preserves_subpage_neighbors() {
+        let platform: &'static MacosUserland = Box::leak(Box::new(MacosUserland::new()));
+        let mm: litebox_common_linux::mm::VmemManager<MacosUserland, PAGE_SIZE> =
+            litebox_common_linux::mm::VmemManager::new(platform);
+        // SAFETY: the mapping remains exclusively owned by this test.
+        let source = unsafe {
+            mm.create_writable_pages(
+                None,
+                litebox_common_linux::vmem::NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                litebox_common_linux::vmem::CreatePagesFlags::empty(),
+                |_| Ok(0),
+            )
+            .unwrap()
+        };
+        let source_range = source.as_usize()..source.as_usize() + PAGE_SIZE;
+        let neighbor_range = source_range.end..source_range.end + PAGE_SIZE;
+        assert_eq!(
+            host_base(source_range.start),
+            host_base(neighbor_range.start)
+        );
+        let neighbor = platform
             .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
+                neighbor_range.clone(),
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::NoReplace,
             )
             .unwrap();
-        let base = memory.as_usize();
-        let _cleanup = litebox::utils::defer(|| {
-            // SAFETY: the test's native page has no active users at cleanup.
-            unsafe {
-                platform
-                    .deallocate_pages(base..base + HOST_PAGE_SIZE)
-                    .unwrap();
-            };
-        });
-        assert_eq!(memory.write_at_offset(0, 42), Some(()));
-        assert_eq!(memory.write_at_offset(PAGE_SIZE as isize, 99), Some(()));
-        let target = base + 2 * PAGE_SIZE..base + HOST_PAGE_SIZE;
-        // SAFETY: source and target are idle, disjoint guest subpages of our mapping.
+        assert_eq!(source.write_at_offset(0, 42), Some(()));
+        assert_eq!(neighbor.write_at_offset(0, 99), Some(()));
+
+        // SAFETY: the source is idle and the neighbor forces the shared Vmem copy fallback.
         let moved = unsafe {
-            platform.deallocate_pages(target.clone()).unwrap();
-            platform
-                .remap_pages(base..base + PAGE_SIZE, target, RW)
+            mm.remap_pages(source, PAGE_SIZE, 2 * PAGE_SIZE, true)
                 .unwrap()
         };
-        assert_eq!(moved.as_usize(), base + 2 * PAGE_SIZE);
+        assert_ne!(moved.as_usize(), source.as_usize());
         assert_eq!(moved.read_at_offset(0), Some(42));
         assert_eq!(moved.read_at_offset(PAGE_SIZE as isize), Some(0));
-        assert_eq!(memory.read_at_offset(PAGE_SIZE as isize), Some(99));
-        assert!(
-            !platform
-                .pages
-                .lock()
-                .unwrap()
-                .contains_range(base..base + PAGE_SIZE)
-        );
+        assert_eq!(neighbor.read_at_offset(0), Some(99));
+        assert!(!platform.pages.lock().unwrap().contains_range(source_range));
+
+        // SAFETY: both mappings are idle and exclusively owned by this test.
+        unsafe {
+            mm.remove_pages(moved, 2 * PAGE_SIZE).unwrap();
+            platform.release_pages(neighbor_range).unwrap();
+        }
     }
 
     // Wait out parallel updates before asserting a synthetic recovery result.

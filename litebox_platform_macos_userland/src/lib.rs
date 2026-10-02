@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-    PermissionUpdateError, RemapError,
+    PermissionUpdateError,
 };
 use litebox::platform::{ArchSpecificError, ArchSpecificRegister, RawConstPointer as _};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
@@ -730,9 +730,17 @@ fn prot_flags(permissions: MemoryRegionPermissions) -> i32 {
     }
     flags
 }
+
+litebox::define_page_reservation!(MacosUserlandReservation);
+
 impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE>
     for MacosUserlandWithPageSize<PAGE_SIZE>
 {
+    type Reservations = litebox::platform::common_providers::reservations::NoTrackedReservations<
+        PAGE_SIZE,
+        MacosUserlandReservation<PAGE_SIZE>,
+    >;
+
     const TASK_ADDR_MIN: usize = TASK_ADDR_MIN;
     const TASK_ADDR_MAX: usize = TASK_ADDR_MAX;
     fn allocate_pages(
@@ -766,134 +774,12 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
             .allocate(range, permissions, behavior)
             .map(Self::RawMutPointer::from_usize)
     }
-    unsafe fn deallocate_pages(&self, range: Range<usize>) -> Result<(), DeallocationError> {
+    unsafe fn release_pages(&self, range: Range<usize>) -> Result<(), DeallocationError> {
         if !is_page_aligned::<PAGE_SIZE>(&range) {
             return Err(DeallocationError::Unaligned);
         }
         self.pages.lock().unwrap().deallocate(range)
     }
-    unsafe fn remap_pages(
-        &self,
-        old_range: Range<usize>,
-        new_range: Range<usize>,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, RemapError> {
-        if !is_page_aligned::<PAGE_SIZE>(&old_range) || !is_page_aligned::<PAGE_SIZE>(&new_range) {
-            return Err(RemapError::Unaligned);
-        }
-        if old_range.start < new_range.end && new_range.start < old_range.end {
-            return Err(RemapError::Overlapping);
-        }
-        assert!(
-            new_range.len() > old_range.len(),
-            "remap_pages requires the new range to be larger than the old range"
-        );
-        {
-            let pages = self.pages.lock().unwrap();
-            if !pages.contains_range(old_range.clone()) {
-                return Err(RemapError::AlreadyUnallocated);
-            }
-        }
-
-        let mut temporary =
-            permissions | MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        temporary.remove(MemoryRegionPermissions::EXEC);
-        let map_error = |error| match error {
-            AllocationError::Unaligned => RemapError::Unaligned,
-            AllocationError::PermissionDenied => RemapError::PermissionDenied,
-            AllocationError::AddressInUse
-            | AllocationError::AddressPartiallyInUse
-            | AllocationError::AddressInUseByPlatform => RemapError::AlreadyAllocated,
-            _ => RemapError::OutOfMemory,
-        };
-        let preferred = self.allocate_pages(
-            new_range.clone(),
-            temporary,
-            false,
-            true,
-            FixedAddressBehavior::NoReplace,
-        );
-        let new_ptr = match preferred {
-            Ok(ptr) => ptr,
-            Err(
-                AllocationError::AddressInUse
-                | AllocationError::AddressPartiallyInUse
-                | AllocationError::AddressInUseByPlatform,
-            ) => self
-                .allocate_pages(
-                    new_range.clone(),
-                    temporary,
-                    false,
-                    true,
-                    FixedAddressBehavior::Hint,
-                )
-                .map_err(map_error)?,
-            Err(error) => return Err(map_error(error)),
-        };
-        let allocated_range = new_ptr.as_usize()..new_ptr.as_usize() + new_range.len();
-
-        let source_readable = if permissions.contains(MemoryRegionPermissions::READ) {
-            Ok(())
-        } else {
-            // SAFETY: the caller permits moving the idle source mapping.
-            unsafe {
-                self.update_permissions(
-                    old_range.clone(),
-                    permissions | MemoryRegionPermissions::READ,
-                )
-            }
-        };
-        if let Err(error) = source_readable {
-            // SAFETY: this call allocated the destination and has not published it.
-            let _ = unsafe { self.deallocate_pages(allocated_range) };
-            return Err(match error {
-                PermissionUpdateError::PermissionDenied => RemapError::PermissionDenied,
-                PermissionUpdateError::Unallocated => RemapError::AlreadyUnallocated,
-                _ => RemapError::OutOfMemory,
-            });
-        }
-
-        // SAFETY: the destination is writable and the source was made readable above.
-        if unsafe {
-            litebox::mm::exception_table::memcpy_fallible(
-                allocated_range.start as *mut u8,
-                old_range.start as *const u8,
-                old_range.len(),
-            )
-        }
-        .is_err()
-        {
-            if !permissions.contains(MemoryRegionPermissions::READ) {
-                // SAFETY: restore the still-owned source mapping before returning.
-                let _ = unsafe { self.update_permissions(old_range.clone(), permissions) };
-            }
-            // SAFETY: this call allocated the destination and has not published it.
-            let _ = unsafe { self.deallocate_pages(allocated_range) };
-            return Err(RemapError::AlreadyUnallocated);
-        }
-        let final_permissions = if temporary == permissions {
-            Ok(())
-        } else {
-            // SAFETY: the destination is unpublished and exclusively owned by this call.
-            unsafe { self.update_permissions(allocated_range.clone(), permissions) }
-        };
-        if let Err(error) = final_permissions {
-            if !permissions.contains(MemoryRegionPermissions::READ) {
-                // SAFETY: restore the still-owned source mapping before returning.
-                let _ = unsafe { self.update_permissions(old_range.clone(), permissions) };
-            }
-            // SAFETY: this call allocated the destination and has not published it.
-            let _ = unsafe { self.deallocate_pages(allocated_range) };
-            return Err(match error {
-                PermissionUpdateError::PermissionDenied => RemapError::PermissionDenied,
-                _ => RemapError::OutOfMemory,
-            });
-        }
-        // SAFETY: the copied source is no longer needed and the caller permits moving it.
-        unsafe { self.deallocate_pages(old_range) }.map_err(|_| RemapError::AlreadyUnallocated)?;
-        Ok(new_ptr)
-    }
-
     unsafe fn update_permissions(
         &self,
         range: Range<usize>,
@@ -2644,7 +2530,9 @@ mod tests {
     use litebox::platform::{
         PageManagementProvider as _, RawMutPointer as _, SignalProvider as _,
         SystemInfoProvider as _, ThreadProvider as _, TimerHandle as _, TimerProvider as _,
+        page_mgmt::AllocationDirection,
     };
+    use std::boxed::Box;
     const RW: MemoryRegionPermissions =
         MemoryRegionPermissions::READ.union(MemoryRegionPermissions::WRITE);
 
@@ -2658,7 +2546,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap()
             .as_usize();
@@ -2666,7 +2554,7 @@ mod tests {
             // SAFETY: this test owns the range and never executes it.
             unsafe {
                 platform
-                    .deallocate_pages(base..base + 2 * HOST_PAGE_SIZE)
+                    .release_pages(base..base + 2 * HOST_PAGE_SIZE)
                     .unwrap();
             }
         });
@@ -2690,16 +2578,8 @@ mod tests {
                     Err(PermissionUpdateError::Unaligned)
                 ));
                 assert!(matches!(
-                    platform.deallocate_pages(range.clone()),
+                    platform.release_pages(range.clone()),
                     Err(DeallocationError::Unaligned)
-                ));
-                assert!(matches!(
-                    platform.remap_pages(
-                        range,
-                        base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE,
-                        RW
-                    ),
-                    Err(RemapError::Unaligned)
                 ));
             }
         }
@@ -2716,7 +2596,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let compat_memory = compat
@@ -2725,7 +2605,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let base = native_memory.as_usize();
@@ -2733,11 +2613,9 @@ mod tests {
         let _cleanup = litebox::utils::defer(|| {
             // SAFETY: both ranges belong to this test and have no active users.
             unsafe {
-                native
-                    .deallocate_pages(base..base + HOST_PAGE_SIZE)
-                    .unwrap();
+                native.release_pages(base..base + HOST_PAGE_SIZE).unwrap();
                 compat
-                    .deallocate_pages(subpage_base..subpage_base + 8192)
+                    .release_pages(subpage_base..subpage_base + 8192)
                     .unwrap();
             }
         });
@@ -3374,7 +3252,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let base = memory.as_usize();
@@ -3439,7 +3317,7 @@ mod tests {
         // SAFETY: VectorStateProbe has stopped, so the guest mappings are idle.
         unsafe {
             platform
-                .deallocate_pages(base..base + 3 * HOST_PAGE_SIZE)
+                .release_pages(base..base + 3 * HOST_PAGE_SIZE)
                 .unwrap();
         }
     }
@@ -3561,14 +3439,14 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
         let _unmap = litebox::utils::defer(|| {
             // SAFETY: the test owns the mapping and its code has returned before cleanup.
             unsafe {
-                p.deallocate_pages(range.clone()).unwrap();
+                p.release_pages(range.clone()).unwrap();
             }
         });
         // mov x0, #42; ret
@@ -3595,17 +3473,20 @@ mod tests {
     }
 
     #[test]
-    fn executable_remap_preserves_code_without_wx() {
-        let p = MacosUserland::new();
-        let source = p
-            .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
-                RW,
-                false,
-                true,
-                FixedAddressBehavior::Hint,
+    fn vmem_remap_fallback_preserves_executable_code_without_wx() {
+        let p: &'static MacosUserland = Box::leak(Box::new(MacosUserland::new()));
+        let mm: litebox_common_linux::mm::VmemManager<MacosUserland, HOST_PAGE_SIZE> =
+            litebox_common_linux::mm::VmemManager::new(p);
+        // SAFETY: the mapping remains exclusively owned by this test.
+        let source = unsafe {
+            mm.create_writable_pages(
+                None,
+                litebox_common_linux::vmem::NonZeroPageSize::new(HOST_PAGE_SIZE).unwrap(),
+                litebox_common_linux::vmem::CreatePagesFlags::empty(),
+                |_| Ok(0),
             )
-            .unwrap();
+            .unwrap()
+        };
         let source_range = source.as_usize()..source.as_usize() + HOST_PAGE_SIZE;
         assert_eq!(
             source.write_slice_at_offset(0, &[0x40, 0x05, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6]),
@@ -3613,61 +3494,42 @@ mod tests {
         );
         // SAFETY: the test exclusively owns the idle source mapping.
         unsafe {
-            p.update_permissions(
-                source_range.clone(),
+            mm.change_page_permissions(
+                source,
+                HOST_PAGE_SIZE,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
             )
             .unwrap();
         }
-        let target = p
+        let blocker = p
             .allocate_pages(
-                TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
+                source_range.end..source_range.end + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::NoReplace,
             )
             .unwrap();
-        let target_range = target.as_usize()..target.as_usize() + 2 * HOST_PAGE_SIZE;
-        // SAFETY: release the probe, then occupy its range as host memory so
-        // remap_pages must choose a different destination without replacing it.
-        unsafe { p.deallocate_pages(target_range.clone()).unwrap() };
-        // SAFETY: target_range was just released and cannot overlap live Rust allocations.
-        let host_mapping = unsafe {
-            libc::mmap(
-                target_range.start as *mut _,
-                target_range.len(),
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
-                -1,
-                0,
-            )
-        };
-        assert_eq!(host_mapping as usize, target_range.start);
-        let _host_unmap = litebox::utils::defer(|| {
-            // SAFETY: this test owns the host mapping and the remap leaves it intact.
-            assert_eq!(unsafe { libc::munmap(host_mapping, target_range.len()) }, 0);
+        let blocker_range = blocker.as_usize()..blocker.as_usize() + HOST_PAGE_SIZE;
+        let _blocker_cleanup = litebox::utils::defer(|| {
+            // SAFETY: the test owns the external blocker and no longer accesses it.
+            unsafe { p.release_pages(blocker_range).unwrap() };
         });
-        // SAFETY: both guest ranges are idle, aligned, and non-overlapping.
+        // SAFETY: the source is idle and the external blocker forces the shared Vmem copy fallback.
         let remapped = unsafe {
-            p.remap_pages(
-                source_range,
-                target_range.clone(),
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
-            )
-            .unwrap()
+            mm.remap_pages(source, HOST_PAGE_SIZE, 2 * HOST_PAGE_SIZE, true)
+                .unwrap()
         };
-        assert_ne!(remapped.as_usize(), target_range.start);
-        let remapped_range = remapped.as_usize()..remapped.as_usize() + target_range.len();
+        assert_ne!(remapped.as_usize(), source.as_usize());
         let value: usize;
         // SAFETY: remap preserved the C-ABI mov/ret stub and installed RX permissions.
         unsafe {
             core::arch::asm!("blr {entry}", entry = in(reg) remapped.as_usize(),
-                lateout("x0") value, clobber_abi("C"));
+            lateout("x0") value, clobber_abi("C"));
         }
         assert_eq!(value, 42);
         // SAFETY: the remapped code has returned and the test owns its actual range.
-        unsafe { p.deallocate_pages(remapped_range).unwrap() };
+        unsafe { mm.remove_pages(remapped, 2 * HOST_PAGE_SIZE).unwrap() };
     }
 
     #[test]
@@ -3688,14 +3550,14 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
         let _unmap = litebox::utils::defer(|| {
             // SAFETY: the test owns this mapping and has no active accesses at cleanup.
             unsafe {
-                p.deallocate_pages(range.clone()).unwrap();
+                p.release_pages(range.clone()).unwrap();
             }
         });
         assert!(matches!(
@@ -3742,7 +3604,7 @@ mod tests {
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::Hint,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
             .unwrap();
         let base = ptr.as_usize();
@@ -3783,13 +3645,13 @@ mod tests {
         );
         // SAFETY: the first page is idle; subsequent probes use fallible raw accesses.
         unsafe {
-            p.deallocate_pages(base..base + HOST_PAGE_SIZE).unwrap();
+            p.release_pages(base..base + HOST_PAGE_SIZE).unwrap();
         }
         assert_eq!(ptr.read_at_offset(0), None);
         assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), Some(0x6b));
         // SAFETY: the remaining test-owned page is no longer accessed.
         unsafe {
-            p.deallocate_pages(base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE)
+            p.release_pages(base + HOST_PAGE_SIZE..base + 2 * HOST_PAGE_SIZE)
                 .unwrap();
         }
     }
@@ -3830,7 +3692,7 @@ mod tests {
         }
         // SAFETY: the range is idle; the platform must leave this unowned mapping intact.
         unsafe {
-            p.deallocate_pages(host as usize..host as usize + HOST_PAGE_SIZE)
+            p.release_pages(host as usize..host as usize + HOST_PAGE_SIZE)
                 .unwrap();
         }
         // SAFETY: rejected replacements and unowned deallocation leave the initialized byte mapped.

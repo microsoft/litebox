@@ -14,7 +14,7 @@ use litebox::platform::{RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::ReinterpretSignedExt as _;
 use litebox_broker_protocol::fs::FileMode;
 use litebox_common_macos::{
-    MmapFlags, OpenFlags, PAGE_SIZE, PtRegs, VmProtection,
+    OpenFlags, PAGE_SIZE, PtRegs, VmProtection,
     loader::{MAX_IMAGE_SIZE, MachoParsedFile, TrampolineInfo, arm64_slice},
 };
 use litebox_syscall_rewriter::{
@@ -75,16 +75,13 @@ fn read_image<P: ShimPlatform>(task: &Task<P>, path: &str) -> Result<Vec<u8>, Ma
     Ok(data)
 }
 
-fn reserve<P: ShimPlatform>(task: &Task<P>, len: usize) -> Result<usize, MachoLoaderError> {
-    task.sys_mmap(
-        P::TASK_ADDR_MIN,
-        len,
-        VmProtection::empty(),
-        MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
-        -1,
-        0,
-    )
-    .map_err(|_| MachoLoaderError::Memory)
+fn reserve<P: ShimPlatform>(
+    task: &Task<P>,
+    len: usize,
+    direction: litebox::platform::page_mgmt::AllocationDirection,
+) -> Result<usize, MachoLoaderError> {
+    task.reserve_anonymous(P::TASK_ADDR_MIN, len, direction)
+        .map_err(|_| MachoLoaderError::Memory)
 }
 
 fn protect<P: ShimPlatform>(
@@ -172,7 +169,11 @@ impl<'a> Image<'a> {
         };
         // TODO: support images requiring preferred-address placement (without
         // replacing host mappings) or rebasing when slid.
-        let base = reserve(task, self.plan.virtual_range.len())?;
+        let base = reserve(
+            task,
+            self.plan.virtual_range.len(),
+            litebox::platform::page_mgmt::AllocationDirection::BottomUp,
+        )?;
         let relocate = |address: usize| base + (address - self.plan.virtual_range.start);
         for segment in &self.plan.segments {
             let address = relocate(segment.virtual_range.start);
@@ -284,7 +285,11 @@ pub(super) fn load<P: ShimPlatform>(
                 .map_err(|_| MachoLoaderError::Invalid("executable header"))?,
         );
     }
-    let stack_base = reserve(task, STACK_SIZE + PAGE_SIZE)? + PAGE_SIZE;
+    let stack_base = reserve(
+        task,
+        STACK_SIZE + PAGE_SIZE,
+        litebox::platform::page_mgmt::AllocationDirection::TopDown,
+    )? + PAGE_SIZE;
     // Keep the guard page inaccessible; this fixed-size stack must not use IS_STACK grow-down.
     protect(
         task,

@@ -9,7 +9,10 @@ extern crate std;
 use super::*;
 use crate::MacosShimBuilder;
 use alloc::sync::Arc;
-use litebox::{LiteBox, platform::page_mgmt::MemoryRegionPermissions as Permissions};
+use litebox::{
+    LiteBox,
+    platform::{PageManagementProvider, page_mgmt::MemoryRegionPermissions as Permissions},
+};
 use litebox_broker_core::{
     ObjectRights, PolicyEngine,
     fs::{
@@ -183,6 +186,9 @@ fn filesystem_loader_runs_linked_static_macho() {
     );
     let sp = program.initial_ctx.sp;
     assert_eq!(sp % STACK_ALIGNMENT, 0);
+    let midpoint =
+        Platform::TASK_ADDR_MIN + (Platform::TASK_ADDR_MAX - Platform::TASK_ADDR_MIN) / 2;
+    assert!(sp >= midpoint, "stack was not placed top-down: {sp:#x}");
     assert_eq!(word(sp), argument_count);
     for terminator in [argv_end, envp_end, apple_start + 1] {
         assert_eq!(word(sp + terminator * size_of::<usize>()), 0);

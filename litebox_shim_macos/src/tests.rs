@@ -298,7 +298,7 @@ fn teardown_continues_after_unmap_failure_during_unwind() {
             .mm
             .change_page_permissions(ptr, PAGE_SIZE, Permissions::READ)
             .unwrap();
-        platform.deallocate_pages(base..base + PAGE_SIZE).unwrap();
+        platform.release_pages(base..base + PAGE_SIZE).unwrap();
     }
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
         let _task = task;
@@ -319,6 +319,6 @@ fn teardown_continues_after_unmap_failure_during_unwind() {
     assert_eq!(probe.as_usize(), second_page.start);
     // SAFETY: the probe has no users and is owned by this test.
     unsafe {
-        platform.deallocate_pages(second_page).unwrap();
+        platform.release_pages(second_page).unwrap();
     }
 }

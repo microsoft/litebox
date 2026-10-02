@@ -13,9 +13,17 @@ use thiserror::Error;
 
 use litebox::platform::PageManagementProvider;
 use litebox::platform::RawConstPointer;
+use litebox::platform::RawMutPointer;
+use litebox::platform::page_mgmt::AllocationDirection;
 use litebox::platform::page_mgmt::AllocationError;
+use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox::platform::page_mgmt::RemapError;
+use litebox::platform::{
+    common_providers::reservations::{NoTrackedReservations, TrackedReservations},
+    page_mgmt::{DeallocationError, PageReservation, ReservationStore},
+};
 
 /// Page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
@@ -52,6 +60,24 @@ bitflags::bitflags! {
         const VM_MAY_ACCESS_FLAGS = Self::VM_MAYREAD.bits()
             | Self::VM_MAYWRITE.bits()
             | Self::VM_MAYEXEC.bits();
+    }
+}
+
+impl From<CreatePagesFlags> for FixedAddressBehavior {
+    fn from(flags: CreatePagesFlags) -> Self {
+        if flags.contains(CreatePagesFlags::FIXED_ADDR) {
+            if flags.contains(CreatePagesFlags::NOREPLACE) {
+                FixedAddressBehavior::NoReplace
+            } else {
+                FixedAddressBehavior::Replace
+            }
+        } else {
+            FixedAddressBehavior::Hint(if flags.contains(CreatePagesFlags::TOP_DOWN) {
+                AllocationDirection::TopDown
+            } else {
+                AllocationDirection::BottomUp
+            })
+        }
     }
 }
 
@@ -125,6 +151,7 @@ pub const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
 
 bitflags::bitflags! {
     /// Options for page creation.
+    #[derive(Clone, Copy)]
     pub struct CreatePagesFlags: u8 {
         /// Force the mapping to be created at the given address, resulting in any
         /// existing overlapping mappings being removed.
@@ -143,6 +170,8 @@ bitflags::bitflags! {
         const NOREPLACE = 1 << 5;
         /// The mapping is shared.
         const SHARED = 1 << 6;
+        /// Search for free address space from high addresses toward low addresses.
+        const TOP_DOWN = 1 << 7;
     }
 }
 
@@ -237,7 +266,7 @@ impl<const ALIGN: usize> core::ops::Add<usize> for NonZeroPageSize<ALIGN> {
     type Output = Option<Self>;
 
     fn add(self, rhs: usize) -> Self::Output {
-        NonZeroPageSize::new(self.size + rhs)
+        NonZeroPageSize::new(self.size.checked_add(rhs)?)
     }
 }
 
@@ -293,6 +322,159 @@ impl VmArea {
     }
 }
 
+pub(super) struct FindAreaRequest<const ALIGN: usize> {
+    pub(super) suggested_address: Option<NonZeroAddress<ALIGN>>,
+    pub(super) length: NonZeroPageSize<ALIGN>,
+    pub(super) behavior: FixedAddressBehavior,
+    pub(super) alignment: usize,
+    pub(super) address_range: Range<usize>,
+}
+
+/// Parameters for creating a Linux Vmem mapping.
+pub struct MmapRequest {
+    /// Requested address range.
+    pub range: Range<usize>,
+    /// Initial page permissions.
+    pub permissions: MemoryRegionPermissions,
+    /// Whether the mapping may grow downward.
+    pub can_grow_down: bool,
+    /// Whether pages should be populated immediately.
+    pub populate_pages_immediately: bool,
+    /// Required fixed-address behavior.
+    pub behavior: FixedAddressBehavior,
+}
+
+/// Reservation store required of platforms used by Linux-style shims.
+pub type ShimReservations<Reservation> = NoTrackedReservations<PAGE_SIZE, Reservation>;
+
+/// Linux Vmem operations supported by a reservation store.
+pub trait LinuxReservationStore<Platform, const ALIGN: usize>:
+    ReservationStore + Send + Sync
+where
+    Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+{
+    /// Create a platform mapping and update reservation ownership.
+    ///
+    /// # Safety
+    ///
+    /// When `request.behavior` is [`FixedAddressBehavior::Replace`], the caller must ensure that
+    /// any replaced mappings are not in active use.
+    unsafe fn mmap(
+        &mut self,
+        platform: &Platform,
+        request: MmapRequest,
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError>;
+
+    /// Release a range's platform backing and update reservation ownership.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that these pages are not in active use.
+    unsafe fn unmap(
+        &mut self,
+        platform: &Platform,
+        range: Range<usize>,
+    ) -> Result<(), DeallocationError>;
+
+    /// Remap platform pages and update reservation ownership.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `old_range` is unused and that `new_range` is a valid,
+    /// disjoint destination.
+    unsafe fn remap(
+        &mut self,
+        platform: &Platform,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, RemapError>;
+}
+
+impl<Platform, Reservation, const ALIGN: usize> LinuxReservationStore<Platform, ALIGN>
+    for NoTrackedReservations<ALIGN, Reservation>
+where
+    Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    Reservation: PageReservation + Send + Sync,
+{
+    unsafe fn mmap(
+        &mut self,
+        platform: &Platform,
+        request: MmapRequest,
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+        let MmapRequest {
+            range,
+            permissions,
+            can_grow_down,
+            populate_pages_immediately,
+            behavior,
+        } = request;
+        platform.allocate_pages(
+            range,
+            permissions,
+            can_grow_down,
+            populate_pages_immediately,
+            behavior,
+        )
+    }
+
+    unsafe fn unmap(
+        &mut self,
+        platform: &Platform,
+        range: Range<usize>,
+    ) -> Result<(), DeallocationError> {
+        // SAFETY: The caller excludes all users of the released range.
+        unsafe { platform.release_pages(range.clone()) }?;
+        Ok(())
+    }
+
+    unsafe fn remap(
+        &mut self,
+        platform: &Platform,
+        old_range: Range<usize>,
+        new_range: Range<usize>,
+        permissions: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
+        // SAFETY: The caller guarantees that the source is unused and the destination is valid.
+        unsafe { platform.remap_pages(old_range, new_range, permissions) }
+    }
+}
+
+impl<Platform, Reservation, const ALIGN: usize> LinuxReservationStore<Platform, ALIGN>
+    for TrackedReservations<Reservation>
+where
+    Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    Reservation: PageReservation + Send + Sync,
+{
+    unsafe fn mmap(
+        &mut self,
+        _platform: &Platform,
+        _request: MmapRequest,
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+        // TODO: Implement after page-management interfaces support tracked reservations.
+        todo!("tracked Linux reservations are not supported yet")
+    }
+
+    unsafe fn unmap(
+        &mut self,
+        _platform: &Platform,
+        _range: Range<usize>,
+    ) -> Result<(), DeallocationError> {
+        // TODO: Implement after page-management interfaces support tracked reservations.
+        todo!("tracked Linux reservations are not supported yet")
+    }
+
+    unsafe fn remap(
+        &mut self,
+        _platform: &Platform,
+        _old_range: Range<usize>,
+        _new_range: Range<usize>,
+        _permissions: MemoryRegionPermissions,
+    ) -> Result<Platform::RawMutPointer<u8>, RemapError> {
+        Err(RemapError::UnsupportedByPlatform)
+    }
+}
+
 /// Virtual Memory Manager
 ///
 /// This struct mantains the virtual memory ranges backed by a memory [backend](PageManagementProvider).
@@ -301,17 +483,25 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
     /// Virtual memory areas.
-    vmas: RangeMap<usize, VmArea>,
+    pub(super) vmas: RangeMap<usize, VmArea>,
+    /// Reservations selected and owned by the platform.
+    pub(super) reservations: Platform::Reservations,
 }
 
-impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem<Platform, ALIGN> {
+impl<Platform, const ALIGN: usize> Vmem<Platform, ALIGN>
+where
+    Platform: PageManagementProvider<ALIGN> + 'static,
+{
     pub(super) const STACK_GUARD_GAP: usize = 256 << 12;
 
     /// Create a new [`Vmem`] instance with the given memory [backend](PageManagementProvider).
     pub(super) fn new(platform: &'static Platform) -> Self {
+        assert!(Platform::RESERVATION_ALIGNMENT.is_power_of_two());
+        assert!(Platform::RESERVATION_ALIGNMENT.is_multiple_of(ALIGN));
         let mut vmem = Self {
-            vmas: RangeMap::new(),
             platform,
+            vmas: RangeMap::new(),
+            reservations: Platform::Reservations::default(),
         };
         for each in platform.reserved_pages() {
             assert!(
@@ -368,13 +558,17 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     pub(super) unsafe fn remove_mapping(
         &mut self,
         range: PageRange<ALIGN>,
-    ) -> Result<(), VmemUnmapError> {
+    ) -> Result<(), VmemUnmapError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
+        let range: Range<usize> = range.into();
         unsafe {
-            self.platform
-                .deallocate_pages(range.into())
+            self.reservations
+                .unmap(self.platform, range.clone())
                 .map_err(VmemUnmapError::UnmapError)?;
         }
-        self.vmas.remove(range.into());
+        self.vmas.remove(range);
         Ok(())
     }
 
@@ -399,7 +593,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         range: PageRange<ALIGN>,
         anonymous_only: bool,
-    ) -> Result<(), VmemResetError> {
+    ) -> Result<(), VmemResetError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let range: Range<usize> = range.into();
         // Any unmapped regions in the original range will result in this function returning `DeallocationError::AlreadyUnallocated`
         // while still resetting all of the existing vmas in the range.
@@ -448,7 +645,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         vma: VmArea,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let (start, end) = (suggested_range.start, suggested_range.end);
         if start < Platform::TASK_ADDR_MIN {
             return Err(AllocationError::BelowMinAddress);
@@ -457,7 +657,7 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             return Err(AllocationError::AboveMaxAddress);
         }
         let platform_fixed_address_behavior = match fixed_address_behavior {
-            FixedAddressBehavior::Hint => FixedAddressBehavior::Hint,
+            FixedAddressBehavior::Hint(direction) => FixedAddressBehavior::Hint(direction),
             FixedAddressBehavior::NoReplace => {
                 // Ensure there are no mappings managed by us.
                 if self.vmas.overlaps(&(start..end)) {
@@ -496,22 +696,26 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             >> 4)
             .try_into()
             .unwrap();
-        // The `max_permissions` is tracked by `VMem::protect_mapping` and thus doesn't need to be
+        // The `max_permissions` is tracked by `Vmem::protect_mapping` and thus doesn't need to be
         // passed to `allocate_pages`.
         let _ = max_permissions;
-        let ret = self
-            .platform
-            .allocate_pages(
-                suggested_range.into(),
-                MemoryRegionPermissions::from_bits(permissions).unwrap(),
-                vma.flags.contains(VmFlags::VM_GROWSDOWN),
-                populate_pages_immediately,
-                platform_fixed_address_behavior,
+        // SAFETY: The caller authorizes replacement, and the checks above preserve external gaps.
+        let ret = unsafe {
+            self.reservations.mmap(
+                self.platform,
+                MmapRequest {
+                    range: suggested_range.into(),
+                    permissions: MemoryRegionPermissions::from_bits(permissions).unwrap(),
+                    can_grow_down: vma.flags.contains(VmFlags::VM_GROWSDOWN),
+                    populate_pages_immediately,
+                    behavior: platform_fixed_address_behavior,
+                },
             )
-            .map_err(|err| match err {
-                AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
-                other => other,
-            })?;
+        }
+        .map_err(|err| match err {
+            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+            other => other,
+        })?;
         let new_start = ret.as_usize();
         let new_end = new_start + suggested_range.len();
         self.vmas.insert(new_start..new_end, vma);
@@ -555,38 +759,69 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         length: NonZeroPageSize<ALIGN>,
         vma: VmArea,
         flags: CreatePagesFlags,
-    ) -> Result<Platform::RawMutPointer<u8>, AllocationError> {
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let total_length = (length
             + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
                 DEFAULT_RESERVED_SPACE_SIZE
             } else {
                 0
             })
-        .unwrap();
-        let new_addr = self
-            .get_unmmaped_area(
-                suggested_address,
-                total_length,
-                flags.contains(CreatePagesFlags::FIXED_ADDR),
-            )
-            .ok_or(AllocationError::OutOfMemory)?;
-        // new_addr must be ALIGN aligned
-        let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
-        unsafe {
-            self.insert_mapping(
-                new_range,
-                vma,
-                flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-                    if flags.contains(CreatePagesFlags::NOREPLACE) {
-                        FixedAddressBehavior::NoReplace
+        .ok_or(AllocationError::OutOfMemory)?;
+        let behavior = FixedAddressBehavior::from(flags);
+        let direction = match behavior {
+            FixedAddressBehavior::Hint(direction) => Some(direction),
+            FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => None,
+        };
+        let platform_behavior = match behavior {
+            FixedAddressBehavior::Hint(direction)
+                if !Platform::HINT_PLACEMENT_BEHAVIOR.supports(direction) =>
+            {
+                FixedAddressBehavior::NoReplace
+            }
+            _ => behavior,
+        };
+        let mut request =
+            Self::build_unmapped_area_request(suggested_address, total_length, behavior);
+        loop {
+            let new_addr = self
+                .find_area(&request)?
+                .ok_or(AllocationError::OutOfMemory)?;
+            // new_addr must be ALIGN aligned
+            let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
+            match unsafe {
+                self.insert_mapping(
+                    new_range,
+                    vma,
+                    flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
+                    platform_behavior,
+                )
+            } {
+                Err(AllocationError::AddressInUseByPlatform)
+                    if direction.is_some()
+                        && platform_behavior == FixedAddressBehavior::NoReplace =>
+                {
+                    // Retry if the requested behavior is `Hint` but the suggested address is already
+                    // in use and the platform does not support the required search direction.
+                    let rejected_hint = request
+                        .suggested_address
+                        .is_some_and(|address| address.as_usize() == new_addr);
+                    if rejected_hint {
+                        request = Self::build_unmapped_area_request(None, total_length, behavior);
+                    } else if direction == Some(AllocationDirection::TopDown) {
+                        request.suggested_address = None;
+                        request.address_range.end = new_addr;
                     } else {
-                        FixedAddressBehavior::Replace
+                        request.suggested_address = None;
+                        request.address_range.start = new_addr
+                            .checked_add(total_length.as_usize())
+                            .ok_or(AllocationError::OutOfMemory)?;
                     }
-                } else {
-                    FixedAddressBehavior::Hint
-                },
-            )
+                }
+                result => return result,
+            }
         }
     }
 
@@ -607,7 +842,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         &mut self,
         range: PageRange<ALIGN>,
         new_size: NonZeroPageSize<ALIGN>,
-    ) -> Result<(), VmemResizeError> {
+    ) -> Result<(), VmemResizeError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let range = range.start..range.end;
         // `cur_range` contains `range.start`
         let (cur_range, cur_vma) = self
@@ -615,7 +853,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .get_key_value(&range.start)
             .ok_or(VmemResizeError::NotExist(range.start))?;
 
-        let new_end = range.start + new_size.as_usize();
+        let new_end = range
+            .start
+            .checked_add(new_size.as_usize())
+            .ok_or(VmemResizeError::OutOfMemory)?;
         match new_end.cmp(&range.end) {
             core::cmp::Ordering::Equal => {
                 // no change
@@ -662,13 +903,12 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                 Err(
                     AllocationError::AddressInUse
                     | AllocationError::AddressInUseByPlatform
-                    | AllocationError::AddressPartiallyInUse,
-                ) => return Err(VmemResizeError::RangeOccupied(range.into())),
-                Err(
-                    AllocationError::Unaligned
-                    | AllocationError::BelowMinAddress
+                    | AllocationError::AddressPartiallyInUse
                     | AllocationError::AboveMaxAddress,
-                ) => unreachable!(),
+                ) => return Err(VmemResizeError::RangeOccupied(range.into())),
+                Err(AllocationError::Unaligned | AllocationError::BelowMinAddress) => {
+                    unreachable!()
+                }
                 Err(_) => return Err(VmemResizeError::OutOfMemory),
             }
             return Ok(());
@@ -700,7 +940,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         old_range: PageRange<ALIGN>,
         suggested_new_address: Option<NonZeroAddress<ALIGN>>,
         new_size: NonZeroPageSize<ALIGN>,
-    ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError> {
+    ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         assert!(new_size.as_usize() >= old_range.len());
 
         // Check if the given range is covered by exactly one mapping
@@ -709,25 +952,129 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
             .get_key_value(&old_range.start)
             .expect("VMEM: range not found");
         assert!(cur_range.contains(&(old_range.end - 1)));
+        let vma = *vma;
 
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
         }
         let new_addr = self
-            .get_unmmaped_area(suggested_new_address, new_size, false)
+            .get_unmmaped_area(
+                suggested_new_address,
+                new_size,
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )
+            .map_err(|_| VmemMoveError::OutOfMemory)?
             .ok_or(VmemMoveError::OutOfMemory)?;
         let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
-        let new_addr = unsafe {
-            self.platform
-                .remap_pages(old_range.into(), new_range.into(), vma.flags.into())
-        }
-        .map_err(VmemMoveError::RemapError)?;
+        // SAFETY: The caller excludes source users, and `get_unmmaped_area` found a disjoint gap.
+        let new_addr = match unsafe {
+            self.reservations.remap(
+                self.platform,
+                old_range.into(),
+                new_range.into(),
+                vma.flags.into(),
+            )
+        } {
+            Ok(new_addr) => new_addr,
+            Err(RemapError::UnsupportedByPlatform) => {
+                // SAFETY: Native remapping left the source unchanged, and the destination is free.
+                return unsafe { self.remap_fallback_with_copy(old_range, new_range, vma) };
+            }
+            Err(error) => return Err(VmemMoveError::RemapError(error)),
+        };
 
         let new_start = new_addr.as_usize();
         let new_end = new_start + new_size.as_usize();
-        self.vmas.insert(new_start..new_end, *vma);
+        self.vmas.insert(new_start..new_end, vma);
         self.vmas.remove(old_range.into());
         Ok(new_addr)
+    }
+
+    /// Remap by copying into a newly allocated destination.
+    ///
+    /// `new_range` provides the destination size and an address hint; the platform may choose a
+    /// different one if the given hint is not suitable.
+    ///
+    /// `vma` is the VMA associated with the source mapping.
+    ///
+    /// # Safety
+    ///
+    /// The source must have no active users.
+    ///
+    /// # Panics
+    ///
+    /// Failures after destination allocation are fatal because copying or teardown may have begun.
+    unsafe fn remap_fallback_with_copy(
+        &mut self,
+        old_range: PageRange<ALIGN>,
+        new_range: PageRange<ALIGN>,
+        vma: VmArea,
+    ) -> Result<Platform::RawMutPointer<u8>, VmemMoveError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
+        const COPY_CHUNK_SIZE: usize = 1 << 16;
+
+        let permissions = MemoryRegionPermissions::from(vma.flags());
+        let temporary = VmArea::new(
+            (vma.flags() | VmFlags::VM_READ | VmFlags::VM_WRITE) - VmFlags::VM_EXEC,
+            false,
+        );
+        let length = NonZeroPageSize::new(new_range.len()).expect("remap destination is empty");
+        // SAFETY: Hint placement never replaces existing mappings.
+        let destination = unsafe {
+            self.create_mapping(
+                NonZeroAddress::new(new_range.start),
+                length,
+                temporary,
+                CreatePagesFlags::TOP_DOWN,
+            )
+        }
+        .map_err(|error| {
+            VmemMoveError::RemapError(match error {
+                AllocationError::OutOfMemory | AllocationError::AboveMaxAddress => {
+                    RemapError::OutOfMemory
+                }
+                AllocationError::Unaligned | AllocationError::BelowMinAddress => {
+                    RemapError::Unaligned
+                }
+                _ => RemapError::AlreadyAllocated,
+            })
+        })?;
+        let extent = destination.as_usize()..destination.as_usize() + new_range.len();
+        if !permissions.contains(MemoryRegionPermissions::READ) {
+            // SAFETY: The caller excludes all source users while copying.
+            unsafe {
+                self.platform.update_permissions(
+                    old_range.into(),
+                    permissions | MemoryRegionPermissions::READ,
+                )
+            }
+            .expect("failed to make remap source readable");
+        }
+        let total = old_range.len();
+        let mut offset = 0;
+        while offset < total {
+            let chunk = (total - offset).min(COPY_CHUNK_SIZE);
+            let source = Platform::RawConstPointer::<u8>::from_usize(old_range.start + offset);
+            let buffer = source
+                .to_owned_slice(chunk)
+                .expect("failed to read remap source");
+            destination
+                .copy_from_slice(offset, &buffer)
+                .expect("failed to copy remap source");
+            offset += chunk;
+        }
+        // SAFETY: The destination is mapped, exclusively owned, and copying is complete.
+        unsafe {
+            self.platform
+                .update_permissions(extent.clone(), permissions)
+        }
+        .expect("failed to restore remap destination permissions");
+        self.vmas.insert(extent, vma);
+        // SAFETY: Copying is complete and the caller excludes all source users.
+        unsafe { self.remove_mapping(old_range) }.expect("failed to unmap remap source");
+        Ok(destination)
     }
 
     /// Change the permissions ([`VmFlags::VM_ACCESS_FLAGS`]) of a range in the virtual address space.
@@ -743,19 +1090,15 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         range: PageRange<ALIGN>,
         permissions: MemoryRegionPermissions,
     ) -> Result<(), VmemProtectError> {
+        let range: Range<usize> = range.into();
+        if self.vmas.gaps(&range).next().is_some() {
+            return Err(VmemProtectError::InvalidRange(range));
+        }
         // `MemoryRegionPermissions` is a subset of `VmFlags` and we only change the access flags
         let flags =
             VmFlags::from_bits(u32::from(permissions.bits())).unwrap() & VmFlags::VM_ACCESS_FLAGS;
-        let range = range.start..range.end;
         let mut mappings_to_change = Vec::new();
         for (r, vma) in self.vmas.overlapping(range.clone()) {
-            mappings_to_change.push((r.start, r.end, *vma));
-        }
-        if mappings_to_change.is_empty() {
-            return Err(VmemProtectError::InvalidRange(range));
-        }
-
-        for (start, end, vma) in mappings_to_change {
             if vma.flags & VmFlags::VM_ACCESS_FLAGS == flags {
                 continue;
             }
@@ -767,25 +1110,18 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     new: flags,
                 });
             }
+            let intersection = range.start.max(r.start)..range.end.min(r.end);
+            mappings_to_change.push((intersection, *vma));
+        }
+        if mappings_to_change.is_empty() {
+            return Ok(());
+        }
 
-            self.vmas.remove(start..end);
-            let intersection = range.start.max(start)..range.end.min(end);
-            // split r into three parts: before, intersection, and after
-            let before = start..intersection.start;
-            let after = intersection.end..end;
-
+        // SAFETY: The range has complete VMA coverage and the caller excludes conflicting access.
+        unsafe { self.platform.update_permissions(range, permissions) }
+            .map_err(VmemProtectError::ProtectError)?;
+        for (intersection, vma) in mappings_to_change {
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            // `intersection` is page aligned.
-            unsafe {
-                self.platform
-                    .update_permissions(intersection.clone(), permissions)
-            }
-            .map_err(|e| {
-                // restore the original mapping
-                self.vmas.insert(start..end, vma);
-                VmemProtectError::ProtectError(e)
-            })?;
-
             self.vmas.insert(
                 intersection,
                 VmArea {
@@ -793,15 +1129,81 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
                     is_file_backed: vma.is_file_backed,
                 },
             );
-            if !before.is_empty() {
-                self.vmas.insert(before, vma);
-            }
-            if !after.is_empty() {
-                self.vmas.insert(after, vma);
-            }
         }
 
         Ok(())
+    }
+
+    /// Attempt a native CoW mapping and register it in the VMA tracker.
+    ///
+    /// # Safety
+    ///
+    /// For replacement, the caller must ensure overlapping mappings are not in use.
+    pub(super) unsafe fn try_create_cow_pages(
+        &mut self,
+        suggested_start: Option<usize>,
+        source_data: &'static [u8],
+        permissions: MemoryRegionPermissions,
+        flags: CreatePagesFlags,
+    ) -> Result<Platform::RawMutPointer<u8>, CowAllocationError> {
+        let behavior = FixedAddressBehavior::from(flags);
+        if source_data.is_empty() || !source_data.len().is_multiple_of(ALIGN) {
+            return Err(CowAllocationError::Unaligned);
+        }
+        if suggested_start.is_none() && !matches!(behavior, FixedAddressBehavior::Hint(_)) {
+            return Err(CowAllocationError::InternalFailure);
+        }
+        let suggested_start = if let Some(start) = suggested_start {
+            if !start.is_multiple_of(ALIGN) {
+                return Err(CowAllocationError::Unaligned);
+            }
+            match start.checked_add(source_data.len()) {
+                Some(end) if start >= Platform::TASK_ADDR_MIN && end <= Platform::TASK_ADDR_MAX => {
+                    if behavior == FixedAddressBehavior::NoReplace
+                        && self.vmas.overlaps(&(start..end))
+                    {
+                        return Err(CowAllocationError::InternalFailure);
+                    }
+                    start
+                }
+                _ if matches!(behavior, FixedAddressBehavior::Hint(_)) => 0,
+                _ => return Err(CowAllocationError::InternalFailure),
+            }
+        } else {
+            0
+        };
+
+        let ptr = self.platform.try_allocate_cow_pages(
+            suggested_start,
+            source_data,
+            permissions,
+            behavior,
+        )?;
+        let actual_start = ptr.as_usize();
+        let actual_end = actual_start
+            .checked_add(source_data.len())
+            .ok_or(CowAllocationError::InternalFailure)?;
+        let actual =
+            PageRange::new(actual_start, actual_end).ok_or(CowAllocationError::InternalFailure)?;
+        debug_assert!(
+            matches!(behavior, FixedAddressBehavior::Hint(_)) || suggested_start == actual_start
+        );
+        debug_assert!(
+            actual_start >= Platform::TASK_ADDR_MIN && actual_end <= Platform::TASK_ADDR_MAX
+        );
+
+        self.register_existing_mapping_overwrite(
+            actual,
+            VmArea::new(
+                VmFlags::from(permissions)
+                    | VmFlags::may_flags_for_mapping(
+                        flags.contains(CreatePagesFlags::SHARED),
+                        true,
+                    ),
+                true,
+            ),
+        );
+        Ok(ptr)
     }
 
     /// Create a mapping with the given flags.
@@ -830,7 +1232,10 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         perms: MemoryRegionPermissions,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
         unsafe {
@@ -879,74 +1284,156 @@ impl<Platform: PageManagementProvider<ALIGN> + 'static, const ALIGN: usize> Vmem
     /*================================Internal Functions================================ */
 
     /// Get an unmapped area in the virtual address space.
-    /// `suggested_range` and `fixed_addr` are the hint address and MAP_FIXED flag respectively,
+    /// `suggested_address` and `behavior` are the hint address and placement policy respectively,
     /// similar to how `mmap` works.
     ///
-    /// Returns `None` if no area found. Otherwise, returns the start address of a page-aligned area.
-    fn get_unmmaped_area(
+    /// Returns `None` if no area was found. Otherwise, returns the start address of an
+    /// `ALIGN`-aligned area.
+    pub(super) fn get_unmmaped_area(
         &self,
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
-        fixed_addr: bool,
-    ) -> Option<usize> {
-        let size = length.as_usize();
+        behavior: FixedAddressBehavior,
+    ) -> Result<Option<usize>, AllocationError> {
+        self.find_area(&Self::build_unmapped_area_request(
+            suggested_address,
+            length,
+            behavior,
+        ))
+    }
+
+    fn build_unmapped_area_request(
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        behavior: FixedAddressBehavior,
+    ) -> FindAreaRequest<ALIGN> {
+        let (address_range_end, alignment) = if suggested_address.is_none() {
+            (
+                // Some platform may allocate more than requested to satisfy alignment requirements,
+                // so we restrict the maximum address to avoid exceeding the platform's addressable range.
+                Platform::TASK_ADDR_MAX & !(Platform::RESERVATION_ALIGNMENT - 1),
+                // When no specific address is suggested, use the platform's reservation alignment
+                // to minimize fragmentation and number of system calls.
+                Platform::RESERVATION_ALIGNMENT,
+            )
+        } else {
+            (Platform::TASK_ADDR_MAX, ALIGN)
+        };
+        FindAreaRequest {
+            suggested_address,
+            length,
+            behavior,
+            alignment,
+            address_range: Platform::TASK_ADDR_MIN..address_range_end,
+        }
+    }
+
+    /// Search VMA gaps while preserving stack guards.
+    pub(super) fn find_area(
+        &self,
+        request: &FindAreaRequest<ALIGN>,
+    ) -> Result<Option<usize>, AllocationError> {
+        debug_assert!(
+            request
+                .suggested_address
+                .is_none_or(|address| address.0.is_multiple_of(request.alignment))
+        );
+        let size = request.length.as_usize();
         if size > Platform::TASK_ADDR_MAX {
+            return Ok(None);
+        }
+        if let Some(suggested_address) = request.suggested_address {
+            let end = suggested_address.0.saturating_add(size);
+            match request.behavior {
+                FixedAddressBehavior::Hint(_) => {
+                    if suggested_address.0 >= request.address_range.start
+                        && end <= request.address_range.end
+                        && !self.vmas.overlaps(&(suggested_address.0..end))
+                    {
+                        return Ok(Some(suggested_address.0));
+                    }
+                    // fall through if the hint cannot be used
+                }
+                FixedAddressBehavior::NoReplace | FixedAddressBehavior::Replace => {
+                    if suggested_address.0 < request.address_range.start {
+                        return Err(AllocationError::BelowMinAddress);
+                    }
+                    if end > request.address_range.end {
+                        return Err(AllocationError::AboveMaxAddress);
+                    }
+                    if request.behavior == FixedAddressBehavior::Replace
+                        || !self.vmas.overlaps(&(suggested_address.0..end))
+                    {
+                        return Ok(Some(suggested_address.0));
+                    }
+                    return Err(AllocationError::AddressInUse);
+                }
+            }
+        } else if !matches!(request.behavior, FixedAddressBehavior::Hint(_)) {
+            return Err(AllocationError::BelowMinAddress);
+        }
+
+        Ok(self.find_area_in_range(request))
+    }
+
+    fn find_area_in_range(&self, request: &FindAreaRequest<ALIGN>) -> Option<usize> {
+        let top_down = matches!(
+            request.behavior,
+            FixedAddressBehavior::Hint(AllocationDirection::TopDown)
+        );
+        let size = request.length.as_usize();
+        let low_limit = request
+            .address_range
+            .start
+            .max(Platform::TASK_ADDR_MIN)
+            .checked_next_multiple_of(request.alignment)?;
+        let high_limit = request.address_range.end.min(Platform::TASK_ADDR_MAX);
+        if high_limit.checked_sub(low_limit)? < size {
             return None;
         }
-        if let Some(suggested_address) = suggested_address {
-            if (Platform::TASK_ADDR_MAX - size) < suggested_address.0 {
-                return None;
-            }
-            if fixed_addr
-                || !self
-                    .vmas
-                    .overlaps(&(suggested_address.0..(suggested_address.0 + size)))
-            {
-                return Some(suggested_address.0);
-            }
-        } else if fixed_addr {
-            // MAP_FIXED with addr=0: return 0 so insert_mapping rejects it
-            // via the TASK_ADDR_MIN check (BelowMinAddress → EPERM).
-            return Some(0);
-        }
-
-        // top down
-        // 1. check [last_end, TASK_SIZE_MAX)
-        let (low_limit, high_limit) = (
-            Platform::TASK_ADDR_MIN,
-            Platform::TASK_ADDR_MAX - length.as_usize(),
-        );
         debug_assert_eq!(Platform::TASK_ADDR_MIN % ALIGN, 0);
         debug_assert_eq!(Platform::TASK_ADDR_MAX % ALIGN, 0);
-        let last_end = self.vmas.last_range_value().map_or(low_limit, |r| r.0.end);
-        if last_end <= high_limit {
-            return Some(high_limit);
+        let find_in_gap = |gap: Range<usize>| {
+            let start = if top_down {
+                gap.end.checked_sub(size)? & !(request.alignment - 1)
+            } else {
+                gap.start.checked_next_multiple_of(request.alignment)?
+            };
+            if start >= gap.start && start.checked_add(size)? <= gap.end {
+                Some(start)
+            } else {
+                None
+            }
+        };
+        // A grow-down mapping also blocks the guard gap below its start.
+        let blocked_extent = |(range, vma): (&Range<usize>, &VmArea)| {
+            let guard = if vma.flags.contains(VmFlags::VM_GROWSDOWN) {
+                Self::STACK_GUARD_GAP << 1
+            } else {
+                0
+            };
+            range.start.saturating_sub(guard).min(high_limit)..range.end.max(low_limit)
+        };
+        // Walk mappings in search order, testing the free gap that precedes each one.
+        if top_down {
+            let mut boundary = high_limit;
+            for blocked in self.vmas.iter().rev().map(blocked_extent) {
+                if let Some(start) = find_in_gap(blocked.end..boundary) {
+                    return Some(start);
+                }
+                boundary = blocked.start;
+            }
+            find_in_gap(low_limit..boundary)
+        } else {
+            let mut boundary = low_limit;
+            for blocked in self.vmas.iter().map(blocked_extent) {
+                if let Some(start) = find_in_gap(boundary..blocked.start) {
+                    return Some(start);
+                }
+                boundary = blocked.end;
+            }
+            find_in_gap(boundary..high_limit)
         }
-
-        // 2. check gaps between ranges
-        for (r, flags) in self.vmas.iter().rev() {
-            let start = r.start.checked_sub(
-                size + if flags.flags.contains(VmFlags::VM_GROWSDOWN) {
-                    // If it is a stack, we need to leave enough space for the stack to grow downwards.
-                    Self::STACK_GUARD_GAP << 1
-                } else {
-                    0
-                },
-            )?;
-            if start < low_limit {
-                return None;
-            }
-            if start > high_limit {
-                // Note we may have pre-allocated memory that are higher than `TASK_ADDR_MAX`
-                // (See [`Vmem::new`]) and thus `start` may be larger than `high_limit`.
-                continue;
-            }
-            if !self.vmas.overlaps(&(start..start + size)) {
-                return Some(start);
-            }
-        }
-
-        None
     }
 }
 
@@ -1005,6 +1492,8 @@ pub enum VmemProtectError {
     InvalidRange(Range<usize>),
     #[error("failed to change permissions from {old:?} to {new:?}")]
     NoAccess { old: VmFlags, new: VmFlags },
+    #[error("unsupported page protection")]
+    UnsupportedProtection,
     #[error("mprotect failed: {0}")]
     ProtectError(#[from] litebox::platform::page_mgmt::PermissionUpdateError),
 }
@@ -1067,56 +1556,87 @@ pub enum PageFaultError {
 mod tests {
     use core::ops::Range;
 
-    use alloc::vec;
-    use alloc::vec::Vec;
+    use alloc::{boxed::Box, vec, vec::Vec};
     use litebox::platform::{
         PageManagementProvider, RawConstPointer,
-        page_mgmt::MemoryRegionPermissions,
+        page_mgmt::{
+            AllocationDirection, AllocationError, FixedAddressBehavior, HintPlacementBehavior,
+            MemoryRegionPermissions,
+        },
         trivial_providers::{TransparentConstPtr, TransparentMutPtr},
     };
+    use spin::Mutex;
     use zerocopy::{FromBytes, IntoBytes};
 
     use super::*;
 
-    /// A dummy page-management platform for virtual-memory tests.
-    struct DummyVmemBackend;
+    type AllocationCall = (Range<usize>, FixedAddressBehavior);
 
-    impl litebox::platform::RawPointerProvider for DummyVmemBackend {
+    litebox::define_page_reservation!(DummyReservation);
+
+    /// A configurable dummy page-management backend.
+    struct DummyVmemBackend<const TOP_DOWN: bool = false> {
+        rejected_address: Option<usize>,
+        calls: Mutex<Vec<AllocationCall>>,
+        releases: Mutex<Vec<Range<usize>>>,
+    }
+
+    impl<const TOP_DOWN: bool> litebox::platform::RawPointerProvider for DummyVmemBackend<TOP_DOWN> {
         type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
         type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
     }
 
     #[expect(unused_variables, reason = "dummy/mock backend")]
-    impl litebox::platform::PageManagementProvider<PAGE_SIZE> for DummyVmemBackend {
+    impl<const TOP_DOWN: bool> PageManagementProvider<PAGE_SIZE> for DummyVmemBackend<TOP_DOWN> {
+        type Reservations =
+            litebox::platform::common_providers::reservations::NoTrackedReservations<
+                PAGE_SIZE,
+                DummyReservation<PAGE_SIZE>,
+            >;
+
         #[cfg(any(target_os = "linux", target_os = "windows"))]
-        const TASK_ADDR_MIN: usize = 0x1_0000; // default linux/windows config
+        const TASK_ADDR_MIN: usize = 0x1_0000;
         #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-        const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000; // (1 << 47) - PAGE_SIZE;
+        const TASK_ADDR_MAX: usize = 0x7FFF_FFFF_F000;
         #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-        const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000; // 48-bit VA space
+        const TASK_ADDR_MAX: usize = 0xFFFF_FFFF_F000;
         #[cfg(all(target_arch = "x86_64", target_os = "windows"))]
         const TASK_ADDR_MAX: usize = 0x7FFF_FFFE_F000;
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         const TASK_ADDR_MIN: usize = 0x1_0000; // Vmem unit-test bound
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000; // MACH_VM_MAX_ADDRESS
+        const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
+            HintPlacementBehavior::Directional(if TOP_DOWN {
+                AllocationDirection::TopDown
+            } else {
+                AllocationDirection::BottomUp
+            });
 
         fn allocate_pages(
             &self,
             suggested_range: Range<usize>,
-            initial_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+            initial_permissions: MemoryRegionPermissions,
             can_grow_down: bool,
             populate_pages_immediately: bool,
-            fixed_address_behavior: litebox::platform::page_mgmt::FixedAddressBehavior,
-        ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError>
-        {
+            fixed_address_behavior: FixedAddressBehavior,
+        ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+            self.calls
+                .lock()
+                .push((suggested_range.clone(), fixed_address_behavior));
+            if fixed_address_behavior == FixedAddressBehavior::NoReplace
+                && self.rejected_address == Some(suggested_range.start)
+            {
+                return Err(AllocationError::AddressInUse);
+            }
             Ok(TransparentMutPtr::from_usize(suggested_range.start))
         }
 
-        unsafe fn deallocate_pages(
+        unsafe fn release_pages(
             &self,
             range: Range<usize>,
         ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
+            self.releases.lock().push(range);
             Ok(())
         }
 
@@ -1124,7 +1644,7 @@ mod tests {
             &self,
             old_range: Range<usize>,
             new_range: Range<usize>,
-            permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+            permissions: MemoryRegionPermissions,
         ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
             Ok(TransparentMutPtr::from_usize(new_range.start))
         }
@@ -1132,7 +1652,7 @@ mod tests {
         unsafe fn update_permissions(
             &self,
             range: Range<usize>,
-            new_permissions: litebox::platform::page_mgmt::MemoryRegionPermissions,
+            new_permissions: MemoryRegionPermissions,
         ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
             Ok(())
         }
@@ -1142,17 +1662,179 @@ mod tests {
         }
     }
 
+    fn dummy_backend<const TOP_DOWN: bool>(
+        rejected_address: Option<usize>,
+    ) -> &'static DummyVmemBackend<TOP_DOWN> {
+        Box::leak(Box::new(DummyVmemBackend {
+            rejected_address,
+            calls: Mutex::new(Vec::new()),
+            releases: Mutex::new(Vec::new()),
+        }))
+    }
+
+    #[test]
+    fn bottom_up_hint_does_not_limit_fallback_search() {
+        let backend = dummy_backend::<false>(None);
+        let mut vmem: Vmem<DummyVmemBackend, PAGE_SIZE> = Vmem::new(backend);
+        let suggested_address = DummyVmemBackend::<false>::TASK_ADDR_MIN + PAGE_SIZE;
+        unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(suggested_address),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+
+        let address = unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(suggested_address),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::empty(),
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(address, DummyVmemBackend::<false>::TASK_ADDR_MIN);
+        assert_eq!(
+            *backend.calls.lock(),
+            [
+                (
+                    suggested_address..suggested_address + PAGE_SIZE,
+                    FixedAddressBehavior::NoReplace,
+                ),
+                (
+                    address..address + PAGE_SIZE,
+                    FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn matching_platform_direction_uses_hint() {
+        let backend = dummy_backend::<true>(Some(DummyVmemBackend::<true>::TASK_ADDR_MAX));
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+
+        let address = unsafe {
+            vmem.create_mapping(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::TOP_DOWN,
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(address, DummyVmemBackend::<true>::TASK_ADDR_MAX - PAGE_SIZE);
+        assert_eq!(
+            *backend.calls.lock(),
+            [(
+                address..address + PAGE_SIZE,
+                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )]
+        );
+    }
+
+    #[test]
+    fn platform_rejected_hint_restarts_full_search() {
+        let suggested_address = DummyVmemBackend::<true>::TASK_ADDR_MAX - PAGE_SIZE;
+        let backend = dummy_backend::<true>(Some(suggested_address));
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+
+        let address = unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(suggested_address),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::empty(),
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(address, DummyVmemBackend::<true>::TASK_ADDR_MIN);
+        assert_eq!(
+            *backend.calls.lock(),
+            [
+                (
+                    suggested_address..suggested_address + PAGE_SIZE,
+                    FixedAddressBehavior::NoReplace,
+                ),
+                (
+                    address..address + PAGE_SIZE,
+                    FixedAddressBehavior::NoReplace,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn mismatched_platform_direction_retries_with_no_replace() {
+        let bottom_up_backend = dummy_backend::<true>(Some(0x1_0000));
+        let mut bottom_up_vmem = Vmem::<_, PAGE_SIZE>::new(bottom_up_backend);
+        let bottom_up_address = unsafe {
+            bottom_up_vmem.create_mapping(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::empty(),
+            )
+        }
+        .unwrap()
+        .as_usize();
+        assert_eq!(bottom_up_address, 0x1_1000);
+        assert_eq!(
+            *bottom_up_backend.calls.lock(),
+            [
+                (0x1_0000..0x1_1000, FixedAddressBehavior::NoReplace),
+                (0x1_1000..0x1_2000, FixedAddressBehavior::NoReplace),
+            ]
+        );
+
+        let rejected_address = DummyVmemBackend::<false>::TASK_ADDR_MAX - PAGE_SIZE;
+        let top_down_backend = dummy_backend::<false>(Some(rejected_address));
+        let mut top_down_vmem = Vmem::<_, PAGE_SIZE>::new(top_down_backend);
+        let top_down_address = unsafe {
+            top_down_vmem.create_mapping(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::TOP_DOWN,
+            )
+        }
+        .unwrap()
+        .as_usize();
+        assert_eq!(top_down_address, rejected_address - PAGE_SIZE);
+        assert_eq!(
+            *top_down_backend.calls.lock(),
+            [
+                (
+                    rejected_address..DummyVmemBackend::<false>::TASK_ADDR_MAX,
+                    FixedAddressBehavior::NoReplace,
+                ),
+                (
+                    rejected_address - PAGE_SIZE..rejected_address,
+                    FixedAddressBehavior::NoReplace,
+                ),
+            ]
+        );
+    }
+
     fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
         vmm.iter().map(|v| v.0.start..v.0.end).collect()
     }
 
     #[test]
     fn test_vmm_mapping() {
-        let start_addr = DummyVmemBackend::TASK_ADDR_MIN;
+        let start_addr = DummyVmemBackend::<false>::TASK_ADDR_MIN;
         let range = PageRange::new(start_addr, start_addr + 12 * PAGE_SIZE).unwrap();
-        let mut vmm = Vmem::new(&DummyVmemBackend);
+        let mut vmm = Vmem::new(dummy_backend::<false>(None));
 
-        // []
         unsafe {
             vmm.insert_mapping(
                 range,
@@ -1161,11 +1843,10 @@ mod tests {
                     false,
                 ),
                 false,
-                litebox::platform::page_mgmt::FixedAddressBehavior::Replace,
+                FixedAddressBehavior::Replace,
             )
         }
         .unwrap();
-        // [(0x1_0000, 0x1_c000)]
         assert_eq!(
             collect_mappings(&vmm),
             vec![start_addr..start_addr + 12 * PAGE_SIZE]
@@ -1177,7 +1858,14 @@ mod tests {
             )
         }
         .unwrap();
-        // [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
+        {
+            let releases = vmm.platform.releases.lock();
+            assert_eq!(releases.len(), 1);
+            assert_eq!(
+                releases[0],
+                start_addr + 2 * PAGE_SIZE..start_addr + 4 * PAGE_SIZE
+            );
+        }
         assert_eq!(
             collect_mappings(&vmm),
             vec![
@@ -1193,7 +1881,6 @@ mod tests {
                     NonZeroPageSize::new(PAGE_SIZE * 2).unwrap(),
                 )
             },
-            // Failed to resize, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
             Err(VmemResizeError::NotExist(_))
         ));
 
@@ -1204,18 +1891,16 @@ mod tests {
                     NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
                 )
             },
-            // Failed to resize, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
             Err(VmemResizeError::InvalidAddr { .. })
         ));
 
         assert!(matches!(
             unsafe {
                 vmm.protect_mapping(
-                    PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap(),
+                    PageRange::new(start_addr, start_addr + 4 * PAGE_SIZE).unwrap(),
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
                 )
             },
-            // Failed to protect, remain [(0x1_0000, 0x1_2000), (0x1_4000, 0x1_c000)]
             Err(VmemProtectError::InvalidRange(_))
         ));
 
@@ -1228,7 +1913,6 @@ mod tests {
             }
             .is_ok()
         );
-        // Grow and merge, [(0x1_0000, 0x1_c000)]
         assert_eq!(
             collect_mappings(&vmm),
             vec![start_addr..start_addr + 12 * PAGE_SIZE]
@@ -1241,7 +1925,6 @@ mod tests {
                     MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
                 )
             },
-            // Failed to protect, remain [(0x1_0000, 0x1_c000)]
             Err(VmemProtectError::NoAccess { .. })
         ));
 
@@ -1254,7 +1937,6 @@ mod tests {
             }
             .is_ok()
         );
-        // Change permission, [(0x1_0000, 0x1_2000), (0x1_2000, 0x1_4000), (0x1_4000, 0x1_c000)]
         assert_eq!(
             collect_mappings(&vmm),
             vec![
@@ -1264,21 +1946,20 @@ mod tests {
             ]
         );
 
-        // try to remap [0x1_2000, 0x1_4000)
-        let r = PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap();
+        let range = PageRange::new(start_addr + 2 * PAGE_SIZE, start_addr + 4 * PAGE_SIZE).unwrap();
         assert!(matches!(
-            unsafe { vmm.resize_mapping(r, NonZeroPageSize::new(PAGE_SIZE * 4).unwrap()) },
+            unsafe { vmm.resize_mapping(range, NonZeroPageSize::new(PAGE_SIZE * 4).unwrap()) },
             Err(VmemResizeError::RangeOccupied(_))
         ));
         assert!(
             unsafe {
                 vmm.move_mappings(
-                    r,
+                    range,
                     Some(NonZeroAddress::new(start_addr + 12 * PAGE_SIZE).unwrap()),
                     NonZeroPageSize::new(PAGE_SIZE * 4).unwrap(),
                 )
             }
-            .is_ok_and(|v| v.as_usize() == start_addr + 12 * PAGE_SIZE)
+            .is_ok_and(|value| value.as_usize() == start_addr + 12 * PAGE_SIZE)
         );
         assert_eq!(
             collect_mappings(&vmm),
@@ -1289,19 +1970,18 @@ mod tests {
             ]
         );
 
-        // create new mapping with no suggested address
         assert_eq!(
             unsafe {
                 vmm.create_mapping(
                     None,
                     NonZeroPageSize::new(PAGE_SIZE).unwrap(),
                     VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
-                    CreatePagesFlags::empty(),
+                    CreatePagesFlags::TOP_DOWN,
                 )
             }
             .unwrap()
             .as_usize(),
-            DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE,
+            DummyVmemBackend::<false>::TASK_ADDR_MAX - PAGE_SIZE,
         );
         assert_eq!(
             collect_mappings(&vmm),
@@ -1309,11 +1989,11 @@ mod tests {
                 start_addr..start_addr + 2 * PAGE_SIZE,
                 start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
                 start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-                DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+                DummyVmemBackend::<false>::TASK_ADDR_MAX - PAGE_SIZE
+                    ..DummyVmemBackend::<false>::TASK_ADDR_MAX,
             ]
         );
 
-        // create new mapping with fixed address that overlaps with other mapping
         assert_eq!(
             unsafe {
                 vmm.create_mapping(
@@ -1334,11 +2014,11 @@ mod tests {
                 start_addr + PAGE_SIZE..start_addr + 2 * PAGE_SIZE,
                 start_addr + 4 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
                 start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-                DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+                DummyVmemBackend::<false>::TASK_ADDR_MAX - PAGE_SIZE
+                    ..DummyVmemBackend::<false>::TASK_ADDR_MAX,
             ]
         );
 
-        // shrink mapping
         assert!(
             unsafe {
                 vmm.resize_mapping(
@@ -1356,19 +2036,20 @@ mod tests {
                 start_addr + 4 * PAGE_SIZE..start_addr + 6 * PAGE_SIZE,
                 start_addr + 8 * PAGE_SIZE..start_addr + 12 * PAGE_SIZE,
                 start_addr + 12 * PAGE_SIZE..start_addr + 16 * PAGE_SIZE,
-                DummyVmemBackend::TASK_ADDR_MAX - PAGE_SIZE..DummyVmemBackend::TASK_ADDR_MAX,
+                DummyVmemBackend::<false>::TASK_ADDR_MAX - PAGE_SIZE
+                    ..DummyVmemBackend::<false>::TASK_ADDR_MAX,
             ]
         );
     }
 
     #[test]
     fn fixed_mappings_respect_task_address_bounds() {
-        let mut vmm = Vmem::new(&DummyVmemBackend);
+        let mut vmm = Vmem::new(dummy_backend::<false>(None));
         let vma = VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false);
 
         let below_min = PageRange::new(
-            DummyVmemBackend::TASK_ADDR_MIN - PAGE_SIZE,
-            DummyVmemBackend::TASK_ADDR_MIN,
+            DummyVmemBackend::<false>::TASK_ADDR_MIN - PAGE_SIZE,
+            DummyVmemBackend::<false>::TASK_ADDR_MIN,
         )
         .unwrap();
         assert!(matches!(
@@ -1377,8 +2058,8 @@ mod tests {
         ));
 
         let above_max = PageRange::new(
-            DummyVmemBackend::TASK_ADDR_MAX,
-            DummyVmemBackend::TASK_ADDR_MAX + PAGE_SIZE,
+            DummyVmemBackend::<false>::TASK_ADDR_MAX,
+            DummyVmemBackend::<false>::TASK_ADDR_MAX + PAGE_SIZE,
         )
         .unwrap();
         assert!(matches!(

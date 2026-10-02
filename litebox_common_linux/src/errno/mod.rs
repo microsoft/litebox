@@ -285,11 +285,11 @@ impl From<litebox::fs::errors::MkdirError> for Errno {
 impl From<litebox::platform::page_mgmt::AllocationError> for Errno {
     fn from(value: litebox::platform::page_mgmt::AllocationError) -> Self {
         match value {
-            litebox::platform::page_mgmt::AllocationError::Unaligned
-            | litebox::platform::page_mgmt::AllocationError::AboveMaxAddress => Errno::EINVAL,
+            litebox::platform::page_mgmt::AllocationError::Unaligned => Errno::EINVAL,
             litebox::platform::page_mgmt::AllocationError::BelowMinAddress => Errno::EPERM,
             litebox::platform::page_mgmt::AllocationError::PermissionDenied => Errno::EACCES,
             litebox::platform::page_mgmt::AllocationError::OutOfMemory
+            | litebox::platform::page_mgmt::AllocationError::AboveMaxAddress
             | litebox::platform::page_mgmt::AllocationError::AddressPartiallyInUse
             | litebox::platform::page_mgmt::AllocationError::AddressInUseByPlatform => {
                 Errno::ENOMEM
@@ -347,9 +347,11 @@ impl From<crate::vmem::MappingError> for Errno {
 impl From<litebox::platform::page_mgmt::RemapError> for Errno {
     fn from(value: litebox::platform::page_mgmt::RemapError) -> Self {
         match value {
+            litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform => Errno::ENOSYS,
             litebox::platform::page_mgmt::RemapError::Unaligned
             | litebox::platform::page_mgmt::RemapError::Overlapping => Errno::EINVAL,
-            litebox::platform::page_mgmt::RemapError::AlreadyAllocated
+            litebox::platform::page_mgmt::RemapError::InvalidRange
+            | litebox::platform::page_mgmt::RemapError::AlreadyAllocated
             | litebox::platform::page_mgmt::RemapError::AlreadyUnallocated => Errno::EFAULT,
             litebox::platform::page_mgmt::RemapError::OutOfMemory
             | litebox::platform::page_mgmt::RemapError::PermissionDenied => Errno::ENOMEM,
@@ -377,6 +379,7 @@ impl From<crate::vmem::VmemProtectError> for Errno {
             crate::vmem::VmemProtectError::UnAligned(_) => Errno::EINVAL,
             crate::vmem::VmemProtectError::InvalidRange(_) => Errno::ENOMEM,
             crate::vmem::VmemProtectError::NoAccess { .. } => Errno::EACCES,
+            crate::vmem::VmemProtectError::UnsupportedProtection => Errno::EINVAL,
             crate::vmem::VmemProtectError::ProtectError(e) => e.into(),
         }
     }

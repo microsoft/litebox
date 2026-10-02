@@ -32,6 +32,12 @@ macro_rules! define_page_reservation {
             }
         }
 
+        impl<const ALIGN: usize> From<$name<ALIGN>> for ::core::ops::Range<usize> {
+            fn from(reservation: $name<ALIGN>) -> Self {
+                reservation.range
+            }
+        }
+
         // Reservation handles must remain non-Clone and non-Copy to preserve exclusive ownership.
         // The inferred marker below resolves to `()` only in that case; either trait adds another
         // matching implementation, making trait selection ambiguous and compilation fail.
@@ -47,6 +53,63 @@ macro_rules! define_page_reservation {
             let _ = <$name<4096> as AmbiguousIfCloneOrCopy<_>>::assert_not_impl;
         };
     };
+}
+
+/// Reservation store for page managers that do not retain reservation handles.
+pub struct NoTrackedReservations<const ALIGN: usize, Reservation>(
+    core::marker::PhantomData<Reservation>,
+);
+
+impl<const ALIGN: usize, Reservation> Default for NoTrackedReservations<ALIGN, Reservation> {
+    fn default() -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+impl<const ALIGN: usize, Reservation> ReservationStore for NoTrackedReservations<ALIGN, Reservation>
+where
+    Reservation: PageReservation,
+{
+    type Reservation = Reservation;
+    type ReleaseTarget = Range<usize>;
+
+    unsafe fn release_all<Platform, const PAGE_ALIGN: usize, V>(
+        &mut self,
+        vmas: &rangemap::RangeMap<usize, V>,
+        platform: &Platform,
+    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
+    where
+        Platform: crate::platform::PageManagementProvider<PAGE_ALIGN, Reservations = Self>,
+    {
+        for (range, _) in vmas.iter() {
+            // SAFETY: The caller relinquishes this provider-owned range without remaining users.
+            let _ = unsafe { platform.release_pages(range.clone()) };
+        }
+        Ok(())
+    }
+
+    fn insert(
+        &mut self,
+        _base: usize,
+        _reservation: Self::Reservation,
+    ) -> Option<Self::Reservation> {
+        None
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = (&usize, &Self::Reservation)> {
+        core::iter::empty()
+    }
+
+    fn overlapping(
+        &self,
+        _range: Range<usize>,
+    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)> {
+        core::iter::empty()
+    }
+
+    fn take_overlapping(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
+        Vec::new()
+    }
 }
 
 /// Reservations indexed by their starting address.
@@ -85,6 +148,22 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
 
 impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Reservation> {
     type Reservation = Reservation;
+    type ReleaseTarget = Reservation;
+
+    unsafe fn release_all<Platform, const ALIGN: usize, V>(
+        &mut self,
+        _vmas: &rangemap::RangeMap<usize, V>,
+        platform: &Platform,
+    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
+    where
+        Platform: crate::platform::PageManagementProvider<ALIGN, Reservations = Self>,
+    {
+        for (_, reservation) in core::mem::take(&mut self.0) {
+            // SAFETY: The caller relinquishes this reservation without remaining users.
+            let _ = unsafe { platform.release_pages(reservation) };
+        }
+        Ok(())
+    }
 
     fn insert(&mut self, base: usize, reservation: Reservation) -> Option<Reservation> {
         let replaced = self.0.insert(base, reservation);
