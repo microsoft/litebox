@@ -65,6 +65,67 @@ fn test_guest_simd_survives_signal_delivery() {
     run_rewritten_fixture("./tests/sigreturn_simd.c", "sigreturn_simd_rewriter");
 }
 
+/// A trampoline too large for the guest's inter-segment hole is split into
+/// sub-trampolines: one fills the hole, the rest goes past the last segment.
+/// The guest checks that its first gate is in the hole and its last is not,
+/// then executes both, so every region must be mapped and finalized.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_split_trampoline_regions_are_all_installed() {
+    let unique_name = "split_trampoline_rewriter";
+    let target = common::compile("./tests/split_trampoline.c", unique_name, true, false);
+    let mut runner = Runner::new(&target, unique_name);
+    let rewritten = std::fs::read(
+        runner.tar_dir().join(
+            std::path::absolute(&target)
+                .unwrap()
+                .strip_prefix("/")
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    // AArch64 footer: (magic, table offset, sub-trampoline count, 0).
+    let footer = &rewritten[rewritten.len() - 32..];
+    assert_eq!(&footer[..8], b"LITEBOX0");
+    let regions = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+    assert!(
+        regions >= 2,
+        "the fixture must need several sub-trampolines for this test to mean anything; \
+         got {regions}"
+    );
+
+    let output = runner.output();
+    let stdout = String::from_utf8_lossy(&output);
+    for line in [
+        "early sub-trampoline ok",
+        "late sub-trampoline ok",
+        "split trampoline ok",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in: {stdout}");
+    }
+}
+
+/// The same guest left unrewritten, so the shim rewrites it at mmap time. It
+/// is built as a PIE because only a loaded span reserves the hole between its
+/// segments, which its gates fill before the runtime trampoline region. The
+/// guest checks that its first gate is in the hole and its last is not, then
+/// executes both.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn test_runtime_split_trampoline_regions_are_all_installed() {
+    let unique_name = "split_trampoline_runtime";
+    let target = common::compile("./tests/split_trampoline.c", unique_name, false, false);
+    let output = Runner::new_pre_rewritten(&target, unique_name).output();
+    let stdout = String::from_utf8_lossy(&output);
+    for line in [
+        "early sub-trampoline ok",
+        "late sub-trampoline ok",
+        "split trampoline ok",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?} in: {stdout}");
+    }
+}
+
 /// Semantic stress only: sampling cannot prove a signal PC landed inside a
 /// short gate; synthetic tests cover each gate instruction boundary.
 #[test]
