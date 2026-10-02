@@ -302,13 +302,13 @@ pub struct VmArea {
 impl VmArea {
     /// Get the [flags](`VmFlags`) of this memory area.
     #[inline]
-    pub(super) fn flags(self) -> VmFlags {
+    pub fn flags(self) -> VmFlags {
         self.flags
     }
 
     /// Check if this area is backed by a file.
     #[inline]
-    pub(super) fn is_file_backed(self) -> bool {
+    pub fn is_file_backed(self) -> bool {
         self.is_file_backed
     }
 
