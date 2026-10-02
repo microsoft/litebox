@@ -46,11 +46,9 @@ const PML4_INDEX_MASK: u64 = (1 << PAGE_TABLE_LEVEL_BITS) - 1;
 /// PML4 index of the first VTL1-kernel slot (`PA + KERNEL_OFFSET`).
 ///
 /// Only slots `>= KERNEL_PML4_START` are safe to share between page tables:
-/// their intermediate tables (P3/P2/P1) are fixed after boot, so sharing them
-/// is read-only. Lower slots (user, direct-map, vmap) get intermediate tables
-/// allocated and freed at runtime on whichever page table is active. Sharing
-/// those would let a task mutate the base's intermediate tables (and make
-/// frame ownership ambiguous at teardown), so each page table must own them.
+/// their intermediate tables are fixed after boot, though CPU startup unmaps
+/// stack-guard leaves. Lower slots (user, direct-map, vmap) allocate and free
+/// intermediate tables at runtime, so each page table must own them.
 ///
 /// `KERNEL_OFFSET` is `PML4_SLOT_SIZE` aligned, so this is an exact cutoff.
 pub(crate) const KERNEL_PML4_START: usize =
@@ -68,8 +66,8 @@ fn flush_tlb_range(start: Page<Size4KiB>, count: usize) {
         return;
     }
 
-    // If the current VP is the BSP, it might use MM operations **before** the hypercall page is set up.
-    // In that case, we fall back to local TLB flushes. This is safe because no AP enters VTL1 yet.
+    // Early BSP mappings need only local flushes. APs must initialize hypercalls
+    // and join the VTL1 VP mask before changing shared mappings.
     if !is_hvcall_ready() {
         if count <= TLB_SINGLE_PAGE_FLUSH_CEILING {
             let base = start.start_address().as_u64();

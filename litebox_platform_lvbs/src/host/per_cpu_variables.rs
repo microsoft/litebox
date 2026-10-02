@@ -11,7 +11,12 @@ use crate::{
     },
 };
 use aligned_vec::avec;
-use alloc::{boxed::Box, sync::Arc};
+use alloc::{
+    alloc::{alloc_zeroed, handle_alloc_error},
+    boxed::Box,
+    sync::Arc,
+};
+use core::alloc::Layout;
 use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
@@ -19,9 +24,13 @@ use litebox_common_linux::{rdgsbase, wrgsbase};
 use litebox_common_lvbs::MAX_CORES;
 use x86_64::VirtAddr;
 
-pub const DOUBLE_FAULT_STACK_SIZE: usize = 2 * PAGE_SIZE;
-pub const EXCEPTION_STACK_SIZE: usize = PAGE_SIZE;
-pub const KERNEL_STACK_SIZE: usize = 32 * PAGE_SIZE;
+// Stack sizes plus 4 guard pages fill a buddy block (128 pages debug, 64 release).
+pub const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
+pub const EXCEPTION_STACK_SIZE: usize = 4 * PAGE_SIZE;
+#[cfg(debug_assertions)]
+pub const KERNEL_STACK_SIZE: usize = 116 * PAGE_SIZE;
+#[cfg(not(debug_assertions))]
+pub const KERNEL_STACK_SIZE: usize = 52 * PAGE_SIZE;
 
 /// Per-CPU VTL1 kernel variables
 #[repr(C, align(4096))]
@@ -31,11 +40,6 @@ pub struct PerCpuVariables {
     /// All fields use `Cell<T>` for interior mutability, so they can be accessed
     /// through `&PerCpuVariables` without requiring `&mut`.
     pub(crate) asm: PerCpuVariablesAsm,
-    double_fault_stack: [u8; DOUBLE_FAULT_STACK_SIZE],
-    _guard_page_0: [u8; PAGE_SIZE],
-    exception_stack: [u8; EXCEPTION_STACK_SIZE],
-    kernel_stack: [u8; KERNEL_STACK_SIZE],
-    _guard_page_1: [u8; PAGE_SIZE],
     /// The below four pages are used for communication with the hypervisor and
     /// must be page-aligned. `UnsafeCell` is used for interior mutability since
     /// the hypervisor can write to or read from them with loose Rust guarantees.
@@ -66,6 +70,49 @@ pub struct PerCpuVariables {
     pub(crate) preemption_timeout_killed_user: Cell<bool>,
     /// Reference to the currently loaded page table (`None`: the base page table).
     active_page_table: UnsafeCell<Option<(usize, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
+    stacks: PerCpuStacks,
+}
+
+/// Layout only: allocate as raw memory, never create a reference to the whole arena.
+#[repr(C, align(4096))]
+struct PerCpuStackArena {
+    guard_0: [u8; PAGE_SIZE],
+    double_fault_stack: [u8; DOUBLE_FAULT_STACK_SIZE],
+    guard_1: [u8; PAGE_SIZE],
+    exception_stack: [u8; EXCEPTION_STACK_SIZE],
+    guard_2: [u8; PAGE_SIZE],
+    kernel_stack: [u8; KERNEL_STACK_SIZE],
+    guard_3: [u8; PAGE_SIZE],
+}
+
+const DOUBLE_FAULT_STACK_OFFSET: usize = offset_of!(PerCpuStackArena, double_fault_stack);
+const EXCEPTION_STACK_OFFSET: usize = offset_of!(PerCpuStackArena, exception_stack);
+const KERNEL_STACK_OFFSET: usize = offset_of!(PerCpuStackArena, kernel_stack);
+const STACK_GUARD_OFFSETS: [usize; 4] = [
+    offset_of!(PerCpuStackArena, guard_0),
+    offset_of!(PerCpuStackArena, guard_1),
+    offset_of!(PerCpuStackArena, guard_2),
+    offset_of!(PerCpuStackArena, guard_3),
+];
+
+/// Address of a leaked raw stack arena.
+struct PerCpuStacks {
+    base: usize,
+}
+
+impl PerCpuStacks {
+    const LAYOUT: Layout = Layout::new::<PerCpuStackArena>();
+
+    fn allocate() -> Self {
+        // Safety: nonzero, page-aligned layout. Retain the allocation for the CPU's lifetime.
+        let base = unsafe { alloc_zeroed(Self::LAYOUT) };
+        if base.is_null() {
+            handle_alloc_error(Self::LAYOUT);
+        }
+        Self {
+            base: base as usize,
+        }
+    }
 }
 
 // These Hyper-V pages must be page-aligned.
@@ -86,15 +133,15 @@ impl PerCpuVariables {
     const MXCSR_DEFAULT: u32 = 0x1f80;
 
     pub(crate) fn kernel_stack_top(&self) -> u64 {
-        &raw const self.kernel_stack as u64 + (self.kernel_stack.len() - 1) as u64
+        (self.stacks.base + KERNEL_STACK_OFFSET + KERNEL_STACK_SIZE - 1) as u64
     }
 
     pub(crate) fn double_fault_stack_top(&self) -> u64 {
-        &raw const self.double_fault_stack as u64 + (self.double_fault_stack.len() - 1) as u64
+        (self.stacks.base + DOUBLE_FAULT_STACK_OFFSET + DOUBLE_FAULT_STACK_SIZE - 1) as u64
     }
 
     pub(crate) fn exception_stack_top(&self) -> u64 {
-        &raw const self.exception_stack as u64 + (self.exception_stack.len() - 1) as u64
+        (self.stacks.base + EXCEPTION_STACK_OFFSET + EXCEPTION_STACK_SIZE - 1) as u64
     }
 
     pub(crate) fn hv_vp_assist_page_as_u64(&self) -> u64 {
@@ -538,6 +585,7 @@ fn get_per_cpu_variables_ptr() -> *mut PerCpuVariables {
 /// # Panics
 /// Panics if the heap allocation fails.
 pub fn allocate_per_cpu_variables() {
+    let stacks = PerCpuStacks::allocate();
     let mut per_cpu_variables = Box::<PerCpuVariables>::new_uninit();
     // Safety: `PerCpuVariables` is too large for the stack, so we zero-init
     // via `write_bytes` then fix up the `vp_index` sentinel. Zero is valid
@@ -548,6 +596,7 @@ pub fn allocate_per_cpu_variables() {
         let ptr = per_cpu_variables.as_mut_ptr();
         ptr.write_bytes(0, 1);
         core::ptr::addr_of_mut!((*ptr).active_page_table).write(UnsafeCell::new(None));
+        core::ptr::addr_of_mut!((*ptr).stacks).write(stacks);
         // Set the "uninitialized" sentinel for vp_index (0 is a valid VP index).
         core::ptr::addr_of_mut!((*ptr).vp_index).write(Cell::new(u32::MAX));
         per_cpu_variables.assume_init()
@@ -558,6 +607,29 @@ pub fn allocate_per_cpu_variables() {
     let addr = &raw const *pcv as u64;
     unsafe {
         wrgsbase(addr.trunc());
+    }
+}
+
+/// Unmap this CPU's stack guards before enabling interrupts.
+/// Requires the permanent page table, hypercalls, and VTL1 VP tracking.
+/// The raw stack arena stays allocated; guard pages must never be accessed.
+pub fn unmap_per_cpu_stack_guards(manager: &crate::PageTableManager) {
+    use litebox_common_linux::vmem::PageRange;
+
+    let base = with_per_cpu_variables(|pcv| pcv.stacks.base);
+    for offset in STACK_GUARD_OFFSETS {
+        let start = base + offset;
+        let range = PageRange {
+            start,
+            end: start + PAGE_SIZE,
+        };
+        // Safety: aligned, unused guards in a leaked allocation. Retain backing
+        // frames and shared page tables; flush stale translations on all CPUs.
+        let _ = unsafe {
+            manager
+                .base_page_table
+                .unmap_pages(range, false, true, false)
+        };
     }
 }
 

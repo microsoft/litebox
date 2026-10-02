@@ -220,6 +220,9 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         );
     }
 
+    let platform = BOOT_PLATFORM
+        .get()
+        .expect("init must publish the platform before any core uses it");
     // Allocate XSAVE areas now that we are on the kernel stack (the CPUID
     // queries and aligned-vec allocations need a lot of stack space).
     per_cpu_variables::allocate_xsave_area();
@@ -229,6 +232,9 @@ pub fn init(is_bsp: bool) -> &'static Platform {
     }
     gdt::init();
     interrupts::init_idt();
+    // Join shootdowns before unmapping shared guard pages.
+    vtl_switch_init();
+    per_cpu_variables::unmap_per_cpu_stack_guards(platform.page_table_manager());
     x86_64::instructions::interrupts::enable();
     Platform::enable_syscall_support();
 
@@ -236,9 +242,6 @@ pub fn init(is_bsp: bool) -> &'static Platform {
     // Per-CPU; safe to call on BSP and APs.
     timer::init();
 
-    let platform = BOOT_PLATFORM
-        .get()
-        .expect("init must publish the platform before any core uses it");
     if is_bsp {
         let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
             .with_ta_signing_cert(TA_SIGNING_CERT_DER)
@@ -249,8 +252,6 @@ pub fn init(is_bsp: bool) -> &'static Platform {
 }
 
 pub fn run(platform: &'static Platform) -> ! {
-    vtl_switch_init();
-
     let mut return_value: Option<i64> = None;
     loop {
         let params = vtl_switch(return_value);
