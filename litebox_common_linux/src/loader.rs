@@ -128,8 +128,8 @@ fn page_align_down(address: usize) -> usize {
     address & !(PAGE_SIZE - 1)
 }
 
-fn page_align_up(len: usize) -> usize {
-    len.next_multiple_of(PAGE_SIZE)
+fn page_align_up(len: usize) -> Option<usize> {
+    len.checked_next_multiple_of(PAGE_SIZE)
 }
 
 /// Errors that can occur when parsing an ELF file.
@@ -346,7 +346,7 @@ impl ElfParsedFile {
         }
 
         // The trampoline code should immediately precede the header.
-        if file_offset + trampoline_size as u64 != header_offset {
+        if file_offset.checked_add(trampoline_size as u64) != Some(header_offset) {
             return Err(ElfParseError::BadTrampoline);
         }
 
@@ -476,17 +476,27 @@ impl ElfParsedFile {
                 write: (ph.p_flags & elf::abi::PF_W) != 0,
                 execute: (ph.p_flags & elf::abi::PF_X) != 0,
             };
-            let adjusted_vaddr = base_addr + p_vaddr;
+            let adjusted_vaddr = base_addr
+                .checked_add(p_vaddr)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
             let load_start = page_align_down(adjusted_vaddr);
-            let file_end = page_align_up(adjusted_vaddr + p_filesz);
-            let load_end = page_align_up(adjusted_vaddr + p_memsz);
+            let unaligned_file_end = adjusted_vaddr
+                .checked_add(p_filesz)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let file_end =
+                page_align_up(unaligned_file_end).ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let load_end = adjusted_vaddr
+                .checked_add(p_memsz)
+                .and_then(page_align_up)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
             if file_end > load_start {
                 // Map the file-backed portion.
                 // `p_offset` should be co-aligned with `p_vaddr`. If it is not,
                 // then `map_file` is expected to fail.
                 let offset = ph
                     .p_offset
-                    .wrapping_sub((adjusted_vaddr - load_start) as u64);
+                    .checked_sub((adjusted_vaddr - load_start) as u64)
+                    .ok_or(ElfLoadError::InvalidProgramHeader)?;
                 mapper
                     .map_file(load_start, file_end - load_start, offset, &prot)
                     .map_err(ElfLoadError::Map)?;
@@ -498,11 +508,11 @@ impl ElfParsedFile {
                 // depend on it. But we only do this if `p_memsz` is beyond
                 // `p_filesz` and the segment is writable. This matches other
                 // loaders' behavior, so it should be sufficient.
-                if p_memsz > p_filesz && ph.p_flags & elf::abi::PF_W != 0 {
-                    let unaligned_file_end = adjusted_vaddr + p_filesz;
-                    if file_end > unaligned_file_end {
-                        mem.zero(unaligned_file_end, file_end - unaligned_file_end)?;
-                    }
+                if p_memsz > p_filesz
+                    && ph.p_flags & elf::abi::PF_W != 0
+                    && file_end > unaligned_file_end
+                {
+                    mem.zero(unaligned_file_end, file_end - unaligned_file_end)?;
                 }
             }
             if load_end > file_end {
@@ -527,7 +537,9 @@ impl ElfParsedFile {
         let mut info = MappingInfo {
             base_addr,
             brk,
-            entry_point: base_addr.wrapping_add(self.header.e_entry.trunc()),
+            entry_point: base_addr
+                .checked_add(self.header.e_entry.trunc())
+                .ok_or(ElfLoadError::InvalidProgramHeader)?,
             phdrs_addr,
             num_phdrs: self.header.e_phnum.into(),
         };
@@ -538,7 +550,9 @@ impl ElfParsedFile {
             // Reserve space for a runtime trampoline so brk starts past it.
             // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
             // will allocate the actual trampoline in this region via MAP_FIXED.
-            info.brk = page_align_up(info.brk) + page_align_up(size);
+            info.brk = page_align_up(info.brk)
+                .and_then(|start| page_align_up(size).and_then(|size| start.checked_add(size)))
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
         }
 
         Ok(info)
@@ -552,8 +566,11 @@ impl ElfParsedFile {
         info: &mut MappingInfo,
     ) -> Result<(), ElfLoadError<M::Error>> {
         let trampoline = self.trampoline.as_ref().unwrap();
-        let trampoline_start = info.base_addr + trampoline.vaddr;
-        let trampoline_end = page_align_up(info.base_addr + trampoline.vaddr + trampoline.size);
+        let range = self
+            .trampoline_page_range(info.base_addr)
+            .ok_or(ElfLoadError::InvalidProgramHeader)?;
+        let trampoline_start = range.start;
+        let trampoline_end = range.end;
         mapper
             .map_file(
                 trampoline_start,
@@ -811,6 +828,151 @@ impl Protection {
             flags |= crate::ProtFlags::PROT_EXEC;
         }
         flags
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_pointer_width = "64")]
+mod overflow_tests {
+    use super::*;
+
+    struct Mapper {
+        base: usize,
+        mappings: usize,
+    }
+
+    impl MapMemory for Mapper {
+        type Error = ();
+
+        fn reserve(&mut self, _len: usize, _align: usize) -> Result<usize, ()> {
+            Ok(self.base)
+        }
+
+        fn map_file(
+            &mut self,
+            _address: usize,
+            _len: usize,
+            _offset: u64,
+            _prot: &Protection,
+        ) -> Result<(), ()> {
+            self.mappings += 1;
+            Ok(())
+        }
+
+        fn map_zero(&mut self, _address: usize, _len: usize, _prot: &Protection) -> Result<(), ()> {
+            self.mappings += 1;
+            Ok(())
+        }
+
+        fn protect(&mut self, _address: usize, _len: usize, _prot: &Protection) -> Result<(), ()> {
+            Ok(())
+        }
+    }
+
+    struct Memory;
+
+    impl AccessMemory for Memory {
+        fn read(&mut self, _address: usize, _buf: &mut [u8]) -> Result<usize, Fault> {
+            panic!("invalid ELF must not access memory")
+        }
+
+        fn write(&mut self, _address: usize, _data: &[u8]) -> Result<(), Fault> {
+            panic!("invalid ELF must not access memory")
+        }
+
+        fn zero(&mut self, _address: usize, _len: usize) -> Result<(), Fault> {
+            panic!("invalid ELF must not access memory")
+        }
+    }
+
+    fn elf_file(vaddr: u64, size: u64, offset: u64) -> ElfParsedFile {
+        let mut phdr = alloc::vec![0; size_of::<elf::segment::Elf64_Phdr>()];
+        phdr[..4].copy_from_slice(&elf::abi::PT_LOAD.to_le_bytes());
+        phdr[8..16].copy_from_slice(&offset.to_le_bytes());
+        phdr[16..24].copy_from_slice(&vaddr.to_le_bytes());
+        phdr[32..40].copy_from_slice(&size.to_le_bytes());
+        phdr[40..48].copy_from_slice(&size.to_le_bytes());
+        ElfParsedFile {
+            header: FileHeader {
+                class: CLASS,
+                endianness: Endian::default(),
+                version: 1,
+                osabi: 0,
+                abiversion: 0,
+                e_type: elf::abi::ET_EXEC,
+                e_machine: MACHINE,
+                e_entry: 0,
+                e_phoff: 0,
+                e_shoff: 0,
+                e_flags: 0,
+                e_ehsize: 64,
+                e_phentsize: u16::try_from(phdr.len()).unwrap(),
+                e_phnum: 1,
+                e_shentsize: 0,
+                e_shnum: 0,
+                e_shstrndx: 0,
+            },
+            phdrs: phdr,
+            trampoline: None,
+        }
+    }
+
+    #[test]
+    fn test_segment_address_overflow() {
+        for (vaddr, size, offset, base, dynamic) in [
+            (usize::MAX as u64 - 1, 1, 0, 0, false),
+            (0x1000, 0x1000, 0, usize::MAX - 0xfff, true),
+            (0, 0x2000, 0, usize::MAX - 0xfff, true),
+            (1, 1, 0, 0, false),
+        ] {
+            let mut file = elf_file(vaddr, size, offset);
+            if dynamic {
+                file.header.e_type = elf::abi::ET_DYN;
+            }
+            let mut mapper = Mapper { base, mappings: 0 };
+            assert!(matches!(
+                file.load(&mut mapper, &mut Memory, None),
+                Err(ElfLoadError::InvalidProgramHeader)
+            ));
+            assert_eq!(mapper.mappings, 0);
+        }
+    }
+
+    #[test]
+    fn test_entry_and_trampoline_overflow() {
+        let mut file = elf_file(0, PAGE_SIZE as u64, 0);
+        file.header.e_type = elf::abi::ET_DYN;
+        file.header.e_entry = usize::MAX as u64;
+        let mut mapper = Mapper {
+            base: PAGE_SIZE,
+            mappings: 0,
+        };
+        assert!(matches!(
+            file.load(&mut mapper, &mut Memory, None),
+            Err(ElfLoadError::InvalidProgramHeader)
+        ));
+        file.header.e_entry = 0;
+        assert!(matches!(
+            file.load(&mut mapper, &mut Memory, Some(usize::MAX)),
+            Err(ElfLoadError::InvalidProgramHeader)
+        ));
+        file.trampoline = Some(TrampolineInfo {
+            vaddr: usize::MAX - PAGE_SIZE + 1,
+            file_offset: 0,
+            size: 1,
+            syscall_entry_point: 1,
+        });
+        let mut info = MappingInfo {
+            base_addr: PAGE_SIZE,
+            brk: 0,
+            entry_point: 0,
+            phdrs_addr: 0,
+            num_phdrs: 0,
+        };
+        assert!(matches!(
+            file.load_trampoline(&mut mapper, &mut Memory, &mut info),
+            Err(ElfLoadError::InvalidProgramHeader)
+        ));
     }
 }
 
