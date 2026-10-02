@@ -90,7 +90,7 @@ pub trait ReservationStore {
     fn overlapping(
         &self,
         range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)>;
+    ) -> impl DoubleEndedIterator<Item = &Self::Reservation>;
 
     /// Remove and return every reservation overlapping `range` in ascending address order.
     fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Self::Reservation>;

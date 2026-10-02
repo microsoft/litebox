@@ -354,9 +354,6 @@ fn insert_mapped_vma<Platform: PageManagementProvider<ALIGN>, const ALIGN: usize
     vmas.insert(start..end, vma);
 }
 
-/// Reservation store required of platforms used by Linux-style shims.
-pub type ShimReservations<Reservation> = NoTrackedReservations<PAGE_SIZE, Reservation>;
-
 /// Linux Vmem operations supported by a reservation store.
 pub trait LinuxReservationStore<Platform, const ALIGN: usize>:
     ReservationStore + Send + Sync
@@ -417,10 +414,7 @@ where
         // stores yield covering handles; handle-free stores yield an empty iterator.
         unsafe {
             platform.protect_pages(
-                || {
-                    self.overlapping(range.clone())
-                        .map(|(_, reservation)| reservation)
-                },
+                || self.overlapping(range.clone()),
                 range.clone(),
                 permissions,
             )
@@ -573,17 +567,15 @@ where
         // SAFETY: The tracked reservations now completely cover the requested range.
         match unsafe {
             platform.commit_pages(
-                || {
-                    self.overlapping(range.clone())
-                        .map(|(_, reservation)| reservation)
-                },
+                || self.overlapping(range.clone()),
                 range.clone(),
                 permissions,
                 populate_pages_immediately,
             )
         } {
             Ok(pointer) => {
-                // Committing already committed pages only changes their permissions but does not discard their contents.
+                // Recommitting preserves contents, so zero them in place. Decommitting first would
+                // be lazier, but a failed recommit would then lose the replaced contents.
                 if behavior == FixedAddressBehavior::Replace {
                     let temporary_permissions = (permissions
                         | MemoryRegionPermissions::READ
@@ -634,13 +626,7 @@ where
                 for gap in vmas.gaps(&range) {
                     // SAFETY: These gaps have no published mappings or active users.
                     let _ = unsafe {
-                        platform.decommit_pages(
-                            || {
-                                self.overlapping(gap.clone())
-                                    .map(|(_, reservation)| reservation)
-                            },
-                            gap.clone(),
-                        )
+                        platform.decommit_pages(|| self.overlapping(gap.clone()), gap.clone())
                     };
                 }
                 // Lastly release any newly acquired reservations.
@@ -704,9 +690,9 @@ pub(super) struct Vmem<Platform: PageManagementProvider<ALIGN> + 'static, const 
     /// Memory backend that provides the actual memory.
     pub(super) platform: &'static Platform,
     /// Virtual memory areas.
-    pub(super) vmas: RangeMap<usize, VmArea>,
+    vmas: RangeMap<usize, VmArea>,
     /// Reservations selected and owned by the platform.
-    pub(super) reservations: Platform::Reservations,
+    reservations: Platform::Reservations,
 }
 
 impl<Platform, const ALIGN: usize> Vmem<Platform, ALIGN>
@@ -766,6 +752,21 @@ where
                 .unmap(self.platform, &mut self.vmas, range)
         }
         .map_err(VmemUnmapError::UnmapError)?;
+        Ok(())
+    }
+
+    /// Release every mapping and reservation owned by this address space.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that no mapped memory remains in use.
+    pub(super) unsafe fn release_all(&mut self) -> Result<(), DeallocationError> {
+        // SAFETY: The caller relinquishes every owned extent without remaining users.
+        unsafe {
+            self.reservations
+                .release_all::<Platform, ALIGN, _>(&self.vmas, self.platform)
+        }?;
+        self.vmas.clear();
         Ok(())
     }
 
@@ -1761,25 +1762,34 @@ mod tests {
 
     litebox::define_page_reservation!(DummyReservation);
 
+    type UntrackedDummyReservations = NoTrackedReservations<PAGE_SIZE, DummyReservation<PAGE_SIZE>>;
+    type TrackedDummyReservations = TrackedReservations<DummyReservation<PAGE_SIZE>>;
+
     /// A configurable dummy page-management backend.
-    struct DummyVmemBackend<const TOP_DOWN: bool = false> {
+    struct DummyVmemBackend<const TOP_DOWN: bool = false, Store = UntrackedDummyReservations> {
         rejected_address: Option<usize>,
+        rejected_commit: Option<usize>,
         calls: Mutex<Vec<AllocationCall>>,
+        decommits: Mutex<Vec<Range<usize>>>,
         releases: Mutex<Vec<Range<usize>>>,
+        store: core::marker::PhantomData<fn() -> Store>,
     }
 
-    impl<const TOP_DOWN: bool> litebox::platform::RawPointerProvider for DummyVmemBackend<TOP_DOWN> {
+    impl<const TOP_DOWN: bool, Store> litebox::platform::RawPointerProvider
+        for DummyVmemBackend<TOP_DOWN, Store>
+    {
         type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
         type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
     }
 
     #[expect(unused_variables, reason = "dummy/mock backend")]
-    impl<const TOP_DOWN: bool> PageManagementProvider<PAGE_SIZE> for DummyVmemBackend<TOP_DOWN> {
-        type Reservations =
-            litebox::platform::common_providers::reservations::NoTrackedReservations<
-                PAGE_SIZE,
-                DummyReservation<PAGE_SIZE>,
-            >;
+    impl<const TOP_DOWN: bool, Store> PageManagementProvider<PAGE_SIZE>
+        for DummyVmemBackend<TOP_DOWN, Store>
+    where
+        Store: ReservationStore<Reservation = DummyReservation<PAGE_SIZE>> + Default,
+        Store::ReleaseTarget: Into<Range<usize>>,
+    {
+        type Reservations = Store;
 
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         const TASK_ADDR_MIN: usize = 0x1_0000;
@@ -1807,6 +1817,9 @@ mod tests {
             Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
             DummyReservation<PAGE_SIZE>: 'reservation,
         {
+            if self.rejected_commit == Some(range.start) {
+                return Err(AllocationError::OutOfMemory);
+            }
             Ok(TransparentMutPtr::from_usize(range.start))
         }
 
@@ -1845,20 +1858,21 @@ mod tests {
         unsafe fn decommit_pages<'reservation, Reservations>(
             &self,
             _covering_reservations: impl FnOnce() -> Reservations,
-            _range: Range<usize>,
+            range: Range<usize>,
         ) -> Result<(), litebox::platform::page_mgmt::DeallocationError>
         where
             Reservations: Iterator<Item = &'reservation DummyReservation<PAGE_SIZE>>,
             DummyReservation<PAGE_SIZE>: 'reservation,
         {
+            self.decommits.lock().push(range);
             Ok(())
         }
 
         unsafe fn release_pages(
             &self,
-            range: Range<usize>,
+            target: litebox::platform::page_mgmt::ReleaseTargetOf<Self, PAGE_SIZE>,
         ) -> Result<(), litebox::platform::page_mgmt::DeallocationError> {
-            self.releases.lock().push(range);
+            self.releases.lock().push(target.into());
             Ok(())
         }
 
@@ -1900,10 +1914,26 @@ mod tests {
     fn dummy_backend<const TOP_DOWN: bool>(
         rejected_address: Option<usize>,
     ) -> &'static DummyVmemBackend<TOP_DOWN> {
+        new_dummy_backend(rejected_address, None)
+    }
+
+    fn tracked_dummy_backend(
+        rejected_commit: Option<usize>,
+    ) -> &'static DummyVmemBackend<false, TrackedDummyReservations> {
+        new_dummy_backend(None, rejected_commit)
+    }
+
+    fn new_dummy_backend<const TOP_DOWN: bool, Store: 'static>(
+        rejected_address: Option<usize>,
+        rejected_commit: Option<usize>,
+    ) -> &'static DummyVmemBackend<TOP_DOWN, Store> {
         Box::leak(Box::new(DummyVmemBackend {
             rejected_address,
+            rejected_commit,
             calls: Mutex::new(Vec::new()),
+            decommits: Mutex::new(Vec::new()),
             releases: Mutex::new(Vec::new()),
+            store: core::marker::PhantomData,
         }))
     }
 
@@ -2060,8 +2090,156 @@ mod tests {
         );
     }
 
-    fn collect_mappings(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<Range<usize>> {
+    fn collect_mappings<Platform: PageManagementProvider<PAGE_SIZE>>(
+        vmm: &Vmem<Platform, PAGE_SIZE>,
+    ) -> Vec<Range<usize>> {
         vmm.iter().map(|v| v.0.start..v.0.end).collect()
+    }
+
+    fn collect_reservations(
+        vmm: &Vmem<DummyVmemBackend<false, TrackedDummyReservations>, PAGE_SIZE>,
+    ) -> Vec<Range<usize>> {
+        vmm.reservations
+            .iter()
+            .map(|(_, reservation)| reservation.range())
+            .collect()
+    }
+
+    fn read_write_vma() -> VmArea {
+        VmArea::new(
+            VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD | VmFlags::VM_MAYWRITE,
+            false,
+        )
+    }
+
+    #[test]
+    fn tracked_unmap_decommits_shared_reservations_and_releases_unused_ones() {
+        let base = 0x10_0000;
+        let mut vmm = Vmem::new(tracked_dummy_backend(None));
+        let page = |index: usize| base + index * PAGE_SIZE;
+
+        unsafe {
+            vmm.insert_mapping(
+                PageRange::new(page(0), page(4)).unwrap(),
+                read_write_vma(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        unsafe { vmm.remove_mapping(PageRange::new(page(1), page(2)).unwrap()) }.unwrap();
+        assert_eq!(*vmm.platform.decommits.lock(), vec![page(1)..page(2)]);
+        assert!(vmm.platform.releases.lock().is_empty());
+        assert_eq!(collect_reservations(&vmm), vec![page(0)..page(4)]);
+        assert_eq!(collect_mappings(&vmm), [page(0)..page(1), page(2)..page(4)]);
+
+        // Remapping the hole commits within the retained reservation without reserving again.
+        unsafe {
+            vmm.insert_mapping(
+                PageRange::new(page(1), page(2)).unwrap(),
+                read_write_vma(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        assert_eq!(vmm.platform.calls.lock().len(), 1);
+        assert_eq!(collect_mappings(&vmm), vec![page(0)..page(4)]);
+
+        unsafe {
+            vmm.insert_mapping(
+                PageRange::new(page(8), page(9)).unwrap(),
+                read_write_vma(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        unsafe { vmm.remove_mapping(PageRange::new(page(8), page(9)).unwrap()) }.unwrap();
+        assert_eq!(*vmm.platform.releases.lock(), vec![page(8)..page(9)]);
+
+        unsafe { vmm.release_all() }.unwrap();
+        assert_eq!(
+            *vmm.platform.releases.lock(),
+            [page(8)..page(9), page(0)..page(4)]
+        );
+        assert_eq!(vmm.reservations.iter().count(), 0);
+        assert_eq!(vmm.iter().count(), 0);
+    }
+
+    #[test]
+    fn tracked_commit_failure_rolls_back_new_reservations() {
+        let base = 0x10_0000;
+        let page = |index: usize| base + index * PAGE_SIZE;
+        let mut vmm = Vmem::new(tracked_dummy_backend(Some(page(1))));
+
+        unsafe {
+            vmm.insert_mapping(
+                PageRange::new(page(0), page(2)).unwrap(),
+                read_write_vma(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        unsafe { vmm.remove_mapping(PageRange::new(page(1), page(2)).unwrap()) }.unwrap();
+
+        // The request spans the retained hole and a new gap, so it reserves the gap then commits.
+        let result = unsafe {
+            vmm.insert_mapping(
+                PageRange::new(page(1), page(3)).unwrap(),
+                read_write_vma(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        };
+        assert!(matches!(result, Err(AllocationError::OutOfMemory)));
+        assert_eq!(
+            vmm.platform.decommits.lock().last(),
+            Some(&(page(1)..page(3)))
+        );
+        assert_eq!(*vmm.platform.releases.lock(), vec![page(2)..page(3)]);
+        assert_eq!(collect_reservations(&vmm), vec![page(0)..page(2)]);
+        assert_eq!(collect_mappings(&vmm), vec![page(0)..page(1)]);
+    }
+
+    #[test]
+    fn tracked_replace_zeroes_existing_contents() {
+        let layout = core::alloc::Layout::from_size_align(2 * PAGE_SIZE, PAGE_SIZE).unwrap();
+        // SAFETY: The layout is nonzero; the buffer models committed pages and is freed below.
+        let buffer = unsafe { alloc::alloc::alloc(layout) };
+        assert!(!buffer.is_null());
+        let base = buffer as usize;
+        let mut vmm = Vmem::new(tracked_dummy_backend(None));
+
+        unsafe {
+            vmm.insert_mapping(
+                PageRange::new(base, base + 2 * PAGE_SIZE).unwrap(),
+                read_write_vma(),
+                false,
+                FixedAddressBehavior::NoReplace,
+            )
+        }
+        .unwrap();
+        // SAFETY: The buffer is live, exclusively owned, and spans two pages.
+        unsafe { buffer.write_bytes(0xAA, 2 * PAGE_SIZE) };
+
+        unsafe {
+            vmm.insert_mapping(
+                PageRange::new(base, base + 2 * PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                false,
+                FixedAddressBehavior::Replace,
+            )
+        }
+        .unwrap();
+        // SAFETY: The buffer is live and no longer written through the mapping.
+        let contents = unsafe { core::slice::from_raw_parts(buffer, 2 * PAGE_SIZE) };
+        assert!(contents.iter().all(|&byte| byte == 0));
+        assert_eq!(vmm.platform.calls.lock().len(), 1);
+        assert_eq!(collect_reservations(&vmm), vec![base..base + 2 * PAGE_SIZE]);
+        // SAFETY: The buffer was allocated above with this layout and is no longer used.
+        unsafe { alloc::alloc::dealloc(buffer, layout) };
     }
 
     #[test]

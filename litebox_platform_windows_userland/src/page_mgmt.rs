@@ -113,13 +113,33 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     }
 
     fn release_reservation(reservation: WindowsUserlandReservation<ALIGN>) {
-        let base = reservation.range().start;
-        assert_ne!(
-            unsafe { VirtualFree(base as *mut c_void, 0, Win32_Memory::MEM_RELEASE) },
-            0,
-            "VirtualFree(RELEASE) failed: {}",
-            std::io::Error::last_os_error()
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn NtFreeVirtualMemory(
+                process: windows_sys::Win32::Foundation::HANDLE,
+                base: *mut *mut c_void,
+                size: *mut usize,
+                free_type: Win32_Memory::VIRTUAL_FREE_TYPE,
+            ) -> windows_sys::Win32::Foundation::NTSTATUS;
+        }
+        let extent = reservation.range();
+        let mut base = extent.start as *mut c_void;
+        let mut size = extent.len();
+        // Unlike `VirtualFree`, a sized native release frees page-aligned split sub-extents.
+        // SAFETY: The reservation exclusively owns this extent and the caller excludes all users.
+        let status = unsafe {
+            NtFreeVirtualMemory(
+                GetCurrentProcess(),
+                &raw mut base,
+                &raw mut size,
+                Win32_Memory::MEM_RELEASE,
+            )
+        };
+        assert!(
+            status >= 0,
+            "NtFreeVirtualMemory(RELEASE) failed: {status:#x}"
         );
+        debug_assert_eq!(base as usize..base as usize + size, extent);
     }
 
     fn commit_reservations<'reservation>(
@@ -408,6 +428,80 @@ mod tests {
         Ok(())
     }
 
+    fn collect_regions(
+        range: core::ops::Range<usize>,
+    ) -> Vec<(
+        core::ops::Range<usize>,
+        Win32_Memory::VIRTUAL_ALLOCATION_TYPE,
+    )> {
+        let mut regions = Vec::new();
+        process_memory_range_by_regions(
+            range,
+            |region, state| -> Result<bool, core::convert::Infallible> {
+                regions.push((region, state));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        regions
+    }
+
+    #[test]
+    fn test_release_split_reservations() {
+        let platform = WindowsUserland::new();
+        let suggested = <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MIN;
+        // SAFETY: The fixture retains exclusive ownership of the returned reservation.
+        let reservation = unsafe {
+            <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::reserve_and_commit_pages(
+                platform,
+                core::iter::empty,
+                suggested..suggested + 0x2_0000,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                false,
+                false,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let base = reservation.range().start;
+        let (prefix, middle, suffix) = reservation.split(base + PAGE_SIZE..base + 2 * PAGE_SIZE);
+        let (prefix, suffix) = (prefix.unwrap(), suffix.unwrap());
+
+        // SAFETY: The split handle exclusively owns the unused middle page.
+        unsafe {
+            <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::release_pages(platform, middle)
+        }
+        .unwrap();
+        assert_eq!(
+            collect_regions(base..base + 0x2_0000),
+            vec![
+                (base..base + PAGE_SIZE, Win32_Memory::MEM_COMMIT),
+                (
+                    base + PAGE_SIZE..base + 2 * PAGE_SIZE,
+                    Win32_Memory::MEM_FREE
+                ),
+                (
+                    base + 2 * PAGE_SIZE..base + 0x2_0000,
+                    Win32_Memory::MEM_COMMIT
+                ),
+            ]
+        );
+
+        for remainder in [prefix, suffix] {
+            // SAFETY: Each split handle exclusively owns its unused remainder.
+            unsafe {
+                <WindowsUserland as PageManagementProvider<PAGE_SIZE>>::release_pages(
+                    platform, remainder,
+                )
+            }
+            .unwrap();
+        }
+        assert_eq!(
+            collect_regions(base..base + 0x2_0000),
+            vec![(base..base + 0x2_0000, Win32_Memory::MEM_FREE)]
+        );
+    }
+
     #[test]
     fn test_reserve_and_commit_pages() {
         let platform = WindowsUserland::new();
@@ -463,19 +557,6 @@ mod tests {
 
     #[test]
     fn test_page_provider() {
-        let collect_regions = |r| {
-            let mut regions = Vec::new();
-            process_memory_range_by_regions(
-                r,
-                |region, state| -> Result<bool, core::convert::Infallible> {
-                    regions.push((region, state));
-                    Ok(true)
-                },
-            )
-            .unwrap();
-            regions
-        };
-
         let platform = WindowsUserland::new();
         let system_allocation_granularity =
             platform.sys_info.read().unwrap().dwAllocationGranularity as usize;

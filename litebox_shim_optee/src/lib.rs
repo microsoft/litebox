@@ -448,9 +448,8 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// The caller must ensure that no references to the released memory regions
     /// are held after this call.
     pub unsafe fn release_user_mappings(&self) {
-        let release = |_r: core::ops::Range<usize>, _vm: litebox_common_linux::vmem::VmFlags| true;
         unsafe {
-            let _ = self.memory_manager().release_memory(release);
+            let _ = self.memory_manager().release_memory();
         }
     }
 }
