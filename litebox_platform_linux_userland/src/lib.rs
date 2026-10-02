@@ -2315,18 +2315,6 @@ mod tests {
 
     #[test]
     fn test_seccomp_filter() {
-        // Isolate the process-wide filter from other tests.
-        const CHILD_ENV: &str = "LITEBOX_TEST_SECCOMP_CHILD";
-        if std::env::var_os(CHILD_ENV).is_none() {
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "tests::test_seccomp_filter", "--test-threads=1"])
-                .env(CHILD_ENV, "1")
-                .status()
-                .unwrap();
-            assert!(status.success(), "seccomp child test failed: {status}");
-            return;
-        }
-
         let _platform: &LinuxUserland = LinuxUserland::new(None);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let worker_barrier = barrier.clone();
