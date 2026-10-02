@@ -30,9 +30,12 @@ use litebox::platform::{
 };
 use litebox::{
     mm::exception_table::search_exception_tables,
-    platform::page_mgmt::{
-        AllocationError, DeallocationError, FixedAddressBehavior, MemoryRegionPermissions,
-        PermissionUpdateError,
+    platform::{
+        common_providers::reservations::NoTrackedReservations,
+        page_mgmt::{
+            AllocationError, DeallocationError, FixedAddressBehavior, HintPlacementBehavior,
+            MemoryRegionPermissions, PermissionUpdateError,
+        },
     },
     shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo},
     utils::TruncateExt,
@@ -604,9 +607,14 @@ fn vm_flags(permissions: MemoryRegionPermissions) -> VmFlags {
         .expect("MemoryRegionPermissions bits are VmFlags bits")
 }
 
+litebox::define_page_reservation!(VmReservation);
+
 impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
+    type Reservations = NoTrackedReservations<ALIGN, VmReservation<ALIGN>>;
+
     const TASK_ADDR_MIN: usize = USER_ADDR_MIN;
     const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
+    const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Exact;
 
     fn allocate_pages(
         &self,
@@ -626,7 +634,7 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         }
         let current_pt = self.page_table_manager.current_page_table();
         match fixed_address_behavior {
-            FixedAddressBehavior::Hint | FixedAddressBehavior::NoReplace => {}
+            FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Safety: the caller replaces this range, so nothing uses it.
                 // Unmapping fails only for an unaligned range.
@@ -641,7 +649,7 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         unsafe { current_pt.map_pages(range, flags, populate_pages_immediately) }
     }
 
-    unsafe fn deallocate_pages(
+    unsafe fn release_pages(
         &self,
         range: core::ops::Range<usize>,
     ) -> Result<(), DeallocationError> {
