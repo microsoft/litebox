@@ -40,8 +40,9 @@ int main(void) {
     long (*original)(void) = (void *)code;
     uintptr_t old_entry = island_entry(code + 1);
     CHECK(old_entry && original() == 201);
-    uint32_t old_slot[6];
+    uint32_t old_slot[6], old_code[3];
     memcpy(old_slot, (void *)old_entry, sizeof old_slot);
+    memcpy(old_code, code, sizeof old_code);
 
     // A rejected request that changes nothing must leave the mapping usable,
     // even though conservative invalidation forces the exact-range RX to rescan.
@@ -51,10 +52,15 @@ int main(void) {
     CHECK(mprotect(code, 4096, PROT_READ | PROT_EXEC) == 0);
     CHECK(island_entry(code + 1) == old_entry && original() == 201);
 
-    // This request makes the tracked RX page writable before failing on the
-    // trailing read-only shared file page. Replace its first island B with SVC.
+    // Vmem preflights the trailing shared page: rejection must leave the RX
+    // code unchanged and callable. Only an explicit successful RW may edit it.
     errno = 0;
     CHECK(mprotect(code, 2 * 4096, PROT_READ | PROT_WRITE) == -1 && errno == EACCES);
+    CHECK(memcmp(old_code, code, sizeof old_code) == 0);
+    CHECK(island_entry(code + 1) == old_entry && original() == 201);
+    CHECK(mprotect(code, 4096, PROT_READ | PROT_EXEC) == 0);
+    CHECK(island_entry(code + 1) == old_entry && original() == 201);
+    CHECK(mprotect(code, 4096, PROT_READ | PROT_WRITE) == 0);
     code[0] = 0xd2800708; // mov x8, #56 (openat)
     code[1] = 0xd4000001; // svc #0
     code[2] = 0xd65f03c0; // ret
@@ -71,6 +77,6 @@ int main(void) {
     CHECK(read((int)reopened, &byte, 1) == 1 && byte == 0x5a);
     CHECK(close((int)reopened) == 0);
     CHECK(munmap(base, 3 * 4096) == 0);
-    puts("partial mprotect EACCES rescanned replacement SVC; guest-only openat stayed intercepted");
+    puts("mprotect EACCES preserved RX; explicit RW/RX rescanned SVC and guest-only openat stayed intercepted");
     return 0;
 }

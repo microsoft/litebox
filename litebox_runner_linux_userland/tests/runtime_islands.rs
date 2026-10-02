@@ -59,7 +59,7 @@ fn runtime_mapping_lifecycle_and_growth() {
 }
 
 #[test]
-fn runtime_island_partial_mprotect_failure_rescans_modified_code() {
+fn runtime_island_rejected_mprotect_preserves_code_before_explicit_rewrite() {
     let path = common::compile("./tests/island_mprotect.c", "island_mprotect", false, false);
     let mut runner = Runner::new_unpatched(&path, "island_mprotect");
     std::fs::write(

@@ -70,7 +70,7 @@ fn read_bytes(address: usize, len: usize) -> Vec<u8> {
 }
 
 #[test]
-fn failed_writable_mprotect_rescans_sites_without_retiring_pairs() {
+fn rejected_writable_mprotect_preserves_sites_until_explicit_rewrite() {
     let task = init_platform();
     create_file(&task, "/island-mprotect", &image());
     create_file(&task, "/island-readonly", &alloc::vec![0; PAGE_SIZE]);
@@ -169,12 +169,37 @@ fn failed_writable_mprotect_rescans_sites_without_retiring_pairs() {
         original.as_ref()
     );
 
-    // Starting at the RX ELF page changes it to RW before the trailing shared
-    // page rejects +W. Replacing B with SVC must invalidate the exact-range hit.
+    // Vmem preflights the trailing shared page before changing the RX page.
+    // Conservative invalidation must not change its bytes or retire its pairs.
     assert_eq!(
         task.sys_mprotect(code, 2 * PAGE_SIZE, ProtFlags::PROT_READ_WRITE),
         Err(Errno::EACCES)
     );
+    assert_eq!(task.global.mm.mappings(), before);
+    assert_eq!(
+        code.to_owned_slice::<TestPlatform>(PAGE_SIZE)
+            .unwrap()
+            .as_ref(),
+        original.as_ref()
+    );
+    assert!(
+        task.global.elf_patch_cache.lock()[&key]
+            .patched_ranges
+            .is_empty()
+    );
+    task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+        .unwrap();
+    assert_eq!(
+        code.to_owned_slice::<TestPlatform>(PAGE_SIZE)
+            .unwrap()
+            .as_ref(),
+        original.as_ref()
+    );
+
+    // A successful, explicit RW transition permits replacing B with SVC; the
+    // following RX transition must rescan rather than reuse the exact-range hit.
+    task.sys_mprotect(code, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
+        .unwrap();
     assert!(task.global.mm.mappings().iter().any(|(range, flags)| {
         range.contains(&code.as_usize())
             && flags.contains(VmFlags::VM_READ | VmFlags::VM_WRITE)
