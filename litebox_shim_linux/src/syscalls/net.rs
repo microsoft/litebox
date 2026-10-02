@@ -2860,6 +2860,37 @@ mod unix_tests {
 
     extern crate std;
 
+    #[test]
+    fn test_unix_sockaddr_short_buffer() {
+        type Platform = crate::syscalls::tests::TestPlatform;
+        let _task = init_platform(None);
+        for address in [
+            UnixSocketAddr::Unnamed,
+            UnixSocketAddr::Abstract(alloc::vec![b'a', b'b']),
+            UnixSocketAddr::Path("ab".to_string()),
+        ] {
+            let expected_len = match &address {
+                UnixSocketAddr::Unnamed => 2,
+                UnixSocketAddr::Abstract(_) | UnixSocketAddr::Path(_) => 5,
+            };
+            for capacity in 0..=6u32 {
+                let mut buffer = [0xa5u8; 8];
+                let mut addrlen = capacity;
+                super::write_sockaddr_to_user::<Platform>(
+                    SocketAddress::Unix(address.clone()),
+                    UserPtrMut::from_ptr(buffer.as_mut_ptr()),
+                    UserPtrMut::from_ptr(&raw mut addrlen),
+                )
+                .unwrap();
+                assert_eq!(addrlen, expected_len);
+                assert!(buffer[capacity as usize..].iter().all(|byte| *byte == 0xa5));
+                let family = (AddressFamily::UNIX as u16).to_ne_bytes();
+                let family_len = (capacity as usize).min(family.len());
+                assert_eq!(&buffer[..family_len], &family[..family_len]);
+            }
+        }
+    }
+
     fn create_unix_socket(task: &TestTask, ty: SockType, flags: SockFlags) -> u32 {
         task.do_socket(AddressFamily::UNIX, ty, flags, 0).unwrap()
     }

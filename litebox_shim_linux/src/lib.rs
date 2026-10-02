@@ -179,10 +179,13 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
             return Ok(state.current);
         }
 
-        let old_page_end = state.current.next_multiple_of(PAGE_SIZE);
-        let new_page_end = requested
+        let old_page_end = state
+            .current
             .checked_next_multiple_of(PAGE_SIZE)
-            .ok_or(MappingError::OutOfMemory)?;
+            .ok_or(MappingError::UnAligned)?;
+        let Some(new_page_end) = requested.checked_next_multiple_of(PAGE_SIZE) else {
+            return Ok(state.current);
+        };
         if state.current >= requested {
             if let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end) {
                 let ptr =
@@ -1269,14 +1272,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.sys_getdirent64(fd, dirp, count)
             }
             SyscallRequest::SchedGetAffinity { pid, len, mask } => {
-                const BITS_PER_BYTE: usize = 8;
                 let cpuset = self.sys_sched_getaffinity(pid);
-                if len * BITS_PER_BYTE < cpuset.len()
-                    || len & (core::mem::size_of::<usize>() - 1) != 0
-                {
+                let raw_bytes = cpuset.as_bytes();
+                if len < raw_bytes.len() || len & (core::mem::size_of::<usize>() - 1) != 0 {
                     Err(Errno::EINVAL)
                 } else {
-                    let raw_bytes = cpuset.as_bytes();
                     mask.copy_from_slice::<Platform>(0, raw_bytes)
                         .map(|()| raw_bytes.len())
                         .ok_or(Errno::EFAULT)
