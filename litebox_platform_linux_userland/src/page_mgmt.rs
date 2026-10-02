@@ -140,17 +140,23 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
-        _permissions: MemoryRegionPermissions,
+        #[cfg_attr(target_arch = "aarch64", expect(unused_variables))]
+        permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         // Without `MREMAP_FIXED` the kernel ignores `new_range` and may move the pages into the
         // host's mmap area. `MREMAP_FIXED` replaces whatever is mapped at the destination, and the
         // host may hold mappings vmem does not know about, so claim the destination first.
+        //
+        // The claim also provides the grown tail, so only the old pages move: growing them would
+        // extend pages that a fork restore mapped from its process image into the image's
+        // following bytes instead of fresh zeroed pages.
         #[cfg(target_arch = "x86_64")]
-        let flags = {
+        let (flags, moved_len) = {
             <Self as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                 self,
                 new_range.clone(),
-                MemoryRegionPermissions::empty(),
+                // Shared anonymous memory is private on the host, as in `allocate_pages`.
+                permissions - MemoryRegionPermissions::SHARED,
                 false,
                 false,
                 FixedAddressBehavior::NoReplace,
@@ -161,16 +167,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 }
                 _ => litebox::platform::page_mgmt::RemapError::OutOfMemory,
             })?;
-            MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_FIXED
+            (
+                MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_FIXED,
+                old_range.len(),
+            )
         };
+        // Only a fork restore, which is x86_64-only, maps guest pages from a file.
         #[cfg(target_arch = "aarch64")]
-        let flags = MRemapFlags::MREMAP_MAYMOVE;
+        let (flags, moved_len) = (MRemapFlags::MREMAP_MAYMOVE, new_range.len());
         let res = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::mremap,
                 old_range.start,
                 old_range.len(),
-                new_range.len(),
+                moved_len,
                 flags.bits() as usize,
                 new_range.start,
             )
@@ -337,6 +347,72 @@ mod tests {
             assert!(page.start >= prev);
             assert!(page.end > page.start);
             prev = page.end;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn moving_growth_of_file_pages_adds_zeroed_pages() {
+        const PAGE: usize = 4096;
+        let platform = LinuxUserland::new();
+        let read_write = libc::PROT_READ | libc::PROT_WRITE;
+        // SAFETY: The name is a valid C string.
+        let fd = unsafe { libc::memfd_create(c"remap".as_ptr(), 0) };
+        assert!(fd >= 0);
+        let contents: Vec<u8> = [0xa5; PAGE].into_iter().chain([0x5a; PAGE]).collect();
+        // SAFETY: `contents` is valid for its length.
+        let written = unsafe { libc::write(fd, contents.as_ptr().cast(), contents.len()) };
+        assert_eq!(written, isize::try_from(contents.len()).unwrap());
+        // SAFETY: A private mapping of the descriptor's first page replaces nothing.
+        let old = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                PAGE,
+                read_write,
+                libc::MAP_PRIVATE,
+                fd,
+                0,
+            )
+        };
+        assert_ne!(old, libc::MAP_FAILED);
+        // Find a free destination by mapping and releasing it.
+        // SAFETY: Anonymous mappings replace nothing, and nothing uses the released one.
+        let new = unsafe {
+            let new = libc::mmap(
+                core::ptr::null_mut(),
+                2 * PAGE,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            );
+            assert_ne!(new, libc::MAP_FAILED);
+            assert_eq!(libc::munmap(new, 2 * PAGE), 0);
+            new as usize
+        };
+        let old = old as usize;
+
+        // SAFETY: Nothing else uses the old page, and the destination is free.
+        let moved = unsafe {
+            <LinuxUserland as PageManagementProvider<PAGE>>::remap_pages(
+                platform,
+                old..old + PAGE,
+                new..new + 2 * PAGE,
+                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            )
+        }
+        .unwrap();
+
+        assert_eq!(moved.as_usize(), new);
+        // SAFETY: The remap left both pages mapped readable and writable.
+        let pages = unsafe { core::slice::from_raw_parts_mut(new as *mut u8, 2 * PAGE) };
+        assert!(pages[..PAGE].iter().all(|&byte| byte == 0xa5));
+        assert!(pages[PAGE..].iter().all(|&byte| byte == 0));
+        pages[PAGE] = 1;
+        // SAFETY: Nothing uses the pages or the descriptor anymore.
+        unsafe {
+            assert_eq!(libc::munmap(new as *mut libc::c_void, 2 * PAGE), 0);
+            assert_eq!(libc::close(fd), 0);
         }
     }
 }

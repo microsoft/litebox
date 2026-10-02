@@ -152,7 +152,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
     };
     let (task_params, prog_path, argv, envp) = match startup {
         Some(LinuxProcessStartup::Fork(startup)) => {
-            // The process image is read before seccomp forbids it.
+            // The process image is loaded before seccomp forbids inspecting it.
             let program = restore_fork(&shim, *startup, initial_thread, process_image)?;
             litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
                 &broker_positional_io_fds,
@@ -301,12 +301,19 @@ fn restore_fork(
     initial_thread: litebox::thread::Thread,
     process_image: Option<std::os::fd::OwnedFd>,
 ) -> Result<litebox_shim_linux::LoadedProgram<Platform>> {
-    let process_image = process_image.map(std::fs::File::from);
-    shim.restore_fork(startup, initial_thread, |offset, buffer| {
-        let Some(process_image) = &process_image else {
+    let process_image = process_image
+        .map(|image| {
+            let image = std::fs::File::from(image);
+            let len = image.metadata()?.len();
+            std::io::Result::Ok((image, len))
+        })
+        .transpose()
+        .context("failed to inspect the process image")?;
+    shim.restore_fork(startup, initial_thread, |offset, pages| {
+        let Some((image, image_len)) = &process_image else {
             return Ok(());
         };
-        read_process_image(process_image, offset, buffer).map_err(|error| {
+        map_process_image(image, *image_len, offset, pages).map_err(|error| {
             error
                 .raw_os_error()
                 .and_then(|errno| litebox_common_linux::errno::Errno::try_from(errno).ok())
@@ -326,44 +333,41 @@ fn restore_fork(
     anyhow::bail!("fork is unsupported on this architecture")
 }
 
-/// Reads `buffer.len()` bytes of `process_image` at `offset` into `buffer`, which starts
-/// zero-filled, reading only the image's data and leaving its holes and anything past its end
-/// zero.
+/// Maps `image`, which is `image_len` bytes long, privately over the page-aligned whole `pages`
+/// from `offset`, so they share the image's memory until written instead of copying it.
+///
+/// The pages start zero-filled, and those past the image's end stay so, as accessing a mapping
+/// there would fault.
 #[cfg(target_arch = "x86_64")]
-fn read_process_image(
-    process_image: &std::fs::File,
+fn map_process_image(
+    image: &std::fs::File,
+    image_len: u64,
     offset: u64,
-    buffer: &mut [u8],
+    pages: &mut [u8],
 ) -> std::io::Result<()> {
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::FileExt as _;
 
-    let seek = |position: u64, whence: libc::c_int| -> std::io::Result<Option<u64>> {
-        let position = libc::off_t::try_from(position)
-            .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-        // SAFETY: `lseek` takes no pointers, and the descriptor stays open while borrowed.
-        let result = unsafe { libc::lseek(process_image.as_raw_fd(), position, whence) };
-        if result >= 0 {
-            return Ok(Some(result.cast_unsigned()));
-        }
-        let error = std::io::Error::last_os_error();
-        // No data follows the position.
-        if error.raw_os_error() == Some(libc::ENXIO) {
-            return Ok(None);
-        }
-        Err(error)
+    let Some(available) = image_len.checked_sub(offset).filter(|&len| len > 0) else {
+        return Ok(());
     };
-    let end = offset + buffer.len() as u64;
-    let mut position = offset;
-    while position < end {
-        let Some(data) = seek(position, libc::SEEK_DATA)?.filter(|&data| data < end) else {
-            break;
-        };
-        let hole = seek(data, libc::SEEK_HOLE)?.map_or(end, |hole| hole.min(end));
-        let start = usize::try_from(data - offset).expect("the data lies within the buffer");
-        let len = usize::try_from(hole - data).expect("the data lies within the buffer");
-        process_image.read_exact_at(&mut buffer[start..start + len], data)?;
-        position = hole;
+    let len = usize::try_from(available).map_or(pages.len(), |len| len.min(pages.len()));
+    let offset = libc::off_t::try_from(offset)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    // SAFETY: `pages` is exclusively borrowed and page-aligned, and the readable and writable
+    // private mapping replacing its first `len` bytes keeps them valid, only changing their
+    // contents.
+    let mapped = unsafe {
+        libc::mmap(
+            pages.as_mut_ptr().cast(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            image.as_raw_fd(),
+            offset,
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }

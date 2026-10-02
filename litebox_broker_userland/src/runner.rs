@@ -31,7 +31,9 @@ use windows::PlatformRunnerEndpoint;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// How often a starting runner is polled for its connection and an exiting runner for its exit.
+/// Every runner start and exit, including those of `fork` and `execve`, waits on these polls.
+const RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Configuration for starting one out-of-process runner.
 ///
@@ -245,7 +247,7 @@ impl RunnerShutdown {
             if remaining.is_zero() {
                 return Ok(false);
             }
-            std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+            std::thread::sleep(remaining.min(RUNNER_POLL_INTERVAL));
         }
     }
 }
@@ -434,7 +436,7 @@ fn accept_runner_channel<Channel>(
             Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
-        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+        std::thread::sleep(remaining.min(RUNNER_POLL_INTERVAL));
     }
 }
 
@@ -457,7 +459,7 @@ fn wait_for_runner_exit(runner: &Arc<Mutex<Child>>) -> IoResult<ExitStatus> {
         {
             return Ok(status);
         }
-        std::thread::sleep(ACCEPT_RETRY_DELAY);
+        std::thread::sleep(RUNNER_POLL_INTERVAL);
     }
 }
 

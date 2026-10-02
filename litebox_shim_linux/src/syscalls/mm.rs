@@ -383,19 +383,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // temporary buffer to read the data from fs (without worrying page
             // faults) and write it to the user buffer with page fault handling.
             let mut file_offset = offset;
-            let mut buffer = [0; PAGE_SIZE];
+            // Read in the largest chunks the broker transfers, as each read is a round trip.
+            let max_read = usize::try_from(litebox_broker_protocol::fs::MAX_FILE_TRANSFER_SIZE)
+                .expect("the broker transfer size fits usize");
+            let mut buffer = alloc::vec![0; len.min(max_read)];
             let mut copied = 0;
             while copied < len {
-                let size =
-                    self.do_read(fd, &mut buffer, Some(file_offset))
-                        .map_err(|e| match e {
-                            // The raw fd was resolved once at syscall entry and is intentionally
-                            // not retained; this payload is discarded when converted to EBADF.
-                            Errno::EBADF => MappingError::BadFD(-1),
-                            Errno::EISDIR => MappingError::NotAFile,
-                            Errno::EACCES => MappingError::NotForReading,
-                            _ => unimplemented!(),
-                        })?;
+                let want = (len - copied).min(buffer.len());
+                let size = self
+                    .do_read(fd, &mut buffer[..want], Some(file_offset))
+                    .map_err(|e| match e {
+                        // The raw fd was resolved once at syscall entry and is intentionally
+                        // not retained; this payload is discarded when converted to EBADF.
+                        Errno::EBADF => MappingError::BadFD(-1),
+                        Errno::EISDIR => MappingError::NotAFile,
+                        Errno::EACCES => MappingError::NotForReading,
+                        _ => unimplemented!(),
+                    })?;
                 if size == 0 {
                     break;
                 }

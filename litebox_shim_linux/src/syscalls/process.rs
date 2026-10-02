@@ -1244,14 +1244,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Maps each of `regions` at its address in `mm`, filling those that have contents from the
-    /// process image [`Self::write_fork_image`] wrote, which `read_image` reads from an offset.
+    /// process image [`Self::write_fork_image`] wrote, which `load_image` loads from an offset
+    /// into a region's pages.
     ///
     /// Restoring fails if any region's address is in use.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn restore_fork_image(
         mm: &crate::MemoryManager<Platform>,
         regions: &[ForkMemoryRegion],
-        mut read_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
+        mut load_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
     ) -> Result<(), crate::ForkRestoreError> {
         let mut image_offset = 0u64;
         for region in regions {
@@ -1285,7 +1286,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 pages.as_usize() as *mut u8,
                                 length.as_usize(),
                             );
-                            if let Err(error) = read_image(image_offset, pages) {
+                            if let Err(error) = load_image(image_offset, pages) {
                                 image_error = Some(error);
                                 return Err(MappingError::OutOfMemory);
                             }

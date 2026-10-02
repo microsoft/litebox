@@ -523,8 +523,9 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     /// Continues a process duplicated by `fork` using the initial thread allocated during broker
     /// negotiation.
     ///
-    /// `read_image` fills a buffer with the parent's process image from an offset. The buffer
-    /// starts zero-filled, so ranges the image does not hold may be left untouched.
+    /// `load_image` fills page-aligned whole pages with the parent's process image from an
+    /// offset, possibly by mapping the image over them privately. The pages start zero-filled,
+    /// so ranges the image does not hold may be left untouched.
     ///
     /// Each memory region is restored at the parent's address and fails if the address is in
     /// use. Regions formerly backed by files are restored as anonymous memory.
@@ -533,7 +534,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         &self,
         startup: litebox_common_linux::program_startup::LinuxForkStartup,
         initial_thread: litebox::thread::Thread,
-        read_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
+        load_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
         let litebox_common_linux::program_startup::LinuxForkStartup {
             parent_process_id,
@@ -562,7 +563,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             return Err(ForkRestoreError::IncompatibleRunner);
         }
 
-        Task::restore_fork_image(&self.0.mm, &regions, read_image)?;
+        Task::restore_fork_image(&self.0.mm, &regions, load_image)?;
         self.0
             .mm
             .restore_program_break(initial_program_break, program_break);
