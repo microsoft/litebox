@@ -593,6 +593,8 @@ struct DeliverFault;
 pub(crate) enum SyscallRestart {
     /// From [`Errno::ERESTARTSYS`]: only a handler without `SA_RESTART` interrupts the syscall.
     Sys,
+    /// From [`Errno::ERESTARTNOINTR`]: no handler interrupts the syscall.
+    NoIntr,
     /// From [`Errno::ERESTARTNOHAND`]: any handler interrupts the syscall.
     NoHandler,
 }
@@ -602,6 +604,7 @@ impl SyscallRestart {
     pub(crate) fn from_errno(errno: Errno) -> Option<Self> {
         match errno {
             Errno::ERESTARTSYS => Some(Self::Sys),
+            Errno::ERESTARTNOINTR => Some(Self::NoIntr),
             Errno::ERESTARTNOHAND => Some(Self::NoHandler),
             _ => None,
         }
@@ -611,6 +614,7 @@ impl SyscallRestart {
     fn is_interrupted_by(self, action: &SigAction) -> bool {
         match self {
             Self::Sys => !action.flags.contains(SaFlags::RESTART),
+            Self::NoIntr => false,
             Self::NoHandler => true,
         }
     }

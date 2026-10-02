@@ -62,6 +62,7 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 const DEDICATED_C_TESTS: &[&str] = &[
     "async_x16.c",
     "fork_parent.c",
+    "fork_threads_parent.c",
     "gate_signals.c",
     "sigreturn.c",
     "sigreturn_simd.c",
@@ -987,6 +988,29 @@ fn fork_child_resumes_from_parent_snapshot() {
     assert_eq!(numeric_field(raw_line, "waited="), raw_child);
     assert_eq!(numeric_field(raw_line, "exited="), 1);
     assert_eq!(numeric_field(raw_line, "code="), 9);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn fork_pauses_sibling_threads() {
+    let parent = common::compile(
+        "./tests/fork_threads_parent.c",
+        "fork_threads_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_threads_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = output
+        .lines()
+        .find(|line| line.starts_with("threads-fork "))
+        .unwrap_or_else(|| panic!("missing threads-fork output in {output:?}"));
+    assert_eq!(numeric_field(line, "code="), 7);
+    assert_eq!(numeric_field(line, "failures="), 0);
+    assert_eq!(numeric_field(line, "read="), 1);
+    assert_eq!(numeric_field(line, "slept="), 1);
 }
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

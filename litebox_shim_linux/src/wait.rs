@@ -43,6 +43,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         restart: Option<SyscallRestart>,
     ) -> bool {
         self.wait_state.0.prepare_to_run_guest(|| {
+            self.wait_while_paused();
             self.queue_async_signals();
             self.process_signals(ctx, restart);
             !self.is_exiting()
@@ -77,6 +78,7 @@ pub(crate) fn wait_errno(timeout: Option<core::time::Duration>, error: impl Into
 
 impl<Platform: ShimPlatform> litebox::event::wait::CheckForInterrupt for Task<Platform> {
     fn check_for_interrupt(&self) -> bool {
+        self.wait_while_paused();
         self.queue_async_signals();
         self.is_exiting() || self.has_pending_signals()
     }

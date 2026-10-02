@@ -167,6 +167,26 @@ impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
     }
 }
 
+/// Keeps the other threads of a process paused for `fork` until dropped.
+#[cfg(target_arch = "x86_64")]
+struct ForkPause<'a, Platform: ShimPlatform> {
+    process: &'a ProcessState<Platform>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<Platform: ShimPlatform> Drop for ForkPause<'_, Platform> {
+    fn drop(&mut self) {
+        let mut inner = self.process.inner.lock();
+        inner.pausing_thread = None;
+        self.process
+            .fork_pause
+            .underlying_atomic()
+            .store(0, Ordering::Release);
+        drop(inner);
+        self.process.fork_pause.wake_all();
+    }
+}
+
 /// Thread state that can be accessed from a remote thread.
 struct ThreadRemote<Platform: ShimPlatform> {
     /// Always set under the process `inner` lock, but can be read without
@@ -196,6 +216,9 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
     nr_threads: <Platform as RawMutexProvider>::RawMutex,
+    /// One while a thread pauses the others for `fork`, which block on it. Always updated under
+    /// the `inner` mutex lock.
+    fork_pause: <Platform as RawMutexProvider>::RawMutex,
     inner: Arc<Mutex<Platform, ProcessInner<Platform>>>,
     /// Started child processes that have not been reaped, mapped by process ID.
     children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
@@ -325,6 +348,11 @@ struct ProcessInner<Platform: ShimPlatform> {
     exit_status: ExitStatus,
     /// The thread list for the process, mapped by thread ID.
     threads: BTreeMap<i32, Arc<ThreadRemote<Platform>>>,
+    /// The thread pausing the others for `fork`, if any.
+    pausing_thread: Option<Arc<ThreadRemote<Platform>>>,
+    /// Number of threads paused for `fork`, which each count themselves until no thread pauses
+    /// them.
+    paused_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -343,9 +371,12 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             group_exit: false,
             is_killing_other_threads: false,
             threads: BTreeMap::from_iter([(pid, remote)]),
+            pausing_thread: None,
+            paused_threads: 0,
         }));
         Self {
             nr_threads,
+            fork_pause: <Platform as RawMutexProvider>::RawMutex::INIT,
             child_events: Arc::new(ChildEvents {
                 changed: AtomicBool::new(false),
                 pollee: Pollee::new(),
@@ -526,6 +557,10 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 assert!(inner.threads.is_empty());
                 // The last thread exited. Prevent new threads.
                 inner.group_exit = true;
+            }
+            // A thread pausing the others for `fork` waits for this one to pause or detach.
+            if let Some(pausing_thread) = &inner.pausing_thread {
+                pausing_thread.interrupt();
             }
 
             // Notify waiters if this is the last thread of the process
@@ -720,6 +755,77 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.thread.process.inner.lock().is_killing_other_threads = false;
         true
+    }
+
+    /// Blocks while another thread pauses this process's other threads for `fork`.
+    ///
+    /// Threads pause as they start to wait or are about to run guest code, where they hold no
+    /// state the pausing thread snapshots.
+    pub(crate) fn wait_while_paused(&self) {
+        let process = &self.thread.process;
+        {
+            let mut inner = process.inner.lock();
+            match &inner.pausing_thread {
+                Some(pausing_thread) if !Arc::ptr_eq(pausing_thread, &self.thread.remote) => {
+                    pausing_thread.interrupt();
+                }
+                _ => return,
+            }
+            inner.paused_threads += 1;
+        }
+        // Stay paused, and counted, until no thread pauses the others, even if another thread
+        // starts pausing them as soon as this one stops.
+        loop {
+            let _ = process.fork_pause.block(1);
+            let mut inner = process.inner.lock();
+            if inner.pausing_thread.is_none() {
+                inner.paused_threads -= 1;
+                return;
+            }
+        }
+    }
+
+    /// Pauses this process's other threads until the returned guard drops, so they neither
+    /// change the memory nor the state `fork` snapshots.
+    ///
+    /// Fails with `ERESTARTNOINTR` if a signal or an exit interrupts the wait for them to pause,
+    /// so `fork` restarts once the signal is handled, as Linux's does if a signal arrives while
+    /// it duplicates the process.
+    #[cfg(target_arch = "x86_64")]
+    fn pause_other_threads(&self) -> Result<ForkPause<'_, Platform>, Errno> {
+        let process = &self.thread.process;
+        loop {
+            let mut inner = process.inner.lock();
+            if inner.pausing_thread.is_none() {
+                inner.pausing_thread = Some(self.thread.remote.clone());
+                process
+                    .fork_pause
+                    .underlying_atomic()
+                    .store(1, Ordering::Release);
+                for (&tid, thread) in &inner.threads {
+                    if tid != self.tid() {
+                        thread.interrupt();
+                    }
+                }
+                break;
+            }
+            drop(inner);
+            // Another thread pauses this one for its own `fork`.
+            self.wait_while_paused();
+        }
+        let pause = ForkPause { process };
+        // Each thread that pauses or detaches interrupts this wait to reevaluate it.
+        self.wait_cx()
+            .wait_until(|| {
+                let inner = process.inner.lock();
+                inner.paused_threads + 1 == process.nr_threads()
+            })
+            .map_err(|_| Errno::ERESTARTNOINTR)?;
+        // The other threads may have paused as they exit the whole process.
+        if self.is_exiting() {
+            return Err(Errno::ERESTARTNOINTR);
+        }
+        Ok(pause)
     }
 
     /// Transfers a surviving nonleader exec caller to the process leader
@@ -1097,11 +1203,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// their open file descriptions, and of its signal dispositions, blocked mask, and alternate
     /// stack, but none of its pending signals, timers, or robust futex list. Memory regions
     /// formerly backed by files are copied as anonymous memory, and `MADV_DONTFORK` regions are
-    /// copied too. Floating-point and vector state is not copied.
+    /// copied too. Floating-point and vector state is not copied. Like Linux, the child has a
+    /// single thread, a copy of the calling one; the parent's other threads pause while the
+    /// parent is copied.
     ///
-    /// Only a single-threaded process outside a `vfork` window, with default resource-limit and
-    /// alarm state, no shared memory mappings, no ELF file mid-load, and only descriptors a fresh
-    /// runner can inherit is duplicated; otherwise this fails with `EAGAIN`.
+    /// Only a process outside a `vfork` window, with default resource-limit and alarm state, no
+    /// shared memory mappings, no ELF file mid-load, and only descriptors a fresh runner can
+    /// inherit is duplicated; otherwise this fails with `EAGAIN`.
     #[cfg(target_arch = "x86_64")]
     fn fork(
         &self,
@@ -1109,9 +1217,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         set_child_tid: usize,
         clear_child_tid: usize,
     ) -> Result<usize, Errno> {
-        if self.thread.process.nr_threads() != 1
-            || self.vfork.borrow().is_some()
-            || !self.thread.process.limits.has_default_state()
+        if self.vfork.borrow().is_some() {
+            return Err(Errno::EAGAIN);
+        }
+        let pause = self.pause_other_threads()?;
+        if !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
             || !self.global.elf_patch_cache.lock().is_empty()
         {
@@ -1191,6 +1301,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
+        // The child's memory and objects are copied, so the other threads may go on.
+        drop(pause);
         let payload = startup
             .encode()
             .expect("the startup fit with placeholder handles");
@@ -3475,7 +3587,12 @@ mod tests {
                 )
                 .expect("rt_sigprocmask failed");
             };
-            for restart in [None, Some(SyscallRestart::Sys), Some(SyscallRestart::NoHandler)] {
+            for restart in [
+                None,
+                Some(SyscallRestart::Sys),
+                Some(SyscallRestart::NoIntr),
+                Some(SyscallRestart::NoHandler),
+            ] {
                 // SIGCHLD is ignored by default, but is queued while blocked. Once unblocked,
                 // it interrupts waits, yet runs no handler.
                 sigprocmask(SigmaskHow::SIG_BLOCK);
