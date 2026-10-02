@@ -26,6 +26,7 @@
 	"relocation-model": "pie",
 	"panic-strategy": "abort",
 	"disable-redzone": true,
+	"stack-probes": { "kind": "inline" },
 	"features": "-avx,-avx2,-avx512f",
 	"dynamic-linking": false
 }
