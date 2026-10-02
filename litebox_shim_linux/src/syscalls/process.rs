@@ -20,6 +20,8 @@ use litebox::event::polling::{Pollee, TryOpError};
 use litebox::event::wait::WaitError;
 use litebox::event::{Events, IOPollable as _};
 use litebox::platform::ArchSpecificRegister;
+#[cfg(target_arch = "x86_64")]
+use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
 use litebox::process::{ChildStatus, ProcessError};
 use litebox::sync::{Mutex, RwLock};
@@ -33,6 +35,10 @@ use litebox_common_linux::ProtFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::vmem::{
+    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE,
+};
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno, program_startup::LinuxProgramStartup,
@@ -90,17 +96,18 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
-    /// Prepares the initial thread of a process duplicated by `fork` to return from the `fork`
-    /// with `registers` and `thread_pointer` as its FS base, storing its thread ID at
-    /// `set_child_tid` and clearing `clear_child_tid` when it exits, unless they are zero.
+    /// Prepares the initial thread of a process duplicated by `fork` to return zero from the
+    /// `fork` with the rest of `registers` and `thread_pointer` as its FS base, storing its thread
+    /// ID at `set_child_tid` and clearing `clear_child_tid` when it exits, unless they are zero.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn set_forked_init_state(
         &self,
-        registers: litebox_common_linux::PtRegs,
+        mut registers: litebox_common_linux::PtRegs,
         thread_pointer: usize,
         set_child_tid: usize,
         clear_child_tid: usize,
     ) {
+        registers.rax = 0;
         let user_ptr = |address: usize| (address != 0).then(|| UserPtrMut::from_usize(address));
         self.init_state.set(ThreadInitState::Forked {
             registers: Box::new(registers),
@@ -1232,6 +1239,68 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 write_region()?;
             }
             image_offset += region.range.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Maps each of `regions` at its address in `mm`, filling those that have contents from the
+    /// process image [`Self::write_fork_image`] wrote, which `read_image` reads from an offset.
+    ///
+    /// Restoring fails if any region's address is in use.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn restore_fork_image(
+        mm: &crate::MemoryManager<Platform>,
+        regions: &[ForkMemoryRegion],
+        mut read_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
+    ) -> Result<(), crate::ForkRestoreError> {
+        let mut image_offset = 0u64;
+        for region in regions {
+            let (Some(address), Some(length)) = (
+                NonZeroAddress::<PAGE_SIZE>::new(region.range.start),
+                NonZeroPageSize::<PAGE_SIZE>::new(region.range.len()),
+            ) else {
+                return Err(crate::ForkRestoreError::Memory(
+                    region.range.start,
+                    MappingError::UnAligned,
+                ));
+            };
+            let mut flags = CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE;
+            if region.flags.contains(VmFlags::VM_GROWSDOWN) {
+                flags |= CreatePagesFlags::IS_STACK;
+            }
+            let has_contents = region.has_contents();
+            let mut image_error = None;
+            // SAFETY: `NOREPLACE` fails rather than replacing any existing mapping.
+            unsafe {
+                mm.create_pages_with_permissions(
+                    Some(address),
+                    length,
+                    flags,
+                    region.flags.into(),
+                    |pages| {
+                        if has_contents {
+                            // SAFETY: The pages were just mapped readable and writable, and
+                            // nothing else uses them until this function returns.
+                            let pages = core::slice::from_raw_parts_mut(
+                                pages.as_usize() as *mut u8,
+                                length.as_usize(),
+                            );
+                            if let Err(error) = read_image(image_offset, pages) {
+                                image_error = Some(error);
+                                return Err(MappingError::OutOfMemory);
+                            }
+                        }
+                        Ok(0)
+                    },
+                )
+            }
+            .map_err(|error| match image_error {
+                Some(error) => crate::ForkRestoreError::Image(error),
+                None => crate::ForkRestoreError::Memory(region.range.start, error),
+            })?;
+            if has_contents {
+                image_offset += length.as_usize() as u64;
+            }
         }
         Ok(())
     }

@@ -533,7 +533,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         &self,
         startup: litebox_common_linux::program_startup::LinuxForkStartup,
         initial_thread: litebox::thread::Thread,
-        mut read_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
+        read_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
     ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
         let litebox_common_linux::program_startup::LinuxForkStartup {
             parent_process_id,
@@ -547,7 +547,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             blocked_signals,
             signal_actions,
             alternate_signal_stack,
-            mut registers,
+            registers,
             thread_pointer,
             syscall_entry_point,
             set_child_tid,
@@ -562,55 +562,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             return Err(ForkRestoreError::IncompatibleRunner);
         }
 
-        let mut image_offset = 0u64;
-        for region in &regions {
-            let (Some(address), Some(length)) = (
-                NonZeroAddress::<PAGE_SIZE>::new(region.range.start),
-                NonZeroPageSize::<PAGE_SIZE>::new(region.range.len()),
-            ) else {
-                return Err(ForkRestoreError::Memory(
-                    region.range.start,
-                    MappingError::UnAligned,
-                ));
-            };
-            let mut flags = CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE;
-            if region.flags.contains(VmFlags::VM_GROWSDOWN) {
-                flags |= CreatePagesFlags::IS_STACK;
-            }
-            let has_contents = region.has_contents();
-            let mut image_error = None;
-            // SAFETY: `NOREPLACE` fails rather than replacing any existing mapping.
-            unsafe {
-                self.0.mm.create_pages_with_permissions(
-                    Some(address),
-                    length,
-                    flags,
-                    region.flags.into(),
-                    |pages| {
-                        if has_contents {
-                            // SAFETY: The pages were just mapped readable and writable, and
-                            // nothing else uses them until this function returns.
-                            let pages = core::slice::from_raw_parts_mut(
-                                pages.as_usize() as *mut u8,
-                                length.as_usize(),
-                            );
-                            if let Err(error) = read_image(image_offset, pages) {
-                                image_error = Some(error);
-                                return Err(MappingError::OutOfMemory);
-                            }
-                        }
-                        Ok(0)
-                    },
-                )
-            }
-            .map_err(|error| match image_error {
-                Some(error) => ForkRestoreError::Image(error),
-                None => ForkRestoreError::Memory(region.range.start, error),
-            })?;
-            if has_contents {
-                image_offset += length.as_usize() as u64;
-            }
-        }
+        Task::restore_fork_image(&self.0.mm, &regions, read_image)?;
         self.0
             .mm
             .restore_program_break(initial_program_break, program_break);
@@ -633,7 +585,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         fs_state.set_umask(umask);
 
         let thread = syscalls::process::ThreadState::new_process(pid);
-        registers.rax = 0;
         thread.set_forked_init_state(registers, thread_pointer, set_child_tid, clear_child_tid);
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
