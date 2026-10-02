@@ -333,12 +333,13 @@ impl LinuxUserland {
         clippy::missing_panics_doc,
         reason = "the seccomp filter rules are hardcoded and not expected to fail"
     )]
-    /// Installs the runner seccomp filter.
+    /// Installs the runner seccomp filter on the threads selected by `scope`.
     ///
     /// Broker transport exceptions are restricted to the supplied descriptors.
     pub fn enable_seccomp_filter(
         positional_io_fds: &[std::os::fd::RawFd],
         shutdown_fds: &[std::os::fd::RawFd],
+        scope: SeccompScope,
     ) {
         use seccompiler::{
             BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
@@ -518,8 +519,21 @@ impl LinuxUserland {
         // TODO: bpf program can be compiled offline
         let bpf_prog: BpfProgram = filter.try_into().unwrap();
 
-        seccompiler::apply_filter(&bpf_prog).unwrap();
+        match scope {
+            SeccompScope::CallingThread => seccompiler::apply_filter(&bpf_prog),
+            SeccompScope::AllThreads => seccompiler::apply_filter_all_threads(&bpf_prog),
+        }
+        .unwrap();
     }
+}
+
+/// Threads confined by [`LinuxUserland::enable_seccomp_filter`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeccompScope {
+    /// The calling thread and threads it creates afterward.
+    CallingThread,
+    /// All threads of the process including pre-existing ones.
+    AllThreads,
 }
 
 impl litebox::platform::Provider for LinuxUserland {}
@@ -2691,10 +2705,21 @@ mod tests {
         let denied = test_memfd(c"seccomp-denied-positional-io");
         let (allowed_shutdown, _allowed_peer) = UnixStream::pair().unwrap();
         let (denied_shutdown, _denied_peer) = UnixStream::pair().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker_barrier = barrier.clone();
+        // Spawned before the filter is installed.
+        let worker = super::spawn_host_thread(move || {
+            worker_barrier.wait();
+            worker_barrier.wait();
+            assert_seccomp_filter();
+        });
+        barrier.wait();
         LinuxUserland::enable_seccomp_filter(
             &[allowed.as_raw_fd()],
             &[allowed_shutdown.as_raw_fd()],
+            super::SeccompScope::AllThreads,
         );
+        barrier.wait();
 
         let written = [7_u8];
         // SAFETY: The buffers are valid for their lengths, and both descriptors
@@ -2739,6 +2764,11 @@ mod tests {
         let error = denied_shutdown.shutdown(Shutdown::Both).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
+        assert_seccomp_filter();
+        worker.join().unwrap();
+    }
+
+    fn assert_seccomp_filter() {
         let pathname = c"/tmp/test_seccomp";
         #[cfg(target_arch = "x86_64")]
         let mkdir_res = unsafe {

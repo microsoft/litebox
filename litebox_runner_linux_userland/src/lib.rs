@@ -4,6 +4,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
 use litebox_platform_linux_userland::LinuxUserland as Platform;
+use litebox_platform_linux_userland::SeccompScope;
 use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
@@ -72,6 +73,20 @@ pub struct CliArgs {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
+    run_with_seccomp(cli_args, SeccompScope::AllThreads)
+}
+
+/// Like [`run`], but the seccomp filter confines only the calling thread and
+/// threads it creates afterward, leaving the broker's threads unconfined.
+///
+/// # Panics
+///
+/// See [`run`].
+pub fn run_in_broker_process(cli_args: CliArgs) -> Result<i32> {
+    run_with_seccomp(cli_args, SeccompScope::CallingThread)
+}
+
+fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i32> {
     if cli_args.broker_proxy_url.is_some() && cli_args.broker_control_channel.is_none() {
         return Err(anyhow!(
             "--broker-proxy-url requires --broker-control-channel"
@@ -209,6 +224,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
         &broker_positional_io_fds,
         &broker_shutdown_fds,
+        seccomp_scope,
     );
 
     let program = shim.load_program(task_params, initial_thread, &prog_path, argv, envp)?;

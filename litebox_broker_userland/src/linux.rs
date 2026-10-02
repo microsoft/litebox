@@ -200,7 +200,7 @@ fn run_runner_in_process(
             .name("litebox-runner".to_owned())
             .spawn(move || {
                 litebox_platform_linux_userland::unblock_guest_signals();
-                litebox_runner_linux_userland::run(runner_args)
+                litebox_runner_linux_userland::run_in_broker_process(runner_args)
                     .map_err(|error| format!("{error:#}"))
             })?;
         let association_result = serve_runner_in_process(broker, control_listener, &runner);
