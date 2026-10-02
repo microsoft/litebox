@@ -1087,6 +1087,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child_fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
         let parent_fs = self.fs.replace(Arc::new(child_fs));
         let child_files = self.files.borrow().copy_for_vfork(&self.global);
+        // The child inherits the default limits checked above, even if a sibling has since
+        // changed the parent's limits.
+        child_files.set_max_fd(RLIMIT_NOFILE_CUR);
         let parent_files = self.files.replace(Arc::new(child_files));
         self.vfork.replace(Some(crate::VforkState {
             child,
@@ -1443,6 +1446,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             limits[resource as usize] = new_limit;
             Ok(old_rlimit)
+        } else if self.vfork.borrow().is_some() {
+            // `begin_vfork` requires default limits, so the vfork child inherited them even if a
+            // sibling thread has since changed the parent's limits.
+            Ok(ResourceLimits::<Platform>::default_values()[resource as usize])
         } else {
             Ok(self.thread.process.limits.limits.read()[resource as usize])
         }
