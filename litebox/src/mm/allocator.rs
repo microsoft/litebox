@@ -37,7 +37,8 @@ pub trait MemoryProvider {
 /// Allocator that uses buddy allocator for pages and slab allocator for small objects.
 ///
 /// `ORDER` is the maximum order of the buddy allocator, specifying the maximum size of the
-/// allocation that can be done using the buddy allocator -- i.e., 1 << (ORDER - 1).
+/// allocation that can be done using the buddy allocator -- i.e., 1 << (ORDER - 1). Larger
+/// allocation requests fail (i.e., [`GlobalAlloc::alloc`] returns null) instead of panicking.
 pub struct SafeZoneAllocator<'a, const ORDER: usize, M: MemoryProvider> {
     buddy_allocator: LockedHeapWithRescue<ORDER>,
     slab_allocator: SpinMutex<ZoneAllocator<'a>>,
@@ -64,7 +65,11 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
             buddy_allocator: LockedHeapWithRescue::new(|heap, layout| {
                 let page_aligned_size = layout.size().next_power_of_two();
                 if page_aligned_size.trailing_zeros() as usize >= ORDER {
-                    unimplemented!("requested size {page_aligned_size:#} is too large");
+                    // The buddy allocator cannot serve a block of this order no matter how much
+                    // memory we add, so do not ask the memory provider for more. Returning here
+                    // makes the retry in `LockedHeapWithRescue::alloc` fail and return null, which
+                    // lets fallible APIs (e.g., `Vec::try_reserve`) report the failure.
+                    return;
                 }
                 let Ok(layout) = Layout::from_size_align(page_aligned_size, page_aligned_size)
                 else {
@@ -235,6 +240,107 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
             _ => unsafe {
                 self.buddy_allocator.dealloc(ptr, layout);
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{MemoryProvider, SafeZoneAllocator};
+
+    /// Maximum order of the buddy allocators under test, i.e., the largest block they can serve
+    /// is `1 << (ORDER - 1)` bytes (4 MiB).
+    const ORDER: usize = 23;
+
+    /// Number of times each [`SystemMemory`] instance has been asked for memory.
+    static SYSTEM_MEMORY_CALLS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+    /// Memory provider backed by the host's allocator. `ID` keeps the call counters of
+    /// concurrently running tests apart.
+    struct SystemMemory<const ID: usize>;
+
+    impl<const ID: usize> MemoryProvider for SystemMemory<ID> {
+        fn alloc(layout: &Layout) -> Option<(usize, usize)> {
+            SYSTEM_MEMORY_CALLS[ID].fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the allocator only requests non-zero, power-of-two sized layouts. The memory
+            // is handed over to the buddy allocator and intentionally never returned.
+            let ptr = unsafe { std::alloc::alloc(*layout) };
+            if ptr.is_null() {
+                None
+            } else {
+                Some((ptr as usize, layout.size()))
+            }
+        }
+
+        unsafe fn free(_addr: usize) {
+            unreachable!("SafeZoneAllocator never returns memory to the provider")
+        }
+    }
+
+    /// Memory provider that never has memory available.
+    struct NoMemory;
+
+    impl MemoryProvider for NoMemory {
+        fn alloc(_layout: &Layout) -> Option<(usize, usize)> {
+            None
+        }
+
+        unsafe fn free(_addr: usize) {
+            unreachable!("NoMemory never hands out memory")
+        }
+    }
+
+    #[test]
+    fn over_max_order_allocation_returns_null() {
+        static ALLOCATOR: SafeZoneAllocator<'static, ORDER, SystemMemory<0>> =
+            SafeZoneAllocator::new();
+
+        for size in [1 << ORDER, (1 << ORDER) + 1, 1 << (ORDER + 4)] {
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            // SAFETY: `layout` has a non-zero size.
+            let ptr = unsafe { ALLOCATOR.alloc(layout) };
+            assert!(ptr.is_null(), "allocation of {size:#x} bytes should fail");
+        }
+        // Requests that the buddy allocator can never serve must not grow the heap.
+        assert_eq!(SYSTEM_MEMORY_CALLS[0].load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn allocations_within_max_order_grow_the_heap() {
+        static ALLOCATOR: SafeZoneAllocator<'static, ORDER, SystemMemory<1>> =
+            SafeZoneAllocator::new();
+
+        // Small (slab), base page, large page, and the largest block the buddy allocator supports.
+        for size in [64, 4096, 2 * 1024 * 1024, 1 << (ORDER - 1)] {
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            // SAFETY: `layout` has a non-zero size.
+            let ptr = unsafe { ALLOCATOR.alloc(layout) };
+            assert!(
+                !ptr.is_null(),
+                "allocation of {size:#x} bytes should succeed"
+            );
+            // SAFETY: `ptr` points to `size` freshly allocated bytes.
+            unsafe { ptr.write_bytes(0xa5, size) };
+            // SAFETY: `ptr` was allocated above by `ALLOCATOR` with `layout`.
+            unsafe { ALLOCATOR.dealloc(ptr, layout) };
+        }
+        assert!(SYSTEM_MEMORY_CALLS[1].load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn unavailable_memory_returns_null() {
+        static ALLOCATOR: SafeZoneAllocator<'static, ORDER, NoMemory> = SafeZoneAllocator::new();
+
+        for size in [64, 4096, 2 * 1024 * 1024, 1 << (ORDER - 1)] {
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            // SAFETY: `layout` has a non-zero size.
+            let ptr = unsafe { ALLOCATOR.alloc(layout) };
+            assert!(ptr.is_null(), "allocation of {size:#x} bytes should fail");
         }
     }
 }
