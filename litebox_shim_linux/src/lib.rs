@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
-use core::ops::{Deref, Range};
+use core::ops::Deref;
 use litebox::{
     LiteBox,
     net::Network,
@@ -37,8 +37,7 @@ use litebox_common_linux::{
     mm::VmemManager,
     user_pointers::{UserPtr, UserPtrMut},
     vmem::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmFlags,
-        VmemUnmapError,
+        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
     },
 };
 
@@ -212,17 +211,14 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
         Ok(requested)
     }
 
-    /// Releases matching mappings and resets Linux program-break state.
+    /// Releases all mappings and resets Linux program-break state.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the released regions are no longer used.
-    pub unsafe fn release_memory(
-        &self,
-        releasable: fn(Range<usize>, VmFlags) -> bool,
-    ) -> Result<(), VmemUnmapError> {
+    pub unsafe fn release_memory(&self) -> Result<(), VmemUnmapError> {
         let mut state = self.brk.lock();
-        unsafe { self.vmem.release_memory(releasable) }?;
+        unsafe { self.vmem.release_memory() }?;
         state.initial = 0;
         state.current = 0;
         Ok(())

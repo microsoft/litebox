@@ -60,6 +60,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         }
         .expect("mprotect failed while committing pages");
         if populate_pages_immediately {
+            // TODO: MADV_WILLNEED only reads ahead file or swap pages; anonymous pages still fault lazily.
             // SAFETY: This advice covers the live owned mapping and does not change its contents.
             let _ = unsafe {
                 syscalls::syscall3(
@@ -175,7 +176,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             )
         }
         .expect("mprotect failed while decommitting pages");
-        // SAFETY: The range is owned and inaccessible; discard its anonymous backing.
+        // TODO: MADV_DONTNEED restores file contents for private file mappings instead of zeroing;
+        // decommit is currently only used by the Windows shim, which lacks native file mappings.
+        // SAFETY: The range is owned and inaccessible; discard its backing.
         unsafe {
             syscalls::syscall3(
                 syscalls::Sysno::madvise,

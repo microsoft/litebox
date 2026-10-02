@@ -315,27 +315,13 @@ where
         unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
     }
 
-    /// Release memory mappings that satisfy the given condition.
+    /// Release every memory mapping and reservation.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the released memory regions are no longer used.
-    pub unsafe fn release_memory(
-        &self,
-        releasable: fn(Range<usize>, VmFlags) -> bool,
-    ) -> Result<(), VmemUnmapError> {
-        for (r, vma) in self.mappings() {
-            if !releasable(r.clone(), vma) {
-                continue;
-            }
-            let mut vmem = self.vmem.write();
-            let Some(range) = PageRange::new(r.start, r.end) else {
-                unreachable!()
-            };
-            unsafe { vmem.remove_mapping(range) }?;
-        }
-
-        Ok(())
+    pub unsafe fn release_memory(&self) -> Result<(), VmemUnmapError> {
+        unsafe { self.vmem.write().release_all() }.map_err(VmemUnmapError::UnmapError)
     }
 
     /// Expands (or shrinks) an existing memory mapping

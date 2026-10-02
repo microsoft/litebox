@@ -123,7 +123,7 @@ where
     fn overlapping(
         &self,
         _range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)> {
+    ) -> impl DoubleEndedIterator<Item = &Self::Reservation> {
         core::iter::empty()
     }
 
@@ -153,14 +153,14 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
             return segments;
         }
         let mut cursor = range.start;
-        for (base, reservation) in self.overlapping(range.clone()) {
+        for reservation in self.overlapping(range.clone()) {
             let extent = reservation.range();
             if cursor < extent.start {
                 segments.push((cursor..extent.start, None));
                 cursor = extent.start;
             }
             let end = extent.end.min(range.end);
-            segments.push((cursor..end, Some(base)));
+            segments.push((cursor..end, Some(extent.start)));
             cursor = end;
         }
         if cursor < range.end {
@@ -292,10 +292,7 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
         self.0.iter()
     }
 
-    fn overlapping(
-        &self,
-        range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Reservation)> {
+    fn overlapping(&self, range: Range<usize>) -> impl DoubleEndedIterator<Item = &Reservation> {
         let first = self
             .0
             .range(..=range.start)
@@ -307,7 +304,7 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
             .filter(move |(_, reservation)| {
                 !range.is_empty() && reservation.range().end > range.start
             })
-            .map(|(&base, reservation)| (base, reservation))
+            .map(|(_, reservation)| reservation)
     }
 
     fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Reservation> {
@@ -373,7 +370,7 @@ mod tests {
         assert_eq!(
             reservations
                 .overlapping(0x2000..0x3800)
-                .map(|(_, reservation)| reservation.range())
+                .map(PageReservation::range)
                 .collect::<Vec<_>>(),
             [0x1000..0x3000, 0x3000..0x4000]
         );
