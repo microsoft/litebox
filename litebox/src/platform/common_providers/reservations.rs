@@ -146,27 +146,17 @@ impl<Reservation> Default for TrackedReservations<Reservation> {
 }
 
 impl<Reservation: PageReservation> TrackedReservations<Reservation> {
-    /// Snapshot a range by reservation boundaries; `None` denotes an unreserved gap.
-    pub fn segments(&self, range: Range<usize>) -> Vec<(Range<usize>, Option<usize>)> {
-        let mut segments = Vec::new();
-        if range.is_empty() {
-            return segments;
-        }
+    fn gaps(&self, range: Range<usize>) -> impl Iterator<Item = Range<usize>> {
         let mut cursor = range.start;
-        for reservation in self.overlapping(range.clone()) {
-            let extent = reservation.range();
-            if cursor < extent.start {
-                segments.push((cursor..extent.start, None));
-                cursor = extent.start;
-            }
-            let end = extent.end.min(range.end);
-            segments.push((cursor..end, Some(extent.start)));
-            cursor = end;
-        }
-        if cursor < range.end {
-            segments.push((cursor..range.end, None));
-        }
-        segments
+        self.overlapping(range.clone())
+            .map(PageReservation::range)
+            .chain(core::iter::once(range.end..range.end))
+            .filter_map(move |extent| {
+                let start = cursor;
+                let end = extent.start.min(range.end);
+                cursor = cursor.max(extent.end.min(range.end));
+                (start < end).then_some(start..end)
+            })
     }
 
     /// Round and reserve one currently unowned gap, or place one addressless hint.
@@ -233,10 +223,7 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
     {
         assert_ne!(requested.start, 0, "reserve_gaps requires a concrete range");
         let mut acquired = Vec::new();
-        for (gap, base) in self.segments(requested) {
-            if base.is_some() {
-                continue;
-            }
+        for gap in self.gaps(requested) {
             // SAFETY: The gap is disjoint from tracked reservations, or a zero-address hint that
             // permits relocation without replacement.
             match unsafe { Self::reserve_gap(platform, gap, can_grow_down, placement) } {
@@ -349,7 +336,7 @@ mod tests {
     crate::define_page_reservation!(TestReservation);
 
     #[test]
-    fn reservation_segments_and_take_overlapping_in_order() {
+    fn reservation_overlap_and_removal_preserve_order() {
         let mut reservations = TrackedReservations::default();
         for range in [0x1000..0x3000, 0x3000..0x4000, 0x5000..0x6000] {
             // SAFETY: Each test range is nonempty, aligned, disjoint, and uniquely represented.
@@ -358,14 +345,8 @@ mod tests {
         }
 
         assert_eq!(
-            reservations.segments(0x800..0x5800),
-            [
-                (0x800..0x1000, None),
-                (0x1000..0x3000, Some(0x1000)),
-                (0x3000..0x4000, Some(0x3000)),
-                (0x4000..0x5000, None),
-                (0x5000..0x5800, Some(0x5000)),
-            ]
+            reservations.gaps(0x800..0x5800).collect::<Vec<_>>(),
+            [0x800..0x1000, 0x4000..0x5000]
         );
         assert_eq!(
             reservations
