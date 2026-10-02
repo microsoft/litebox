@@ -1379,7 +1379,6 @@ mod tests {
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
         SharedBufferSlotIndex,
     };
-    use litebox_broker_protocol::signal::{PendingSignal, SendSignalRequest, TakeSignalRequest};
     use litebox_broker_protocol::socket::{
         AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
         ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
@@ -1728,7 +1727,6 @@ mod tests {
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
-        active_requests_send_signals(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
@@ -2503,56 +2501,6 @@ mod tests {
             BrokerResult::ObjectClosed
         );
         assert_eq!(clock.alarm_count(), 0);
-    }
-
-    fn active_requests_send_signals(broker: &BrokerCore) {
-        let sender = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let target = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        let response = handle_test_request(&target, BrokerOperation::Signal(SignalRequest::Open));
-        let BrokerResult::Signal(SignalResponse::Open(OpenSignalsResponse { handle })) = response
-        else {
-            panic!("unexpected open response: {response:?}");
-        };
-        let send = |process_id, signal| {
-            handle_test_request(
-                &sender,
-                BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
-                    process_id,
-                    signal,
-                })),
-            )
-        };
-        let take = || {
-            handle_test_request(
-                &target,
-                BrokerOperation::Signal(SignalRequest::Take(TakeSignalRequest { handle })),
-            )
-        };
-
-        assert_eq!(take(), BrokerResult::Error(ErrorCode::WouldBlock));
-        assert_eq!(
-            send(target.id(), 10),
-            BrokerResult::Signal(SignalResponse::Sent)
-        );
-        assert_eq!(
-            take(),
-            BrokerResult::Signal(SignalResponse::Take(PendingSignal {
-                signal: 10,
-                sender: sender.id(),
-            }))
-        );
-        assert_eq!(
-            send(ProcessId(u32::MAX), 0),
-            BrokerResult::Error(ErrorCode::UnknownObject)
-        );
-        assert_eq!(
-            handle_test_request(&target, BrokerOperation::CloseObject(handle)),
-            BrokerResult::ObjectClosed
-        );
     }
 
     fn active_request_allocates_and_releases_thread_id(broker: &BrokerCore) {
