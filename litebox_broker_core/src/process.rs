@@ -7,7 +7,8 @@ use alloc::{
     vec::Vec,
 };
 use core::any::Any;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::ops::Range;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
@@ -39,13 +40,79 @@ pub trait ProcessImage: Send {
     /// Writes `data` at `offset`, extending the image as needed.
     fn write(&mut self, offset: u64, data: &[u8]) -> Result<()>;
 
-    /// Converts the image so the platform that created it can recover its
+    /// Copies the bytes at `range` in the shared memory `memory` to `offset`,
+    /// extending the image as needed.
+    ///
+    /// Returns `None` if the image cannot read `memory`'s type directly, so
+    /// the caller must copy the bytes through [`Self::write`] instead.
+    fn write_from_shared(
+        &mut self,
+        _offset: u64,
+        _memory: &dyn Any,
+        _range: Range<usize>,
+    ) -> Option<Result<()>> {
+        None
+    }
+
+    /// Returns the image so the platform that created it can recover its
     /// concrete type when starting the child.
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
+    fn as_any(&self) -> &dyn Any;
+}
+
+/// A pending child's memory image.
+///
+/// The image holds its share of the broker-wide child image budget until it is
+/// dropped.
+pub struct ChildImage {
+    image: Box<dyn ProcessImage>,
+    /// Image bytes counted in `budget`.
+    reserved: u64,
+    budget: Arc<AtomicU64>,
+}
+
+impl ChildImage {
+    fn new(image: Box<dyn ProcessImage>, budget: Arc<AtomicU64>) -> Self {
+        Self {
+            image,
+            reserved: 0,
+            budget,
+        }
+    }
+
+    /// Returns the platform image.
+    #[must_use]
+    pub fn image(&self) -> &dyn ProcessImage {
+        &*self.image
+    }
+
+    /// Counts image bytes up to `end` in the budget, which must stay within
+    /// `limit`.
+    fn reserve(&mut self, end: u64, limit: u64) -> Result<()> {
+        let Some(growth) = end.checked_sub(self.reserved).filter(|growth| *growth > 0) else {
+            return Ok(());
+        };
+        self.budget
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved.checked_add(growth).filter(|total| *total <= limit)
+            })
+            .map_err(|_| BrokerError::ResourceExhausted)?;
+        self.reserved = end;
+        Ok(())
+    }
+}
+
+impl Drop for ChildImage {
+    fn drop(&mut self) {
+        self.budget
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                reserved.checked_sub(self.reserved)
+            })
+            .expect("reserved child image size must include every live image");
+    }
 }
 
 /// A pending child taken for startup, with its memory image if one was written.
-type ChildWithImage = (Arc<BrokerProcess>, Option<Box<dyn ProcessImage>>);
+type ChildWithImage = (Arc<BrokerProcess>, Option<ChildImage>);
 
 /// Caller identity information supplied by the broker entry layer.
 ///
@@ -189,7 +256,7 @@ struct BrokerProcessState {
 struct PendingChild {
     process: Arc<BrokerProcess>,
     /// Memory image the child starts from, once written.
-    image: Option<Box<dyn ProcessImage>>,
+    image: Option<ChildImage>,
 }
 
 /// Broker-visible status of one process.
@@ -489,33 +556,37 @@ impl BrokerProcess {
         Ok((process, image))
     }
 
-    /// Writes `data` at `offset` in the memory image of the pending child
-    /// selected by `child_process_id`.
+    /// Lets `write` store `length` bytes at `offset` in the memory image of
+    /// the pending child selected by `child_process_id`.
     ///
     /// The first write creates the image with `create`. The image ends no
-    /// later than the broker's child image size limit.
-    pub fn write_child_memory(
+    /// later than the broker's child image size limit, and all child images
+    /// together stay within the broker's total child image size limit.
+    pub fn write_child_memory<E: From<BrokerError>>(
         &self,
         child_process_id: ProcessId,
         offset: u64,
-        data: &[u8],
+        length: u64,
         create: impl FnOnce() -> Result<Box<dyn ProcessImage>>,
-    ) -> Result<()> {
-        let end = u64::try_from(data.len())
-            .ok()
-            .and_then(|length| offset.checked_add(length))
+        write: impl FnOnce(&mut dyn ProcessImage) -> core::result::Result<(), E>,
+    ) -> core::result::Result<(), E> {
+        let limits = self.core.limits;
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= limits.max_child_image_size)
             .ok_or(BrokerError::ResourceExhausted)?;
-        if end > self.core.limits.max_child_image_size {
-            return Err(BrokerError::ResourceExhausted);
-        }
         // The state lock keeps the child pending while its image is written.
         let mut state = self.state.lock();
         let pending = self.pending_child(&mut state, child_process_id)?;
         let image = match &mut pending.image {
             Some(image) => image,
-            None => pending.image.insert(create()?),
+            None => pending.image.insert(ChildImage::new(
+                create()?,
+                Arc::clone(&self.core.reserved_child_image_size),
+            )),
         };
-        image.write(offset, data)
+        image.reserve(end, limits.max_total_child_image_size)?;
+        write(&mut *image.image)
     }
 
     /// Returns the pending child selected by `child_process_id` while it
@@ -2276,7 +2347,7 @@ mod tests {
                 Ok(())
             }
 
-            fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+            fn as_any(&self) -> &dyn Any {
                 self
             }
         }
@@ -2285,7 +2356,7 @@ mod tests {
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
                 .with_process_duplication_enabled(true),
         )
-        .with_limits(BrokerCoreLimits::DEFAULT.with_child_image_size_limit(8))
+        .with_limits(BrokerCoreLimits::DEFAULT.with_child_image_size_limits(8, 8))
         .build()
         .unwrap();
         let parent = broker
@@ -2303,40 +2374,112 @@ mod tests {
             created.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(TestImage(Arc::clone(&writes))) as Box<dyn ProcessImage>)
         };
+        let write = |process_id, offset, data: &[u8]| {
+            parent.write_child_memory(process_id, offset, data.len() as u64, create, |image| {
+                image.write(offset, data)
+            })
+        };
 
         assert_eq!(
-            parent.write_child_memory(ProcessId(process_id.0 + 1), 0, &[1], create),
+            write(ProcessId(process_id.0 + 1), 0, &[1]),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            parent.write_child_memory(process_id, 7, &[1, 2], create),
+            write(process_id, 7, &[1, 2]),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(
-            parent.write_child_memory(process_id, u64::MAX, &[1], create),
+            write(process_id, u64::MAX, &[1]),
             Err(BrokerError::ResourceExhausted)
         );
         assert_eq!(created.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            parent.write_child_memory(process_id, 6, &[1, 2], create),
-            Ok(())
-        );
-        assert_eq!(
-            parent.write_child_memory(process_id, 0, &[3], create),
-            Ok(())
-        );
+        assert_eq!(write(process_id, 6, &[1, 2]), Ok(()));
+        assert_eq!(write(process_id, 0, &[3]), Ok(()));
         assert_eq!(created.load(Ordering::Relaxed), 1);
+        assert_eq!(broker.reserved_child_image_size.load(Ordering::Relaxed), 8);
 
         let (child, image) = parent.take_child_process_with_image(process_id).unwrap();
         assert_eq!(child.id(), process_id);
-        assert!(image.unwrap().into_any().downcast::<TestImage>().is_ok());
+        let image = image.unwrap();
+        assert!(image.image().as_any().downcast_ref::<TestImage>().is_some());
+        drop(image);
         assert_eq!(*writes.lock().unwrap(), [(6, vec![1, 2]), (0, vec![3])]);
         assert_eq!(Arc::strong_count(&writes), 1);
-        assert_eq!(
-            parent.write_child_memory(process_id, 0, &[1], create),
-            Err(BrokerError::UnknownObject)
-        );
+        assert_eq!(broker.reserved_child_image_size.load(Ordering::Relaxed), 0);
+        assert_eq!(write(process_id, 0, &[1]), Err(BrokerError::UnknownObject));
         child.complete_start().unwrap();
+    }
+
+    #[test]
+    fn child_images_share_the_broker_image_budget() {
+        struct TestImage;
+
+        impl ProcessImage for TestImage {
+            fn write(&mut self, _offset: u64, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let broker = TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .with_limits(BrokerCoreLimits::DEFAULT.with_child_image_size_limits(8, 12))
+        .build()
+        .unwrap();
+        let pending_child = || {
+            let parent = broker
+                .allocate_process(CallerCredential::Unauthenticated, None)
+                .unwrap();
+            parent.complete_start().unwrap();
+            let child = parent
+                .allocate_child_process(readiness_sink())
+                .unwrap()
+                .identity
+                .process_id;
+            (parent, child)
+        };
+        let write = |parent: &BrokerProcess, child, offset, length| {
+            parent.write_child_memory::<BrokerError>(
+                child,
+                offset,
+                length,
+                || Ok(Box::new(TestImage)),
+                |_| Ok(()),
+            )
+        };
+        let reserved = || broker.reserved_child_image_size.load(Ordering::Relaxed);
+        let (first, first_child) = pending_child();
+        let (second, second_child) = pending_child();
+
+        assert_eq!(write(&first, first_child, 0, 8), Ok(()));
+        // Rewriting bytes the image already holds takes no more of the budget.
+        assert_eq!(write(&first, first_child, 2, 4), Ok(()));
+        assert_eq!(write(&second, second_child, 0, 4), Ok(()));
+        assert_eq!(
+            write(&second, second_child, 4, 1),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(reserved(), 12);
+
+        // A taken image keeps its share until it is dropped.
+        let (child, image) = first.take_child_process_with_image(first_child).unwrap();
+        assert_eq!(
+            write(&second, second_child, 4, 1),
+            Err(BrokerError::ResourceExhausted)
+        );
+        drop(image);
+        assert_eq!(reserved(), 4);
+        assert_eq!(write(&second, second_child, 4, 4), Ok(()));
+        assert_eq!(reserved(), 8);
+        child.complete_start().unwrap();
+
+        second.exit_child_process(second_child, EXITED).unwrap();
+        assert_eq!(reserved(), 0);
     }
 
     #[test]
@@ -2349,7 +2492,7 @@ mod tests {
                 Ok(())
             }
 
-            fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+            fn as_any(&self) -> &dyn Any {
                 self
             }
         }
@@ -2371,9 +2514,13 @@ mod tests {
             .process_id;
         let image = Arc::new(());
         parent
-            .write_child_memory(process_id, 0, &[1], || {
-                Ok(Box::new(TestImage(Arc::clone(&image))))
-            })
+            .write_child_memory::<BrokerError>(
+                process_id,
+                0,
+                1,
+                || Ok(Box::new(TestImage(Arc::clone(&image)))),
+                |_| Ok(()),
+            )
             .unwrap();
         assert_eq!(Arc::strong_count(&image), 2);
 

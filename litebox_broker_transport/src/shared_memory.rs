@@ -9,11 +9,13 @@
 //! access.
 
 use alloc::sync::Arc;
+use core::ops::Range;
 
 use thiserror::Error;
 
 use litebox_broker_protocol::shared_buffer::{
-    SharedBufferLayout, SharedBufferLayoutError, SharedBufferSequence, SharedBufferSlotIndex,
+    MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SharedBufferLayout, SharedBufferLayoutError,
+    SharedBufferSequence, SharedBufferSlotIndex,
 };
 
 /// Error accessing a shared-memory resource.
@@ -200,28 +202,56 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
         Ok(())
     }
 
+    /// Returns the shared-memory ranges holding the first `length` bytes of
+    /// `sequence`, in transfer order.
+    ///
+    /// Slots adjacent in memory share one range.
+    pub fn sequence_ranges(
+        &self,
+        sequence: SharedBufferSequence,
+        length: usize,
+    ) -> Result<impl Iterator<Item = Range<usize>> + use<Memory>, SharedBufferError> {
+        let descriptors = sequence.descriptors(self.layout)?;
+        if length > sequence.length() as usize {
+            return Err(SharedBufferError::TransferExceedsSequence);
+        }
+        let mut ranges: [Range<usize>; MAX_SHARED_BUFFER_SEQUENCE_SLOTS] =
+            core::array::from_fn(|_| 0..0);
+        let mut count = 0_usize;
+        let mut remaining = length;
+        for descriptor in descriptors {
+            if remaining == 0 {
+                break;
+            }
+            let slot_length = remaining.min(descriptor.length as usize);
+            let range = self.layout.range(descriptor.slot_index, slot_length)?;
+            remaining -= slot_length;
+            match count.checked_sub(1).map(|last| &mut ranges[last]) {
+                Some(last) if last.end == range.start => last.end = range.end,
+                _ => {
+                    ranges[count] = range;
+                    count += 1;
+                }
+            }
+        }
+        if remaining != 0 {
+            return Err(SharedBufferError::TransferExceedsSequence);
+        }
+        Ok(ranges.into_iter().take(count))
+    }
+
     /// Copies a sequence prefix into `destination`.
     pub fn read_sequence(
         &self,
         sequence: SharedBufferSequence,
         destination: &mut [u8],
     ) -> Result<(), SharedBufferError> {
-        let descriptors = sequence.descriptors(self.layout)?;
-        if destination.len() > sequence.length() as usize {
-            return Err(SharedBufferError::TransferExceedsSequence);
-        }
         let mut offset = 0;
-        for descriptor in descriptors {
-            if offset == destination.len() {
-                break;
-            }
-            let length = (destination.len() - offset).min(descriptor.length as usize);
-            let end = offset + length;
-            self.read(descriptor.slot_index, &mut destination[offset..end])?;
+        for range in self.sequence_ranges(sequence, destination.len())? {
+            let end = offset + range.len();
+            self.memory
+                .read(range.start, &mut destination[offset..end])?;
             offset = end;
-        }
-        if offset != destination.len() {
-            return Err(SharedBufferError::TransferExceedsSequence);
         }
         Ok(())
     }
@@ -232,22 +262,11 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
         sequence: SharedBufferSequence,
         source: &[u8],
     ) -> Result<(), SharedBufferError> {
-        let descriptors = sequence.descriptors(self.layout)?;
-        if source.len() > sequence.length() as usize {
-            return Err(SharedBufferError::TransferExceedsSequence);
-        }
         let mut offset = 0;
-        for descriptor in descriptors {
-            if offset == source.len() {
-                break;
-            }
-            let length = (source.len() - offset).min(descriptor.length as usize);
-            let end = offset + length;
-            self.write(descriptor.slot_index, &source[offset..end])?;
+        for range in self.sequence_ranges(sequence, source.len())? {
+            let end = offset + range.len();
+            self.memory.write(range.start, &source[offset..end])?;
             offset = end;
-        }
-        if offset != source.len() {
-            return Err(SharedBufferError::TransferExceedsSequence);
         }
         Ok(())
     }
@@ -258,6 +277,7 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[test]
@@ -309,15 +329,58 @@ mod tests {
         );
     }
 
-    struct TestSharedMemory(Mutex<Vec<u8>>);
+    #[test]
+    fn pool_merges_slots_adjacent_in_memory() {
+        let layout = SharedBufferLayout::new(4, 4).unwrap();
+        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
+        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let sequence = SharedBufferSequence::new(
+            &[
+                SharedBufferSlotIndex(1),
+                SharedBufferSlotIndex(2),
+                SharedBufferSlotIndex(0),
+                SharedBufferSlotIndex(3),
+            ],
+            14,
+        )
+        .unwrap();
+
+        let ranges = |length| {
+            pool.sequence_ranges(sequence, length)
+                .unwrap()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ranges(14), [4..12, 0..4, 12..14]);
+        assert_eq!(ranges(6), core::iter::once(4..10).collect::<Vec<_>>());
+        assert_eq!(ranges(0), []);
+
+        let source: Vec<u8> = (1..=14).collect();
+        pool.write_sequence(sequence, &source).unwrap();
+        assert_eq!(
+            memory.bytes(),
+            [9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 0, 0]
+        );
+        let mut destination = [0; 14];
+        pool.read_sequence(sequence, &mut destination).unwrap();
+        assert_eq!(destination, *source);
+        // One access per merged range, instead of one per slot.
+        assert_eq!(memory.accesses(), 6);
+    }
+
+    struct TestSharedMemory(Mutex<Vec<u8>>, AtomicUsize);
 
     impl TestSharedMemory {
         fn new(length: usize) -> Self {
-            Self(Mutex::new(vec![0; length]))
+            Self(Mutex::new(vec![0; length]), AtomicUsize::new(0))
         }
 
         fn bytes(&self) -> Vec<u8> {
             self.0.lock().unwrap().clone()
+        }
+
+        /// Returns the number of reads and writes.
+        fn accesses(&self) -> usize {
+            self.1.load(Ordering::Relaxed)
         }
     }
 
@@ -327,6 +390,7 @@ mod tests {
         }
 
         fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+            self.1.fetch_add(1, Ordering::Relaxed);
             let memory = self.0.lock().unwrap();
             let end = offset
                 .checked_add(destination.len())
@@ -339,6 +403,7 @@ mod tests {
         }
 
         fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
+            self.1.fetch_add(1, Ordering::Relaxed);
             let mut memory = self.0.lock().unwrap();
             let end = offset
                 .checked_add(source.len())

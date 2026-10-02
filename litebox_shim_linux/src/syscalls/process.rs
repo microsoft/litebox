@@ -1338,17 +1338,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 Ok(())
             };
-            // Host protection keys can make execute-only pages unreadable, so they are
-            // readable only while copied.
-            if region.flags & VmFlags::VM_ACCESS_FLAGS == VmFlags::VM_EXEC {
+            // Regions without read access, such as inaccessible ones that may hold data and
+            // execute-only ones that host protection keys can make unreadable, are readable only
+            // while copied.
+            if region.flags.contains(VmFlags::VM_READ) {
+                write_region()?;
+            } else {
                 let start = UserPtrMut::from_usize(region.range.start);
                 let len = region.range.len();
-                self.sys_mprotect_raw(start, len, ProtFlags::PROT_READ_EXEC)?;
+                let prot = super::mm::prot_flags_from_permissions(region.flags.into());
+                self.sys_mprotect_raw(start, len, prot | ProtFlags::PROT_READ)?;
                 let written = write_region();
-                self.sys_mprotect_raw(start, len, ProtFlags::PROT_EXEC)?;
+                self.sys_mprotect_raw(start, len, prot)?;
                 written?;
-            } else {
-                write_region()?;
             }
             image_offset += region.range.len() as u64;
         }
@@ -1383,15 +1385,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             let has_contents = region.has_contents();
             let mut image_error = None;
-            // SAFETY: `NOREPLACE` fails rather than replacing any existing mapping.
-            unsafe {
-                mm.create_pages_with_permissions(
-                    Some(address),
-                    length,
-                    flags,
-                    region.flags.into(),
-                    |pages| {
-                        if has_contents {
+            let created = if has_contents {
+                // SAFETY: `NOREPLACE` fails rather than replacing any existing mapping.
+                unsafe {
+                    mm.create_pages_with_permissions(
+                        Some(address),
+                        length,
+                        flags,
+                        region.flags.into(),
+                        |pages| {
                             // SAFETY: The pages were just mapped readable and writable, and
                             // nothing else uses them until this function returns.
                             let pages = core::slice::from_raw_parts_mut(
@@ -1402,12 +1404,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 image_error = Some(error);
                                 return Err(MappingError::OutOfMemory);
                             }
-                        }
-                        Ok(0)
-                    },
-                )
-            }
-            .map_err(|error| match image_error {
+                            Ok(0)
+                        },
+                    )
+                }
+            } else {
+                // A region without contents is never accessible, so creating it inaccessible
+                // keeps it marked as holding no data.
+                // SAFETY: `NOREPLACE` fails rather than replacing any existing mapping.
+                unsafe { mm.create_inaccessible_pages(Some(address), length, flags, |_| Ok(0)) }
+            };
+            created.map_err(|error| match image_error {
                 Some(error) => crate::ForkRestoreError::Image(error),
                 None => crate::ForkRestoreError::Memory(region.range.start, error),
             })?;

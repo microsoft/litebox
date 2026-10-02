@@ -177,9 +177,11 @@ pub struct ForkMemoryRegion {
 
 impl ForkMemoryRegion {
     /// Returns whether the region's contents are in the process image, which holds those of
-    /// every region with any access permission. Any other region starts zero-filled.
+    /// every region with any access permission or [`VmFlags::VM_HAS_CONTENTS`]. Any other
+    /// region starts zero-filled.
     pub fn has_contents(&self) -> bool {
-        self.flags.intersects(VmFlags::VM_ACCESS_FLAGS)
+        self.flags
+            .intersects(VmFlags::VM_ACCESS_FLAGS | VmFlags::VM_HAS_CONTENTS)
     }
 }
 

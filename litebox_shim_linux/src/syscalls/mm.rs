@@ -78,7 +78,7 @@ fn finalize_trampoline_gates(
     }
 }
 
-fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
+pub(super) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
     prot.set(
         ProtFlags::PROT_READ,
@@ -2382,6 +2382,69 @@ mod tests {
             (fixed, PAGE_SIZE),
         ] {
             task.sys_munmap(address, len).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn repeated_moving_growth_keeps_contents() {
+        const PAGE: isize = PAGE_SIZE.cast_signed();
+        let task = init_platform();
+        let read_write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let anonymous = MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
+        // Occupies the page after a mapping so that growing it has to move it.
+        let block_after = |address: UserPtrMut<u8>, len: usize| {
+            task.sys_mmap(
+                address.as_usize() + len,
+                PAGE_SIZE,
+                ProtFlags::PROT_NONE,
+                anonymous | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .ok()
+        };
+
+        let first = task
+            .sys_mmap(0, 2 * PAGE_SIZE, read_write, anonymous, -1, 0)
+            .unwrap();
+        first
+            .write_slice_at_offset::<Platform>(0, &[0xa5; 0x10])
+            .unwrap();
+        let first_block = block_after(first, 2 * PAGE_SIZE);
+        let second = task
+            .sys_mremap(
+                first,
+                2 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+                MRemapFlags::MREMAP_MAYMOVE,
+                0,
+            )
+            .unwrap();
+        assert_ne!(second.as_usize(), first.as_usize());
+        second
+            .write_slice_at_offset::<Platform>(3 * PAGE, &[0x5a; 0x10])
+            .unwrap();
+
+        // The moved pages and the grown tail are separate host mappings that must move together.
+        let second_block = block_after(second, 4 * PAGE_SIZE);
+        let third = task
+            .sys_mremap(
+                second,
+                4 * PAGE_SIZE,
+                8 * PAGE_SIZE,
+                MRemapFlags::MREMAP_MAYMOVE,
+                0,
+            )
+            .unwrap();
+        assert_ne!(third.as_usize(), second.as_usize());
+        assert_eq!(third.read_at_offset::<Platform>(0).unwrap(), 0xa5_u8);
+        assert_eq!(third.read_at_offset::<Platform>(3 * PAGE).unwrap(), 0x5a_u8);
+        assert_eq!(third.read_at_offset::<Platform>(5 * PAGE).unwrap(), 0_u8);
+
+        task.sys_munmap(third, 8 * PAGE_SIZE).unwrap();
+        for block in [first_block, second_block].into_iter().flatten() {
+            task.sys_munmap(block, PAGE_SIZE).unwrap();
         }
     }
 

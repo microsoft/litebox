@@ -53,6 +53,10 @@ bitflags::bitflags! {
 
         /// The area can grow downward upon page fault.
         const VM_GROWSDOWN = 1 << 8;
+        /// The area may hold data even while it has no access: it is file-backed or had access
+        /// at some point. Inaccessible areas without it, such as reservations and guard pages,
+        /// hold only zeros.
+        const VM_HAS_CONTENTS = 1 << 9;
 
         const VM_ACCESS_FLAGS = Self::VM_READ.bits()
             | Self::VM_WRITE.bits()
@@ -312,9 +316,13 @@ impl VmArea {
         self.is_file_backed
     }
 
-    /// Create a new [`VmArea`] with the given flags.
+    /// Create a new [`VmArea`] with the given flags, adding [`VmFlags::VM_HAS_CONTENTS`] if the
+    /// area is file-backed or has any access.
     #[inline]
-    pub(super) fn new(flags: VmFlags, is_file_backed: bool) -> Self {
+    pub(super) fn new(mut flags: VmFlags, is_file_backed: bool) -> Self {
+        if is_file_backed || flags.intersects(VmFlags::VM_ACCESS_FLAGS) {
+            flags |= VmFlags::VM_HAS_CONTENTS;
+        }
         Self {
             flags,
             is_file_backed,
@@ -1122,13 +1130,8 @@ where
             .map_err(VmemProtectError::ProtectError)?;
         for (intersection, vma) in mappings_to_change {
             let new_flags = (vma.flags & !VmFlags::VM_ACCESS_FLAGS) | flags;
-            self.vmas.insert(
-                intersection,
-                VmArea {
-                    flags: new_flags,
-                    is_file_backed: vma.is_file_backed,
-                },
-            );
+            self.vmas
+                .insert(intersection, VmArea::new(new_flags, vma.is_file_backed));
         }
 
         Ok(())
@@ -2070,5 +2073,42 @@ mod tests {
             unsafe { vmm.insert_mapping(above_max, vma, false, FixedAddressBehavior::NoReplace,) },
             Err(AllocationError::AboveMaxAddress)
         ));
+    }
+
+    #[test]
+    fn inaccessible_areas_remember_whether_they_had_access() {
+        let start = DummyVmemBackend::<false>::TASK_ADDR_MIN;
+        let mut vmm = Vmem::new(dummy_backend::<false>(None));
+        unsafe {
+            vmm.create_pages(
+                Some(NonZeroAddress::new(start).unwrap()),
+                NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
+                CreatePagesFlags::FIXED_ADDR,
+                MemoryRegionPermissions::empty(),
+            )
+        }
+        .unwrap();
+        let accessed = PageRange::new(start + PAGE_SIZE, start + 2 * PAGE_SIZE).unwrap();
+        for permissions in [
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+            MemoryRegionPermissions::empty(),
+        ] {
+            unsafe { vmm.protect_mapping(accessed, permissions) }.unwrap();
+        }
+        let has_contents = vmm
+            .iter()
+            .map(|(range, vma)| {
+                let contents = vma.flags().contains(VmFlags::VM_HAS_CONTENTS);
+                (range.clone(), contents)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            has_contents,
+            vec![
+                (start..start + PAGE_SIZE, false),
+                (start + PAGE_SIZE..start + 2 * PAGE_SIZE, true),
+                (start + 2 * PAGE_SIZE..start + 3 * PAGE_SIZE, false),
+            ]
+        );
     }
 }

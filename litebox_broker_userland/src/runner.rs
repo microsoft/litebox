@@ -26,13 +26,17 @@ use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher}
 use linux::PlatformRunnerEndpoint;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::create_process_image;
+#[cfg(target_os = "linux")]
+use linux::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::PlatformRunnerEndpoint;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use windows::wait_for_runner_event;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often a starting runner is polled for its connection and an exiting runner for its exit.
-/// Every runner start and exit, including those of `fork` and `execve`, waits on these polls.
+/// How often runner connections and exits are rechecked where readiness waits
+/// are unavailable (Windows, and Linux kernels without `pidfd_open`).
 const RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Configuration for starting one out-of-process runner.
@@ -247,7 +251,7 @@ impl RunnerShutdown {
             if remaining.is_zero() {
                 return Ok(false);
             }
-            std::thread::sleep(remaining.min(RUNNER_POLL_INTERVAL));
+            wait_for_runner_event(&self.runner, None, Some(remaining))?;
         }
     }
 }
@@ -416,6 +420,7 @@ fn accept_runner_channel<Channel>(
     channel_name: &'static str,
     mut runner_status: impl FnMut() -> IoResult<Option<String>>,
     mut try_accept: impl FnMut() -> IoResult<Channel>,
+    mut wait: impl FnMut(Duration) -> IoResult<()>,
 ) -> IoResult<Channel> {
     loop {
         if let Some(status) = runner_status()? {
@@ -436,7 +441,7 @@ fn accept_runner_channel<Channel>(
             Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
-        std::thread::sleep(remaining.min(RUNNER_POLL_INTERVAL));
+        wait(remaining)?;
     }
 }
 
@@ -459,7 +464,7 @@ fn wait_for_runner_exit(runner: &Arc<Mutex<Child>>) -> IoResult<ExitStatus> {
         {
             return Ok(status);
         }
-        std::thread::sleep(RUNNER_POLL_INTERVAL);
+        wait_for_runner_event(runner, None, None)?;
     }
 }
 

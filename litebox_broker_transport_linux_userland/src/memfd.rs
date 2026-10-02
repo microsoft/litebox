@@ -10,12 +10,14 @@
 //!
 //! Rust never dereferences the peer-writable mapping. Byte and word access uses
 //! positional descriptor I/O into private buffers; the mapping exists only to
-//! provide checked addresses to the kernel's futex operations.
+//! provide checked addresses to the kernel's futex operations and to process
+//! image writes.
 
 use std::io::{Error, Result as IoResult};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::mem::{align_of, size_of};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::ops::Range;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::ptr::NonNull;
 use std::time::Instant;
@@ -496,6 +498,57 @@ impl MemfdProcessImage {
             MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
         )?;
         Ok(Self { fd })
+    }
+
+    /// Copies the bytes at `range` in `memory` to `offset`, extending the image
+    /// as needed.
+    ///
+    /// The kernel copies straight from the shared mapping, so a peer writing
+    /// the range concurrently changes only the copied bytes.
+    pub fn write_from_shared(
+        &self,
+        mut offset: u64,
+        memory: &MemfdSharedMemory,
+        range: Range<usize>,
+    ) -> IoResult<()> {
+        let mut source = shared_address(&memory.mapping, range.start, range.len(), 1)
+            .map_err(MemfdSharedMemory::wait_access_error)?;
+        if !memory.policy.permits_byte_range(range.start, range.len()) {
+            return Err(MemfdSharedMemory::wait_access_error(
+                SharedMemoryError::InvalidRange,
+            ));
+        }
+        let mut remaining = range.len();
+        while remaining > 0 {
+            let file_offset = libc::off_t::try_from(offset)
+                .map_err(|_| Error::new(ErrorKind::InvalidInput, "process image is too large"))?;
+            // SAFETY: `source..source + remaining` lies within the live shared
+            // mapping, which `memory` keeps mapped. The kernel copies from it
+            // without Rust forming references to peer-writable memory.
+            let written =
+                unsafe { libc::pwrite(self.fd.as_raw_fd(), source.cast(), remaining, file_offset) };
+            match written {
+                0 => {
+                    return Err(Error::new(
+                        ErrorKind::WriteZero,
+                        "failed to write process image",
+                    ));
+                }
+                1.. => {
+                    let written = written.cast_unsigned();
+                    source = source.wrapping_add(written);
+                    remaining -= written;
+                    offset += written as u64;
+                }
+                _ => {
+                    let error = Error::last_os_error();
+                    if error.kind() != ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Writes `data` at `offset`, extending the image as needed.
@@ -1181,6 +1234,35 @@ mod tests {
             image.write(0, b"x").unwrap_err().kind(),
             ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn process_image_copies_from_shared_memory() {
+        let memory = MemfdSharedMemory::create(16).unwrap();
+        memory.write(4, b"shared").unwrap();
+        let image = MemfdProcessImage::create().unwrap();
+
+        image.write_from_shared(0x1000, &memory, 4..10).unwrap();
+        assert_eq!(
+            image
+                .write_from_shared(0, &memory, 12..17)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        let control = MemfdSharedMemory::create_control_ring().unwrap();
+        assert_eq!(
+            image
+                .write_from_shared(0, &control, 0..1)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+
+        assert_eq!(fstat(&image.fd).unwrap().st_size, 0x1006);
+        let mut bytes = [0; 6];
+        assert_eq!(pread(&image.fd, &mut bytes, 0x1000).unwrap(), 6);
+        assert_eq!(&bytes, b"shared");
     }
 
     #[test]

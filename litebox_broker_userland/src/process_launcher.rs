@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ProcessImage, ProcessLifecycleSink,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
@@ -28,14 +28,14 @@ pub(crate) struct UserlandProcessLauncher {
 pub(crate) struct PendingRunnerAssociation {
     pub(super) process: Arc<BrokerProcess>,
     data: Option<ProcessStartupData>,
-    image: Option<Box<dyn ProcessImage>>,
+    image: Option<ChildImage>,
 }
 
 impl PendingRunnerAssociation {
     fn new(
         process: Arc<BrokerProcess>,
         data: Option<ProcessStartupData>,
-        image: Option<Box<dyn ProcessImage>>,
+        image: Option<ChildImage>,
     ) -> Self {
         Self {
             process,
@@ -45,7 +45,7 @@ impl PendingRunnerAssociation {
     }
 
     /// Takes the memory image to pass to the runner during setup.
-    pub(crate) fn take_image(&mut self) -> Option<Box<dyn ProcessImage>> {
+    pub(crate) fn take_image(&mut self) -> Option<ChildImage> {
         self.image.take()
     }
 
@@ -213,7 +213,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
         data: ProcessStartupData,
-        image: Option<Box<dyn ProcessImage>>,
+        image: Option<ChildImage>,
     ) -> Result<(), BrokerError> {
         let config = self.started_runner_config.clone();
         self.launch_runner(
@@ -224,7 +224,7 @@ impl ProcessLauncher for UserlandProcessLauncher {
     }
 
     #[cfg(target_os = "linux")]
-    fn create_image(&self) -> Result<Box<dyn ProcessImage>, BrokerError> {
+    fn create_image(&self) -> Result<Box<dyn litebox_broker_core::ProcessImage>, BrokerError> {
         crate::runner::create_process_image()
     }
 }

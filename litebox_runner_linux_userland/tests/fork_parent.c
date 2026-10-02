@@ -18,6 +18,9 @@
 static int global_value = 1;
 static volatile sig_atomic_t usr1_count;
 static volatile sig_atomic_t sigchld_count;
+// A page written and then made inaccessible, and an inaccessible reservation never written.
+static unsigned char *hidden;
+static unsigned char *reserved;
 
 static void on_usr1(int signal) {
     (void)signal;
@@ -27,6 +30,15 @@ static void on_usr1(int signal) {
 static void on_sigchld(int signal) {
     (void)signal;
     sigchld_count++;
+}
+
+// Returns whether the inaccessible page still holds what was written before it became so.
+static int hidden_is_intact(void) {
+    if (mprotect(hidden, 4096, PROT_READ) != 0) {
+        return 0;
+    }
+    int intact = memcmp(hidden, "hidden", sizeof "hidden") == 0;
+    return mprotect(hidden, 4096, PROT_NONE) == 0 && intact;
 }
 
 static unsigned long checksum(const unsigned char *buffer, size_t size) {
@@ -57,6 +69,8 @@ static int run_child(pid_t parent, unsigned char *buffer, unsigned long expected
     failures += checksum(buffer, BUFFER_SIZE) != expected_sum;
     // Execute-only memory keeps its code.
     failures += exec_only() != 42;
+    // An inaccessible reservation stays reserved and zero-filled.
+    failures += mprotect(reserved, 4096, PROT_READ) != 0 || reserved[0] != 0;
     // Writes stay in the child.
     global_value = 3;
     memset(buffer, 0x5a, BUFFER_SIZE);
@@ -70,11 +84,13 @@ static int run_child(pid_t parent, unsigned char *buffer, unsigned long expected
 
     pid_t grandchild = fork();
     if (grandchild == 0) {
-        _exit(global_value == 3 ? 5 : 6);
+        // The inaccessible page's contents survive a second fork before the child touches it.
+        _exit(global_value == 3 && hidden_is_intact() ? 5 : 6);
     }
     int status = 0;
     failures += grandchild < 0 || waitpid(grandchild, &status, 0) != grandchild ||
                 !WIFEXITED(status) || WEXITSTATUS(status) != 5;
+    failures += !hidden_is_intact();
 
     char message[64];
     int length = snprintf(message, sizeof message, "child pid=%d failures=%d\n", pid, failures);
@@ -112,6 +128,15 @@ int main(void) {
         return 3;
     }
     int (*exec_only)(void) = (int (*)(void))(void *)code;
+    hidden = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    reserved = mmap(NULL, 1024 * 1024, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (hidden == MAP_FAILED || reserved == MAP_FAILED) {
+        return 3;
+    }
+    memcpy(hidden, "hidden", sizeof "hidden");
+    if (mprotect(hidden, 4096, PROT_NONE) != 0) {
+        return 3;
+    }
     global_value = 2;
     fflush(stdout);
 
@@ -151,7 +176,9 @@ int main(void) {
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
     printf("parent pid=%d global=%d intact=%d usr1=%d sigchld=%d echild=%d\n", getpid(),
-           global_value, checksum(buffer, BUFFER_SIZE) == expected_sum && exec_only() == 42,
+           global_value,
+           checksum(buffer, BUFFER_SIZE) == expected_sum && exec_only() == 42 &&
+               hidden_is_intact(),
            usr1_count, sigchld_count > 0, again == -1 && again_errno == ECHILD);
     return failures;
 }

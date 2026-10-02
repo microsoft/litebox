@@ -184,8 +184,22 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 flags.bits() as usize,
                 new_range.start,
             )
-            .expect("mremap failed")
         };
+        // A moved range's pages and its claimed tail stay separate host mappings, and kernels
+        // before 6.17 cannot move more than one mapping at once. Release the claim, which the
+        // kernel may already have unmapped, and let the caller copy instead.
+        #[cfg(target_arch = "x86_64")]
+        let res = res.map_err(|_| {
+            // SAFETY: vmem reserved `new_range` for this move and the failed `mremap` placed
+            // nothing in it, so only the claim made above can be unmapped.
+            let _ = unsafe {
+                syscalls::syscall2(syscalls::Sysno::munmap, new_range.start, new_range.len())
+            }
+            .expect("munmap failed");
+            litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
+        })?;
+        #[cfg(target_arch = "aarch64")]
+        let res = res.expect("mremap failed");
         Ok(UserMutPtr::from_usize(res))
     }
 

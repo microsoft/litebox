@@ -6,7 +6,7 @@ use std::io::Result as IoResult;
 use std::os::windows::io::AsRawHandle;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use litebox_broker_core::BrokerCore;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
@@ -16,7 +16,8 @@ use litebox_broker_transport_windows_userland::named_pipe::{
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
 use super::{
-    PendingRunnerAssociation, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
+    PendingRunnerAssociation, RUNNER_POLL_INTERVAL, UserlandProcessLauncher, accept_runner_channel,
+    runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
 
@@ -118,6 +119,7 @@ fn accept_control_channel(
         "control",
         || runner_has_exited(runner).map(|exited| exited.then(|| "exited".to_owned())),
         || control_listener.try_accept(),
+        |remaining| wait_for_runner_event(runner, None, Some(remaining)),
     )?;
     let runner_id = runner.lock().expect("runner process mutex poisoned").id();
     validate_client_process(&control_stream, runner_id)?;
@@ -125,6 +127,21 @@ fn accept_control_channel(
         control_stream,
         setup_deadline,
     ))
+}
+
+/// Sleeps for at most [`RUNNER_POLL_INTERVAL`] before callers recheck the
+/// runner and listener.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "callers share the fallible Linux signature"
+)]
+pub(super) fn wait_for_runner_event(
+    _runner: &Arc<Mutex<Child>>,
+    _listener: Option<&WindowsNamedPipeListener>,
+    timeout: Option<Duration>,
+) -> IoResult<()> {
+    std::thread::sleep(timeout.map_or(RUNNER_POLL_INTERVAL, |t| t.min(RUNNER_POLL_INTERVAL)));
+    Ok(())
 }
 
 fn unique_control_pipe_name() -> OsString {
