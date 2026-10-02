@@ -455,8 +455,8 @@ fn incompatible_aot_gate_is_rejected_before_execution() {
 
 #[test]
 fn loader_teardown_and_argument_limit() {
+    use litebox::platform::PageManagementProvider as _;
     use litebox::platform::page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions as Perm};
-    use litebox::platform::{PageManagementProvider as _, RawConstPointer as _};
     use litebox_common_macos::PAGE_SIZE;
     use litebox_platform_macos_userland::{GuestAbi, MacosUserland, set_guest_abi};
     use litebox_shim_macos::MacosShimBuilder;
@@ -481,16 +481,20 @@ fn loader_teardown_and_argument_limit() {
     drop(program);
     // Probe each kind of loader-owned mapping after teardown.
     for page in [code_page, trampoline_page, stack_page] {
-        let ptr = platform
-            .allocate_pages(
-                page..page + PAGE_SIZE,
-                Perm::READ,
-                false,
-                true,
-                FixedAddressBehavior::NoReplace,
-            )
-            .unwrap();
-        assert_eq!(ptr.as_usize(), page);
+        let reservation = unsafe {
+            platform
+                .reserve_and_commit_pages(
+                    core::iter::empty,
+                    page..page + PAGE_SIZE,
+                    Perm::READ,
+                    false,
+                    true,
+                    FixedAddressBehavior::NoReplace,
+                )
+                .unwrap()
+        };
+        let reservation: std::ops::Range<usize> = reservation.into();
+        assert_eq!(reservation.start, page);
         // SAFETY: this test owns the idle probe mapping.
         unsafe {
             platform.release_pages(page..page + PAGE_SIZE).unwrap();
