@@ -4,12 +4,12 @@
 //! QEMU machine control. Power-off needs
 //! `-device isa-debug-exit,iobase=0xf4,iosize=0x04`.
 
-const DEBUG_EXIT_PORT: u16 = 0xf4;
+pub(crate) const DEBUG_EXIT_PORT: u16 = 0xf4;
 
 /// Written on success; QEMU exits with status 33.
 const DEBUG_EXIT_SUCCESS: u32 = 0x10;
 /// Written on failure; QEMU exits with status 65.
-const DEBUG_EXIT_FAILURE: u32 = 0x20;
+pub(crate) const DEBUG_EXIT_FAILURE: u32 = 0x20;
 
 /// QEMU exits with status `(value << 1) | 1`. Without the device the machine
 /// resets instead (use `-no-reboot` to make QEMU exit).

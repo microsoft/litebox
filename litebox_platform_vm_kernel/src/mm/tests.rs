@@ -11,7 +11,7 @@ use litebox_common_linux::vmem::{PAGE_SIZE, PageRange, VmFlags};
 use std::collections::HashMap;
 use x86_64::structures::idt::PageFaultErrorCode;
 use x86_64::structures::paging::{
-    Page, PageTableFlags,
+    Page, PageTableFlags, PhysFrame, Size4KiB,
     mapper::{MappedFrame, TranslateResult},
 };
 use x86_64::{PhysAddr, VirtAddr};
@@ -243,6 +243,106 @@ fn populate_failure_on_first_page() {
         drop(pgtable);
         assert_eq!(live_frames(), before);
     }
+}
+
+fn mapped_frame(pgtable: &TestPageTable, addr: usize) -> PhysFrame<Size4KiB> {
+    match pgtable.translate(VirtAddr::new(addr as u64)) {
+        TranslateResult::Mapped {
+            frame: MappedFrame::Size4KiB(frame),
+            ..
+        } => frame,
+        other => panic!("expected an owned 4 KiB frame: {other:?}"),
+    }
+}
+
+#[test]
+fn prot_none_preserves_contents_and_can_be_unmapped() {
+    let before = live_frames();
+    let pgtable = new_table();
+    let page = range(0x1_0000, 1);
+    let writable = VmFlags::VM_READ | VmFlags::VM_WRITE;
+    // Safety: unused user range in a table that is never loaded.
+    unsafe { pgtable.map_pages(page, writable, true) }.unwrap();
+    let frame = mapped_frame(&pgtable, page.start);
+    let ptr = frame.start_address().as_u64() as *mut u64;
+    // Safety: HostMemory uses PA == VA; the live frame is exclusively owned.
+    unsafe { ptr.write(0x1234_5678_9abc_def0) };
+    let allocated = live_frames();
+
+    for flags in [
+        VmFlags::empty(),
+        VmFlags::VM_READ,
+        writable,
+        VmFlags::empty(),
+    ] {
+        // Safety: the table is not loaded and there are no references to its mappings.
+        unsafe { pgtable.mprotect_pages(page, flags) }.unwrap();
+        check_mapped(&pgtable, page.start, vmflags_to_pteflags(flags));
+        assert_eq!(mapped_frame(&pgtable, page.start), frame);
+        assert_eq!(live_frames(), allocated);
+        // Safety: protection changes do not affect HostMemory's backing allocation.
+        assert_eq!(unsafe { ptr.read() }, 0x1234_5678_9abc_def0);
+    }
+    assert!(!vmflags_to_pteflags(VmFlags::empty()).contains(PageTableFlags::PRESENT));
+    // Safety: the table is never loaded and no access to the frame remains.
+    unsafe { pgtable.unmap_pages(page, UnmapOptions::RELEASE) }.unwrap();
+    check_unmapped(&pgtable, page.start);
+    assert_eq!(live_frames(), allocated - 1);
+    drop(pgtable);
+    assert_eq!(live_frames(), before);
+}
+
+#[test]
+fn populated_prot_none_keeps_and_drops_frames() {
+    let before = live_frames();
+    let pgtable = new_table();
+    let pages = range(0x1_0000, 2);
+    // Safety: unused user range in a table that is never loaded.
+    unsafe { pgtable.map_pages(pages, VmFlags::empty(), true) }.unwrap();
+    for page in pages {
+        check_mapped(&pgtable, page, vmflags_to_pteflags(VmFlags::empty()));
+    }
+    let frame = mapped_frame(&pgtable, pages.start);
+    let allocated = live_frames();
+    // Safety: no access to these mappings; the retained frame is freed below.
+    unsafe { pgtable.unmap_pages(range(pages.start, 1), UnmapOptions::KEEP_FRAMES) }.unwrap();
+    check_unmapped(&pgtable, pages.start);
+    assert_eq!(live_frames(), allocated);
+    drop(pgtable);
+    assert_eq!(live_frames(), before + 1);
+    // Safety: the retained frame was allocated by HostMemory at order 0.
+    unsafe { HostMemory::mem_free_pages(frame.start_address().as_u64() as *mut u8, 0) };
+    assert_eq!(live_frames(), before);
+}
+
+#[test]
+fn kernel_image_permissions() {
+    let before = live_frames();
+    let pgtable = new_table();
+    let frames = [(); 3].map(|()| {
+        let ptr = HostMemory::mem_allocate_pages(0).unwrap();
+        PhysFrame::<Size4KiB>::containing_address(PhysAddr::new(ptr as u64))
+    });
+    let text = frames[0].start_address()..(frames[0] + 1).start_address();
+    let read_only = frames[1].start_address()..(frames[1] + 1).start_address();
+    let expected = [
+        PageTableFlags::PRESENT,
+        PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE,
+        PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE | PageTableFlags::WRITABLE,
+    ];
+    for (frame, flags) in frames.into_iter().zip(expected) {
+        pgtable
+            .map_kernel_ram(PhysFrame::range(frame, frame + 1), &text, &read_only)
+            .unwrap();
+        check_mapped(
+            &pgtable,
+            usize::try_from(frame.start_address().as_u64()).unwrap(),
+            flags,
+        );
+    }
+    // HostMemory's identity mapping places these owned frames in private slots.
+    drop(pgtable);
+    assert_eq!(live_frames(), before);
 }
 
 #[test]

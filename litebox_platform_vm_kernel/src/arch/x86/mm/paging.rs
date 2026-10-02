@@ -26,7 +26,7 @@ use x86_64::{
 use crate::UserMutPtr;
 use crate::mm::{
     MemoryProvider,
-    pgtable::{PageTableAllocator, PageTableImpl},
+    pgtable::{PROT_NONE, PageTableAllocator, PageTableImpl},
 };
 
 /// Above this many pages, a full TLB flush is cheaper than `invlpg` per page
@@ -71,6 +71,19 @@ fn frame_to_pointer<M: MemoryProvider>(frame: PhysFrame) -> *mut PageTable {
     virt.as_mut_ptr()
 }
 
+fn leaf_entry<M: MemoryProvider>(
+    mut table: &mut PageTable,
+    page: Page<Size4KiB>,
+) -> Option<&mut PageTableEntry> {
+    for index in [page.p4_index(), page.p3_index(), page.p2_index()] {
+        let frame = table[index].frame().ok()?;
+        // Safety: these are live intermediate tables reached under the owning
+        // page table's lock; `frame()` rejects absent and huge-page entries.
+        table = unsafe { &mut *frame_to_pointer::<M>(frame) };
+    }
+    Some(&mut table[page.p1_index()])
+}
+
 pub(crate) struct X64PageTable<'a, M: MemoryProvider, const ALIGN: usize> {
     inner: spin::mutex::SpinMutex<MappedPageTable<'a, FrameMapping<M>>>,
 }
@@ -106,7 +119,9 @@ impl<M: MemoryProvider> FrameDeallocator<Size4KiB> for PageTableAllocator<M> {
 pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
     let mut flags = PageTableFlags::empty();
     if values.intersects(VmFlags::VM_ACCESS_FLAGS) {
-        flags |= PageTableFlags::USER_ACCESSIBLE;
+        flags |= PageTableFlags::USER_ACCESSIBLE | PageTableFlags::PRESENT;
+    } else {
+        flags |= PROT_NONE;
     }
     if values.contains(VmFlags::VM_WRITE) {
         flags |= PageTableFlags::WRITABLE;
@@ -210,7 +225,17 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let mut unmap_one = |page: Page<Size4KiB>| -> Option<PhysFrame<Size4KiB>> {
             match inner.unmap(page) {
                 Ok((frame, _)) => Some(frame),
-                Err(X64UnmapError::PageNotMapped) => None,
+                Err(X64UnmapError::PageNotMapped) => {
+                    // The mapper's unmap requires PRESENT; retained PROT_NONE
+                    // leaves must be cleared without making them accessible.
+                    let entry = leaf_entry::<M>(inner.level_4_table_mut(), page)?;
+                    if !entry.flags().contains(PROT_NONE) {
+                        return None;
+                    }
+                    let frame = PhysFrame::containing_address(entry.addr());
+                    entry.set_unused();
+                    Some(frame)
+                }
                 Err(X64UnmapError::ParentEntryHugePage) => {
                     litebox_util_log::error!("BUG: attempt to unmap a huge page");
                     None
@@ -314,8 +339,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
                     // COW is unsupported: install WRITABLE eagerly. Teardown
                     // assumes exclusive frame ownership, not refcounts.
                     if flags != new_flags {
-                        // Safety: changes only permission bits of a present
-                        // leaf; stale TLB entries are flushed below.
+                        // Safety: retains the owned frame, including PROT_NONE
+                        // leaves; stale translations are flushed below.
                         match unsafe {
                             inner.update_flags(page, (flags & !Self::MPROTECT_PTE_MASK) | new_flags)
                         } {
@@ -362,6 +387,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         &self,
         frame_range: PhysFrameRange<Size4KiB>,
         text: &Range<PhysAddr>,
+        read_only: &Range<PhysAddr>,
     ) -> Result<(), MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
         // Parent entries are permissive; leaves carry the restrictions.
@@ -376,6 +402,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             let page = Page::containing_address(M::pa_to_va(frame.start_address()));
             let flags = if text.contains(&frame.start_address()) {
                 PageTableFlags::PRESENT
+            } else if read_only.contains(&frame.start_address()) {
+                PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE
             } else {
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE
             };
@@ -500,7 +528,12 @@ impl<M: MemoryProvider, const ALIGN: usize> Drop for X64PageTable<'_, M, ALIGN> 
                             | (p2_index << P2_SHIFT)
                             | (p1_index << PAGE_SHIFT);
                         if (crate::USER_ADDR_MIN..crate::USER_ADDR_MAX).contains(&page_address) {
-                            match p1_entry.frame() {
+                            let frame = if p1_entry.flags().contains(PROT_NONE) {
+                                Ok(PhysFrame::containing_address(p1_entry.addr()))
+                            } else {
+                                p1_entry.frame()
+                            };
+                            match frame {
                                 Ok(frame) => {
                                     // Safety: task user leaf frames are exclusively owned.
                                     unsafe { allocator.deallocate_frame(frame) };
@@ -581,6 +614,9 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 offset: _,
                 flags,
             } => {
+                if flags.contains(PROT_NONE) {
+                    return Err(PageFaultError::AccessError("PROT_NONE"));
+                }
                 if error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE) {
                     if flags.contains(PageTableFlags::WRITABLE) {
                         return Ok(());
@@ -621,13 +657,7 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
                 // Safety: `frame` is fresh and exclusively owned; the caller
                 // checked that the access is allowed.
                 match unsafe {
-                    inner.map_to_with_table_flags(
-                        page,
-                        frame,
-                        flags | PageTableFlags::PRESENT,
-                        table_flags,
-                        &mut allocator,
-                    )
+                    inner.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator)
                 } {
                     Ok(_fl) => {}
                     Err(e) => {

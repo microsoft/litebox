@@ -22,7 +22,10 @@ mod tests;
 
 use boot::{BootInfo, Range};
 use core::panic::PanicInfo;
-use layout::{heap_start_address, text_end_address, text_start_address};
+use layout::{
+    heap_start_address, rodata_end_address, rodata_start_address, text_end_address,
+    text_start_address,
+};
 use litebox_platform_vm_kernel::{
     BootConfig, KERNEL_OFFSET, VmKernel,
     clock::TscClock,
@@ -109,6 +112,7 @@ pub(crate) fn kernel_start(info: BootInfo) -> ! {
                 clock,
                 ram: &ram,
                 text: to_pa(text_start_address())..to_pa(text_end_address()),
+                read_only: to_pa(rodata_start_address())..to_pa(rodata_end_address()),
                 ignored_vectors: &machine::SPURIOUS_VECTORS,
             },
             kernel_main,
@@ -129,6 +133,7 @@ fn kernel_main(platform: &'static VmKernel) -> ! {
     }
 
     install_development_platform_root_key();
+    tests::check_user_memory_protection(platform);
 
     optee::run(platform, info);
     serial_println!("[litebox] ALL TESTS PASSED");

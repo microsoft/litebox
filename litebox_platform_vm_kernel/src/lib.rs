@@ -77,8 +77,11 @@ pub struct BootConfig<'a> {
     pub clock: &'static dyn clock::ClockSource,
     /// Physical RAM to map; ranges are rounded inward to whole pages.
     pub ram: &'a [core::ops::Range<PhysAddr>],
-    /// Physical executable kernel range; all other RAM is mapped RW/NX.
+    /// Page-aligned physical kernel code range, mapped RX.
     pub text: core::ops::Range<PhysAddr>,
+    /// Page-aligned physical constants, mapped R/NX after relocation.
+    /// Must not overlap `text`; remaining RAM is mapped RW/NX.
+    pub read_only: core::ops::Range<PhysAddr>,
     /// External vectors that require neither handling nor acknowledgement.
     pub ignored_vectors: &'a [u8],
 }
@@ -371,8 +374,8 @@ impl ArchSpecificProvider for VmKernel {
 impl VmKernel {
     fn initialize(
         ram: &[core::ops::Range<PhysAddr>],
-        text_phys_start: PhysAddr,
-        text_phys_end: PhysAddr,
+        text: &core::ops::Range<PhysAddr>,
+        read_only: &core::ops::Range<PhysAddr>,
         clock: &'static dyn clock::ClockSource,
     ) -> &'static Self {
         let ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>> = ram
@@ -383,17 +386,31 @@ impl VmKernel {
                 (start < end).then(|| PhysFrame::range(start, end))
             })
             .collect();
+        assert!(!text.is_empty(), "kernel text is empty");
+        for region in [text, read_only] {
+            assert!(region.start <= region.end, "reversed kernel image range");
+            if region.is_empty() {
+                continue;
+            }
+            assert!(
+                region.start.is_aligned(Size4KiB::SIZE) && region.end.is_aligned(Size4KiB::SIZE),
+                "kernel image ranges must be page-aligned"
+            );
+            assert!(
+                ram_frame_ranges.iter().any(|r| {
+                    r.start.start_address() <= region.start && region.end <= r.end.start_address()
+                }),
+                "kernel image range {region:?} is outside guest RAM"
+            );
+        }
         assert!(
-            ram_frame_ranges.iter().any(|r| {
-                r.start.start_address() <= text_phys_start && text_phys_end <= r.end.start_address()
-            }),
-            "the kernel text {text_phys_start:?}..{text_phys_end:?} is not inside guest RAM"
+            read_only.is_empty() || text.end <= read_only.start || read_only.end <= text.start,
+            "kernel text and read-only data overlap"
         );
 
-        let text = text_phys_start..text_phys_end;
         let base_pt = mm::PageTable::new_top_level();
         for range in &ram_frame_ranges {
-            if let Err(e) = base_pt.map_kernel_ram(*range, &text) {
+            if let Err(e) = base_pt.map_kernel_ram(*range, text, read_only) {
                 panic!("failed to map guest RAM {range:?}: {e:?}");
             }
         }

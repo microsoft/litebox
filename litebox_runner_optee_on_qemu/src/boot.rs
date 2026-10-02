@@ -197,8 +197,11 @@ _start:
 4:
     cmp rsi, rdi
     jae 5f
-    cmp dword ptr [rsi + 8], {r_x86_64_relative}  /* ELF64_R_TYPE(r_info) */
-    jne 6f
+    mov eax, [rsi + 8]                           /* ELF64_R_TYPE(r_info) */
+    test eax, eax                               /* R_X86_64_NONE */
+    jz 6f
+    cmp eax, {r_x86_64_relative}
+    jne 7f
     mov rax, [rsi + 16]                           /* r_addend */
     add rax, rdx
     mov rcx, [rsi]                                /* r_offset */
@@ -209,6 +212,11 @@ _start:
 5:
     xor rbp, rbp
     call {rust_entry}
+7:
+    /* No Rust diagnostics are available before relocation completes. */
+    mov dx, {debug_exit_port}
+    mov eax, {debug_exit_failure}
+    out dx, eax
 3:
     cli
     hlt
@@ -231,6 +239,8 @@ _start:
     off_sinfo = const OFF_HVM_START_INFO,
     off_stack_top = const OFF_STACK_TOP,
     r_x86_64_relative = const 8,
+    debug_exit_port = const crate::machine::DEBUG_EXIT_PORT,
+    debug_exit_failure = const crate::machine::DEBUG_EXIT_FAILURE,
     rust_entry = sym pvh_entry,
 );
 

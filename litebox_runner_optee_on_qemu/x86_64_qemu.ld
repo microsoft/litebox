@@ -16,7 +16,7 @@ SECTIONS
         _text_start = .;
         KEEP(*(.text._start))
         *(.text .text.*)
-        *(.got)
+        . = ALIGN(0x1000);
         _text_end = .;
     }
 
@@ -25,17 +25,23 @@ SECTIONS
         KEEP(*(.note.Xen))
     }
 
-    .data : ALIGN(0x200000) {
-        _data_start = .;
+    /* Writable during self-relocation; mapped R/NX by the platform afterward. */
+    .rodata : ALIGN(0x1000) {
+        _rodata_start = .;
         *(.rodata .rodata.*)
-        *(.data .data.*)
-
-        /* Exception table for fallible memory operations (memcpy_fallible, etc.) */
+        *(.data.rel.ro .data.rel.ro.*)
+        *(.got .got.*)
         . = ALIGN(4);
         __start_ex_table = .;
         KEEP(*(ex_table))
         __stop_ex_table = .;
+        . = ALIGN(0x1000);
+        _rodata_end = .;
+    }
 
+    .data : ALIGN(0x200000) {
+        _data_start = .;
+        *(.data .data.*)
         _data_end = .;
 
         . = ALIGN(0x1000);

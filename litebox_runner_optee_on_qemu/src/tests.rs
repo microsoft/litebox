@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Drives a TA with a JSON command sequence in place of a normal-world
-//! client. Outputs are logged, not checked; a TA error fails the run.
+//! User-memory checks and JSON-driven TA commands. TA outputs are logged,
+//! not checked; a TA error fails the run.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -14,6 +14,67 @@ use litebox_common_optee::{
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
+
+pub fn check_user_memory_protection(platform: &VmKernel) {
+    use litebox::platform::{
+        PageManagementProvider, RawMutPointer as _,
+        page_mgmt::{FixedAddressBehavior, MemoryRegionPermissions as Permissions},
+    };
+    use litebox_common_linux::vmem::PAGE_SIZE;
+    use litebox_platform_vm_kernel::AddressSpaceId;
+
+    let id = platform.create_address_space();
+    // Safety: no user references exist; this private address space is used only here.
+    unsafe { platform.switch_address_space(id) }.unwrap();
+    let range = 0x1_0000..0x1_0000 + PAGE_SIZE;
+    let writable = Permissions::READ | Permissions::WRITE;
+    let ptr = PageManagementProvider::<PAGE_SIZE>::allocate_pages(
+        platform,
+        range.clone(),
+        writable,
+        false,
+        true,
+        FixedAddressBehavior::NoReplace,
+    )
+    .unwrap();
+    assert_eq!(ptr.write_at_offset(0, 0x5a), Some(()));
+    for _ in 0..2 {
+        // Safety: no borrowed user references; only fallible copies access the range.
+        unsafe {
+            PageManagementProvider::<PAGE_SIZE>::update_permissions(
+                platform,
+                range.clone(),
+                Permissions::empty(),
+            )
+        }
+        .unwrap();
+        assert_eq!(ptr.read_at_offset(0), None);
+        assert_eq!(ptr.write_at_offset(0, 0xa5), None);
+        // Safety: as above; restore access to the same owned frame.
+        unsafe {
+            PageManagementProvider::<PAGE_SIZE>::update_permissions(
+                platform,
+                range.clone(),
+                writable,
+            )
+        }
+        .unwrap();
+        assert_eq!(ptr.read_at_offset(0), Some(0x5a));
+    }
+    // Safety: no user references remain and the pointer is not used afterward.
+    unsafe {
+        PageManagementProvider::<PAGE_SIZE>::update_permissions(
+            platform,
+            range,
+            Permissions::empty(),
+        )
+        .unwrap();
+        platform
+            .switch_address_space(AddressSpaceId::KERNEL)
+            .unwrap();
+        platform.unregister_address_space(id).unwrap();
+    }
+}
 
 pub fn run_ta_with_test_commands(
     shim: &litebox_shim_optee::OpteeShim<VmKernel>,

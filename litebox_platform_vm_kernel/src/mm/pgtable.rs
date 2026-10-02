@@ -8,6 +8,9 @@ use crate::arch::{
     Page, PageFaultErrorCode, PageTableFlags, PhysAddr, PhysFrame, Size4KiB, VirtAddr,
 };
 
+// A non-present user leaf that still owns the frame stored in its address bits.
+pub(crate) const PROT_NONE: PageTableFlags = PageTableFlags::BIT_9;
+
 pub(crate) struct PageTableAllocator<M: super::MemoryProvider> {
     _provider: core::marker::PhantomData<M>,
 }
@@ -40,7 +43,9 @@ pub(crate) trait PageTableImpl<const ALIGN: usize> {
     /// Flags that `mprotect` can change.
     const MPROTECT_PTE_MASK: PageTableFlags = PageTableFlags::WRITABLE
         .union(PageTableFlags::USER_ACCESSIBLE)
-        .union(PageTableFlags::NO_EXECUTE);
+        .union(PageTableFlags::NO_EXECUTE)
+        .union(PageTableFlags::PRESENT)
+        .union(PROT_NONE);
 
     /// # Safety
     ///
