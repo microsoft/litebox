@@ -1,14 +1,16 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-backed guest process creation and child termination.
+//! Broker-backed guest process creation, child termination, and signals
+//! between processes.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessIdentity, ProcessTermination};
+use litebox_broker_protocol::signal::PendingSignal;
+use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
@@ -47,6 +49,9 @@ pub enum ProcessError {
     /// A descriptor passed to the child process is closed.
     #[error("descriptor is closed")]
     ClosedDescriptor,
+    /// No process has the target process ID.
+    #[error("no such process")]
+    NoSuchProcess,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
@@ -71,6 +76,31 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn set_child_reaping(&self, enabled: bool) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_child_reaping(enabled)?)
+    }
+
+    /// Sends `signal` to process `process_id`, or only checks that the process
+    /// exists if `signal` is zero.
+    ///
+    /// The target takes the signal through [`Signals`]. A signal already
+    /// pending for the target is not sent again.
+    pub fn send_signal(&self, process_id: ProcessId, signal: u32) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        match broker.send_signal(process_id, signal) {
+            Err(BrokerControlError::Broker(ErrorCode::UnknownObject)) => {
+                Err(ProcessError::NoSuchProcess)
+            }
+            result => Ok(result?),
+        }
+    }
+
+    /// Opens the signals other processes send to this process, including
+    /// those sent before it is opened.
+    ///
+    /// A process may hold only one [`Signals`] at a time.
+    pub fn open_signals(&self) -> Result<Signals<Platform>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        let handle = broker.open_signals()?;
+        Ok(Signals::new(self, broker, handle))
     }
 }
 
@@ -237,6 +267,63 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Process<Platfo
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Process<Platform> {
+    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
+        self.pollee.register_observer(observer, mask);
+    }
+
+    fn check_io_events(&self) -> Events {
+        self.broker
+            .check_readiness(self.handle)
+            .map_or(Events::ERR, readiness_events)
+    }
+}
+
+/// The signals other processes send to this process.
+///
+/// It reports [`Events::IN`] while a signal is pending.
+pub struct Signals<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+    broker: Arc<dyn BrokerControl>,
+    handle: ObjectHandle,
+    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
+    pollee: Arc<Pollee<Platform>>,
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Signals<Platform> {
+    fn new(
+        litebox: &LiteBox<Platform>,
+        broker: Arc<dyn BrokerControl>,
+        handle: ObjectHandle,
+    ) -> Self {
+        let pollable_registry = litebox.broker_pollable_registry();
+        let pollee = Arc::new(Pollee::new());
+        pollable_registry.register_pollable(handle, &pollee);
+        Self {
+            broker,
+            handle,
+            pollable_registry,
+            pollee,
+        }
+    }
+
+    /// Takes the lowest-numbered pending signal, or returns `None` if none is
+    /// pending.
+    pub fn take(&self) -> Result<Option<PendingSignal>, ProcessError> {
+        match self.broker.take_signal(self.handle) {
+            Ok(signal) => Ok(Some(signal)),
+            Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Signals<Platform> {
+    fn drop(&mut self) {
+        self.pollable_registry.unregister_pollable(self.handle);
+        let _ = self.broker.close_object(self.handle);
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
         self.pollee.register_observer(observer, mask);
     }

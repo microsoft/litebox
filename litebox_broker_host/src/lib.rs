@@ -38,7 +38,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-    SocketRequest, SocketResponse, TimerRequest, TimerResponse,
+    SignalRequest, SignalResponse, SocketRequest, SocketResponse, TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -54,6 +54,7 @@ use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
     SharedBufferSlotIndex,
 };
+use litebox_broker_protocol::signal::OpenSignalsResponse;
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, BindSocketResponse, ConnectSocketResponse, CreateSocketResponse,
     ListenSocketResponse, MAX_SOCKET_PEEK_SIZE, MAX_SOCKET_TRANSFER_SIZE, MAX_TCP_LISTEN_BACKLOG,
@@ -553,6 +554,9 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::Timer(request) => {
             handle_timer_request(process, request, readiness_sink).map(BrokerResult::Timer)
+        }
+        BrokerOperation::Signal(request) => {
+            handle_signal_request(process, request, readiness_sink).map(BrokerResult::Signal)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -1306,6 +1310,27 @@ fn handle_timer_request(
             .map(|current| TimerResponse::Get(GetTimerResponse { current })),
         TimerRequest::Read(request) => litebox_broker_core::timer::read(process, request.handle)
             .map(|expirations| TimerResponse::Read(ReadTimerResponse { expirations })),
+    };
+    response.map_err(RequestFailure::from)
+}
+
+fn handle_signal_request(
+    process: &BrokerProcess,
+    request: SignalRequest,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<SignalResponse> {
+    let response = match request {
+        SignalRequest::Open => {
+            litebox_broker_core::signal::open(process, Arc::clone(readiness_sink))
+                .map(|handle| SignalResponse::Open(OpenSignalsResponse { handle }))
+        }
+        SignalRequest::Send(request) => {
+            litebox_broker_core::signal::send(process, request.process_id, request.signal)
+                .map(|()| SignalResponse::Sent)
+        }
+        SignalRequest::Take(request) => {
+            litebox_broker_core::signal::take(process, request.handle).map(SignalResponse::Take)
+        }
     };
     response.map_err(RequestFailure::from)
 }

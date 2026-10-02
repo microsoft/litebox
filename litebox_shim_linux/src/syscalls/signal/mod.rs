@@ -21,7 +21,9 @@ use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::collections::vec_deque::VecDeque;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
+use litebox::process::ProcessError;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_common_linux::signal::{
     CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL,
@@ -433,6 +435,17 @@ pub(crate) fn siginfo_kill(signal: Signal) -> Siginfo {
     }
 }
 
+/// Creates the `Siginfo` for `signal` sent via `kill()` by process `pid` of user `uid`.
+pub(crate) fn siginfo_kill_from(signal: Signal, pid: i32, uid: u32) -> Siginfo {
+    Siginfo {
+        signo: signal.as_i32(),
+        errno: 0,
+        code: SI_USER,
+        __pad: 0,
+        data: SiginfoData::new_kill(pid, uid),
+    }
+}
+
 impl<Platform: ShimPlatform> SignalState<Platform> {
     /// Updates the blocked signal mask. Like Linux, SIGKILL and SIGSTOP are never blocked.
     fn set_signal_mask(&self, mut mask: SigSet) {
@@ -766,10 +779,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     fn do_kill(&self, pid: Option<i32>, tid: Option<i32>, signal: i32) -> Result<usize, Errno> {
-        let signal = Signal::try_from(signal)?;
+        // Signal zero only checks that the target exists.
+        let signal = if signal == 0 {
+            None
+        } else {
+            Some(Signal::try_from(signal)?)
+        };
         if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid()) {
-            self.send_signal(signal, siginfo_kill(signal));
+            if let Some(signal) = signal {
+                self.send_signal(signal, siginfo_kill(signal));
+            }
             Ok(0)
+        } else if let (Some(pid @ 1..), None) = (pid, tid) {
+            let signal = signal.map_or(0, |signal| signal.as_i32().cast_unsigned());
+            match self
+                .global
+                .litebox
+                .send_signal(ProcessId(pid.cast_unsigned()), signal)
+            {
+                Ok(()) => Ok(0),
+                // Without a process service, no other process exists.
+                Err(ProcessError::Unavailable) => Err(Errno::ESRCH),
+                Err(error) => Err(error.into()),
+            }
         } else {
             log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
             Err(Errno::ESRCH)

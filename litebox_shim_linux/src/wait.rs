@@ -50,7 +50,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Queues the signals raised outside this thread: platform signals, the fallback alarm's
-    /// `SIGALRM`, and `SIGCHLD` for terminated children.
+    /// `SIGALRM`, `SIGCHLD` for terminated children, and signals other processes sent.
     fn queue_async_signals(&self) {
         self.global.platform.take_pending_signals(|signal| {
             self.queue_signals(signal);
@@ -58,6 +58,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(feature = "alarm_fallback")]
         self.check_alarm_deadline();
         self.check_for_child_terminations();
+        self.take_signals();
     }
 }
 

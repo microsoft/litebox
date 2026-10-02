@@ -25,6 +25,7 @@ use litebox_broker_protocol::process::{
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
+use litebox_broker_protocol::signal::PendingSignal;
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
@@ -84,6 +85,19 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<ProcessTermination, BrokerControlError>;
+
+    fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn send_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        signal: u32,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn take_signal(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<PendingSignal, BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -550,6 +564,25 @@ where
         handle: ObjectHandle,
     ) -> core::result::Result<ProcessTermination, BrokerControlError> {
         self.request(|local| local.process_exit_status(handle))
+    }
+
+    fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(BrokerLocal::open_signals)
+    }
+
+    fn send_signal(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        signal: u32,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.send_signal(process_id, signal))
+    }
+
+    fn take_signal(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<PendingSignal, BrokerControlError> {
+        self.request(|local| local.take_signal(handle))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

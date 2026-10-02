@@ -28,6 +28,7 @@ mod policy;
 mod process;
 pub mod random;
 pub mod readiness;
+pub mod signal;
 pub mod socket;
 pub mod stdio;
 pub mod timer;

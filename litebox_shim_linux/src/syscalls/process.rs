@@ -3,7 +3,7 @@
 
 //! Process/thread related syscalls.
 
-use crate::syscalls::signal::{child_termination, siginfo_child};
+use crate::syscalls::signal::{child_termination, siginfo_child, siginfo_kill_from};
 use crate::wait::wait_errno;
 use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
 use alloc::boxed::Box;
@@ -168,6 +168,10 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
     /// Termination events of the children, shared with each child's watcher.
     child_events: Arc<ChildEvents<Platform>>,
+    /// Signals other processes send to this process, once opened.
+    signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
+    /// Watcher of `signals`.
+    signal_watcher: Arc<SignalWatcher<Platform>>,
     /// Resource limits for this process.
     pub(crate) limits: ResourceLimits<Platform>,
     /// Process-wide alarm timer.
@@ -219,6 +223,25 @@ impl<Platform: ShimPlatform> Observer<Events> for ChildWatcher<Platform> {
         self.parent.changed.store(true, Ordering::SeqCst);
         self.parent.pollee.notify_observers(Events::IN);
         interrupt_threads(&self.parent.process, None);
+    }
+}
+
+/// Watcher of the signals other processes send to a process, which interrupts its threads to take
+/// them.
+struct SignalWatcher<Platform: ShimPlatform> {
+    /// Set when a signal may have been sent since signals were last taken.
+    changed: AtomicBool,
+    /// The process's locked state, to interrupt its threads.
+    process: Arc<Mutex<Platform, ProcessInner<Platform>>>,
+}
+
+impl<Platform: ShimPlatform> Observer<Events> for SignalWatcher<Platform> {
+    fn on_events(&self, events: &Events) {
+        if events.is_empty() {
+            return;
+        }
+        self.changed.store(true, Ordering::SeqCst);
+        interrupt_threads(&self.process, None);
     }
 }
 
@@ -293,6 +316,12 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             child_events: Arc::new(ChildEvents {
                 changed: AtomicBool::new(false),
                 pollee: Pollee::new(),
+                process: inner.clone(),
+            }),
+            signals: once_cell::race::OnceBox::new(),
+            // Signals sent before they are opened are taken at the first check.
+            signal_watcher: Arc::new(SignalWatcher {
+                changed: AtomicBool::new(true),
                 process: inner.clone(),
             }),
             inner,
@@ -546,6 +575,54 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             // Failure means the process service failed, so no termination can be observed.
             let _ = self.observe_child_terminations();
+        }
+    }
+
+    /// Opens the signals other processes send to this process, so its threads take them.
+    pub(crate) fn open_signals(&self) {
+        let process = &self.thread.process;
+        // Failure means the process service is unavailable or has failed, so no signal can be
+        // received.
+        let Ok(signals) = self.global.litebox.open_signals() else {
+            return;
+        };
+        signals.register_observer(
+            Arc::downgrade(&process.signal_watcher) as Weak<dyn Observer<Events>>,
+            Events::IN,
+        );
+        assert!(
+            process.signals.set(Box::new(signals)).is_ok(),
+            "process signals were already opened"
+        );
+    }
+
+    /// Queues the signals other processes sent since signals were last taken.
+    ///
+    /// During a `vfork` window the signal state is the child's, so the parent takes the signals
+    /// once it resumes.
+    pub(crate) fn take_signals(&self) {
+        let process = &self.thread.process;
+        if self.vfork.borrow().is_some() {
+            return;
+        }
+        let Some(signals) = process.signals.get() else {
+            return;
+        };
+        if !process.signal_watcher.changed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        // Failure means the process service failed, so no more signals can be taken.
+        while let Ok(Some(received)) = signals.take() {
+            if let Ok(signal) = Signal::try_from(received.signal.cast_signed()) {
+                self.send_shared_signal(
+                    signal,
+                    siginfo_kill_from(
+                        signal,
+                        received.sender.0.cast_signed(),
+                        self.credentials.uid,
+                    ),
+                );
+            }
         }
     }
 

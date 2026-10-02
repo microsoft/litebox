@@ -70,6 +70,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_fd_parent.c",
     "vfork_fd_ops_parent.c",
     "vfork_exec_parent.c",
+    "vfork_kill_parent.c",
     "vfork_pipe_parent.c",
     "vfork_exit_parent.c",
     "vfork_reap_parent.c",
@@ -648,6 +649,90 @@ fn vfork_children_are_reaped_automatically_when_sigchld_says_so() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
+fn kill_signals_other_processes() {
+    let parent = common::compile(
+        "./tests/vfork_kill_parent.c",
+        "vfork_kill_parent",
+        true,
+        false,
+    );
+    let child = common::compile(
+        "./tests/vfork_exec_child.c",
+        "vfork_kill_child",
+        true,
+        false,
+    );
+    let child_guest_path = std::path::absolute(&child).unwrap();
+    let mut runner = Runner::new(&parent, "vfork_kill_parent");
+    runner
+        .allow_process_duplication()
+        .arg(&child_guest_path)
+        .with_fs_path(|root| {
+            let destination = root.join(child_guest_path.strip_prefix("/").unwrap());
+            assert!(common::rewrite_with_cache(&child, &destination, &[]));
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    // Each signal reports its sender's process ID and the receiver's user.
+    let handshake = line("handshake ");
+    assert_eq!(numeric_field(handshake, "count="), 1, "{handshake}");
+    assert_eq!(
+        numeric_field(handshake, "pid="),
+        numeric_field(handshake, "child="),
+        "{handshake}"
+    );
+    assert_eq!(
+        numeric_field(handshake, "code="),
+        libc::SI_USER,
+        "{handshake}"
+    );
+    assert_eq!(numeric_field(handshake, "uid="), 1, "{handshake}");
+    assert_eq!(numeric_field(handshake, "alive="), 1, "{handshake}");
+    assert_eq!(numeric_field(handshake, "sent="), 1, "{handshake}");
+    assert_eq!(
+        numeric_field(handshake, "waited="),
+        numeric_field(handshake, "child="),
+        "{handshake}"
+    );
+    assert_eq!(numeric_field(handshake, "exit="), 42, "{handshake}");
+    let child_kill = line("child-kill ");
+    assert_eq!(numeric_field(child_kill, "count="), 1, "{child_kill}");
+    assert_eq!(
+        numeric_field(child_kill, "pid="),
+        numeric_field(child_kill, "ppid="),
+        "{child_kill}"
+    );
+    assert_eq!(
+        numeric_field(child_kill, "code="),
+        libc::SI_USER,
+        "{child_kill}"
+    );
+    assert_eq!(numeric_field(child_kill, "uid="), 1, "{child_kill}");
+
+    let killed = line("killed ");
+    assert_eq!(
+        numeric_field(killed, "waited="),
+        numeric_field(killed, "child="),
+        "{killed}"
+    );
+    assert_eq!(numeric_field(killed, "sent="), 1, "{killed}");
+    assert_eq!(numeric_field(killed, "signaled="), 1, "{killed}");
+    assert_eq!(numeric_field(killed, "signal="), libc::SIGKILL, "{killed}");
+
+    let missing = line("missing ");
+    assert_eq!(numeric_field(missing, "esrch="), 1, "{missing}");
+    assert_eq!(numeric_field(missing, "check_esrch="), 1, "{missing}");
+    assert_eq!(numeric_field(missing, "self_check="), 1, "{missing}");
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
 fn vfork_children_signal_parent_on_termination() {
     let parent = common::compile(
         "./tests/vfork_sigchld_parent.c",
@@ -1176,7 +1261,8 @@ fn run_test_broker_connection(
     let publisher_readiness = readiness.clone();
     let publisher = std::thread::spawn(move || publisher_readiness.run(&mut notifications));
     let mut close_object_count = 0;
-    let mut file_handles = Vec::new();
+    // Files and the process's signals are not counted, since every runner opens them.
+    let mut uncounted_handles = Vec::new();
     let termination = loop {
         match request_source
             .recv_request()
@@ -1186,19 +1272,23 @@ fn run_test_broker_connection(
                 if let litebox_broker_protocol::message::BrokerOperation::CloseObject(handle) =
                     &request.operation
                 {
-                    if let Some(index) = file_handles.iter().position(|value| value == handle) {
-                        file_handles.swap_remove(index);
+                    if let Some(index) = uncounted_handles.iter().position(|value| value == handle)
+                    {
+                        uncounted_handles.swap_remove(index);
                     } else {
                         close_object_count += 1;
                     }
                 }
                 association
                     .execute_request(request, |response| {
-                        if let litebox_broker_protocol::message::BrokerResult::File(
-                            litebox_broker_protocol::message::FileResponse::Open(open),
-                        ) = &response.result
-                        {
-                            file_handles.push(open.handle);
+                        match &response.result {
+                            litebox_broker_protocol::message::BrokerResult::File(
+                                litebox_broker_protocol::message::FileResponse::Open(open),
+                            ) => uncounted_handles.push(open.handle),
+                            litebox_broker_protocol::message::BrokerResult::Signal(
+                                litebox_broker_protocol::message::SignalResponse::Open(open),
+                            ) => uncounted_handles.push(open.handle),
+                            _ => {}
                         }
                         response_sink.send_response(response)
                     })
