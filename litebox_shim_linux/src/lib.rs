@@ -64,8 +64,6 @@ pub(crate) type LinuxFS<Platform> =
 
 pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
 
-pub use litebox_common_linux::vmem::ShimReservations;
-
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written

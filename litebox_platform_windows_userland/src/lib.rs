@@ -49,8 +49,6 @@ extern crate alloc;
 const PAGE_SIZE: usize = 4096;
 
 mod page_mgmt;
-#[doc(hidden)]
-pub use page_mgmt::WindowsUserlandReservation;
 
 // Thread-local storage for FS base state
 thread_local! {
