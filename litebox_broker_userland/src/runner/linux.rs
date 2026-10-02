@@ -1,17 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use std::any::Any;
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Child;
+use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use litebox_broker_core::BrokerCore;
+use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport_linux_userland::memfd::MemfdSharedMemory;
+use litebox_broker_transport_linux_userland::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
@@ -20,6 +22,47 @@ use super::{
     PendingRunnerAssociation, UserlandProcessLauncher, accept_runner_channel, runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
+
+/// Memory image passed to a runner as a sealed memfd.
+struct RunnerProcessImage(MemfdProcessImage);
+
+impl ProcessImage for RunnerProcessImage {
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), BrokerError> {
+        self.0
+            .write(offset, data)
+            .map_err(|_| BrokerError::OutOfMemory)
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
+    }
+}
+
+pub(crate) fn create_process_image() -> Result<Box<dyn ProcessImage>, BrokerError> {
+    MemfdProcessImage::create()
+        .map(|image| Box::new(RunnerProcessImage(image)) as Box<dyn ProcessImage>)
+        .map_err(|_| BrokerError::OutOfMemory)
+}
+
+/// Makes `command` start its process with address-space layout randomization
+/// disabled.
+pub(super) fn disable_aslr(command: &mut Command) {
+    // SAFETY: The hook runs in the forked child before exec and only makes
+    // async-signal-safe `personality` system calls.
+    unsafe {
+        command.pre_exec(|| {
+            let persona = libc::personality(0xffff_ffff);
+            if persona == -1
+                || libc::personality(
+                    (persona as libc::c_ulong) | libc::ADDR_NO_RANDOMIZE as libc::c_ulong,
+                ) == -1
+            {
+                return Err(IoError::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
 
 pub(super) struct PlatformRunnerEndpoint {
     socket_path: PathBuf,
@@ -75,11 +118,17 @@ impl PlatformRunnerEndpoint {
 fn serve_association(
     control_listener: &UnixListener,
     runner: &Arc<Mutex<Child>>,
-    startup: PendingRunnerAssociation,
+    mut startup: PendingRunnerAssociation,
     setup_deadline: Instant,
     broker: BrokerCore,
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
+    let image = startup.take_image().map(|image| {
+        image
+            .into_any()
+            .downcast::<RunnerProcessImage>()
+            .expect("the userland launcher creates every process image")
+    });
     let shutdown_was_expected = startup.process.shutdown_was_expected();
     let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
         Ok(connection) => connection,
@@ -101,7 +150,7 @@ fn serve_association(
         |channel, shared_memory, control_memory| {
             channel.send_memfd(shared_memory, Some(setup_deadline))?;
             channel.send_memfd(control_memory, Some(setup_deadline))?;
-            Ok(())
+            channel.send_process_image(image.as_ref().map(|image| &image.0), Some(setup_deadline))
         },
         UnixStreamHostSetupChannel::into_active,
         launcher,

@@ -67,11 +67,16 @@ impl PlatformRunnerEndpoint {
 fn serve_association(
     control_listener: &mut WindowsNamedPipeListener,
     runner: &Arc<Mutex<Child>>,
-    startup: PendingRunnerAssociation,
+    mut startup: PendingRunnerAssociation,
     setup_deadline: Instant,
     broker: BrokerCore,
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
+    let image = startup.take_image();
+    debug_assert!(
+        image.is_none(),
+        "Windows runners do not support process images"
+    );
     let shutdown_was_expected = startup.process.shutdown_was_expected();
     let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
         Ok(connection) => connection,

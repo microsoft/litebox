@@ -46,6 +46,8 @@ use crate::unix_io::{
 const REQUIRED_MEMFD_SEALS: SealFlags = SealFlags::from_bits_retain(
     SealFlags::GROW.bits() | SealFlags::SHRINK.bits() | SealFlags::SEAL.bits(),
 );
+const PROCESS_IMAGE_SEALS: SealFlags =
+    SealFlags::from_bits_retain(REQUIRED_MEMFD_SEALS.bits() | SealFlags::WRITE.bits());
 /// Linux memfd-backed shared memory usable by broker transports.
 pub struct MemfdSharedMemory {
     fd: OwnedFd,
@@ -478,17 +480,112 @@ pub fn receive_control_ring_memfd(
     MemfdSharedMemory::control_ring_from_received_fd(fd)
 }
 
+/// Sparse memfd holding a process memory image for a runner being started.
+///
+/// The broker writes the image, then [`send_process_image`] seals it against
+/// all changes before passing it to the runner.
+pub struct MemfdProcessImage {
+    fd: OwnedFd,
+}
+
+impl MemfdProcessImage {
+    /// Creates an empty image.
+    pub fn create() -> IoResult<Self> {
+        let fd = memfd_create(
+            "litebox-process-image",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )?;
+        Ok(Self { fd })
+    }
+
+    /// Writes `data` at `offset`, extending the image as needed.
+    pub fn write(&self, mut offset: u64, mut data: &[u8]) -> IoResult<()> {
+        while !data.is_empty() {
+            match pwrite(&self.fd, data, offset) {
+                Ok(0) => {
+                    return Err(Error::new(
+                        ErrorKind::WriteZero,
+                        "failed to write process image",
+                    ));
+                }
+                Ok(written) => {
+                    data = &data[written..];
+                    offset += written as u64;
+                }
+                Err(Errno::INTR) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Seals `image`, if any, and sends it over an exclusively owned connected
+/// Unix stream.
+///
+/// The peer must call [`receive_process_image`] at the same setup step, even
+/// when there is no image.
+pub fn send_process_image(
+    stream: &mut UnixStream,
+    image: Option<&MemfdProcessImage>,
+    deadline: Option<Instant>,
+) -> IoResult<()> {
+    let fd = match image {
+        Some(image) => {
+            fcntl_add_seals(&image.fd, PROCESS_IMAGE_SEALS)?;
+            Some(image.fd.as_fd())
+        }
+        None => None,
+    };
+    with_write_deadline(stream, deadline, |stream, deadline| {
+        send_frame(stream, fd, deadline)
+    })
+}
+
+/// Receives the optional process image sent by [`send_process_image`].
+///
+/// A received image is sealed against all changes, so its size and contents
+/// stay as validated.
+pub fn receive_process_image(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> IoResult<Option<OwnedFd>> {
+    let (carrier, fd) = with_read_deadline(stream, deadline, receive_frame)?;
+    match (carrier, fd) {
+        (0, None) => Ok(None),
+        (1, Some(fd)) => {
+            if !fcntl_get_seals(&fd)?.contains(PROCESS_IMAGE_SEALS) {
+                return Err(invalid_data("process image is not sealed"));
+            }
+            Ok(Some(fd))
+        }
+        _ => Err(invalid_data("invalid process image setup data")),
+    }
+}
+
 fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant>) -> IoResult<()> {
+    send_frame(stream, Some(fd), deadline)
+}
+
+/// Sends one setup frame: a carrier byte that is 1 when `fd` is attached and
+/// 0 otherwise.
+fn send_frame(
+    stream: &mut UnixStream,
+    fd: Option<BorrowedFd<'_>>,
+    deadline: Option<Instant>,
+) -> IoResult<()> {
     // Unix streams require an ordinary data byte to carry ancillary data.
-    let carrier = [0];
+    let carrier = [u8::from(fd.is_some())];
     let io = [IoSlice::new(&carrier)];
-    let fds = [fd];
+    let fds = fd.as_slice();
     let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = SendAncillaryBuffer::new(&mut control_space);
-    assert!(
-        control.push(SendAncillaryMessage::ScmRights(&fds)),
-        "SCM_RIGHTS control buffer is correctly sized"
-    );
+    if !fds.is_empty() {
+        assert!(
+            control.push(SendAncillaryMessage::ScmRights(fds)),
+            "SCM_RIGHTS control buffer is correctly sized"
+        );
+    }
     loop {
         refresh_write_deadline(stream, deadline)?;
         match rustix::net::sendmsg(stream.as_fd(), &io, &mut control, SendFlags::NOSIGNAL) {
@@ -507,6 +604,19 @@ fn send_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>, deadline: Option<Instant
 }
 
 fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<OwnedFd> {
+    match receive_frame(stream, deadline)? {
+        (_, Some(fd)) => Ok(fd),
+        (_, None) => Err(invalid_data(
+            "shared-memory setup contained invalid descriptor data",
+        )),
+    }
+}
+
+/// Receives one setup frame's carrier byte and at most one descriptor.
+fn receive_frame(
+    stream: &mut UnixStream,
+    deadline: Option<Instant>,
+) -> IoResult<(u8, Option<OwnedFd>)> {
     let mut carrier = [0];
     let mut io = [IoSliceMut::new(&mut carrier)];
     let mut control_space = [std::mem::MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(4))];
@@ -545,15 +655,13 @@ fn receive_fd(stream: &mut UnixStream, deadline: Option<Instant>) -> IoResult<Ow
             .flags
             .intersects(ReturnFlags::TRUNC | ReturnFlags::CTRUNC)
         || unexpected_control_message
-        || received_fds.len() != 1
+        || received_fds.len() > 1
     {
         return Err(invalid_data(
             "shared-memory setup contained invalid descriptor data",
         ));
     }
-    Ok(received_fds
-        .pop()
-        .expect("exactly one received descriptor was validated"))
+    Ok((carrier[0], received_fds.pop()))
 }
 
 impl Drop for MappedRegion {
@@ -1043,6 +1151,91 @@ mod tests {
             ErrorKind::TimedOut
         );
         assert_eq!(sender.write_timeout().unwrap(), previous_timeout);
+    }
+
+    #[test]
+    fn transfers_sealed_sparse_process_image() {
+        let image = MemfdProcessImage::create().unwrap();
+        image.write(0x3000, b"image").unwrap();
+        image.write(0x1000, b"first").unwrap();
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_process_image(&mut sender, Some(&image), None).unwrap();
+        let fd = receive_process_image(&mut receiver, None)
+            .unwrap()
+            .expect("image must be received");
+
+        assert_eq!(fstat(&fd).unwrap().st_size, 0x3005);
+        let mut bytes = [0xff; 5];
+        assert_eq!(pread(&fd, &mut bytes, 0x1000).unwrap(), 5);
+        assert_eq!(&bytes, b"first");
+        assert_eq!(pread(&fd, &mut bytes, 0x2000).unwrap(), 5);
+        assert_eq!(bytes, [0; 5]);
+        assert_eq!(pread(&fd, &mut bytes, 0x3000).unwrap(), 5);
+        assert_eq!(&bytes, b"image");
+        assert!(
+            rustix::io::fcntl_getfd(&fd)
+                .unwrap()
+                .contains(FdFlags::CLOEXEC)
+        );
+        assert_eq!(
+            image.write(0, b"x").unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn transfers_absent_process_image_in_order() {
+        let memory = MemfdSharedMemory::create(8).unwrap();
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_process_image(&mut sender, None, None).unwrap();
+        send_memfd(&mut sender, &memory, None).unwrap();
+        assert!(
+            receive_process_image(&mut receiver, None)
+                .unwrap()
+                .is_none()
+        );
+        receive_memfd(&mut receiver, 8, None).unwrap();
+    }
+
+    #[test]
+    fn rejects_mismatched_and_unsealed_process_images() {
+        let image = MemfdProcessImage::create().unwrap();
+
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        sender.write_all(&[1]).unwrap();
+        assert_eq!(
+            receive_process_image(&mut receiver, None)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        sender.write_all(&[2]).unwrap();
+        assert_eq!(
+            receive_process_image(&mut receiver, None)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_test_fds(&mut sender, &[image.fd.as_fd()]);
+        assert_eq!(
+            receive_process_image(&mut receiver, None)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
+
+        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
+        send_frame(&mut sender, Some(image.fd.as_fd()), None).unwrap();
+        assert_eq!(
+            receive_process_image(&mut receiver, None)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidData
+        );
     }
 
     fn send_test_fds(stream: &mut UnixStream, fds: &[BorrowedFd<'_>]) {

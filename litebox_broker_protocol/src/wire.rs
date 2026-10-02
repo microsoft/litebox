@@ -25,7 +25,7 @@ use crate::message::{
 use crate::process::{
     CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
-    ProcessTermination, StartChildProcessRequest, StartChildProcessSource,
+    ProcessTermination, StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -59,11 +59,11 @@ const REQUEST_TAG_TIMER: u8 = 17;
 const REQUEST_TAG_GET_STATUS_FLAGS: u8 = 18;
 const REQUEST_TAG_SET_STATUS_FLAGS: u8 = 19;
 const REQUEST_TAG_SIGNAL: u8 = 20;
+const REQUEST_TAG_WRITE_CHILD_MEMORY: u8 = 21;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
 const START_CHILD_PROCESS_TAG_BOOTSTRAP: u8 = 0;
-const START_CHILD_PROCESS_TAG_DUPLICATE: u8 = 1;
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
 const PROCESS_EXIT_STATUS_TAG_UNKNOWN: u8 = 2;
@@ -89,6 +89,7 @@ const RESPONSE_TAG_TIMER: u8 = 17;
 const RESPONSE_TAG_STATUS_FLAGS: u8 = 18;
 const RESPONSE_TAG_STATUS_FLAGS_SET: u8 = 19;
 const RESPONSE_TAG_SIGNAL: u8 = 20;
+const RESPONSE_TAG_CHILD_MEMORY_WRITTEN: u8 = 21;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -156,7 +157,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_TIMER
         | REQUEST_TAG_GET_STATUS_FLAGS
         | REQUEST_TAG_SET_STATUS_FLAGS
-        | REQUEST_TAG_SIGNAL => {
+        | REQUEST_TAG_SIGNAL
+        | REQUEST_TAG_WRITE_CHILD_MEMORY => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -243,10 +245,6 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
                     encoder.u8(START_CHILD_PROCESS_TAG_BOOTSTRAP);
                     encoder.shared_buffer_sequence(buffer);
                 }
-                StartChildProcessSource::Duplicate(buffer) => {
-                    encoder.u8(START_CHILD_PROCESS_TAG_DUPLICATE);
-                    encoder.shared_buffer_sequence(buffer);
-                }
             }
         }
         BrokerOperation::GetProcessExitStatus(handle) => {
@@ -281,6 +279,17 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             encoder.process_id(child_process_id);
             encoder.shared_buffer_sequence(handles);
+        }
+        BrokerOperation::WriteChildMemory(WriteChildMemoryRequest {
+            child_process_id,
+            offset,
+            data,
+        }) => {
+            encoder.u8(REQUEST_TAG_WRITE_CHILD_MEMORY);
+            encoder.request_id(request_id);
+            encoder.process_id(child_process_id);
+            encoder.u64(offset);
+            encoder.shared_buffer_sequence(data);
         }
         BrokerOperation::Timer(request) => {
             encoder.u8(REQUEST_TAG_TIMER);
@@ -320,7 +329,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_TIMER
         | REQUEST_TAG_GET_STATUS_FLAGS
         | REQUEST_TAG_SET_STATUS_FLAGS
-        | REQUEST_TAG_SIGNAL => {}
+        | REQUEST_TAG_SIGNAL
+        | REQUEST_TAG_WRITE_CHILD_MEMORY => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -350,9 +360,6 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                         buffer: decoder.shared_buffer_sequence()?,
                     })
                 }
-                START_CHILD_PROCESS_TAG_DUPLICATE => {
-                    StartChildProcessSource::Duplicate(decoder.shared_buffer_sequence()?)
-                }
                 _ => return Err(WireError::InvalidTag),
             };
             BrokerOperation::StartChildProcess(StartChildProcessRequest {
@@ -381,6 +388,13 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
             BrokerOperation::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
                 child_process_id: decoder.process_id()?,
                 handles: decoder.shared_buffer_sequence()?,
+            })
+        }
+        REQUEST_TAG_WRITE_CHILD_MEMORY => {
+            BrokerOperation::WriteChildMemory(WriteChildMemoryRequest {
+                child_process_id: decoder.process_id()?,
+                offset: decoder.u64()?,
+                data: decoder.shared_buffer_sequence()?,
             })
         }
         REQUEST_TAG_TIMER => BrokerOperation::Timer(timer::decode_timer_request(&mut decoder)?),
@@ -469,7 +483,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_TIMER
         | RESPONSE_TAG_STATUS_FLAGS
         | RESPONSE_TAG_STATUS_FLAGS_SET
-        | RESPONSE_TAG_SIGNAL => {
+        | RESPONSE_TAG_SIGNAL
+        | RESPONSE_TAG_CHILD_MEMORY_WRITTEN => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -590,6 +605,10 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_OBJECTS_DUPLICATED);
             encoder.request_id(request_id);
         }
+        BrokerResult::ChildMemoryWritten => {
+            encoder.u8(RESPONSE_TAG_CHILD_MEMORY_WRITTEN);
+            encoder.request_id(request_id);
+        }
         BrokerResult::Timer(response) => {
             encoder.u8(RESPONSE_TAG_TIMER);
             encoder.request_id(request_id);
@@ -636,7 +655,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_TIMER
         | RESPONSE_TAG_STATUS_FLAGS
         | RESPONSE_TAG_STATUS_FLAGS_SET
-        | RESPONSE_TAG_SIGNAL => {}
+        | RESPONSE_TAG_SIGNAL
+        | RESPONSE_TAG_CHILD_MEMORY_WRITTEN => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -678,6 +698,7 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_EXIT_STATUS_REPORTED => BrokerResult::ExitStatusReported,
         RESPONSE_TAG_CHILD_REAPING_SET => BrokerResult::ChildReapingSet,
         RESPONSE_TAG_OBJECTS_DUPLICATED => BrokerResult::ObjectsDuplicated,
+        RESPONSE_TAG_CHILD_MEMORY_WRITTEN => BrokerResult::ChildMemoryWritten,
         RESPONSE_TAG_TIMER => BrokerResult::Timer(timer::decode_timer_response(&mut decoder)?),
         RESPONSE_TAG_SIGNAL => BrokerResult::Signal(signal::decode_signal_response(&mut decoder)?),
         _ => unreachable!("active response tag was validated"),
@@ -809,6 +830,7 @@ mod tests {
         CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
         ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
         ProcessTermination, StartChildProcessRequest, StartChildProcessSource,
+        WriteChildMemoryRequest,
     };
     use crate::shared_buffer::{SharedBufferSequence, SharedBufferSlotIndex};
     use crate::signal::{OpenSignalsResponse, PendingSignal, SendSignalRequest, TakeSignalRequest};
@@ -877,6 +899,7 @@ mod tests {
                 RESPONSE_TAG_STATUS_FLAGS,
                 RESPONSE_TAG_STATUS_FLAGS_SET,
                 RESPONSE_TAG_SIGNAL,
+                RESPONSE_TAG_CHILD_MEMORY_WRITTEN,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -899,6 +922,7 @@ mod tests {
                 REQUEST_TAG_GET_STATUS_FLAGS,
                 REQUEST_TAG_SET_STATUS_FLAGS,
                 REQUEST_TAG_SIGNAL,
+                REQUEST_TAG_WRITE_CHILD_MEMORY,
             ]
         );
         assert_eq!(
@@ -1178,10 +1202,6 @@ mod tests {
                     buffer: largest_sequence,
                 }),
             }),
-            BrokerOperation::StartChildProcess(StartChildProcessRequest {
-                child_process_id: process_id(1),
-                source: StartChildProcessSource::Duplicate(sequence(0, 2)),
-            }),
             BrokerOperation::GetProcessExitStatus(ObjectHandle(u64::MAX)),
             BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
                 child_process_id: process_id(u32::MAX),
@@ -1203,6 +1223,11 @@ mod tests {
             BrokerOperation::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
                 child_process_id: process_id(u32::MAX),
                 handles: largest_sequence,
+            }),
+            BrokerOperation::WriteChildMemory(WriteChildMemoryRequest {
+                child_process_id: process_id(u32::MAX),
+                offset: u64::MAX,
+                data: largest_sequence,
             }),
         ];
         let mut maximum_encoded_size = 0;
@@ -1588,6 +1613,7 @@ mod tests {
             BrokerResult::ExitStatusReported,
             BrokerResult::ChildReapingSet,
             BrokerResult::ObjectsDuplicated,
+            BrokerResult::ChildMemoryWritten,
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),
             BrokerResult::Error(ErrorCode::NonBlockingWouldBlock),
@@ -1799,7 +1825,9 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::StartChildProcess(StartChildProcessRequest {
                 child_process_id: process_id(1),
-                source: StartChildProcessSource::Duplicate(sequence(0, 2)),
+                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
+                    buffer: sequence(0, 2),
+                }),
             }),
         });
         unknown_child_start[13] = 0xff;

@@ -55,7 +55,8 @@ pub use policy::{
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 pub use process::{
-    AssociationCancellation, BrokerProcess, CallerCredential, ProcessLifecycleSink, ProcessShutdown,
+    AssociationCancellation, BrokerProcess, CallerCredential, ProcessImage, ProcessLifecycleSink,
+    ProcessShutdown,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -87,6 +88,8 @@ pub struct BrokerCoreLimits {
     pub max_threads: usize,
     /// Maximum live broker-allocated thread IDs owned by one process.
     pub max_threads_per_process: usize,
+    /// Maximum size in bytes of one pending child's memory image.
+    pub max_child_image_size: u64,
 }
 
 impl BrokerCoreLimits {
@@ -101,6 +104,7 @@ impl BrokerCoreLimits {
         max_sockets_per_process: 256,
         max_threads: 4096,
         max_threads_per_process: 1024,
+        max_child_image_size: 1024 * 1024 * 1024,
     };
 
     /// Creates a broker core limit set.
@@ -118,6 +122,7 @@ impl BrokerCoreLimits {
             max_sockets_per_process: Self::DEFAULT.max_sockets_per_process,
             max_threads: Self::DEFAULT.max_threads,
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
+            max_child_image_size: Self::DEFAULT.max_child_image_size,
         }
     }
 
@@ -141,6 +146,7 @@ impl BrokerCoreLimits {
             max_sockets_per_process,
             max_threads: Self::DEFAULT.max_threads,
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
+            max_child_image_size: Self::DEFAULT.max_child_image_size,
         }
     }
 
@@ -183,6 +189,15 @@ impl BrokerCoreLimits {
         Self {
             max_threads,
             max_threads_per_process,
+            ..self
+        }
+    }
+
+    /// Returns these limits with an explicit child memory image size limit.
+    #[must_use]
+    pub const fn with_child_image_size_limit(self, max_child_image_size: u64) -> Self {
+        Self {
+            max_child_image_size,
             ..self
         }
     }

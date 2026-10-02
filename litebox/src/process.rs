@@ -8,7 +8,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::process::{ProcessExitStatus, ProcessIdentity, ProcessTermination};
+use litebox_broker_protocol::process::{
+    MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity, ProcessTermination,
+};
 use litebox_broker_protocol::signal::PendingSignal;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::time::TimeProvider;
@@ -229,6 +231,22 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
                 inherited[index]
             })
             .collect())
+    }
+
+    /// Writes `data` at `offset` of this pending child process's memory image,
+    /// which the child's runner receives when the child starts.
+    ///
+    /// The image is zero-filled where nothing was written.
+    pub fn write_memory(&self, offset: u64, data: &[u8]) -> Result<(), ProcessError> {
+        let mut offset = offset;
+        for chunk in data.chunks(MAX_CHILD_MEMORY_WRITE_SIZE as usize) {
+            self.broker
+                .write_child_memory(self.identity.process_id, offset, chunk)?;
+            offset = offset
+                .checked_add(chunk.len() as u64)
+                .ok_or(ProcessError::ResourceExhausted)?;
+        }
+        Ok(())
     }
 
     /// Records that this pending child process exited without starting a

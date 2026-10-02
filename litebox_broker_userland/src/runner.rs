@@ -24,6 +24,8 @@ mod windows;
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
 use linux::PlatformRunnerEndpoint;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::create_process_image;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::PlatformRunnerEndpoint;
 
@@ -40,6 +42,8 @@ pub struct RunnerConfig {
     executable: PathBuf,
     arguments: Vec<OsString>,
     proxy_url: Option<String>,
+    #[cfg(target_os = "linux")]
+    disable_aslr: bool,
 }
 
 impl RunnerConfig {
@@ -51,7 +55,20 @@ impl RunnerConfig {
             executable,
             arguments,
             proxy_url: None,
+            #[cfg(target_os = "linux")]
+            disable_aslr: false,
         }
+    }
+
+    /// Starts runners with address-space layout randomization disabled.
+    ///
+    /// Runners started from a parent's memory image rely on every runner
+    /// sharing the same host layout.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_aslr_disabled(mut self) -> Self {
+        self.disable_aslr = true;
+        self
     }
 
     /// Configures the HTTP proxy URL passed to the runner.
@@ -80,6 +97,8 @@ impl RunnerConfig {
             executable: self.executable.clone(),
             arguments: Vec::new(),
             proxy_url: self.proxy_url.clone(),
+            #[cfg(target_os = "linux")]
+            disable_aslr: self.disable_aslr,
         }
     }
 }
@@ -236,11 +255,13 @@ impl RunnerInstance {
     pub(crate) fn start(config: RunnerConfig) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
         let endpoint = PlatformRunnerEndpoint::create()?;
-        let runner = Arc::new(Mutex::new(
-            Command::new(&config.executable)
-                .args(config.arguments(endpoint.control_channel()))
-                .spawn()?,
-        ));
+        let mut command = Command::new(&config.executable);
+        command.args(config.arguments(endpoint.control_channel()));
+        #[cfg(target_os = "linux")]
+        if config.disable_aslr {
+            linux::disable_aslr(&mut command);
+        }
+        let runner = Arc::new(Mutex::new(command.spawn()?));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),

@@ -129,6 +129,15 @@ impl UnixStreamLocalSetupChannel {
         crate::memfd::receive_control_ring_memfd(&mut self.stream, deadline)
     }
 
+    /// Receives the optional process image offered by the broker during
+    /// setup, after the control ring.
+    pub fn receive_process_image(
+        &mut self,
+        deadline: Option<Instant>,
+    ) -> IoResult<Option<OwnedFd>> {
+        crate::memfd::receive_process_image(&mut self.stream, deadline)
+    }
+
     /// Consumes a negotiated setup channel into independently usable active
     /// call, notification, and shutdown handles, starting the response
     /// dispatcher and liveness monitor.

@@ -2150,6 +2150,7 @@ impl ShutdownHow {
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum SyscallRequest {
+    Fork,
     Vfork,
     Wait4 {
         pid: i32,
@@ -2916,6 +2917,8 @@ impl SyscallRequest {
             Sysno::exit => sys_req!(Exit { status }),
             Sysno::exit_group => sys_req!(ExitGroup { status }),
             #[cfg(target_arch = "x86_64")]
+            Sysno::fork => SyscallRequest::Fork,
+            #[cfg(target_arch = "x86_64")]
             Sysno::vfork => SyscallRequest::Vfork,
             Sysno::wait4 => sys_req!(Wait4 { pid, wstatus:*, options, rusage:* }),
             Sysno::uname => sys_req!(Uname { buf:* }),
@@ -3334,7 +3337,7 @@ impl TimeParam {
 /// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/x86/include/asm/ptrace.h#L59)
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 pub struct PtRegs {
     /*
      * C ABI says these regs are callee-preserved. They aren't saved on kernel entry
@@ -3376,7 +3379,7 @@ pub struct PtRegs {
 /// pt_regs from [Linux](https://elixir.bootlin.com/linux/v5.19.17/source/arch/arm64/include/asm/ptrace.h#L178)
 #[cfg(target_arch = "aarch64")]
 #[repr(C, align(16))]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, FromBytes, IntoBytes, Immutable)]
 pub struct PtRegs {
     /// General-purpose registers x0-x30.
     pub regs: [usize; AARCH64_GENERAL_REGISTER_COUNT],

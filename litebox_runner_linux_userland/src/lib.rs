@@ -8,7 +8,9 @@ use litebox_platform_linux_userland::SeccompScope;
 use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
-use litebox_common_linux::program_startup::LinuxProgramStartup;
+use litebox_common_linux::program_startup::{
+    LinuxForkStartup, LinuxProcessStartup, LinuxProgramStartup,
+};
 use litebox_common_linux::signal::SigSet;
 
 // Use a stable non-root guest identity instead of mirroring the host user. This keeps shim
@@ -122,6 +124,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         coordinator: broker_association_coordinator,
         positional_io_fds,
         shutdown_fd,
+        process_image,
     } = connection;
     broker_positional_io_fds.extend(positional_io_fds);
     broker_shutdown_fds.push(shutdown_fd);
@@ -137,88 +140,109 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         )
     })?;
     let shim_builder =
-        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
+        litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
+            .enable_fork(address_randomization_disabled());
 
     let shim = shim_builder.build();
-    let (task_params, prog_path, argv, envp) = if let Some(startup) = startup {
-        let LinuxProgramStartup {
-            parent_process_id,
-            uid,
-            euid,
-            gid,
-            egid,
-            blocked_signals,
-            ignored_signals,
-            umask,
-            path,
-            cwd,
-            argv,
-            envp,
-            inherited_fds,
-        } = LinuxProgramStartup::decode(&startup.payload)
-            .context("invalid child Linux program startup")?;
-        (
-            litebox_common_linux::TaskParams {
-                pid: process_id,
-                ppid: parent_process_id,
+    let startup = match startup {
+        Some(startup) => Some(
+            LinuxProcessStartup::decode(&startup.payload)
+                .context("invalid child Linux process startup")?,
+        ),
+        None => None,
+    };
+    let (task_params, prog_path, argv, envp) = match startup {
+        Some(LinuxProcessStartup::Fork(startup)) => {
+            // The process image is read before seccomp forbids it.
+            let program = restore_fork(&shim, *startup, initial_thread, process_image)?;
+            litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
+                &broker_positional_io_fds,
+                &broker_shutdown_fds,
+            );
+            return Ok(run_program(&shim, program));
+        }
+        Some(LinuxProcessStartup::Program(startup)) => {
+            let LinuxProgramStartup {
+                parent_process_id,
                 uid,
                 euid,
                 gid,
                 egid,
                 blocked_signals,
                 ignored_signals,
-                inherited_fds: Some(inherited_fds),
-                cwd: Some(cwd),
-                umask: Some(umask),
-            },
-            path,
-            argv,
-            envp,
-        )
-    } else {
-        let prog_path = cli_args
-            .program_and_arguments
-            .first()
-            .context("program path missing")?
-            .clone();
-        if !prog_path.starts_with('/') {
-            anyhow::bail!("program path must be absolute (e.g., /usr/bin/ls), got: {prog_path}");
+                umask,
+                path,
+                cwd,
+                argv,
+                envp,
+                inherited_fds,
+            } = startup;
+            (
+                litebox_common_linux::TaskParams {
+                    pid: process_id,
+                    ppid: parent_process_id,
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                    blocked_signals,
+                    ignored_signals,
+                    inherited_fds: Some(inherited_fds),
+                    cwd: Some(cwd),
+                    umask: Some(umask),
+                },
+                path,
+                argv,
+                envp,
+            )
         }
-        let argv = cli_args
-            .program_and_arguments
-            .iter()
-            .map(|value| std::ffi::CString::new(value.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .context("invalid program argument")?;
-        let proxy_url = cli_args.broker_proxy_url;
-        let mut environment = cli_args.environment_variables;
-        if cli_args.forward_environment_variables {
-            environment.extend(std::env::vars().map(|(key, value)| format!("{key}={value}")));
+        None => {
+            let prog_path = cli_args
+                .program_and_arguments
+                .first()
+                .context("program path missing")?
+                .clone();
+            if !prog_path.starts_with('/') {
+                anyhow::bail!(
+                    "program path must be absolute (e.g., /usr/bin/ls), got: {prog_path}"
+                );
+            }
+            let argv = cli_args
+                .program_and_arguments
+                .iter()
+                .map(|value| std::ffi::CString::new(value.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+                .context("invalid program argument")?;
+            let proxy_url = cli_args.broker_proxy_url;
+            let mut environment = cli_args.environment_variables;
+            if cli_args.forward_environment_variables {
+                environment.extend(std::env::vars().map(|(key, value)| format!("{key}={value}")));
+            }
+            apply_broker_proxy_environment(&mut environment, proxy_url.as_deref());
+            let envp = environment
+                .iter()
+                .map(|value| std::ffi::CString::new(value.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()
+                .context("invalid environment variable")?;
+            (
+                litebox_common_linux::TaskParams {
+                    pid: process_id,
+                    ppid: 0,
+                    uid: u32::from(DEFAULT_GUEST_UID),
+                    euid: u32::from(DEFAULT_GUEST_UID),
+                    gid: u32::from(DEFAULT_GUEST_GID),
+                    egid: u32::from(DEFAULT_GUEST_GID),
+                    blocked_signals: SigSet::empty(),
+                    ignored_signals: SigSet::empty(),
+                    inherited_fds: None,
+                    cwd: None,
+                    umask: None,
+                },
+                prog_path,
+                argv,
+                envp,
+            )
         }
-        apply_broker_proxy_environment(&mut environment, proxy_url.as_deref());
-        let envp = environment
-            .iter()
-            .map(|value| std::ffi::CString::new(value.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .context("invalid environment variable")?;
-        (
-            litebox_common_linux::TaskParams {
-                pid: process_id,
-                ppid: 0,
-                uid: u32::from(DEFAULT_GUEST_UID),
-                euid: u32::from(DEFAULT_GUEST_UID),
-                gid: u32::from(DEFAULT_GUEST_GID),
-                egid: u32::from(DEFAULT_GUEST_GID),
-                blocked_signals: SigSet::empty(),
-                ignored_signals: SigSet::empty(),
-                inherited_fds: None,
-                cwd: None,
-                umask: None,
-            },
-            prog_path,
-            argv,
-            envp,
-        )
     };
 
     litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
@@ -228,7 +252,14 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
     );
 
     let program = shim.load_program(task_params, initial_thread, &prog_path, argv, envp)?;
+    Ok(run_program(&shim, program))
+}
 
+/// Runs the loaded `program` until it exits, returning its exit code.
+fn run_program(
+    shim: &litebox_shim_linux::LinuxShim<Platform>,
+    program: litebox_shim_linux::LoadedProgram<Platform>,
+) -> i32 {
     #[cfg(feature = "lock_tracing")]
     litebox::sync::start_recording();
 
@@ -259,7 +290,91 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
     let _ = shim
         .litebox()
         .report_exit_status(program.process.wait_for_exit_status());
-    Ok(program.process.wait_for_unix_shell_exit_code())
+    program.process.wait_for_unix_shell_exit_code()
+}
+
+/// Returns whether host address space randomization is disabled, so that every runner in the
+/// process tree lays out its address space identically, as `fork` requires.
+fn address_randomization_disabled() -> bool {
+    // SAFETY: Querying the persona changes nothing.
+    let persona = unsafe { libc::personality(0xffff_ffff) };
+    persona != -1 && persona & libc::ADDR_NO_RANDOMIZE != 0
+}
+
+/// Continues the process a parent duplicated by `fork`, whose memory contents are in
+/// `process_image`, if any.
+#[cfg(target_arch = "x86_64")]
+fn restore_fork(
+    shim: &litebox_shim_linux::LinuxShim<Platform>,
+    startup: LinuxForkStartup,
+    initial_thread: litebox::thread::Thread,
+    process_image: Option<std::os::fd::OwnedFd>,
+) -> Result<litebox_shim_linux::LoadedProgram<Platform>> {
+    let process_image = process_image.map(std::fs::File::from);
+    shim.restore_fork(startup, initial_thread, |offset, buffer| {
+        let Some(process_image) = &process_image else {
+            return Ok(());
+        };
+        read_process_image(process_image, offset, buffer).map_err(|error| {
+            error
+                .raw_os_error()
+                .and_then(|errno| litebox_common_linux::errno::Errno::try_from(errno).ok())
+                .unwrap_or(litebox_common_linux::errno::Errno::EIO)
+        })
+    })
+    .context("failed to continue the forked process")
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn restore_fork(
+    _shim: &litebox_shim_linux::LinuxShim<Platform>,
+    _startup: LinuxForkStartup,
+    _initial_thread: litebox::thread::Thread,
+    _process_image: Option<std::os::fd::OwnedFd>,
+) -> Result<litebox_shim_linux::LoadedProgram<Platform>> {
+    anyhow::bail!("fork is unsupported on this architecture")
+}
+
+/// Reads `buffer.len()` bytes of `process_image` at `offset` into `buffer`, which starts
+/// zero-filled, reading only the image's data and leaving its holes and anything past its end
+/// zero.
+#[cfg(target_arch = "x86_64")]
+fn read_process_image(
+    process_image: &std::fs::File,
+    offset: u64,
+    buffer: &mut [u8],
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::FileExt as _;
+
+    let seek = |position: u64, whence: libc::c_int| -> std::io::Result<Option<u64>> {
+        let position = libc::off_t::try_from(position)
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+        // SAFETY: `lseek` takes no pointers, and the descriptor stays open while borrowed.
+        let result = unsafe { libc::lseek(process_image.as_raw_fd(), position, whence) };
+        if result >= 0 {
+            return Ok(Some(result.cast_unsigned()));
+        }
+        let error = std::io::Error::last_os_error();
+        // No data follows the position.
+        if error.raw_os_error() == Some(libc::ENXIO) {
+            return Ok(None);
+        }
+        Err(error)
+    };
+    let end = offset + buffer.len() as u64;
+    let mut position = offset;
+    while position < end {
+        let Some(data) = seek(position, libc::SEEK_DATA)?.filter(|&data| data < end) else {
+            break;
+        };
+        let hole = seek(data, libc::SEEK_HOLE)?.map_or(end, |hole| hole.min(end));
+        let start = usize::try_from(data - offset).expect("the data lies within the buffer");
+        let len = usize::try_from(hole - data).expect("the data lies within the buffer");
+        process_image.read_exact_at(&mut buffer[start..start + len], data)?;
+        position = hole;
+    }
+    Ok(())
 }
 
 fn apply_broker_proxy_environment(environment: &mut Vec<String>, proxy_url: Option<&str>) {

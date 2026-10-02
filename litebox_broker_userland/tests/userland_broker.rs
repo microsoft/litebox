@@ -138,6 +138,11 @@ fn run_fake_runner(args: &[OsString]) {
         )?;
         let control_memory =
             setup.receive_control_ring(Some(Instant::now() + Duration::from_secs(5)))?;
+        assert!(
+            setup
+                .receive_process_image(Some(Instant::now() + Duration::from_secs(5)))?
+                .is_none()
+        );
         let control_ring = ControlRing::new(control_memory).map_err(|error| {
             std::io::Error::new(
                 ErrorKind::InvalidData,

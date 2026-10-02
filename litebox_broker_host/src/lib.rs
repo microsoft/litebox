@@ -21,10 +21,10 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, CallerCredential};
+use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, CallerCredential, ProcessImage};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -45,9 +45,9 @@ use litebox_broker_protocol::pipe::{
 };
 use litebox_broker_protocol::process::{
     CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -575,7 +575,7 @@ fn handle_request<Memory: SharedMemory>(
             handle_file_request(process, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::File)
         }
-        BrokerOperation::StartChildProcess(_) => {
+        BrokerOperation::StartChildProcess(_) | BrokerOperation::WriteChildMemory(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
@@ -882,15 +882,26 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
 
 /// Platform implementation that starts execution for a broker-created process.
 ///
-/// Once called, the launcher owns final process retirement even when launch
-/// fails. Success means process startup reached `Running`.
+/// Once called, [`Self::launch`] owns final process retirement even when
+/// launch fails. Success means process startup reached `Running`.
 pub trait ProcessLauncher: Send + Sync {
     /// Starts one process and waits for startup to commit or fail.
+    ///
+    /// The process's runner receives `image`, the memory image its parent
+    /// wrote, if any.
     fn launch(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
+        image: Option<Box<dyn ProcessImage>>,
     ) -> core::result::Result<(), BrokerError>;
+
+    /// Creates an empty memory image for a pending child.
+    ///
+    /// Platforms that cannot pass images to runners reject the request.
+    fn create_image(&self) -> core::result::Result<Box<dyn ProcessImage>, BrokerError> {
+        Err(BrokerError::UnsupportedOperation)
+    }
 }
 
 /// Handles a process operation using the configured platform launcher.
@@ -920,6 +931,21 @@ where
                 })
                 .map(|()| BrokerResult::ProcessStarted),
         ),
+        BrokerOperation::WriteChildMemory(WriteChildMemoryRequest {
+            child_process_id,
+            offset,
+            data,
+        }) => Some(
+            read_shared_buffer(shared_buffers, *data, MAX_CHILD_MEMORY_WRITE_SIZE)
+                .and_then(|data| {
+                    parent
+                        .write_child_memory(*child_process_id, *offset, &data, || {
+                            launcher.create_image()
+                        })
+                        .map_err(RequestFailure::from)
+                })
+                .map(|()| BrokerResult::ChildMemoryWritten),
+        ),
         _ => None,
     }
 }
@@ -933,8 +959,8 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
-    let process = parent
-        .take_child_process(child_process_id)
+    let (process, image) = parent
+        .take_child_process_with_image(child_process_id)
         .map_err(RequestFailure::from)?;
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
@@ -947,6 +973,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
             ProcessStartupData {
                 payload: startup.payload,
             },
+            image,
         )
         .map_err(RequestFailure::from)
 }

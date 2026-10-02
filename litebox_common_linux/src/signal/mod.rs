@@ -15,7 +15,7 @@ use x86_64::Sigcontext;
 
 use int_enum::IntEnum;
 use litebox::utils::ReinterpretSignedExt as _;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::errno::Errno;
 
@@ -119,7 +119,7 @@ pub enum SignalDisposition {
     Continue,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable)]
 #[repr(transparent)]
 pub struct SigSet(u64);
 
@@ -228,7 +228,7 @@ impl core::ops::Not for SigSet {
 }
 
 /// Signal action flags for `rt_sigaction` syscall.
-#[derive(Copy, Clone, FromBytes, IntoBytes)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Immutable)]
 #[repr(transparent)]
 pub struct SaFlags(u32);
 
@@ -249,7 +249,7 @@ bitflags::bitflags! {
 
 /// Linux's `sigaction` struct used by the `rt_sigaction` syscall.
 #[repr(C)]
-#[derive(Copy, Clone, FromBytes, IntoBytes)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Immutable)]
 pub struct SigAction {
     pub sigaction: usize,
     pub flags: SaFlags,
@@ -272,7 +272,7 @@ pub enum SigmaskHow {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, FromBytes, IntoBytes)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Immutable)]
 pub struct SigAltStack {
     pub sp: usize,
     pub flags: SsFlags,
@@ -283,7 +283,7 @@ pub struct SigAltStack {
 }
 
 /// Signal stack flags.
-#[derive(Debug, Clone, Copy, FromBytes, IntoBytes)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, Immutable)]
 #[repr(transparent)]
 pub struct SsFlags(u32);
 

@@ -129,6 +129,40 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         state
     }
 
+    /// Returns the initial signal state of a process duplicated by `fork`, which inherits the
+    /// `blocked` mask, the dispositions in `actions`, indexed by signal number minus one, and
+    /// the alternate signal stack, but none of the pending signals.
+    #[cfg(target_arch = "x86_64")]
+    pub fn forked(blocked: SigSet, actions: &[SigAction; NSIG], altstack: SigAltStack) -> Self {
+        let mut state = Self::new_process();
+        state.set_signal_mask(blocked);
+        let handlers = Arc::get_mut(state.handlers.get_mut())
+            .expect("new signal handlers must not be shared")
+            .inner
+            .get_mut();
+        for (handler, action) in handlers.handlers.iter_mut().zip(actions) {
+            // The actions of SIGKILL and SIGSTOP cannot change.
+            if !handler.immutable {
+                handler.action = *action;
+            }
+        }
+        state.altstack.set(altstack);
+        state
+    }
+
+    /// Returns the blocked mask, the dispositions indexed by signal number minus one, and the
+    /// alternate signal stack, which a child duplicated by `fork` inherits.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn fork_state(&self) -> (SigSet, [SigAction; NSIG], SigAltStack) {
+        let handlers = self.handlers.borrow();
+        let handlers = handlers.inner.lock();
+        (
+            self.blocked.get(),
+            core::array::from_fn(|index| handlers.handlers[index].action),
+            self.altstack.get(),
+        )
+    }
+
     /// Returns the currently blocked signals.
     pub(crate) fn blocked(&self) -> SigSet {
         self.blocked.get()

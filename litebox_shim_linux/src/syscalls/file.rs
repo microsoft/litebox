@@ -26,7 +26,7 @@ use litebox_common_linux::{
     FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx,
     StatxMask, TimeParam,
     errno::Errno,
-    program_startup::{InheritedFd, InheritedFdKind},
+    program_startup::{ForkedFd, InheritedFd, InheritedFdKind},
     signal::Signal,
     vmem::PAGE_SIZE,
 };
@@ -328,6 +328,25 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
         Ok(())
     }
 
+    /// Installs the descriptors a process duplicated by `fork` inherited, with their
+    /// close-on-exec flags.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn install_forked_fds(
+        &self,
+        global: &GlobalState<Platform>,
+        forked_fds: &[ForkedFd],
+    ) -> Result<(), crate::loader::elf::ElfLoaderError> {
+        let inherited_fds: alloc::vec::Vec<_> = forked_fds.iter().map(|fd| fd.inherited).collect();
+        self.install_inherited_fds(global, &inherited_fds)?;
+        for forked in forked_fds.iter().filter(|fd| fd.close_on_exec) {
+            let fd = self
+                .typed_fd_from_raw(forked.inherited.fd as usize)
+                .expect("an installed inherited descriptor stays open");
+            set_file_descriptor_flags(&fd, global, FileDescriptorFlags::FD_CLOEXEC);
+        }
+        Ok(())
+    }
+
     /// Installs an inherited descriptor at `raw_fd`, duplicating the descriptor at `first_fd` if
     /// it shares an already installed open file description and calling `adopt` otherwise.
     fn install_inherited_fd<Subsystem: FdEnabledSubsystem>(
@@ -550,9 +569,33 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// close-on-exec, in ascending order.
     ///
     /// Each is returned as its startup record, whose handle the caller replaces with the child's,
-    /// and the object the child inherits.
+    /// and the object the child inherits. This fails like [`Self::inheritable_fds`].
+    pub(crate) fn fds_inherited_across_exec(
+        &self,
+    ) -> Result<alloc::vec::Vec<(InheritedFd, InheritableFd<Platform>)>, Errno> {
+        Ok(self
+            .inheritable_fds(false)?
+            .into_iter()
+            .map(|(fd, object)| (fd.inherited, object))
+            .collect())
+    }
+
+    /// Returns every descriptor, with its close-on-exec flag, in ascending order, as a fresh
+    /// runner continuing a `fork` child inherits them.
     ///
-    /// Linux keeps every such descriptor, whatever it refers to. A fresh runner can share only
+    /// Each is returned as its startup record, whose handle the caller replaces with the child's,
+    /// and the object the child inherits. This fails like [`Self::inheritable_fds`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn fds_inherited_across_fork(
+        &self,
+    ) -> Result<alloc::vec::Vec<(ForkedFd, InheritableFd<Platform>)>, Errno> {
+        self.inheritable_fds(true)
+    }
+
+    /// Returns the descriptors a fresh runner inherits, skipping those marked close-on-exec
+    /// unless `include_close_on_exec` is set.
+    ///
+    /// Linux keeps every inherited descriptor, whatever it refers to. A fresh runner can share only
     /// objects the broker holds, and not all of those yet, so this fails with `EAGAIN` if one of
     /// them is:
     ///
@@ -566,9 +609,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Transferred descriptors also differ from Linux in that the parent does not observe the
     /// child's reads of an inherited directory.
-    pub(crate) fn fds_inherited_across_exec(
+    fn inheritable_fds(
         &self,
-    ) -> Result<alloc::vec::Vec<(InheritedFd, InheritableFd<Platform>)>, Errno> {
+        include_close_on_exec: bool,
+    ) -> Result<alloc::vec::Vec<(ForkedFd, InheritableFd<Platform>)>, Errno> {
         let files = self.files.borrow();
         let alive_fds: alloc::vec::Vec<usize> =
             files.raw_descriptor_store.read().iter_alive().collect();
@@ -576,9 +620,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut next_fd = 0;
         for raw_fd in alive_fds {
             let fd = files.typed_fd_from_raw(raw_fd)?;
-            if get_file_descriptor_flags(&fd, &self.global)
-                .contains(FileDescriptorFlags::FD_CLOEXEC)
-            {
+            let close_on_exec = get_file_descriptor_flags(&fd, &self.global)
+                .contains(FileDescriptorFlags::FD_CLOEXEC);
+            if close_on_exec && !include_close_on_exec {
                 continue;
             }
             if raw_fd - next_fd > MAX_INHERITED_FD_GAP {
@@ -599,10 +643,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 _ => return Err(Errno::EAGAIN),
             };
             next_fd = raw_fd + 1;
-            let inherited_fd = InheritedFd {
-                fd: u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?,
-                handle: ObjectHandle::default(),
-                kind,
+            let inherited_fd = ForkedFd {
+                inherited: InheritedFd {
+                    fd: u32::try_from(raw_fd).map_err(|_| Errno::EAGAIN)?,
+                    handle: ObjectHandle::default(),
+                    kind,
+                },
+                close_on_exec,
             };
             inherited.push((inherited_fd, object));
         }
