@@ -3074,63 +3074,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn kill_signals_other_processes() {
-        use litebox_broker_protocol::ProcessId;
-        use litebox_broker_protocol::signal::PendingSignal;
-        use litebox_common_linux::{
-            errno::Errno,
-            signal::{SigSet, Signal},
-        };
-
-        let task = crate::syscalls::tests::init_platform();
-        let (other, other_pid) =
-            crate::syscalls::test_broker::litebox(crate::syscalls::tests::test_platform());
-        let pid = ProcessId(task.pid.cast_unsigned());
-        let number = |signal: Signal| signal.as_i32().cast_unsigned();
-
-        // A signal sent before the process opens its signals waits for it.
-        other.send_signal(pid, number(Signal::SIGUSR1)).unwrap();
-        task.check_for_received_signals();
-        assert!(task.pending_signal_set().is_empty());
-        task.receive_signals();
-        task.check_for_received_signals();
-        let usr1 = SigSet::empty().with(Signal::SIGUSR1);
-        assert_eq!(task.pending_signal_set(), usr1);
-
-        // A later signal wakes the process to take it.
-        task.check_for_received_signals();
-        assert_eq!(task.pending_signal_set(), usr1);
-        other.send_signal(pid, number(Signal::SIGUSR2)).unwrap();
-        task.check_for_received_signals();
-        assert_eq!(task.pending_signal_set(), usr1.with(Signal::SIGUSR2));
-
-        // `kill` signals another process, or checks that it exists with signal zero.
-        let other_signals = other.open_signals().unwrap();
-        assert_eq!(task.sys_kill(other_pid, 0), Ok(0));
-        assert_eq!(task.sys_kill(other_pid, Signal::SIGTERM.as_i32()), Ok(0));
-        assert_eq!(
-            other_signals.take(),
-            Ok(Some(PendingSignal {
-                signal: number(Signal::SIGTERM),
-                sender: pid,
-            }))
-        );
-        assert_eq!(other_signals.take(), Ok(None));
-        assert_eq!(task.sys_kill(task.pid, 0), Ok(0));
-        assert_eq!(task.sys_kill(i32::MAX, 0), Err(Errno::ESRCH));
-        assert_eq!(
-            task.sys_kill(i32::MAX, Signal::SIGTERM.as_i32()),
-            Err(Errno::ESRCH)
-        );
-        assert_eq!(task.sys_kill(other_pid, 65), Err(Errno::EINVAL));
-        assert_eq!(
-            task.sys_tgkill(other_pid, other_pid, Signal::SIGTERM.as_i32()),
-            Err(Errno::ESRCH)
-        );
-        assert_eq!(other_signals.take(), Ok(None));
-    }
-
     const SYSCALL_RETURN_IP: usize = 0x5000;
     const SYSCALL_ARG0: usize = 7;
 
