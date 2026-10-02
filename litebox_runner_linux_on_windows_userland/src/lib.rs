@@ -126,6 +126,8 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
                 blocked_signals: litebox_common_linux::signal::SigSet::empty(),
                 ignored_signals: litebox_common_linux::signal::SigSet::empty(),
                 inherited_fds: None,
+                cwd: None,
+                umask: None,
             },
             initial_thread,
             prog_path,

@@ -22,8 +22,9 @@ use litebox_broker_protocol::fs::{
     FileStatusFlags, FileType, FileUser,
 };
 use litebox_common_linux::{
-    AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
-    InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx, StatxMask, TimeParam,
+    AccessFlags, AtFlags, CloseRangeFlags, EfdFlags, EpollCreateFlags, FcntlArg,
+    FileDescriptorFlags, FileStat, InodeType, IoReadVec, IoWriteVec, IoctlArg, OFlags, Statx,
+    StatxMask, TimeParam,
     errno::Errno,
     program_startup::{InheritedFd, InheritedFdKind},
     signal::Signal,
@@ -85,17 +86,28 @@ impl<Platform: ShimPlatform> FsState<Platform> {
         }
     }
 
-    fn umask(&self) -> Mode {
+    /// The file mode creation mask.
+    pub(crate) fn umask(&self) -> Mode {
         Mode::from_u32_bits_truncate(self.umask.load(Ordering::Relaxed))
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub(crate) fn has_default_fs_state(&self, credentials: &super::process::Credentials) -> bool {
-        let context = self.context.read();
-        self.umask() == Mode::from_u32_bits_truncate(u32::from((Mode::WGRP | Mode::WOTH).bits()))
-            && context.cwd().to_string() == "/"
-            && u32::from(context.acting_user().user) == credentials.euid
-            && u32::from(context.acting_user().group) == credentials.egid
+    /// Sets the file mode creation mask to the permission bits of `umask`, returning the previous
+    /// mask.
+    pub(crate) fn set_umask(&self, umask: u32) -> Mode {
+        let umask = Mode::from_u32_bits_truncate(umask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
+        Mode::from_u32_bits_truncate(self.umask.swap(umask.bits().into(), Ordering::Relaxed))
+    }
+
+    /// Moves to the absolute path `cwd` without checking it, as a program keeps the working
+    /// directory it inherits.
+    pub(crate) fn inherit_cwd(&self, cwd: &str) -> Result<(), Errno> {
+        if !cwd.starts_with('/') {
+            return Err(Errno::EINVAL);
+        }
+        let mut context = self.context.write();
+        let cwd = context.resolve(cwd)?;
+        context.set_cwd(cwd);
+        Ok(())
     }
 }
 
@@ -441,19 +453,12 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
     /// close-on-exec flags and share this table's open file descriptions.
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn copy_for_vfork(&self, global: &GlobalState<Platform>) -> Self {
-        let alive_fds: alloc::vec::Vec<usize> =
-            self.raw_descriptor_store.read().iter_alive().collect();
-        let len = alive_fds.last().map_or(0, |&raw_fd| raw_fd + 1);
-        let copy = Self {
-            raw_descriptor_store: litebox::sync::RwLock::new(
-                litebox::fd::RawDescriptorStorage::with_len(len),
-            ),
-            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
-        };
-        for raw_fd in alive_fds {
-            let fd = self
-                .typed_fd_from_raw(raw_fd)
-                .expect("the table is not changing");
+        // Sibling threads cannot change the table while it is locked for the copy.
+        let rds = self.raw_descriptor_store.read();
+        let len = rds.iter_alive().last().map_or(0, |raw_fd| raw_fd + 1);
+        let mut copy = litebox::fd::RawDescriptorStorage::with_len(len);
+        for raw_fd in rds.iter_alive() {
+            let fd = Self::typed_fd_locked(&rds, raw_fd).expect("the table is not changing");
             let flags = get_file_descriptor_flags(&fd, global);
             on_any_fd!(&fd, |fd| {
                 let mut descriptors = global.litebox.descriptor_table_mut();
@@ -465,14 +470,14 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                     assert!(old.is_none());
                 }
                 drop(descriptors);
-                let success = copy
-                    .raw_descriptor_store
-                    .write()
-                    .fd_into_specific_raw_integer(fd, raw_fd);
+                let success = copy.fd_into_specific_raw_integer(fd, raw_fd);
                 assert!(success);
             });
         }
-        copy
+        Self {
+            raw_descriptor_store: litebox::sync::RwLock::new(copy),
+            max_fd: AtomicUsize::new(self.max_fd.load(Ordering::Relaxed)),
+        }
     }
 }
 
@@ -702,14 +707,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `umask`
     pub(crate) fn sys_umask(&self, new_mask: u32) -> Mode {
-        let new_mask =
-            Mode::from_u32_bits_truncate(new_mask) & (Mode::RWXU | Mode::RWXG | Mode::RWXO);
-        let old_mask = self
-            .fs
-            .borrow()
-            .umask
-            .swap(new_mask.bits().into(), Ordering::Relaxed);
-        Mode::from_u32_bits_truncate(old_mask)
+        self.fs.borrow().set_umask(new_mask)
     }
 
     /// Handle syscall `open`
@@ -1277,10 +1275,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.finalize_elf_patch(fd);
                 result
             }
-            // A `vfork` child cannot create sockets, so the suspended parent's table still holds
-            // each socket the child's table refers to, and only the child's descriptor goes.
+            // A `vfork` child cannot create sockets, so each socket the child's table refers to
+            // is also held by the suspended parent's table or, if a sibling thread has since
+            // closed it there, waits in the network's deferred closes. Only the child's
+            // descriptor goes, and then a socket it held last closes.
             AnyTypedFd::Network(fd) if self.vfork.borrow().is_some() => {
                 self.remove_and_drop_descriptor(&fd);
+                self.global.net.lock().finish_deferred_closes();
                 Ok(())
             }
             AnyTypedFd::Network(fd) => self.global.close_socket(&self.wait_cx(), fd),
@@ -1309,6 +1310,43 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let raw_fd = usize::try_from(fd).map_err(|_| Errno::EBADF)?;
         // Like Linux, an interrupted close does not restart: the descriptor is already gone.
         self.do_close(raw_fd).map_err(Errno::without_restart)
+    }
+
+    /// Handle syscall `close_range`.
+    ///
+    /// Like Linux, failures closing individual descriptors are not reported.
+    pub(crate) fn sys_close_range(
+        &self,
+        first: u32,
+        last: u32,
+        flags: CloseRangeFlags,
+    ) -> Result<(), Errno> {
+        if first > last || flags.intersects(!(CloseRangeFlags::UNSHARE | CloseRangeFlags::CLOEXEC))
+        {
+            return Err(Errno::EINVAL);
+        }
+        if flags.contains(CloseRangeFlags::UNSHARE) {
+            log_unsupported!("close_range with CLOSE_RANGE_UNSHARE");
+            return Err(Errno::EINVAL);
+        }
+        let raw_fds: alloc::vec::Vec<usize> = self
+            .files
+            .borrow()
+            .raw_descriptor_store
+            .read()
+            .iter_alive()
+            .filter(|&raw_fd| u32::try_from(raw_fd).is_ok_and(|fd| (first..=last).contains(&fd)))
+            .collect();
+        for raw_fd in raw_fds {
+            if flags.contains(CloseRangeFlags::CLOEXEC) {
+                if let Ok(fd) = self.files.borrow().typed_fd_from_raw(raw_fd) {
+                    set_file_descriptor_flags(&fd, &self.global, FileDescriptorFlags::FD_CLOEXEC);
+                }
+            } else {
+                let _ = self.do_close(raw_fd);
+            }
+        }
+        Ok(())
     }
 
     /// Resolve a userland fd number into the subsystem that owns it.

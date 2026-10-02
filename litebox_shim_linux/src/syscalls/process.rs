@@ -934,7 +934,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Ends the `vfork` window after the child exits or starts its own runner,
     /// restoring the parent's context and returning the child's PID to it.
     fn resume_vfork_parent(&self, ctx: &mut litebox_common_linux::PtRegs) -> usize {
-        // Close the child's descriptors, as its exit would, while the window is still open.
+        self.close_vfork_child_descriptors();
+        let state = self
+            .vfork
+            .borrow_mut()
+            .take()
+            .expect("completed vfork window lost its parent context");
+        self.files.replace(state.parent_files);
+        self.fs.replace(state.parent_fs);
+        self.signals.restore_vfork_parent(state.parent_signals);
+        self.thread.process.add_child(state.child_pid, state.child);
+        // Failure means the process service failed, so no termination can be observed.
+        let _ = self.observe_child_terminations();
+        *ctx = state.parent_context;
+        state.child_pid.cast_unsigned() as usize
+    }
+
+    /// Closes the `vfork` child's descriptors, as its exit would, while the window is still open.
+    pub(crate) fn close_vfork_child_descriptors(&self) {
         let child_fds: Vec<usize> = self
             .files
             .borrow()
@@ -945,18 +962,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for raw_fd in child_fds {
             let _ = self.do_close(raw_fd);
         }
-        let state = self
-            .vfork
-            .borrow_mut()
-            .take()
-            .expect("completed vfork window lost its parent context");
-        self.files.replace(state.parent_files);
-        self.signals.restore_vfork_parent(state.parent_signals);
-        self.thread.process.add_child(state.child_pid, state.child);
-        // Failure means the process service failed, so no termination can be observed.
-        let _ = self.observe_child_terminations();
-        *ctx = state.parent_context;
-        state.child_pid.cast_unsigned() as usize
     }
 
     /// Terminates the shared runner when the constrained `vfork` window cannot continue.
@@ -1043,14 +1048,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// stack. If `clear_signal_handlers` is set (`CLONE_CLEAR_SIGHAND`), the child's handled
     /// signals start with their default action.
     ///
-    /// Only single-threaded processes with default filesystem, resource-limit, and alarm state are
-    /// admitted. The child gets its own copy of the parent's descriptor table, sharing its open
-    /// file descriptions, and a copy of its signal dispositions, blocked mask, and alternate
-    /// stack, but none of its pending signals. When the parent resumes, the child's descriptors
-    /// are closed and the parent's table and signal state are restored. The parent remains
-    /// suspended until the child exits, is killed by a signal, or successfully transfers to a
-    /// fresh runner through `execve`; an `execve` that fails before the transfer returns its error
-    /// to the child. The child must not change platform-managed architectural state outside
+    /// Only processes with default resource-limit and alarm state are admitted. The child gets its
+    /// own copy of the parent's working directory and umask, of its descriptor table, sharing its
+    /// open file descriptions, and of its signal dispositions, blocked mask, and alternate stack,
+    /// but none of its pending signals. When the parent resumes, the child's descriptors are
+    /// closed and the parent's filesystem, descriptor, and signal state are restored. The parent
+    /// remains suspended until the child exits, is killed by a signal, or successfully transfers
+    /// to a fresh runner through `execve`; an `execve` that fails before the transfer returns its
+    /// error to the child. The parent's other threads keep running, but they cannot wait for the
+    /// child until the parent resumes, and the child ends if one of them ends the process or
+    /// execs. The child must not change platform-managed architectural state outside
     /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that
     /// state.
     #[cfg(target_arch = "x86_64")]
@@ -1061,8 +1068,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         clear_signal_handlers: bool,
     ) -> Result<usize, Errno> {
         if self.vfork.borrow().is_some()
-            || self.thread.process.nr_threads() != 1
-            || !self.fs.borrow().has_default_fs_state(&self.credentials)
             || !self.thread.process.limits.has_default_state()
             || !self.thread.process.has_default_alarm_state()
         {
@@ -1079,12 +1084,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
         parent_context.rax = child_pid.cast_unsigned() as usize;
+        let child_fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
+        let parent_fs = self.fs.replace(Arc::new(child_fs));
         let child_files = self.files.borrow().copy_for_vfork(&self.global);
+        // The child inherits the default limits checked above, even if a sibling has since
+        // changed the parent's limits.
+        child_files.set_max_fd(RLIMIT_NOFILE_CUR);
         let parent_files = self.files.replace(Arc::new(child_files));
         self.vfork.replace(Some(crate::VforkState {
             child,
             child_pid,
             parent_context,
+            parent_fs,
             parent_files,
             parent_signals: self.signals.begin_vfork_child(clear_signal_handlers),
         }));
@@ -1435,6 +1446,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             limits[resource as usize] = new_limit;
             Ok(old_rlimit)
+        } else if self.vfork.borrow().is_some() {
+            // `begin_vfork` requires default limits, so the vfork child inherited them even if a
+            // sibling thread has since changed the parent's limits.
+            Ok(ResourceLimits::<Platform>::default_values()[resource as usize])
         } else {
             Ok(self.thread.process.limits.limits.read()[resource as usize])
         }
@@ -2148,6 +2163,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(|_| Errno::EINVAL)?;
         let (inherited_fds, fds): (alloc::vec::Vec<_>, alloc::vec::Vec<_>) =
             self.fds_inherited_across_exec()?.into_iter().unzip();
+        let fs = self.fs.borrow();
+        let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
+        let umask = u32::from(fs.umask().bits());
+        drop(fs);
         let mut startup = LinuxProgramStartup {
             parent_process_id: self.pid,
             uid: self.credentials.uid,
@@ -2156,7 +2175,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             egid: self.credentials.egid,
             blocked_signals: self.signals.blocked(),
             ignored_signals: self.signals.ignored(),
+            umask,
             path,
+            cwd,
             argv,
             envp,
             inherited_fds,

@@ -75,6 +75,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "vfork_exit_parent.c",
     "vfork_reap_parent.c",
     "vfork_sigchld_parent.c",
+    "vfork_shell_parent.c",
     "vfork_signal_parent.c",
     "vfork_spawn_parent.c",
 ];
@@ -889,6 +890,61 @@ fn clone_vfork_children_start_like_vfork_children() {
     assert_eq!(numeric_field(parent_line, "hup_ignored="), 1);
     assert_eq!(numeric_field(parent_line, "usr2_handled="), 1);
     assert_eq!(numeric_field(parent_line, "ill_handled="), 1);
+}
+
+/// Stages the host's `dash`, with its libraries, as the guest's `/bin/sh`, and a `/tmp` directory.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn stage_shell(root: &Path) {
+    const SHELL: &str = "/usr/bin/dash";
+    assert!(common::rewrite_with_cache(
+        Path::new(SHELL),
+        &root.join("bin/sh"),
+        &[]
+    ));
+    for library in common::find_dependencies(SHELL) {
+        assert!(common::rewrite_with_cache(
+            Path::new(&library),
+            &root.join(&library[1..]),
+            &[]
+        ));
+    }
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn vfork_children_run_shell_commands() {
+    let parent = common::compile(
+        "./tests/vfork_shell_parent.c",
+        "vfork_shell_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "vfork_shell_parent");
+    runner.allow_process_duplication().with_fs_path(stage_shell);
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    // The second thread, working directory, and umask do not stop `system` and `popen`, whose
+    // shells inherit the working directory and umask.
+    // A `vfork` child changes its own working directory, umask, and descriptors before exec.
+    for expected in [
+        "system exited=1 code=7",
+        "popen-read cwd=/tmp",
+        "popen-read umask=0027",
+        "popen-read exited=1 code=0",
+        "popen-write exited=1 code=0",
+        "vfork-child cwd=/",
+        "vfork-child umask=0077",
+        "vfork-child kept=closed",
+        "vfork exited=1 code=0",
+        "parent cwd=/tmp umask=027 kept=1",
+    ] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?} in {output:?}"
+        );
+    }
 }
 
 /// Get the path of a program using `which`
@@ -2034,6 +2090,52 @@ fn test_runner_with_python() {
     python_runner("python_rewriter")
         .args(["-c", HELLO_WORLD_PY])
         .run();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn python_runs_child_programs() {
+    const SCRIPT: &str = r#"
+import os, subprocess, threading
+release = threading.Event()
+thread = threading.Thread(target=release.wait)
+thread.start()
+try:
+    os.chdir("/tmp")
+    os.umask(0o027)
+    sh = lambda command, **kwargs: subprocess.run(["/bin/sh", "-c", command], **kwargs)
+    print("run", sh("exit 7").returncode)
+    print("capture", sh("pwd; umask", capture_output=True, text=True).stdout.split())
+    print("cwd", sh("pwd", cwd="/", capture_output=True, text=True).stdout.strip())
+    print("system", os.waitstatus_to_exitcode(os.system("exit 5")))
+    with os.popen("echo popen") as output:
+        print("popen", output.read().strip())
+    print("parent", os.getcwd(), oct(os.umask(0o027)))
+finally:
+    release.set()
+    thread.join()
+"#;
+    let mut runner = python_runner("python_child_programs");
+    runner
+        .allow_process_duplication()
+        .args(["-c", SCRIPT])
+        .with_fs_path(stage_shell);
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    for expected in [
+        "run 7",
+        "capture ['/tmp', '0027']",
+        "cwd /",
+        "system 5",
+        "popen popen",
+        "parent /tmp 0o27",
+    ] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?} in {output:?}"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]
