@@ -25,6 +25,7 @@ extern crate alloc;
 mod broker;
 mod layout;
 pub mod loader;
+mod lockdown;
 mod memory;
 pub mod optee;
 
@@ -41,8 +42,8 @@ use litebox_common_vm_abi::{
     ABI_VERSION, CallId, DERIVED_KEY_LEN, DeriveKeyReply, DeriveKeyRequest, IDENTITY_LEN, Image,
     KernelCall, LogLevel, LogRequest, MAX_IMAGES, MAX_KDF_CONTEXT_LEN, MAX_LOG_LEN, MapReply,
     MapRequest, Message, PAGE_SIZE, Placement, Populate, Prot, ProtectRequest, RUNNER_MANAGED_MAX,
-    RUNNER_MANAGED_MIN, Registers, Request, StartupInfo, Status, UnmapRequest, UpcallFrame,
-    UpcallKind, UserRegion,
+    RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest, StartupInfo, Status, UnmapRequest,
+    UpcallFrame, UpcallKind, UserRegion,
 };
 use litebox_platform_vm_kernel::{AddressSpaceId, VmKernel};
 use zerocopy::IntoBytes;
@@ -99,6 +100,7 @@ struct Inner {
     broker: broker::Broker,
     state: Cell<State>,
     upcall_entry: Cell<Option<u64>>,
+    lockdown: Cell<lockdown::Lockdown>,
     /// The request to deliver, then the reply.
     pending: RefCell<Option<Vec<u8>>>,
     completion: RefCell<Option<Vec<u8>>>,
@@ -191,6 +193,7 @@ impl Process {
                 broker: broker::Broker::new(broker_core, layout::BROKER_SHARED_MEMORY),
                 state: Cell::new(State::New),
                 upcall_entry: Cell::new(None),
+                lockdown: Cell::new(lockdown::Lockdown::OPEN),
                 pending: RefCell::new(None),
                 completion: RefCell::new(None),
                 entries: Cell::new(0),
@@ -457,6 +460,10 @@ impl Inner {
         let Some(id) = CallId::from_raw(ctx.orig_rax as u64) else {
             return Flow::Return(Status::UnknownCall);
         };
+        if !self.lockdown.get().permits_call(id) {
+            log::warn!("{id:?} is not allowed by the process's lockdown");
+            return self.kill_flow("call not allowed by the lockdown");
+        }
         if ctx.rsi != id.request_size() || ctx.r10 != id.reply_size() {
             return Flow::Return(Status::BadSize);
         }
@@ -493,6 +500,13 @@ impl Inner {
                     Err(status) => Flow::Return(status),
                 }
             }
+            Request::Map(MapRequest { prot, .. })
+            | Request::Protect(ProtectRequest { prot, .. })
+                if !self.lockdown.get().permits_prot(prot) =>
+            {
+                log::warn!("{prot:?} is not allowed by the process's lockdown");
+                self.kill_flow("page permissions not allowed by the lockdown")
+            }
             Request::Map(r) => reply::<MapRequest>(slot, self.map(&r)),
             Request::Unmap(r) => reply::<UnmapRequest>(slot, self.unmap(&r)),
             Request::Protect(r) => reply::<ProtectRequest>(slot, self.protect(&r)),
@@ -501,7 +515,16 @@ impl Inner {
                 self.broker.handshake(&r.0),
             ),
             Request::BrokerCall(r) => {
-                reply::<litebox_common_vm_abi::BrokerRequestFrame>(slot, self.broker.call(&r.0))
+                let lockdown = self.lockdown.get();
+                let result = match self.broker.call(&r.0, |op| lockdown.permits_broker_op(op)) {
+                    Ok(frame) => Ok(frame),
+                    Err(broker::CallError::Status(status)) => Err(status),
+                    Err(broker::CallError::NotPermitted(op)) => {
+                        log::warn!("{op:?} is not allowed by the process's lockdown");
+                        return self.kill_flow("broker operation not allowed by the lockdown");
+                    }
+                };
+                reply::<litebox_common_vm_abi::BrokerRequestFrame>(slot, result)
             }
             Request::DeriveKey(r) => reply::<DeriveKeyRequest>(slot, self.derive_key(&r)),
             Request::Log(r) => reply::<LogRequest>(slot, Self::log(&r)),
@@ -509,14 +532,27 @@ impl Inner {
                 self.state.set(State::Dead(Dead::Exited(r.code)));
                 Flow::Stop
             }
+            Request::Restrict(r) => reply::<RestrictRequest>(slot, self.restrict(&r)),
         }
+    }
+
+    fn kill_flow(&self, reason: &'static str) -> Flow {
+        self.kill(reason);
+        Flow::Stop
+    }
+
+    fn restrict(&self, r: &RestrictRequest) -> Result<(), Status> {
+        self.lockdown.set(self.lockdown.get().narrowed(r)?);
+        log::debug!("lockdown: {}", self.lockdown.get());
+        Ok(())
     }
 
     fn managed(addr: u64, len: u64) -> Result<Range<usize>, Status> {
         checked_range(addr, len, RUNNER_MANAGED_MIN..RUNNER_MANAGED_MAX)
     }
 
-    /// W^X. Defense in depth only: the guest can reach the gate anyway.
+    /// W^X, regardless of lockdown. Defense in depth only: the guest can reach
+    /// the gate anyway.
     fn check_wx(prot: Prot) -> Result<(), Status> {
         if prot.write() && prot.exec() {
             Err(Status::Denied)

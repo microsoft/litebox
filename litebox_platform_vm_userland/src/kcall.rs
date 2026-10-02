@@ -6,9 +6,9 @@
 //! [`GATE_SECTION`](litebox_common_vm_abi::GATE_SECTION).
 
 use litebox_common_vm_abi::{
-    DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel, LogRequest, MapRequest,
-    Message, Placement, Populate, Prot, ProtectRequest, ReadyRequest, Status, UnmapRequest,
-    UserBytes,
+    BrokerOpSet, CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel,
+    LogRequest, MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest,
+    ReadyRequest, RestrictRequest, Status, UnmapRequest, UserBytes,
 };
 use zerocopy::TryFromBytes;
 
@@ -144,6 +144,20 @@ pub fn protect(addr: usize, len: usize, prot: Prot) -> Result<(), Status> {
         addr: addr as u64,
         len: len as u64,
         prot,
+        reserved: 0,
+    })
+}
+
+/// Irrevocable.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn restrict(calls: CallSet, broker_ops: BrokerOpSet, prots: ProtSet) -> Result<(), Status> {
+    call(&RestrictRequest {
+        calls,
+        broker_ops,
+        prots,
         reserved: 0,
     })
 }
