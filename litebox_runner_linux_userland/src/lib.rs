@@ -315,10 +315,14 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let net_worker = if cli_args.tun_device_name.is_some() {
         let shim = shim.clone();
         let shutdown_clone = shutdown.clone();
+        // Finish sched_setaffinity before the process-wide seccomp filter blocks it.
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let ready_clone = ready.clone();
         let child = litebox_platform_linux_userland::spawn_host_thread(move || {
             const DEFAULT_TIMEOUT: core::time::Duration = core::time::Duration::from_micros(100);
             const MAX_TIMEOUT: core::time::Duration = core::time::Duration::from_millis(1);
             pin_thread_to_cpu(0);
+            ready_clone.wait();
 
             while !shutdown_clone.load(core::sync::atomic::Ordering::Relaxed) {
                 let timeout = loop {
@@ -338,6 +342,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             // TODO: keep running until all sockets are closed?
             while shim.perform_network_interaction().call_again_immediately() {}
         });
+        ready.wait();
         Some(child)
     } else {
         None
