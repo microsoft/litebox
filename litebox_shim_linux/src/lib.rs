@@ -422,6 +422,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             blocked_signals,
             ignored_signals,
             inherited_fds,
+            cwd,
+            umask,
         } = task;
         if pid != self.0.process_id || ppid < 0 {
             return Err(loader::elf::ElfLoaderError::InvalidProcessId);
@@ -436,7 +438,16 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             gid,
             egid,
         });
-        let fs_state = Arc::new(syscalls::file::FsState::new(&credentials));
+        let fs_state = syscalls::file::FsState::new(&credentials);
+        if let Some(cwd) = cwd {
+            fs_state
+                .inherit_cwd(&cwd)
+                .map_err(loader::elf::ElfLoaderError::OpenError)?;
+        }
+        if let Some(umask) = umask {
+            fs_state.set_umask(umask);
+        }
+        let fs_state = Arc::new(fs_state);
         match inherited_fds {
             None => {
                 files.initialize_stdio_in_shared_descriptors_table(
@@ -569,8 +580,14 @@ impl<Platform: ShimPlatform> syscalls::file::FilesState<Platform> {
         &self,
         fd: usize,
     ) -> Result<syscalls::file::AnyTypedFd<Platform>, Errno> {
-        let rds = self.raw_descriptor_store.read();
+        Self::typed_fd_locked(&self.raw_descriptor_store.read(), fd)
+    }
 
+    /// Like [`Self::typed_fd_from_raw`], with the raw descriptor store already locked.
+    pub(crate) fn typed_fd_locked(
+        rds: &litebox::fd::RawDescriptorStorage,
+        fd: usize,
+    ) -> Result<syscalls::file::AnyTypedFd<Platform>, Errno> {
         macro_rules! resolve_fd {
             ($subsystem:ty, $variant:ident) => {
                 if let Ok(fd) = rds.fd_from_raw_integer::<$subsystem>(fd) {
@@ -700,9 +717,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(target_arch = "aarch64")]
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
-        // The constrained vfork child may only inspect its temporary identity, manage its own
-        // signal state and descriptors, open and write files, exit, or attempt execve. Any other
-        // syscall terminates the shared runner.
+        // The constrained vfork child may only inspect its temporary identity and resource limits,
+        // manage its own signal state, descriptors, working directory, and umask, open and write
+        // files, exit, or attempt execve. Any other syscall terminates the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
@@ -713,18 +730,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getpid
                     | SyscallRequest::Getppid
                     | SyscallRequest::Gettid
+                    | SyscallRequest::Prlimit {
+                        pid: 0,
+                        new_limit: None,
+                        ..
+                    }
                     | SyscallRequest::RtSigaction { .. }
                     | SyscallRequest::RtSigprocmask { .. }
                     | SyscallRequest::RtSigreturn
                     | SyscallRequest::Sigaltstack { .. }
                     | SyscallRequest::Close { .. }
+                    | SyscallRequest::CloseRange { .. }
                     | SyscallRequest::Dup { .. }
                     | SyscallRequest::Fcntl {
                         arg: FcntlArg::GETFD | FcntlArg::SETFD(_) | FcntlArg::DUPFD { .. },
                         ..
                     }
                     | SyscallRequest::Openat { .. }
-                    | SyscallRequest::Write { .. })
+                    | SyscallRequest::Write { .. }
+                    | SyscallRequest::Chdir { .. }
+                    | SyscallRequest::Umask { .. })
             )
         {
             return Ok(self.abort_vfork_window());
@@ -790,6 +815,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 None => Err(Errno::EFAULT),
             },
             SyscallRequest::Close { fd } => syscall!(sys_close(fd)),
+            SyscallRequest::CloseRange { first, last, flags } => {
+                syscall!(sys_close_range(first, last, flags))
+            }
             SyscallRequest::Lseek { fd, offset, whence } => {
                 use litebox::utils::TruncateExt as _;
                 syscalls::file::try_into_whence(whence.trunc())
@@ -1391,6 +1419,7 @@ struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::Process<Platform>,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
+    parent_fs: Arc<syscalls::file::FsState<Platform>>,
     parent_files: Arc<syscalls::file::FilesState<Platform>>,
     parent_signals: syscalls::signal::VforkParentSignals<Platform>,
 }
@@ -1403,6 +1432,11 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 
 impl<Platform: ShimPlatform> Drop for Task<Platform> {
     fn drop(&mut self) {
+        // A thread can end inside a `vfork` window, as when a sibling thread execs. The process
+        // goes on, so the child's descriptors must not keep their open file descriptions alive.
+        if self.vfork.get_mut().is_some() {
+            self.close_vfork_child_descriptors();
+        }
         self.prepare_for_exit();
         // Remove the local identity before the broker can release it for reuse,
         // but keep the process thread count until broker exit is acknowledged.

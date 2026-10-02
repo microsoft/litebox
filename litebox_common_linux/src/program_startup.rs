@@ -13,7 +13,7 @@ use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 
 use crate::signal::SigSet;
 
-const HEADER_SIZE: usize = size_of::<[u32; 9]>() + size_of::<[u64; 2]>();
+const HEADER_SIZE: usize = size_of::<[u32; 11]>() + size_of::<[u64; 2]>();
 /// Size of an inherited descriptor's number, handle, and kind tag, which precede its kind's fields.
 const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
 const FILE_TAG: u8 = 0;
@@ -38,8 +38,12 @@ pub struct LinuxProgramStartup {
     pub blocked_signals: SigSet,
     /// Signals whose ignored disposition survives `execve`.
     pub ignored_signals: SigSet,
+    /// File mode creation mask, with only permission bits set.
+    pub umask: u32,
     /// Absolute executable path.
     pub path: String,
+    /// Absolute working directory.
+    pub cwd: String,
     /// Program arguments.
     pub argv: Vec<CString>,
     /// Program environment.
@@ -93,6 +97,12 @@ pub enum LinuxProgramStartupError {
     /// The executable path is not an absolute UTF-8 path.
     #[error("invalid Linux program path")]
     InvalidPath,
+    /// The working directory is not an absolute UTF-8 path.
+    #[error("invalid Linux program working directory")]
+    InvalidWorkingDirectory,
+    /// The file mode creation mask has bits other than permission bits.
+    #[error("invalid Linux program umask")]
+    InvalidUmask,
     /// The parent process ID is not representable by Linux process semantics.
     #[error("invalid Linux program parent process ID")]
     InvalidParentProcess,
@@ -117,9 +127,14 @@ impl LinuxProgramStartup {
         push_u32(&mut output, self.egid);
         push_u64(&mut output, self.blocked_signals.as_u64());
         push_u64(&mut output, self.ignored_signals.as_u64());
+        push_u32(&mut output, self.umask);
         push_u32(
             &mut output,
             u32::try_from(self.path.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
+        );
+        push_u32(
+            &mut output,
+            u32::try_from(self.cwd.len()).map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
         push_u32(
             &mut output,
@@ -135,6 +150,7 @@ impl LinuxProgramStartup {
                 .map_err(|_| LinuxProgramStartupError::TooLarge)?,
         );
         output.extend_from_slice(self.path.as_bytes());
+        output.extend_from_slice(self.cwd.as_bytes());
         for value in self.argv.iter().chain(&self.envp) {
             let value = value.as_bytes();
             push_u32(
@@ -163,7 +179,10 @@ impl LinuxProgramStartup {
         let effective_group_id = read_u32(&mut input)?;
         let blocked_signals = SigSet::from_u64(read_u64(&mut input)?);
         let ignored_signals = SigSet::from_u64(read_u64(&mut input)?);
+        let umask = read_u32(&mut input)?;
         let path_length = usize::try_from(read_u32(&mut input)?)
+            .map_err(|_| LinuxProgramStartupError::Malformed)?;
+        let cwd_length = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
         let argv_count = usize::try_from(read_u32(&mut input)?)
             .map_err(|_| LinuxProgramStartupError::Malformed)?;
@@ -174,6 +193,10 @@ impl LinuxProgramStartup {
         let path_bytes = take_bytes(&mut input, path_length)?;
         let path = core::str::from_utf8(path_bytes)
             .map_err(|_| LinuxProgramStartupError::InvalidPath)?
+            .into();
+        let cwd_bytes = take_bytes(&mut input, cwd_length)?;
+        let cwd = core::str::from_utf8(cwd_bytes)
+            .map_err(|_| LinuxProgramStartupError::InvalidWorkingDirectory)?
             .into();
         let value_count = argv_count
             .checked_add(envp_count)
@@ -215,7 +238,9 @@ impl LinuxProgramStartup {
             egid: effective_group_id,
             blocked_signals,
             ignored_signals,
+            umask,
             path,
+            cwd,
             argv: values,
             envp,
             inherited_fds,
@@ -274,12 +299,19 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
     }
+    if !startup.cwd.starts_with('/') || startup.cwd.as_bytes().contains(&0) {
+        return Err(LinuxProgramStartupError::InvalidWorkingDirectory);
+    }
+    if startup.umask & !0o777 != 0 {
+        return Err(LinuxProgramStartupError::InvalidUmask);
+    }
     Ok(())
 }
 
 fn encoded_len(startup: &LinuxProgramStartup) -> Result<usize, LinuxProgramStartupError> {
     let mut length = HEADER_SIZE
         .checked_add(startup.path.len())
+        .and_then(|length| length.checked_add(startup.cwd.len()))
         .ok_or(LinuxProgramStartupError::TooLarge)?;
     if length > MAX_PROCESS_BOOTSTRAP_SIZE as usize {
         return Err(LinuxProgramStartupError::TooLarge);
@@ -362,7 +394,9 @@ mod tests {
             egid: 1003,
             blocked_signals: SigSet::empty().with(Signal::SIGUSR1),
             ignored_signals: SigSet::empty().with(Signal::SIGPIPE),
+            umask: 0o027,
             path: "/bin/child".into(),
+            cwd: "/home/user".into(),
             argv: vec![
                 CString::new("child").unwrap(),
                 CString::new("argument").unwrap(),
@@ -412,7 +446,9 @@ mod tests {
             egid: 0,
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
+            umask: 0o022,
             path: "/child".into(),
+            cwd: "/".into(),
             argv: vec![CString::new("").unwrap(); 1025],
             envp: Vec::new(),
             inherited_fds: Vec::new(),
@@ -434,7 +470,9 @@ mod tests {
             egid: 0,
             blocked_signals: SigSet::empty(),
             ignored_signals: SigSet::empty(),
+            umask: 0o022,
             path: "/child".into(),
+            cwd: "/".into(),
             argv: vec![CString::new("child").unwrap()],
             envp: Vec::new(),
             inherited_fds: Vec::new(),
@@ -447,7 +485,8 @@ mod tests {
         );
 
         let mut invalid = startup.encode().unwrap();
-        let first_argument = HEADER_SIZE + startup.path.len() + size_of::<u32>();
+        let first_argument =
+            HEADER_SIZE + startup.path.len() + startup.cwd.len() + size_of::<u32>();
         invalid[first_argument] = 0;
         assert_eq!(
             LinuxProgramStartup::decode(&invalid),

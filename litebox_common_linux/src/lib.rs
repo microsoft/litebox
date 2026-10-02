@@ -776,6 +776,19 @@ impl FcntlArg {
 }
 
 bitflags::bitflags! {
+    /// `close_range` flags.
+    #[derive(Debug, Clone, Copy)]
+    pub struct CloseRangeFlags: core::ffi::c_uint {
+        /// Unshare the descriptor table before closing.
+        const UNSHARE = 1 << 1;
+        /// Mark the descriptors close-on-exec instead of closing them.
+        const CLOEXEC = 1 << 2;
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
+
+bitflags::bitflags! {
     #[derive(Debug, Clone, Copy)]
     pub struct EfdFlags: core::ffi::c_uint {
         const SEMAPHORE = 1;
@@ -1437,6 +1450,10 @@ pub struct TaskParams {
     pub ignored_signals: SigSet,
     /// Descriptors inherited from the parent, or `None` to start with the standard streams.
     pub inherited_fds: Option<alloc::vec::Vec<program_startup::InheritedFd>>,
+    /// The absolute working directory inherited from the parent, or `None` to start at `/`.
+    pub cwd: Option<alloc::string::String>,
+    /// The file mode creation mask inherited from the parent, or `None` to start with `0o022`.
+    pub umask: Option<u32>,
 }
 
 #[repr(C)]
@@ -2164,6 +2181,11 @@ pub enum SyscallRequest {
     Close {
         fd: i32,
     },
+    CloseRange {
+        first: u32,
+        last: u32,
+        flags: CloseRangeFlags,
+    },
     Stat {
         pathname: UserPtr<c_char>,
         buf: UserPtrMut<FileStat>,
@@ -2728,6 +2750,7 @@ impl SyscallRequest {
             Sysno::read => sys_req!(Read { fd, buf:*, count }),
             Sysno::write => sys_req!(Write { fd, buf:*, count }),
             Sysno::close => sys_req!(Close { fd }),
+            Sysno::close_range => sys_req!(CloseRange { first, last, flags }),
             Sysno::lseek => sys_req!(Lseek { fd, offset, whence }),
             #[cfg(target_arch = "x86_64")]
             Sysno::stat => sys_req!(Stat { pathname:*, buf:* }),
@@ -3621,6 +3644,7 @@ reinterpret_truncated_from_usize_for! {
         MapFlags,
         MRemapFlags,
         AccessFlags,
+        CloseRangeFlags,
         FileMode,
         OFlags,
         AtFlags,
