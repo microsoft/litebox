@@ -2895,7 +2895,7 @@ mod tests {
             forget_unmapped_trampolines(&mut state, REGION..REGION + PAGE_SIZE);
             assert!(!state.trampoline_invalidated);
             assert!(!state.trampoline_mapped);
-            assert!(state.mapped_trampoline_ranges().is_empty());
+            assert_eq!(state.mapped_trampoline_ranges(), []);
         }
 
         #[test]
@@ -2947,7 +2947,7 @@ mod tests {
 
             forget_unmapped_trampolines(&mut state, REGION..REGION + PAGE_SIZE);
             assert!(!state.trampoline_mapped);
-            assert!(state.mapped_trampoline_ranges().is_empty());
+            assert_eq!(state.mapped_trampoline_ranges(), []);
         }
     }
 

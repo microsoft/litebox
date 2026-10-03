@@ -1408,11 +1408,7 @@ mod aarch64_trampoline_footer_tests {
         assert_eq!(read_trampoline_regions(&mut Bytes(file)).unwrap(), expected);
 
         let (sentinel, _) = aarch64_file(&[]);
-        assert!(
-            read_trampoline_regions(&mut Bytes(sentinel))
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(read_trampoline_regions(&mut Bytes(sentinel)).unwrap(), []);
     }
 
     #[test]

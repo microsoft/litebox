@@ -8918,7 +8918,7 @@ mod tests {
         outcome: &SplitHookOutcome,
         spaces: &[TrampolineSpace],
     ) {
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         let mut pages: Vec<(u64, u64)> = Vec::new();
         for sub in &outcome.trampolines {
             assert!(sub.vaddr.is_multiple_of(SPLIT_PAGE));
@@ -9153,7 +9153,7 @@ mod tests {
             },
         ];
         let (_, outcome) = split_words(&words, 0x1000, &spaces, x18_config(Host::MacOs));
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         assert_eq!(outcome.trampolines.len(), 2);
         assert!(outcome.trampolines[0].data.len() <= 0x2000);
         for sub in &outcome.trampolines {
@@ -9198,7 +9198,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [SPACE, SPACE + SPLIT_PAGE]
         );
-        assert!(outcome.trapped_sites.is_empty());
+        assert_eq!(outcome.trapped_sites, []);
         let late = word_at(&code, 0x800);
         assert_eq!(
             decode_branch_target(late, late_site),
