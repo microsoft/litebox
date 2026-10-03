@@ -20,7 +20,7 @@ pub const SHARED_BUFFER_SLOT_SIZE: u32 = 64 * 1024;
 pub const SHARED_BUFFER_SLOT_COUNT: u32 = 256;
 
 /// Maximum number of slots named by one operation-scoped sequence.
-pub const MAX_SHARED_BUFFER_SEQUENCE_SLOTS: usize = 8;
+pub const MAX_SHARED_BUFFER_SEQUENCE_SLOTS: usize = 16;
 
 const _: () = assert!(MAX_SHARED_BUFFER_SEQUENCE_SLOTS <= SHARED_BUFFER_SLOT_COUNT as usize);
 
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn larger_slots_do_not_change_existing_transfer_limits() {
         assert_eq!(crate::pipe::MAX_PIPE_TRANSFER_SIZE, 32 * 1024);
-        assert_eq!(crate::fs::MAX_FILE_TRANSFER_SIZE, 512 * 1024);
+        assert_eq!(crate::fs::MAX_FILE_TRANSFER_SIZE, 1024 * 1024);
         assert_eq!(crate::socket::MAX_SOCKET_TRANSFER_SIZE, 32 * 1024);
         assert_eq!(crate::socket::MAX_UDP_DATAGRAM_SIZE, 65_507);
     }

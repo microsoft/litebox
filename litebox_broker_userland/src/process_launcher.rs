@@ -10,7 +10,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use litebox_broker_core::{
-    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ProcessLifecycleSink,
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessLifecycleSink,
 };
 use litebox_broker_host::ProcessLauncher;
 use litebox_broker_protocol::process::{ProcessExitStatus, ProcessStartupData};
@@ -28,11 +28,25 @@ pub(crate) struct UserlandProcessLauncher {
 pub(crate) struct PendingRunnerAssociation {
     pub(super) process: Arc<BrokerProcess>,
     data: Option<ProcessStartupData>,
+    image: Option<ChildImage>,
 }
 
 impl PendingRunnerAssociation {
-    fn new(process: Arc<BrokerProcess>, data: Option<ProcessStartupData>) -> Self {
-        Self { process, data }
+    fn new(
+        process: Arc<BrokerProcess>,
+        data: Option<ProcessStartupData>,
+        image: Option<ChildImage>,
+    ) -> Self {
+        Self {
+            process,
+            data,
+            image,
+        }
+    }
+
+    /// Takes the memory image to pass to the runner during setup.
+    pub(crate) fn take_image(&mut self) -> Option<ChildImage> {
+        self.image.take()
     }
 
     pub(crate) fn into_process_and_startup(
@@ -119,7 +133,7 @@ impl UserlandProcessLauncher {
             .broker
             .create_process(CallerCredential::HostGuaranteed, None)
             .map_err(broker_io_error)?;
-        let association = PendingRunnerAssociation::new(Arc::clone(&process), None);
+        let association = PendingRunnerAssociation::new(Arc::clone(&process), None, None);
         let (completion_sender, completion_receiver) = sync_channel(1);
         let startup =
             Arc::clone(&launcher).launch_runner(association, config, Some(completion_sender));
@@ -199,13 +213,19 @@ impl ProcessLauncher for UserlandProcessLauncher {
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
         data: ProcessStartupData,
+        image: Option<ChildImage>,
     ) -> Result<(), BrokerError> {
         let config = self.started_runner_config.clone();
         self.launch_runner(
-            PendingRunnerAssociation::new(process, Some(data)),
+            PendingRunnerAssociation::new(process, Some(data), image),
             config,
             None,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_image(&self) -> Result<Box<dyn litebox_broker_core::ProcessImage>, BrokerError> {
+        crate::runner::create_image()
     }
 }
 

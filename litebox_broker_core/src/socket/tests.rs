@@ -1335,6 +1335,7 @@ fn test_broker_with_policy(
         pending_references: Arc::new(AtomicUsize::new(0)),
         reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
         reserved_sockets: Arc::new(AtomicUsize::new(0)),
+        reserved_child_image_size: Arc::new(core::sync::atomic::AtomicU64::new(0)),
         random_provider: Arc::new(crate::random::TestRandomProvider),
         socket_provider,
         timer_provider: Arc::new(crate::timer::UnsupportedTimerProvider),

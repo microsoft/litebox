@@ -412,15 +412,20 @@ impl<'a, Platform: RawSyncPrimitivesProvider + TimeProvider> WaitContext<'a, Pla
         // Check for timeout before checking for an interrupt. This is important
         // for things like sleep(), where we want to return `TimedOut` rather than
         // `Interrupted` if the deadline has already passed.
+        if self.deadline.is_some() && self.remaining_timeout().is_none() {
+            return Err(WaitError::TimedOut);
+        }
+        if self.check_interrupt.check_for_interrupt() {
+            return Err(WaitError::Interrupted);
+        }
+
+        // The interrupt check may block (for example, while another thread
+        // pauses this one), so compute the remaining timeout after it.
         let timeout = if self.deadline.is_some() {
             Some(self.remaining_timeout().ok_or(WaitError::TimedOut)?)
         } else {
             None
         };
-        if self.check_interrupt.check_for_interrupt() {
-            return Err(WaitError::Interrupted);
-        }
-
         if let Some(timeout) = timeout {
             let r = self
                 .waker

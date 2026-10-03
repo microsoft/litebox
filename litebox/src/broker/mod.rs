@@ -19,8 +19,8 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    CreatedProcess, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus,
-    ProcessTermination,
+    CreatedProcess, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessTermination,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -60,6 +60,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
         payload: &[u8],
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn write_child_memory(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        offset: u64,
+        data: &[u8],
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn exit_child_process(
@@ -520,6 +527,21 @@ where
         let shared_buffer_lease = self.acquire_shared_buffer(payload.len())?;
         self.request(|local| {
             local.start_child_process(child_process_id, shared_buffer_lease.sequence(), payload)
+        })
+    }
+
+    fn write_child_memory(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        offset: u64,
+        data: &[u8],
+    ) -> core::result::Result<(), BrokerControlError> {
+        if data.is_empty() || data.len() > MAX_CHILD_MEMORY_WRITE_SIZE as usize {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let lease = self.acquire_shared_buffer(data.len())?;
+        self.request(|local| {
+            local.write_child_memory(child_process_id, offset, lease.sequence(), data)
         })
     }
 

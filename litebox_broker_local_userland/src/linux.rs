@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 use std::{
-    os::fd::{AsFd, AsRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, OwnedFd, RawFd},
     path::Path,
     sync::{
         Arc, Mutex,
@@ -37,6 +37,9 @@ pub struct BrokerConnection {
     pub positional_io_fds: [RawFd; 2],
     /// Association-shutdown descriptor that a runner's syscall filter must permit.
     pub shutdown_fd: RawFd,
+    /// Sealed memfd holding the memory image this process starts from, if
+    /// its parent wrote one.
+    pub process_image: Option<OwnedFd>,
 }
 
 /// Connects to and negotiates an association with a Linux-userland broker.
@@ -57,11 +60,12 @@ pub fn connect(
         )
     })?;
     let association_coordinator = Arc::new(BrokerAssociationFailureCoordinator::new());
-    let (local, startup, (notification_channel, positional_io_fds, shutdown_fd)) =
+    let (local, startup, (notification_channel, positional_io_fds, shutdown_fd, process_image)) =
         BrokerLocal::negotiate(setup_channel, |mut setup| {
             let shared_memory =
                 setup.receive_memfd(SHARED_BUFFER_POOL_SIZE, Some(setup_deadline))?;
             let control_memory = setup.receive_control_ring(Some(setup_deadline))?;
+            let process_image = setup.receive_process_image(Some(setup_deadline))?;
             let positional_io_fds = [
                 shared_memory.as_fd().as_raw_fd(),
                 control_memory.as_fd().as_raw_fd(),
@@ -84,7 +88,12 @@ pub fn connect(
             Ok((
                 call_channel,
                 Arc::new(shared_memory),
-                (notification_channel, positional_io_fds, shutdown_fd),
+                (
+                    notification_channel,
+                    positional_io_fds,
+                    shutdown_fd,
+                    process_image,
+                ),
             ))
         })
         .context("broker negotiation failed")?;
@@ -95,6 +104,7 @@ pub fn connect(
             coordinator: association_coordinator,
             positional_io_fds,
             shutdown_fd,
+            process_image,
         },
         startup,
     ))

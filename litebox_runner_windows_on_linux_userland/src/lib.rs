@@ -93,6 +93,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         coordinator,
         positional_io_fds: _broker_positional_io_fds,
         shutdown_fd: _broker_shutdown_fd,
+        process_image: _broker_process_image,
     } = connection;
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);

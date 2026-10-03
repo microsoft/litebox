@@ -61,6 +61,8 @@ impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
 // colliding with this sweep's dynamic `<stem>_rewriter` outputs.
 const DEDICATED_C_TESTS: &[&str] = &[
     "async_x16.c",
+    "fork_parent.c",
+    "fork_threads_parent.c",
     "gate_signals.c",
     "sigreturn.c",
     "sigreturn_simd.c",
@@ -947,6 +949,125 @@ fn vfork_children_run_shell_commands() {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn fork_child_resumes_from_parent_snapshot() {
+    let parent = common::compile("./tests/fork_parent.c", "fork_parent", true, false);
+    let mut runner = Runner::new(&parent, "fork_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    let parent_line = line("parent ");
+    let parent_pid = numeric_field(parent_line, "pid=");
+    assert_eq!(numeric_field(parent_line, "global="), 2);
+    assert_eq!(numeric_field(parent_line, "intact="), 1);
+    assert_eq!(numeric_field(parent_line, "usr1="), 0);
+    assert_eq!(numeric_field(parent_line, "sigchld="), 1);
+    assert_eq!(numeric_field(parent_line, "echild="), 1);
+
+    let fork_line = line("fork ");
+    let child = numeric_field(fork_line, "child=");
+    assert_ne!(child, parent_pid);
+    assert_eq!(numeric_field(fork_line, "waited="), child);
+    assert_eq!(numeric_field(fork_line, "exited="), 1);
+    assert_eq!(numeric_field(fork_line, "code="), 7);
+    let pipe_line = line("pipe ");
+    assert_eq!(numeric_field(pipe_line, "pid="), child);
+    assert_eq!(numeric_field(pipe_line, "failures="), 0);
+    assert_eq!(numeric_field(line("child-stdout "), "pid="), child);
+
+    let raw_line = line("raw-fork ");
+    let raw_child = numeric_field(raw_line, "child=");
+    assert!(raw_child != parent_pid && raw_child != child);
+    assert_eq!(numeric_field(raw_line, "waited="), raw_child);
+    assert_eq!(numeric_field(raw_line, "exited="), 1);
+    assert_eq!(numeric_field(raw_line, "code="), 9);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn fork_pauses_sibling_threads() {
+    let parent = common::compile(
+        "./tests/fork_threads_parent.c",
+        "fork_threads_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_threads_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = output
+        .lines()
+        .find(|line| line.starts_with("threads-fork "))
+        .unwrap_or_else(|| panic!("missing threads-fork output in {output:?}"));
+    assert_eq!(numeric_field(line, "code="), 7);
+    assert_eq!(numeric_field(line, "failures="), 0);
+    assert_eq!(numeric_field(line, "read="), 1);
+    assert_eq!(numeric_field(line, "slept="), 1);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn fork_requires_process_duplication() {
+    let parent = common::compile(
+        "./tests/fork_parent.c",
+        "fork_without_duplication",
+        true,
+        false,
+    );
+    let output = Runner::new(&parent, "fork_without_duplication").output_expect_failure();
+    let output = String::from_utf8(output).unwrap();
+    let line = output
+        .lines()
+        .find(|line| line.starts_with("fork-failed "))
+        .unwrap_or_else(|| panic!("missing fork failure in {output:?}"));
+    assert_eq!(numeric_field(line, "errno="), libc::EPERM);
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn forked_shell_subshells_and_pipelines() {
+    const SCRIPT: &str = r#"
+value=$(echo substituted)
+echo "substitution=$value"
+echo piped | { read line; echo "pipeline=$line"; }
+(exit 3)
+echo "subshell=$?"
+cd /tmp && umask 027 && (read marker < cwd-marker; echo "nested cwd=$marker umask=$(umask)")
+"#;
+    let mut runner = Runner::new(Path::new("/usr/bin/dash"), "fork_dash");
+    runner
+        .allow_process_duplication()
+        .args(["-c", SCRIPT])
+        .with_fs_path(|root| {
+            // dash's `pwd` prints its own copy of the cwd, so the forked subshell opens a
+            // relative path to check the cwd the child actually restored.
+            std::fs::create_dir_all(root.join("tmp")).unwrap();
+            std::fs::write(root.join("tmp/cwd-marker"), "tmp\n").unwrap();
+        });
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    for expected in [
+        "substitution=substituted",
+        "pipeline=piped",
+        "subshell=3",
+        "nested cwd=tmp umask=0027",
+    ] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?} in {output:?}"
+        );
+    }
+}
+
 /// Get the path of a program using `which`
 fn run_which(prog: &str) -> std::path::PathBuf {
     let prog_path_str = std::process::Command::new("which")
@@ -1306,7 +1427,8 @@ fn run_test_broker_connection(
         |_| false,
         |channel| {
             channel.send_memfd(shared_buffers.memory(), Some(setup_deadline))?;
-            channel.send_memfd(control_ring.memory(), Some(setup_deadline))
+            channel.send_memfd(control_ring.memory(), Some(setup_deadline))?;
+            channel.send_process_image(None, Some(setup_deadline))
         },
     )
     .expect("broker host setup failed")
@@ -2131,6 +2253,40 @@ finally:
         "popen popen",
         "parent /tmp 0o27",
     ] {
+        assert!(
+            lines.contains(&expected),
+            "missing {expected:?} in {output:?}"
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn python_os_fork() {
+    const SCRIPT: &str = r#"
+import os
+data = {"value": 1}
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+    data["value"] = 2
+    os.write(write_fd, f"child {os.getpid()} {os.getppid()} {data['value']}".encode())
+    os._exit(11)
+os.close(write_fd)
+with os.fdopen(read_fd) as pipe:
+    message = pipe.read()
+waited, status = os.waitpid(pid, 0)
+print("pipe", message == f"child {pid} {os.getpid()} 2")
+print("wait", waited == pid, os.waitstatus_to_exitcode(status))
+print("parent", data["value"])
+"#;
+    let mut runner = python_runner("python_os_fork");
+    runner.allow_process_duplication().args(["-c", SCRIPT]);
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    for expected in ["pipe True", "wait True 11", "parent 1"] {
         assert!(
             lines.contains(&expected),
             "missing {expected:?} in {output:?}"

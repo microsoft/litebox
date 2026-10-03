@@ -43,9 +43,9 @@ use litebox_broker_protocol::message::{
 };
 use litebox_broker_protocol::process::{
     CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor, ProcessTermination,
-    StartChildProcessRequest, StartChildProcessSource,
+    ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor,
+    ProcessTermination, StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -211,12 +211,47 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request(BrokerOperation::StartChildProcess(
             StartChildProcessRequest {
                 child_process_id,
-                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }),
+                startup: ProcessStartupDescriptor { buffer },
             },
         ))? {
             BrokerResult::ProcessStarted => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => panic!("broker returned unexpected process-start response: {response:?}"),
+        }
+    }
+
+    /// Writes `data` at `offset` of the memory image of a pending child
+    /// created by [`Self::allocate_child_process`].
+    ///
+    /// The caller must retain exclusive ownership of the data sequence until
+    /// this method returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the data length differs from the shared-buffer sequence or the
+    /// broker returns a response for another operation.
+    pub fn write_child_memory(
+        &self,
+        child_process_id: ProcessId,
+        offset: u64,
+        buffer: SharedBufferSequence,
+        data: &[u8],
+    ) -> Result<(), Channel::Error> {
+        if buffer.length() > MAX_CHILD_MEMORY_WRITE_SIZE {
+            return Err(BrokerLocalError::Broker(ErrorCode::ResourceExhausted));
+        }
+
+        self.write_shared_buffer(buffer, data);
+        match self.request(BrokerOperation::WriteChildMemory(WriteChildMemoryRequest {
+            child_process_id,
+            offset,
+            data: buffer,
+        }))? {
+            BrokerResult::ChildMemoryWritten => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected child-memory-write response: {response:?}")
+            }
         }
     }
 
