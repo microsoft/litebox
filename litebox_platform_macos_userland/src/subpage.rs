@@ -623,7 +623,7 @@ mod tests {
     use super::*;
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
-    use litebox::platform::page_mgmt::AllocationDirection;
+    use litebox::platform::page_mgmt::{AllocationDirection, PageReservation as _};
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -1190,15 +1190,21 @@ mod tests {
             host_base(source_range.start),
             host_base(neighbor_range.start)
         );
-        let neighbor = platform
-            .allocate_pages(
+        let neighbor_reservation = unsafe {
+            platform.reserve_and_commit_pages(
+                core::iter::empty,
                 neighbor_range.clone(),
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::NoReplace,
             )
-            .unwrap();
+        }
+        .unwrap();
+        let neighbor =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                neighbor_reservation.range().start,
+            );
         assert_eq!(source.write_at_offset(0, 42), Some(()));
         assert_eq!(neighbor.write_at_offset(0, 99), Some(()));
 
