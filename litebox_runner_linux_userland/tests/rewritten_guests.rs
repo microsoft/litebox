@@ -67,8 +67,9 @@ fn test_guest_simd_survives_signal_delivery() {
 
 /// A trampoline too large for the guest's inter-segment hole is split into
 /// sub-trampolines: one fills the hole, the rest goes past the last segment.
-/// The guest checks that its first gate is in the hole and its last is not,
-/// then executes both, so every region must be mapped and finalized.
+/// The guest checks that its first gate is in the hole and its last past its
+/// last segment, then executes both, so every region must be mapped and
+/// finalized.
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn test_split_trampoline_regions_are_all_installed() {
@@ -84,10 +85,10 @@ fn test_split_trampoline_regions_are_all_installed() {
         ),
     )
     .unwrap();
-    // AArch64 footer: (magic, table offset, sub-trampoline count, 0).
-    let footer = &rewritten[rewritten.len() - 32..];
-    assert_eq!(&footer[..8], b"LITEBOX0");
-    let regions = u64::from_le_bytes(footer[16..24].try_into().unwrap());
+    let regions = litebox_syscall_rewriter::aarch64_trampoline_regions(&rewritten)
+        .unwrap()
+        .expect("rewritten guest has a LiteBox trailer")
+        .len();
     assert!(
         regions >= 2,
         "the fixture must need several sub-trampolines for this test to mean anything; \
@@ -106,15 +107,22 @@ fn test_split_trampoline_regions_are_all_installed() {
 }
 
 /// The same guest left unrewritten, so the shim rewrites it at mmap time. It
-/// is built as a PIE because only a loaded span reserves the hole between its
-/// segments, which its gates fill before the runtime trampoline region. The
-/// guest checks that its first gate is in the hole and its last is not, then
-/// executes both.
+/// must be a PIE, the toolchain default, because only a loaded span reserves
+/// the hole between its segments, which its gates fill before the runtime
+/// trampoline region past the last segment.
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn test_runtime_split_trampoline_regions_are_all_installed() {
+    const E_TYPE: std::ops::Range<usize> = 16..18;
+    const ET_DYN: u16 = 3;
     let unique_name = "split_trampoline_runtime";
     let target = common::compile("./tests/split_trampoline.c", unique_name, false, false);
+    let elf = std::fs::read(&target).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(elf[E_TYPE].try_into().unwrap()),
+        ET_DYN,
+        "the toolchain must build a PIE by default for this test to mean anything"
+    );
     let output = Runner::new_pre_rewritten(&target, unique_name).output();
     let stdout = String::from_utf8_lossy(&output);
     for line in [

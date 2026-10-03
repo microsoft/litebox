@@ -94,7 +94,7 @@
 //! [`crate::hook_syscalls_in_elf`] writes zero into the callback slot when its
 //! caller supplies no address, leaving the loader to fill it in before the
 //! trampoline is executable. A binary with no patch sites gets no trampoline,
-//! only a size-0 sentinel header, matching the x86-64 path.
+//! only an empty sub-trampoline table.
 //!
 //! ### Sub-trampolines
 //!
@@ -105,7 +105,7 @@
 //! and recovery needs only the interrupted PC. Gates fill the object's
 //! inter-segment holes before the space past its last segment, and each
 //! sub-trampoline is capped at [`MAX_SUB_TRAMPOLINE_BYTES`]. The file format is
-//! described at [`crate::MAX_AARCH64_TRAMPOLINE_REGIONS`].
+//! described at [`crate::parse_aarch64_trampoline_footer`].
 //!
 //! `rt_sigreturn` needs no gate: the runtime installs its own trampoline
 //! address into the signal frame, and an absolute address is reachable
@@ -224,7 +224,8 @@ impl ElfCodeMetadata {
             let gate_bytes = site.kind.metadata().map_or(0, |metadata| {
                 metadata.slot_size_for_host(options.target_host())
             });
-            // One prologue per site covers separate mapping batches.
+            // One header per site covers separate mapping batches and every
+            // sub-trampoline's header.
             total
                 .checked_add(GATES_START_OFFSET)
                 .and_then(|total| total.checked_add(gate_bytes))
@@ -3217,10 +3218,9 @@ pub(crate) struct HookOutcome {
 /// trampoline will be mapped at; `callback` is the absolute address stored in
 /// the callback slot (0 if the loader fills it in later).
 ///
-/// Returns `Ok(None)` when the image contains no patch sites, so the caller
-/// emits a size-0 sentinel header instead (matching the x86-64 path). Signal
-/// returns are handled by the runtime rather than a per-binary gate, so a
-/// syscall-free binary needs no trampoline at all.
+/// Returns `Ok(None)` when the image contains no patch sites. Signal returns
+/// are handled by the runtime rather than a per-binary gate, so a syscall-free
+/// binary needs no trampoline at all.
 ///
 /// Otherwise returns `Ok(Some(outcome))`. A site that cannot reach its gate, or
 /// whose gate cannot branch back, is replaced with a trap and listed in
@@ -3414,9 +3414,7 @@ fn hook_sites(
             config,
             layout,
         )? {
-            // Replace the original instruction with `B <gate>`.
-            buf[site.file_offset..site.file_offset + INSN_BYTES]
-                .copy_from_slice(&b_insn.to_le_bytes());
+            patch_branch(buf, site, b_insn);
         } else {
             trap_site(buf, site.file_offset);
             trapped_sites.push(site.vaddr);
@@ -3434,8 +3432,9 @@ fn hook_sites(
 /// replaces the site.
 ///
 /// Returns `None`, leaving `trampoline_data` untouched, when the inbound branch
-/// or one of the gate's own PC-relative references is out of range, or the
-/// site is an unsupported x18 form that no placement could fix.
+/// or a branch back to the guest is out of range, or the site is an
+/// unsupported x18 form. An SVC callback literal out of reach of the header
+/// fails the rewrite instead; see [`GateBuild`].
 fn emit_site_gate(
     trampoline_data: &mut Vec<u8>,
     trampoline_base_addr: u64,
@@ -3579,11 +3578,18 @@ pub(crate) struct SplitHookOutcome {
 }
 
 /// The sub-trampoline currently accepting gates in one space.
+#[derive(Clone, Copy)]
 struct OpenSubTrampoline {
     /// Index into the output list.
     index: usize,
     /// One past the last byte the sub-trampoline may grow to.
     limit: u64,
+}
+
+/// One space and the sub-trampoline currently accepting gates in it.
+struct PlacementSpace {
+    space: TrampolineSpace,
+    open: Option<OpenSubTrampoline>,
 }
 
 /// Rewrites `sites`, spreading their gates over sub-trampolines in `spaces`.
@@ -3601,147 +3607,188 @@ pub(crate) fn hook_split_aarch64_with_code_ranges(
     callback: u64,
     config: RewriteConfig,
 ) -> Result<Option<SplitHookOutcome>> {
-    let sites = find_patch_sites_with_code_ranges(sections.executable, sections.code, buf, config)?;
-    hook_sites_split(
-        buf,
-        &sites,
-        spaces,
-        granule,
-        callback,
-        config,
-        GateLayout::linux(config.host),
-    )
+    let mut placer = SubTrampolinePlacer::new(spaces, granule, callback, config)?;
+    let mut sites =
+        find_patch_sites_with_code_ranges(sections.executable, sections.code, buf, config)?;
+    if sites.is_empty() {
+        return Ok(None);
+    }
+    // Placement assumes ascending sites; see `SubTrampolinePlacer::try_place`.
+    sites.sort_by_key(|site| site.vaddr);
+    let mut trapped_sites = Vec::new();
+    for site in &sites {
+        if let Some(b_insn) = placer.place(site)? {
+            patch_branch(buf, site, b_insn);
+        } else {
+            trap_site(buf, site.file_offset);
+            trapped_sites.push(site.vaddr);
+        }
+    }
+    Ok(Some(SplitHookOutcome {
+        trampolines: placer.trampolines,
+        trapped_sites,
+    }))
 }
 
-fn hook_sites_split(
-    buf: &mut [u8],
-    sites: &[PatchSite],
-    spaces: &[TrampolineSpace],
-    granule: u64,
-    callback: u64,
-    config: RewriteConfig,
-    layout: GateLayout,
-) -> Result<Option<SplitHookOutcome>> {
+/// Checks that `spaces` are `granule`-aligned and disjoint, and bounds each
+/// unbounded space by the start of the next space above it.
+fn normalize_spaces(spaces: &[TrampolineSpace], granule: u64) -> Result<Vec<TrampolineSpace>> {
+    let invalid = |reason: alloc::string::String| Err(Error::InvalidTrampolineSpace(reason));
     if !granule.is_power_of_two() || granule < GATE_ALIGNMENT as u64 {
-        return Err(Error::AddressOverflow(format!(
-            "invalid AArch64 sub-trampoline granule {granule:#x}"
-        )));
+        return invalid(format!("granule {granule:#x}"));
     }
     if let Some(space) = spaces.iter().find(|space| {
         !space.start.is_multiple_of(granule) || space.end.is_some_and(|end| end < space.start)
     }) {
-        return Err(Error::AddressOverflow(format!(
-            "invalid AArch64 trampoline space {space:x?}"
-        )));
+        return invalid(format!("{space:x?}"));
     }
-    // Spaces must be disjoint, or two sub-trampolines could overlap. An
-    // unbounded space ends where the next space above it starts. Non-empty
-    // spaces sharing a start always overlap, whichever bound each has.
+    // Non-empty spaces sharing a start always overlap, whichever bound each
+    // has.
     let is_empty = |space: &TrampolineSpace| space.end == Some(space.start);
     let mut by_start: Vec<usize> = (0..spaces.len()).collect();
     by_start.sort_by_key(|&index| (spaces[index].start, spaces[index].end.unwrap_or(u64::MAX)));
-    if by_start.windows(2).any(|pair| {
-        let (a, b) = (&spaces[pair[0]], &spaces[pair[1]]);
-        a.start == b.start && !is_empty(a) && !is_empty(b)
-    }) {
-        return Err(Error::AddressOverflow(
-            "overlapping AArch64 trampoline spaces".into(),
-        ));
-    }
-    let mut clipped: Vec<TrampolineSpace> = spaces.to_vec();
+    let mut normalized = spaces.to_vec();
     for pair in by_start.windows(2) {
-        let next_start = spaces[pair[1]].start;
-        let space = &mut clipped[pair[0]];
+        let (space, next) = (&spaces[pair[0]], &spaces[pair[1]]);
+        if space.start == next.start && !is_empty(space) && !is_empty(next) {
+            return invalid("overlapping spaces".into());
+        }
         match space.end {
-            Some(end) if end > next_start => {
-                return Err(Error::AddressOverflow(
-                    "overlapping AArch64 trampoline spaces".into(),
-                ));
-            }
+            Some(end) if end > next.start => return invalid("overlapping spaces".into()),
             Some(_) => {}
-            None => space.end = Some(next_start),
+            None => normalized[pair[0]].end = Some(next.start),
         }
     }
-    let spaces = clipped.as_slice();
-    if sites.is_empty() {
-        return Ok(None);
+    Ok(normalized)
+}
+
+/// Places gates into sub-trampolines across a list of spaces; see
+/// [`hook_split_aarch64_with_code_ranges`].
+struct SubTrampolinePlacer {
+    spaces: Vec<PlacementSpace>,
+    trampolines: Vec<SubTrampoline>,
+    granule: u64,
+    callback: u64,
+    config: RewriteConfig,
+    layout: GateLayout,
+}
+
+impl SubTrampolinePlacer {
+    fn new(
+        spaces: &[TrampolineSpace],
+        granule: u64,
+        callback: u64,
+        config: RewriteConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            spaces: normalize_spaces(spaces, granule)?
+                .into_iter()
+                .map(|space| PlacementSpace { space, open: None })
+                .collect(),
+            trampolines: Vec::new(),
+            granule,
+            callback,
+            config,
+            layout: GateLayout::linux(config.host),
+        })
     }
 
-    let mut trampolines: Vec<SubTrampoline> = Vec::new();
-    let mut open: Vec<Option<OpenSubTrampoline>> = spaces.iter().map(|_| None).collect();
-    let mut trapped_sites: Vec<u64> = Vec::new();
-
-    'sites: for site in sites {
-        // Room is checked before emitting: an SVC gate past the limit would
-        // have its callback literal out of reach.
-        let Some(slot_bytes) = site_slot_bytes(site, config) else {
-            // An unsupported form no placement could fix.
-            trap_site(buf, site.file_offset);
-            trapped_sites.push(site.vaddr);
-            continue;
+    /// Places `site`'s gate in the first space with room for it and in its
+    /// reach, returning the inbound `B`, or `None` if no space can serve it.
+    fn place(&mut self, site: &PatchSite) -> Result<Option<u32>> {
+        let Some(slot_bytes) = site_slot_bytes(site, self.config) else {
+            return Ok(None);
         };
-        for (space_index, space) in spaces.iter().enumerate() {
-            let start = if let Some(current) = &open[space_index] {
-                let sub = &mut trampolines[current.index];
-                let before = checked_add_u64(sub.vaddr, sub.data.len() as u64, "sub-trampoline")?;
-                // Sites come in ascending order: one above the space that is
-                // out of reach here may reach a fresh sub-trampoline further
-                // up; one below fails that too and moves to the next space.
-                if before
-                    .checked_add(slot_bytes as u64)
-                    .is_some_and(|end| end <= current.limit)
-                    && let Some(b_insn) =
-                        emit_site_gate(&mut sub.data, sub.vaddr, site, config, layout)?
-                {
-                    debug_assert_eq!(
-                        sub.vaddr + sub.data.len() as u64,
-                        before + slot_bytes as u64
-                    );
-                    buf[site.file_offset..site.file_offset + INSN_BYTES]
-                        .copy_from_slice(&b_insn.to_le_bytes());
-                    continue 'sites;
-                }
-                // The successor starts on a fresh granule.
-                let Some(next) = before.checked_next_multiple_of(granule) else {
-                    continue;
-                };
-                next
-            } else {
-                space.start
-            };
-
-            let limit = start
-                .saturating_add(MAX_SUB_TRAMPOLINE_BYTES as u64)
-                .min(space.end.unwrap_or(u64::MAX));
-            if start
-                .checked_add((GATES_START_OFFSET + slot_bytes) as u64)
-                .is_none_or(|end| end > limit)
-            {
-                continue;
+        for index in 0..self.spaces.len() {
+            if let Some(b_insn) = self.try_place(index, site, slot_bytes)? {
+                return Ok(Some(b_insn));
             }
-            let mut data = Vec::new();
-            emit_shared_prologue(&mut data, callback);
-            let Some(b_insn) = emit_site_gate(&mut data, start, site, config, layout)? else {
-                continue;
-            };
-            debug_assert_eq!(data.len(), GATES_START_OFFSET + slot_bytes);
-            buf[site.file_offset..site.file_offset + INSN_BYTES]
-                .copy_from_slice(&b_insn.to_le_bytes());
-            open[space_index] = Some(OpenSubTrampoline {
-                index: trampolines.len(),
-                limit,
-            });
-            trampolines.push(SubTrampoline { vaddr: start, data });
-            continue 'sites;
         }
-        trap_site(buf, site.file_offset);
-        trapped_sites.push(site.vaddr);
+        Ok(None)
     }
 
-    Ok(Some(SplitHookOutcome {
-        trampolines,
-        trapped_sites,
-    }))
+    /// Places `site`'s gate in space `index`: in its open sub-trampoline, or
+    /// else in a new one on the next granule.
+    ///
+    /// Sites arrive in ascending order, so a site above the space that cannot
+    /// reach the open sub-trampoline may still reach a new one further up; one
+    /// below fails that too and moves on to the next space.
+    fn try_place(
+        &mut self,
+        index: usize,
+        site: &PatchSite,
+        slot_bytes: usize,
+    ) -> Result<Option<u32>> {
+        let (config, layout) = (self.config, self.layout);
+        let start = if let Some(open) = self.spaces[index].open {
+            let sub = &mut self.trampolines[open.index];
+            let end = checked_add_u64(sub.vaddr, sub.data.len() as u64, "sub-trampoline")?;
+            // Room is checked before emitting: an SVC gate past the limit
+            // would have its callback literal out of reach.
+            if end
+                .checked_add(slot_bytes as u64)
+                .is_some_and(|gate_end| gate_end <= open.limit)
+                && let Some(b_insn) =
+                    emit_slot(&mut sub.data, sub.vaddr, site, slot_bytes, config, layout)?
+            {
+                return Ok(Some(b_insn));
+            }
+            let Some(next) = end.checked_next_multiple_of(self.granule) else {
+                return Ok(None);
+            };
+            next
+        } else {
+            self.spaces[index].space.start
+        };
+
+        let limit = start
+            .saturating_add(MAX_SUB_TRAMPOLINE_BYTES as u64)
+            .min(self.spaces[index].space.end.unwrap_or(u64::MAX));
+        if start
+            .checked_add((GATES_START_OFFSET + slot_bytes) as u64)
+            .is_none_or(|end| end > limit)
+        {
+            return Ok(None);
+        }
+        let mut data = Vec::new();
+        emit_shared_prologue(&mut data, self.callback);
+        let Some(b_insn) = emit_slot(&mut data, start, site, slot_bytes, config, layout)? else {
+            return Ok(None);
+        };
+        self.spaces[index].open = Some(OpenSubTrampoline {
+            index: self.trampolines.len(),
+            limit,
+        });
+        self.trampolines.push(SubTrampoline { vaddr: start, data });
+        Ok(Some(b_insn))
+    }
+}
+
+/// [`emit_site_gate`], failing unless the gate takes exactly `slot_bytes`,
+/// which the placer's room checks rely on.
+fn emit_slot(
+    data: &mut Vec<u8>,
+    base: u64,
+    site: &PatchSite,
+    slot_bytes: usize,
+    config: RewriteConfig,
+    layout: GateLayout,
+) -> Result<Option<u32>> {
+    let before = data.len();
+    let b_insn = emit_site_gate(data, base, site, config, layout)?;
+    let emitted = data.len() - before;
+    if b_insn.is_some() && emitted != slot_bytes {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "gate for {:#x} took {emitted} bytes instead of {slot_bytes}",
+            site.vaddr
+        )));
+    }
+    Ok(b_insn)
+}
+
+/// Replaces `site` with the inbound `B` to its gate.
+fn patch_branch(buf: &mut [u8], site: &PatchSite, b_insn: u32) {
+    buf[site.file_offset..site.file_offset + INSN_BYTES].copy_from_slice(&b_insn.to_le_bytes());
 }
 
 /// Bytes [`emit_site_gate`] appends for `site`, or `None` for a site it
@@ -3890,9 +3937,9 @@ fn emit_svc_gate(
     });
 
     // LDR X16, =callback ; BR X16. The literal reaches back to the header, so
-    // the last SVC gate has to sit within LDR-literal's ±1MiB of offset 0.
-    // That caps one object at about 16K SVC slots; beyond it `ldr_literal`
-    // reports `AddressOverflow` rather than encoding a wrapped offset.
+    // the last SVC gate has to sit within LDR-literal's ±1MiB of offset 0;
+    // see `MAX_SUB_TRAMPOLINE_BYTES`. Beyond it `ldr_literal` reports
+    // `AddressOverflow` rather than encoding a wrapped offset.
     let callback_vaddr = checked_add_u64(
         trampoline_base_addr,
         HEADER_CALLBACK_OFFSET as u64,
@@ -7562,8 +7609,7 @@ mod tests {
 
     #[test]
     fn no_patch_sites_emit_no_trampoline() {
-        // No patch sites: a NOP-only section yields no trampoline at all, so the
-        // caller emits a size-0 sentinel (matching the x86-64 path).
+        // No patch sites: a NOP-only section yields no trampoline at all.
         let (_patched, tramp) = hook_words_opt(&[0xD503_201F], 0x1000, 0x100000);
         assert!(tramp.is_none());
     }
@@ -9206,6 +9252,53 @@ mod tests {
         );
     }
 
+    /// Placement is by address, not file order: the late site comes first in
+    /// the file, yet still gets the fresh sub-trampoline above the early one.
+    #[test]
+    fn sites_are_placed_in_address_order() {
+        const SPACE: u64 = 0x10_0000;
+        let base = SPACE + (1 << 27);
+        let late_site = base + 0x800;
+        // `[late SVC][early SVC]` in the file.
+        let mut buf: Vec<u8> = [SVC_0, SVC_0]
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let sections = vec![
+            TextSectionInfo {
+                vaddr: late_site,
+                file_offset: 0,
+                size: 4,
+            },
+            TextSectionInfo {
+                vaddr: base,
+                file_offset: 4,
+                size: 4,
+            },
+        ];
+        let outcome = hook_split_aarch64_with_code_ranges(
+            &mut buf,
+            ScanSections {
+                executable: &sections,
+                code: &sections,
+            },
+            &[TrampolineSpace {
+                start: SPACE,
+                end: None,
+            }],
+            SPLIT_PAGE,
+            0,
+            linux_config(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.trapped_sites, []);
+        assert_eq!(
+            decode_branch_target(word_at(&buf, 0), late_site),
+            Some(SPACE + SPLIT_PAGE + GATES_START_OFFSET as u64)
+        );
+    }
+
     #[test]
     fn x18_gates_split_and_finalize_per_sub_trampoline() {
         let words = vec![0xaa00_03f2u32; 200]; // mov x18, x0
@@ -9323,7 +9416,7 @@ mod tests {
                     0,
                     linux_config(),
                 ),
-                Err(Error::AddressOverflow(_))
+                Err(Error::InvalidTrampolineSpace(_))
             ));
         }
     }

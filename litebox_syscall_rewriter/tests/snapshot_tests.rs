@@ -76,6 +76,7 @@ fn trampoline_ranges(binary: &[u8]) -> Vec<std::ops::Range<u64>> {
     let machine = u16::from_le_bytes(binary[E_MACHINE].try_into().unwrap());
     if machine == EM_AARCH64 {
         return litebox_syscall_rewriter::aarch64_trampoline_regions(binary)
+            .expect("valid LiteBox trailer")
             .into_iter()
             .flatten()
             .map(|region| region.vaddr..region.vaddr + region.size)

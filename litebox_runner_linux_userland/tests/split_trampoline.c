@@ -6,18 +6,20 @@
 //
 // One asm block fixes the site order: `split_early_svc`, then 4096 never-run
 // padding sites needing 256KiB of gates, more than the hole holds, then
-// `split_late_svc`. Gates are placed in site order, so the early one lands in
-// the hole and the late one past it. The guest checks where its rewritten
-// sites branch, then executes both gates.
+// `split_late_svc`. Gates are placed in address order, so the early one lands
+// in the hole and the late one past the last segment. The guest checks where
+// its rewritten sites branch, then executes both gates.
 
 #include <stdio.h>
 
 #if defined(__aarch64__)
 extern const unsigned int split_early_svc[];
 extern const unsigned int split_late_svc[];
-// Linker- and crt-provided bounds of the hole between text and data.
+// Linker- and crt-provided bounds of the hole between text and data, and the
+// end of the last segment.
 extern const char etext[];
 extern const char __data_start[];
+extern const char _end[];
 
 // Target of the `B` the rewriter put at `site`, or 0 if the site is not one.
 static unsigned long branch_target(const unsigned int *site) {
@@ -29,10 +31,13 @@ static unsigned long branch_target(const unsigned int *site) {
     return (unsigned long)site + (unsigned long)offset;
 }
 
-// Between text and data: a superset of the hole between the segments, which
-// still tells it apart from space past the last segment or a runtime region.
+// Between text and data: a superset of the hole between the segments.
 static int in_hole(unsigned long address) {
     return address >= (unsigned long)etext && address < (unsigned long)__data_start;
+}
+
+static int past_last_segment(unsigned long address) {
+    return address >= (unsigned long)_end;
 }
 
 static void two_writes(const char *early, unsigned long early_len, const char *late,
@@ -79,9 +84,10 @@ int main(int argc, char **argv) {
         printf("sites were not rewritten\n");
         return 1;
     }
-    if (!in_hole(early_gate) || in_hole(late_gate)) {
-        printf("unexpected gate placement: early %#lx, late %#lx, hole [%p, %p)\n", early_gate,
-               late_gate, (const void *)etext, (const void *)__data_start);
+    if (!in_hole(early_gate) || !past_last_segment(late_gate)) {
+        printf("unexpected gate placement: early %#lx, late %#lx, hole [%p, %p), end %p\n",
+               early_gate, late_gate, (const void *)etext, (const void *)__data_start,
+               (const void *)_end);
         return 1;
     }
     static const char early[] = "early sub-trampoline ok\n";

@@ -111,7 +111,9 @@ fn trampoline_header(out: &[u8]) -> (u64, u64, u64) {
         TRAMPOLINE_MAGIC,
         "trampoline magic mismatch"
     );
-    let regions = aarch64_trampoline_regions(out).expect("well-formed sub-trampoline table");
+    let regions = aarch64_trampoline_regions(out)
+        .unwrap()
+        .expect("well-formed sub-trampoline table");
     assert_eq!(regions.len(), 1, "fixture fits one sub-trampoline");
     (regions[0].file_offset, regions[0].vaddr, regions[0].size)
 }
@@ -314,4 +316,14 @@ fn aarch64_rehooking_is_idempotent() {
         again, out,
         "already-hooked binary must be returned unchanged"
     );
+
+    // A trailer that has the magic but is malformed is an error, not a binary
+    // to rewrite again.
+    let mut corrupt = out;
+    let reserved = corrupt.len() - 8;
+    corrupt[reserved] = 1;
+    assert!(matches!(
+        hook_syscalls_in_elf(&corrupt, Some(0)),
+        Err(Error::MalformedTrailer(_))
+    ));
 }

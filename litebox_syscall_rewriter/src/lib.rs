@@ -90,6 +90,7 @@ use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
 use thiserror::Error;
+use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Possible errors during hooking of `syscall` instructions
@@ -110,6 +111,10 @@ pub enum Error {
     TrampolinePatchFailure(String),
     #[error("trampoline needs {needed:#x} bytes but only {available:#x} are available")]
     TrampolineTooLarge { needed: u64, available: u64 },
+    #[error("malformed LiteBox trailer: {0}")]
+    MalformedTrailer(String),
+    #[error("invalid trampoline space: {0}")]
+    InvalidTrampolineSpace(String),
 }
 
 /// Internal-only error variants used for control flow within the crate.
@@ -152,21 +157,6 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
 /// Most sub-trampolines an AArch64 ELF footer may describe.
-///
-/// An AArch64 ELF's gates are split into sub-trampolines; see
-/// [`aarch64`]. Its file layout is
-/// `[ELF][padding][sub 0][padding][sub 1]...[sub N-1][table][footer]`: every
-/// sub-trampoline starts at a [`TRAMPOLINE_FILE_ALIGNMENT`]-aligned file
-/// offset and a page-aligned virtual address, the table holds `N` 24-byte
-/// little-endian `(file_offset, vaddr, size)` entries in file order, and the
-/// 32-byte footer is `(TRAMPOLINE_MAGIC, table_file_offset, N, 0)`. `N == 0`
-/// means nothing was patched.
-///
-/// Each sub-trampoline has the layout of a whole trampoline: the loader writes
-/// the callback into its first 8 bytes and finalizes it independently.
-///
-/// The footer's last word is zero where the single-header trailer holds its size,
-/// so the already-hooked check treats any AArch64 output as processed.
 pub const MAX_AARCH64_TRAMPOLINE_REGIONS: usize = 4096;
 
 /// Required file alignment of the appended trampoline payload.
@@ -318,9 +308,6 @@ pub fn rewrite_binary_with_options(
 }
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
-///
-/// Ends x86-64 ELF, PE, and Mach-O outputs. AArch64 ELF outputs end in an
-/// [`Aarch64TrampolineFooter64`] instead.
 #[repr(C, packed)]
 #[derive(FromBytes, IntoBytes, Immutable)]
 struct TrampolineHeader64 {
@@ -331,26 +318,27 @@ struct TrampolineHeader64 {
 }
 
 /// One entry of an AArch64 ELF's sub-trampoline table; see
-/// [`MAX_AARCH64_TRAMPOLINE_REGIONS`].
-#[repr(C, packed)]
+/// [`parse_aarch64_trampoline_footer`].
+#[repr(C)]
 #[derive(FromBytes, IntoBytes, Immutable)]
 struct Aarch64TrampolineTableEntry64 {
-    file_offset: u64,
-    vaddr: u64,
-    size: u64,
+    file_offset: U64,
+    vaddr: U64,
+    size: U64,
 }
 
-/// Footer of an AArch64 ELF; see [`MAX_AARCH64_TRAMPOLINE_REGIONS`].
-#[repr(C, packed)]
+/// Footer of an AArch64 ELF; see [`parse_aarch64_trampoline_footer`].
+#[repr(C)]
 #[derive(FromBytes, IntoBytes, Immutable)]
 struct Aarch64TrampolineFooter64 {
     magic: [u8; 8],
-    table_file_offset: u64,
-    region_count: u64,
-    reserved: u64,
+    table_file_offset: U64,
+    region_count: U64,
+    reserved: U64,
 }
 
-const _: () = assert!(size_of::<Aarch64TrampolineFooter64>() == size_of::<TrampolineHeader64>());
+/// Size of an AArch64 ELF's footer.
+pub const AARCH64_TRAMPOLINE_FOOTER_BYTES: usize = size_of::<Aarch64TrampolineFooter64>();
 
 /// Metadata about an executable section, extracted from a read-only object parse.
 #[derive(Clone, Copy)]
@@ -397,7 +385,7 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 /// no instructions are rewritten in that case.
 ///
 /// AArch64 ELFs instead end in a table of independently mapped sub-trampolines
-/// and a footer of the same size; see [`MAX_AARCH64_TRAMPOLINE_REGIONS`]. An
+/// and a footer of the same size; see [`parse_aarch64_trampoline_footer`]. An
 /// empty table is their sentinel.
 ///
 /// For patch-site discovery, AArch64 also rewrites guest thread-pointer accesses
@@ -506,6 +494,11 @@ pub fn hook_syscalls_in_elf_with_options(
             (sections, Vec::new())
         };
 
+        // AArch64 ELFs end in a sub-trampoline table rather than a header; a
+        // malformed one is an error, not a binary to rewrite again.
+        if arch == Arch::Aarch64 && aarch64_trampoline_regions(buf)?.is_some() {
+            return Ok(input_binary.to_vec());
+        }
         if is_already_hooked(&*buf, arch) {
             return Ok(input_binary.to_vec());
         }
@@ -1095,7 +1088,7 @@ fn hook_aarch64_elf(
     let granule = aarch64_trampoline_page_size(options.target_host());
     let spaces = {
         let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
-        aarch64_trampoline_spaces(&elf_load_segments(&file), granule, placement)
+        aarch64_trampoline_spaces(&elf_load_segments(&file), granule, placement)?
     };
     hook_aarch64_elf_in_spaces(
         input_binary,
@@ -1113,7 +1106,7 @@ fn hook_aarch64_elf(
 /// Each site's gate goes to the first space, in preference order, with room
 /// for it and in its branch reach; see
 /// [`aarch64::hook_split_aarch64_with_code_ranges`]. The output layout is
-/// described at [`MAX_AARCH64_TRAMPOLINE_REGIONS`].
+/// described at [`parse_aarch64_trampoline_footer`].
 fn hook_aarch64_elf_in_spaces(
     input_binary: &[u8],
     buf: &mut [u8],
@@ -1154,7 +1147,7 @@ fn unpatchable_aarch64_sites(trapped_sites: &[u64]) -> Error {
 }
 
 /// Appends sub-trampolines, their table, and the AArch64 ELF footer described
-/// at [`MAX_AARCH64_TRAMPOLINE_REGIONS`].
+/// at [`parse_aarch64_trampoline_footer`].
 fn append_aarch64_trampolines(
     out: &mut Vec<u8>,
     trampolines: &[aarch64::SubTrampoline],
@@ -1165,23 +1158,30 @@ fn append_aarch64_trampolines(
             trampolines.len()
         )));
     }
+    let as_u64 = |value: usize| {
+        u64::try_from(value).map_err(|_| Error::AddressOverflow("AArch64 trampoline table".into()))
+    };
     let mut table =
         Vec::with_capacity(trampolines.len() * size_of::<Aarch64TrampolineTableEntry64>());
     for sub in trampolines {
-        out.resize(out.len().next_multiple_of(TRAMPOLINE_FILE_ALIGNMENT), 0);
+        let file_offset = out
+            .len()
+            .checked_next_multiple_of(TRAMPOLINE_FILE_ALIGNMENT)
+            .ok_or_else(|| Error::AddressOverflow("AArch64 sub-trampoline offset".into()))?;
+        out.resize(file_offset, 0);
         let entry = Aarch64TrampolineTableEntry64 {
-            file_offset: out.len() as u64,
-            vaddr: sub.vaddr,
-            size: sub.data.len() as u64,
+            file_offset: as_u64(file_offset)?.into(),
+            vaddr: sub.vaddr.into(),
+            size: as_u64(sub.data.len())?.into(),
         };
         table.extend_from_slice(entry.as_bytes());
         out.extend_from_slice(&sub.data);
     }
     let footer = Aarch64TrampolineFooter64 {
         magic: *TRAMPOLINE_MAGIC,
-        table_file_offset: out.len() as u64,
-        region_count: trampolines.len() as u64,
-        reserved: 0,
+        table_file_offset: as_u64(out.len())?.into(),
+        region_count: as_u64(trampolines.len())?.into(),
+        reserved: 0.into(),
     };
     out.extend_from_slice(&table);
     out.extend_from_slice(footer.as_bytes());
@@ -1232,76 +1232,161 @@ pub struct TrampolineRegion {
     pub size: u64,
 }
 
-/// Parses and validates a rewritten AArch64 ELF's sub-trampoline table; see
-/// [`MAX_AARCH64_TRAMPOLINE_REGIONS`]. Returns `None` if `rewritten` does not
-/// end in a well-formed one, and no regions if nothing was patched.
+impl TrampolineRegion {
+    /// The `page`-sized pages the region occupies, or `None` on overflow.
+    pub fn page_range(&self, page: u64) -> Option<Range<u64>> {
+        let end = self
+            .vaddr
+            .checked_add(self.size)?
+            .checked_next_multiple_of(page)?;
+        Some(self.vaddr..end)
+    }
+}
+
+/// Why an AArch64 sub-trampoline table is unusable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrampolineTableError {
+    /// The trailer carries an unknown `LITEBOX` version.
+    UnknownVersion,
+    /// The trailer carries the magic but is malformed.
+    Malformed,
+}
+
+/// Where an AArch64 ELF's sub-trampoline table lies in the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrampolineTableLocation {
+    /// File offset of the table.
+    pub file_offset: u64,
+    /// Size of the table.
+    pub len: usize,
+}
+
+/// Parses the footer that ends a `file_len`-byte AArch64 ELF the rewriter has
+/// processed, returning where its sub-trampoline table lies, or `None` if the
+/// file carries no LiteBox trailer.
+///
+/// The file layout is
+/// `[ELF][padding][sub 0][padding][sub 1]...[sub N-1][table][footer]`, all
+/// little-endian. The 32-byte footer is
+/// `(TRAMPOLINE_MAGIC, table_file_offset, N, 0)`, and the table that ends at it
+/// holds `N` 24-byte `(file_offset, vaddr, size)` entries in file order; see
+/// [`parse_aarch64_trampoline_table`]. `N == 0` means nothing was patched.
+///
+/// Each sub-trampoline has the layout of a whole trampoline: the loader writes
+/// the callback into its first 8 bytes and finalizes it independently.
+///
+/// # Errors
+///
+/// See [`TrampolineTableError`].
+pub fn parse_aarch64_trampoline_footer(
+    footer: &[u8; AARCH64_TRAMPOLINE_FOOTER_BYTES],
+    file_len: u64,
+) -> core::result::Result<Option<TrampolineTableLocation>, TrampolineTableError> {
+    let version_at = TRAMPOLINE_MAGIC.len() - 1;
+    if footer[..TRAMPOLINE_MAGIC.len()] != *TRAMPOLINE_MAGIC {
+        if footer[..version_at] == TRAMPOLINE_MAGIC[..version_at] {
+            return Err(TrampolineTableError::UnknownVersion);
+        }
+        return Ok(None);
+    }
+    let footer = Aarch64TrampolineFooter64::read_from_bytes(footer)
+        .map_err(|_| TrampolineTableError::Malformed)?;
+    let count = usize::try_from(footer.region_count.get())
+        .ok()
+        .filter(|&count| count <= MAX_AARCH64_TRAMPOLINE_REGIONS)
+        .ok_or(TrampolineTableError::Malformed)?;
+    let len = count * size_of::<Aarch64TrampolineTableEntry64>();
+    let file_offset = footer.table_file_offset.get();
+    let footer_start = file_len.checked_sub(AARCH64_TRAMPOLINE_FOOTER_BYTES as u64);
+    if footer.reserved.get() != 0 || file_offset.checked_add(len as u64) != footer_start {
+        return Err(TrampolineTableError::Malformed);
+    }
+    Ok(Some(TrampolineTableLocation { file_offset, len }))
+}
+
+/// Parses the sub-trampoline table found at `location` by
+/// [`parse_aarch64_trampoline_footer`], returning the regions in file order,
+/// empty if nothing was patched.
 ///
 /// Regions must be non-empty, start at [`TRAMPOLINE_FILE_ALIGNMENT`]-aligned
 /// file offsets and 4KiB-aligned addresses, appear in ascending,
 /// non-overlapping file order before the table, and occupy disjoint pages.
-pub fn aarch64_trampoline_regions(rewritten: &[u8]) -> Option<Vec<TrampolineRegion>> {
+///
+/// # Errors
+///
+/// [`TrampolineTableError::Malformed`] if `table` is not `location.len` bytes
+/// or breaks one of the rules above.
+pub fn parse_aarch64_trampoline_table(
+    table: &[u8],
+    location: TrampolineTableLocation,
+) -> core::result::Result<Vec<TrampolineRegion>, TrampolineTableError> {
     const PAGE: u64 = TRAMPOLINE_PAGE_SIZE;
-    let footer_start = rewritten
-        .len()
-        .checked_sub(size_of::<Aarch64TrampolineFooter64>())?;
-    let footer = Aarch64TrampolineFooter64::read_from_bytes(&rewritten[footer_start..]).ok()?;
-    let (table_offset, count, reserved) = (
-        footer.table_file_offset,
-        footer.region_count,
-        footer.reserved,
-    );
-    if footer.magic != *TRAMPOLINE_MAGIC || reserved != 0 {
-        return None;
+    const ENTRY_SIZE: usize = size_of::<Aarch64TrampolineTableEntry64>();
+    let malformed = TrampolineTableError::Malformed;
+    if table.len() != location.len {
+        return Err(malformed);
     }
-    let count = usize::try_from(count).ok()?;
-    if count > MAX_AARCH64_TRAMPOLINE_REGIONS {
-        return None;
-    }
-    let table_offset = usize::try_from(table_offset).ok()?;
-    if table_offset.checked_add(count * size_of::<Aarch64TrampolineTableEntry64>())? != footer_start
-    {
-        return None;
-    }
-    let mut regions: Vec<TrampolineRegion> = Vec::with_capacity(count);
+    let mut regions: Vec<TrampolineRegion> = Vec::with_capacity(table.len() / ENTRY_SIZE);
     let mut file_cursor = 0u64;
-    let table = &rewritten[table_offset..footer_start];
-    for entry in table
-        .as_chunks::<{ size_of::<Aarch64TrampolineTableEntry64>() }>()
-        .0
-    {
-        let entry = Aarch64TrampolineTableEntry64::read_from_bytes(entry).ok()?;
+    for entry in table.as_chunks::<ENTRY_SIZE>().0 {
+        let entry = Aarch64TrampolineTableEntry64::read_from_bytes(entry).map_err(|_| malformed)?;
         let region = TrampolineRegion {
-            file_offset: entry.file_offset,
-            vaddr: entry.vaddr,
-            size: entry.size,
+            file_offset: entry.file_offset.get(),
+            vaddr: entry.vaddr.get(),
+            size: entry.size.get(),
         };
-        let file_end = region.file_offset.checked_add(region.size)?;
+        let file_end = region
+            .file_offset
+            .checked_add(region.size)
+            .ok_or(malformed)?;
         if region.size == 0
             || !region
                 .file_offset
                 .is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT as u64)
             || !region.vaddr.is_multiple_of(PAGE)
             || region.file_offset < file_cursor
-            || file_end > table_offset as u64
+            || file_end > location.file_offset
+            || region.page_range(PAGE).is_none()
         {
-            return None;
+            return Err(malformed);
         }
         file_cursor = file_end;
-        region
-            .vaddr
-            .checked_add(region.size)?
-            .checked_next_multiple_of(PAGE)?;
         regions.push(region);
     }
-    let mut by_vaddr: Vec<&TrampolineRegion> = regions.iter().collect();
-    by_vaddr.sort_unstable_by_key(|region| region.vaddr);
-    if by_vaddr
-        .windows(2)
-        .any(|pair| (pair[0].vaddr + pair[0].size).next_multiple_of(PAGE) > pair[1].vaddr)
-    {
-        return None;
+    let mut pages: Vec<Range<u64>> = regions
+        .iter()
+        .filter_map(|region| region.page_range(PAGE))
+        .collect();
+    pages.sort_unstable_by_key(|range| range.start);
+    if pages.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err(malformed);
     }
-    Some(regions)
+    Ok(regions)
+}
+
+/// The sub-trampolines of a whole rewritten AArch64 ELF, or `None` if it
+/// carries no LiteBox trailer; see [`parse_aarch64_trampoline_footer`].
+///
+/// # Errors
+///
+/// [`Error::MalformedTrailer`] if `rewritten` ends in a malformed or unknown
+/// LiteBox trailer.
+pub fn aarch64_trampoline_regions(rewritten: &[u8]) -> Result<Option<Vec<TrampolineRegion>>> {
+    let malformed = |error: TrampolineTableError| Error::MalformedTrailer(format!("{error:?}"));
+    let Some(footer) = rewritten.last_chunk::<AARCH64_TRAMPOLINE_FOOTER_BYTES>() else {
+        return Ok(None);
+    };
+    let Some(location) =
+        parse_aarch64_trampoline_footer(footer, rewritten.len() as u64).map_err(malformed)?
+    else {
+        return Ok(None);
+    };
+    // The footer check bounds the table to the file.
+    let start = usize::try_from(location.file_offset)
+        .map_err(|_| malformed(TrampolineTableError::Malformed))?;
+    parse_aarch64_trampoline_table(&rewritten[start..start + location.len], location)
+        .map(Some)
+        .map_err(malformed)
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
@@ -2305,12 +2390,24 @@ fn largest_inter_segment_hole(segments: &[LoadSegment], page: u64) -> Option<(u6
 /// `(start, end)` in ascending address order. Empty when the segments are
 /// contiguous or their extents overflow.
 ///
+/// This is the scan of `largest_inter_segment_hole`, which the x86-64
+/// placement shares, keeping every gap rather than only the largest.
+///
 /// The bounds mirror glibc's `mapend` / `mapstart`, except that a segment is
 /// treated as occupying `max(p_filesz, p_memsz)` rather than `p_filesz`:
 /// `_dl_map_segments` maps anonymous pages over the difference for any segment
 /// whose `p_memsz` exceeds its `p_filesz`, not only the last one, so counting
 /// only `p_filesz` would open a gap that is actually backed.
-pub fn inter_segment_holes(segments: &[LoadSegment], page: u64) -> Vec<(u64, u64)> {
+///
+/// # Errors
+///
+/// [`Error::InvalidTrampolineSpace`] if `page` is not a power of two.
+pub fn inter_segment_holes(segments: &[LoadSegment], page: u64) -> Result<Vec<(u64, u64)>> {
+    if !page.is_power_of_two() {
+        return Err(Error::InvalidTrampolineSpace(format!(
+            "page size {page:#x}"
+        )));
+    }
     let mut sorted: Vec<&LoadSegment> = segments.iter().collect();
     sorted.sort_unstable_by_key(|s| s.vaddr);
 
@@ -2327,14 +2424,14 @@ pub fn inter_segment_holes(segments: &[LoadSegment], page: u64) -> Vec<(u64, u64
             .checked_add(s.filesz.max(s.memsz))
             .and_then(|e| e.checked_next_multiple_of(page))
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if start > covered_to && covered_to != 0 {
             holes.push((covered_to, start));
         }
         covered_to = covered_to.max(end);
     }
-    holes
+    Ok(holes)
 }
 
 /// Spaces an AArch64 object's sub-trampolines may occupy, in preference order:
@@ -2347,8 +2444,8 @@ pub(crate) fn aarch64_trampoline_spaces(
     segments: &[LoadSegment],
     page_size: u64,
     placement: TrampolinePlacement,
-) -> Vec<aarch64::TrampolineSpace> {
-    let mut holes = inter_segment_holes(segments, page_size);
+) -> Result<Vec<aarch64::TrampolineSpace>> {
+    let mut holes = inter_segment_holes(segments, page_size)?;
     // Stable: equally sized holes keep ascending address order.
     holes.sort_by_key(|(start, end)| core::cmp::Reverse(end - start));
     let mut spaces: Vec<_> = holes
@@ -2362,7 +2459,7 @@ pub(crate) fn aarch64_trampoline_spaces(
         start: placement.fallback_addr(),
         end: None,
     });
-    spaces
+    Ok(spaces)
 }
 
 /// Page size AArch64 sub-trampoline placement uses on `host`; matches the
@@ -2775,7 +2872,7 @@ mod tests {
             RewriteOptions::new(TargetHost::MacOs, true),
         )
         .unwrap();
-        let regions = aarch64_trampoline_regions(&output).unwrap();
+        let regions = aarch64_trampoline_regions(&output).unwrap().unwrap();
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].vaddr, 0x184000);
 
@@ -3196,7 +3293,8 @@ mod tests {
             seg(0xc000, 0x800, 0x800, 0x1000),
         ];
         let spaces =
-            aarch64_trampoline_spaces(&segments, TRAMPOLINE_PAGE_SIZE, placement_of(&segments));
+            aarch64_trampoline_spaces(&segments, TRAMPOLINE_PAGE_SIZE, placement_of(&segments))
+                .unwrap();
         let expected = [
             (0x4000, Some(0x9000)),
             (0x1000, Some(0x3000)),
@@ -3241,7 +3339,8 @@ mod tests {
             seg(0x6000, 0x1000, 0x1000, 0x1000),
         ];
         let spaces =
-            aarch64_trampoline_spaces(&segments, TRAMPOLINE_PAGE_SIZE, placement_of(&segments));
+            aarch64_trampoline_spaces(&segments, TRAMPOLINE_PAGE_SIZE, placement_of(&segments))
+                .unwrap();
         let out = hook_aarch64_elf_in_spaces(
             &input,
             &mut code,
@@ -3257,8 +3356,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(&out[out.len() - 32..][..8], TRAMPOLINE_MAGIC);
-        assert!(is_already_hooked(&out, Arch::Aarch64));
-        let regions = aarch64_trampoline_regions(&out).expect("well-formed footer");
+        let regions = aarch64_trampoline_regions(&out)
+            .unwrap()
+            .expect("well-formed footer");
         assert_eq!(
             regions
                 .iter()
@@ -3288,15 +3388,14 @@ mod tests {
         let mut corrupt = out.clone();
         let footer = corrupt.len() - 32;
         corrupt[footer + 24] = 1; // reserved
-        assert!(aarch64_trampoline_regions(&corrupt).is_none());
-        assert!(!is_already_hooked(&corrupt, Arch::Aarch64));
+        assert!(aarch64_trampoline_regions(&corrupt).is_err());
         let mut overlapping = out.clone();
         let table = usize::try_from(u64::from_le_bytes(
             out[footer + 8..footer + 16].try_into().unwrap(),
         ))
         .unwrap();
         overlapping[table + 24 + 8..table + 24 + 16].copy_from_slice(&0x2000u64.to_le_bytes());
-        assert!(aarch64_trampoline_regions(&overlapping).is_none());
+        assert!(aarch64_trampoline_regions(&overlapping).is_err());
     }
 
     /// x86-64 placement is deliberately unchanged; see `trampoline_addr_for`.
