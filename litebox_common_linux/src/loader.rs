@@ -152,7 +152,7 @@ const MAX_AARCH64_TRAMPOLINE_REGIONS: usize = 4096;
 #[cfg(target_arch = "aarch64")]
 #[repr(C, packed)]
 #[derive(FromBytes)]
-struct TrampolineRegion64 {
+struct Aarch64TrampolineTableEntry64 {
     file_offset: u64,
     vaddr: u64,
     size: u64,
@@ -813,8 +813,11 @@ impl ElfParsedFile {
     ) -> Result<(), ElfLoadError<M::Error>> {
         let trampoline = self.trampoline.as_ref().unwrap();
         for region in &trampoline.regions {
-            let trampoline_start = info.base_addr + region.vaddr;
-            let trampoline_end = page_align_up(info.base_addr + region.vaddr + region.size);
+            let range = region
+                .page_range(info.base_addr)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let trampoline_start = range.start;
+            let trampoline_end = range.end;
             if M::POPULATES_TRAMPOLINE {
                 info.brk = info.brk.max(trampoline_end);
                 continue;
@@ -927,7 +930,7 @@ pub fn read_trampoline_regions<F: ReadAt>(
     if reserved != 0 || count > MAX_AARCH64_TRAMPOLINE_REGIONS {
         return Err(ElfParseError::BadTrampoline);
     }
-    let entry_size = size_of::<TrampolineRegion64>();
+    let entry_size = size_of::<Aarch64TrampolineTableEntry64>();
     let table_len = count * entry_size;
     if table_offset.checked_add(table_len as u64) != Some(footer_offset) {
         return Err(ElfParseError::BadTrampoline);
@@ -939,8 +942,8 @@ pub fn read_trampoline_regions<F: ReadAt>(
     let mut regions = Vec::with_capacity(count);
     let mut file_cursor = 0u64;
     for entry in table.chunks_exact(entry_size) {
-        let entry =
-            TrampolineRegion64::read_from_bytes(entry).map_err(|_| ElfParseError::BadTrampoline)?;
+        let entry = Aarch64TrampolineTableEntry64::read_from_bytes(entry)
+            .map_err(|_| ElfParseError::BadTrampoline)?;
         let region = TrampolineRegion {
             file_offset: entry.file_offset,
             vaddr: entry

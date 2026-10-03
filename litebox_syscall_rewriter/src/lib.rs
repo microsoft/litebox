@@ -334,7 +334,7 @@ struct TrampolineHeader64 {
 /// [`MAX_AARCH64_TRAMPOLINE_REGIONS`].
 #[repr(C, packed)]
 #[derive(FromBytes, IntoBytes, Immutable)]
-struct TrampolineRegion64 {
+struct Aarch64TrampolineTableEntry64 {
     file_offset: u64,
     vaddr: u64,
     size: u64,
@@ -1165,15 +1165,16 @@ fn append_aarch64_trampolines(
             trampolines.len()
         )));
     }
-    let mut table = Vec::with_capacity(trampolines.len() * size_of::<TrampolineRegion64>());
+    let mut table =
+        Vec::with_capacity(trampolines.len() * size_of::<Aarch64TrampolineTableEntry64>());
     for sub in trampolines {
         out.resize(out.len().next_multiple_of(TRAMPOLINE_FILE_ALIGNMENT), 0);
-        let region = TrampolineRegion64 {
+        let entry = Aarch64TrampolineTableEntry64 {
             file_offset: out.len() as u64,
             vaddr: sub.vaddr,
             size: sub.data.len() as u64,
         };
-        table.extend_from_slice(region.as_bytes());
+        table.extend_from_slice(entry.as_bytes());
         out.extend_from_slice(&sub.data);
     }
     let footer = Aarch64TrampolineFooter64 {
@@ -1257,14 +1258,18 @@ pub fn aarch64_trampoline_regions(rewritten: &[u8]) -> Option<Vec<TrampolineRegi
         return None;
     }
     let table_offset = usize::try_from(table_offset).ok()?;
-    if table_offset.checked_add(count * size_of::<TrampolineRegion64>())? != footer_start {
+    if table_offset.checked_add(count * size_of::<Aarch64TrampolineTableEntry64>())? != footer_start
+    {
         return None;
     }
     let mut regions: Vec<TrampolineRegion> = Vec::with_capacity(count);
     let mut file_cursor = 0u64;
     let table = &rewritten[table_offset..footer_start];
-    for entry in table.as_chunks::<{ size_of::<TrampolineRegion64>() }>().0 {
-        let entry = TrampolineRegion64::read_from_bytes(entry).ok()?;
+    for entry in table
+        .as_chunks::<{ size_of::<Aarch64TrampolineTableEntry64>() }>()
+        .0
+    {
+        let entry = Aarch64TrampolineTableEntry64::read_from_bytes(entry).ok()?;
         let region = TrampolineRegion {
             file_offset: entry.file_offset,
             vaddr: entry.vaddr,
