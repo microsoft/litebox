@@ -153,6 +153,7 @@ impl super::Errno {
             132 => "ERFKILL: Operation not possible due to RF-kill",
             133 => "EHWPOISON: Memory page has hardware error",
             512 => "ERESTARTSYS: Interrupted system call, restartable with SA_RESTART",
+            513 => "ERESTARTNOINTR: Interrupted system call, always restartable",
             514 => "ERESTARTNOHAND: Interrupted system call, restartable if unhandled",
             _ => unreachable!(),
         }

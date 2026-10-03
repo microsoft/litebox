@@ -3,7 +3,9 @@
 
 use alloc::vec::Vec;
 
-use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
+use crate::shared_buffer::{
+    MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
+};
 use crate::{ObjectHandle, ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
@@ -92,10 +94,10 @@ pub enum CreateThreadResponse {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StartChildProcessSource {
     /// Starts a child from an opaque platform bootstrap.
+    ///
+    /// The child's runner also receives the memory image written by
+    /// [`WriteChildMemoryRequest`]s, if any.
     Bootstrap(ProcessStartupDescriptor),
-    /// Starts a child by duplicating the calling process from an encoded,
-    /// input-only image whose exact length is the buffer sequence length.
-    Duplicate(SharedBufferSequence),
 }
 
 /// Starts a pending child created earlier.
@@ -124,6 +126,33 @@ pub struct DuplicateObjectsToChildRequest {
     /// Operation-scoped shared-buffer sequence holding between one and
     /// [`MAX_CHILD_OBJECT_DUPLICATES`] handles.
     pub handles: SharedBufferSequence,
+}
+
+/// Number of shared-buffer slots one [`WriteChildMemoryRequest`] fills at most.
+const MAX_CHILD_MEMORY_WRITE_SLOT_COUNT: u32 = 16;
+
+const _: () =
+    assert!(MAX_CHILD_MEMORY_WRITE_SLOT_COUNT as usize <= MAX_SHARED_BUFFER_SEQUENCE_SLOTS);
+
+/// Maximum number of bytes one [`WriteChildMemoryRequest`] writes.
+pub const MAX_CHILD_MEMORY_WRITE_SIZE: u32 =
+    SHARED_BUFFER_SLOT_SIZE * MAX_CHILD_MEMORY_WRITE_SLOT_COUNT;
+
+/// Writes bytes into the memory image of the caller's pending child, as a
+/// Linux `fork` child starts from a copy of its parent's memory.
+///
+/// The image is a byte array, zero wherever it was not written, that the
+/// child's runner receives when the child starts. Its layout is opaque to the
+/// broker. A pending child has no image until it is first written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteChildMemoryRequest {
+    /// Pending child whose image receives the bytes.
+    pub child_process_id: ProcessId,
+    /// Image offset of the first byte.
+    pub offset: u64,
+    /// Operation-scoped shared-buffer sequence holding between one and
+    /// [`MAX_CHILD_MEMORY_WRITE_SIZE`] bytes.
+    pub data: SharedBufferSequence,
 }
 
 /// Records the exit of a pending child that ran without starting its own

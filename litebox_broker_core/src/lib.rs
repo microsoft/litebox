@@ -39,7 +39,7 @@ mod test_platform;
 pub mod test_support;
 
 use alloc::sync::{Arc, Weak};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
@@ -55,7 +55,8 @@ pub use policy::{
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
 pub use process::{
-    AssociationCancellation, BrokerProcess, CallerCredential, ProcessLifecycleSink, ProcessShutdown,
+    AssociationCancellation, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
+    ProcessLifecycleSink, ProcessShutdown,
 };
 use random::RandomProvider;
 use socket::{BrokerSocketPorts, SocketProvider};
@@ -87,6 +88,10 @@ pub struct BrokerCoreLimits {
     pub max_threads: usize,
     /// Maximum live broker-allocated thread IDs owned by one process.
     pub max_threads_per_process: usize,
+    /// Maximum size in bytes of one pending child's memory image.
+    pub max_child_image_size: u64,
+    /// Maximum total size in bytes of child memory images held by the broker.
+    pub max_total_child_image_size: u64,
 }
 
 impl BrokerCoreLimits {
@@ -101,6 +106,8 @@ impl BrokerCoreLimits {
         max_sockets_per_process: 256,
         max_threads: 4096,
         max_threads_per_process: 1024,
+        max_child_image_size: 1024 * 1024 * 1024,
+        max_total_child_image_size: 4 * 1024 * 1024 * 1024,
     };
 
     /// Creates a broker core limit set.
@@ -118,6 +125,8 @@ impl BrokerCoreLimits {
             max_sockets_per_process: Self::DEFAULT.max_sockets_per_process,
             max_threads: Self::DEFAULT.max_threads,
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
+            max_child_image_size: Self::DEFAULT.max_child_image_size,
+            max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
         }
     }
 
@@ -141,6 +150,8 @@ impl BrokerCoreLimits {
             max_sockets_per_process,
             max_threads: Self::DEFAULT.max_threads,
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
+            max_child_image_size: Self::DEFAULT.max_child_image_size,
+            max_total_child_image_size: Self::DEFAULT.max_total_child_image_size,
         }
     }
 
@@ -186,6 +197,24 @@ impl BrokerCoreLimits {
             ..self
         }
     }
+
+    /// Returns these limits with explicit per-child and broker-wide child
+    /// memory image size limits.
+    ///
+    /// A per-child limit above the broker-wide limit is accepted; the
+    /// broker-wide limit still applies.
+    #[must_use]
+    pub const fn with_child_image_size_limits(
+        self,
+        max_child_image_size: u64,
+        max_total_child_image_size: u64,
+    ) -> Self {
+        Self {
+            max_child_image_size,
+            max_total_child_image_size,
+            ..self
+        }
+    }
 }
 
 impl Default for BrokerCoreLimits {
@@ -212,6 +241,8 @@ pub struct BrokerCore {
     pub(crate) pending_references: Arc<AtomicUsize>,
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    /// Bytes of child memory images held by the broker.
+    pub(crate) reserved_child_image_size: Arc<AtomicU64>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
     pub(crate) socket_provider: Arc<dyn SocketProvider>,
     pub(crate) timer_provider: Arc<dyn TimerProvider>,
@@ -272,6 +303,7 @@ impl BrokerCore {
             pending_references: Arc::new(AtomicUsize::new(0)),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            reserved_child_image_size: Arc::new(AtomicU64::new(0)),
             random_provider,
             socket_provider,
             timer_provider,

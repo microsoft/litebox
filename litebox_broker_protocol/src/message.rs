@@ -21,7 +21,7 @@ use crate::pipe::{
 use crate::process::{
     CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, ProcessExitStatus, ProcessStartupDescriptor, ProcessTermination,
-    StartChildProcessRequest, StartChildProcessSource,
+    StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -95,6 +95,8 @@ pub enum BrokerOperation {
     SetChildReaping(bool),
     /// Duplicate object references into this process's pending child.
     DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
+    /// Write bytes into this process's pending child's memory image.
+    WriteChildMemory(WriteChildMemoryRequest),
     /// Timer object request family.
     Timer(TimerRequest),
     /// Signal request family.
@@ -130,15 +132,14 @@ impl BrokerOperation {
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
             | Self::StartChildProcess(StartChildProcessRequest {
-                source:
-                    StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer, .. })
-                    | StartChildProcessSource::Duplicate(buffer),
+                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer, .. }),
                 ..
             })
             | Self::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
                 handles: buffer,
                 ..
-            }) => Some(*buffer),
+            })
+            | Self::WriteChildMemory(WriteChildMemoryRequest { data: buffer, .. }) => Some(*buffer),
             Self::CreateThread(_)
             | Self::ExitThread(_)
             | Self::CloseObject(_)
@@ -336,6 +337,8 @@ pub enum BrokerResult {
     /// Object references were duplicated into a pending child, whose handles
     /// replaced the request's handles in its shared buffer.
     ObjectsDuplicated,
+    /// Bytes were written into a pending child's memory image.
+    ChildMemoryWritten,
     /// Timer object response family.
     Timer(TimerResponse),
     /// Signal response family.

@@ -162,6 +162,27 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
         state.current = brk;
     }
 
+    /// Returns the initial and current program break.
+    #[cfg(target_arch = "x86_64")]
+    fn program_break(&self) -> (usize, usize) {
+        let state = self.brk.lock();
+        (state.initial, state.current)
+    }
+
+    /// Restores the program break of a process duplicated by `fork`, whose memory already
+    /// covers it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the initial program break has already been set.
+    #[cfg(target_arch = "x86_64")]
+    fn restore_program_break(&self, initial: usize, current: usize) {
+        let mut state = self.brk.lock();
+        assert_eq!(state.initial, 0, "initial brk is already set");
+        state.initial = initial;
+        state.current = current;
+    }
+
     /// Sets or queries the Linux program break.
     ///
     /// # Panics
@@ -499,6 +520,106 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         })
     }
 
+    /// Continues a process duplicated by `fork` using the initial thread allocated during broker
+    /// negotiation.
+    ///
+    /// `load_image` fills page-aligned whole pages with the parent's process image from an
+    /// offset, possibly by mapping the image over them privately. The pages start zero-filled,
+    /// so ranges the image does not hold may be left untouched.
+    ///
+    /// Each memory region is restored at the parent's address and fails if the address is in
+    /// use. Regions formerly backed by files are restored as anonymous memory.
+    #[cfg(target_arch = "x86_64")]
+    pub fn restore_fork(
+        &self,
+        startup: litebox_common_linux::program_startup::LinuxForkStartup,
+        initial_thread: litebox::thread::Thread,
+        load_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
+    ) -> Result<LoadedProgram<Platform>, ForkRestoreError> {
+        let litebox_common_linux::program_startup::LinuxForkStartup {
+            parent_process_id,
+            uid,
+            euid,
+            gid,
+            egid,
+            umask,
+            cwd,
+            comm,
+            blocked_signals,
+            signal_actions,
+            alternate_signal_stack,
+            registers,
+            thread_pointer,
+            syscall_entry_point,
+            set_child_tid,
+            clear_child_tid,
+            initial_program_break,
+            program_break,
+            regions,
+            fds,
+        } = startup;
+        let pid = self.0.process_id;
+        if syscall_entry_point != self.0.platform.get_syscall_entry_point() {
+            return Err(ForkRestoreError::IncompatibleRunner);
+        }
+
+        Task::restore_fork_image(&self.0.mm, &regions, load_image)?;
+        self.0
+            .mm
+            .restore_program_break(initial_program_break, program_break);
+
+        let files = syscalls::file::FilesState::new();
+        files.set_max_fd(syscalls::process::RLIMIT_NOFILE_CUR);
+        files
+            .install_forked_fds(&self.0, &fds)
+            .map_err(ForkRestoreError::Descriptors)?;
+        let credentials = Arc::new(syscalls::process::Credentials {
+            uid,
+            euid,
+            gid,
+            egid,
+        });
+        let fs_state = syscalls::file::FsState::new(&credentials);
+        fs_state
+            .inherit_cwd(&cwd)
+            .map_err(ForkRestoreError::WorkingDirectory)?;
+        fs_state.set_umask(umask);
+
+        let thread = syscalls::process::ThreadState::new_process(pid);
+        thread.set_forked_init_state(registers, thread_pointer, set_child_tid, clear_child_tid);
+        let entrypoints = crate::LinuxShimEntrypoints {
+            _not_send: core::marker::PhantomData,
+            task: Task {
+                global: self.0.clone(),
+                litebox_thread: Cell::new(Some(initial_thread)),
+                thread,
+                wait_state: wait::WaitState::new(self.0.platform),
+                vfork: RefCell::new(None),
+                pid,
+                ppid: parent_process_id,
+                credentials,
+                comm: comm.into(),
+                fs: Arc::new(fs_state).into(),
+                files: Arc::new(files).into(),
+                signals: syscalls::signal::SignalState::forked(
+                    blocked_signals,
+                    &signal_actions,
+                    alternate_signal_stack,
+                ),
+            },
+        };
+        // The broker starts each process without child reaping.
+        if entrypoints.task.signals.reaps_children() {
+            entrypoints.task.set_child_reaping(true);
+        }
+        entrypoints.task.open_signals();
+        let process = LinuxShimProcess(entrypoints.task.process().clone());
+        Ok(LoadedProgram {
+            entrypoints,
+            process,
+        })
+    }
+
     /// Returns the global memory manager.
     pub fn memory_manager(&self) -> &MemoryManager<Platform> {
         &self.0.mm
@@ -517,6 +638,27 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
 pub struct LoadedProgram<Platform: ShimPlatform> {
     pub entrypoints: LinuxShimEntrypoints<Platform>,
     pub process: LinuxShimProcess<Platform>,
+}
+
+/// A failure to continue a process duplicated by `fork`.
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, thiserror::Error)]
+pub enum ForkRestoreError {
+    /// The runner's code addresses differ from the parent's runner.
+    #[error("the runner's address layout differs from the parent's")]
+    IncompatibleRunner,
+    /// A memory region could not be restored at its address.
+    #[error("failed to restore the memory region at {0:#x}")]
+    Memory(usize, #[source] MappingError),
+    /// The process image could not be read.
+    #[error("failed to read the process image")]
+    Image(#[source] Errno),
+    /// The inherited descriptors could not be installed.
+    #[error("failed to install the inherited descriptors")]
+    Descriptors(#[source] loader::elf::ElfLoaderError),
+    /// The working directory could not be restored.
+    #[error("failed to restore the working directory")]
+    WorkingDirectory(#[source] Errno),
 }
 
 /// A handle to a process loaded via [`LinuxShim::load_program`].
@@ -1252,6 +1394,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
+            SyscallRequest::Fork => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    self.sys_fork(ctx)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    Err(Errno::ENOSYS)
+                }
+            }
             SyscallRequest::Vfork => {
                 #[cfg(target_arch = "x86_64")]
                 {

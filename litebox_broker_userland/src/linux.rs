@@ -239,7 +239,7 @@ fn serve_control_stream(
         |channel, shared_memory, control_memory| {
             channel.send_memfd(shared_memory, Some(setup_deadline))?;
             channel.send_memfd(control_memory, Some(setup_deadline))?;
-            Ok(())
+            channel.send_process_image(None, Some(setup_deadline))
         },
         UnixStreamHostSetupChannel::into_active,
     )

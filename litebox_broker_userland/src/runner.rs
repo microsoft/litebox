@@ -24,12 +24,20 @@ mod windows;
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 #[cfg(target_os = "linux")]
 use linux::PlatformRunnerEndpoint;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::create_process_image;
+#[cfg(target_os = "linux")]
+use linux::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::PlatformRunnerEndpoint;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use windows::wait_for_runner_event;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_EXIT_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// How often runner connections and exits are rechecked where readiness waits
+/// are unavailable (Windows, and Linux kernels without `pidfd_open`).
+const RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Configuration for starting one out-of-process runner.
 ///
@@ -40,6 +48,8 @@ pub struct RunnerConfig {
     executable: PathBuf,
     arguments: Vec<OsString>,
     proxy_url: Option<String>,
+    #[cfg(target_os = "linux")]
+    disable_aslr: bool,
 }
 
 impl RunnerConfig {
@@ -51,7 +61,20 @@ impl RunnerConfig {
             executable,
             arguments,
             proxy_url: None,
+            #[cfg(target_os = "linux")]
+            disable_aslr: false,
         }
+    }
+
+    /// Starts runners with address-space layout randomization disabled.
+    ///
+    /// Runners started from a parent's memory image rely on every runner
+    /// sharing the same host layout.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_aslr_disabled(mut self) -> Self {
+        self.disable_aslr = true;
+        self
     }
 
     /// Configures the HTTP proxy URL passed to the runner.
@@ -80,6 +103,8 @@ impl RunnerConfig {
             executable: self.executable.clone(),
             arguments: Vec::new(),
             proxy_url: self.proxy_url.clone(),
+            #[cfg(target_os = "linux")]
+            disable_aslr: self.disable_aslr,
         }
     }
 }
@@ -226,7 +251,7 @@ impl RunnerShutdown {
             if remaining.is_zero() {
                 return Ok(false);
             }
-            std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+            wait_for_runner_event(&self.runner, None, Some(remaining))?;
         }
     }
 }
@@ -236,11 +261,13 @@ impl RunnerInstance {
     pub(crate) fn start(config: RunnerConfig) -> IoResult<Self> {
         let setup_deadline = Instant::now() + SETUP_TIMEOUT;
         let endpoint = PlatformRunnerEndpoint::create()?;
-        let runner = Arc::new(Mutex::new(
-            Command::new(&config.executable)
-                .args(config.arguments(endpoint.control_channel()))
-                .spawn()?,
-        ));
+        let mut command = Command::new(&config.executable);
+        command.args(config.arguments(endpoint.control_channel()));
+        #[cfg(target_os = "linux")]
+        if config.disable_aslr {
+            linux::disable_aslr(&mut command);
+        }
+        let runner = Arc::new(Mutex::new(command.spawn()?));
         let shutdown = Arc::new(RunnerShutdown {
             runner: Arc::clone(&runner),
             state: Mutex::new(RunnerShutdownState::Active),
@@ -393,6 +420,7 @@ fn accept_runner_channel<Channel>(
     channel_name: &'static str,
     mut runner_status: impl FnMut() -> IoResult<Option<String>>,
     mut try_accept: impl FnMut() -> IoResult<Channel>,
+    mut wait: impl FnMut(Duration) -> IoResult<()>,
 ) -> IoResult<Channel> {
     loop {
         if let Some(status) = runner_status()? {
@@ -413,7 +441,7 @@ fn accept_runner_channel<Channel>(
             Err(error) if error.kind() == ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
-        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+        wait(remaining)?;
     }
 }
 
@@ -436,7 +464,7 @@ fn wait_for_runner_exit(runner: &Arc<Mutex<Child>>) -> IoResult<ExitStatus> {
         {
             return Ok(status);
         }
-        std::thread::sleep(ACCEPT_RETRY_DELAY);
+        wait_for_runner_event(runner, None, None)?;
     }
 }
 

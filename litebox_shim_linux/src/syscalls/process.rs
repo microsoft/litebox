@@ -20,13 +20,25 @@ use litebox::event::polling::{Pollee, TryOpError};
 use litebox::event::wait::WaitError;
 use litebox::event::{Events, IOPollable as _};
 use litebox::platform::ArchSpecificRegister;
+#[cfg(target_arch = "x86_64")]
+use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
 use litebox::process::{ChildStatus, ProcessError};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
+#[cfg(target_arch = "x86_64")]
+use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::ProcessExitStatus;
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::ProtFlags;
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::vmem::{
+    CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE,
+};
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, Rusage, TimeParam,
     errno::Errno, program_startup::LinuxProgramStartup,
@@ -84,6 +96,27 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
         })
     }
 
+    /// Prepares the initial thread of a process duplicated by `fork` to return zero from the
+    /// `fork` with the rest of `registers` and `thread_pointer` as its FS base, storing its thread
+    /// ID at `set_child_tid` and clearing `clear_child_tid` when it exits, unless they are zero.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn set_forked_init_state(
+        &self,
+        mut registers: litebox_common_linux::PtRegs,
+        thread_pointer: usize,
+        set_child_tid: usize,
+        clear_child_tid: usize,
+    ) {
+        registers.rax = 0;
+        let user_ptr = |address: usize| (address != 0).then(|| UserPtrMut::from_usize(address));
+        self.init_state.set(ThreadInitState::Forked {
+            registers: Box::new(registers),
+            thread_pointer,
+            set_child_tid: user_ptr(set_child_tid),
+        });
+        self.clear_child_tid.set(user_ptr(clear_child_tid));
+    }
+
     pub(crate) fn begin_detach_from_process(&self) -> Option<ThreadDetachGuard<'_, Platform>> {
         let tid = self.tid.take()?;
         self.process.remove_thread(tid);
@@ -134,6 +167,26 @@ impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
     }
 }
 
+/// Keeps the other threads of a process paused for `fork` until dropped.
+#[cfg(target_arch = "x86_64")]
+struct ForkPause<'a, Platform: ShimPlatform> {
+    process: &'a ProcessState<Platform>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl<Platform: ShimPlatform> Drop for ForkPause<'_, Platform> {
+    fn drop(&mut self) {
+        let mut inner = self.process.inner.lock();
+        inner.pausing_thread = None;
+        self.process
+            .fork_pause
+            .underlying_atomic()
+            .store(0, Ordering::Release);
+        drop(inner);
+        self.process.fork_pause.wake_all();
+    }
+}
+
 /// Thread state that can be accessed from a remote thread.
 struct ThreadRemote<Platform: ShimPlatform> {
     /// Always set under the process `inner` lock, but can be read without
@@ -163,6 +216,9 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// Number of threads in this process. Always updated under the `inner`
     /// mutex lock.
     nr_threads: <Platform as RawMutexProvider>::RawMutex,
+    /// One while a thread pauses the others for `fork`, which block on it. Always updated under
+    /// the `inner` mutex lock.
+    fork_pause: <Platform as RawMutexProvider>::RawMutex,
     inner: Arc<Mutex<Platform, ProcessInner<Platform>>>,
     /// Started child processes that have not been reaped, mapped by process ID.
     children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
@@ -292,6 +348,11 @@ struct ProcessInner<Platform: ShimPlatform> {
     exit_status: ExitStatus,
     /// The thread list for the process, mapped by thread ID.
     threads: BTreeMap<i32, Arc<ThreadRemote<Platform>>>,
+    /// The thread pausing the others for `fork`, if any.
+    pausing_thread: Option<Arc<ThreadRemote<Platform>>>,
+    /// Number of threads paused for `fork`, which each count themselves until no thread pauses
+    /// them.
+    paused_threads: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -310,9 +371,12 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             group_exit: false,
             is_killing_other_threads: false,
             threads: BTreeMap::from_iter([(pid, remote)]),
+            pausing_thread: None,
+            paused_threads: 0,
         }));
         Self {
             nr_threads,
+            fork_pause: <Platform as RawMutexProvider>::RawMutex::INIT,
             child_events: Arc::new(ChildEvents {
                 changed: AtomicBool::new(false),
                 pollee: Pollee::new(),
@@ -493,6 +557,10 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 assert!(inner.threads.is_empty());
                 // The last thread exited. Prevent new threads.
                 inner.group_exit = true;
+            }
+            // A thread pausing the others for `fork` waits for this one to pause or detach.
+            if let Some(pausing_thread) = &inner.pausing_thread {
+                pausing_thread.interrupt();
             }
 
             // Notify waiters if this is the last thread of the process
@@ -689,6 +757,77 @@ impl<Platform: ShimPlatform> Task<Platform> {
         true
     }
 
+    /// Blocks while another thread pauses this process's other threads for `fork`.
+    ///
+    /// Threads pause as they start to wait or are about to run guest code, where they hold no
+    /// state the pausing thread snapshots.
+    pub(crate) fn wait_while_paused(&self) {
+        let process = &self.thread.process;
+        {
+            let mut inner = process.inner.lock();
+            match &inner.pausing_thread {
+                Some(pausing_thread) if !Arc::ptr_eq(pausing_thread, &self.thread.remote) => {
+                    pausing_thread.interrupt();
+                }
+                _ => return,
+            }
+            inner.paused_threads += 1;
+        }
+        // Stay paused, and counted, until no thread pauses the others, even if another thread
+        // starts pausing them as soon as this one stops.
+        loop {
+            let _ = process.fork_pause.block(1);
+            let mut inner = process.inner.lock();
+            if inner.pausing_thread.is_none() {
+                inner.paused_threads -= 1;
+                return;
+            }
+        }
+    }
+
+    /// Pauses this process's other threads until the returned guard drops, so they neither
+    /// change the memory nor the state `fork` snapshots.
+    ///
+    /// Fails with `ERESTARTNOINTR` if a signal or an exit interrupts the wait for them to pause,
+    /// so `fork` restarts once the signal is handled, as Linux's does if a signal arrives while
+    /// it duplicates the process.
+    #[cfg(target_arch = "x86_64")]
+    fn pause_other_threads(&self) -> Result<ForkPause<'_, Platform>, Errno> {
+        let process = &self.thread.process;
+        loop {
+            let mut inner = process.inner.lock();
+            if inner.pausing_thread.is_none() {
+                inner.pausing_thread = Some(self.thread.remote.clone());
+                process
+                    .fork_pause
+                    .underlying_atomic()
+                    .store(1, Ordering::Release);
+                for (&tid, thread) in &inner.threads {
+                    if tid != self.tid() {
+                        thread.interrupt();
+                    }
+                }
+                break;
+            }
+            drop(inner);
+            // Another thread pauses this one for its own `fork`.
+            self.wait_while_paused();
+        }
+        let pause = ForkPause { process };
+        // Each thread that pauses or detaches interrupts this wait to reevaluate it.
+        self.wait_cx()
+            .wait_until(|| {
+                let inner = process.inner.lock();
+                inner.paused_threads + 1 == process.nr_threads()
+            })
+            .map_err(|_| Errno::ERESTARTNOINTR)?;
+        // The other threads may have paused as they exit the whole process.
+        if self.is_exiting() {
+            return Err(Errno::ERESTARTNOINTR);
+        }
+        Ok(pause)
+    }
+
     /// Transfers a surviving nonleader exec caller to the process leader
     /// identity while retaining its broker thread ownership.
     fn rebind_exec_identity(&self) {
@@ -723,6 +862,12 @@ enum ThreadInitState {
     NewThread {
         stack: Option<usize>,
         tls: Option<ThreadLocalDescriptor>,
+        set_child_tid: Option<UserPtrMut<i32>>,
+    },
+    #[cfg(target_arch = "x86_64")]
+    Forked {
+        registers: Box<litebox_common_linux::PtRegs>,
+        thread_pointer: usize,
         set_child_tid: Option<UserPtrMut<i32>>,
     },
 }
@@ -1041,6 +1186,251 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.begin_vfork(ctx, None, false)
     }
 
+    /// Handle syscall `fork`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn sys_fork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
+        self.fork(ctx, 0, 0)
+    }
+
+    /// Duplicates this process in a fresh runner, which continues the child at the parent's
+    /// addresses, as `fork`, or `clone` or `clone3` without `CLONE_VM`, do.
+    ///
+    /// The child stores its thread ID at `set_child_tid` and clears `clear_child_tid` when it
+    /// exits, unless they are zero.
+    ///
+    /// The child gets a copy of the parent's memory, program break, registers, and FS base, of
+    /// its credentials, command name, working directory, and umask, of its descriptors, sharing
+    /// their open file descriptions, and of its signal dispositions, blocked mask, and alternate
+    /// stack, but none of its pending signals, timers, or robust futex list. Memory regions
+    /// formerly backed by files are copied as anonymous memory, and `MADV_DONTFORK` regions are
+    /// copied too. Floating-point and vector state is not copied. Like Linux, the child has a
+    /// single thread, a copy of the calling one; the parent's other threads pause while the
+    /// parent is copied.
+    ///
+    /// Only a process outside a `vfork` window, with default resource-limit and alarm state, no
+    /// shared memory mappings, no ELF file mid-load, and only descriptors a fresh runner can
+    /// inherit is duplicated; otherwise this fails with `EAGAIN`.
+    #[cfg(target_arch = "x86_64")]
+    fn fork(
+        &self,
+        ctx: &litebox_common_linux::PtRegs,
+        set_child_tid: usize,
+        clear_child_tid: usize,
+    ) -> Result<usize, Errno> {
+        if self.vfork.borrow().is_some() {
+            return Err(Errno::EAGAIN);
+        }
+        let pause = self.pause_other_threads()?;
+        if !self.thread.process.limits.has_default_state()
+            || !self.thread.process.has_default_alarm_state()
+            || !self.global.elf_patch_cache.lock().is_empty()
+        {
+            return Err(Errno::EAGAIN);
+        }
+        let mut regions = Vec::new();
+        for (range, flags) in self.global.mm.mappings() {
+            // Mappings without flags are reserved by the runner, which reserves its own.
+            if flags.is_empty() {
+                continue;
+            }
+            if flags.contains(VmFlags::VM_SHARED) {
+                return Err(Errno::EAGAIN);
+            }
+            regions.push(ForkMemoryRegion { range, flags });
+        }
+        let (fds, objects): (Vec<_>, Vec<_>) =
+            self.fds_inherited_across_fork()?.into_iter().unzip();
+        let fs = self.fs.borrow();
+        let cwd = alloc::string::ToString::to_string(fs.context.read().cwd());
+        let umask = u32::from(fs.umask().bits());
+        drop(fs);
+        let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
+        let (initial_program_break, program_break) = self.global.mm.program_break();
+        let mut startup = LinuxForkStartup {
+            parent_process_id: self.pid,
+            uid: self.credentials.uid,
+            euid: self.credentials.euid,
+            gid: self.credentials.gid,
+            egid: self.credentials.egid,
+            umask,
+            cwd,
+            comm: self.comm.get(),
+            blocked_signals,
+            signal_actions,
+            alternate_signal_stack,
+            registers: ctx.clone(),
+            thread_pointer: self
+                .global
+                .platform
+                .get_arch_specific_register(&ArchSpecificRegister::FsBase)?,
+            syscall_entry_point: self.global.platform.get_syscall_entry_point(),
+            set_child_tid,
+            clear_child_tid,
+            initial_program_break,
+            program_break,
+            regions,
+            fds,
+        };
+        // The child keeps the references it inherits until it exits, so check the size first.
+        startup.encode().map_err(|_| Errno::ENOMEM)?;
+
+        // Release the children the broker reaped, which hold process capacity until observed.
+        let _ = self.observe_child_terminations();
+        let child = self
+            .global
+            .litebox
+            .allocate_child_process()
+            .map_err(Errno::from)?;
+        let child_pid = i32::try_from(child.identity().process_id.0)
+            .expect("broker process IDs must fit Linux pid_t");
+        let prepared = self
+            .write_fork_image(&child, &startup.regions)
+            .and_then(|()| {
+                child
+                    .inherit(&self.global.litebox, &objects)
+                    .map_err(Errno::from)
+            });
+        let handles = match prepared {
+            Ok(handles) => handles,
+            Err(errno) => {
+                // The pending child never runs, and no one observes its status.
+                let _ = child.exit(ProcessExitStatus::Unknown);
+                return Err(errno);
+            }
+        };
+        for (forked, handle) in startup.fds.iter_mut().zip(handles) {
+            forked.inherited.handle = handle;
+        }
+        // The child's memory and objects are copied, so the other threads may go on.
+        drop(pause);
+        let payload = startup
+            .encode()
+            .expect("the startup fit with placeholder handles");
+        // The broker no longer holds a pending child if starting it fails.
+        child.start(&payload).map_err(Errno::from)?;
+        self.thread.process.add_child(child_pid, child);
+        // Failure means the process service failed, so no termination can be observed.
+        let _ = self.observe_child_terminations();
+        Ok(child_pid.cast_unsigned() as usize)
+    }
+
+    /// Writes the contents of each of `regions` that has contents to the pending `child`'s
+    /// process image, back to back, skipping zero-filled pages at the ends of each chunk.
+    #[cfg(target_arch = "x86_64")]
+    fn write_fork_image(
+        &self,
+        child: &litebox::process::Process<Platform>,
+        regions: &[ForkMemoryRegion],
+    ) -> Result<(), Errno> {
+        const CHUNK_SIZE: usize = MAX_CHILD_MEMORY_WRITE_SIZE as usize;
+        // Folding a page vectorizes, unlike stopping at its first nonzero byte.
+        let has_data = |page: &[u8]| page.iter().fold(0, |acc, &byte| acc | byte) != 0;
+        let mut image_offset = 0u64;
+        for region in regions.iter().filter(|region| region.has_contents()) {
+            let write_region = || -> Result<(), Errno> {
+                for start in region.range.clone().step_by(CHUNK_SIZE) {
+                    let len = CHUNK_SIZE.min(region.range.end - start);
+                    let chunk = UserPtr::<u8>::from_usize(start)
+                        .to_owned_slice::<Platform>(len)
+                        .ok_or(Errno::ENOMEM)?;
+                    let Some(first) = chunk.chunks(PAGE_SIZE).position(has_data) else {
+                        continue;
+                    };
+                    let last = chunk.chunks(PAGE_SIZE).rposition(has_data).unwrap();
+                    let data = &chunk[first * PAGE_SIZE..(last + 1) * PAGE_SIZE];
+                    let offset =
+                        image_offset + (start - region.range.start + first * PAGE_SIZE) as u64;
+                    child.write_memory(offset, data).map_err(Errno::from)?;
+                }
+                Ok(())
+            };
+            // Regions without read access, such as inaccessible ones that may hold data and
+            // execute-only ones that host protection keys can make unreadable, are readable only
+            // while copied.
+            if region.flags.contains(VmFlags::VM_READ) {
+                write_region()?;
+            } else {
+                let start = UserPtrMut::from_usize(region.range.start);
+                let len = region.range.len();
+                let prot = super::mm::prot_flags_from_permissions(region.flags.into());
+                self.sys_mprotect_raw(start, len, prot | ProtFlags::PROT_READ)?;
+                let written = write_region();
+                self.sys_mprotect_raw(start, len, prot)?;
+                written?;
+            }
+            image_offset += region.range.len() as u64;
+        }
+        Ok(())
+    }
+
+    /// Maps each of `regions` at its address in `mm`, filling those that have contents from the
+    /// process image [`Self::write_fork_image`] wrote, which `load_image` loads from an offset
+    /// into a region's pages.
+    ///
+    /// Restoring fails if any region's address is in use.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn restore_fork_image(
+        mm: &crate::MemoryManager<Platform>,
+        regions: &[ForkMemoryRegion],
+        mut load_image: impl FnMut(u64, &mut [u8]) -> Result<(), Errno>,
+    ) -> Result<(), crate::ForkRestoreError> {
+        let mut image_offset = 0u64;
+        for region in regions {
+            let (Some(address), Some(length)) = (
+                NonZeroAddress::<PAGE_SIZE>::new(region.range.start),
+                NonZeroPageSize::<PAGE_SIZE>::new(region.range.len()),
+            ) else {
+                return Err(crate::ForkRestoreError::Memory(
+                    region.range.start,
+                    MappingError::UnAligned,
+                ));
+            };
+            let mut flags = CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE;
+            if region.flags.contains(VmFlags::VM_GROWSDOWN) {
+                flags |= CreatePagesFlags::IS_STACK;
+            }
+            let has_contents = region.has_contents();
+            let mut image_error = None;
+            let created = if has_contents {
+                // SAFETY: `NOREPLACE` fails rather than replacing any existing mapping.
+                unsafe {
+                    mm.create_pages_with_permissions(
+                        Some(address),
+                        length,
+                        flags,
+                        region.flags.into(),
+                        |pages| {
+                            // SAFETY: The pages were just mapped readable and writable, and
+                            // nothing else uses them until this function returns.
+                            let pages = core::slice::from_raw_parts_mut(
+                                pages.as_usize() as *mut u8,
+                                length.as_usize(),
+                            );
+                            if let Err(error) = load_image(image_offset, pages) {
+                                image_error = Some(error);
+                                return Err(MappingError::OutOfMemory);
+                            }
+                            Ok(0)
+                        },
+                    )
+                }
+            } else {
+                // A region without contents is never accessible, so creating it inaccessible
+                // keeps it marked as holding no data.
+                // SAFETY: `NOREPLACE` fails rather than replacing any existing mapping.
+                unsafe { mm.create_inaccessible_pages(Some(address), length, flags, |_| Ok(0)) }
+            };
+            created.map_err(|error| match image_error {
+                Some(error) => crate::ForkRestoreError::Image(error),
+                None => crate::ForkRestoreError::Memory(region.range.start, error),
+            })?;
+            if has_contents {
+                image_offset += length.as_usize() as u64;
+            }
+        }
+        Ok(())
+    }
+
     /// Begins a constrained `vfork` child in the current runner, as `vfork`, or `clone` or
     /// `clone3` with `CLONE_VM | CLONE_VFORK`, do.
     ///
@@ -1161,6 +1551,31 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             None
         };
+
+        #[cfg(target_arch = "x86_64")]
+        if !flags.intersects(CloneFlags::VM | CloneFlags::THREAD | CloneFlags::VFORK) {
+            let supported_fork_flags = CloneFlags::CHILD_SETTID | CloneFlags::CHILD_CLEARTID;
+            if flags.intersects(!supported_fork_flags) {
+                log_unsupported!("fork clone with flags: {:?}", flags);
+                return Err(Errno::EINVAL);
+            }
+            let sigchld = litebox_common_linux::signal::Signal::SIGCHLD.as_i32();
+            if exit_signal != u64::from(sigchld.cast_unsigned()) {
+                log_unsupported!("fork clone with exit signal {exit_signal}");
+                return Err(Errno::EINVAL);
+            }
+            if sp.is_some() {
+                log_unsupported!("fork clone with a stack");
+                return Err(Errno::EINVAL);
+            }
+            let child_tid: usize = child_tid.trunc();
+            let tid_if = |flag| if flags.contains(flag) { child_tid } else { 0 };
+            return self.fork(
+                ctx,
+                tid_if(CloneFlags::CHILD_SETTID),
+                tid_if(CloneFlags::CHILD_CLEARTID),
+            );
+        }
 
         #[cfg(target_arch = "x86_64")]
         if flags.contains(CloneFlags::VFORK) {
@@ -2457,6 +2872,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid());
                 }
             }
+            #[cfg(target_arch = "x86_64")]
+            ThreadInitState::Forked {
+                registers,
+                thread_pointer,
+                set_child_tid,
+            } => {
+                *ctx = *registers;
+                self.sys_arch_prctl(ArchPrctlArg::SetFs(thread_pointer))
+                    .expect("failed to restore the forked thread's FS base");
+                if let Some(child_tid_ptr) = set_child_tid {
+                    let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid());
+                }
+            }
         }
     }
 }
@@ -3172,7 +3600,12 @@ mod tests {
                 )
                 .expect("rt_sigprocmask failed");
             };
-            for restart in [None, Some(SyscallRestart::Sys), Some(SyscallRestart::NoHandler)] {
+            for restart in [
+                None,
+                Some(SyscallRestart::Sys),
+                Some(SyscallRestart::NoIntr),
+                Some(SyscallRestart::NoHandler),
+            ] {
                 // SIGCHLD is ignored by default, but is queued while blocked. Once unblocked,
                 // it interrupts waits, yet runs no handler.
                 sigprocmask(SigmaskHow::SIG_BLOCK);

@@ -21,10 +21,12 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::{BrokerCore, BrokerError, BrokerProcess, CallerCredential};
+use litebox_broker_core::{
+    BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
+};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::{AddEventResponse, CreateEventResponse};
 use litebox_broker_protocol::fs::{
@@ -45,9 +47,9 @@ use litebox_broker_protocol::pipe::{
 };
 use litebox_broker_protocol::process::{
     CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
-    ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    StartChildProcessSource,
+    ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -575,7 +577,7 @@ fn handle_request<Memory: SharedMemory>(
             handle_file_request(process, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::File)
         }
-        BrokerOperation::StartChildProcess(_) => {
+        BrokerOperation::StartChildProcess(_) | BrokerOperation::WriteChildMemory(_) => {
             Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation))
         }
     }
@@ -662,7 +664,7 @@ fn handle_file_request<Memory: SharedMemory>(
             offset,
         }) => {
             validate_shared_buffer(buffer, MAX_FILE_TRANSFER_SIZE)?;
-            let mut data = allocate_zeroed(buffer.length())?;
+            let mut data = allocate_zeroed(buffer.length() as usize)?;
             match litebox_broker_core::fs::read(process, handle, &mut data, offset)
                 .map_err(RequestFailure::from)?
             {
@@ -858,11 +860,11 @@ fn validate_shared_buffer(buffer: SharedBufferSequence, max_length: u32) -> Requ
     Ok(())
 }
 
-fn allocate_zeroed(length: u32) -> RequestResult<Vec<u8>> {
+fn allocate_zeroed(length: usize) -> RequestResult<Vec<u8>> {
     let mut data = Vec::new();
-    data.try_reserve_exact(length as usize)
+    data.try_reserve_exact(length)
         .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
-    data.resize(length as usize, 0);
+    data.resize(length, 0);
     Ok(data)
 }
 
@@ -873,7 +875,7 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
     max_length: u32,
 ) -> RequestResult<Vec<u8>> {
     validate_shared_buffer(buffer, max_length)?;
-    let mut data = allocate_zeroed(buffer.length())?;
+    let mut data = allocate_zeroed(buffer.length() as usize)?;
     shared_buffers
         .read_sequence(buffer, &mut data)
         .map_err(shared_buffer_access_failure)?;
@@ -882,15 +884,26 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
 
 /// Platform implementation that starts execution for a broker-created process.
 ///
-/// Once called, the launcher owns final process retirement even when launch
-/// fails. Success means process startup reached `Running`.
+/// Once called, [`Self::launch`] owns final process retirement even when
+/// launch fails. Success means process startup reached `Running`.
 pub trait ProcessLauncher: Send + Sync {
     /// Starts one process and waits for startup to commit or fail.
+    ///
+    /// The process's runner receives `image`, the memory image its parent
+    /// wrote, if any.
     fn launch(
         self: Arc<Self>,
         process: Arc<BrokerProcess>,
         startup: ProcessStartupData,
+        image: Option<ChildImage>,
     ) -> core::result::Result<(), BrokerError>;
+
+    /// Creates an empty memory image for a pending child.
+    ///
+    /// Platforms that cannot pass images to runners reject the request.
+    fn create_image(&self) -> core::result::Result<Box<dyn ProcessImage>, BrokerError> {
+        Err(BrokerError::UnsupportedOperation)
+    }
 }
 
 /// Handles a process operation using the configured platform launcher.
@@ -920,8 +933,67 @@ where
                 })
                 .map(|()| BrokerResult::ProcessStarted),
         ),
+        BrokerOperation::WriteChildMemory(WriteChildMemoryRequest {
+            child_process_id,
+            offset,
+            data,
+        }) => Some(
+            write_child_memory(
+                launcher.as_ref(),
+                parent,
+                *child_process_id,
+                *offset,
+                *data,
+                shared_buffers,
+            )
+            .map(|()| BrokerResult::ChildMemoryWritten),
+        ),
         _ => None,
     }
+}
+
+/// Writes `data` at `offset` in the pending child's memory image, copying
+/// straight from shared memory when the image supports it.
+fn write_child_memory<Memory, Launcher>(
+    launcher: &Launcher,
+    parent: &BrokerProcess,
+    child_process_id: ProcessId,
+    offset: u64,
+    data: SharedBufferSequence,
+    shared_buffers: &SharedBufferPool<Memory>,
+) -> RequestResult<()>
+where
+    Memory: SharedMemory,
+    Launcher: ProcessLauncher + ?Sized,
+{
+    validate_shared_buffer(data, MAX_CHILD_MEMORY_WRITE_SIZE)?;
+    let ranges = shared_buffers
+        .sequence_ranges(data, data.length() as usize)
+        .map_err(shared_buffer_access_failure)?;
+    let memory = shared_buffers.memory();
+    parent.write_child_memory(
+        child_process_id,
+        offset,
+        u64::from(data.length()),
+        || launcher.create_image(),
+        |image| {
+            let mut image_offset = offset;
+            for range in ranges {
+                let length = range.len();
+                if let Some(result) = image.write_from_shared(image_offset, memory, range.clone()) {
+                    result?;
+                } else {
+                    let mut buffer = allocate_zeroed(length)?;
+                    memory
+                        .read(range.start, &mut buffer)
+                        .map_err(|error| shared_buffer_access_failure(error.into()))?;
+                    image.write(image_offset, &buffer)?;
+                }
+                image_offset += length as u64;
+            }
+            Ok(())
+        },
+    )
 }
 
 fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
@@ -933,8 +1005,8 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
     if !parent.is_running() {
         return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
     }
-    let process = parent
-        .take_child_process(child_process_id)
+    let (process, image) = parent
+        .take_child_process_with_image(child_process_id)
         .map_err(RequestFailure::from)?;
     if parent.is_cancellation_requested() {
         let _ = process.fail_start(BrokerError::PeerClosed, false, true);
@@ -947,6 +1019,7 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
             ProcessStartupData {
                 payload: startup.payload,
             },
+            image,
         )
         .map_err(RequestFailure::from)
 }

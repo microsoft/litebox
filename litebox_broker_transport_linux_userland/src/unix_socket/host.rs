@@ -32,7 +32,7 @@ use litebox_broker_transport::control_ring::{
     ControlRingReadError, ControlRingReadStatus, ControlRingWakeHandle, ControlRingWriteStatus,
 };
 
-use crate::memfd::MemfdSharedMemory;
+use crate::memfd::{MemfdProcessImage, MemfdSharedMemory};
 use crate::setup::{
     copy_io_error, invalid_data, read_setup_frame, ring_error, shutdown_socket, wire_error,
     write_setup_frame,
@@ -169,6 +169,16 @@ impl UnixStreamHostSetupChannel {
         deadline: Option<Instant>,
     ) -> IoResult<()> {
         crate::memfd::send_memfd(&mut self.stream, shared_memory, deadline)
+    }
+
+    /// Sends the optional process image during association setup, after the
+    /// control ring.
+    pub fn send_process_image(
+        &mut self,
+        image: Option<&MemfdProcessImage>,
+        deadline: Option<Instant>,
+    ) -> IoResult<()> {
+        crate::memfd::send_process_image(&mut self.stream, image, deadline)
     }
 
     /// Consumes a negotiated setup channel into independently usable active

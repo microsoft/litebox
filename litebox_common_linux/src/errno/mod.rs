@@ -58,6 +58,8 @@ impl Errno {
     /// Restart the syscall unless a handler without `SA_RESTART` runs. Interrupted waits convert
     /// to this, as in Linux.
     pub const ERESTARTSYS: Self = Self::from_const(512);
+    /// Restart the syscall, even after a handler runs.
+    pub const ERESTARTNOINTR: Self = Self::from_const(513);
     /// Restart the syscall only if no handler runs.
     pub const ERESTARTNOHAND: Self = Self::from_const(514);
 
@@ -77,7 +79,8 @@ impl Errno {
     /// restart.
     #[must_use]
     pub fn without_restart(self) -> Self {
-        if self == Self::ERESTARTSYS || self == Self::ERESTARTNOHAND {
+        if self == Self::ERESTARTSYS || self == Self::ERESTARTNOINTR || self == Self::ERESTARTNOHAND
+        {
             Self::EINTR
         } else {
             self

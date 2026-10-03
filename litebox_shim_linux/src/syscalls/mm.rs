@@ -78,7 +78,7 @@ fn finalize_trampoline_gates(
     }
 }
 
-fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
+pub(super) fn prot_flags_from_permissions(permissions: MemoryRegionPermissions) -> ProtFlags {
     let mut prot = ProtFlags::PROT_NONE;
     prot.set(
         ProtFlags::PROT_READ,
@@ -383,19 +383,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // temporary buffer to read the data from fs (without worrying page
             // faults) and write it to the user buffer with page fault handling.
             let mut file_offset = offset;
-            let mut buffer = [0; PAGE_SIZE];
+            // Read in the largest chunks the broker transfers, as each read is a round trip.
+            let max_read = usize::try_from(litebox_broker_protocol::fs::MAX_FILE_TRANSFER_SIZE)
+                .expect("the broker transfer size fits usize");
+            let mut buffer = alloc::vec![0; len.min(max_read)];
             let mut copied = 0;
             while copied < len {
-                let size =
-                    self.do_read(fd, &mut buffer, Some(file_offset))
-                        .map_err(|e| match e {
-                            // The raw fd was resolved once at syscall entry and is intentionally
-                            // not retained; this payload is discarded when converted to EBADF.
-                            Errno::EBADF => MappingError::BadFD(-1),
-                            Errno::EISDIR => MappingError::NotAFile,
-                            Errno::EACCES => MappingError::NotForReading,
-                            _ => unimplemented!(),
-                        })?;
+                let want = (len - copied).min(buffer.len());
+                let size = self
+                    .do_read(fd, &mut buffer[..want], Some(file_offset))
+                    .map_err(|e| match e {
+                        // The raw fd was resolved once at syscall entry and is intentionally
+                        // not retained; this payload is discarded when converted to EBADF.
+                        Errno::EBADF => MappingError::BadFD(-1),
+                        Errno::EISDIR => MappingError::NotAFile,
+                        Errno::EACCES => MappingError::NotForReading,
+                        _ => unimplemented!(),
+                    })?;
                 if size == 0 {
                     break;
                 }
@@ -2314,6 +2318,134 @@ mod tests {
             .unwrap();
         task.sys_munmap(addr, 0x2000).unwrap();
         task.sys_munmap(new_addr, 0x2000).unwrap();
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn self_placed_mappings_stay_below_placement_limit() {
+        let task = init_platform();
+        let limit = <Platform as PageManagementProvider<PAGE_SIZE>>::PLACEMENT_ADDR_MAX;
+        assert!(limit < <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX);
+        let below_limit = |address: UserPtrMut<u8>, len: usize| {
+            assert!(
+                address.as_usize() + len <= limit,
+                "mapping at {:#x} crosses the placement limit {limit:#x}",
+                address.as_usize(),
+            );
+        };
+        let read_write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let anonymous = MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
+
+        let unhinted = task
+            .sys_mmap(0, 2 * PAGE_SIZE, read_write, anonymous, -1, 0)
+            .unwrap();
+        below_limit(unhinted, 2 * PAGE_SIZE);
+
+        let hinted = task
+            .sys_mmap(limit, PAGE_SIZE, read_write, anonymous, -1, 0)
+            .unwrap();
+        below_limit(hinted, PAGE_SIZE);
+
+        // Native remapping must honor the destination vmem chose instead of letting the host
+        // kernel pick one, and must still carry the contents along.
+        unhinted
+            .write_slice_at_offset::<Platform>(0, &[0xa5; 0x10])
+            .unwrap();
+        let moved = task
+            .sys_mremap(
+                unhinted,
+                PAGE_SIZE,
+                4 * PAGE_SIZE,
+                MRemapFlags::MREMAP_MAYMOVE,
+                0,
+            )
+            .unwrap();
+        below_limit(moved, 4 * PAGE_SIZE);
+        assert_eq!(moved.read_at_offset::<Platform>(0).unwrap(), 0xa5_u8);
+
+        let fixed = task
+            .sys_mmap(
+                limit,
+                PAGE_SIZE,
+                read_write,
+                anonymous | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap();
+        assert_eq!(fixed.as_usize(), limit);
+
+        for (address, len) in [
+            (unhinted, 2 * PAGE_SIZE),
+            (hinted, PAGE_SIZE),
+            (moved, 4 * PAGE_SIZE),
+            (fixed, PAGE_SIZE),
+        ] {
+            task.sys_munmap(address, len).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn repeated_moving_growth_keeps_contents() {
+        const PAGE: isize = PAGE_SIZE.cast_signed();
+        let task = init_platform();
+        let read_write = ProtFlags::PROT_READ | ProtFlags::PROT_WRITE;
+        let anonymous = MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE;
+        // Occupies the page after a mapping so that growing it has to move it.
+        let block_after = |address: UserPtrMut<u8>, len: usize| {
+            task.sys_mmap(
+                address.as_usize() + len,
+                PAGE_SIZE,
+                ProtFlags::PROT_NONE,
+                anonymous | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .ok()
+        };
+
+        let first = task
+            .sys_mmap(0, 2 * PAGE_SIZE, read_write, anonymous, -1, 0)
+            .unwrap();
+        first
+            .write_slice_at_offset::<Platform>(0, &[0xa5; 0x10])
+            .unwrap();
+        let first_block = block_after(first, 2 * PAGE_SIZE);
+        let second = task
+            .sys_mremap(
+                first,
+                2 * PAGE_SIZE,
+                4 * PAGE_SIZE,
+                MRemapFlags::MREMAP_MAYMOVE,
+                0,
+            )
+            .unwrap();
+        assert_ne!(second.as_usize(), first.as_usize());
+        second
+            .write_slice_at_offset::<Platform>(3 * PAGE, &[0x5a; 0x10])
+            .unwrap();
+
+        // The moved pages and the grown tail are separate host mappings that must move together.
+        let second_block = block_after(second, 4 * PAGE_SIZE);
+        let third = task
+            .sys_mremap(
+                second,
+                4 * PAGE_SIZE,
+                8 * PAGE_SIZE,
+                MRemapFlags::MREMAP_MAYMOVE,
+                0,
+            )
+            .unwrap();
+        assert_ne!(third.as_usize(), second.as_usize());
+        assert_eq!(third.read_at_offset::<Platform>(0).unwrap(), 0xa5_u8);
+        assert_eq!(third.read_at_offset::<Platform>(3 * PAGE).unwrap(), 0x5a_u8);
+        assert_eq!(third.read_at_offset::<Platform>(5 * PAGE).unwrap(), 0_u8);
+
+        task.sys_munmap(third, 8 * PAGE_SIZE).unwrap();
+        for block in [first_block, second_block].into_iter().flatten() {
+            task.sys_munmap(block, PAGE_SIZE).unwrap();
+        }
     }
 
     #[test]
