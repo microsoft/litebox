@@ -14,7 +14,7 @@ use crate::ObjectHandle;
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 
 /// Maximum number of shared-buffer slots used by one file read or write.
-pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 8;
+pub const MAX_FILE_TRANSFER_SLOT_COUNT: u32 = 16;
 
 /// Maximum bytes transferred by one logical file read or write.
 pub const MAX_FILE_TRANSFER_SIZE: u32 = SHARED_BUFFER_SLOT_SIZE * MAX_FILE_TRANSFER_SLOT_COUNT;
