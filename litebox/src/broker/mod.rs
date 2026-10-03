@@ -22,10 +22,11 @@ use litebox_broker_protocol::process::{
     CreatedProcess, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
     MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessTermination,
 };
+use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
-use litebox_broker_protocol::signal::PendingSignal;
+use litebox_broker_protocol::signal::{PendingSignal, SignalTarget};
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
@@ -97,7 +98,7 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn send_signal(
         &self,
-        process_id: litebox_broker_protocol::ProcessId,
+        target: SignalTarget,
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError>;
 
@@ -105,6 +106,22 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         handle: ObjectHandle,
     ) -> core::result::Result<PendingSignal, BrokerControlError>;
+
+    fn process_group(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<ProcessGroupMembership, BrokerControlError>;
+
+    fn set_process_group(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        process_group: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn create_session(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -594,10 +611,10 @@ where
 
     fn send_signal(
         &self,
-        process_id: litebox_broker_protocol::ProcessId,
+        target: SignalTarget,
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.send_signal(process_id, signal))
+        self.request(|local| local.send_signal(target, signal))
     }
 
     fn take_signal(
@@ -605,6 +622,28 @@ where
         handle: ObjectHandle,
     ) -> core::result::Result<PendingSignal, BrokerControlError> {
         self.request(|local| local.take_signal(handle))
+    }
+
+    fn process_group(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<ProcessGroupMembership, BrokerControlError> {
+        self.request(|local| local.process_group(process_id))
+    }
+
+    fn set_process_group(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        process_group: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_process_group(process_id, process_group))
+    }
+
+    fn create_session(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.create_session(process_id))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

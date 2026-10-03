@@ -65,6 +65,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_threads_parent.c",
     "fork_aarch64_state.c",
     "gate_signals.c",
+    "process_group_parent.c",
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
@@ -1066,6 +1067,27 @@ fn fork_requires_process_duplication() {
         .find(|line| line.starts_with("fork-failed "))
         .unwrap_or_else(|| panic!("missing fork failure in {output:?}"));
     assert_eq!(numeric_field(line, "errno="), libc::EPERM);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn process_groups_and_sessions_span_processes() {
+    let parent = common::compile(
+        "./tests/process_group_parent.c",
+        "process_group_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "process_group_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "process-group failures=0"),
+        "{output}"
+    );
 }
 
 #[cfg(target_os = "linux")]

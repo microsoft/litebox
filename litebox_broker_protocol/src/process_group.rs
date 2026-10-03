@@ -1,0 +1,34 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Process groups and sessions.
+//!
+//! Every process belongs to one process group, and every process group to one
+//! session. Each is identified by the ID of the process that created it, which
+//! need not still exist. A child process starts in its parent's group and
+//! session, while a process without a parent leads its own.
+
+use crate::ProcessId;
+
+/// A process's group and session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessGroupMembership {
+    /// Process group.
+    pub process_group: ProcessId,
+    /// Session.
+    pub session: ProcessId,
+}
+
+/// Request to move a process into a process group.
+///
+/// The target must be the caller or one of its children, or the broker returns
+/// `UnknownObject`. The broker returns `PolicyDenied` if the target is in
+/// another session than the caller or leads a session, or if `process_group`
+/// is neither the target's ID nor an existing group in the caller's session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetProcessGroupRequest {
+    /// Process to move.
+    pub process_id: ProcessId,
+    /// Group to join, which is created if it is `process_id`.
+    pub process_group: ProcessId,
+}

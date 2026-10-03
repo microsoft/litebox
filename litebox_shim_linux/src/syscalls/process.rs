@@ -24,8 +24,10 @@ use litebox::platform::TimerHandle;
 use litebox::process::{ChildStatus, ProcessError};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
+use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_common_linux::ProtFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
@@ -246,6 +248,14 @@ struct Child<Platform: ShimPlatform> {
     exit_status: Option<ProcessExitStatus>,
 }
 
+/// Children a `wait4` call waits for.
+#[derive(Clone, Copy)]
+enum WaitTarget {
+    Any,
+    Process(i32),
+    ProcessGroup(ProcessId),
+}
+
 /// A process's view of its children's terminations, which its threads observe.
 ///
 /// This does not own the children, so a watcher holding it cannot drop them while its child's
@@ -288,6 +298,9 @@ impl<Platform: ShimPlatform> Observer<Events> for ChildWatcher<Platform> {
 struct SignalWatcher<Platform: ShimPlatform> {
     /// Set when a signal may have been sent since signals were last taken.
     changed: AtomicBool,
+    /// Held while taking signals, so a forced take waits for one in progress to queue the
+    /// signals it took.
+    taking: Mutex<Platform, ()>,
     /// The process's locked state, to interrupt its threads.
     process: Arc<Mutex<Platform, ProcessInner<Platform>>>,
 }
@@ -387,6 +400,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             // Signals sent before they are opened are taken at the first check.
             signal_watcher: Arc::new(SignalWatcher {
                 changed: AtomicBool::new(true),
+                taking: Mutex::new(()),
                 process: inner.clone(),
             }),
             inner,
@@ -480,20 +494,21 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         Ok(terminated)
     }
 
-    /// Removes one child with process ID `target`, or any child when `target` is `None`, whose
-    /// termination was observed.
+    /// Returns the process IDs of this process's children.
+    fn child_pids(&self) -> Vec<i32> {
+        self.children.lock().keys().copied().collect()
+    }
+
+    /// Removes one child whose process ID `matches` and whose termination was observed.
     ///
     /// The caller drops the returned child outside the children lock to reap it.
     fn take_exited_child(
         &self,
-        target: Option<i32>,
+        matches: impl Fn(i32) -> bool,
     ) -> Result<(i32, litebox::process::Process<Platform>, ProcessExitStatus), TryOpError<Errno>>
     {
         let mut children = self.children.lock();
-        let mut matching = children
-            .iter()
-            .filter(|&(&pid, _)| target.is_none_or(|target| target == pid))
-            .peekable();
+        let mut matching = children.iter().filter(|&(&pid, _)| matches(pid)).peekable();
         if matching.peek().is_none() {
             return Err(TryOpError::Other(Errno::ECHILD));
         }
@@ -664,11 +679,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
     }
 
+    /// Queues the signals other processes sent, without waiting to be notified of them.
+    ///
+    /// Like Linux, a process that signals its own process group thus handles the signal before
+    /// `kill` returns.
+    pub(crate) fn take_signals_now(&self) {
+        self.take_signals_inner(true);
+    }
+
     /// Queues the signals other processes sent since signals were last taken.
     ///
     /// During a `vfork` window the signal state is the child's, so the parent takes the signals
     /// once it resumes.
     pub(crate) fn take_signals(&self) {
+        self.take_signals_inner(false);
+    }
+
+    /// Queues the signals other processes sent, if notified of any since signals were last taken
+    /// or if `force` is set.
+    fn take_signals_inner(&self, force: bool) {
         let process = &self.thread.process;
         if self.vfork.borrow().is_some() {
             return;
@@ -676,7 +705,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(signals) = process.signals.get() else {
             return;
         };
-        if !process.signal_watcher.changed.swap(false, Ordering::SeqCst) {
+        let watcher = &process.signal_watcher;
+        if !force && !watcher.changed.load(Ordering::SeqCst) {
+            return;
+        }
+        // A forced take waits here for a take in progress to queue the signals it took.
+        let _taking = watcher.taking.lock();
+        if !watcher.changed.swap(false, Ordering::SeqCst) && !force {
             return;
         }
         // Failure means the process service failed, so no more signals can be taken.
@@ -2284,9 +2319,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `wait4`.
     ///
     /// Only terminated children are reported. Like Linux, children that terminate while
-    /// `SIGCHLD` is ignored or has `SA_NOCLDWAIT` are reaped instead of reported. Process groups
-    /// are not modeled, so `pid == 0` waits for any child and `pid < -1` matches no child.
-    /// Resource usage is reported as zero.
+    /// `SIGCHLD` is ignored or has `SA_NOCLDWAIT` are reaped instead of reported, and `pid == 0`
+    /// waits for the children in the process group this process is in when it starts waiting.
+    /// Unlike Linux, children's groups are read one at a time, so a wait that overlaps children
+    /// moving between groups may miss a member. Resource usage is reported as zero.
     /// A child without an observable termination status is reported as killed by `SIGSEGV`.
     /// Children belong to the process rather than the creating thread, so `__WNOTHREAD` is
     /// accepted but does not restrict which children match.
@@ -2308,10 +2344,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         let target = match pid {
-            -1 | 0 => None,
-            1.. => Some(pid),
+            -1 => WaitTarget::Any,
+            1.. => WaitTarget::Process(pid),
             i32::MIN => return Err(Errno::ESRCH),
-            _ => return Err(Errno::ECHILD),
+            0 => match self.membership(self.pid) {
+                Ok(membership) => WaitTarget::ProcessGroup(membership.process_group),
+                // Without a process service, this process has no children.
+                Err(ProcessError::Unavailable) => return Err(Errno::ECHILD),
+                Err(error) => return Err(error.into()),
+            },
+            _ => WaitTarget::ProcessGroup(ProcessId(pid.unsigned_abs())),
         };
         // Every child is created with the default exit signal, so only __WALL selects it
         // together with __WCLONE.
@@ -2322,7 +2364,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut take_exited_child = || {
             self.observe_child_terminations()
                 .map_err(|error| TryOpError::Other(error.into()))?;
-            process.take_exited_child(target)
+            match target {
+                WaitTarget::Any => process.take_exited_child(|_| true),
+                WaitTarget::Process(target) => process.take_exited_child(|pid| pid == target),
+                WaitTarget::ProcessGroup(process_group) => {
+                    let members = self
+                        .children_in_process_group(process_group)
+                        .map_err(|error| TryOpError::Other(error.into()))?;
+                    process.take_exited_child(|pid| members.contains(&pid))
+                }
+            }
         };
         let exited = match process.child_events.pollee.wait(
             &self.wait_cx(),
@@ -2362,6 +2413,92 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .ok_or(Errno::EFAULT)?;
         }
         Ok(child_pid.cast_unsigned() as usize)
+    }
+
+    /// Returns the process IDs of this process's children in `process_group`.
+    fn children_in_process_group(
+        &self,
+        process_group: ProcessId,
+    ) -> Result<Vec<i32>, ProcessError> {
+        let mut members = Vec::new();
+        for pid in self.thread.process.child_pids() {
+            match self.membership(pid) {
+                Ok(membership) if membership.process_group == process_group => members.push(pid),
+                // A child reaped since its ID was read is in no group.
+                Ok(_) | Err(ProcessError::NoSuchProcess) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(members)
+    }
+
+    /// Returns the process group and session of process `pid`.
+    fn membership(&self, pid: i32) -> Result<ProcessGroupMembership, ProcessError> {
+        self.global
+            .litebox
+            .process_group(ProcessId(pid.cast_unsigned()))
+    }
+
+    /// Returns the process group and session of process `pid`, or of this process if `pid` is
+    /// zero.
+    fn membership_for_syscall(&self, pid: i32) -> Result<ProcessGroupMembership, Errno> {
+        let pid = match pid {
+            0 => self.sys_getpid(),
+            1.. => pid,
+            _ => return Err(Errno::ESRCH),
+        };
+        Ok(self.membership(pid)?)
+    }
+
+    /// Handle syscall `setpgid`.
+    ///
+    /// Unlike Linux, a child that already called `execve` can still be moved.
+    pub(crate) fn sys_setpgid(&self, pid: i32, process_group: i32) -> Result<usize, Errno> {
+        let pid = if pid == 0 { self.sys_getpid() } else { pid };
+        let process_group = if process_group == 0 {
+            pid
+        } else {
+            process_group
+        };
+        if process_group < 0 {
+            return Err(Errno::EINVAL);
+        }
+        // A `vfork` child makes its requests as its parent, so it must not reach the parent or
+        // the parent's other children, which it cannot on Linux.
+        if pid < 0 || (self.vfork.borrow().is_some() && pid != self.sys_getpid()) {
+            return Err(Errno::ESRCH);
+        }
+        self.global.litebox.set_process_group(
+            ProcessId(pid.cast_unsigned()),
+            ProcessId(process_group.cast_unsigned()),
+        )?;
+        Ok(0)
+    }
+
+    /// Handle syscall `getpgid`.
+    pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<usize, Errno> {
+        let membership = self.membership_for_syscall(pid)?;
+        Ok(membership.process_group.0 as usize)
+    }
+
+    /// Handle syscall `getpgrp`.
+    pub(crate) fn sys_getpgrp(&self) -> Result<usize, Errno> {
+        self.sys_getpgid(0)
+    }
+
+    /// Handle syscall `setsid`.
+    pub(crate) fn sys_setsid(&self) -> Result<usize, Errno> {
+        let pid = self.sys_getpid();
+        self.global
+            .litebox
+            .create_session(ProcessId(pid.cast_unsigned()))?;
+        Ok(pid.cast_unsigned() as usize)
+    }
+
+    /// Handle syscall `getsid`.
+    pub(crate) fn sys_getsid(&self, pid: i32) -> Result<usize, Errno> {
+        let membership = self.membership_for_syscall(pid)?;
+        Ok(membership.session.0 as usize)
     }
 
     /// Handle syscall `getpid`.

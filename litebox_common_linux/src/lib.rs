@@ -2588,6 +2588,18 @@ pub enum SyscallRequest {
     },
     Getpid,
     Getppid,
+    Setpgid {
+        pid: i32,
+        pgid: i32,
+    },
+    Getpgid {
+        pid: i32,
+    },
+    Getpgrp,
+    Setsid,
+    Getsid {
+        pid: i32,
+    },
     Getuid,
     Geteuid,
     Getgid,
@@ -2965,6 +2977,12 @@ impl SyscallRequest {
             Sysno::prlimit64 => sys_req!(Prlimit { pid, resource:?, new_limit:*, old_limit:* }),
             Sysno::getpid => SyscallRequest::Getpid,
             Sysno::getppid => SyscallRequest::Getppid,
+            Sysno::setpgid => sys_req!(Setpgid { pid, pgid }),
+            Sysno::getpgid => sys_req!(Getpgid { pid }),
+            #[cfg(target_arch = "x86_64")]
+            Sysno::getpgrp => SyscallRequest::Getpgrp,
+            Sysno::setsid => SyscallRequest::Setsid,
+            Sysno::getsid => sys_req!(Getsid { pid }),
             Sysno::getuid => SyscallRequest::Getuid,
             Sysno::getgid => SyscallRequest::Getgid,
             Sysno::geteuid => SyscallRequest::Geteuid,

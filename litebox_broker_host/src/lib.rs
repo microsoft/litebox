@@ -40,7 +40,8 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-    SignalRequest, SignalResponse, SocketRequest, SocketResponse, TimerRequest, TimerResponse,
+    ProcessGroupRequest, ProcessGroupResponse, SignalRequest, SignalResponse, SocketRequest,
+    SocketResponse, TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -559,6 +560,9 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::Signal(request) => {
             handle_signal_request(process, request, readiness_sink).map(BrokerResult::Signal)
+        }
+        BrokerOperation::ProcessGroup(request) => {
+            handle_process_group_request(process, request).map(BrokerResult::ProcessGroup)
         }
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
@@ -1398,11 +1402,34 @@ fn handle_signal_request(
                 .map(|handle| SignalResponse::Open(OpenSignalsResponse { handle }))
         }
         SignalRequest::Send(request) => {
-            litebox_broker_core::signal::send(process, request.process_id, request.signal)
+            litebox_broker_core::signal::send(process, request.target, request.signal)
                 .map(|()| SignalResponse::Sent)
         }
         SignalRequest::Take(request) => {
             litebox_broker_core::signal::take(process, request.handle).map(SignalResponse::Take)
+        }
+    };
+    response.map_err(RequestFailure::from)
+}
+
+fn handle_process_group_request(
+    process: &BrokerProcess,
+    request: ProcessGroupRequest,
+) -> RequestResult<ProcessGroupResponse> {
+    let response = match request {
+        ProcessGroupRequest::Get(process_id) => {
+            litebox_broker_core::process_group::get(process, process_id)
+                .map(ProcessGroupResponse::Get)
+        }
+        ProcessGroupRequest::Set(request) => litebox_broker_core::process_group::set(
+            process,
+            request.process_id,
+            request.process_group,
+        )
+        .map(|()| ProcessGroupResponse::Set),
+        ProcessGroupRequest::CreateSession(process_id) => {
+            litebox_broker_core::process_group::create_session(process, process_id)
+                .map(|()| ProcessGroupResponse::CreateSession)
         }
     };
     response.map_err(RequestFailure::from)
@@ -1447,11 +1474,13 @@ mod tests {
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
+    use litebox_broker_protocol::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
         SharedBufferSlotIndex,
     };
+    use litebox_broker_protocol::signal::{SendSignalRequest, SignalTarget};
     use litebox_broker_protocol::socket::{
         AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
         ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
@@ -1800,6 +1829,7 @@ mod tests {
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
+        active_requests_manage_process_groups(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
@@ -2574,6 +2604,62 @@ mod tests {
             BrokerResult::ObjectClosed
         );
         assert_eq!(clock.alarm_count(), 0);
+    }
+
+    fn active_requests_manage_process_groups(broker: &BrokerCore) {
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        let request = |process: &BrokerProcess, request| {
+            handle_test_request(process, BrokerOperation::ProcessGroup(request))
+        };
+        let membership = |process_group: &BrokerProcess| {
+            BrokerResult::ProcessGroup(ProcessGroupResponse::Get(ProcessGroupMembership {
+                process_group: process_group.id(),
+                session: parent.id(),
+            }))
+        };
+
+        assert_eq!(
+            request(&child, ProcessGroupRequest::Get(child.id())),
+            membership(&parent)
+        );
+        assert_eq!(
+            request(
+                &parent,
+                ProcessGroupRequest::Set(SetProcessGroupRequest {
+                    process_id: child.id(),
+                    process_group: child.id(),
+                })
+            ),
+            BrokerResult::ProcessGroup(ProcessGroupResponse::Set)
+        );
+        assert_eq!(
+            request(&parent, ProcessGroupRequest::Get(child.id())),
+            membership(&child)
+        );
+        assert_eq!(
+            request(&child, ProcessGroupRequest::CreateSession(child.id())),
+            BrokerResult::Error(ErrorCode::PolicyDenied)
+        );
+        assert_eq!(
+            request(&parent, ProcessGroupRequest::CreateSession(child.id())),
+            BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+        assert_eq!(
+            handle_test_request(
+                &parent,
+                BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
+                    target: SignalTarget::ProcessGroup(child.id()),
+                    signal: 0,
+                }))
+            ),
+            BrokerResult::Signal(SignalResponse::Sent)
+        );
     }
 
     fn active_request_allocates_and_releases_thread_id(broker: &BrokerCore) {

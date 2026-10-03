@@ -1,0 +1,265 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+//! Process groups and sessions.
+//!
+//! Every process belongs to one process group, and every process group to one
+//! session, each identified by the ID of the process that created it. A child
+//! process starts in its parent's group and session, while a process without a
+//! parent leads its own. A group or session exists while any registered
+//! process, including one that has terminated but whose status is still held,
+//! belongs to it.
+
+use alloc::sync::Arc;
+
+use litebox_broker_protocol::ProcessId;
+use litebox_broker_protocol::process_group::ProcessGroupMembership;
+
+use crate::{BrokerError, BrokerProcess, Result};
+
+/// Returns the group and session of the process `target`.
+///
+/// Returns `UnknownObject` if no such process exists.
+pub fn get(process: &BrokerProcess, target: ProcessId) -> Result<ProcessGroupMembership> {
+    Ok(process.core.registered_process(target)?.membership())
+}
+
+/// Moves the process `target` into `process_group`, creating the group if it
+/// is `target`'s ID.
+///
+/// `target` must be the caller or one of its children, or this returns
+/// `UnknownObject`. Returns `PolicyDenied` if `target` is in another session
+/// than the caller or leads a session, or if `process_group` is neither
+/// `target`'s ID nor an existing group in the caller's session.
+pub fn set(process: &BrokerProcess, target: ProcessId, process_group: ProcessId) -> Result<()> {
+    let target = process.core.registered_process(target)?;
+    if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
+        return Err(BrokerError::UnknownObject);
+    }
+    let _serialized = process.core.process_groups.lock();
+    let session = process.membership().session;
+    let membership = target.membership();
+    if membership.session != session || membership.session == target.id() {
+        return Err(BrokerError::PolicyDenied);
+    }
+    let joined = ProcessGroupMembership {
+        process_group,
+        session,
+    };
+    if process_group != target.id()
+        && !process
+            .core
+            .registered_processes()
+            .iter()
+            .any(|member| member.membership() == joined)
+    {
+        return Err(BrokerError::PolicyDenied);
+    }
+    *target.membership.lock() = joined;
+    Ok(())
+}
+
+/// Makes the process `target` the leader of a new session and of a new process
+/// group in it.
+///
+/// `target` must be the caller or its pending child, or this returns
+/// `UnknownObject`. Returns `PolicyDenied` if a process group already has
+/// `target`'s ID.
+pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
+    let pending_child;
+    let target = if target == process.id() {
+        process
+    } else {
+        pending_child = process.pending_child_process(target)?;
+        &pending_child
+    };
+    let _serialized = process.core.process_groups.lock();
+    let id = target.id();
+    if process
+        .core
+        .registered_processes()
+        .iter()
+        .any(|member| member.membership().process_group == id)
+    {
+        return Err(BrokerError::PolicyDenied);
+    }
+    *target.membership.lock() = ProcessGroupMembership {
+        process_group: id,
+        session: id,
+    };
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+
+    use litebox_broker_protocol::ProcessId;
+    use litebox_broker_protocol::process::CreatedProcess;
+    use litebox_broker_protocol::process_group::ProcessGroupMembership;
+
+    use crate::readiness::tests::TestReadinessSink;
+    use crate::test_support::TestBrokerCoreBuilder;
+    use crate::{
+        BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
+    };
+
+    fn broker() -> BrokerCore {
+        TestBrokerCoreBuilder::new(
+            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
+                .with_process_duplication_enabled(true),
+        )
+        .build()
+        .unwrap()
+    }
+
+    fn process(broker: &BrokerCore, parent: Option<&BrokerProcess>) -> Arc<BrokerProcess> {
+        broker
+            .create_process(
+                CallerCredential::Unauthenticated,
+                parent.map(BrokerProcess::id),
+            )
+            .unwrap()
+    }
+
+    fn membership(
+        process_group: &BrokerProcess,
+        session: &BrokerProcess,
+    ) -> ProcessGroupMembership {
+        ProcessGroupMembership {
+            process_group: process_group.id(),
+            session: session.id(),
+        }
+    }
+
+    #[test]
+    fn children_inherit_their_parents_membership() {
+        let broker = broker();
+        let root = process(&broker, None);
+        let child = process(&broker, Some(&root));
+        let other = process(&broker, None);
+
+        assert_eq!(super::get(&other, root.id()), Ok(membership(&root, &root)));
+        assert_eq!(super::get(&other, child.id()), Ok(membership(&root, &root)));
+        assert_eq!(
+            super::get(&root, other.id()),
+            Ok(membership(&other, &other))
+        );
+        assert_eq!(
+            super::get(&root, ProcessId(u32::MAX)),
+            Err(BrokerError::UnknownObject)
+        );
+
+        super::set(&root, child.id(), child.id()).unwrap();
+        let grandchild = process(&broker, Some(&child));
+        assert_eq!(
+            super::get(&root, grandchild.id()),
+            Ok(membership(&child, &root))
+        );
+    }
+
+    #[test]
+    fn setting_groups_follows_the_session_rules() {
+        let broker = broker();
+        let root = process(&broker, None);
+        let first = process(&broker, Some(&root));
+        let second = process(&broker, Some(&root));
+        let grandchild = process(&broker, Some(&first));
+        let other = process(&broker, None);
+
+        // Only the caller and its children can move, and not session leaders.
+        assert_eq!(
+            super::set(&root, root.id(), root.id()),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            super::set(&root, grandchild.id(), grandchild.id()),
+            Err(BrokerError::UnknownObject)
+        );
+        assert_eq!(
+            super::set(&root, other.id(), other.id()),
+            Err(BrokerError::UnknownObject)
+        );
+
+        // A process creates its own group or joins one in its session.
+        super::set(&root, first.id(), first.id()).unwrap();
+        super::set(&root, second.id(), first.id()).unwrap();
+        assert_eq!(
+            super::get(&root, second.id()),
+            Ok(membership(&first, &root))
+        );
+        super::set(&second, second.id(), root.id()).unwrap();
+        assert_eq!(super::get(&root, second.id()), Ok(membership(&root, &root)));
+        assert_eq!(
+            super::set(&second, second.id(), ProcessId(u32::MAX)),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            super::set(&second, second.id(), other.id()),
+            Err(BrokerError::PolicyDenied)
+        );
+        super::set(&first, grandchild.id(), root.id()).unwrap();
+
+        // A child in another session cannot move, nor can a session leader.
+        super::create_session(&grandchild, grandchild.id()).unwrap();
+        assert_eq!(
+            super::set(&first, grandchild.id(), first.id()),
+            Err(BrokerError::PolicyDenied)
+        );
+        assert_eq!(
+            super::set(&grandchild, grandchild.id(), grandchild.id()),
+            Err(BrokerError::PolicyDenied)
+        );
+        let great_grandchild = process(&broker, Some(&grandchild));
+        assert_eq!(
+            super::set(&great_grandchild, great_grandchild.id(), root.id()),
+            Err(BrokerError::PolicyDenied)
+        );
+        super::set(&great_grandchild, great_grandchild.id(), grandchild.id()).unwrap();
+    }
+
+    #[test]
+    fn sessions_are_created_by_processes_not_leading_a_group() {
+        let broker = broker();
+        let root = process(&broker, None);
+        root.complete_start().unwrap();
+        let child = process(&broker, Some(&root));
+
+        assert_eq!(
+            super::create_session(&root, root.id()),
+            Err(BrokerError::PolicyDenied)
+        );
+        // Only the caller and its pending child can be targeted.
+        assert_eq!(
+            super::create_session(&root, child.id()),
+            Err(BrokerError::UnknownObject)
+        );
+        let CreatedProcess { identity, .. } = root
+            .allocate_child_process(Arc::new(TestReadinessSink::default()))
+            .unwrap();
+        let pending = identity.process_id;
+        super::create_session(&root, pending).unwrap();
+        assert_eq!(
+            super::get(&root, pending),
+            Ok(ProcessGroupMembership {
+                process_group: pending,
+                session: pending,
+            })
+        );
+
+        // A group keeps its ID while another process is in it.
+        super::set(&root, child.id(), child.id()).unwrap();
+        let grandchild = process(&broker, Some(&child));
+        super::set(&child, child.id(), root.id()).unwrap();
+        assert_eq!(
+            super::create_session(&child, child.id()),
+            Err(BrokerError::PolicyDenied)
+        );
+        super::set(&child, grandchild.id(), root.id()).unwrap();
+        super::create_session(&child, child.id()).unwrap();
+        assert_eq!(
+            super::get(&root, child.id()),
+            Ok(membership(&child, &child))
+        );
+    }
+}
