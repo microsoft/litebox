@@ -92,14 +92,17 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     ) -> Result<UserMutPtr<u8>, page_mgmt::AllocationError> {
         if populate_pages {
             let flags = vmflags_to_pteflags(flags);
-            for page in range {
+            for page_addr in range {
                 let page =
-                    Page::<Size4KiB>::from_start_address(VirtAddr::new(page as u64)).unwrap();
+                    Page::<Size4KiB>::from_start_address(VirtAddr::new(page_addr as u64)).unwrap();
                 if let Err(err) = unsafe {
                     PageTableImpl::handle_page_fault(self, page, flags, PageFaultErrorCode::empty())
                 } {
+                    // Only `range.start..=page_addr` may have been touched (including any
+                    // page-table frames allocated by the failed fault); avoid walking the rest.
+                    let populated = PageRange::new(range.start, page_addr + ALIGN).unwrap();
                     // SAFETY: `range` was unmapped before this call and is not yet returned.
-                    let _ = unsafe { self.unmap_pages(range, true) };
+                    let _ = unsafe { self.unmap_pages(populated, true) };
                     return Err(match err {
                         PageFaultError::AllocationFailed => page_mgmt::AllocationError::OutOfMemory,
                         PageFaultError::HugePage | PageFaultError::AccessError(_) => {
