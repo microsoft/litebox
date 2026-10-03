@@ -56,6 +56,9 @@ pub trait EnterShim {
     /// Handle a hardware exception.
     ///
     /// The type of exception information passed depends on the architecture.
+    ///
+    /// If `info.kernel_mode` is set, `ctx` is a placeholder to avoid aliasing:
+    /// the interrupted code may already hold the guest context.
     fn exception(
         &self,
         ctx: &mut Self::ExecutionContext,
