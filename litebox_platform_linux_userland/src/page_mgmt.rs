@@ -162,8 +162,10 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 FixedAddressBehavior::NoReplace,
             )
             .map_err(|error| match error {
+                // A host mapping vmem does not know about holds the destination; the caller's
+                // copy places the pages elsewhere instead.
                 litebox::platform::page_mgmt::AllocationError::AddressInUse => {
-                    litebox::platform::page_mgmt::RemapError::AlreadyAllocated
+                    litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
                 }
                 _ => litebox::platform::page_mgmt::RemapError::OutOfMemory,
             })?;
