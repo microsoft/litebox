@@ -157,6 +157,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
             litebox_platform_linux_userland::LinuxUserland::enable_seccomp_filter(
                 &broker_positional_io_fds,
                 &broker_shutdown_fds,
+                seccomp_scope,
             );
             return Ok(run_program(&shim, program));
         }
