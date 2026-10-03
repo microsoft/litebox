@@ -426,7 +426,7 @@ pub fn hook_syscalls_in_elf_with_options(
     // Some ELF files (e.g. Node.js SEA binaries) have a program header table at an offset that
     // is not 8-byte aligned, which the `object` crate rejects. Fix this by relocating the phdr
     // table within our mutable copy so it sits at an 8-byte aligned offset.
-    fixup_phdr_alignment(buf);
+    fixup_phdr_alignment(buf)?;
 
     // Parse the ELF and extract all metadata we need, then drop the borrow so we can mutate buf.
     let (arch, text_sections, aarch64_code_sections, placement) = {
@@ -1225,6 +1225,9 @@ fn is_already_hooked(input_binary: &[u8], arch: Arch) -> bool {
     if file_offset.checked_add(trampoline_size) != Some(header_start as u64) {
         return false;
     }
+    if vaddr.checked_add(trampoline_size).is_none() {
+        return false;
+    }
 
     true
 }
@@ -1422,15 +1425,15 @@ fn hook_syscalls_in_section(
 /// The function modifies the buffer in-place: it moves the phdr table contents and updates
 /// `e_phoff` in the ELF header. Only ELF64 files are handled (ELF32 requires 4-byte alignment
 /// which is always satisfied when `e_phoff` is within a valid file).
-fn fixup_phdr_alignment(buf: &mut [u8]) {
+fn fixup_phdr_alignment(buf: &mut [u8]) -> Result<()> {
     // Minimum ELF header size for ELF64
     if buf.len() < 64 {
-        return;
+        return Ok(());
     }
 
     // Check ELF magic, class (must be ELF64), and byte order (must be little-endian).
     if &buf[0..4] != b"\x7fELF" || buf[4] != 2 || buf[5] != 1 {
-        return;
+        return Ok(());
     }
 
     let e_phoff = u64::from_le_bytes(buf[32..40].try_into().unwrap());
@@ -1438,46 +1441,46 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
     let e_phnum = u64::from(u16::from_le_bytes(buf[56..58].try_into().unwrap()));
 
     if e_phoff == 0 || e_phnum == 0 || e_phentsize == 0 {
-        return;
+        return Ok(());
     }
 
     let misalignment = e_phoff % 8;
     if misalignment == 0 {
-        return; // already aligned
+        return Ok(()); // already aligned
     }
 
     let Some(phdr_size) = e_phentsize.checked_mul(e_phnum) else {
-        return;
+        return Ok(());
     };
     let Ok(old_start) = usize::try_from(e_phoff) else {
-        return;
+        return Ok(());
     };
     let Ok(phdr_size) = usize::try_from(phdr_size) else {
-        return;
+        return Ok(());
     };
     let Some(old_end) = old_start.checked_add(phdr_size) else {
-        return;
+        return Ok(());
     };
 
     // Shift forward to align: new offset is the next 8-byte boundary.
     let Ok(padding) = usize::try_from(8 - misalignment) else {
-        return;
+        return Ok(());
     };
     let Some(new_start) = old_start.checked_add(padding) else {
-        return;
+        return Ok(());
     };
     let Some(new_end) = new_start.checked_add(phdr_size) else {
-        return;
+        return Ok(());
     };
 
     if new_end > buf.len() {
-        return; // not enough room
+        return Ok(()); // not enough room
     }
 
     // Only relocate when the overwritten bytes are padding. Otherwise this would corrupt the file
     // by destroying whatever payload follows the existing program header table.
     if !buf[old_end..new_end].iter().all(|&byte| byte == 0) {
-        return;
+        return Ok(());
     }
 
     // Move the phdr table forward (use copy_within since src and dst overlap).
@@ -1496,10 +1499,10 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
     // Shifting the phdr table forward in the file shifts it within the PT_LOAD
     // mapping by the same amount, so all three fields need the same adjustment.
     let Ok(e_phentsize_usize) = usize::try_from(e_phentsize) else {
-        return;
+        return Ok(());
     };
     let Ok(e_phnum_usize) = usize::try_from(e_phnum) else {
-        return;
+        return Ok(());
     };
     for i in 0..e_phnum_usize {
         let Some(i_times_size) = i.checked_mul(e_phentsize_usize) else {
@@ -1524,12 +1527,14 @@ fn fixup_phdr_alignment(buf: &mut [u8]) {
             ] {
                 let off = entry_off + field_off;
                 let old_val = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
-                let new_val = (old_val + padding as u64).to_le_bytes();
+                let new_val =
+                    checked_add_u64(old_val, padding as u64, "PT_PHDR relocation")?.to_le_bytes();
                 buf[off..off + 8].copy_from_slice(&new_val);
             }
             // The PHDR segment size should match the phdr table; no change needed.
         }
     }
+    Ok(())
 }
 
 /// Replace an unpatchable syscall instruction with `ICEBP; HLT` (`F1 F4`) so
@@ -2214,6 +2219,9 @@ fn decode_section_instructions(
     section_data: &[u8],
     section_base_addr: u64,
 ) -> Result<Vec<iced_x86::Instruction>> {
+    section_base_addr
+        .checked_add(section_data.len() as u64)
+        .ok_or_else(|| Error::AddressOverflow("executable section range".to_string()))?;
     let bitness = match arch {
         Arch::X86_64 => 64,
         Arch::Aarch64 => unreachable!("AArch64 uses the arm64 module, not iced-x86"),
@@ -2362,7 +2370,7 @@ fn reencode_instructions(
     let mut reencoded = Vec::new();
     let mut encoder = iced_x86::Encoder::new(64);
     for inst in instructions {
-        let tramp_ip = base_addr + reencoded.len() as u64;
+        let tramp_ip = base_addr.checked_add(reencoded.len() as u64)?;
         if encoder.encode(inst, tramp_ip).is_err() {
             return None;
         }
