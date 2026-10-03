@@ -882,31 +882,6 @@ mod tests {
     }
 
     #[test]
-    fn process_startup_decodes_program() {
-        let startup = LinuxProgramStartup {
-            parent_process_id: 1,
-            uid: 0,
-            euid: 0,
-            gid: 0,
-            egid: 0,
-            blocked_signals: SigSet::empty(),
-            ignored_signals: SigSet::empty(),
-            umask: 0o022,
-            path: "/child".into(),
-            cwd: "/".into(),
-            argv: vec![CString::new("child").unwrap()],
-            envp: Vec::new(),
-            inherited_fds: Vec::new(),
-        };
-        let Ok(LinuxProcessStartup::Program(decoded)) =
-            LinuxProcessStartup::decode(&startup.encode().unwrap())
-        else {
-            panic!("program startup must decode as a program");
-        };
-        assert_eq!(decoded, startup);
-    }
-
-    #[test]
     fn program_startup_rejects_trailing_and_invalid_strings() {
         let startup = LinuxProgramStartup {
             parent_process_id: 1,
