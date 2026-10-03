@@ -1413,52 +1413,6 @@ impl<const PAGE_SIZE: usize> litebox::platform::PageManagementProvider<PAGE_SIZE
     }
 }
 
-#[cfg(test)]
-impl<const PAGE_SIZE: usize> MacosUserlandWithPageSize<PAGE_SIZE> {
-    fn allocate_pages(
-        &self,
-        range: Range<usize>,
-        permissions: MemoryRegionPermissions,
-        can_grow_down: bool,
-        populate_pages_immediately: bool,
-        behavior: FixedAddressBehavior,
-    ) -> Result<<Self as litebox::platform::RawPointerProvider>::RawMutPointer<u8>, AllocationError>
-    {
-        let reservation = unsafe {
-            <Self as litebox::platform::PageManagementProvider<PAGE_SIZE>>::reserve_and_commit_pages(
-                self,
-                core::iter::empty,
-                range,
-                permissions,
-                can_grow_down,
-                populate_pages_immediately,
-                behavior,
-            )
-        }?;
-        let extent: Range<usize> = reservation.into();
-        Ok(
-            <Self as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
-                extent.start,
-            ),
-        )
-    }
-
-    unsafe fn update_permissions(
-        &self,
-        range: Range<usize>,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<(), PermissionUpdateError> {
-        unsafe {
-            <Self as litebox::platform::PageManagementProvider<PAGE_SIZE>>::protect_pages(
-                self,
-                core::iter::empty,
-                range,
-                permissions,
-            )
-        }
-    }
-}
-
 /// Layout of LiteBox's per-thread AArch64 state.
 ///
 /// Field offsets are shared with transition assembly and rewritten guest gates.
@@ -3495,7 +3449,7 @@ mod tests {
     use litebox::platform::{
         PageManagementProvider as _, RawMutPointer as _, SignalProvider as _,
         SystemInfoProvider as _, ThreadProvider as _, TimerHandle as _, TimerProvider as _,
-        page_mgmt::AllocationDirection,
+        page_mgmt::{AllocationDirection, PageReservation as _},
     };
     use std::boxed::Box;
     const RW: MemoryRegionPermissions =
@@ -3972,16 +3926,18 @@ mod tests {
     fn native_page_size_rejects_subpage_operations() {
         let platform = MacosUserland::new();
         assert_eq!(HOST_PAGE_SIZE, 16384);
-        let base = platform
-            .allocate_pages(
+        let reservation = unsafe {
+            platform.reserve_and_commit_pages(
+                core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
-            .unwrap()
-            .as_usize();
+        }
+        .unwrap();
+        let base = reservation.range().start;
         let _cleanup = litebox::utils::defer(|| {
             // SAFETY: this test owns the range and never executes it.
             unsafe {
@@ -3994,19 +3950,26 @@ mod tests {
         // assertions also run with subpage_compat enabled through another crate.
         for range in [base..base + 4096, base + 4096..base + HOST_PAGE_SIZE] {
             assert!(matches!(
-                platform.allocate_pages(
-                    range.clone(),
-                    RW,
-                    false,
-                    true,
-                    FixedAddressBehavior::Replace,
-                ),
+                unsafe {
+                    platform.reserve_and_commit_pages(
+                        core::iter::empty,
+                        range.clone(),
+                        RW,
+                        false,
+                        true,
+                        FixedAddressBehavior::Replace,
+                    )
+                },
                 Err(AllocationError::Unaligned)
             ));
             // SAFETY: these invalid ranges are within our idle mapping.
             unsafe {
                 assert!(matches!(
-                    platform.update_permissions(range.clone(), MemoryRegionPermissions::READ),
+                    platform.protect_pages(
+                        || core::iter::once(&reservation),
+                        range.clone(),
+                        MemoryRegionPermissions::READ,
+                    ),
                     Err(PermissionUpdateError::Unaligned)
                 ));
                 assert!(matches!(
@@ -4022,26 +3985,37 @@ mod tests {
     fn native_and_subpage_instances_keep_distinct_permissions() {
         let native = MacosUserland::new();
         let compat = MacosUserland4K::new();
-        let native_memory = native
-            .allocate_pages(
+        let native_reservation = unsafe {
+            native.reserve_and_commit_pages(
+                core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
-            .unwrap();
-        let compat_memory = compat
-            .allocate_pages(
+        }
+        .unwrap();
+        let compat_reservation = unsafe {
+            compat.reserve_and_commit_pages(
+                core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + 8192,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
-            .unwrap();
-        let base = native_memory.as_usize();
-        let subpage_base = compat_memory.as_usize();
+        }
+        .unwrap();
+        let base = native_reservation.range().start;
+        let subpage_base = compat_reservation.range().start;
+        let native_memory = <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<
+            u8,
+        >::from_usize(base);
+        let compat_memory =
+            <MacosUserland4K as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                subpage_base,
+            );
         let _cleanup = litebox::utils::defer(|| {
             // SAFETY: both ranges belong to this test and have no active users.
             unsafe {
@@ -4062,10 +4036,15 @@ mod tests {
         // SAFETY: this test owns both idle ranges.
         unsafe {
             native
-                .update_permissions(base..base + HOST_PAGE_SIZE, MemoryRegionPermissions::READ)
+                .protect_pages(
+                    || core::iter::once(&native_reservation),
+                    base..base + HOST_PAGE_SIZE,
+                    MemoryRegionPermissions::READ,
+                )
                 .unwrap();
             compat
-                .update_permissions(
+                .protect_pages(
+                    || core::iter::once(&compat_reservation),
                     subpage_base..subpage_base + 4096,
                     MemoryRegionPermissions::READ,
                 )
@@ -4577,6 +4556,164 @@ mod tests {
     }
 
     #[test]
+    fn child_inherits_vector_state_and_dispatches_on_host_stack() {
+        use litebox::shim::InitThread;
+        use litebox_syscall_rewriter::{
+            RewriteOptions, TargetHost, patch_code_segment_with_options,
+        };
+
+        #[derive(Debug, PartialEq)]
+        enum Event {
+            VectorStateInherited(bool),
+            EnteredOnHostStack(bool),
+            SyscallOnHostStackWithVectorState(bool),
+            Done,
+        }
+        struct VectorStateProbe {
+            entry: usize,
+            stack: usize,
+            vector_state: GuestVectorState,
+            send: std::sync::mpsc::Sender<Event>,
+        }
+        fn altstack_is_installed_and_inactive() -> bool {
+            // SAFETY: stack_t is zero-valid writable output for this thread's query.
+            let mut stack = unsafe { core::mem::zeroed::<libc::stack_t>() };
+            // SAFETY: null requests a query; stack remains writable for the call.
+            let result = unsafe { libc::sigaltstack(core::ptr::null(), &raw mut stack) };
+            result == 0 && stack.ss_flags & (libc::SS_ONSTACK | libc::SS_DISABLE) == 0
+        }
+        impl InitThread for VectorStateProbe {
+            type ExecutionContext = PtRegs;
+            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
+                self.send
+                    .send(Event::VectorStateInherited(
+                        get_guest_vector_state() == self.vector_state,
+                    ))
+                    .unwrap();
+                self
+            }
+        }
+        impl EnterShim for VectorStateProbe {
+            type ExecutionContext = PtRegs;
+            fn init(&self, ctx: &mut PtRegs) -> ContinueOperation {
+                self.send
+                    .send(Event::EnteredOnHostStack(
+                        altstack_is_installed_and_inactive(),
+                    ))
+                    .unwrap();
+                ctx.pc = self.entry;
+                ctx.sp = self.stack;
+                ctx.regs[8] = 172; // getpid
+                ContinueOperation::Resume
+            }
+            fn syscall(&self, _: &mut PtRegs) -> ContinueOperation {
+                self.send
+                    .send(Event::SyscallOnHostStackWithVectorState(
+                        altstack_is_installed_and_inactive()
+                            && get_guest_vector_state() == self.vector_state,
+                    ))
+                    .unwrap();
+                ContinueOperation::Terminate
+            }
+            fn exception(&self, _: &mut PtRegs, _: &ExceptionInfo) -> ContinueOperation {
+                ContinueOperation::Terminate
+            }
+            fn interrupt(&self, _: &mut PtRegs) -> ContinueOperation {
+                ContinueOperation::Resume
+            }
+        }
+        impl Drop for VectorStateProbe {
+            fn drop(&mut self) {
+                let _ = self.send.send(Event::Done);
+            }
+        }
+
+        set_guest_abi(GuestAbi::Linux);
+        let platform = MacosUserland::new();
+        let reservation = unsafe {
+            platform.reserve_and_commit_pages(
+                core::iter::empty,
+                TASK_ADDR_MIN..TASK_ADDR_MIN + 3 * HOST_PAGE_SIZE,
+                RW,
+                false,
+                true,
+                FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
+            )
+        }
+        .unwrap();
+        let base = reservation.range().start;
+        let memory =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                base,
+            );
+        let mut code = 0xd4000001u32.to_le_bytes();
+        let (trampoline, trapped) = patch_code_segment_with_options(
+            &mut code,
+            base as u64,
+            (base + HOST_PAGE_SIZE / 2) as u64,
+            platform.get_syscall_entry_point() as u64,
+            RewriteOptions::new(TargetHost::MacOs, true),
+        )
+        .unwrap();
+        assert_eq!(trapped, []);
+        assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
+        assert_eq!(
+            memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), &trampoline),
+            Some(())
+        );
+        // SAFETY: code is initialized and has no active readers before publication.
+        unsafe {
+            platform
+                .protect_pages(
+                    || core::iter::once(&reservation),
+                    base..base + HOST_PAGE_SIZE,
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                )
+                .unwrap();
+        }
+        let original_vector_state = get_guest_vector_state();
+        let _restore = litebox::utils::defer(|| set_guest_vector_state(&original_vector_state));
+        let mut vector_state = GuestVectorState::default();
+        vector_state.registers[0] = 0x1234;
+        vector_state.registers[31] = 0x5678;
+        set_guest_vector_state(&vector_state);
+        let (send, receive) = std::sync::mpsc::channel();
+        // SAFETY: the test retains the child's rewritten code and stack until
+        // VectorStateProbe is dropped.
+        unsafe {
+            platform
+                .spawn_thread(
+                    &PtRegs::default(),
+                    Box::new(VectorStateProbe {
+                        entry: base,
+                        stack: base + 3 * HOST_PAGE_SIZE,
+                        vector_state,
+                        send,
+                    }),
+                )
+                .unwrap();
+        }
+        let observed: Vec<_> = (0..4)
+            .map(|_| receive.recv_timeout(Duration::from_secs(5)).unwrap())
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                Event::VectorStateInherited(true),
+                Event::EnteredOnHostStack(true),
+                Event::SyscallOnHostStackWithVectorState(true),
+                Event::Done
+            ]
+        );
+        // SAFETY: VectorStateProbe has stopped, so the guest mappings are idle.
+        unsafe {
+            platform
+                .release_pages(base..base + 3 * HOST_PAGE_SIZE)
+                .unwrap();
+        }
+    }
+
+    #[test]
     fn pstate_capture_and_restore_preserve_only_user_bits() {
         use litebox_common_linux::arch::{
             PSR_DIT_BIT, PSR_NZCV_MASK, PSR_SSBS_BIT, SAFE_USER_PSTATE,
@@ -4688,16 +4825,22 @@ mod tests {
     #[test]
     fn executable_protection_after_prot_none() {
         let p = MacosUserland::new();
-        let ptr = p
-            .allocate_pages(
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
-            .unwrap();
-        let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
+        }
+        .unwrap();
+        let range = reservation.range();
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                range.start,
+            );
         let _unmap = litebox::utils::defer(|| {
             // SAFETY: the test owns the mapping and its code has returned before cleanup.
             unsafe {
@@ -4716,9 +4859,18 @@ mod tests {
             // SAFETY: the test exclusively owns the mapping; its RX code is a C-ABI mov/ret stub.
             // The assembly declares the call's register clobbers.
             unsafe {
-                p.update_permissions(range.clone(), MemoryRegionPermissions::empty())
-                    .unwrap();
-                p.update_permissions(range.clone(), permissions).unwrap();
+                p.protect_pages(
+                    || core::iter::once(&reservation),
+                    range.clone(),
+                    MemoryRegionPermissions::empty(),
+                )
+                .unwrap();
+                p.protect_pages(
+                    || core::iter::once(&reservation),
+                    range.clone(),
+                    permissions,
+                )
+                .unwrap();
                 let value: usize;
                 core::arch::asm!("blr {entry}", entry = in(reg) range.start,
                     lateout("x0") value, clobber_abi("C"));
@@ -4751,13 +4903,16 @@ mod tests {
                 .unwrap()
             };
             let end = source.as_usize() + HOST_PAGE_SIZE;
-            match p.allocate_pages(
-                end..end + HOST_PAGE_SIZE,
-                RW,
-                false,
-                true,
-                FixedAddressBehavior::NoReplace,
-            ) {
+            match unsafe {
+                p.reserve_and_commit_pages(
+                    core::iter::empty,
+                    end..end + HOST_PAGE_SIZE,
+                    RW,
+                    false,
+                    true,
+                    FixedAddressBehavior::NoReplace,
+                )
+            } {
                 Ok(blocker) => break (source, blocker),
                 Err(AllocationError::AddressInUseByPlatform) => {
                     rejected_sources.push(source);
@@ -4771,7 +4926,7 @@ mod tests {
                 unsafe { mm.remove_pages(rejected, HOST_PAGE_SIZE).unwrap() };
             }
         });
-        let blocker_range = blocker.as_usize()..blocker.as_usize() + HOST_PAGE_SIZE;
+        let blocker_range = blocker.range();
         let _blocker_cleanup = litebox::utils::defer(|| {
             // SAFETY: the test owns the external blocker and no longer accesses it.
             unsafe { p.release_pages(blocker_range).unwrap() };
@@ -4809,16 +4964,18 @@ mod tests {
     #[test]
     fn permission_denials_are_not_reported_as_missing_pages() {
         let p = MacosUserland::new();
-        let ptr = p
-            .allocate_pages(
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
-            .unwrap();
-        let range = ptr.as_usize()..ptr.as_usize() + HOST_PAGE_SIZE;
+        }
+        .unwrap();
+        let range = reservation.range();
         let _unmap = litebox::utils::defer(|| {
             // SAFETY: the test owns this mapping and has no active accesses at cleanup.
             unsafe {
@@ -4826,18 +4983,14 @@ mod tests {
             }
         });
         assert!(matches!(
-            p.allocate_pages(
-                range.clone(),
-                RW | MemoryRegionPermissions::EXEC,
-                false,
-                true,
-                FixedAddressBehavior::Replace
-            ),
-            Err(AllocationError::PermissionDenied)
-        ));
-        assert!(matches!(
             // SAFETY: the test owns the idle mapping; denied permissions must leave it intact.
-            unsafe { p.update_permissions(range.clone(), RW | MemoryRegionPermissions::EXEC) },
+            unsafe {
+                p.protect_pages(
+                    || core::iter::once(&reservation),
+                    range.clone(),
+                    RW | MemoryRegionPermissions::EXEC,
+                )
+            },
             Err(PermissionUpdateError::PermissionDenied)
         ));
         // SAFETY: this aligned range is exclusively test-owned; no live references require write access.
@@ -4853,26 +5006,45 @@ mod tests {
                 KernReturn::SUCCESS
             );
             assert!(matches!(
-                p.update_permissions(range.clone(), RW),
+                p.protect_pages(|| core::iter::once(&reservation), range.clone(), RW),
                 Err(PermissionUpdateError::PermissionDenied)
             ));
         }
+        assert!(matches!(
+            unsafe {
+                p.reserve_and_commit_pages(
+                    || core::iter::once(reservation),
+                    range.clone(),
+                    RW | MemoryRegionPermissions::EXEC,
+                    false,
+                    true,
+                    FixedAddressBehavior::Replace,
+                )
+            },
+            Err(AllocationError::PermissionDenied)
+        ));
     }
 
     #[test]
     fn native_pages_preserve_neighbors_and_reject_collisions() {
         // Native-page boundaries still provide exact hardware protection.
         let p = MacosUserland::new();
-        let ptr = p
-            .allocate_pages(
+        let reservation = unsafe {
+            p.reserve_and_commit_pages(
+                core::iter::empty,
                 TASK_ADDR_MIN..TASK_ADDR_MIN + 2 * HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
             )
-            .unwrap();
-        let base = ptr.as_usize();
+        }
+        .unwrap();
+        let base = reservation.range().start;
+        let ptr =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                base,
+            );
         assert_eq!(base % HOST_PAGE_SIZE, 0);
         assert_eq!(ptr.read_at_offset(0), Some(0));
         assert_eq!(
@@ -4880,28 +5052,41 @@ mod tests {
             Some(())
         );
         assert!(matches!(
-            p.allocate_pages(
+            unsafe {
+                p.reserve_and_commit_pages(
+                    core::iter::empty,
+                    base..base + HOST_PAGE_SIZE,
+                    RW,
+                    false,
+                    true,
+                    FixedAddressBehavior::NoReplace,
+                )
+            },
+            Err(AllocationError::AddressInUse)
+        ));
+        let (prefix, replaced, suffix) = reservation.split(base..base + HOST_PAGE_SIZE);
+        assert!(prefix.is_none());
+        let _remaining = suffix.unwrap();
+        let replacement = unsafe {
+            p.reserve_and_commit_pages(
+                || core::iter::once(replaced),
                 base..base + HOST_PAGE_SIZE,
                 RW,
                 false,
                 true,
-                FixedAddressBehavior::NoReplace
-            ),
-            Err(AllocationError::AddressInUse)
-        ));
-        p.allocate_pages(
-            base..base + HOST_PAGE_SIZE,
-            RW,
-            false,
-            true,
-            FixedAddressBehavior::Replace,
-        )
+                FixedAddressBehavior::Replace,
+            )
+        }
         .unwrap();
         assert_eq!(ptr.read_at_offset(HOST_PAGE_SIZE.cast_signed()), Some(0x5a));
         // SAFETY: no accesses to the first test-owned page overlap this permission change.
         unsafe {
-            p.update_permissions(base..base + HOST_PAGE_SIZE, MemoryRegionPermissions::READ)
-                .unwrap();
+            p.protect_pages(
+                || core::iter::once(&replacement),
+                base..base + HOST_PAGE_SIZE,
+                MemoryRegionPermissions::READ,
+            )
+            .unwrap();
         }
         assert_eq!(ptr.write_at_offset(0, 1), None); // Fault-safe exception-table recovery
         assert_eq!(
@@ -4945,13 +5130,16 @@ mod tests {
             FixedAddressBehavior::Replace,
         ] {
             assert!(matches!(
-                p.allocate_pages(
-                    host as usize..host as usize + HOST_PAGE_SIZE,
-                    RW,
-                    false,
-                    true,
-                    behavior
-                ),
+                unsafe {
+                    p.reserve_and_commit_pages(
+                        core::iter::empty,
+                        host as usize..host as usize + HOST_PAGE_SIZE,
+                        RW,
+                        false,
+                        true,
+                        behavior,
+                    )
+                },
                 Err(AllocationError::AddressInUseByPlatform)
             ));
         }
