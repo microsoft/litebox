@@ -130,8 +130,8 @@ fn page_align_down(address: usize) -> usize {
     address & !(PAGE_SIZE - 1)
 }
 
-fn page_align_up(len: usize) -> usize {
-    len.next_multiple_of(PAGE_SIZE)
+fn page_align_up(len: usize) -> Option<usize> {
+    len.checked_next_multiple_of(PAGE_SIZE)
 }
 
 /// Errors that can occur when parsing an ELF file.
@@ -394,7 +394,7 @@ impl ElfParsedFile {
         }
 
         // The trampoline code should immediately precede the header.
-        if file_offset + trampoline_size as u64 != header_offset {
+        if file_offset.checked_add(trampoline_size as u64) != Some(header_offset) {
             return Err(ElfParseError::BadTrampoline);
         }
 
@@ -507,6 +507,8 @@ impl ElfParsedFile {
             0
         };
 
+        let checked_add =
+            |a: usize, b: usize| a.checked_add(b).ok_or(ElfLoadError::InvalidProgramHeader);
         let mut brk = 0;
         let mut phdrs_addr = 0;
         for ph in self.pt_loads() {
@@ -524,10 +526,12 @@ impl ElfParsedFile {
                 write: (ph.p_flags & elf::abi::PF_W) != 0,
                 execute: (ph.p_flags & elf::abi::PF_X) != 0,
             };
-            let adjusted_vaddr = base_addr + p_vaddr;
+            let adjusted_vaddr = checked_add(base_addr, p_vaddr)?;
             let load_start = page_align_down(adjusted_vaddr);
-            let file_end = page_align_up(adjusted_vaddr + p_filesz);
-            let load_end = page_align_up(adjusted_vaddr + p_memsz);
+            let file_end = page_align_up(checked_add(adjusted_vaddr, p_filesz)?)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let load_end = page_align_up(checked_add(adjusted_vaddr, p_memsz)?)
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
             if file_end > load_start {
                 // Map the file-backed portion.
                 // `p_offset` should be co-aligned with `p_vaddr`. If it is not,
@@ -587,7 +591,11 @@ impl ElfParsedFile {
             // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
             // will allocate the actual trampoline in this region via MAP_FIXED.
             // Match the runtime rewriter's native-page-aligned placement.
-            info.brk = info.brk.next_multiple_of(HOST_PAGE_SIZE) + page_align_up(size);
+            info.brk = info
+                .brk
+                .checked_next_multiple_of(HOST_PAGE_SIZE)
+                .and_then(|start| page_align_up(size).and_then(|size| start.checked_add(size)))
+                .ok_or(ElfLoadError::InvalidProgramHeader)?;
         }
 
         // The initial writable brk heap must not share native backing with an
@@ -604,8 +612,11 @@ impl ElfParsedFile {
         info: &mut MappingInfo,
     ) -> Result<(), ElfLoadError<M::Error>> {
         let trampoline = self.trampoline.as_ref().unwrap();
-        let trampoline_start = info.base_addr + trampoline.vaddr;
-        let trampoline_end = page_align_up(info.base_addr + trampoline.vaddr + trampoline.size);
+        let range = self
+            .trampoline_page_range(info.base_addr)
+            .ok_or(ElfLoadError::InvalidProgramHeader)?;
+        let trampoline_start = range.start;
+        let trampoline_end = range.end;
         if M::POPULATES_TRAMPOLINE {
             info.brk = info.brk.max(trampoline_end);
             return Ok(());
