@@ -25,7 +25,7 @@ use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher}
 #[cfg(target_os = "linux")]
 use linux::PlatformRunnerEndpoint;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::create_process_image;
+pub(crate) use linux::create_image;
 #[cfg(target_os = "linux")]
 use linux::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
