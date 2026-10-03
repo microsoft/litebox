@@ -1,0 +1,24 @@
+[package]
+name = "litebox_runner_vm_kernel"
+version = "0.1.0"
+edition = "2024"
+description = "LiteBox as the guest kernel of a QEMU VM, hosting ring-3 runner processes"
+
+[dependencies]
+arrayvec = { version = "0.7.6", default-features = false }
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+litebox_bootloader = { version = "0.1.0", path = "../litebox_bootloader" }
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
+litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
+litebox_common_vm_abi = { version = "0.1.0", path = "../litebox_common_vm_abi" }
+litebox_platform_vm_kernel = { version = "0.1.0", path = "../litebox_platform_vm_kernel" }
+litebox_shim_vm_kernel = { version = "0.1.0", path = "../litebox_shim_vm_kernel" }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+log = { version = "0.4", default-features = false }
+serde = { version = "1.0.142", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1.0.142", default-features = false, features = ["alloc"] }
+tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

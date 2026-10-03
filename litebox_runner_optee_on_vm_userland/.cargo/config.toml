@@ -1,0 +1,8 @@
+# Static PIE: the kernel loads it high and relocates it.
+[build]
+target = "x86_64-unknown-none"
+# Separate, so the different flags do not invalidate the workspace's builds.
+target-dir = "../target/vm_userland"
+
+[target.x86_64-unknown-none]
+rustflags = ["-C", "relocation-model=pic", "-C", "code-model=small"]

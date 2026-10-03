@@ -1,0 +1,30 @@
+[package]
+name = "litebox_shim_vm_kernel"
+version = "0.1.0"
+edition = "2024"
+description = "Kernel side of the LiteBox VM userland ABI: hosts ring-3 runner processes"
+
+[dependencies]
+elf = { version = "0.8.0", default-features = false }
+hmac = { version = "0.12", default-features = false }
+litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
+litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
+litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0" }
+litebox_common_vm_abi = { path = "../litebox_common_vm_abi", version = "0.1.0" }
+litebox_platform_vm_kernel = { path = "../litebox_platform_vm_kernel", version = "0.1.0" }
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+log = { version = "0.4", default-features = false }
+rangemap = { version = "1.5.1", features = ["const_fn"] }
+sha2 = { version = "0.10", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+# The SIMD backend fails to compile (LLVM error) for soft-float kernel targets.
+[target.'cfg(target_os = "none")'.dependencies]
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[lints]
+workspace = true

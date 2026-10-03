@@ -17,6 +17,7 @@ members = [
     "litebox_common_macos",
     "litebox_common_windows",
     "litebox_common_optee",
+    "litebox_common_vm_abi",
     "litebox_common_lvbs",
     "litebox_platform",
     "litebox_egress_proxy",
@@ -26,6 +27,7 @@ members = [
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
     "litebox_platform_vm_kernel",
+    "litebox_platform_vm_userland",
     "litebox_bootloader",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_macos_userland",
@@ -35,11 +37,14 @@ members = [
     "litebox_runner_windows_userland",
     "litebox_runner_lvbs",
     "litebox_runner_optee_on_qemu",
+    "litebox_runner_optee_on_vm_userland",
+    "litebox_runner_vm_kernel",
     "litebox_runner_snp",
     "litebox_runner_optee_on_linux_userland",
     "litebox_shim_linux",
     "litebox_shim_macos",
     "litebox_shim_windows",
+    "litebox_shim_vm_kernel",
     "litebox_service_heki",
     "litebox_syscall_rewriter",
     "litebox_packager",
@@ -67,6 +72,7 @@ default-members = [
     "litebox_common_macos",
     "litebox_common_windows",
     "litebox_common_optee",
+    "litebox_common_vm_abi",
     "litebox_common_lvbs",
     "litebox_platform",
     "litebox_egress_proxy",
@@ -76,6 +82,7 @@ default-members = [
     "litebox_platform_windows_userland",
     "litebox_platform_lvbs",
     "litebox_platform_vm_kernel",
+    "litebox_platform_vm_userland",
     "litebox_runner_linux_userland",
     "litebox_runner_linux_on_windows_userland",
     "litebox_runner_macos_userland",
@@ -85,6 +92,7 @@ default-members = [
     "litebox_shim_macos",
     "litebox_shim_windows",
     "litebox_shim_optee",
+    "litebox_shim_vm_kernel",
     "litebox_service_heki",
     "litebox_syscall_rewriter",
     "litebox_packager",
@@ -95,7 +103,8 @@ default-members = [
 ]
 # We exclude `litebox_runner_lvbs` from `default-members` because it requires
 # a custom target and `-Z build-std`, which requires a nightly toolchain.
-# `litebox_runner_optee_on_qemu` is excluded because it only builds for
+# `litebox_runner_optee_on_qemu`, `litebox_runner_vm_kernel`, and
+# `litebox_runner_optee_on_vm_userland` are excluded because they only build for
 # `x86_64-unknown-none`. `litebox_bootloader` is excluded because it is empty
 # except on that target (it still builds, as an empty crate, on others).
 

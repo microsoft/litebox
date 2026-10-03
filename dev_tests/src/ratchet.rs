@@ -78,10 +78,13 @@ fn ratchet_globals() -> Result<()> {
             ("litebox_platform_macos_userland/", 7),
             ("litebox_platform_lvbs/", 21),
             ("litebox_platform_vm_kernel/", 4),
+            ("litebox_platform_vm_userland/", 1),
             ("litebox_platform_windows_userland/", 12),
             ("litebox_runner_lvbs/", 8),
             ("litebox_runner_optee_on_qemu/", 1),
+            ("litebox_runner_optee_on_vm_userland/", 2),
             ("litebox_runner_snp/", 2),
+            ("litebox_runner_vm_kernel/", 1),
             ("litebox_runner_windows_userland/", 2),
             ("litebox_shim_linux/", 2),
             ("litebox_shim_optee/", 6),
@@ -115,6 +118,7 @@ fn ratchet_maybe_uninit() -> Result<()> {
             ("litebox_broker_transport_linux_userland/", 3),
             ("litebox_platform_linux_userland/", 2),
             ("litebox_platform_macos_userland/", 2),
+            ("litebox_platform_vm_userland/", 1),
         ],
         |file| {
             Ok(file
