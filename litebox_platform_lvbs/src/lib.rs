@@ -1826,7 +1826,9 @@ unsafe extern "C" fn run_thread_arch(
 }
 
 unsafe extern "C" fn init_handler(thread_ctx: &ThreadContext) {
-    // SAFETY: user-mode entry; no other reference to `ctx` is live.
+    // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
+    // is blocked in `run_thread_arch` and does not touch it, so the pointer is
+    // valid and this is the only reference.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     match thread_ctx.shim.init(ctx) {
         ContinueOperation::Resume => {
@@ -1840,7 +1842,9 @@ unsafe extern "C" fn init_handler(thread_ctx: &ThreadContext) {
 }
 
 unsafe extern "C" fn reenter_handler(thread_ctx: &ThreadContext) {
-    // SAFETY: user-mode entry; no other reference to `ctx` is live.
+    // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
+    // is blocked in `run_thread_arch` and does not touch it, so the pointer is
+    // valid and this is the only reference.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     match thread_ctx.shim.reenter(ctx) {
         ContinueOperation::Resume => {
@@ -1854,7 +1858,9 @@ unsafe extern "C" fn reenter_handler(thread_ctx: &ThreadContext) {
 }
 
 unsafe extern "C" fn syscall_handler(thread_ctx: &ThreadContext) {
-    // SAFETY: user-mode entry; no other reference to `ctx` is live.
+    // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
+    // is still blocked in `run_thread_arch`, so the pointer is valid. We entered
+    // from user mode, so no shim call is in progress and no other reference exists.
     let ctx = unsafe { &mut *thread_ctx.ctx };
     if !ctx.has_user_return_addresses() {
         return;
@@ -1913,11 +1919,14 @@ unsafe extern "C" fn exception_handler(
     faulting_rip: usize,
 ) -> usize {
     let mut scratch = litebox_common_linux::PtRegs::default();
-    // A kernel-mode #PF may nest inside a shim call holding `&mut` to the user context.
-    // SAFETY: otherwise this is a user-mode entry; no other reference to `ctx` is live.
+    // A kernel-mode #PF may interrupt a shim call that is using the user context,
+    // so give the shim a scratch context instead.
     let ctx = if kernel_mode {
         &mut scratch
     } else {
+        // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
+        // is still blocked in `run_thread_arch`, so the pointer is valid. We entered
+        // from user mode, so no shim call is in progress and no other reference exists.
         unsafe { &mut *thread_ctx.ctx }
     };
     let info = if kernel_mode {
