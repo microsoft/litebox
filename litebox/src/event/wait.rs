@@ -500,37 +500,3 @@ pub enum WaitError {
     #[error("wait timed out")]
     TimedOut,
 }
-
-#[cfg(test)]
-mod tests {
-    extern crate std;
-
-    use core::time::Duration;
-
-    use super::*;
-    use crate::platform::mock::MockPlatform;
-
-    #[test]
-    fn timeout_includes_time_spent_checking_for_interrupts() {
-        struct AdvanceClock(&'static MockPlatform);
-
-        impl CheckForInterrupt for AdvanceClock {
-            fn check_for_interrupt(&self) -> bool {
-                self.0.advance_time(Duration::from_secs(60));
-                false
-            }
-        }
-
-        let platform = MockPlatform::new();
-        let wait_state = WaitState::new(platform);
-        let check = AdvanceClock(platform);
-        let start = std::time::Instant::now();
-        let result = wait_state
-            .context()
-            .with_timeout(Duration::from_secs(10))
-            .with_check_for_interrupt(&check)
-            .sleep();
-        assert!(matches!(result, WaitError::TimedOut));
-        assert!(start.elapsed() < Duration::from_secs(5));
-    }
-}

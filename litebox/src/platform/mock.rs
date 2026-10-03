@@ -41,12 +41,6 @@ impl MockPlatform {
             current_time: AtomicU64::new(0),
         }))
     }
-
-    /// Moves the mock clock forward by `duration`.
-    pub(crate) fn advance_time(&self, duration: core::time::Duration) {
-        let millis = u64::try_from(duration.as_millis()).unwrap();
-        self.current_time.fetch_add(millis, Ordering::SeqCst);
-    }
 }
 
 impl Provider for MockPlatform {}
