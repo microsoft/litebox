@@ -840,7 +840,7 @@ where
     ///
     /// It fails if it resizes more than one mapping or needs to split the current mapping
     /// (due to enlarging). When enlarging, adjacent mappings that differ only in
-    /// [`VmFlags::VM_HAS_CONTENTS`] count as one, which may hold data.
+    /// [`VmFlags::VM_HAS_CONTENTS`] count as one.
     ///
     /// See <https://elixir.bootlin.com/linux/v5.19.17/source/mm/mremap.c#L886> for reference.
     ///
@@ -857,72 +857,47 @@ where
     {
         let range = range.start..range.end;
         // `cur_range` contains `range.start`
-        let (mut cur_range, mut cur_vma) = self
+        let cur_range = self
             .vmas
             .get_key_value(&range.start)
-            .map(|(cur_range, cur_vma)| (cur_range.clone(), *cur_vma))
+            .map(|(cur_range, _)| cur_range.clone())
             .ok_or(VmemResizeError::NotExist(range.start))?;
 
-        let new_end = range
-            .start
-            .checked_add(new_size.as_usize())
-            .ok_or(VmemResizeError::OutOfMemory)?;
-        match new_end.cmp(&range.end) {
-            core::cmp::Ordering::Equal => {
-                // no change
-                return Ok(());
-            }
-            core::cmp::Ordering::Less => {
+        let new_end = range.start.checked_add(new_size.as_usize());
+        if let Some(new_end) = new_end
+            && new_end <= range.end
+        {
+            if new_end < range.end {
                 // shrink
                 let range = PageRange::new(new_end, range.end).unwrap();
                 unsafe { self.remove_mapping(range) }.unwrap();
-                return Ok(());
             }
-            core::cmp::Ordering::Greater => {}
+            return Ok(());
         }
 
         // grow
-        if range.end > cur_range.end {
-            // Areas that differ only in whether they may hold data, such as those left by making
-            // part of an inaccessible area accessible and back, are one area to Linux.
-            let mut flags = cur_vma.flags();
-            let mut end = cur_range.end;
-            while end < range.end
-                && let Some((next_range, next_vma)) = self.vmas.get_key_value(&end)
-                && next_vma.is_file_backed() == cur_vma.is_file_backed()
-                && ((next_vma.flags() ^ cur_vma.flags()) - VmFlags::VM_HAS_CONTENTS).is_empty()
-            {
-                flags |= next_vma.flags();
-                end = next_range.end;
-            }
-            if end < range.end {
-                // we can't remap across vm area boundaries
-                return Err(VmemResizeError::InvalidAddr {
-                    range: cur_range,
-                    addr: range.end,
-                });
-            }
-            self.vmas.insert(
-                range.clone(),
-                VmArea {
-                    flags,
-                    is_file_backed: cur_vma.is_file_backed(),
-                },
-            );
-            (cur_range, cur_vma) = self
-                .vmas
-                .get_key_value(&range.start)
-                .map(|(cur_range, cur_vma)| (cur_range.clone(), *cur_vma))
-                .unwrap();
+        if self.merged_area(range.clone()).is_none() {
+            // we can't remap across vm area boundaries
+            return Err(VmemResizeError::InvalidAddr {
+                range: cur_range,
+                addr: range.end,
+            });
         }
+        let new_end = new_end.ok_or(VmemResizeError::OutOfMemory)?;
+        // `last_range` contains the last page of `range`
+        let (last_range, last_vma) = self
+            .vmas
+            .get_key_value(&(range.end - 1))
+            .map(|(last_range, last_vma)| (last_range.clone(), *last_vma))
+            .unwrap();
 
-        if range.end == cur_range.end {
-            // expand the current range
+        if range.end == last_range.end {
+            // expand the last range
             let r = range.end..new_end;
             if self.vmas.overlaps(&r) {
                 return Err(VmemResizeError::RangeOccupied(r));
             }
-            if cur_vma.is_file_backed() {
+            if last_vma.is_file_backed() {
                 unimplemented!("file-backed mapping expansion is not supported yet");
             }
             let range = PageRange::new(range.end, new_end).unwrap();
@@ -930,7 +905,7 @@ where
             // litebox mappings in this range, this may fail if there are
             // platform mappings in the way.
             match unsafe {
-                self.insert_mapping(range, cur_vma, false, FixedAddressBehavior::NoReplace)
+                self.insert_mapping(range, last_vma, false, FixedAddressBehavior::NoReplace)
             } {
                 Ok(_) => {}
                 Err(AllocationError::PermissionDenied) => {
@@ -950,8 +925,30 @@ where
             return Ok(());
         }
 
-        // has to split the current range and move it to somewhere else
-        Err(VmemResizeError::RangeOccupied(range.end..cur_range.end))
+        // has to split the last range and move it to somewhere else
+        Err(VmemResizeError::RangeOccupied(range.end..last_range.end))
+    }
+
+    /// Returns the one area Linux sees over `range`, if areas that differ only in
+    /// [`VmFlags::VM_HAS_CONTENTS`] cover it without gaps.
+    ///
+    /// Such areas, as left by making part of an inaccessible area accessible and back, are one
+    /// area to Linux. The returned area may hold data if any of them may.
+    fn merged_area(&self, range: Range<usize>) -> Option<VmArea> {
+        let (first_range, first) = self.vmas.get_key_value(&range.start)?;
+        let mut area = *first;
+        let mut end = first_range.end;
+        while end < range.end {
+            let (next_range, next) = self.vmas.get_key_value(&end)?;
+            if next.is_file_backed() != first.is_file_backed()
+                || !((next.flags() ^ first.flags()) - VmFlags::VM_HAS_CONTENTS).is_empty()
+            {
+                return None;
+            }
+            area.flags |= next.flags();
+            end = next_range.end;
+        }
+        Some(area)
     }
 
     /// Move a range from `old_range` to `suggested_new_range`.
@@ -970,7 +967,8 @@ where
     /// # Panics
     ///
     /// Panics if the size of `suggested_new_range` is smaller than the size of `old_range`.
-    /// Panics if the `old_range` is not covered by exactly one mapping.
+    /// Panics if the `old_range` is not covered by exactly one mapping, counting adjacent mappings
+    /// that differ only in [`VmFlags::VM_HAS_CONTENTS`] as one.
     pub(super) unsafe fn move_mappings(
         &mut self,
         old_range: PageRange<ALIGN>,
@@ -982,13 +980,9 @@ where
     {
         assert!(new_size.as_usize() >= old_range.len());
 
-        // Check if the given range is covered by exactly one mapping
-        let (cur_range, vma) = self
-            .vmas
-            .get_key_value(&old_range.start)
-            .expect("VMEM: range not found");
-        assert!(cur_range.contains(&(old_range.end - 1)));
-        let vma = *vma;
+        let vma = self
+            .merged_area(old_range.into())
+            .expect("VMEM: range not covered by one mapping");
 
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
@@ -2134,23 +2128,17 @@ mod tests {
         ] {
             unsafe { vmm.protect_mapping(accessed, permissions) }.unwrap();
         }
-        let has_contents = vmm
-            .iter()
-            .map(|(range, vma)| {
-                let contents = vma.flags().contains(VmFlags::VM_HAS_CONTENTS);
-                (range.clone(), contents)
-            })
-            .collect::<Vec<_>>();
         assert_eq!(
-            has_contents,
-            vec![
+            contents_by_area(&vmm),
+            [
                 (start..start + PAGE_SIZE, false),
                 (start + PAGE_SIZE..start + 2 * PAGE_SIZE, true),
                 (start + 2 * PAGE_SIZE..start + 3 * PAGE_SIZE, false),
             ]
         );
 
-        // Growing treats areas that differ only in whether they may hold data as one.
+        // Growing in place treats areas that differ only in whether they may hold data as one,
+        // without merging them.
         unsafe {
             vmm.resize_mapping(
                 PageRange::new(start, start + 3 * PAGE_SIZE).unwrap(),
@@ -2158,14 +2146,93 @@ mod tests {
             )
         }
         .unwrap();
+        let blocker = start + 5 * PAGE_SIZE..start + 6 * PAGE_SIZE;
+        unsafe {
+            vmm.create_mapping(
+                NonZeroAddress::new(blocker.start),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+        let split = [
+            (start..start + PAGE_SIZE, false),
+            (start + PAGE_SIZE..start + 2 * PAGE_SIZE, true),
+            (start + 2 * PAGE_SIZE..start + 4 * PAGE_SIZE, false),
+            (blocker, true),
+        ];
+        assert_eq!(contents_by_area(&vmm), split);
+
+        // Failed growth and moves leave them apart.
+        let grown = PageRange::new(start, start + 4 * PAGE_SIZE).unwrap();
+        let huge = NonZeroPageSize::new(usize::MAX & !(PAGE_SIZE - 1)).unwrap();
+        assert!(matches!(
+            unsafe { vmm.resize_mapping(grown, NonZeroPageSize::new(6 * PAGE_SIZE).unwrap()) },
+            Err(VmemResizeError::RangeOccupied(_))
+        ));
+        assert!(matches!(
+            unsafe { vmm.resize_mapping(grown, huge) },
+            Err(VmemResizeError::OutOfMemory)
+        ));
+        assert!(matches!(
+            unsafe { vmm.move_mappings(grown, None, huge) },
+            Err(VmemMoveError::OutOfMemory)
+        ));
+        assert_eq!(contents_by_area(&vmm), split);
+
+        // Moving them makes one area that may hold data.
+        let moved =
+            unsafe { vmm.move_mappings(grown, None, NonZeroPageSize::new(4 * PAGE_SIZE).unwrap()) }
+                .unwrap()
+                .as_usize();
         let areas = vmm
             .iter()
             .map(|(range, vma)| (range.clone(), vma.flags()))
             .collect::<Vec<_>>();
-        assert_eq!(areas.len(), 1);
-        assert_eq!(areas[0].0, start..start + 4 * PAGE_SIZE);
-        assert!(areas[0].1.contains(VmFlags::VM_HAS_CONTENTS));
-        assert!(!areas[0].1.intersects(VmFlags::VM_ACCESS_FLAGS));
+        assert_eq!(areas.len(), 2);
+        assert_eq!(areas[1].0, moved..moved + 4 * PAGE_SIZE);
+        assert!(areas[1].1.contains(VmFlags::VM_HAS_CONTENTS));
+        assert!(!areas[1].1.intersects(VmFlags::VM_ACCESS_FLAGS));
+    }
+
+    #[test]
+    fn growing_across_distinct_areas_fails_before_size_overflows() {
+        let start = DummyVmemBackend::<false>::TASK_ADDR_MIN;
+        let mut vmm = Vmem::new(dummy_backend::<false>(None));
+        for (offset, flags) in [
+            (0, VmFlags::VM_READ | VmFlags::VM_MAYREAD),
+            (PAGE_SIZE, VmFlags::VM_MAYREAD),
+        ] {
+            unsafe {
+                vmm.create_mapping(
+                    NonZeroAddress::new(start + offset),
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    VmArea::new(flags, false),
+                    CreatePagesFlags::FIXED_ADDR,
+                )
+            }
+            .unwrap();
+        }
+
+        assert!(matches!(
+            unsafe {
+                vmm.resize_mapping(
+                    PageRange::new(start, start + 2 * PAGE_SIZE).unwrap(),
+                    NonZeroPageSize::new(usize::MAX & !(PAGE_SIZE - 1)).unwrap(),
+                )
+            },
+            Err(VmemResizeError::InvalidAddr { .. })
+        ));
+    }
+
+    fn contents_by_area(vmm: &Vmem<DummyVmemBackend, PAGE_SIZE>) -> Vec<(Range<usize>, bool)> {
+        vmm.iter()
+            .map(|(range, vma)| {
+                let contents = vma.flags().contains(VmFlags::VM_HAS_CONTENTS);
+                (range.clone(), contents)
+            })
+            .collect()
     }
 
     #[test]

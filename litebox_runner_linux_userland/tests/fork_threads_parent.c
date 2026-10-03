@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -25,6 +26,7 @@ static struct {
 } counters;
 static atomic_int stop;
 static int reader_pipe[2];
+static atomic_int forkers_ready;
 
 static void *count_up(void *arg) {
     (void)arg;
@@ -67,11 +69,17 @@ static int wait_exit_code(pid_t child) {
     return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
+// Forks by system call, as glibc's fork() holds process-wide locks that would keep the forkers
+// from forking at once. Each child only reads memory and exits.
 static void *fork_repeatedly(void *arg) {
     (void)arg;
     long failures = 0;
     for (int i = 0; i < FORKS_PER_FORKER; i++) {
-        pid_t child = fork();
+        // Spin, rather than block, so the forkers make the system call at the same time.
+        atomic_fetch_add(&forkers_ready, 1);
+        while (atomic_load(&forkers_ready) < (i + 1) * FORKERS) {
+        }
+        pid_t child = (pid_t)syscall(SYS_fork);
         if (child == 0) {
             _exit(counters_consistent() ? 0 : 1);
         }
