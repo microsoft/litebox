@@ -1203,9 +1203,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// their open file descriptions, and of its signal dispositions, blocked mask, and alternate
     /// stack, but none of its pending signals, timers, or robust futex list. Memory regions
     /// formerly backed by files are copied as anonymous memory, and `MADV_DONTFORK` regions are
-    /// copied too. Floating-point and vector state is not copied. Like Linux, the child has a
-    /// single thread, a copy of the calling one; the parent's other threads pause while the
-    /// parent is copied.
+    /// copied too. Floating-point and vector state is not copied yet, because x86-64 platforms
+    /// cannot capture a guest thread's vector state until they implement
+    /// [`GuestVectorStateProvider`](litebox::platform::GuestVectorStateProvider) instead of
+    /// using its no-op default. Like Linux, the child has a single thread, a copy of the calling
+    /// one; the parent's other threads pause while the parent is copied.
     ///
     /// Only a process outside a `vfork` window, with default resource-limit and alarm state, no
     /// shared memory mappings, no ELF file mid-load, and only descriptors a fresh runner can
