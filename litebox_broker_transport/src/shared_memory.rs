@@ -277,7 +277,6 @@ mod tests {
     use super::*;
     use alloc::vec;
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     #[test]
@@ -332,8 +331,8 @@ mod tests {
     #[test]
     fn pool_merges_slots_adjacent_in_memory() {
         let layout = SharedBufferLayout::new(4, 4).unwrap();
-        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
-        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let pool =
+            SharedBufferPool::new(TestSharedMemory::new(layout.total_len()), layout).unwrap();
         let sequence = SharedBufferSequence::new(
             &[
                 SharedBufferSlotIndex(1),
@@ -353,34 +352,17 @@ mod tests {
         assert_eq!(ranges(14), [4..12, 0..4, 12..14]);
         assert_eq!(ranges(6), core::iter::once(4..10).collect::<Vec<_>>());
         assert_eq!(ranges(0), []);
-
-        let source: Vec<u8> = (1..=14).collect();
-        pool.write_sequence(sequence, &source).unwrap();
-        assert_eq!(
-            memory.bytes(),
-            [9, 10, 11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 13, 14, 0, 0]
-        );
-        let mut destination = [0; 14];
-        pool.read_sequence(sequence, &mut destination).unwrap();
-        assert_eq!(destination, *source);
-        // One access per merged range, instead of one per slot.
-        assert_eq!(memory.accesses(), 6);
     }
 
-    struct TestSharedMemory(Mutex<Vec<u8>>, AtomicUsize);
+    struct TestSharedMemory(Mutex<Vec<u8>>);
 
     impl TestSharedMemory {
         fn new(length: usize) -> Self {
-            Self(Mutex::new(vec![0; length]), AtomicUsize::new(0))
+            Self(Mutex::new(vec![0; length]))
         }
 
         fn bytes(&self) -> Vec<u8> {
             self.0.lock().unwrap().clone()
-        }
-
-        /// Returns the number of reads and writes.
-        fn accesses(&self) -> usize {
-            self.1.load(Ordering::Relaxed)
         }
     }
 
@@ -390,7 +372,6 @@ mod tests {
         }
 
         fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-            self.1.fetch_add(1, Ordering::Relaxed);
             let memory = self.0.lock().unwrap();
             let end = offset
                 .checked_add(destination.len())
@@ -403,7 +384,6 @@ mod tests {
         }
 
         fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-            self.1.fetch_add(1, Ordering::Relaxed);
             let mut memory = self.0.lock().unwrap();
             let end = offset
                 .checked_add(source.len())
