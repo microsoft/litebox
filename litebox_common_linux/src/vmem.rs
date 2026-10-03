@@ -1007,7 +1007,8 @@ where
         } {
             Ok(new_addr) => new_addr,
             Err(RemapError::UnsupportedByPlatform) => {
-                // SAFETY: Native remapping left the source unchanged, and the destination is free.
+                // SAFETY: The caller excludes source users, and the copy only places pages with
+                // hints, which never replace existing mappings.
                 return unsafe { self.remap_fallback_with_copy(old_range, new_range, vma) };
             }
             Err(error) => return Err(VmemMoveError::RemapError(error)),
