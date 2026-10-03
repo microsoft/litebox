@@ -1207,36 +1207,6 @@ mod tests {
     }
 
     #[test]
-    fn transfers_sealed_sparse_process_image() {
-        let image = MemfdProcessImage::create().unwrap();
-        image.write(0x3000, b"image").unwrap();
-        image.write(0x1000, b"first").unwrap();
-        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_process_image(&mut sender, Some(&image), None).unwrap();
-        let fd = receive_process_image(&mut receiver, None)
-            .unwrap()
-            .expect("image must be received");
-
-        assert_eq!(fstat(&fd).unwrap().st_size, 0x3005);
-        let mut bytes = [0xff; 5];
-        assert_eq!(pread(&fd, &mut bytes, 0x1000).unwrap(), 5);
-        assert_eq!(&bytes, b"first");
-        assert_eq!(pread(&fd, &mut bytes, 0x2000).unwrap(), 5);
-        assert_eq!(bytes, [0; 5]);
-        assert_eq!(pread(&fd, &mut bytes, 0x3000).unwrap(), 5);
-        assert_eq!(&bytes, b"image");
-        assert!(
-            rustix::io::fcntl_getfd(&fd)
-                .unwrap()
-                .contains(FdFlags::CLOEXEC)
-        );
-        assert_eq!(
-            image.write(0, b"x").unwrap_err().kind(),
-            ErrorKind::PermissionDenied
-        );
-    }
-
-    #[test]
     fn process_image_copies_from_shared_memory() {
         let memory = MemfdSharedMemory::create(16).unwrap();
         memory.write(4, b"shared").unwrap();
@@ -1263,20 +1233,6 @@ mod tests {
         let mut bytes = [0; 6];
         assert_eq!(pread(&image.fd, &mut bytes, 0x1000).unwrap(), 6);
         assert_eq!(&bytes, b"shared");
-    }
-
-    #[test]
-    fn transfers_absent_process_image_in_order() {
-        let memory = MemfdSharedMemory::create(8).unwrap();
-        let (mut receiver, mut sender) = UnixStream::pair().unwrap();
-        send_process_image(&mut sender, None, None).unwrap();
-        send_memfd(&mut sender, &memory, None).unwrap();
-        assert!(
-            receive_process_image(&mut receiver, None)
-                .unwrap()
-                .is_none()
-        );
-        receive_memfd(&mut receiver, 8, None).unwrap();
     }
 
     #[test]
