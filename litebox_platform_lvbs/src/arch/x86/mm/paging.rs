@@ -144,24 +144,36 @@ pub(crate) fn vmflags_to_pteflags(values: VmFlags) -> PageTableFlags {
 }
 
 impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
+    /// `range` must not be mapped. On error, nothing in `range` is left mapped.
     pub(crate) fn map_pages(
         &self,
         range: PageRange<ALIGN>,
         flags: VmFlags,
         populate_pages: bool,
-    ) -> UserMutPtr<u8> {
+    ) -> Result<UserMutPtr<u8>, page_mgmt::AllocationError> {
         if populate_pages {
             let flags = vmflags_to_pteflags(flags);
-            for page in range {
+            for page_addr in range {
                 let page =
-                    Page::<Size4KiB>::from_start_address(VirtAddr::new(page as u64)).unwrap();
-                unsafe {
+                    Page::<Size4KiB>::from_start_address(VirtAddr::new(page_addr as u64)).unwrap();
+                if let Err(err) = unsafe {
                     PageTableImpl::handle_page_fault(self, page, flags, PageFaultErrorCode::empty())
+                } {
+                    // Only `range.start..=page_addr` may have been touched (including any
+                    // page-table frames allocated by the failed fault); avoid walking the rest.
+                    let populated = PageRange::new(range.start, page_addr + ALIGN).unwrap();
+                    // SAFETY: `range` was unmapped before this call and is not yet returned.
+                    let _ = unsafe { self.unmap_pages(populated, true, true, true) };
+                    return Err(match err {
+                        PageFaultError::AllocationFailed => page_mgmt::AllocationError::OutOfMemory,
+                        PageFaultError::HugePage | PageFaultError::AccessError(_) => {
+                            page_mgmt::AllocationError::AddressInUseByPlatform
+                        }
+                    });
                 }
-                .expect("Failed to handle page fault");
             }
         }
-        UserMutPtr::from_ptr(range.start as *mut u8)
+        Ok(UserMutPtr::from_ptr(range.start as *mut u8))
     }
 
     /// Unmap a range of 4KiB pages from the page table.
@@ -732,10 +744,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     }
 
     /// This function creates a new empty top-level page table.
-    pub(crate) unsafe fn new_top_level() -> Self {
-        let frame = PageTableAllocator::<M>::allocate_frame(true)
-            .expect("Failed to allocate a new page table frame");
-        unsafe { Self::init(frame.start_address()) }
+    pub(crate) unsafe fn new_top_level() -> Option<Self> {
+        let frame = PageTableAllocator::<M>::allocate_frame(true)?;
+        Some(unsafe { Self::init(frame.start_address()) })
     }
 
     /// Share the VTL1-kernel P3/P2/P1 tables from `source` by copying its
@@ -961,7 +972,9 @@ impl<M: MemoryProvider, const ALIGN: usize> PageTableImpl<ALIGN> for X64PageTabl
             TranslateResult::NotMapped => {
                 let mut allocator = PageTableAllocator::<M>::new();
                 // TODO: if it is file-backed, we need to read the page from file
-                let frame = PageTableAllocator::<M>::allocate_frame(true).unwrap();
+                let Some(frame) = PageTableAllocator::<M>::allocate_frame(true) else {
+                    return Err(PageFaultError::AllocationFailed);
+                };
                 // ACCESSED and DIRTY are pre-set here (mirroring the Linux kernel's
                 // `_KERNPG_TABLE`) so the CPU's page-table walker doesn't need an
                 // atomic read-modify-write on this entry the first time it's traversed.
