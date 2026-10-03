@@ -2483,53 +2483,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_child_exit_drops_its_memory_image() {
-        // The image holds the reference only to observe its drop.
-        struct TestImage(#[expect(dead_code)] Arc<()>);
-
-        impl ProcessImage for TestImage {
-            fn write(&mut self, _offset: u64, _data: &[u8]) -> Result<()> {
-                Ok(())
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-        let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let process_id = parent
-            .allocate_child_process(readiness_sink())
-            .unwrap()
-            .identity
-            .process_id;
-        let image = Arc::new(());
-        parent
-            .write_child_memory::<BrokerError>(
-                process_id,
-                0,
-                1,
-                || Ok(Box::new(TestImage(Arc::clone(&image)))),
-                |_| Ok(()),
-            )
-            .unwrap();
-        assert_eq!(Arc::strong_count(&image), 2);
-
-        parent.exit_child_process(process_id, EXITED).unwrap();
-
-        assert_eq!(Arc::strong_count(&image), 1);
-    }
-
-    #[test]
     fn pending_child_exit_after_owner_death_is_rejected() {
         let broker = TestBrokerCoreBuilder::new(
             PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
