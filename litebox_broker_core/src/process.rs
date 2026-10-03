@@ -19,6 +19,7 @@ use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlags
 use litebox_broker_protocol::process::{
     CreatedProcess, ProcessExitStatus, ProcessIdentity, ProcessTermination,
 };
+use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, Once, rwlock::RwLock};
@@ -215,6 +216,11 @@ pub struct BrokerProcess {
     initial_thread_id: Once<ThreadId>,
     /// Creating parent process.
     parent: Option<Weak<BrokerProcess>>,
+    /// Process group and session.
+    ///
+    /// No other lock is taken while this one is held. Changes are serialized
+    /// by the core's process group lock.
+    pub(crate) membership: Mutex<ProcessGroupMembership>,
     /// Whether this process's children are reaped when they terminate.
     reap_children: AtomicBool,
     state: Mutex<BrokerProcessState>,
@@ -344,6 +350,7 @@ impl BrokerProcess {
         core: BrokerCore,
         id: ProcessId,
         parent: Option<Weak<BrokerProcess>>,
+        membership: ProcessGroupMembership,
         caller_credential: CallerCredential,
     ) -> Self {
         Self {
@@ -351,6 +358,7 @@ impl BrokerProcess {
             id,
             initial_thread_id: Once::new(),
             parent,
+            membership: Mutex::new(membership),
             reap_children: AtomicBool::new(false),
             state: Mutex::new(BrokerProcessState {
                 status: ProcessStatus::Starting,
@@ -709,6 +717,28 @@ impl BrokerProcess {
         self.duplicate_object_references_to(handles, child)
     }
 
+    /// Returns this process's group and session.
+    pub(crate) fn membership(&self) -> ProcessGroupMembership {
+        *self.membership.lock()
+    }
+
+    /// Returns whether this process has a parent, even one that no longer
+    /// exists.
+    pub(crate) fn has_parent(&self) -> bool {
+        self.parent.is_some()
+    }
+
+    /// Returns the pending child selected by `child_process_id`.
+    pub(crate) fn pending_child_process(
+        &self,
+        child_process_id: ProcessId,
+    ) -> Result<Arc<BrokerProcess>> {
+        let mut state = self.state.lock();
+        Ok(Arc::clone(
+            &self.pending_child(&mut state, child_process_id)?.process,
+        ))
+    }
+
     /// Returns this process's parent if it still exists.
     ///
     /// Callers upgrade before taking this process's state lock and drop the
@@ -969,7 +999,7 @@ impl BrokerProcess {
         self.is_active(state) && matches!(state.status, ProcessStatus::Starting)
     }
 
-    fn is_child_of(&self, parent: &BrokerProcess) -> bool {
+    pub(crate) fn is_child_of(&self, parent: &BrokerProcess) -> bool {
         // The weak reference keeps the parent's allocation, so its address
         // cannot be reused by another process.
         self.parent

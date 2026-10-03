@@ -26,6 +26,7 @@ mod object;
 pub mod pipe;
 mod policy;
 mod process;
+pub mod process_group;
 pub mod random;
 pub mod readiness;
 pub mod signal;
@@ -41,7 +42,9 @@ pub mod test_support;
 use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use alloc::vec::Vec;
 use hashbrown::HashMap;
+use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
@@ -234,6 +237,9 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) ids: Arc<Mutex<IdAllocator>>,
     pub(crate) processes: Arc<RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>>,
+    /// Serializes changes to process group and session membership, and
+    /// selecting the members of a group.
+    pub(crate) process_groups: Arc<Mutex<()>>,
     /// Number of broker threads created and not normally retired.
     pub(crate) active_thread_count: Arc<AtomicUsize>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
@@ -297,6 +303,7 @@ impl BrokerCore {
             limits,
             ids: Arc::new(Mutex::new(ids)),
             processes: Arc::new(RwLock::new(HashMap::new())),
+            process_groups: Arc::new(Mutex::new(())),
             active_thread_count: Arc::new(AtomicUsize::new(0)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
@@ -320,6 +327,25 @@ impl BrokerCore {
             process_lifecycle_sink: sink,
             ..self.clone()
         }
+    }
+
+    /// Returns the registered process `id`, or `UnknownObject` if none.
+    pub(crate) fn registered_process(&self, id: ProcessId) -> Result<Arc<BrokerProcess>> {
+        // The registry lock is released before the process can drop, since a
+        // final process drop removes itself from the registry.
+        self.processes
+            .read()
+            .get(&id)
+            .and_then(Weak::upgrade)
+            .ok_or(BrokerError::UnknownObject)
+    }
+
+    /// Returns every registered process.
+    pub(crate) fn registered_processes(&self) -> Vec<Arc<BrokerProcess>> {
+        // The registry lock is released before any process can drop, since a
+        // final process drop removes itself from the registry.
+        let processes = self.processes.read();
+        processes.values().filter_map(Weak::upgrade).collect()
     }
 
     /// Returns whether any broker process remains registered.
@@ -371,7 +397,7 @@ impl BrokerCore {
         caller_credential: CallerCredential,
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
-        let allocate_process = |parent: Option<Weak<BrokerProcess>>| {
+        let allocate_process = |parent: Option<&Arc<BrokerProcess>>| {
             let mut processes = self.processes.write();
             if processes.len() >= self.limits.max_processes {
                 return Err(BrokerError::ResourceExhausted);
@@ -381,10 +407,18 @@ impl BrokerCore {
                 .map_err(|_| BrokerError::OutOfMemory)?;
             let raw_id = self.ids.lock().allocate()?;
             let id = ProcessId(raw_id);
+            let membership = parent.map_or(
+                ProcessGroupMembership {
+                    process_group: id,
+                    session: id,
+                },
+                |parent| parent.membership(),
+            );
             let process = Arc::new(BrokerProcess::new(
                 self.clone(),
                 id,
-                parent,
+                parent.map(Arc::downgrade),
+                membership,
                 caller_credential,
             ));
             assert!(
@@ -401,7 +435,7 @@ impl BrokerCore {
                 .get(&parent_id)
                 .and_then(Weak::upgrade)
                 .ok_or(BrokerError::UnknownObject)?;
-            return parent.with_live_owner(|| allocate_process(Some(Arc::downgrade(&parent))))?;
+            return parent.with_live_owner(|| allocate_process(Some(&parent)))?;
         }
         allocate_process(None)
     }

@@ -23,6 +23,7 @@ use crate::process::{
     ExitChildProcessRequest, ProcessExitStatus, ProcessStartupDescriptor, ProcessTermination,
     StartChildProcessRequest, WriteChildMemoryRequest,
 };
+use crate::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
 use crate::signal::{OpenSignalsResponse, PendingSignal, SendSignalRequest, TakeSignalRequest};
@@ -97,6 +98,8 @@ pub enum BrokerOperation {
     DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
     /// Write bytes into this process's pending child's memory image.
     WriteChildMemory(WriteChildMemoryRequest),
+    /// Process group and session request family.
+    ProcessGroup(ProcessGroupRequest),
     /// Timer object request family.
     Timer(TimerRequest),
     /// Signal request family.
@@ -151,6 +154,7 @@ impl BrokerOperation {
             | Self::GetStatusFlags(_)
             | Self::SetStatusFlags(_)
             | Self::Event(_)
+            | Self::ProcessGroup(_)
             | Self::Timer(_)
             | Self::Signal(_)
             | Self::Pipe(PipeRequest::Create(_))
@@ -240,6 +244,24 @@ pub enum TimerRequest {
     Get(GetTimerRequest),
     /// Consume a timer's pending expirations.
     Read(ReadTimerRequest),
+}
+
+/// Request about process groups and sessions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessGroupRequest {
+    /// Read a process's group and session.
+    ///
+    /// The broker returns `UnknownObject` if no such process exists.
+    Get(ProcessId),
+    /// Move a process into a process group.
+    Set(SetProcessGroupRequest),
+    /// Make a process the leader of a new session and of a new process group
+    /// in it.
+    ///
+    /// The process must be the caller or its pending child, or the broker
+    /// returns `UnknownObject`. The broker returns `PolicyDenied` if a process
+    /// group already has the process's ID.
+    CreateSession(ProcessId),
 }
 
 /// Request about signals sent between broker processes.
@@ -339,6 +361,8 @@ pub enum BrokerResult {
     ObjectsDuplicated,
     /// Bytes were written into a pending child's memory image.
     ChildMemoryWritten,
+    /// Process group and session response family.
+    ProcessGroup(ProcessGroupResponse),
     /// Timer object response family.
     Timer(TimerResponse),
     /// Signal response family.
@@ -378,6 +402,17 @@ pub enum TimerResponse {
     Get(GetTimerResponse),
     /// Read operation response.
     Read(ReadTimerResponse),
+}
+
+/// Response to a process group request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessGroupResponse {
+    /// Get operation response.
+    Get(ProcessGroupMembership),
+    /// The process moved into the group.
+    Set,
+    /// The session was created.
+    CreateSession,
 }
 
 /// Response to a signal request.

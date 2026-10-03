@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SignalRequest, SignalResponse,
 };
-use litebox_broker_protocol::signal::{PendingSignal, SendSignalRequest, TakeSignalRequest};
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_broker_protocol::signal::{
+    PendingSignal, SendSignalRequest, SignalTarget, TakeSignalRequest,
+};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -25,18 +27,15 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Sends `signal` to process `process_id`, or only checks that it exists
-    /// if `signal` is zero.
+    /// Sends `signal` to the processes `target` selects, or only checks that
+    /// one exists if `signal` is zero.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued signal request.
-    pub fn send_signal(&self, process_id: ProcessId, signal: u32) -> Result<(), Channel::Error> {
-        match self.request_signal(SignalRequest::Send(SendSignalRequest {
-            process_id,
-            signal,
-        }))? {
+    pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), Channel::Error> {
+        match self.request_signal(SignalRequest::Send(SendSignalRequest { target, signal }))? {
             SignalResponse::Sent => Ok(()),
             response => panic!("broker returned unexpected signal response: {response:?}"),
         }

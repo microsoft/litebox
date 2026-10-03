@@ -12,14 +12,26 @@ use crate::{ObjectHandle, ProcessId};
 /// Largest signal number the broker delivers.
 pub const MAX_SIGNAL: u32 = 64;
 
-/// Request to send a signal to a process.
+/// Process or processes a signal is sent to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalTarget {
+    /// One process.
+    Process(ProcessId),
+    /// Every process in a process group.
+    ProcessGroup(ProcessId),
+    /// Every process except the caller and the processes without a parent,
+    /// as Linux spares `init`.
+    All,
+}
+
+/// Request to send a signal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendSignalRequest {
-    /// Target process.
+    /// Target processes.
     ///
-    /// The broker returns `UnknownObject` if no such process exists.
-    pub process_id: ProcessId,
-    /// Signal number, or zero to only check that the target exists.
+    /// The broker returns `UnknownObject` if no process is targeted.
+    pub target: SignalTarget,
+    /// Signal number, or zero to only check that a target exists.
     ///
     /// The broker returns `UnsupportedOperation` for a number above
     /// [`MAX_SIGNAL`].

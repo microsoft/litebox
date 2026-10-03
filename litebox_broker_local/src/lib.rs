@@ -24,6 +24,7 @@ mod error;
 mod event;
 mod fs;
 mod pipe;
+mod process_group;
 mod random;
 mod signal;
 mod socket;

@@ -862,8 +862,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let syscall_number = ctx.syscallno.cast_unsigned() as usize;
         let request = SyscallRequest::try_from_raw(syscall_number, ctx, log_unsupported_fmt);
         // The constrained vfork child may only inspect its temporary identity and resource limits,
-        // manage its own signal state, descriptors, working directory, and umask, open and write
-        // files, exit, or attempt execve. Any other syscall terminates the shared runner.
+        // manage its own process group and session, signal state, descriptors, working directory,
+        // and umask, open and write files, exit, or attempt execve. Any other syscall terminates
+        // the shared runner.
         let is_vfork_child = self.vfork.borrow().is_some();
         if is_vfork_child
             && !matches!(
@@ -874,6 +875,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | SyscallRequest::Getpid
                     | SyscallRequest::Getppid
                     | SyscallRequest::Gettid
+                    | SyscallRequest::Setpgid { .. }
+                    | SyscallRequest::Getpgid { .. }
+                    | SyscallRequest::Getpgrp
+                    | SyscallRequest::Setsid
+                    | SyscallRequest::Getsid { .. }
                     | SyscallRequest::Prlimit {
                         pid: 0,
                         new_limit: None,
@@ -1444,6 +1450,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => self.sys_wait4(pid, wstatus, options, rusage),
             SyscallRequest::Getpid => Ok(self.sys_getpid().reinterpret_as_unsigned() as usize),
             SyscallRequest::Getppid => Ok(self.sys_getppid().reinterpret_as_unsigned() as usize),
+            SyscallRequest::Setpgid { pid, pgid } => self.sys_setpgid(pid, pgid),
+            SyscallRequest::Getpgid { pid } => self.sys_getpgid(pid),
+            SyscallRequest::Getpgrp => self.sys_getpgrp(),
+            SyscallRequest::Setsid => self.sys_setsid(),
+            SyscallRequest::Getsid { pid } => self.sys_getsid(pid),
             SyscallRequest::Getuid => Ok(self.sys_getuid() as usize),
             SyscallRequest::Getgid => Ok(self.sys_getgid() as usize),
             SyscallRequest::Geteuid => Ok(self.sys_geteuid() as usize),

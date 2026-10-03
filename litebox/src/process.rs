@@ -1,8 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-backed guest process creation, child termination, and signals
-//! between processes.
+//! Broker-backed guest process creation, child termination, process groups
+//! and sessions, and signals between processes.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -11,7 +11,8 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
     MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity, ProcessTermination,
 };
-use litebox_broker_protocol::signal::PendingSignal;
+use litebox_broker_protocol::process_group::ProcessGroupMembership;
+use litebox_broker_protocol::signal::{PendingSignal, SignalTarget};
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::time::TimeProvider;
 
@@ -33,8 +34,8 @@ pub enum ProcessError {
     /// The broker association failed.
     #[error("process service failed")]
     ServiceFailed,
-    /// Process duplication is disabled by policy.
-    #[error("process duplication is denied")]
+    /// The operation is denied by policy or by process group rules.
+    #[error("process operation is denied")]
     PolicyDenied,
     /// Another pending child process already exists.
     #[error("a child process is already pending")]
@@ -80,19 +81,52 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(broker.set_child_reaping(enabled)?)
     }
 
-    /// Sends `signal` to process `process_id`, or only checks that the process
-    /// exists if `signal` is zero.
+    /// Sends `signal` to the processes `target` selects, or only checks that
+    /// one exists if `signal` is zero.
     ///
-    /// The target takes the signal through [`Signals`]. A signal already
-    /// pending for the target is not sent again.
-    pub fn send_signal(&self, process_id: ProcessId, signal: u32) -> Result<(), ProcessError> {
+    /// Each target takes the signal through [`Signals`]. A signal already
+    /// pending for a target is not sent again. Returns
+    /// [`ProcessError::NoSuchProcess`] if no process is targeted.
+    pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        match broker.send_signal(process_id, signal) {
-            Err(BrokerControlError::Broker(ErrorCode::UnknownObject)) => {
-                Err(ProcessError::NoSuchProcess)
-            }
-            result => Ok(result?),
-        }
+        broker.send_signal(target, signal).map_err(no_such_process)
+    }
+
+    /// Returns the process group and session of process `process_id`.
+    pub fn process_group(
+        &self,
+        process_id: ProcessId,
+    ) -> Result<ProcessGroupMembership, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        broker.process_group(process_id).map_err(no_such_process)
+    }
+
+    /// Moves process `process_id`, which is this process or one of its
+    /// children, into `process_group`, creating the group if it is
+    /// `process_id`.
+    ///
+    /// Returns [`ProcessError::PolicyDenied`] if the process is in another
+    /// session than this process or leads a session, or if `process_group` is
+    /// neither `process_id` nor an existing group in this process's session.
+    pub fn set_process_group(
+        &self,
+        process_id: ProcessId,
+        process_group: ProcessId,
+    ) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        broker
+            .set_process_group(process_id, process_group)
+            .map_err(no_such_process)
+    }
+
+    /// Makes process `process_id`, which is this process or its pending
+    /// child, the leader of a new session and of a new process group in it.
+    ///
+    /// Returns [`ProcessError::PolicyDenied`] if a process group already has
+    /// the ID `process_id`.
+    pub fn create_session(&self, process_id: ProcessId) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        broker.create_session(process_id).map_err(no_such_process)
     }
 
     /// Opens the signals other processes send to this process, including
@@ -350,6 +384,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Signals<
         self.broker
             .check_readiness(self.handle)
             .map_or(Events::ERR, readiness_events)
+    }
+}
+
+/// Converts an error from a request that targets processes by ID.
+fn no_such_process(error: BrokerControlError) -> ProcessError {
+    match error {
+        BrokerControlError::Broker(ErrorCode::UnknownObject) => ProcessError::NoSuchProcess,
+        error => error.into(),
     }
 }
 

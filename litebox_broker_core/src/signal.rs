@@ -8,10 +8,11 @@
 //! Signals sent before the process opens its handle stay pending until it
 //! takes them.
 
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
+use alloc::vec;
 
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal};
+use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal, SignalTarget};
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::Mutex;
 
@@ -50,26 +51,37 @@ pub fn open(
     }))
 }
 
-/// Sends `signal` to the process `target`, or only checks that it exists if
-/// `signal` is zero.
+/// Sends `signal` to the processes `target` selects, or only checks that one
+/// exists if `signal` is zero.
 ///
-/// A signal already pending for the target is not sent again. Returns
-/// `UnknownObject` if no such process exists.
-pub fn send(process: &BrokerProcess, target: ProcessId, signal: u32) -> Result<()> {
+/// A signal already pending for a target is not sent again. Returns
+/// `UnknownObject` if no process is targeted.
+pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Result<()> {
     if signal > MAX_SIGNAL {
         return Err(BrokerError::UnsupportedOperation);
     }
-    // The registry lock is released before the target can drop, since a final
-    // process drop removes itself from the registry.
-    let target = process
-        .core
-        .processes
-        .read()
-        .get(&target)
-        .and_then(Weak::upgrade)
-        .ok_or(BrokerError::UnknownObject)?;
+    let targets = match target {
+        SignalTarget::Process(id) => vec![process.core.registered_process(id)?],
+        SignalTarget::ProcessGroup(process_group) => {
+            // Members cannot move between groups while they are selected.
+            let _serialized = process.core.process_groups.lock();
+            let mut targets = process.core.registered_processes();
+            targets.retain(|target| target.membership().process_group == process_group);
+            targets
+        }
+        SignalTarget::All => {
+            let mut targets = process.core.registered_processes();
+            targets.retain(|target| target.id() != process.id() && target.has_parent());
+            targets
+        }
+    };
+    if targets.is_empty() {
+        return Err(BrokerError::UnknownObject);
+    }
     if let Some(index) = signal.checked_sub(1) {
-        target.signals.send(index as usize, process.id);
+        for target in &targets {
+            target.signals.send(index as usize, process.id);
+        }
     }
     Ok(())
 }
@@ -172,7 +184,7 @@ mod tests {
     use alloc::sync::Arc;
 
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::signal::PendingSignal;
+    use litebox_broker_protocol::signal::{PendingSignal, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
 
     use crate::readiness::tests::TestReadinessSink;
@@ -199,6 +211,10 @@ mod tests {
         PendingSignal { signal, sender }
     }
 
+    fn to(process: &BrokerProcess) -> SignalTarget {
+        SignalTarget::Process(process.id())
+    }
+
     #[test]
     fn signals_stay_pending_until_taken() {
         let broker = broker();
@@ -208,10 +224,10 @@ mod tests {
 
         // Signals sent before the target opens its handle stay pending, and
         // repeated signals keep their first sender.
-        super::send(&first, target.id(), 10).unwrap();
-        super::send(&second, target.id(), 10).unwrap();
-        super::send(&second, target.id(), 64).unwrap();
-        super::send(&second, target.id(), 2).unwrap();
+        super::send(&first, to(&target), 10).unwrap();
+        super::send(&second, to(&target), 10).unwrap();
+        super::send(&second, to(&target), 64).unwrap();
+        super::send(&second, to(&target), 2).unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         let handle = super::open(&target, sink.clone()).unwrap();
         assert_eq!(target.check_readiness(handle), Ok(ReadinessFlags::READ));
@@ -227,8 +243,8 @@ mod tests {
 
         // A signal sent while the handle is open republishes readiness, but
         // one already pending does not.
-        super::send(&first, target.id(), 15).unwrap();
-        super::send(&second, target.id(), 15).unwrap();
+        super::send(&first, to(&target), 15).unwrap();
+        super::send(&second, to(&target), 15).unwrap();
         assert_eq!(
             *sink.republished.lock().unwrap(),
             [(handle, ReadinessFlags::READ)]
@@ -241,7 +257,7 @@ mod tests {
 
         target.close_object_reference(handle).unwrap();
         assert_eq!(*sink.retired.lock().unwrap(), [handle]);
-        super::send(&first, target.id(), 15).unwrap();
+        super::send(&first, to(&target), 15).unwrap();
         assert_eq!(sink.republished.lock().unwrap().len(), 1);
     }
 
@@ -253,25 +269,75 @@ mod tests {
         let handle = super::open(&target, Arc::new(TestReadinessSink::default())).unwrap();
 
         // Signal zero only checks that the target exists.
-        super::send(&sender, target.id(), 0).unwrap();
+        super::send(&sender, to(&target), 0).unwrap();
         assert_eq!(super::take(&target, handle), Err(BrokerError::WouldBlock));
         assert_eq!(
-            super::send(&sender, ProcessId(u32::MAX), 0),
+            super::send(&sender, SignalTarget::Process(ProcessId(u32::MAX)), 0),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            super::send(&sender, ProcessId(u32::MAX), 9),
+            super::send(&sender, SignalTarget::Process(ProcessId(u32::MAX)), 9),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            super::send(&sender, target.id(), 65),
+            super::send(&sender, to(&target), 65),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(super::take(&target, handle), Err(BrokerError::WouldBlock));
 
         // A process can signal itself.
-        super::send(&target, target.id(), 1).unwrap();
+        super::send(&target, to(&target), 1).unwrap();
         assert_eq!(super::take(&target, handle), Ok(pending(1, target.id())));
+    }
+
+    #[test]
+    fn signals_reach_process_groups_and_all_processes() {
+        let broker = broker();
+        let root = process(&broker);
+        let other = process(&broker);
+        let first = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        // No process other than the caller has a parent yet.
+        assert_eq!(
+            super::send(&first, SignalTarget::All, 0),
+            Err(BrokerError::UnknownObject)
+        );
+        let second = broker
+            .create_process(CallerCredential::Unauthenticated, Some(root.id()))
+            .unwrap();
+        crate::process_group::set(&root, second.id(), second.id()).unwrap();
+        let sink = Arc::new(TestReadinessSink::default());
+        let handles = [&root, &other, &first, &second]
+            .map(|process| (process, super::open(process, sink.clone()).unwrap()));
+        let take_all = || {
+            handles
+                .iter()
+                .filter_map(|(process, handle)| {
+                    Some((process.id(), super::take(process, *handle).ok()?.signal))
+                })
+                .collect::<std::vec::Vec<_>>()
+        };
+
+        super::send(&other, SignalTarget::ProcessGroup(root.id()), 10).unwrap();
+        assert_eq!(take_all(), [(root.id(), 10), (first.id(), 10)]);
+        super::send(&other, SignalTarget::ProcessGroup(second.id()), 0).unwrap();
+        super::send(&other, SignalTarget::ProcessGroup(second.id()), 12).unwrap();
+        assert_eq!(take_all(), [(second.id(), 12)]);
+        assert_eq!(
+            super::send(&other, SignalTarget::ProcessGroup(ProcessId(u32::MAX)), 0),
+            Err(BrokerError::UnknownObject)
+        );
+
+        // Processes without a parent and the sender are spared.
+        super::send(&first, SignalTarget::All, 15).unwrap();
+        assert_eq!(take_all(), [(second.id(), 15)]);
+        super::send(&root, SignalTarget::All, 15).unwrap();
+        assert_eq!(take_all(), [(first.id(), 15), (second.id(), 15)]);
+        assert_eq!(
+            super::send(&root, SignalTarget::All, 65),
+            Err(BrokerError::UnsupportedOperation)
+        );
     }
 
     #[test]
@@ -289,7 +355,7 @@ mod tests {
         let retired = sink.retired.lock().unwrap().clone();
         assert_eq!(retired.len(), 1);
         assert_ne!(retired[0], handle);
-        super::send(&process, process.id(), 3).unwrap();
+        super::send(&process, to(&process), 3).unwrap();
         assert_eq!(
             *sink.republished.lock().unwrap(),
             [(handle, ReadinessFlags::READ)]
