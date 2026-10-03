@@ -45,7 +45,7 @@ use litebox_broker_protocol::process::{
     CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
     MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor,
-    ProcessTermination, StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
+    ProcessTermination, StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -211,7 +211,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         match self.request(BrokerOperation::StartChildProcess(
             StartChildProcessRequest {
                 child_process_id,
-                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }),
+                startup: ProcessStartupDescriptor { buffer },
             },
         ))? {
             BrokerResult::ProcessStarted => Ok(()),

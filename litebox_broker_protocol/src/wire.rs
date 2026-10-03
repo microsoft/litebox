@@ -25,7 +25,7 @@ use crate::message::{
 use crate::process::{
     CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
-    ProcessTermination, StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
+    ProcessTermination, StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use crate::readiness::ReadinessFlags;
 
@@ -63,7 +63,6 @@ const REQUEST_TAG_WRITE_CHILD_MEMORY: u8 = 21;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
-const START_CHILD_PROCESS_TAG_BOOTSTRAP: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
 const PROCESS_EXIT_STATUS_TAG_UNKNOWN: u8 = 2;
@@ -240,12 +239,7 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.u8(REQUEST_TAG_START_CHILD_PROCESS);
             encoder.request_id(request_id);
             encoder.process_id(request.child_process_id);
-            match request.source {
-                StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer }) => {
-                    encoder.u8(START_CHILD_PROCESS_TAG_BOOTSTRAP);
-                    encoder.shared_buffer_sequence(buffer);
-                }
-            }
+            encoder.shared_buffer_sequence(request.startup.buffer);
         }
         BrokerOperation::GetProcessExitStatus(handle) => {
             encoder.u8(REQUEST_TAG_GET_PROCESS_EXIT_STATUS);
@@ -353,18 +347,11 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_FILL_RANDOM => BrokerOperation::FillRandom(decoder.shared_buffer_sequence()?),
         REQUEST_TAG_FILE => BrokerOperation::File(fs::decode_fs_request(&mut decoder)?),
         REQUEST_TAG_START_CHILD_PROCESS => {
-            let child_process_id = decoder.process_id()?;
-            let source = match decoder.u8()? {
-                START_CHILD_PROCESS_TAG_BOOTSTRAP => {
-                    StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
-                        buffer: decoder.shared_buffer_sequence()?,
-                    })
-                }
-                _ => return Err(WireError::InvalidTag),
-            };
             BrokerOperation::StartChildProcess(StartChildProcessRequest {
-                child_process_id,
-                source,
+                child_process_id: decoder.process_id()?,
+                startup: ProcessStartupDescriptor {
+                    buffer: decoder.shared_buffer_sequence()?,
+                },
             })
         }
         REQUEST_TAG_GET_PROCESS_EXIT_STATUS => {
@@ -829,8 +816,7 @@ mod tests {
     use crate::process::{
         CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
         ExitChildProcessRequest, ProcessExitStatus, ProcessIdentity, ProcessStartupDescriptor,
-        ProcessTermination, StartChildProcessRequest, StartChildProcessSource,
-        WriteChildMemoryRequest,
+        ProcessTermination, StartChildProcessRequest, WriteChildMemoryRequest,
     };
     use crate::shared_buffer::{
         MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
@@ -1196,9 +1182,9 @@ mod tests {
             BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
             BrokerOperation::StartChildProcess(StartChildProcessRequest {
                 child_process_id: process_id(u32::MAX),
-                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
+                startup: ProcessStartupDescriptor {
                     buffer: largest_sequence,
-                }),
+                },
             }),
             BrokerOperation::GetProcessExitStatus(ObjectHandle(u64::MAX)),
             BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
@@ -1817,20 +1803,6 @@ mod tests {
         unknown_create_thread[9] = 0xff;
         assert_eq!(
             decode_request(&unknown_create_thread),
-            Err(WireError::InvalidTag)
-        );
-        let mut unknown_child_start = encode_request(BrokerRequest {
-            request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::StartChildProcess(StartChildProcessRequest {
-                child_process_id: process_id(1),
-                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor {
-                    buffer: sequence(0, 2),
-                }),
-            }),
-        });
-        unknown_child_start[13] = 0xff;
-        assert_eq!(
-            decode_request(&unknown_child_start),
             Err(WireError::InvalidTag)
         );
         let mut unknown_exit_status = encode_request(BrokerRequest {

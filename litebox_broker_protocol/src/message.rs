@@ -21,7 +21,7 @@ use crate::pipe::{
 use crate::process::{
     CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, ProcessExitStatus, ProcessStartupDescriptor, ProcessTermination,
-    StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
+    StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
@@ -132,7 +132,7 @@ impl BrokerOperation {
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
             | Self::StartChildProcess(StartChildProcessRequest {
-                source: StartChildProcessSource::Bootstrap(ProcessStartupDescriptor { buffer, .. }),
+                startup: ProcessStartupDescriptor { buffer },
                 ..
             })
             | Self::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {

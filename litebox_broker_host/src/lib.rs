@@ -49,7 +49,7 @@ use litebox_broker_protocol::process::{
     CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
     ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
     MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData, ProcessStartupDescriptor,
-    StartChildProcessRequest, StartChildProcessSource, WriteChildMemoryRequest,
+    StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::shared_buffer::{
@@ -920,7 +920,7 @@ where
     match operation {
         BrokerOperation::StartChildProcess(StartChildProcessRequest {
             child_process_id,
-            source: StartChildProcessSource::Bootstrap(startup),
+            startup,
         }) => Some(
             read_shared_buffer(shared_buffers, startup.buffer, MAX_PROCESS_BOOTSTRAP_SIZE)
                 .and_then(|payload| {

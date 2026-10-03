@@ -90,23 +90,16 @@ pub enum CreateThreadResponse {
     Process(CreatedProcess),
 }
 
-/// Source used to start one child process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartChildProcessSource {
-    /// Starts a child from an opaque platform bootstrap.
-    ///
-    /// The child's runner also receives the memory image written by
-    /// [`WriteChildMemoryRequest`]s, if any.
-    Bootstrap(ProcessStartupDescriptor),
-}
-
 /// Starts a pending child created earlier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartChildProcessRequest {
     /// Pending child to start.
     pub child_process_id: ProcessId,
-    /// Process startup source.
-    pub source: StartChildProcessSource,
+    /// Opaque platform bootstrap for the child.
+    ///
+    /// The child's runner also receives the memory image written by
+    /// [`WriteChildMemoryRequest`]s, if any.
+    pub startup: ProcessStartupDescriptor,
 }
 
 /// Maximum number of object references one [`DuplicateObjectsToChildRequest`]
