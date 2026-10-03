@@ -281,7 +281,7 @@ mod tests {
             process.check_readiness(handle),
             Ok(ReadinessFlags::default())
         );
-        clock.advance(Duration::from_nanos(1000));
+        clock.advance(Duration::from_micros(1));
         assert_eq!(republished().len(), 1);
 
         // Periodic: overruns accumulate until read, and the phase is kept.
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(super::read(&process, handle), Err(BrokerError::WouldBlock));
         assert_eq!(super::set(&process, handle, spec(0, 7)), Ok(spec(50, 0)));
         assert_eq!(super::get(&process, handle), Ok(spec(0, 7)));
-        clock.advance(Duration::from_nanos(1000));
+        clock.advance(Duration::from_micros(1));
         assert_eq!(republished().len(), 3);
 
         process.close_object_reference(handle).unwrap();
