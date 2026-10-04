@@ -80,7 +80,7 @@ struct TrampolineInfo {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub use litebox_syscall_rewriter::TrampolineRegion;
+use litebox_syscall_rewriter::TrampolineRegion;
 
 /// The pages `region` occupies when its object is loaded at `base_addr`.
 #[cfg(target_arch = "aarch64")]
@@ -328,26 +328,6 @@ impl ElfParsedFile {
             .checked_add(trampoline.size)?
             .checked_next_multiple_of(PAGE_SIZE)?;
         Some(start..end)
-    }
-
-    /// The pages covering every sub-trampoline when this ELF is loaded at
-    /// `base_addr`; a zero `base_addr` yields the load-address-relative range.
-    /// This can include the object's own segments between sub-trampolines;
-    /// [`Self::trampoline_regions`] has the exact pages.
-    ///
-    /// `None` if the binary has no trampoline or, like [`Self::has_trampoline`],
-    /// if [`Self::parse_trampoline`] has not run yet.
-    #[cfg(target_arch = "aarch64")]
-    pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
-        let mut pages = self
-            .trampoline_regions()
-            .iter()
-            .map(|region| loaded_pages(region, base_addr));
-        let first = pages.next()??;
-        pages.try_fold(first, |covering, range| {
-            let range = range?;
-            Some(covering.start.min(range.start)..covering.end.max(range.end))
-        })
     }
 
     /// The independently mapped sub-trampolines of the parsed trampoline.

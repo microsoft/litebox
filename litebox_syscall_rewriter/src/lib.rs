@@ -2257,8 +2257,8 @@ pub struct LoadSegment {
 
 /// Where an object's appended trampoline goes, and how large it may grow.
 ///
-/// On AArch64 only the fallback address is used; gates go to sub-trampolines
-/// in every hole first; see [`aarch64_trampoline_spaces`].
+/// AArch64 ELF rewriting uses only the fallback address, after spreading gates
+/// over every hole; see [`aarch64_trampoline_spaces`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrampolinePlacement {
     /// A hole between two `PT_LOAD` segments, inside the object's own load
@@ -2390,8 +2390,8 @@ fn largest_inter_segment_hole(segments: &[LoadSegment], page: u64) -> Option<(u6
 /// `(start, end)` in ascending address order. Empty when the segments are
 /// contiguous or their extents overflow.
 ///
-/// This is the scan of `largest_inter_segment_hole`, which the x86-64
-/// placement shares, keeping every gap rather than only the largest.
+/// This is the scan of `largest_inter_segment_hole`, keeping every gap rather
+/// than only the largest.
 ///
 /// The bounds mirror glibc's `mapend` / `mapstart`, except that a segment is
 /// treated as occupying `max(p_filesz, p_memsz)` rather than `p_filesz`:

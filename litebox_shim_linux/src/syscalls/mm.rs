@@ -224,7 +224,7 @@ struct AotTrampoline {
 impl AotTrampoline {
     /// `region` of an object loaded at `base`, or `None` if its pages would
     /// overflow.
-    fn new(region: &litebox_common_linux::loader::TrampolineRegion, base: usize) -> Option<Self> {
+    fn new(region: &litebox_syscall_rewriter::TrampolineRegion, base: usize) -> Option<Self> {
         let addr = base.checked_add(usize::try_from(region.vaddr).ok()?)?;
         let size = usize::try_from(region.size).ok()?;
         addr.checked_add(size)?
@@ -307,7 +307,7 @@ enum Trailer {
     /// No trailer: the file is rewritten at runtime.
     Unpatched,
     /// The sub-trampolines of a pre-patched file.
-    Regions(Vec<litebox_common_linux::loader::TrampolineRegion>),
+    Regions(Vec<litebox_syscall_rewriter::TrampolineRegion>),
     /// A trailer that is malformed, overlaps the object, or cannot be read.
     Unusable,
 }
@@ -533,8 +533,8 @@ fn area_unmap(area: &Range<usize>, unmapped: &Range<usize>) -> AreaUnmap {
 /// holes but not a region past its last segment. Only an area left partly
 /// mapped makes its gates unusable, which invalidates the trampoline.
 ///
-/// A removed AOT region is reinstalled by the next executable mapping, so
-/// remapped code never branches into an unmapped region.
+/// A removed AOT region is reinstalled by the file's next executable mapping,
+/// at the address its first mapping's load base gave it.
 #[cfg(target_arch = "aarch64")]
 fn forget_unmapped_trampolines(state: &mut ElfPatchState, unmapped: Range<usize>) {
     let mut partial = false;
@@ -1181,11 +1181,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         #[cfg(target_arch = "aarch64")]
         let trailer = self.check_trampoline_magic(&fd.0, &load_segments);
+        // Sub-trampolines carry their own addresses, so AArch64 only needs the
+        // runtime region's address below. A pre-patched file whose load base
+        // is unknown becomes `TrampolineState::Unusable` rather than a panic.
         #[cfg(target_arch = "aarch64")]
-        let pre_patched = !matches!(trailer, Trailer::Unpatched);
-        // Sub-trampolines carry their own addresses; this one goes unused.
-        #[cfg(target_arch = "aarch64")]
-        let tramp_vaddr = 0u64;
+        let (pre_patched, tramp_vaddr) = (false, 0u64);
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
