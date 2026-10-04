@@ -17,6 +17,8 @@ impl ReadinessFlags {
     pub const HANGUP: Self = Self(1 << 2);
     /// The object is in an error state.
     pub const ERROR: Self = Self(1 << 3);
+    /// Both directions are shut down.
+    pub const CLOSED: Self = Self(1 << 4);
 
     /// Returns whether every flag in `other` is set.
     #[must_use]

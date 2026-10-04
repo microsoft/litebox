@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod event;
 pub mod fd;
 pub mod fs;
+pub mod local_sockets;
 pub mod mm;
 pub mod net;
 pub mod path;

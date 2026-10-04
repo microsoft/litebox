@@ -763,6 +763,51 @@ impl From<litebox::pipes::errors::CloseError> for Errno {
     }
 }
 
+impl From<litebox::local_sockets::errors::LocalSocketError> for Errno {
+    fn from(value: litebox::local_sockets::errors::LocalSocketError) -> Self {
+        use litebox::local_sockets::errors::LocalSocketError;
+        use litebox_broker_protocol::fs::FileError;
+        use litebox_broker_protocol::local_socket::LocalSocketError as SocketError;
+        match value {
+            LocalSocketError::Socket(error) => match error {
+                SocketError::AddressInUse => Errno::EADDRINUSE,
+                SocketError::ConnectionRefused => Errno::ECONNREFUSED,
+                SocketError::WrongType => Errno::EPROTOTYPE,
+                SocketError::InvalidArgument => Errno::EINVAL,
+                SocketError::AlreadyConnected => Errno::EISCONN,
+                SocketError::NotConnected => Errno::ENOTCONN,
+                SocketError::Unsupported => Errno::EOPNOTSUPP,
+                SocketError::MessageTooLarge => Errno::EMSGSIZE,
+                SocketError::BrokenPipe => Errno::EPIPE,
+                SocketError::NotPermitted => Errno::EPERM,
+                SocketError::File(error) => match error {
+                    FileError::NoSuchFileOrDirectory | FileError::MissingComponent => Errno::ENOENT,
+                    FileError::AccessNotAllowed
+                    | FileError::NoWritePermissions
+                    | FileError::NoSearchPermissions => Errno::EACCES,
+                    FileError::ReadOnlyFs => Errno::EROFS,
+                    FileError::AlreadyExists => Errno::EADDRINUSE,
+                    FileError::InvalidPathname => Errno::EINVAL,
+                    FileError::ComponentNotDirectory | FileError::NotDirectory => Errno::ENOTDIR,
+                    _ => Errno::EIO,
+                },
+                _ => Errno::EIO,
+            },
+            LocalSocketError::WouldBlock => Errno::EAGAIN,
+            LocalSocketError::Interrupted => Errno::EINTR,
+            LocalSocketError::WaitError(error) => match error {
+                litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
+                litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
+            },
+            LocalSocketError::ResourceExhausted => Errno::ENOBUFS,
+            LocalSocketError::OutOfMemory => Errno::ENOMEM,
+            LocalSocketError::PermissionDenied => Errno::EACCES,
+            LocalSocketError::Unsupported => Errno::EINVAL,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::pipes::errors::ClosedError> for Errno {
     fn from(value: litebox::pipes::errors::ClosedError) -> Self {
         match value {

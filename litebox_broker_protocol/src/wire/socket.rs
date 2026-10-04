@@ -66,10 +66,7 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             encoder.u8(match request.address_family {
                 AddressFamily::Ipv4 => ADDRESS_FAMILY_TAG_IPV4,
             });
-            encoder.u8(match request.socket_type {
-                SocketType::Stream => TYPE_TAG_STREAM,
-                SocketType::Datagram => TYPE_TAG_DATAGRAM,
-            });
+            encode_socket_type(encoder, request.socket_type);
             encoder.u8(match request.protocol {
                 IpProtocol::Tcp => IP_PROTOCOL_TAG_TCP,
                 IpProtocol::Udp => IP_PROTOCOL_TAG_UDP,
@@ -124,13 +121,7 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
         SocketRequest::Shutdown(request) => {
             encoder.u8(SOCKET_TAG_SHUTDOWN);
             encoder.handle(request.handle);
-            encoder.u8(match request.mode {
-                ShutdownMode::Read => SHUTDOWN_TAG_READ,
-                ShutdownMode::Write => SHUTDOWN_TAG_WRITE,
-                ShutdownMode::Both => SHUTDOWN_TAG_BOTH,
-                ShutdownMode::Abort => SHUTDOWN_TAG_ABORT,
-                ShutdownMode::StopListening => SHUTDOWN_TAG_STOP_LISTENING,
-            });
+            encode_shutdown_mode(encoder, request.mode);
         }
         SocketRequest::SetTcpOption(request) => {
             encoder.u8(SOCKET_TAG_SET_TCP_OPTION);
@@ -156,11 +147,7 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
                 ADDRESS_FAMILY_TAG_IPV4 => AddressFamily::Ipv4,
                 _ => return Err(WireError::InvalidTag),
             },
-            socket_type: match decoder.u8()? {
-                TYPE_TAG_STREAM => SocketType::Stream,
-                TYPE_TAG_DATAGRAM => SocketType::Datagram,
-                _ => return Err(WireError::InvalidTag),
-            },
+            socket_type: decode_socket_type(decoder)?,
             protocol: match decoder.u8()? {
                 IP_PROTOCOL_TAG_TCP => IpProtocol::Tcp,
                 IP_PROTOCOL_TAG_UDP => IpProtocol::Udp,
@@ -207,14 +194,7 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
         })),
         SOCKET_TAG_SHUTDOWN => Ok(SocketRequest::Shutdown(ShutdownSocketRequest {
             handle: decoder.handle()?,
-            mode: match decoder.u8()? {
-                SHUTDOWN_TAG_READ => ShutdownMode::Read,
-                SHUTDOWN_TAG_WRITE => ShutdownMode::Write,
-                SHUTDOWN_TAG_BOTH => ShutdownMode::Both,
-                SHUTDOWN_TAG_ABORT => ShutdownMode::Abort,
-                SHUTDOWN_TAG_STOP_LISTENING => ShutdownMode::StopListening,
-                _ => return Err(WireError::InvalidTag),
-            },
+            mode: decode_shutdown_mode(decoder)?,
         })),
         SOCKET_TAG_SET_TCP_OPTION => Ok(SocketRequest::SetTcpOption(SetTcpOptionRequest {
             handle: decoder.handle()?,
@@ -348,6 +328,42 @@ pub(super) fn decode_socket_response(
             pending_error: decode_optional_socket_error(decoder)?,
         })),
         SOCKET_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+pub(super) fn encode_socket_type(encoder: &mut Encoder, socket_type: SocketType) {
+    encoder.u8(match socket_type {
+        SocketType::Stream => TYPE_TAG_STREAM,
+        SocketType::Datagram => TYPE_TAG_DATAGRAM,
+    });
+}
+
+pub(super) fn decode_socket_type(decoder: &mut Decoder<'_>) -> Result<SocketType, WireError> {
+    match decoder.u8()? {
+        TYPE_TAG_STREAM => Ok(SocketType::Stream),
+        TYPE_TAG_DATAGRAM => Ok(SocketType::Datagram),
+        _ => Err(WireError::InvalidTag),
+    }
+}
+
+pub(super) fn encode_shutdown_mode(encoder: &mut Encoder, mode: ShutdownMode) {
+    encoder.u8(match mode {
+        ShutdownMode::Read => SHUTDOWN_TAG_READ,
+        ShutdownMode::Write => SHUTDOWN_TAG_WRITE,
+        ShutdownMode::Both => SHUTDOWN_TAG_BOTH,
+        ShutdownMode::Abort => SHUTDOWN_TAG_ABORT,
+        ShutdownMode::StopListening => SHUTDOWN_TAG_STOP_LISTENING,
+    });
+}
+
+pub(super) fn decode_shutdown_mode(decoder: &mut Decoder<'_>) -> Result<ShutdownMode, WireError> {
+    match decoder.u8()? {
+        SHUTDOWN_TAG_READ => Ok(ShutdownMode::Read),
+        SHUTDOWN_TAG_WRITE => Ok(ShutdownMode::Write),
+        SHUTDOWN_TAG_BOTH => Ok(ShutdownMode::Both),
+        SHUTDOWN_TAG_ABORT => Ok(ShutdownMode::Abort),
+        SHUTDOWN_TAG_STOP_LISTENING => Ok(ShutdownMode::StopListening),
         _ => Err(WireError::InvalidTag),
     }
 }

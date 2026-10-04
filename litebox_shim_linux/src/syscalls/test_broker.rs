@@ -28,7 +28,7 @@ use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::syscalls::tests::TestPlatform;
 
-pub(crate) const MAX_TEST_BROKER_REFERENCES: usize = 16;
+pub(crate) const MAX_TEST_BROKER_REFERENCES: usize = 64;
 
 static BROKER: OnceLock<TestBroker> = OnceLock::new();
 
