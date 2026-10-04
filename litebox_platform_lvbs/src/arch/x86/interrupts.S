@@ -28,6 +28,10 @@
  *   stack space before performing operations that might fault; otherwise
  *   the fault handler may overwrite live data or trigger a double fault.
  *
+ * SMAP: interrupt/exception delivery does not clear RFLAGS.AC, so stubs that
+ * run handlers `clac` on entry to keep them from bypassing SMAP. `iretq`
+ * restores AC.
+ *
  * The x86_64 interrupt frame pushed by CPU:
  *   [rsp+40] SS
  *   [rsp+32] RSP
@@ -96,6 +100,7 @@
 .global \name
 \name:
     cld
+    clac
     push    0                   /* Push dummy error code */
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     jnz     .Luser_\name
@@ -118,6 +123,7 @@
 .global \name
 \name:
     cld
+    clac
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     jnz     .Luser_\name
     push_regs
@@ -176,6 +182,7 @@ isr_with_err_code isr_general_protection_fault general_protection_fault_handler_
 .global isr_page_fault
 isr_page_fault:
     cld
+    clac
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     push    14                  /* Pass vector number (push does not affect flags) */
     jnz     .Luser_isr_page_fault
