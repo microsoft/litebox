@@ -939,14 +939,6 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         self.entries(&resolved).map_err(|_| ReadDirError::Io)
     }
 
-    fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
-        let resolved = self
-            .resolve_dir(&dir.get_typed::<Self>().path)
-            .map_err(|_| ReadDirError::Io)?;
-        let entry = self.entry(&resolved, name).map_err(|_| ReadDirError::Io)?;
-        Ok(entry.map(|entry| entry.entry))
-    }
-
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
         self.with_file(h.get_typed::<Self>(), |_, backend, handle| {
             backend.read(handle, buf, offset)
