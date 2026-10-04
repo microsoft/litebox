@@ -30,6 +30,11 @@ extern crate std;
 
 pub mod channel;
 pub mod control_ring;
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "sse2"),
+    target_arch = "aarch64"
+))]
+pub mod peer_memory;
 pub mod pending_calls;
 pub mod setup_frame;
 pub mod shared_memory;
