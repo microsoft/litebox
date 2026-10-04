@@ -523,6 +523,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
     ///
     /// Page frames whose physical addresses fall within `exec_ranges` are mapped
     /// without `NO_EXECUTE`; all other frames are mapped with `NO_EXECUTE`.
+    /// Frames within `read_only_ranges` are mapped without `WRITABLE`.
     ///
     /// Parent (P2/P3) table entry flags never include `NO_EXECUTE` so that
     /// the NX restriction is applied only at the leaf (P1) level.
@@ -533,6 +534,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         frame_range: PhysFrameRange<Size4KiB>,
         flags: PageTableFlags,
         exec_ranges: Option<&[Range<PhysAddr>]>,
+        read_only_ranges: Option<&[Range<PhysAddr>]>,
     ) -> Result<*mut u8, MapToError<Size4KiB>> {
         let mut allocator = PageTableAllocator::<M>::new();
 
@@ -571,8 +573,8 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
             // When exec_ranges are provided, determine per-page flags based
             // on whether the frame falls within an executable region.
-            let page_flags = if let Some(ranges) = exec_ranges {
-                let frame_addr = target_frame.start_address();
+            let frame_addr = target_frame.start_address();
+            let mut page_flags = if let Some(ranges) = exec_ranges {
                 let is_exec = ranges.iter().any(|r| r.contains(&frame_addr));
                 if is_exec {
                     // W^X: if the page is executable, it should not be writable.
@@ -583,6 +585,10 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
             } else {
                 flags
             };
+            if read_only_ranges.is_some_and(|ranges| ranges.iter().any(|r| r.contains(&frame_addr)))
+            {
+                page_flags.remove(PageTableFlags::WRITABLE);
+            }
             // Parent entries use a stable permissive constant, not leaf-derived flags.
             //
             // ACCESSED and DIRTY are pre-set here (mirroring the Linux kernel's
