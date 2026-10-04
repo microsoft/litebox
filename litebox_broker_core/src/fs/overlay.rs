@@ -14,7 +14,7 @@
 //! changes do not compromise memory safety or the structural integrity of its internal state.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -112,13 +112,11 @@ enum OverlayFileLayer {
 /// A logical directory, resolved to the per-layer directories that make it up.
 ///
 /// Its entries are looked up by name on demand (see [`Overlay::entry`]), so resolving a path never
-/// reads whole directories.
+/// reads whole lower directories.
 struct ResolvedDir {
     upper: Option<DirHandle>,
     /// Per lower backend, in precedence order, its directory at this path if any.
     lowers: Vec<Option<DirHandle>>,
-    /// Whether the upper directory hides every lower entry.
-    opaque: bool,
 }
 
 /// An overlay-visible directory entry, plus which layers contribute to it.
@@ -131,6 +129,10 @@ struct ResolvedEntry {
     /// Per lower backend, whether it has a *directory* of this name that merges into this entry.
     lower_directories: Vec<bool>,
 }
+
+/// One name's entries in the layers of a directory: its upper entry, and its lower entries (by
+/// lower backend, in precedence order) that the upper directory does not hide.
+type LayerEntries = (Option<DirEntry>, Vec<(usize, DirEntry)>);
 
 impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
     /// Construct an overlay over a single `lower`, using `allocator` for overlay-visible inodes.
@@ -171,25 +173,9 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
             .iter()
             .map(|lower| lower.owned_dir_at(lower.root(), OFlags::PATH).map(Some))
             .collect::<Result<Vec<_>, _>>()?;
-        self.resolved_dir(Some(upper), lowers)
-    }
-
-    /// The logical directory made up of the given per-layer directories.
-    fn resolved_dir(
-        &self,
-        upper: Option<DirHandle>,
-        lowers: Vec<Option<DirHandle>>,
-    ) -> Result<ResolvedDir, OpenError> {
-        let opaque = match &upper {
-            Some(upper) => self
-                .marker_present(upper, OPAQUE_MARKER)
-                .map_err(|_| OpenError::Io)?,
-            None => false,
-        };
         Ok(ResolvedDir {
-            upper,
+            upper: Some(upper),
             lowers,
-            opaque,
         })
     }
 
@@ -255,7 +241,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
         let component =
             owner_component.expect("a merged directory is owned by upper or by a lower directory");
 
-        Ok((self.resolved_dir(upper, lowers)?, component))
+        Ok((ResolvedDir { upper, lowers }, component))
     }
 
     /// Resolve a logical `path` (relative to the overlay root) to its per-layer directories.
@@ -597,52 +583,113 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
 
     /// The overlay-visible entry `name` of `dir`, if any, merged across the layers that hold it.
     fn entry(&self, dir: &ResolvedDir, name: &str) -> Result<Option<ResolvedEntry>, OpenError> {
-        fn lookup(
-            backend: &dyn Backend,
-            dir: &DirHandle,
-            name: &str,
-        ) -> Result<Option<DirEntry>, OpenError> {
-            backend.lookup_at(dir, name).map_err(|_| OpenError::Io)
-        }
         if !valid(name) {
             return Ok(None);
         }
 
+        let mut upper = None;
+        let mut lowers = Vec::new();
+        if let Some(handle) = &dir.upper {
+            // Read paths do not take the namespace lock, so read the mutable upper directory in a
+            // single listing: separate lookups of `name` and of the markers hiding it could
+            // straddle a concurrent writer and expose deleted lower entries.
+            let whiteout = whiteout(name);
+            let mut hidden = false;
+            for entry in self
+                .upper
+                .list_dir_at(handle.clone())
+                .map_err(|_| OpenError::Io)?
+            {
+                if entry.name == name {
+                    upper = Some(entry);
+                } else if entry.name == whiteout || entry.name == OPAQUE_MARKER {
+                    // Markers held by the upper directory say what it hides from the lowers.
+                    hidden = true;
+                }
+            }
+            if hidden {
+                return Ok(self.merge_entry(upper, lowers));
+            }
+        }
+        // Lower backends are immutable, so they can be looked up by name.
+        for (layer, (backend, handle)) in self.lowers.iter().zip(&dir.lowers).enumerate() {
+            if let Some(handle) = handle
+                && let Some(entry) = backend.lookup_at(handle, name).map_err(|_| OpenError::Io)?
+            {
+                lowers.push((layer, entry));
+            }
+        }
+        Ok(self.merge_entry(upper, lowers))
+    }
+
+    /// Every overlay-visible entry of `dir`, sorted by name.
+    fn entries(&self, dir: &ResolvedDir) -> Result<Vec<DirEntry>, OpenError> {
+        fn list(backend: &dyn Backend, dir: &DirHandle) -> Result<Vec<DirEntry>, OpenError> {
+            backend.list_dir_at(dir.clone()).map_err(|_| OpenError::Io)
+        }
+
+        let mut names: BTreeMap<String, LayerEntries> = BTreeMap::new();
+        // Markers held by the upper directory say what it hides from the lowers.
+        let mut markers = BTreeSet::new();
+        if let Some(handle) = &dir.upper {
+            for entry in list(self.upper.as_ref(), handle)? {
+                if valid(&entry.name) {
+                    let name = entry.name.clone();
+                    names.entry(name).or_default().0 = Some(entry);
+                } else {
+                    markers.insert(entry.name);
+                }
+            }
+        }
+        if !markers.contains(OPAQUE_MARKER) {
+            for (layer, (backend, handle)) in self.lowers.iter().zip(&dir.lowers).enumerate() {
+                let Some(handle) = handle else {
+                    continue;
+                };
+                for entry in list(backend.as_ref(), handle)? {
+                    if valid(&entry.name) && !markers.contains(&whiteout(&entry.name)) {
+                        names
+                            .entry(entry.name.clone())
+                            .or_default()
+                            .1
+                            .push((layer, entry));
+                    }
+                }
+            }
+        }
+        Ok(names
+            .into_values()
+            .filter_map(|(upper, lowers)| self.merge_entry(upper, lowers))
+            .map(|merged| merged.entry)
+            .collect())
+    }
+
+    /// Merge the entries of one name in one logical directory: `upper` from its upper directory,
+    /// and `lowers` (in precedence order) from the lower directories it does not hide.
+    fn merge_entry(
+        &self,
+        upper: Option<DirEntry>,
+        lowers: Vec<(usize, DirEntry)>,
+    ) -> Option<ResolvedEntry> {
         let mut merged: Option<ResolvedEntry> = None;
         // Whether lower entries can no longer be merged in: the entry is not a directory in every
         // layer that contributed to it.
         let mut blocked = false;
-        if let Some(upper) = &dir.upper {
-            if let Some(mut entry) = lookup(self.upper.as_ref(), upper, name)? {
-                blocked = entry.file_type != FileType::Directory;
-                entry.ino_info = entry
-                    .ino_info
-                    .take()
-                    .map(|node| self.map_node(&mut self.state.lock().ids, None, node));
-                merged = Some(ResolvedEntry {
-                    entry,
-                    upper: true,
-                    lower: None,
-                    lower_directories: vec![false; self.lowers.len()],
-                });
-            }
-            // Markers held by the upper directory say what it hides from the lowers.
-            if dir.opaque
-                || self
-                    .marker_present(upper, &whiteout(name))
-                    .map_err(|_| OpenError::Io)?
-            {
-                return Ok(merged);
-            }
+        if let Some(mut entry) = upper {
+            blocked = entry.file_type != FileType::Directory;
+            entry.ino_info = entry
+                .ino_info
+                .take()
+                .map(|node| self.map_node(&mut self.state.lock().ids, None, node));
+            merged = Some(ResolvedEntry {
+                entry,
+                upper: true,
+                lower: None,
+                lower_directories: vec![false; self.lowers.len()],
+            });
         }
 
-        for (layer, handle) in dir.lowers.iter().enumerate() {
-            let Some(handle) = handle else {
-                continue;
-            };
-            let Some(mut lower_entry) = lookup(self.lowers[layer].as_ref(), handle, name)? else {
-                continue;
-            };
+        for (layer, mut lower_entry) in lowers {
             let directory = lower_entry.file_type == FileType::Directory;
             let lower_node = lower_entry.ino_info.take();
             let entry = merged.get_or_insert_with(|| ResolvedEntry {
@@ -675,36 +722,7 @@ impl<Platform: RawSyncPrimitivesProvider> Overlay<Platform> {
                 blocked = true;
             }
         }
-        Ok(merged)
-    }
-
-    /// Every overlay-visible entry of `dir`, sorted by name.
-    fn entries(&self, dir: &ResolvedDir) -> Result<Vec<DirEntry>, OpenError> {
-        let mut names = BTreeSet::new();
-        let mut add_names = |backend: &dyn Backend, dir: &DirHandle| {
-            let entries = backend
-                .list_dir_at(dir.clone())
-                .map_err(|_| OpenError::Io)?;
-            names.extend(entries.into_iter().map(|entry| entry.name));
-            Ok::<_, OpenError>(())
-        };
-        if let Some(upper) = &dir.upper {
-            add_names(self.upper.as_ref(), upper)?;
-        }
-        if !dir.opaque {
-            for (lower, handle) in self.lowers.iter().zip(&dir.lowers) {
-                if let Some(handle) = handle {
-                    add_names(lower.as_ref(), handle)?;
-                }
-            }
-        }
-        let mut entries = Vec::with_capacity(names.len());
-        for name in names {
-            if let Some(entry) = self.entry(dir, &name)? {
-                entries.push(entry.entry);
-            }
-        }
-        Ok(entries)
+        merged
     }
 }
 

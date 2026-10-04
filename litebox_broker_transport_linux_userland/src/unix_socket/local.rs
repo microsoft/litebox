@@ -381,8 +381,12 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
             }
             match self.consumer.try_read(decode_notification) {
                 Ok(ControlRingReadStatus::Message(notification)) => {
-                    self.association
-                        .acknowledge_notification(&mut self.consumer)?;
+                    if let Err(error) = self
+                        .association
+                        .acknowledge_notification(&mut self.consumer)
+                    {
+                        return self.association.end_notifications(&error);
+                    }
                     return Ok(Some(notification));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
