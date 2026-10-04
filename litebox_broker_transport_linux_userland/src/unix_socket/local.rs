@@ -11,6 +11,7 @@ use std::io::{Error, ErrorKind, Read, Result as IoResult};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -66,12 +67,17 @@ pub struct UnixControlRingLocalShutdown {
 }
 
 /// State shared by every activated local endpoint of one association: the
-/// request producer, the setup socket used for liveness and teardown, pending
-/// call tracking, and the wake handles of all three ring directions.
+/// request producer, the response consumer read by whichever caller holds the
+/// pending-call reader role, the setup socket used for liveness and teardown,
+/// pending call tracking, and the wake handles of all three ring directions.
 struct LocalRingAssociation {
     request_producer: Mutex<ControlRingProducer<MemfdSharedMemory>>,
+    response_consumer: Mutex<ControlRingConsumer<MemfdSharedMemory>>,
     control_stream: UnixStream,
     pending_calls: Arc<PendingCalls>,
+    /// Whether the call channel was dropped, which ends the association as a
+    /// local close rather than a failure.
+    closed: AtomicBool,
     on_failure: Arc<dyn Fn() + Send + Sync>,
     request_wake: ControlRingWakeHandle<MemfdSharedMemory>,
     response_wake: ControlRingWakeHandle<MemfdSharedMemory>,
@@ -139,8 +145,8 @@ impl UnixStreamLocalSetupChannel {
     }
 
     /// Consumes a negotiated setup channel into independently usable active
-    /// call, notification, and shutdown handles, starting the response
-    /// dispatcher and liveness monitor.
+    /// call, notification, and shutdown handles, starting the liveness
+    /// monitor.
     ///
     /// The ring must be the validated control-ring memfd received during this
     /// setup exchange.
@@ -186,20 +192,12 @@ impl UnixStreamLocalSetupChannel {
             request_producer: Mutex::new(request_producer),
             control_stream: shutdown_stream,
             pending_calls: Arc::clone(&pending_calls),
+            closed: AtomicBool::new(false),
             on_failure,
             response_wake: response_consumer.wake_handle(),
+            response_consumer: Mutex::new(response_consumer),
             notification_wake: notification_consumer.wake_handle(),
         });
-        let response_association = Arc::clone(&association);
-        if let Err(error) = thread::Builder::new()
-            .name("litebox-broker-responses".to_owned())
-            .spawn(move || {
-                dispatch_responses(response_consumer, response_association);
-            })
-        {
-            let _ = association.fail(error);
-            return Err(Error::other("failed to start broker response dispatcher"));
-        }
         let monitor_association = Arc::clone(&association);
         if let Err(error) = thread::Builder::new()
             .name("litebox-broker-liveness".to_owned())
@@ -296,6 +294,7 @@ impl AsFd for UnixControlRingLocalShutdown {
 
 impl Drop for UnixControlRingLocalCallChannel {
     fn drop(&mut self) {
+        self.association.closed.store(true, Ordering::Release);
         let _ = self.association.fail(Error::new(
             ErrorKind::ConnectionAborted,
             "broker local call channel dropped",
@@ -366,7 +365,9 @@ impl LocalCallChannel for UnixControlRingLocalCallChannel {
             let _ = association.fail(error);
         }
 
-        pending_call.wait().map_err(|error| copy_io_error(&error))
+        pending_call
+            .wait(|| association.read_response())
+            .map_err(|error| copy_io_error(&error))
     }
 }
 
@@ -376,7 +377,7 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
     fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
         loop {
             if let Some(error) = self.association.pending_calls.current_failure() {
-                return Err(copy_io_error(&error));
+                return self.association.end_notifications(&error);
             }
             match self.consumer.try_read(decode_notification) {
                 Ok(ControlRingReadStatus::Message(notification)) => {
@@ -386,7 +387,7 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
                     if let Some(error) = self.association.pending_calls.current_failure() {
-                        return Err(copy_io_error(&error));
+                        return self.association.end_notifications(&error);
                     }
                     if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
                         let result = Err(copy_io_error(&error));
@@ -412,6 +413,16 @@ impl LocalNotificationChannel for UnixControlRingLocalNotificationChannel {
 }
 
 impl LocalRingAssociation {
+    /// Ends notification receipt once the association has ended with
+    /// `failure`: cleanly if the local side closed it.
+    fn end_notifications(&self, failure: &Error) -> IoResult<Option<BrokerNotification>> {
+        if self.closed.load(Ordering::Acquire) {
+            Ok(None)
+        } else {
+            Err(copy_io_error(failure))
+        }
+    }
+
     fn acknowledge_notification(
         &self,
         consumer: &mut ControlRingConsumer<MemfdSharedMemory>,
@@ -431,6 +442,51 @@ impl LocalRingAssociation {
             return result;
         }
         Ok(())
+    }
+
+    /// Reads one response for the caller holding the pending-call reader
+    /// role, blocking until one arrives or the association fails.
+    fn read_response(&self) {
+        let mut consumer = self
+            .response_consumer
+            .lock()
+            .expect("broker response reader mutex poisoned");
+        loop {
+            match consumer.try_read(decode_response) {
+                Ok(ControlRingReadStatus::Message(response)) => {
+                    if let Err(error) = consumer
+                        .publish_head()
+                        .map_err(ring_error)
+                        .and_then(|()| consumer.wake_producer())
+                        .and_then(|()| {
+                            self.pending_calls
+                                .complete(response)
+                                .map_err(pending_calls_error)
+                        })
+                    {
+                        let _ = self.fail(error);
+                    }
+                    return;
+                }
+                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                    if self.pending_calls.current_failure().is_some() {
+                        return;
+                    }
+                    if let Err(error) = consumer.wait_for_message(wait_epoch) {
+                        let _ = self.fail(error);
+                        return;
+                    }
+                }
+                Err(ControlRingReadError::Ring(error)) => {
+                    let _ = self.fail(ring_error(error));
+                    return;
+                }
+                Err(ControlRingReadError::Decode(error)) => {
+                    let _ = self.fail(wire_error(error));
+                    return;
+                }
+            }
+        }
     }
 
     fn fail(&self, error: Error) -> IoResult<()> {
@@ -469,49 +525,6 @@ fn wait_for_socket_termination(stream: &mut UnixStream, peer: &'static str) -> E
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => return error,
-        }
-    }
-}
-
-fn dispatch_responses(
-    mut consumer: ControlRingConsumer<MemfdSharedMemory>,
-    association: Arc<LocalRingAssociation>,
-) {
-    loop {
-        match consumer.try_read(decode_response) {
-            Ok(ControlRingReadStatus::Message(response)) => {
-                if let Err(error) = consumer
-                    .publish_head()
-                    .map_err(ring_error)
-                    .and_then(|()| consumer.wake_producer())
-                    .and_then(|()| {
-                        association
-                            .pending_calls
-                            .complete(response)
-                            .map_err(pending_calls_error)
-                    })
-                {
-                    let _ = association.fail(error);
-                    return;
-                }
-            }
-            Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                if association.pending_calls.current_failure().is_some() {
-                    return;
-                }
-                if let Err(error) = consumer.wait_for_message(wait_epoch) {
-                    let _ = association.fail(error);
-                    return;
-                }
-            }
-            Err(ControlRingReadError::Ring(error)) => {
-                let _ = association.fail(ring_error(error));
-                return;
-            }
-            Err(ControlRingReadError::Decode(error)) => {
-                let _ = association.fail(wire_error(error));
-                return;
-            }
         }
     }
 }
@@ -611,6 +624,7 @@ mod control_ring_tests {
         on_failure: impl Fn() + Send + Sync + 'static,
     ) -> (
         UnixControlRingLocalCallChannel,
+        UnixControlRingLocalNotificationChannel,
         UnixControlRingLocalShutdown,
         Producer,
         Consumer,
@@ -627,8 +641,7 @@ mod control_ring_tests {
         });
         let (local_ring, broker_ring) = ring_pair();
         let setup = negotiated_local(local_stream);
-        let (channel, _notifications, shutdown) =
-            setup.into_active(local_ring, on_failure).unwrap();
+        let (channel, notifications, shutdown) = setup.into_active(local_ring, on_failure).unwrap();
         acknowledgement.join().unwrap();
         let litebox_broker_transport::control_ring::BrokerControlRingEndpoints {
             request_consumer,
@@ -637,6 +650,7 @@ mod control_ring_tests {
         } = broker_ring.into_broker();
         (
             channel,
+            notifications,
             shutdown,
             response_producer,
             request_consumer,
@@ -750,7 +764,8 @@ mod control_ring_tests {
 
     #[test]
     fn local_matches_out_of_order_ring_responses_without_socket_frames() {
-        let (channel, _shutdown, mut responses, mut requests, mut peer) = activate_local(|| {});
+        let (channel, _notifications, _shutdown, mut responses, mut requests, mut peer) =
+            activate_local(|| {});
         peer.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let channel = Arc::new(channel);
@@ -782,7 +797,7 @@ mod control_ring_tests {
             let failures = Arc::new(AtomicUsize::new(0));
             let callback_failures = Arc::clone(&failures);
             let (failure_reported, wait_for_failure) = mpsc::channel();
-            let (channel, _shutdown, mut responses, mut requests, _peer) =
+            let (channel, _notifications, _shutdown, mut responses, mut requests, _peer) =
                 activate_local(move || {
                     callback_failures.fetch_add(1, Ordering::SeqCst);
                     failure_reported.send(()).unwrap();
@@ -818,7 +833,8 @@ mod control_ring_tests {
     #[test]
     fn local_socket_eof_and_shutdown_wake_pending_calls() {
         for close_peer in [false, true] {
-            let (channel, shutdown, _responses, mut requests, peer) = activate_local(|| {});
+            let (channel, _notifications, shutdown, _responses, mut requests, peer) =
+                activate_local(|| {});
             let caller = thread::spawn(move || channel.call(request(1)));
             read_request(&mut requests);
             if close_peer {
@@ -827,6 +843,26 @@ mod control_ring_tests {
                 shutdown.shutdown().unwrap();
             }
             assert!(caller.join().unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn notifications_end_cleanly_only_when_the_call_channel_is_dropped() {
+        for end in 0..3 {
+            let (channel, mut notifications, shutdown, _responses, _requests, peer) =
+                activate_local(|| {});
+            let notification_receiver = thread::spawn(move || notifications.recv_notification());
+            match end {
+                0 => drop(channel),
+                1 => drop(peer),
+                _ => shutdown.shutdown().unwrap(),
+            }
+            let received = notification_receiver.join().unwrap();
+            if end == 0 {
+                assert!(received.unwrap().is_none());
+            } else {
+                assert!(received.is_err());
+            }
         }
     }
 
@@ -943,7 +979,10 @@ mod control_ring_tests {
             ErrorKind::ConnectionAborted,
             "test failure",
         )));
-        assert_eq!(completed.wait().unwrap().request_id, RequestId(1));
+        assert_eq!(
+            completed.wait(|| unreachable!()).unwrap().request_id,
+            RequestId(1)
+        );
 
         let pending = PendingCalls::new();
         let failed = pending.register(RequestId(2)).unwrap();
@@ -953,7 +992,7 @@ mod control_ring_tests {
         )));
         assert!(pending.complete(response(RequestId(2))).is_err());
         assert_eq!(
-            failed.wait().unwrap_err().kind(),
+            failed.wait(|| unreachable!()).unwrap_err().kind(),
             ErrorKind::ConnectionAborted
         );
     }
@@ -1006,7 +1045,7 @@ mod control_ring_tests {
             .unwrap();
         failure.join().unwrap();
         assert_eq!(
-            pending_call.wait().unwrap_err().kind(),
+            pending_call.wait(|| unreachable!()).unwrap_err().kind(),
             ErrorKind::ConnectionAborted
         );
     }
@@ -1020,6 +1059,9 @@ mod control_ring_tests {
         };
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         pending.complete(response(RequestId(1))).unwrap();
-        assert_eq!(original.wait().unwrap().request_id, RequestId(1));
+        assert_eq!(
+            original.wait(|| unreachable!()).unwrap().request_id,
+            RequestId(1)
+        );
     }
 }

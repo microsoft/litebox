@@ -143,6 +143,7 @@ fn failed_close_acknowledgement_waits_for_reactor_termination() {
         wake,
         next_socket_id: AtomicU64::new(1),
         thread: Mutex::new(Some(reactor_thread)),
+        before_wait: || {},
     });
 
     let closing_reactor = Arc::clone(&reactor);

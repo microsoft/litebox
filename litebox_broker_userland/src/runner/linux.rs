@@ -5,7 +5,7 @@ use std::any::Any;
 use std::ffi::OsStr;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::ops::Range;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -236,16 +236,23 @@ pub(super) fn wait_for_runner_event(
         Some(_) => timeout,
         None => Some(timeout.map_or(RUNNER_POLL_INTERVAL, |t| t.min(RUNNER_POLL_INTERVAL))),
     };
+    poll_readable(
+        [pidfd.as_ref().map(AsFd::as_fd), listener.map(AsFd::as_fd)],
+        timeout,
+    )
+}
+
+/// Waits until any of `fds` becomes readable or `timeout` elapses.
+pub(super) fn poll_readable(
+    fds: [Option<BorrowedFd<'_>>; 2],
+    timeout: Option<Duration>,
+) -> IoResult<()> {
     let timeout_ms = timeout.map_or(-1, |timeout| {
         i32::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX)
     });
     // `poll` ignores entries with negative descriptors.
-    let mut fds = [
-        pidfd.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-        listener.map_or(-1, AsRawFd::as_raw_fd),
-    ]
-    .map(|fd| libc::pollfd {
-        fd,
+    let mut fds = fds.map(|fd| libc::pollfd {
+        fd: fd.map_or(-1, |fd| fd.as_raw_fd()),
         events: libc::POLLIN,
         revents: 0,
     });

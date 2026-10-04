@@ -16,6 +16,8 @@
 
 pub mod builder;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
+pub mod mapped_file;
+#[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 mod process_launcher;
 pub mod readiness;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -26,4 +28,5 @@ pub mod random;
 pub mod stdio;
 mod timer;
 
+/// The most request workers one association runs at a time.
 const WORKER_COUNT: usize = 8;

@@ -1,7 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use std::borrow::Cow;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
@@ -10,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::Parser;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -27,6 +26,7 @@ use litebox_broker_core::{
 };
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_broker_userland::mapped_file::MappedFile;
 use litebox_broker_userland::random::UserlandRandomProvider;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 use litebox_platform::sync::RawSyncPrimitivesProvider;
@@ -37,7 +37,9 @@ mod linux;
 mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
+/// How often an in-process runner thread, which cannot be waited on alongside
+/// its connection, is rechecked for having stopped before connecting.
+const IN_PROCESS_RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedDestination {
@@ -129,6 +131,9 @@ struct CliArgs {
     )]
     runner: Option<PathBuf>,
     /// Tar archive to mount as the broker-owned initial file system.
+    ///
+    /// The archive is mapped into memory rather than copied, so it must not be modified while the
+    /// broker runs.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     fs_initial_files: Option<PathBuf>,
     /// Opaque arguments to pass to the local runner without interpretation.
@@ -152,7 +157,7 @@ where
         ("/registry".to_owned(), writable_directory(UserInfo::ROOT)),
     ];
 
-    let tar_data = match initial_files {
+    let tar_file = match initial_files {
         Some(path) => {
             if path.extension().and_then(|extension| extension.to_str()) != Some("tar") {
                 return Err(IoError::new(
@@ -160,18 +165,20 @@ where
                     format!("expected a .tar file, found {}", path.display()),
                 ));
             }
-            Cow::Owned(std::fs::read(path)?)
+            // SAFETY: As documented on `--fs-initial-files`, the archive must not be modified
+            // while the broker runs.
+            Some(unsafe { MappedFile::open(path) }?)
         }
-        None => Cow::Borrowed(EMPTY_TAR_FILE),
+        None => None,
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
     let backend = Composer::builder()
         .mount_nestable("/", |allocators| {
-            Overlay::<Platform>::new(
-                in_mem,
-                TarRo::new(tar_data, allocators.next()),
-                allocators.next(),
-            )
+            let lower = match tar_file {
+                Some(tar_file) => TarRo::new(tar_file, allocators.next()),
+                None => TarRo::new(EMPTY_TAR_FILE, allocators.next()),
+            };
+            Overlay::<Platform>::new(in_mem, lower, allocators.next())
         })
         .mount("/dev", |allocator| {
             litebox_broker_core::fs::devices::Devices::new(
@@ -300,35 +307,6 @@ fn destination_rules(allowed_destinations: &[AllowedDestination]) -> Vec<Destina
             )
         })
         .collect()
-}
-
-fn accept_runner_channel<Channel>(
-    deadline: Instant,
-    channel_name: &'static str,
-    mut runner_status: impl FnMut() -> IoResult<Option<String>>,
-    mut try_accept: impl FnMut() -> IoResult<Channel>,
-) -> IoResult<Channel> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(IoError::new(
-                ErrorKind::TimedOut,
-                format!("timed out waiting for runner {channel_name} channel"),
-            ));
-        }
-        if let Some(status) = runner_status()? {
-            return Err(IoError::new(
-                ErrorKind::BrokenPipe,
-                format!("runner {status} before connecting its {channel_name} channel"),
-            ));
-        }
-        match try_accept() {
-            Ok(channel) => return Ok(channel),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
-    }
 }
 
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

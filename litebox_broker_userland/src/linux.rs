@@ -22,9 +22,10 @@ use litebox_broker_transport_linux_userland::unix_socket::{
     UnixStreamHostSetupChannel, validate_peer_process,
 };
 use litebox_broker_userland::builder::BrokerCoreBuilder;
+use litebox_broker_userland::runner::{accept_runner_channel, wait_for_connection};
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 
-use super::{SETUP_TIMEOUT, configured_socket_policy};
+use super::{IN_PROCESS_RUNNER_POLL_INTERVAL, SETUP_TIMEOUT, configured_socket_policy};
 
 const PROXY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -214,11 +215,17 @@ fn serve_runner_in_process(
     runner: &JoinHandle<super::InProcessRunnerResult>,
 ) -> IoResult<()> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = crate::accept_runner_channel(
+    let control_stream = accept_runner_channel(
         setup_deadline,
         "control",
         || Ok(runner.is_finished().then(|| "thread stopped".to_owned())),
         || control_listener.accept().map(|(stream, _)| stream),
+        |remaining| {
+            wait_for_connection(
+                control_listener,
+                remaining.min(IN_PROCESS_RUNNER_POLL_INTERVAL),
+            )
+        },
     )?;
     validate_peer_process(&control_stream, std::process::id())?;
     serve_control_stream(broker, control_stream, setup_deadline)

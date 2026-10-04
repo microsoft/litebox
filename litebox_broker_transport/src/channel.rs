@@ -111,8 +111,9 @@ pub trait LocalNotificationChannel {
 
     /// Receives one broker notification.
     ///
-    /// Returns `Ok(None)` when the broker closed the channel cleanly before
-    /// starting another notification frame.
+    /// Returns `Ok(None)` when the channel closed cleanly: the broker closed it
+    /// before starting another notification frame, or the local side closed
+    /// the association.
     fn recv_notification(&mut self) -> Result<Option<BrokerNotification>, Self::Error>;
 }
 
