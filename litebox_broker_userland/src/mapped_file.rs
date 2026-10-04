@@ -8,12 +8,17 @@ use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::path::Path;
 use std::ptr::NonNull;
 
+use litebox_broker_core::fs::errors::ReadError;
+use litebox_broker_core::fs::tar_ro::TarStorage;
+
 /// The contents of a file, mapped read-only into the broker's address space.
 ///
 /// This lets the broker serve a large read-only input, such as the initial file system archive,
 /// without first copying all of it into memory: pages come from the host's page cache as they are
-/// read.
+/// read. Reads at an offset copy from the page cache directly, sparing the broker the cost of
+/// mapping those pages in and tearing them down again.
 pub struct MappedFile {
+    file: File,
     /// Start of the mapping, or dangling if `len` is zero.
     address: NonNull<u8>,
     len: usize,
@@ -37,24 +42,26 @@ impl MappedFile {
         let file = File::open(path)?;
         let len = usize::try_from(file.metadata()?.len())
             .map_err(|_| IoError::new(ErrorKind::InvalidInput, "file is too large to map"))?;
-        if len == 0 {
+        let address = if len == 0 {
             // Hosts refuse to map empty files, and there are no bytes to lend out anyway.
-            return Ok(Self {
-                address: NonNull::dangling(),
-                len,
-            });
-        }
-        let address = host::map(&file, len)?;
-        Ok(Self { address, len })
+            NonNull::dangling()
+        } else {
+            host::map(&file, len)?
+        };
+        Ok(Self { file, address, len })
     }
 }
 
-impl AsRef<[u8]> for MappedFile {
-    fn as_ref(&self) -> &[u8] {
+impl TarStorage for MappedFile {
+    fn bytes(&self) -> &[u8] {
         // SAFETY: `address` is either dangling with a zero `len`, or the start of a live, readable
         // mapping of `len` bytes owned by `self`, whose contents the contract of `open` keeps
         // unchanged.
         unsafe { std::slice::from_raw_parts(self.address.as_ptr(), self.len) }
+    }
+
+    fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<(), ReadError> {
+        host::read_exact_at(&self.file, buf, offset as u64).map_err(|_| ReadError::Io)
     }
 }
 
@@ -73,7 +80,13 @@ mod host {
     use std::fs::File;
     use std::io::{Error as IoError, Result as IoResult};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt as _;
     use std::ptr::NonNull;
+
+    /// Fill `buf` with the bytes of `file` at `offset`.
+    pub(super) fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> IoResult<()> {
+        file.read_exact_at(buf, offset)
+    }
 
     /// Map the first `len` bytes of `file` read-only.
     pub(super) fn map(file: &File, len: usize) -> IoResult<NonNull<u8>> {
@@ -110,9 +123,26 @@ mod host {
 #[cfg(all(windows, target_arch = "x86_64"))]
 mod host {
     use std::fs::File;
-    use std::io::{Error as IoError, Result as IoResult};
+    use std::io::{Error as IoError, ErrorKind, Result as IoResult};
+    use std::os::windows::fs::FileExt as _;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::ptr::NonNull;
+
+    /// Fill `buf` with the bytes of `file` at `offset`.
+    pub(super) fn read_exact_at(file: &File, mut buf: &mut [u8], mut offset: u64) -> IoResult<()> {
+        while !buf.is_empty() {
+            match file.seek_read(buf, offset) {
+                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                Ok(read) => {
+                    buf = &mut buf[read..];
+                    offset += read as u64;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
 
     use windows_sys::Win32::System::Memory::{
         CreateFileMappingW, FILE_MAP_READ, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -163,6 +193,8 @@ mod host {
 mod tests {
     use std::io::Write;
 
+    use litebox_broker_core::fs::tar_ro::TarStorage as _;
+
     use super::MappedFile;
 
     fn mapped(contents: &[u8]) -> MappedFile {
@@ -175,11 +207,21 @@ mod tests {
     #[test]
     fn maps_file_contents() {
         let contents: Vec<u8> = (0..10_000u32).flat_map(u32::to_le_bytes).collect();
-        assert_eq!(mapped(&contents).as_ref(), contents);
+        assert_eq!(mapped(&contents).bytes(), contents);
+    }
+
+    #[test]
+    fn reads_file_contents_at_an_offset() {
+        let contents: Vec<u8> = (0..10_000u32).flat_map(u32::to_le_bytes).collect();
+        let mut buf = [0; 100];
+        mapped(&contents).read_exact_at(&mut buf, 5000).unwrap();
+        assert_eq!(buf, contents[5000..5100]);
     }
 
     #[test]
     fn maps_empty_file() {
-        assert!(mapped(b"").as_ref().is_empty());
+        let file = mapped(b"");
+        assert!(file.bytes().is_empty());
+        file.read_exact_at(&mut [], 0).unwrap();
     }
 }

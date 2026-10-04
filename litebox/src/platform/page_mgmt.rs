@@ -220,6 +220,16 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Note that the returned ranges should be `ALIGN`-aligned.
     fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
 
+    /// Hints that the caller is about to fill the allocated pages in `range` with data from their
+    /// start, possibly stopping short of the end (e.g., at the end of a file copied into them).
+    ///
+    /// A platform may, for example, back these pages with larger host pages, which take fewer
+    /// faults to fill but can leave up to one larger page past the filled part resident.
+    ///
+    /// The default implementation does nothing.
+    #[expect(unused_variables, reason = "default body")]
+    fn advise_fill(&self, range: Range<usize>) {}
+
     /// Attempt to allocate pages with copy-on-write semantics backed by static data.
     ///
     /// This method allows platforms that support it to create CoW mappings instead of performing

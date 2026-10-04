@@ -52,19 +52,34 @@ pub struct TarRo {
 }
 
 /// The storage holding a [`TarRo`] archive.
-type TarData = Box<dyn AsRef<[u8]> + Send + Sync>;
+///
+/// Anything that can lend out the archive's bytes, such as a static slice or an owned buffer, is
+/// such storage.
+pub trait TarStorage: Send + Sync + 'static {
+    /// Lends out the whole archive, which must be the same bytes every time.
+    fn bytes(&self) -> &[u8];
+
+    /// Fills `buf` with the archive's bytes starting at `offset`, which lie within [`Self::bytes`].
+    ///
+    /// [`TarRo`] indexes the archive through [`Self::bytes`] but reads file contents through this,
+    /// so storage that can read its bytes more cheaply than it lends them out can override it.
+    fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> Result<(), ReadError> {
+        buf.copy_from_slice(&self.bytes()[offset..][..buf.len()]);
+        Ok(())
+    }
+}
+
+impl<T: AsRef<[u8]> + Send + Sync + 'static> TarStorage for T {
+    fn bytes(&self) -> &[u8] {
+        self.as_ref()
+    }
+}
 
 impl TarRo {
     /// Construct a tar backend over the archive in `tar_data`, using a caller-provided inode
     /// allocator.
-    ///
-    /// `tar_data` is any storage that can lend out the archive's bytes, such as a static slice, an
-    /// owned buffer, or a memory-mapped file; it must lend out the same bytes every time.
     #[must_use]
-    pub fn new(
-        tar_data: impl AsRef<[u8]> + Send + Sync + 'static,
-        inode_allocator: InodeAllocator,
-    ) -> Self {
+    pub fn new(tar_data: impl TarStorage, inode_allocator: InodeAllocator) -> Self {
         Self {
             tar_index: TarIndex::new(Box::new(tar_data), inode_allocator),
         }
@@ -201,12 +216,16 @@ impl super::backend::Backend for TarRo {
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
-        let file = self.tar_index.file_data(h.get_typed::<Self>().idx);
+        let file = self.tar_index.files[h.get_typed::<Self>().idx]
+            .data_range
+            .clone();
         let start = offset.min(file.len());
         let end = offset.checked_add(buf.len()).unwrap().min(file.len());
         debug_assert!(start <= end);
         let len = end - start;
-        buf[..len].copy_from_slice(&file[start..end]);
+        self.tar_index
+            .tar_data
+            .read_exact_at(&mut buf[..len], file.start + start)?;
         Ok(len)
     }
 
@@ -326,14 +345,14 @@ enum IndexedChild {
 }
 
 struct TarIndex {
-    tar_data: TarData,
+    tar_data: Box<dyn TarStorage>,
     files: Vec<IndexedFile>,
     dirs: Vec<IndexedDir>,
 }
 
 impl TarIndex {
-    fn new(tar_data: TarData, inode_allocator: InodeAllocator) -> Self {
-        let bytes = (*tar_data).as_ref();
+    fn new(tar_data: Box<dyn TarStorage>, inode_allocator: InodeAllocator) -> Self {
+        let bytes = tar_data.bytes();
         let archive = tar_no_std::TarArchiveRef::new(bytes).expect("invalid tar data");
         let base_ptr = bytes.as_ptr() as usize;
 
@@ -420,11 +439,6 @@ impl TarIndex {
             files,
             dirs,
         }
-    }
-
-    fn file_data(&self, file_idx: usize) -> &[u8] {
-        let range = self.files[file_idx].data_range.clone();
-        &(*self.tar_data).as_ref()[range]
     }
 
     /// The directory entry for `child`, named `name` in its parent.

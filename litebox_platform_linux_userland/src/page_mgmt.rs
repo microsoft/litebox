@@ -272,6 +272,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         self.reserved_pages.iter()
     }
 
+    /// Asks the host to back `range` with transparent huge pages, each of which takes one
+    /// fault and one clear instead of one per base page. This is best-effort: the host may
+    /// have them disabled, or another thread may have unmapped the range.
+    fn advise_fill(&self, range: core::ops::Range<usize>) {
+        // SAFETY: `MADV_HUGEPAGE` changes how the host backs `range`, never what it contains.
+        let _ = unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::madvise,
+                range.start,
+                range.len(),
+                libc::MADV_HUGEPAGE.reinterpret_as_unsigned() as usize,
+            )
+        };
+    }
+
     fn try_allocate_cow_pages(
         &self,
         suggested_start: usize,
