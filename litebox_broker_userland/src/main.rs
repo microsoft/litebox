@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
@@ -37,9 +37,7 @@ mod linux;
 mod windows;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// How often an in-process runner thread, which cannot be waited on alongside
-/// its connection, is rechecked for having stopped before connecting.
-const IN_PROCESS_RUNNER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AllowedDestination {
@@ -307,6 +305,35 @@ fn destination_rules(allowed_destinations: &[AllowedDestination]) -> Vec<Destina
             )
         })
         .collect()
+}
+
+fn accept_runner_channel<Channel>(
+    deadline: Instant,
+    channel_name: &'static str,
+    mut runner_status: impl FnMut() -> IoResult<Option<String>>,
+    mut try_accept: impl FnMut() -> IoResult<Channel>,
+) -> IoResult<Channel> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(IoError::new(
+                ErrorKind::TimedOut,
+                format!("timed out waiting for runner {channel_name} channel"),
+            ));
+        }
+        if let Some(status) = runner_status()? {
+            return Err(IoError::new(
+                ErrorKind::BrokenPipe,
+                format!("runner {status} before connecting its {channel_name} channel"),
+            ));
+        }
+        match try_accept() {
+            Ok(channel) => return Ok(channel),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(remaining.min(ACCEPT_RETRY_DELAY));
+    }
 }
 
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]

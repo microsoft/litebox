@@ -20,10 +20,9 @@ use litebox_broker_transport_windows_userland::named_pipe::{
 };
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 use litebox_broker_userland::builder::BrokerCoreBuilder;
-use litebox_broker_userland::runner::accept_runner_channel;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
 
-use super::{IN_PROCESS_RUNNER_POLL_INTERVAL, SETUP_TIMEOUT, configured_socket_policy};
+use super::{SETUP_TIMEOUT, configured_socket_policy};
 
 pub(super) fn run(
     args: super::CliArgs,
@@ -75,15 +74,11 @@ fn serve_runner_in_process(
     runner: &JoinHandle<super::InProcessRunnerResult>,
 ) -> IoResult<()> {
     let setup_deadline = Instant::now() + SETUP_TIMEOUT;
-    let control_stream = accept_runner_channel(
+    let control_stream = crate::accept_runner_channel(
         setup_deadline,
         "control",
         || Ok(runner.is_finished().then(|| "thread stopped".to_owned())),
         || control_listener.try_accept(),
-        |remaining| {
-            std::thread::sleep(remaining.min(IN_PROCESS_RUNNER_POLL_INTERVAL));
-            Ok(())
-        },
     )?;
     validate_client_process(&control_stream, std::process::id())?;
     serve_control_stream(

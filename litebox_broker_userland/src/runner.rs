@@ -415,12 +415,7 @@ const _: () = {
     assert!(runner_exit_code_is_crash(Some(breakpoint)));
 };
 
-/// Accepts a runner's `channel_name` channel with `try_accept`, calling `wait`
-/// with the remaining setup time whenever no connection is pending.
-///
-/// Fails once `runner_status` reports that the runner stopped or `deadline`
-/// passes.
-pub fn accept_runner_channel<Channel>(
+fn accept_runner_channel<Channel>(
     deadline: Instant,
     channel_name: &'static str,
     mut runner_status: impl FnMut() -> IoResult<Option<String>>,
@@ -448,17 +443,6 @@ pub fn accept_runner_channel<Channel>(
         }
         wait(remaining)?;
     }
-}
-
-/// Waits until `listener` has a pending connection or `timeout` elapses.
-/// Callers recheck their own condition, so early returns are harmless.
-#[cfg(target_os = "linux")]
-pub fn wait_for_connection(
-    listener: &std::os::unix::net::UnixListener,
-    timeout: Duration,
-) -> IoResult<()> {
-    use std::os::fd::AsFd;
-    linux::poll_readable([Some(listener.as_fd()), None], Some(timeout))
 }
 
 fn runner_has_exited(runner: &Arc<Mutex<Child>>) -> IoResult<bool> {
