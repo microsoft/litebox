@@ -2331,16 +2331,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .collect();
 
         if runtime.region.is_none() {
-            let holes_only = rewrite(&spaces);
-            if holes_only
-                .as_ref()
-                .is_ok_and(|batch| batch.trapped.is_empty())
+            // Without a hole to try, go straight to the region.
+            let holes_only = (!spaces.is_empty()).then(|| rewrite(&spaces));
+            if let Some(Ok(batch)) = &holes_only
+                && batch.trapped.is_empty()
             {
-                return holes_only;
+                return holes_only.expect("matched above");
             }
             if let Err(reason) = self.reserve_runtime_trampoline_region(runtime, code_range) {
                 litebox_util_log::warn!(err:% = reason; "no runtime trampoline region");
-                return holes_only.or(Err(RuntimeGateError::NoRegion(reason)));
+                return match holes_only {
+                    Some(Ok(batch)) => Ok(batch),
+                    _ => Err(RuntimeGateError::NoRegion(reason)),
+                };
             }
         }
         let region = runtime.region.as_ref().expect("reserved above");
