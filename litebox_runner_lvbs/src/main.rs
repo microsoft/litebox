@@ -203,7 +203,8 @@ unsafe fn apply_relocations() {
 /// │ Heap is now available (seeded from the 16 MiB Phase 1 window).      │
 /// │ Allocate a fresh PML4 from the heap. Map ALL 128 MiB of VTL1        │
 /// │ memory with NX (no-execute) by default; mark only .text and         │
-/// │ .hvcall_page executable. Enable EFER.NXE, then load the new CR3.    │
+/// │ .hvcall_page executable, and .rodata read-only. Enable EFER.NXE,    │
+/// │ load the new CR3, then enable CR0.WP.                               │
 /// │                                                                     │
 /// │ The page table pages themselves are allocated from the heap         │
 /// │ (within 16 MiB) — we never need to ACCESS memory beyond 16 MiB      │

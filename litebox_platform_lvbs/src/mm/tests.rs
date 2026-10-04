@@ -230,6 +230,8 @@ fn test_vmm_page_fault() {
         x86_64::PhysAddr::new(0),
         x86_64::PhysAddr::new(0),
         x86_64::PhysAddr::new(0),
+        x86_64::PhysAddr::new(0),
+        x86_64::PhysAddr::new(0),
     );
     let vmm = VmemManager::<_, PAGE_SIZE>::new(platform);
     unsafe {

@@ -111,6 +111,15 @@ pub fn enable_dep() {
     }
 }
 
+/// Enable supervisor write protection (`CR0.WP`) on the current CPU.
+#[cfg(target_arch = "x86_64")]
+pub fn enable_write_protect() {
+    use x86_64::registers::control::{Cr0, Cr0Flags};
+    // Safety: setting WP only restricts ring-0 writes to read-only pages; it
+    // does not alter translation or any other CR0 state.
+    unsafe { Cr0::update(|cr0| cr0.insert(Cr0Flags::WRITE_PROTECT)) };
+}
+
 /// Enable Supervisor Mode Execution/Access Prevention (SMEP & SMAP).
 ///
 /// - **CR4.SMEP**: prevents the kernel from executing code that resides
