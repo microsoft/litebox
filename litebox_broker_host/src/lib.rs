@@ -23,6 +23,7 @@ extern crate std;
 
 use alloc::{boxed::Box, sync::Arc, vec::Vec};
 
+use litebox_broker_core::local_socket::LocalSocketResult;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{
     BrokerCore, BrokerError, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
@@ -37,10 +38,17 @@ use litebox_broker_protocol::fs::{
     SeekFileResponse, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest, WriteFileResponse,
     encode_directory_entries_chunk,
 };
+use litebox_broker_protocol::local_socket::{
+    AcceptLocalSocketResponse, CreateLocalSocketPairResponse, CreateLocalSocketResponse,
+    GetLocalSocketNameResponse, GetLocalSocketOptionsResponse, LocalSocketAddress,
+    LocalSocketError, MAX_ENCODED_LOCAL_SOCKET_ADDRESS_SIZE, MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE,
+    MAX_LOCAL_SOCKET_TRANSFER_SIZE, ReceiveLocalSocketResponse, SendLocalSocketResponse,
+};
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
-    EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-    SignalRequest, SignalResponse, SocketRequest, SocketResponse, TimerRequest, TimerResponse,
+    EventRequest, EventResponse, FileRequest, FileResponse, LocalSocketRequest,
+    LocalSocketResponse, PipeRequest, PipeResponse, SignalRequest, SignalResponse, SocketRequest,
+    SocketResponse, TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -563,6 +571,10 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::Socket(request) => {
             handle_socket_request(process, request, shared_buffers, readiness_sink)
                 .map(BrokerResult::Socket)
+        }
+        BrokerOperation::LocalSocket(request) => {
+            handle_local_socket_request(process, request, shared_buffers, readiness_sink)
+                .map(BrokerResult::LocalSocket)
         }
         BrokerOperation::FillRandom(buffer) => {
             validate_shared_buffer(buffer, MAX_RANDOM_TRANSFER_SIZE)?;
@@ -1342,6 +1354,217 @@ fn handle_pipe_request<Memory: SharedMemory>(
     }
 }
 
+fn handle_local_socket_request<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    request: LocalSocketRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<LocalSocketResponse> {
+    Ok(
+        local_socket_operation(process, request, shared_buffers, readiness_sink)?
+            .unwrap_or_else(LocalSocketResponse::Failed),
+    )
+}
+
+fn local_socket_operation<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    request: LocalSocketRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<LocalSocketResult<LocalSocketResponse>> {
+    use litebox_broker_core::local_socket;
+
+    match request {
+        LocalSocketRequest::Create(request) => {
+            let handle =
+                local_socket::create(process, request.socket_type, request.flags, readiness_sink)?;
+            Ok(Ok(LocalSocketResponse::Create(CreateLocalSocketResponse {
+                handle,
+            })))
+        }
+        LocalSocketRequest::CreatePair(request) => {
+            let (first, second) = local_socket::create_pair(
+                process,
+                request.socket_type,
+                request.flags,
+                readiness_sink,
+            )?;
+            Ok(Ok(LocalSocketResponse::CreatePair(
+                CreateLocalSocketPairResponse { first, second },
+            )))
+        }
+        LocalSocketRequest::Bind(request) => {
+            let address = match read_local_socket_address(shared_buffers, request.address)? {
+                Ok(address) => address,
+                Err(error) => return Ok(Err(error)),
+            };
+            Ok(local_socket::bind(
+                process,
+                request.handle,
+                &address,
+                request.user,
+                request.mode,
+            )?
+            .map(|()| LocalSocketResponse::Bind))
+        }
+        LocalSocketRequest::Listen(request) => {
+            Ok(
+                local_socket::listen(process, request.handle, request.backlog)?
+                    .map(|()| LocalSocketResponse::Listen),
+            )
+        }
+        LocalSocketRequest::Connect(request) => {
+            let address = match read_local_socket_address(shared_buffers, request.address)? {
+                Ok(address) => address,
+                Err(error) => return Ok(Err(error)),
+            };
+            Ok(
+                local_socket::connect(process, request.handle, &address, request.user)?
+                    .map(|()| LocalSocketResponse::Connect),
+            )
+        }
+        LocalSocketRequest::Accept(request) => {
+            Ok(
+                local_socket::accept(process, request.handle, request.flags, readiness_sink)?.map(
+                    |handle| LocalSocketResponse::Accept(AcceptLocalSocketResponse { handle }),
+                ),
+            )
+        }
+        LocalSocketRequest::Send(request) => {
+            let buffer = read_shared_buffer(
+                shared_buffers,
+                request.buffer,
+                MAX_LOCAL_SOCKET_TRANSFER_SIZE,
+            )?;
+            let (address, data) = buffer
+                .split_at_checked(request.address_length as usize)
+                .ok_or(RequestFailure::Abort(ErrorCode::MalformedRequest))?;
+            let address = if address.is_empty() {
+                None
+            } else {
+                match LocalSocketAddress::decode(address) {
+                    Ok(address) => Some(address),
+                    Err(_) => return Ok(Err(LocalSocketError::InvalidArgument)),
+                }
+            };
+            Ok(local_socket::send(
+                process,
+                request.handle,
+                address.as_ref(),
+                data,
+                request.user,
+            )?
+            .map(|sent| {
+                LocalSocketResponse::Send(SendLocalSocketResponse {
+                    sent: u32::try_from(sent).expect("sent bytes fit in the request"),
+                })
+            }))
+        }
+        LocalSocketRequest::Receive(request) => {
+            validate_shared_buffer(request.buffer, MAX_LOCAL_SOCKET_TRANSFER_SIZE)?;
+            if request
+                .capacity
+                .checked_add(MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE)
+                .is_none_or(|length| length > request.buffer.length())
+            {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            let received = match local_socket::receive(
+                process,
+                request.handle,
+                request.capacity,
+                request.peek,
+                request.nonblocking,
+            )? {
+                Ok(received) => received,
+                Err(error) => return Ok(Err(error)),
+            };
+            let source = received
+                .source
+                .encode()
+                .ok_or(RequestFailure::Abort(ErrorCode::Internal))?;
+            let length = u32::try_from(received.length)
+                .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
+            let mut output = received.data;
+            let received = u32::try_from(output.len()).expect("received bytes fit the capacity");
+            output
+                .try_reserve_exact(source.len())
+                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+            output.extend_from_slice(&source);
+            write_shared_buffer(
+                shared_buffers,
+                request.buffer,
+                &output,
+                MAX_LOCAL_SOCKET_TRANSFER_SIZE,
+            )?;
+            Ok(Ok(LocalSocketResponse::Receive(
+                ReceiveLocalSocketResponse {
+                    received,
+                    length,
+                    source_length: u32::try_from(source.len()).expect("encoded names fit in u32"),
+                },
+            )))
+        }
+        LocalSocketRequest::Shutdown(request) => {
+            Ok(
+                local_socket::shutdown(process, request.handle, request.mode)?
+                    .map(|()| LocalSocketResponse::Shutdown),
+            )
+        }
+        LocalSocketRequest::GetName(request) => {
+            validate_shared_buffer(request.buffer, MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE)?;
+            let name = match local_socket::name(process, request.handle, request.peer)? {
+                Ok(name) => name,
+                Err(error) => return Ok(Err(error)),
+            };
+            let encoded = name
+                .encode()
+                .ok_or(RequestFailure::Abort(ErrorCode::Internal))?;
+            if encoded.len() > request.buffer.length() as usize {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            write_shared_buffer(
+                shared_buffers,
+                request.buffer,
+                &encoded,
+                MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE,
+            )?;
+            Ok(Ok(LocalSocketResponse::GetName(
+                GetLocalSocketNameResponse {
+                    length: u32::try_from(encoded.len()).expect("encoded names fit in u32"),
+                },
+            )))
+        }
+        LocalSocketRequest::SetOption(request) => {
+            local_socket::set_option(process, request.handle, request.option)?;
+            Ok(Ok(LocalSocketResponse::SetOption))
+        }
+        LocalSocketRequest::GetOptions(handle) => {
+            let (socket_type, options) = local_socket::options(process, handle)?;
+            Ok(Ok(LocalSocketResponse::GetOptions(
+                GetLocalSocketOptionsResponse {
+                    socket_type,
+                    options,
+                },
+            )))
+        }
+    }
+}
+
+/// Reads an encoded local socket address, reporting an undecodable one as
+/// an invalid argument.
+fn read_local_socket_address<Memory: SharedMemory>(
+    shared_buffers: &SharedBufferPool<Memory>,
+    buffer: SharedBufferSequence,
+) -> RequestResult<LocalSocketResult<LocalSocketAddress>> {
+    let encoded = read_shared_buffer(
+        shared_buffers,
+        buffer,
+        MAX_ENCODED_LOCAL_SOCKET_ADDRESS_SIZE,
+    )?;
+    Ok(LocalSocketAddress::decode(&encoded).map_err(|_| LocalSocketError::InvalidArgument))
+}
+
 fn handle_event_request(
     process: &BrokerProcess,
     request: EventRequest,
@@ -1444,6 +1667,11 @@ mod tests {
         FileAccessMode, FileMode, FileOpenFlags, FileSeekWhence, FileStatusFlags, FileType,
         FileUser, OpenFileRequest, ReadDirectoryRequest, ReadFileRequest, SeekFileRequest,
         SetStatusFlagsRequest, WriteFileRequest, decode_directory_entries,
+    };
+    use litebox_broker_protocol::local_socket::{
+        AcceptLocalSocketRequest, BindLocalSocketRequest, ConnectLocalSocketRequest,
+        CreateLocalSocketRequest, GetLocalSocketNameRequest, ListenLocalSocketRequest,
+        LocalSocketName, ReceiveLocalSocketRequest, SendLocalSocketRequest,
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
@@ -1802,6 +2030,7 @@ mod tests {
         active_requests_operate_timers(&broker, &timer_provider);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
+        association_shared_buffer_sequences_stage_local_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
         active_request_queries_file_terminal(&broker, &stdio_provider);
         active_requests_change_file_status_flags(&broker);
@@ -2658,6 +2887,232 @@ mod tests {
             .read(SharedBufferSlotIndex(1), &mut second_slot)
             .unwrap();
         assert_eq!(second_slot, [9]);
+    }
+
+    fn association_shared_buffer_sequences_stage_local_socket_data(broker: &BrokerCore) {
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let request = |operation| {
+            let BrokerResult::LocalSocket(response) =
+                handle_test_request_with_buffers(&process, operation, &shared_buffers)
+            else {
+                panic!("expected a local socket response");
+            };
+            response
+        };
+        let create = |socket_type| {
+            let LocalSocketResponse::Create(response) = request(BrokerOperation::LocalSocket(
+                LocalSocketRequest::Create(CreateLocalSocketRequest {
+                    socket_type,
+                    flags: FileOpenFlags::NONE,
+                }),
+            )) else {
+                panic!("expected local socket creation");
+            };
+            response.handle
+        };
+        let stage = |slot, data: &[u8]| {
+            shared_buffers
+                .write(SharedBufferSlotIndex(slot), data)
+                .unwrap();
+            single_slot_sequence(slot, u32::try_from(data.len()).unwrap())
+        };
+        let receive = |handle, capacity: u32| {
+            let response = request(BrokerOperation::LocalSocket(LocalSocketRequest::Receive(
+                ReceiveLocalSocketRequest {
+                    handle,
+                    buffer: single_slot_sequence(9, capacity + MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE),
+                    capacity,
+                    peek: false,
+                    nonblocking: false,
+                },
+            )));
+            let LocalSocketResponse::Receive(response) = response else {
+                panic!("expected a receive response, got {response:?}");
+            };
+            let mut output = std::vec![0; (response.received + response.source_length) as usize];
+            shared_buffers
+                .read(SharedBufferSlotIndex(9), &mut output)
+                .unwrap();
+            let source = output.split_off(response.received as usize);
+            (
+                output,
+                response.length,
+                LocalSocketName::decode(&source).unwrap(),
+            )
+        };
+
+        // A stream pair moves staged bytes to its peer.
+        let LocalSocketResponse::CreatePair(pair) = request(BrokerOperation::LocalSocket(
+            LocalSocketRequest::CreatePair(CreateLocalSocketRequest {
+                socket_type: SocketType::Stream,
+                flags: FileOpenFlags::NONE,
+            }),
+        )) else {
+            panic!("expected local socket pair creation");
+        };
+        assert_eq!(
+            request(BrokerOperation::LocalSocket(LocalSocketRequest::Send(
+                SendLocalSocketRequest {
+                    handle: pair.first,
+                    buffer: stage(2, &[1, 2, 3]),
+                    address_length: 0,
+                    user: ROOT,
+                },
+            ))),
+            LocalSocketResponse::Send(SendLocalSocketResponse { sent: 3 })
+        );
+        assert_eq!(
+            receive(pair.second, 8),
+            (std::vec![1, 2, 3], 3, LocalSocketName::Unnamed)
+        );
+
+        // A path-bound listener accepts a connection made through the same
+        // path.
+        let path = LocalSocketAddress::Path {
+            path: "/server.sock".into(),
+            name: b"server.sock".to_vec(),
+        };
+        let listener = create(SocketType::Stream);
+        assert_eq!(
+            request(BrokerOperation::LocalSocket(LocalSocketRequest::Bind(
+                BindLocalSocketRequest {
+                    handle: listener,
+                    address: stage(3, &path.encode().unwrap()),
+                    user: ROOT,
+                    mode: FileMode::from_bits(0o755).unwrap(),
+                },
+            ))),
+            LocalSocketResponse::Bind
+        );
+        assert_eq!(
+            request(BrokerOperation::LocalSocket(LocalSocketRequest::Listen(
+                ListenLocalSocketRequest {
+                    handle: listener,
+                    backlog: 1,
+                },
+            ))),
+            LocalSocketResponse::Listen
+        );
+        let client = create(SocketType::Stream);
+        assert_eq!(
+            request(BrokerOperation::LocalSocket(LocalSocketRequest::Connect(
+                ConnectLocalSocketRequest {
+                    handle: client,
+                    address: stage(3, &path.encode().unwrap()),
+                    user: ROOT,
+                },
+            ))),
+            LocalSocketResponse::Connect
+        );
+        let LocalSocketResponse::Accept(accepted) = request(BrokerOperation::LocalSocket(
+            LocalSocketRequest::Accept(AcceptLocalSocketRequest {
+                handle: listener,
+                flags: FileOpenFlags::NONE,
+            }),
+        )) else {
+            panic!("expected an accepted connection");
+        };
+        let get_name = |handle, peer| {
+            let response = request(BrokerOperation::LocalSocket(LocalSocketRequest::GetName(
+                GetLocalSocketNameRequest {
+                    handle,
+                    peer,
+                    buffer: single_slot_sequence(10, MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE),
+                },
+            )));
+            let LocalSocketResponse::GetName(response) = response else {
+                panic!("expected a name response, got {response:?}");
+            };
+            let mut encoded = std::vec![0; response.length as usize];
+            shared_buffers
+                .read(SharedBufferSlotIndex(10), &mut encoded)
+                .unwrap();
+            LocalSocketName::decode(&encoded).unwrap()
+        };
+        assert_eq!(get_name(client, true), path.name());
+        assert_eq!(get_name(accepted.handle, false), path.name());
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::File(FileRequest::Unlink(UnlinkFileRequest {
+                    path: stage(3, b"/server.sock"),
+                    user: ROOT,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::File(FileResponse::Unlink)
+        );
+
+        // A datagram addressed by name reports the sender's name.
+        let server = create(SocketType::Datagram);
+        let sender = create(SocketType::Datagram);
+        let server_address = LocalSocketAddress::Abstract(b"server".to_vec());
+        let sender_address = LocalSocketAddress::Abstract(b"sender".to_vec());
+        for (handle, address) in [(server, &server_address), (sender, &sender_address)] {
+            assert_eq!(
+                request(BrokerOperation::LocalSocket(LocalSocketRequest::Bind(
+                    BindLocalSocketRequest {
+                        handle,
+                        address: stage(3, &address.encode().unwrap()),
+                        user: ROOT,
+                        mode: FileMode::default(),
+                    },
+                ))),
+                LocalSocketResponse::Bind
+            );
+        }
+        let mut staged = server_address.encode().unwrap();
+        let address_length = u32::try_from(staged.len()).unwrap();
+        staged.extend_from_slice(&[7, 8, 9]);
+        assert_eq!(
+            request(BrokerOperation::LocalSocket(LocalSocketRequest::Send(
+                SendLocalSocketRequest {
+                    handle: sender,
+                    buffer: stage(4, &staged),
+                    address_length,
+                    user: ROOT,
+                },
+            ))),
+            LocalSocketResponse::Send(SendLocalSocketResponse { sent: 3 })
+        );
+        assert_eq!(
+            receive(server, 2),
+            (std::vec![7, 8], 3, sender_address.name())
+        );
+
+        // An undecodable address fails the operation without aborting.
+        assert_eq!(
+            request(BrokerOperation::LocalSocket(LocalSocketRequest::Connect(
+                ConnectLocalSocketRequest {
+                    handle: create(SocketType::Stream),
+                    address: stage(3, &[0xff]),
+                    user: ROOT,
+                },
+            ))),
+            LocalSocketResponse::Failed(LocalSocketError::InvalidArgument)
+        );
+
+        // A receive buffer without room for the source name is malformed.
+        assert_eq!(
+            complete_request(handle_request(
+                &process,
+                BrokerOperation::LocalSocket(LocalSocketRequest::Receive(
+                    ReceiveLocalSocketRequest {
+                        handle: server,
+                        buffer: single_slot_sequence(9, 8),
+                        capacity: 8,
+                        peek: false,
+                        nonblocking: false,
+                    },
+                )),
+                &shared_buffers,
+                &test_readiness_sink(),
+            )),
+            Err(ErrorCode::MalformedRequest)
+        );
     }
 
     fn association_shared_buffer_sequences_stage_socket_data(broker: &BrokerCore) {

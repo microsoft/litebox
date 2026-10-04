@@ -19,6 +19,7 @@ extern crate std;
 pub mod error;
 pub mod event;
 pub mod fs;
+pub mod local_socket;
 pub mod message;
 pub mod pipe;
 pub mod process;

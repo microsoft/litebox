@@ -33,6 +33,7 @@ use primitive::{Decoder, Encoder};
 
 mod event;
 mod fs;
+mod local_socket;
 mod pipe;
 mod primitive;
 mod signal;
@@ -60,6 +61,7 @@ const REQUEST_TAG_GET_STATUS_FLAGS: u8 = 18;
 const REQUEST_TAG_SET_STATUS_FLAGS: u8 = 19;
 const REQUEST_TAG_SIGNAL: u8 = 20;
 const REQUEST_TAG_WRITE_CHILD_MEMORY: u8 = 21;
+const REQUEST_TAG_LOCAL_SOCKET: u8 = 22;
 
 const CREATE_THREAD_TAG_THREAD: u8 = 0;
 const CREATE_THREAD_TAG_PROCESS: u8 = 1;
@@ -89,6 +91,7 @@ const RESPONSE_TAG_STATUS_FLAGS: u8 = 18;
 const RESPONSE_TAG_STATUS_FLAGS_SET: u8 = 19;
 const RESPONSE_TAG_SIGNAL: u8 = 20;
 const RESPONSE_TAG_CHILD_MEMORY_WRITTEN: u8 = 21;
+const RESPONSE_TAG_LOCAL_SOCKET: u8 = 22;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -157,7 +160,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_GET_STATUS_FLAGS
         | REQUEST_TAG_SET_STATUS_FLAGS
         | REQUEST_TAG_SIGNAL
-        | REQUEST_TAG_WRITE_CHILD_MEMORY => {
+        | REQUEST_TAG_WRITE_CHILD_MEMORY
+        | REQUEST_TAG_LOCAL_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -295,6 +299,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             signal::encode_signal_request(&mut encoder, request);
         }
+        BrokerOperation::LocalSocket(request) => {
+            encoder.u8(REQUEST_TAG_LOCAL_SOCKET);
+            encoder.request_id(request_id);
+            local_socket::encode_local_socket_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -324,7 +333,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_GET_STATUS_FLAGS
         | REQUEST_TAG_SET_STATUS_FLAGS
         | REQUEST_TAG_SIGNAL
-        | REQUEST_TAG_WRITE_CHILD_MEMORY => {}
+        | REQUEST_TAG_WRITE_CHILD_MEMORY
+        | REQUEST_TAG_LOCAL_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -386,6 +396,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         }
         REQUEST_TAG_TIMER => BrokerOperation::Timer(timer::decode_timer_request(&mut decoder)?),
         REQUEST_TAG_SIGNAL => BrokerOperation::Signal(signal::decode_signal_request(&mut decoder)?),
+        REQUEST_TAG_LOCAL_SOCKET => {
+            BrokerOperation::LocalSocket(local_socket::decode_local_socket_request(&mut decoder)?)
+        }
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -471,7 +484,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_STATUS_FLAGS
         | RESPONSE_TAG_STATUS_FLAGS_SET
         | RESPONSE_TAG_SIGNAL
-        | RESPONSE_TAG_CHILD_MEMORY_WRITTEN => {
+        | RESPONSE_TAG_CHILD_MEMORY_WRITTEN
+        | RESPONSE_TAG_LOCAL_SOCKET => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -606,6 +620,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             signal::encode_signal_response(&mut encoder, response);
         }
+        BrokerResult::LocalSocket(response) => {
+            encoder.u8(RESPONSE_TAG_LOCAL_SOCKET);
+            encoder.request_id(request_id);
+            local_socket::encode_local_socket_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -643,7 +662,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_STATUS_FLAGS
         | RESPONSE_TAG_STATUS_FLAGS_SET
         | RESPONSE_TAG_SIGNAL
-        | RESPONSE_TAG_CHILD_MEMORY_WRITTEN => {}
+        | RESPONSE_TAG_CHILD_MEMORY_WRITTEN
+        | RESPONSE_TAG_LOCAL_SOCKET => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -688,6 +708,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_CHILD_MEMORY_WRITTEN => BrokerResult::ChildMemoryWritten,
         RESPONSE_TAG_TIMER => BrokerResult::Timer(timer::decode_timer_response(&mut decoder)?),
         RESPONSE_TAG_SIGNAL => BrokerResult::Signal(signal::decode_signal_response(&mut decoder)?),
+        RESPONSE_TAG_LOCAL_SOCKET => {
+            BrokerResult::LocalSocket(local_socket::decode_local_socket_response(&mut decoder)?)
+        }
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -805,9 +828,19 @@ mod tests {
         SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
         WriteFileResponse,
     };
+    use crate::local_socket::{
+        AcceptLocalSocketRequest, AcceptLocalSocketResponse, BindLocalSocketRequest,
+        ConnectLocalSocketRequest, CreateLocalSocketPairResponse, CreateLocalSocketRequest,
+        CreateLocalSocketResponse, GetLocalSocketNameRequest, GetLocalSocketNameResponse,
+        GetLocalSocketOptionsResponse, ListenLocalSocketRequest, LocalSocketError,
+        LocalSocketOption, LocalSocketOptions, ReceiveLocalSocketRequest,
+        ReceiveLocalSocketResponse, SendLocalSocketRequest, SendLocalSocketResponse,
+        SetLocalSocketOptionRequest, ShutdownLocalSocketRequest,
+    };
     use crate::message::{
-        EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-        SignalRequest, SignalResponse, SocketRequest, SocketResponse, TimerRequest, TimerResponse,
+        EventRequest, EventResponse, FileRequest, FileResponse, LocalSocketRequest,
+        LocalSocketResponse, PipeRequest, PipeResponse, SignalRequest, SignalResponse,
+        SocketRequest, SocketResponse, TimerRequest, TimerResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -889,6 +922,7 @@ mod tests {
                 RESPONSE_TAG_STATUS_FLAGS_SET,
                 RESPONSE_TAG_SIGNAL,
                 RESPONSE_TAG_CHILD_MEMORY_WRITTEN,
+                RESPONSE_TAG_LOCAL_SOCKET,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -912,6 +946,7 @@ mod tests {
                 REQUEST_TAG_SET_STATUS_FLAGS,
                 REQUEST_TAG_SIGNAL,
                 REQUEST_TAG_WRITE_CHILD_MEMORY,
+                REQUEST_TAG_LOCAL_SOCKET,
             ]
         );
         assert_eq!(
@@ -1213,6 +1248,84 @@ mod tests {
                 offset: u64::MAX,
                 data: largest_sequence,
             }),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Create(CreateLocalSocketRequest {
+                socket_type: SocketType::Stream,
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::CreatePair(
+                CreateLocalSocketRequest {
+                    socket_type: SocketType::Datagram,
+                    flags: FileOpenFlags::NONE,
+                },
+            )),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Bind(BindLocalSocketRequest {
+                handle,
+                address: largest_sequence,
+                user: FileUser {
+                    user: 1000,
+                    group: u16::MAX,
+                },
+                mode: FileMode::from_bits(0o755).unwrap(),
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Listen(ListenLocalSocketRequest {
+                handle,
+                backlog: u32::MAX,
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Connect(ConnectLocalSocketRequest {
+                handle,
+                address: largest_sequence,
+                user: FileUser { user: 0, group: 0 },
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Accept(AcceptLocalSocketRequest {
+                handle,
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Send(SendLocalSocketRequest {
+                handle,
+                buffer: largest_sequence,
+                address_length: u32::MAX,
+                user: FileUser { user: 1, group: 2 },
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Receive(ReceiveLocalSocketRequest {
+                handle,
+                buffer: largest_sequence,
+                capacity: u32::MAX,
+                peek: true,
+                nonblocking: true,
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::Shutdown(
+                ShutdownLocalSocketRequest {
+                    handle,
+                    mode: ShutdownMode::Both,
+                },
+            )),
+            BrokerOperation::LocalSocket(LocalSocketRequest::GetName(GetLocalSocketNameRequest {
+                handle,
+                peer: true,
+                buffer: largest_sequence,
+            })),
+            BrokerOperation::LocalSocket(LocalSocketRequest::SetOption(
+                SetLocalSocketOptionRequest {
+                    handle,
+                    option: LocalSocketOption::ReceiveTimeout(Some(core::time::Duration::new(
+                        u64::MAX,
+                        999_999_999,
+                    ))),
+                },
+            )),
+            BrokerOperation::LocalSocket(LocalSocketRequest::SetOption(
+                SetLocalSocketOptionRequest {
+                    handle,
+                    option: LocalSocketOption::Linger(None),
+                },
+            )),
+            BrokerOperation::LocalSocket(LocalSocketRequest::SetOption(
+                SetLocalSocketOptionRequest {
+                    handle,
+                    option: LocalSocketOption::Broadcast(true),
+                },
+            )),
+            BrokerOperation::LocalSocket(LocalSocketRequest::GetOptions(handle)),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1458,6 +1571,52 @@ mod tests {
             BrokerResult::Timer(TimerResponse::Read(ReadTimerResponse {
                 expirations: u64::MAX,
             })),
+            BrokerResult::LocalSocket(LocalSocketResponse::Create(CreateLocalSocketResponse {
+                handle,
+            })),
+            BrokerResult::LocalSocket(LocalSocketResponse::CreatePair(
+                CreateLocalSocketPairResponse {
+                    first: handle,
+                    second: ObjectHandle(u64::MAX),
+                },
+            )),
+            BrokerResult::LocalSocket(LocalSocketResponse::Bind),
+            BrokerResult::LocalSocket(LocalSocketResponse::Listen),
+            BrokerResult::LocalSocket(LocalSocketResponse::Connect),
+            BrokerResult::LocalSocket(LocalSocketResponse::Accept(AcceptLocalSocketResponse {
+                handle,
+            })),
+            BrokerResult::LocalSocket(LocalSocketResponse::Send(SendLocalSocketResponse {
+                sent: u32::MAX,
+            })),
+            BrokerResult::LocalSocket(LocalSocketResponse::Receive(ReceiveLocalSocketResponse {
+                received: 1,
+                length: u32::MAX,
+                source_length: 109,
+            })),
+            BrokerResult::LocalSocket(LocalSocketResponse::Shutdown),
+            BrokerResult::LocalSocket(LocalSocketResponse::GetName(GetLocalSocketNameResponse {
+                length: 3,
+            })),
+            BrokerResult::LocalSocket(LocalSocketResponse::SetOption),
+            BrokerResult::LocalSocket(LocalSocketResponse::GetOptions(
+                GetLocalSocketOptionsResponse {
+                    socket_type: SocketType::Datagram,
+                    options: LocalSocketOptions {
+                        receive_timeout: Some(core::time::Duration::new(u64::MAX, 1)),
+                        send_timeout: None,
+                        linger: Some(core::time::Duration::from_secs(3)),
+                        reuse_address: true,
+                        keep_alive: false,
+                        broadcast: true,
+                    },
+                },
+            )),
+            BrokerResult::LocalSocket(LocalSocketResponse::Failed(LocalSocketError::AddressInUse)),
+            BrokerResult::LocalSocket(LocalSocketResponse::Failed(LocalSocketError::NotPermitted)),
+            BrokerResult::LocalSocket(LocalSocketResponse::Failed(LocalSocketError::File(
+                FileError::NoSuchFileOrDirectory,
+            ))),
             BrokerResult::Signal(SignalResponse::Open(OpenSignalsResponse { handle })),
             BrokerResult::Signal(SignalResponse::Sent),
             BrokerResult::Signal(SignalResponse::Take(PendingSignal {

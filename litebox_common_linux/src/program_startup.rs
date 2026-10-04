@@ -27,6 +27,7 @@ const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + si
 const FORK_REGION_SIZE: usize = size_of::<[u64; 2]>() + size_of::<u32>();
 const FILE_TAG: u8 = 0;
 const PIPE_TAG: u8 = 1;
+const LOCAL_SOCKET_TAG: u8 = 2;
 const PROGRAM_STARTUP_TAG: u8 = 0;
 const FORK_STARTUP_TAG: u8 = 1;
 
@@ -116,6 +117,8 @@ pub enum InheritedFdKind {
         /// Which end.
         endpoint: HalfPipeType,
     },
+    /// A local socket, such as a Unix domain socket.
+    LocalSocket,
 }
 
 /// Linux process state needed to continue a child duplicated by `fork` in a fresh runner.
@@ -528,7 +531,7 @@ impl InheritedFd {
     fn encoded_len(&self) -> usize {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
-                InheritedFdKind::File => 0,
+                InheritedFdKind::File | InheritedFdKind::LocalSocket => 0,
                 InheritedFdKind::Pipe { .. } => size_of::<u8>(),
             }
     }
@@ -538,6 +541,7 @@ impl InheritedFd {
         push_u64(output, self.handle.0);
         match self.kind {
             InheritedFdKind::File => output.push(FILE_TAG),
+            InheritedFdKind::LocalSocket => output.push(LOCAL_SOCKET_TAG),
             InheritedFdKind::Pipe { endpoint } => {
                 output.push(PIPE_TAG);
                 output.push(match endpoint {
@@ -553,6 +557,7 @@ impl InheritedFd {
         let handle = ObjectHandle(read_u64(input)?);
         let kind = match read_u8(input)? {
             FILE_TAG => InheritedFdKind::File,
+            LOCAL_SOCKET_TAG => InheritedFdKind::LocalSocket,
             PIPE_TAG => InheritedFdKind::Pipe {
                 endpoint: match read_u8(input)? {
                     0 => HalfPipeType::ReceiverHalf,
@@ -763,6 +768,11 @@ mod tests {
                         endpoint: HalfPipeType::SenderHalf,
                     },
                 },
+                InheritedFd {
+                    fd: 7,
+                    handle: ObjectHandle(10),
+                    kind: InheritedFdKind::LocalSocket,
+                },
             ],
         };
 
@@ -878,6 +888,14 @@ mod tests {
                         },
                     },
                     close_on_exec: true,
+                },
+                ForkedFd {
+                    inherited: InheritedFd {
+                        fd: 4,
+                        handle: ObjectHandle(9),
+                        kind: InheritedFdKind::LocalSocket,
+                    },
+                    close_on_exec: false,
                 },
             ],
         }

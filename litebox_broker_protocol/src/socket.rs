@@ -45,7 +45,7 @@ pub enum AddressFamily {
 }
 
 /// Communication semantics of a broker socket.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum SocketType {
     /// Reliable ordered byte stream.

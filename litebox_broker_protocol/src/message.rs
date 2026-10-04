@@ -14,6 +14,14 @@ use crate::fs::{
     SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
     WriteFileResponse,
 };
+use crate::local_socket::{
+    AcceptLocalSocketRequest, AcceptLocalSocketResponse, BindLocalSocketRequest,
+    ConnectLocalSocketRequest, CreateLocalSocketPairResponse, CreateLocalSocketRequest,
+    CreateLocalSocketResponse, GetLocalSocketNameRequest, GetLocalSocketNameResponse,
+    GetLocalSocketOptionsResponse, ListenLocalSocketRequest, LocalSocketError,
+    ReceiveLocalSocketRequest, ReceiveLocalSocketResponse, SendLocalSocketRequest,
+    SendLocalSocketResponse, SetLocalSocketOptionRequest, ShutdownLocalSocketRequest,
+};
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
@@ -101,6 +109,8 @@ pub enum BrokerOperation {
     Timer(TimerRequest),
     /// Signal request family.
     Signal(SignalRequest),
+    /// Local socket request family.
+    LocalSocket(LocalSocketRequest),
 }
 
 impl BrokerOperation {
@@ -139,7 +149,18 @@ impl BrokerOperation {
                 handles: buffer,
                 ..
             })
-            | Self::WriteChildMemory(WriteChildMemoryRequest { data: buffer, .. }) => Some(*buffer),
+            | Self::WriteChildMemory(WriteChildMemoryRequest { data: buffer, .. })
+            | Self::LocalSocket(
+                LocalSocketRequest::Bind(BindLocalSocketRequest {
+                    address: buffer, ..
+                })
+                | LocalSocketRequest::Connect(ConnectLocalSocketRequest {
+                    address: buffer, ..
+                })
+                | LocalSocketRequest::Send(SendLocalSocketRequest { buffer, .. })
+                | LocalSocketRequest::Receive(ReceiveLocalSocketRequest { buffer, .. })
+                | LocalSocketRequest::GetName(GetLocalSocketNameRequest { buffer, .. }),
+            ) => Some(*buffer),
             Self::CreateThread(_)
             | Self::ExitThread(_)
             | Self::CloseObject(_)
@@ -170,6 +191,15 @@ impl BrokerOperation {
                 | FileRequest::Truncate(_)
                 | FileRequest::HandleStatus(_)
                 | FileRequest::IsTerminal(_),
+            )
+            | Self::LocalSocket(
+                LocalSocketRequest::Create(_)
+                | LocalSocketRequest::CreatePair(_)
+                | LocalSocketRequest::Listen(_)
+                | LocalSocketRequest::Accept(_)
+                | LocalSocketRequest::Shutdown(_)
+                | LocalSocketRequest::SetOption(_)
+                | LocalSocketRequest::GetOptions(_),
             ) => None,
         }
     }
@@ -268,6 +298,35 @@ pub enum PipeRequest {
     Write(WritePipeRequest),
 }
 
+/// Broker-owned local socket request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalSocketRequest {
+    /// Create an unbound, unconnected socket.
+    Create(CreateLocalSocketRequest),
+    /// Create a pair of connected unnamed sockets.
+    CreatePair(CreateLocalSocketRequest),
+    /// Bind a socket to a name.
+    Bind(BindLocalSocketRequest),
+    /// Make a bound stream socket accept connections.
+    Listen(ListenLocalSocketRequest),
+    /// Connect a socket to a named socket.
+    Connect(ConnectLocalSocketRequest),
+    /// Accept one pending connection.
+    Accept(AcceptLocalSocketRequest),
+    /// Send bytes staged in shared memory.
+    Send(SendLocalSocketRequest),
+    /// Receive bytes into shared memory.
+    Receive(ReceiveLocalSocketRequest),
+    /// Shut down one or both directions.
+    Shutdown(ShutdownLocalSocketRequest),
+    /// Read the name of a socket or its peer.
+    GetName(GetLocalSocketNameRequest),
+    /// Store one socket option.
+    SetOption(SetLocalSocketOptionRequest),
+    /// Read a socket's type and options.
+    GetOptions(ObjectHandle),
+}
+
 /// Broker-owned socket object request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SocketRequest {
@@ -343,6 +402,8 @@ pub enum BrokerResult {
     Timer(TimerResponse),
     /// Signal response family.
     Signal(SignalResponse),
+    /// Local socket response family.
+    LocalSocket(LocalSocketResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -440,6 +501,40 @@ pub enum SocketResponse {
     ///
     /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
     Failed(SocketError),
+}
+
+/// Broker-owned local socket response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalSocketResponse {
+    /// Create operation response.
+    Create(CreateLocalSocketResponse),
+    /// Pair create operation response.
+    CreatePair(CreateLocalSocketPairResponse),
+    /// Bind operation completed.
+    Bind,
+    /// Listen operation completed.
+    Listen,
+    /// Connect operation completed.
+    Connect,
+    /// Accept operation response.
+    Accept(AcceptLocalSocketResponse),
+    /// Send operation response.
+    Send(SendLocalSocketResponse),
+    /// Receive operation response.
+    Receive(ReceiveLocalSocketResponse),
+    /// Shutdown operation completed.
+    Shutdown,
+    /// Name operation response.
+    GetName(GetLocalSocketNameResponse),
+    /// Option was stored.
+    SetOption,
+    /// Options operation response.
+    GetOptions(GetLocalSocketOptionsResponse),
+    /// The operation failed in a way the guest ABI reports.
+    ///
+    /// Waiting, resource, and request-validation failures use
+    /// [`BrokerResult::Error`] instead.
+    Failed(LocalSocketError),
 }
 
 /// Broker-owned fs request.

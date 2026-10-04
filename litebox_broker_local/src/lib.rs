@@ -23,6 +23,7 @@ extern crate std;
 mod error;
 mod event;
 mod fs;
+mod local_socket;
 mod pipe;
 mod random;
 mod signal;

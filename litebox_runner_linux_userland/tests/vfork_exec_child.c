@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -121,6 +122,21 @@ int main(int argc, char **argv) {
             stdin_flags >= 0 && fcntl(stdin_alias, F_SETFL, stdin_flags | O_NONBLOCK) == 0;
         int hidden_closed = fcntl(hidden, F_GETFD) == -1 && errno == EBADF;
         printf("child-fds stdin_setfl=%d hidden_closed=%d\n", stdin_setfl, hidden_closed);
+        return 42;
+    }
+    if (strcmp(marker, "unix-fd") == 0 && argc > 3) {
+        int socket_fd = atoi(argv[2]);
+        int hidden = atoi(argv[3]);
+        int type = 0;
+        socklen_t length = sizeof type;
+        int is_stream = getsockopt(socket_fd, SOL_SOCKET, SO_TYPE, &type, &length) == 0 &&
+                        type == SOCK_STREAM;
+        int sent = write(socket_fd, "exec", 4) == 4;
+        char reply[8] = {0};
+        int replied = read(socket_fd, reply, sizeof reply - 1) == 5 && strcmp(reply, "reply") == 0;
+        int hidden_closed = fcntl(hidden, F_GETFD) == -1 && errno == EBADF;
+        printf("child-unix stream=%d sent=%d replied=%d hidden_closed=%d\n", is_stream, sent,
+               replied, hidden_closed);
         return 42;
     }
     if (strcmp(marker, "stdout-mode") == 0) {
