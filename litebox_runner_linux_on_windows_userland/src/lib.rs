@@ -96,6 +96,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .context("invalid child Linux process startup")?;
     let (task_params, prog_path, argv, envp) = match startup {
         Some(LinuxProcessStartup::Fork(startup)) => {
+            // The child continues at its parent's syscall entry point in this runner. Windows
+            // shares an executable's relocated image among running instances, so this runner
+            // normally loads where its live parent's did; `restore_fork` rejects it otherwise.
             let program = shim
                 .restore_fork(*startup, initial_thread, |offset, pages| {
                     process_image.as_ref().map_or(Ok(()), |image| {
