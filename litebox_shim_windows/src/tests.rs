@@ -106,15 +106,15 @@ fn map_csr_server_shared_memory(
     let length = litebox_common_linux::vmem::NonZeroPageSize::new(
         crate::syscalls::section::WINDOWS_SHARED_SECTION_SIZE,
     )?;
-    // SAFETY: address selection is left to the page manager, so this cannot replace a mapping.
-    unsafe {
-        page_manager.create_writable_pages(
-            None,
-            length,
-            litebox_common_linux::vmem::CreatePagesFlags::empty(),
-            |_| Ok(0),
-        )
-    }
+    crate::syscalls::mm::create_pages(
+        page_manager,
+        None,
+        length,
+        litebox_common_linux::vmem::CreatePagesFlags::empty(),
+        litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+            | litebox::platform::page_mgmt::MemoryRegionPermissions::WRITE,
+        |_| Ok(0),
+    )
     .map(|mapping| mapping.as_usize())
     .ok()
 }

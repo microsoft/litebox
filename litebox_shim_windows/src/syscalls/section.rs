@@ -17,7 +17,7 @@ use rangemap::RangeMap;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 use crate::nt_types::{AccessMask, ObjectAttributes};
-use crate::syscalls::mm::{MemoryType, PageProtection, create_pages, parse_page_protection};
+use crate::syscalls::mm::{self, MemoryType, PageProtection};
 use crate::syscalls::{Handle, ProcessHandle};
 use crate::{ConstPtr, MutPtr, PAGE_SIZE, ShimPlatform, Task, WindowsSectionView};
 
@@ -263,7 +263,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if section_page_protection & PageProtection::PAGE_TARGETS_INVALID.bits() != 0 {
             return NtStatus::INVALID_PAGE_PROTECTION;
         }
-        let Some((protection, _)) = parse_page_protection(section_page_protection) else {
+        let Some((protection, _)) = mm::parse_page_protection(section_page_protection) else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
         if !file_handle.is_null() {
@@ -554,7 +554,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return NtStatus::INVALID_PARAMETER;
         }
-        let Some((page_protection, permissions)) = parse_page_protection(request.page_protection)
+        let Some((page_protection, permissions)) =
+            mm::parse_page_protection(request.page_protection)
         else {
             return NtStatus::INVALID_PAGE_PROTECTION;
         };
@@ -703,7 +704,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         )?;
         let section = entry.with_entry(|entry| Arc::clone(&entry.section));
         let page_protection = PageProtection::PAGE_READWRITE;
-        let Some((_, permissions)) = parse_page_protection(page_protection.bits()) else {
+        let Some((_, permissions)) = mm::parse_page_protection(page_protection.bits()) else {
             return Err(NtStatus::INVALID_PAGE_PROTECTION);
         };
         self.map_pagefile_section_view(
@@ -769,19 +770,26 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let is_reserved = section
             .attributes
             .contains(SectionAllocationAttributes::SEC_RESERVE);
-        let initial_permissions = if is_reserved {
-            MemoryRegionPermissions::empty()
+        let mapping = if is_reserved {
+            // SAFETY: Address selection is left to the page manager; no existing mapping is replaced.
+            unsafe {
+                self.global.page_manager.create_reserved_pages(
+                    None,
+                    length,
+                    super::mm::ALLOCATION_GRANULARITY,
+                    CreatePagesFlags::empty(),
+                )
+            }
         } else {
-            permissions
-        };
-        let mapping = create_pages(
-            &self.global.page_manager,
-            None,
-            length,
-            CreatePagesFlags::empty(),
-            initial_permissions,
-            |_| Ok(0),
-        )
+            mm::create_pages(
+                &self.global.page_manager,
+                None,
+                length,
+                CreatePagesFlags::empty(),
+                permissions,
+                |_| Ok(0),
+            )
+        }
         .map_err(|_| {
             section.pagefile_view_active.store(false, Ordering::Release);
             NtStatus::NO_MEMORY
@@ -802,10 +810,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 size: mapped_size,
                 allocation_protect: section.protection,
                 type_: MemoryType::MEM_MAPPED,
-                pages: if is_reserved {
+                page_protections: if is_reserved {
                     RangeMap::new()
                 } else {
-                    committed_pages(base, mapped_size, page_protection)
+                    mm::initial_page_protections(base, mapped_size, page_protection)
                 },
             },
         );
@@ -899,7 +907,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 type_: MemoryType::MEM_MAPPED,
                 // TODO(section-subsystem): honor per-view CSR protections only after
                 // the backing is no longer aliased by PEB direct-deref pointers.
-                pages: committed_pages(base, mapped_size, section.protection),
+                page_protections: mm::initial_page_protections(
+                    base,
+                    mapped_size,
+                    section.protection,
+                ),
             },
         );
         NtStatus::SUCCESS
@@ -940,11 +952,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             &self.process.virtual_allocations,
         ) {
             Ok(mapping) => mapping,
-            Err(crate::loader::WindowsLoadError::Access(_)) => {
-                return NtStatus::OBJECT_NAME_NOT_FOUND;
+            Err(error) => {
+                litebox_util_log::debug!(
+                    error:? = error,
+                    fs_path:% = fs_path;
+                    "Failed to load image section"
+                );
+                return match error {
+                    crate::loader::WindowsLoadError::Access(_) => NtStatus::OBJECT_NAME_NOT_FOUND,
+                    crate::loader::WindowsLoadError::Load(_) => NtStatus::NO_MEMORY,
+                    _ => NtStatus::INVALID_FILE_FOR_SECTION,
+                };
             }
-            Err(crate::loader::WindowsLoadError::Load(_)) => return NtStatus::NO_MEMORY,
-            Err(_) => return NtStatus::INVALID_FILE_FOR_SECTION,
         };
         if request
             .base_address
@@ -1239,18 +1258,6 @@ fn write_section_image_information<Platform: ShimPlatform>(
         return NtStatus::ACCESS_VIOLATION;
     }
     NtStatus::SUCCESS
-}
-
-fn committed_pages(
-    base: usize,
-    size: usize,
-    protect: PageProtection,
-) -> RangeMap<usize, PageProtection> {
-    let mut pages = RangeMap::new();
-    if let Some(end) = base.checked_add(size) {
-        pages.insert(base..end, protect);
-    }
-    pages
 }
 
 fn remove_view_pages<Platform: ShimPlatform>(
@@ -1705,6 +1712,71 @@ mod tests {
             NtStatus::INVALID_PARAMETER_4
         );
         assert_eq!(create_handle, Handle::from_raw(0x3333_4444));
+    }
+
+    #[test]
+    fn reserved_pagefile_view_is_reserved_until_committed() {
+        const MEM_COMMIT: u32 = 0x1000;
+
+        let task = test_task();
+        let size = i64::try_from(PAGE_SIZE).unwrap();
+        let mut handle = Handle::default();
+        assert_eq!(
+            task.sys_nt_create_section(
+                mut_ptr(&mut handle),
+                SectionAccess::ALL_ACCESS.bits(),
+                None,
+                Some(const_ptr(&size)),
+                PageProtection::PAGE_READWRITE.bits(),
+                SectionAllocationAttributes::SEC_RESERVE.bits(),
+                Handle::default(),
+            ),
+            NtStatus::SUCCESS
+        );
+        let (mut base, mut view_size) = map_pagefile_section(&task, handle);
+        assert!(
+            task.global
+                .page_manager
+                .reservations()
+                .iter()
+                .any(|range| range.contains(&base))
+        );
+        assert!(
+            !task
+                .global
+                .page_manager
+                .mappings()
+                .iter()
+                .any(|(range, _)| range.contains(&base))
+        );
+
+        assert_eq!(
+            task.sys_nt_allocate_virtual_memory(
+                ProcessHandle::CURRENT,
+                mut_ptr(&mut base),
+                0,
+                mut_ptr(&mut view_size),
+                MEM_COMMIT,
+                PageProtection::PAGE_READWRITE.bits(),
+            ),
+            NtStatus::SUCCESS
+        );
+        assert!(
+            task.global
+                .page_manager
+                .mappings()
+                .into_iter()
+                .any(|(range, _)| range.contains(&base))
+        );
+        let mapped = MutPtr::<TestPlatform, u32>::from_usize(base);
+        assert_eq!(mapped.read_at_offset(0), Some(0));
+        assert_eq!(mapped.write_at_offset(0, 0xfeed_cafe), Some(()));
+        assert_eq!(mapped.read_at_offset(0), Some(0xfeed_cafe));
+        assert_eq!(
+            task.sys_nt_unmap_view_of_section(ProcessHandle::CURRENT, base),
+            NtStatus::SUCCESS
+        );
+        assert_eq!(task.sys_nt_close(handle), NtStatus::SUCCESS);
     }
 
     #[test]
