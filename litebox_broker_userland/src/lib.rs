@@ -28,4 +28,5 @@ pub mod random;
 pub mod stdio;
 mod timer;
 
+/// The most request workers one association runs at a time.
 const WORKER_COUNT: usize = 8;
