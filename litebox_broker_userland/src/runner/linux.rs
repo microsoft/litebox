@@ -55,7 +55,8 @@ impl ProcessImage for RunnerProcessImage {
     }
 }
 
-pub(crate) fn create_image() -> Result<Box<dyn ProcessImage>, BrokerError> {
+/// Creates an empty child memory image, a memfd, which grows as it is written.
+pub(crate) fn create_image(_capacity: u64) -> Result<Box<dyn ProcessImage>, BrokerError> {
     MemfdProcessImage::create()
         .map(|image| Box::new(RunnerProcessImage(image)) as Box<dyn ProcessImage>)
         .map_err(|_| BrokerError::OutOfMemory)

@@ -31,6 +31,8 @@ use linux::wait_for_runner_event;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use windows::PlatformRunnerEndpoint;
 #[cfg(all(windows, target_arch = "x86_64"))]
+pub(crate) use windows::create_image;
+#[cfg(all(windows, target_arch = "x86_64"))]
 use windows::wait_for_runner_event;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);

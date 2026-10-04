@@ -171,6 +171,54 @@ fn test_programs_with_windows_broker() {
     run_prog_with_windows_broker(&broker, &runner, "hello_thread", &DYNAMIC_LIBS, None);
 }
 
+/// Runs `fork_parent`, whose children resume from snapshots of their parents' memory.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/fork_parent.c`.
+#[test]
+fn test_fork_with_windows_broker() {
+    let (broker, runner) = build_windows_broker();
+    let output = run_progs_with_process_duplication(&broker, &runner, &["fork_parent"], &[]);
+
+    let parent = output_line(&output, "parent ");
+    assert_eq!(numeric_field(parent, "global="), 2);
+    assert_eq!(numeric_field(parent, "intact="), 1);
+    assert_eq!(numeric_field(parent, "echild="), 1);
+    let fork = output_line(&output, "fork ");
+    let child = numeric_field(fork, "child=");
+    assert_ne!(child, numeric_field(parent, "pid="));
+    assert_eq!(numeric_field(fork, "waited="), child);
+    // The child and its own forked child passed every check.
+    assert_eq!(numeric_field(fork, "code="), 7);
+    assert_eq!(numeric_field(output_line(&output, "pipe "), "failures="), 0);
+    assert_eq!(numeric_field(output_line(&output, "raw-fork "), "code="), 9);
+}
+
+/// Runs `vfork_exec_parent`, whose child execs `vfork_exec_child` in a new runner.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/vfork_exec_*.c`.
+#[test]
+fn test_vfork_exec_with_windows_broker() {
+    let (broker, runner) = build_windows_broker();
+    let output = run_progs_with_process_duplication(
+        &broker,
+        &runner,
+        &["vfork_exec_parent", "vfork_exec_child"],
+        &["/bin/vfork_exec_child.hooked"],
+    );
+
+    let parent = output_line(&output, "parent ");
+    let child = numeric_field(parent, "child=");
+    assert_eq!(numeric_field(parent, "waited="), child);
+    assert_eq!(numeric_field(parent, "code="), 42);
+    let child_line = output_line(&output, "child ");
+    assert_eq!(numeric_field(child_line, "pid="), child);
+    assert_eq!(
+        numeric_field(child_line, "ppid="),
+        numeric_field(parent, "before=")
+    );
+    assert!(child_line.contains("marker=from-vfork env=1"));
+}
+
 const DYNAMIC_LIBS: [(&str, &str); 2] = [
     ("libc.so.6", "/lib/x86_64-linux-gnu"),
     ("ld-linux-x86-64.so.2", "/lib64"),
@@ -254,6 +302,64 @@ fn run_prog_with_windows_broker(
         .status()
         .expect("failed to run litebox-broker-userland");
     assert!(status.success(), "litebox-broker-userland failed: {status}");
+}
+
+/// Runs the first of `programs` with `arguments` and process duplication allowed, and returns its
+/// standard output. Each program is at `/bin/<program>.hooked`.
+fn run_progs_with_process_duplication(
+    broker: &std::path::Path,
+    runner: &std::path::Path,
+    programs: &[&str],
+    arguments: &[&str],
+) -> String {
+    let test_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-bins");
+    let tar_path =
+        std::path::Path::new(env!("OUT_DIR")).join(format!("broker_{}_rootfs.tar", programs[0]));
+    let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
+    for program in programs {
+        append_rewritten_file(
+            &mut tar,
+            &test_dir.join(program),
+            &format!("bin/{program}.hooked"),
+        );
+    }
+    tar.finish().unwrap();
+    drop(tar);
+
+    let output = std::process::Command::new(broker)
+        .args([
+            "--unstable",
+            "--allow-process-duplication",
+            "--fs-initial-files",
+        ])
+        .arg(&tar_path)
+        .arg("--runner")
+        .arg(runner)
+        .arg(format!("/bin/{}.hooked", programs[0]))
+        .args(arguments)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .expect("failed to run litebox-broker-userland");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "litebox-broker-userland failed: {}\n{stdout}",
+        output.status
+    );
+    stdout
+}
+
+fn output_line<'a>(output: &'a str, prefix: &str) -> &'a str {
+    output
+        .lines()
+        .find(|line| line.starts_with(prefix))
+        .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+}
+
+fn numeric_field(line: &str, name: &str) -> i32 {
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix(name)?.parse().ok())
+        .unwrap_or_else(|| panic!("missing {name} in {line:?}"))
 }
 
 fn append_rewritten_file(

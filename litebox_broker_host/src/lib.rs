@@ -898,10 +898,15 @@ pub trait ProcessLauncher: Send + Sync {
         image: Option<ChildImage>,
     ) -> core::result::Result<(), BrokerError>;
 
-    /// Creates an empty memory image for a pending child.
+    /// Creates an empty memory image for a pending child, which never grows
+    /// past `capacity` bytes.
     ///
     /// Platforms that cannot pass images to runners reject the request.
-    fn create_image(&self) -> core::result::Result<Box<dyn ProcessImage>, BrokerError> {
+    fn create_image(
+        &self,
+        capacity: u64,
+    ) -> core::result::Result<Box<dyn ProcessImage>, BrokerError> {
+        let _ = capacity;
         Err(BrokerError::UnsupportedOperation)
     }
 }
@@ -975,7 +980,7 @@ where
         child_process_id,
         offset,
         u64::from(data.length()),
-        || launcher.create_image(),
+        |capacity| launcher.create_image(capacity),
         |image| {
             let mut image_offset = offset;
             for range in ranges {

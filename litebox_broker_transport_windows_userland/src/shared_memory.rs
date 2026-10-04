@@ -36,7 +36,7 @@ const CONTROL_RING_WAKE_OFFSETS: [usize; 6] = [
     ControlRingDirection::Notifications.consumer_epoch_offset(),
 ];
 
-struct OwnedHandle(HANDLE);
+pub(crate) struct OwnedHandle(pub(crate) HANDLE);
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
@@ -158,10 +158,18 @@ impl WindowsSharedMemory {
                 .as_ref()
                 .map_or(0, |handles| handles.len()),
         );
-        handles.push(duplicate_handle_to_process(self.mapping.0, target_process)?);
+        handles.push(duplicate_handle_to_process(
+            self.mapping.0,
+            target_process,
+            None,
+        )?);
         if let Some(wake_handles) = &self.wake_handles {
             for wake_handle in wake_handles.iter() {
-                handles.push(duplicate_handle_to_process(wake_handle.0, target_process)?);
+                handles.push(duplicate_handle_to_process(
+                    wake_handle.0,
+                    target_process,
+                    None,
+                )?);
             }
         }
         Ok(TransferredSharedMemory {
@@ -303,7 +311,13 @@ fn create_wake_handles() -> IoResult<[OwnedHandle; CONTROL_RING_WAKE_OFFSETS.len
         .map_err(|_| Error::other("incorrect control-ring wake handle count"))
 }
 
-fn duplicate_handle_to_process(handle: HANDLE, target_process: HANDLE) -> IoResult<usize> {
+/// Duplicates `handle` into `target_process` with `access`, or with the same access if `None`,
+/// and returns the duplicate's value there.
+pub(crate) fn duplicate_handle_to_process(
+    handle: HANDLE,
+    target_process: HANDLE,
+    access: Option<u32>,
+) -> IoResult<usize> {
     let mut duplicate = std::ptr::null_mut();
     // SAFETY: The source handle and both process handles are live. The output points to writable
     // storage for the target-process handle value.
@@ -313,9 +327,13 @@ fn duplicate_handle_to_process(handle: HANDLE, target_process: HANDLE) -> IoResu
             handle,
             target_process,
             &raw mut duplicate,
+            access.unwrap_or(0),
             0,
-            0,
-            DUPLICATE_SAME_ACCESS,
+            if access.is_some() {
+                0
+            } else {
+                DUPLICATE_SAME_ACCESS
+            },
         )
     };
     if succeeded == 0 {

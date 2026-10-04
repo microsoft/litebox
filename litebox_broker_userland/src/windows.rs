@@ -28,9 +28,12 @@ pub(super) fn run(
     args: super::CliArgs,
     stdio: Arc<UserlandStdioProvider>,
 ) -> Result<(), Box<dyn Error>> {
-    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all()).with_socket_policy(
-        configured_socket_policy(&args.allow_tcp_destination, &args.allow_udp_destination)?,
-    );
+    let policy = PolicyEngine::with_host_guaranteed_rights(ObjectRights::all())
+        .with_socket_policy(configured_socket_policy(
+            &args.allow_tcp_destination,
+            &args.allow_udp_destination,
+        )?)
+        .with_process_duplication_enabled(args.allow_process_duplication);
     let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
         stdio,
@@ -87,7 +90,8 @@ fn serve_runner_in_process(
         setup_deadline,
         |channel, shared_memory, control_memory| {
             channel.send_shared_memory_to_current_process(shared_memory)?;
-            channel.send_shared_memory_to_current_process(control_memory)
+            channel.send_shared_memory_to_current_process(control_memory)?;
+            channel.send_process_image_to_current_process(None)
         },
     )
 }

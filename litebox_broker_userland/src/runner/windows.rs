@@ -1,18 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+use std::any::Any;
 use std::ffi::OsString;
 use std::io::Result as IoResult;
+use std::ops::Range;
 use std::os::windows::io::AsRawHandle;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use litebox_broker_core::BrokerCore;
+use litebox_broker_core::{BrokerCore, BrokerError, ProcessImage};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
 use litebox_broker_transport_windows_userland::named_pipe::{
     WindowsNamedPipeHostSetupChannel, WindowsNamedPipeListener, validate_client_process,
 };
+use litebox_broker_transport_windows_userland::process_image::WindowsProcessImage;
 use litebox_broker_transport_windows_userland::shared_memory::WindowsSharedMemory;
 
 use super::{
@@ -20,6 +23,44 @@ use super::{
     runner_has_exited,
 };
 use crate::runtime::{AssociationOutcome, is_peer_closed_error};
+
+/// A child's memory image held for its runner.
+struct RunnerProcessImage(WindowsProcessImage);
+
+impl ProcessImage for RunnerProcessImage {
+    fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), BrokerError> {
+        self.0
+            .write(offset, data)
+            .map_err(|_| BrokerError::OutOfMemory)
+    }
+
+    fn write_from_shared(
+        &mut self,
+        offset: u64,
+        memory: &dyn Any,
+        range: Range<usize>,
+    ) -> Option<Result<(), BrokerError>> {
+        let memory = memory.downcast_ref::<WindowsSharedMemory>()?;
+        Some(
+            self.0
+                .write_from_shared(offset, memory, range)
+                .map_err(|_| BrokerError::OutOfMemory),
+        )
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Creates an empty child memory image, a section that reserves `capacity`
+/// bytes and commits them as they are written.
+pub(crate) fn create_image(capacity: u64) -> Result<Box<dyn ProcessImage>, BrokerError> {
+    let capacity = usize::try_from(capacity).map_err(|_| BrokerError::OutOfMemory)?;
+    WindowsProcessImage::create(capacity)
+        .map(|image| Box::new(RunnerProcessImage(image)) as Box<dyn ProcessImage>)
+        .map_err(|_| BrokerError::OutOfMemory)
+}
 
 pub(super) struct PlatformRunnerEndpoint {
     pipe_name: OsString,
@@ -74,10 +115,6 @@ fn serve_association(
     launcher: Arc<UserlandProcessLauncher>,
 ) -> AssociationOutcome {
     let image = startup.take_image();
-    debug_assert!(
-        image.is_none(),
-        "Windows runners do not support process images"
-    );
     let shutdown_was_expected = startup.process.shutdown_was_expected();
     let control_channel = match accept_control_channel(control_listener, runner, setup_deadline) {
         Ok(connection) => connection,
@@ -100,9 +137,20 @@ fn serve_association(
         control_channel,
         || WindowsSharedMemory::create(SHARED_BUFFER_POOL_SIZE),
         WindowsSharedMemory::create_control_ring,
-        |channel, shared_memory, control_memory| {
+        // Moving `image` into this one-shot closure releases the broker's
+        // snapshot as soon as setup ends; the runner owns its copy after that.
+        move |channel, shared_memory, control_memory| {
             channel.send_shared_memory(shared_memory, runner_process)?;
-            channel.send_shared_memory(control_memory, runner_process)
+            channel.send_shared_memory(control_memory, runner_process)?;
+            let image = image.as_ref().map(|image| {
+                &image
+                    .image()
+                    .as_any()
+                    .downcast_ref::<RunnerProcessImage>()
+                    .expect("the userland launcher creates every process image")
+                    .0
+            });
+            channel.send_process_image(image, runner_process)
         },
         WindowsNamedPipeHostSetupChannel::into_active,
         launcher,

@@ -10,6 +10,7 @@ extern crate alloc;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
+use litebox_common_linux::program_startup::{LinuxProcessStartup, LinuxProgramStartup};
 use litebox_platform_windows_userland::{GuestTlsMode, WindowsUserland};
 
 type Platform = WindowsUserland<{ litebox_common_linux::vmem::PAGE_SIZE }>;
@@ -23,8 +24,9 @@ pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/bin/ls --color`).
     ///
     /// The program path refers to a path inside the broker-owned file system.
-    /// All binaries must be pre-rewritten with the syscall rewriter.
-    #[arg(required = true, trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
+    /// All binaries must be pre-rewritten with the syscall rewriter. Runners
+    /// the broker starts for child processes receive no program.
+    #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
     #[arg(long = "env")]
@@ -71,12 +73,10 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         .as_deref()
         .context("file operations require --broker-control-channel")?;
     let (connection, startup) = broker::connect(control_pipe)?;
-    if startup.is_some() {
-        anyhow::bail!("unsupported child Linux process startup");
-    }
     let broker::BrokerConnection {
         local,
         notifications,
+        process_image,
     } = connection;
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);
@@ -89,57 +89,131 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     let shim_builder =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id);
 
-    // The program path is a Unix-style path inside the tar archive.
-    let prog_path = &cli_args.program_and_arguments[0];
-
     let shim = shim_builder.build();
-    let argv = cli_args
-        .program_and_arguments
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp: Vec<_> = cli_args
-        .environment_variables
-        .iter()
-        .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
-        .collect();
-    let envp = if cli_args.forward_environment_variables {
-        envp.into_iter()
-            .chain(std::env::vars().map(|(k, v)| {
-                std::ffi::CString::new(k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>())
-                    .unwrap()
-            }))
-            .collect()
-    } else {
-        envp
+    let startup = startup
+        .map(|startup| LinuxProcessStartup::decode(&startup.payload))
+        .transpose()
+        .context("invalid child Linux process startup")?;
+    let (task_params, prog_path, argv, envp) = match startup {
+        Some(LinuxProcessStartup::Fork(startup)) => {
+            let program = shim
+                .restore_fork(*startup, initial_thread, |offset, pages| {
+                    process_image.as_ref().map_or(Ok(()), |image| {
+                        image
+                            .read(offset, pages)
+                            .map_err(|_| litebox_common_linux::errno::Errno::EIO)
+                    })
+                })
+                .context("failed to continue the forked process")?;
+            drop(process_image);
+            run_program(&shim, program)
+        }
+        Some(LinuxProcessStartup::Program(startup)) => {
+            let LinuxProgramStartup {
+                parent_process_id,
+                uid,
+                euid,
+                gid,
+                egid,
+                blocked_signals,
+                ignored_signals,
+                umask,
+                path,
+                cwd,
+                argv,
+                envp,
+                inherited_fds,
+            } = startup;
+            (
+                litebox_common_linux::TaskParams {
+                    pid: process_id,
+                    ppid: parent_process_id,
+                    uid,
+                    euid,
+                    gid,
+                    egid,
+                    blocked_signals,
+                    ignored_signals,
+                    inherited_fds: Some(inherited_fds),
+                    cwd: Some(cwd),
+                    umask: Some(umask),
+                },
+                path,
+                argv,
+                envp,
+            )
+        }
+        None => {
+            // The program path is a Unix-style path inside the tar archive.
+            let prog_path = cli_args
+                .program_and_arguments
+                .first()
+                .context("program path missing")?
+                .clone();
+            let argv = cli_args
+                .program_and_arguments
+                .iter()
+                .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+                .collect();
+            let envp: Vec<_> = cli_args
+                .environment_variables
+                .iter()
+                .map(|x| std::ffi::CString::new(x.bytes().collect::<Vec<u8>>()).unwrap())
+                .collect();
+            let envp = if cli_args.forward_environment_variables {
+                envp.into_iter()
+                    .chain(std::env::vars().map(|(k, v)| {
+                        std::ffi::CString::new(
+                            k.bytes().chain(*b"=").chain(v.bytes()).collect::<Vec<u8>>(),
+                        )
+                        .unwrap()
+                    }))
+                    .collect()
+            } else {
+                envp
+            };
+            (
+                litebox_common_linux::TaskParams {
+                    pid: process_id,
+                    ppid: 0,
+                    uid: 1000,
+                    gid: 1000,
+                    euid: 1000,
+                    egid: 1000,
+                    blocked_signals: litebox_common_linux::signal::SigSet::empty(),
+                    ignored_signals: litebox_common_linux::signal::SigSet::empty(),
+                    inherited_fds: None,
+                    cwd: None,
+                    umask: None,
+                },
+                prog_path,
+                argv,
+                envp,
+            )
+        }
     };
 
     let program = shim
-        .load_program(
-            litebox_common_linux::TaskParams {
-                pid: process_id,
-                ppid: 0,
-                uid: 1000,
-                gid: 1000,
-                euid: 1000,
-                egid: 1000,
-                blocked_signals: litebox_common_linux::signal::SigSet::empty(),
-                ignored_signals: litebox_common_linux::signal::SigSet::empty(),
-                inherited_fds: None,
-                cwd: None,
-                umask: None,
-            },
-            initial_thread,
-            prog_path,
-            argv,
-            envp,
-        )
+        .load_program(task_params, initial_thread, &prog_path, argv, envp)
         .unwrap();
+    run_program(&shim, program)
+}
+
+/// Runs the loaded `program` until it exits, then exits this runner.
+fn run_program(
+    shim: &litebox_shim_linux::LinuxShim<Platform>,
+    program: litebox_shim_linux::LoadedProgram<Platform>,
+) -> ! {
     unsafe {
         litebox_platform_windows_userland::run_thread(
             program.entrypoints,
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
+    // Report the guest status for the parent to observe. If the report fails,
+    // the broker falls back to the runner's host exit status.
+    let _ = shim
+        .litebox()
+        .report_exit_status(program.process.wait_for_exit_status());
     std::process::exit(program.process.wait())
 }

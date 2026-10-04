@@ -15,6 +15,7 @@ use litebox_broker_transport_windows_userland::control_ring::{
     WindowsControlRingLocalCallChannel, WindowsControlRingLocalNotificationChannel,
 };
 use litebox_broker_transport_windows_userland::named_pipe::WindowsNamedPipeLocalSetupChannel;
+use litebox_broker_transport_windows_userland::process_image::WindowsReceivedProcessImage;
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -24,6 +25,8 @@ pub struct BrokerConnection {
     pub local: BrokerLocal<WindowsControlRingLocalCallChannel>,
     /// Asynchronous broker notification channel.
     pub notifications: BrokerNotifications<WindowsControlRingLocalNotificationChannel>,
+    /// Memory image this process starts from, if its parent wrote one.
+    pub process_image: Option<WindowsReceivedProcessImage>,
 }
 
 /// Connects to and negotiates an association with a Windows-userland broker.
@@ -37,23 +40,26 @@ pub fn connect(control_pipe: &OsStr) -> Result<(BrokerConnection, Option<Process
                     std::path::Path::new(control_pipe).display()
                 )
             })?;
-    let (local, startup, notifications) = BrokerLocal::negotiate(setup, |mut setup| {
-        let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
-        let control_memory = setup.receive_control_ring()?;
-        let control_ring = ControlRing::new(control_memory).map_err(|error| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid broker control ring: {error:?}"),
-            )
-        })?;
-        let (calls, notifications) = setup.into_active(control_ring)?;
-        Ok((calls, shared_memory, notifications))
-    })
-    .context("broker negotiation failed")?;
+    let (local, startup, (notifications, process_image)) =
+        BrokerLocal::negotiate(setup, |mut setup| {
+            let shared_memory = Arc::new(setup.receive_shared_memory(SHARED_BUFFER_POOL_SIZE)?);
+            let control_memory = setup.receive_control_ring()?;
+            let process_image = setup.receive_process_image()?;
+            let control_ring = ControlRing::new(control_memory).map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid broker control ring: {error:?}"),
+                )
+            })?;
+            let (calls, notifications) = setup.into_active(control_ring)?;
+            Ok((calls, shared_memory, (notifications, process_image)))
+        })
+        .context("broker negotiation failed")?;
     Ok((
         BrokerConnection {
             local,
             notifications: BrokerNotifications::new(notifications),
+            process_image,
         },
         startup,
     ))

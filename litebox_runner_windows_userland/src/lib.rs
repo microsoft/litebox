@@ -70,6 +70,7 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
     let broker::BrokerConnection {
         local,
         notifications,
+        process_image: _,
     } = connection;
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);
