@@ -93,6 +93,17 @@ pub trait Backend: Send + Sync + Any {
     /// Read directory entries at `dir`.
     fn list_dir_at(&self, handle: DirHandle) -> Result<Vec<DirEntry>, ReadDirError>;
 
+    /// Look up the single entry `name` at `dir`, as [`Self::list_dir_at`] would report it.
+    ///
+    /// The default implementation scans the full listing; backends that can find one entry more
+    /// cheaply should override it.
+    fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
+        Ok(self
+            .list_dir_at(dir.clone())?
+            .into_iter()
+            .find(|entry| entry.name == name))
+    }
+
     /// Read at `offset` into `buf`, returning the number of bytes read.
     ///
     /// Backends do not have an internal notion of offsets; instead the resolver maintains offsets

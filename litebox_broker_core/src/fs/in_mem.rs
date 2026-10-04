@@ -381,18 +381,22 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .read()
             .children
             .iter()
-            .map(|(name, child)| {
-                let (file_type, node_info) = match child {
-                    Node::File(file) => (FileType::RegularFile, file.read().node_info),
-                    Node::Dir(dir) => (FileType::Directory, dir.read().node_info),
-                };
-                DirEntry {
-                    name: name.clone(),
-                    file_type,
-                    ino_info: Some(node_info),
-                }
-            })
+            .map(|(name, child)| child.dir_entry(name))
             .collect())
+    }
+
+    fn lookup_at(
+        &self,
+        dir: &super::backend::DirHandle,
+        name: &str,
+    ) -> Result<Option<DirEntry>, ReadDirError> {
+        Ok(dir
+            .get_typed::<Self>()
+            .dir
+            .read()
+            .children
+            .get_key_value(name)
+            .map(|(name, child)| child.dir_entry(name)))
     }
 
     fn read(
@@ -653,6 +657,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider> Clone for Node<Platform> {
         match self {
             Self::File(file) => Self::File(file.clone()),
             Self::Dir(dir) => Self::Dir(dir.clone()),
+        }
+    }
+}
+
+impl<Platform: sync::RawSyncPrimitivesProvider> Node<Platform> {
+    /// The directory entry for this node, named `name` in its parent.
+    fn dir_entry(&self, name: &str) -> DirEntry {
+        let (file_type, node_info) = match self {
+            Node::File(file) => (FileType::RegularFile, file.read().node_info),
+            Node::Dir(dir) => (FileType::Directory, dir.read().node_info),
+        };
+        DirEntry {
+            name: name.into(),
+            file_type,
+            ino_info: Some(node_info),
         }
     }
 }

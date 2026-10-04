@@ -181,22 +181,15 @@ impl super::backend::Backend for TarRo {
         Ok(self.tar_index.dirs[handle.idx]
             .children
             .iter()
-            .map(|(name, child)| {
-                let (file_type, node_info) = match *child {
-                    IndexedChild::File(idx) => {
-                        (FileType::RegularFile, self.tar_index.files[idx].node_info)
-                    }
-                    IndexedChild::Dir(idx) => {
-                        (FileType::Directory, self.tar_index.dirs[idx].node_info)
-                    }
-                };
-                DirEntry {
-                    name: name.clone(),
-                    file_type,
-                    ino_info: Some(node_info),
-                }
-            })
+            .map(|(name, child)| self.tar_index.dir_entry(name, *child))
             .collect())
+    }
+
+    fn lookup_at(&self, dir: &DirHandle, name: &str) -> Result<Option<DirEntry>, ReadDirError> {
+        Ok(self.tar_index.dirs[dir.get_typed::<Self>().idx]
+            .children
+            .get_key_value(name)
+            .map(|(name, child)| self.tar_index.dir_entry(name, *child)))
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
@@ -423,6 +416,19 @@ impl TarIndex {
     fn file_data(&self, file_idx: usize) -> &[u8] {
         let range = self.files[file_idx].data_range.clone();
         &self.tar_data[range]
+    }
+
+    /// The directory entry for `child`, named `name` in its parent.
+    fn dir_entry(&self, name: &str, child: IndexedChild) -> DirEntry {
+        let (file_type, node_info) = match child {
+            IndexedChild::File(idx) => (FileType::RegularFile, self.files[idx].node_info),
+            IndexedChild::Dir(idx) => (FileType::Directory, self.dirs[idx].node_info),
+        };
+        DirEntry {
+            name: name.into(),
+            file_type,
+            ino_info: Some(node_info),
+        }
     }
 }
 

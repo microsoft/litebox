@@ -1795,6 +1795,82 @@ mod overlay {
         rx.recv_timeout(Duration::from_secs(2))
             .expect("copy-up deadlocked");
     }
+
+    /// `lookup_at` finds exactly what `list_dir_at` lists, across merged, whited-out, and opaque
+    /// directories, and never exposes the overlay's own markers.
+    #[test]
+    fn lookup_agrees_with_listing() {
+        use crate::fs::backend::{Backend, CreationMetadata, DirHandle};
+        use crate::fs::inode_allocator::InodeAllocator;
+        use crate::fs::tar_ro::TarRo;
+
+        fn assert_lookups(overlay: &Overlay<TestPlatform>, dir: &DirHandle, absent: &[&str]) {
+            for entry in overlay.list_dir_at(dir.clone()).unwrap() {
+                assert_eq!(overlay.lookup_at(dir, &entry.name).unwrap(), Some(entry));
+            }
+            for name in absent {
+                assert_eq!(overlay.lookup_at(dir, name).unwrap(), None, "{name}");
+            }
+        }
+
+        let overlay = Overlay::<TestPlatform>::new(
+            upper([
+                (
+                    "/bar",
+                    InitialNode::Directory {
+                        mode: ALL_PERMS,
+                        owner: ACTING_USER,
+                    },
+                ),
+                (
+                    "/bar/qux",
+                    InitialNode::File {
+                        mode: Mode::RWXU,
+                        owner: ACTING_USER,
+                        data: alloc::borrow::Cow::Borrowed(b""),
+                    },
+                ),
+            ]),
+            TarRo::new(
+                alloc::borrow::Cow::Borrowed(TEST_TAR_FILE),
+                InodeAllocator::standalone(),
+            ),
+            InodeAllocator::standalone(),
+        );
+        let root = overlay.owned_dir_at(overlay.root(), OFlags::PATH).unwrap();
+        let bar = || {
+            let walked = overlay.walk_directories(overlay.root(), &["bar"]).unwrap();
+            overlay.owned_dir_at(walked.last, OFlags::PATH).unwrap()
+        };
+        let names = |dir: &DirHandle| -> Vec<_> {
+            let entries = overlay.list_dir_at(dir.clone()).unwrap();
+            entries.into_iter().map(|entry| entry.name).collect()
+        };
+
+        // `bar` merges the upper and lower directories.
+        assert_eq!(names(&bar()), ["baz", "qux"]);
+        assert_lookups(&overlay, &root, &["missing"]);
+        assert_lookups(&overlay, &bar(), &["missing"]);
+
+        // Unlinking a lower file leaves a whiteout behind, which hides it without being visible.
+        overlay.unlink_at(root.clone(), "foo").unwrap();
+        assert_eq!(names(&root), ["bar"]);
+        assert_lookups(&overlay, &root, &["foo", ".litebox-overlay-whiteout-foo"]);
+
+        // A directory recreated over a whiteout is opaque, hiding the lower directory's entries.
+        overlay.unlink_at(bar(), "baz").unwrap();
+        overlay.unlink_at(bar(), "qux").unwrap();
+        overlay.rmdir_at(root.clone(), "bar").unwrap();
+        let metadata = CreationMetadata {
+            mode: ALL_PERMS,
+            owner: ACTING_USER,
+        };
+        overlay.mkdir_at(root.clone(), "bar", metadata).unwrap();
+        overlay.create_file_at(bar(), "new", metadata).unwrap();
+        assert_eq!(names(&bar()), ["new"]);
+        assert_lookups(&overlay, &bar(), &["baz", ".litebox-overlay-opaque"]);
+        assert_lookups(&overlay, &root, &["foo"]);
+    }
 }
 
 mod devices {
