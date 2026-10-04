@@ -346,6 +346,9 @@ struct RuntimeBatch {
     code: Vec<u8>,
     subs: Vec<litebox_syscall_rewriter::aarch64::SubTrampoline>,
     trapped: Vec<u64>,
+    /// Indices of the holes offered as spaces. Only these can hold `subs`; a
+    /// hole that was not offered may even contain the runtime region.
+    offered_holes: Vec<usize>,
 }
 
 /// Runtime trampoline state from before a batch, to restore if it fails.
@@ -2294,6 +2297,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // The shim maps and protects each space as a whole, so sub-trampolines
         // are packed at gate alignment.
+        let mut offered_holes: Vec<usize> = (0..runtime.holes.len())
+            .filter(|&index| {
+                let hole = &runtime.holes[index];
+                hole.cursor < hole.range.end
+                    && (hole.mapped || self.runtime_hole_is_reserved(&hole.range, code_range))
+            })
+            .collect();
+        offered_holes.sort_by_key(|&index| {
+            let hole = &runtime.holes[index];
+            core::cmp::Reverse(hole.range.end - hole.cursor)
+        });
+        let mut spaces: Vec<TrampolineSpace> = offered_holes
+            .iter()
+            .map(|&index| TrampolineSpace {
+                start: runtime.holes[index].cursor as u64,
+                end: Some(runtime.holes[index].range.end as u64),
+            })
+            .collect();
+
         let rewrite = |spaces: &[TrampolineSpace]| {
             let mut patched = code.to_vec();
             litebox_syscall_rewriter::patch_aarch64_code_segment_in_spaces(
@@ -2309,26 +2331,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 code: patched,
                 subs,
                 trapped,
+                offered_holes: offered_holes.clone(),
             })
             .map_err(RuntimeGateError::Rewrite)
         };
-
-        let mut holes: Vec<&RuntimeHole> = runtime
-            .holes
-            .iter()
-            .filter(|hole| {
-                hole.cursor < hole.range.end
-                    && (hole.mapped || self.runtime_hole_is_reserved(&hole.range, code_range))
-            })
-            .collect();
-        holes.sort_by_key(|hole| core::cmp::Reverse(hole.range.end - hole.cursor));
-        let mut spaces: Vec<TrampolineSpace> = holes
-            .iter()
-            .map(|hole| TrampolineSpace {
-                start: hole.cursor as u64,
-                end: Some(hole.range.end as u64),
-            })
-            .collect();
 
         if runtime.region.is_none() {
             // Without a hole to try, go straight to the region.
@@ -2365,11 +2371,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for sub in &batch.subs {
             let start: usize = sub.vaddr.trunc();
             let end = start + sub.data.len();
-            if let Some(hole) = runtime
-                .holes
-                .iter_mut()
-                .find(|hole| hole.range.contains(&start))
+            if let Some(&index) = batch
+                .offered_holes
+                .iter()
+                .find(|&&index| runtime.holes[index].range.contains(&start))
             {
+                let hole = &mut runtime.holes[index];
                 if !hole.mapped {
                     let mapped = self
                         .do_mmap_anonymous(
@@ -3090,6 +3097,45 @@ mod tests {
             forget_unmapped_trampolines(&mut state, REGION..REGION + PAGE_SIZE);
             assert_eq!(mapped(&state), []);
         }
+    }
+
+    /// A sub-trampoline in a runtime region that lies inside a hole the batch
+    /// did not offer belongs to the region, not to that hole.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn only_offered_holes_take_sub_trampolines() {
+        use super::{RuntimeBatch, RuntimeHole, RuntimeRegion, TrampolineState};
+
+        const HOLE: core::ops::Range<usize> = 0x10_0000..0x20_0000;
+        const REGION: usize = 0x18_0000;
+        let task = init_platform();
+        let mut state = runtime_patch_state(BTreeSet::new(), REGION, true);
+        let TrampolineState::Runtime(runtime) = &mut state.trampoline else {
+            unreachable!()
+        };
+        runtime.holes = alloc::vec![RuntimeHole {
+            range: HOLE,
+            cursor: HOLE.start,
+            mapped: false,
+        }];
+        runtime.region = Some(RuntimeRegion {
+            addr: REGION,
+            len: PAGE_SIZE,
+            cursor: 0,
+        });
+        let batch = RuntimeBatch {
+            code: alloc::vec::Vec::new(),
+            subs: alloc::vec![litebox_syscall_rewriter::aarch64::SubTrampoline {
+                vaddr: REGION as u64,
+                data: alloc::vec![0; 0x40],
+            }],
+            trapped: alloc::vec::Vec::new(),
+            offered_holes: alloc::vec::Vec::new(),
+        };
+        task.make_room_for_batch(runtime, &batch).unwrap();
+        assert!(!runtime.holes[0].mapped);
+        assert_eq!(runtime.holes[0].cursor, HOLE.start);
+        assert_eq!(runtime.region.as_ref().unwrap().cursor, 0x40);
     }
 
     /// A failed batch gives back the region memory it reserved or grew, and
