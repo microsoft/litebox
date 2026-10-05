@@ -834,7 +834,14 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // `interrupt_callback`.
         "mov BYTE PTR fs:in_guest@tpoff, 1",
         "cmp BYTE PTR fs:interrupt@tpoff, 0",
-        "jne interrupt_callback",
+        "je 2f",
+        // The guest is not entered after all, so `in_guest` must not stay set:
+        // `interrupt_callback` runs host code, and a signal arriving there with
+        // `in_guest` set is taken for a guest interrupt and overwrites the
+        // saved guest context with the host register file.
+        "mov BYTE PTR fs:in_guest@tpoff, 0",
+        "jmp interrupt_callback",
+        "2:",
         // Restore guest context from ctx.
         "mov rsp, rdi",
         // Switch to the guest fsbase
@@ -2239,6 +2246,100 @@ mod tests {
     use crate::LinuxUserland;
 
     extern crate std;
+
+    /// An interrupt pending at guest entry diverts to the interrupt handler
+    /// without entering the guest, so a further interrupt taken while that
+    /// handler runs host code must not be attributed to the guest.
+    #[test]
+    fn interrupt_in_diverted_interrupt_handler_keeps_guest_context() {
+        use litebox::platform::ThreadProvider as _;
+        use litebox::shim::{ContinueOperation, EnterShim, InitThread};
+
+        type Outcome = std::sync::mpsc::Sender<bool>;
+
+        struct Init(Outcome);
+        struct Shim {
+            result: Outcome,
+            interrupted: core::cell::Cell<bool>,
+        }
+
+        // The signal is delivered to the calling thread before `pthread_kill` returns.
+        fn interrupt_current_thread() {
+            let signal = super::INTERRUPT_SIGNAL_NUMBER.load(core::sync::atomic::Ordering::Relaxed);
+            // SAFETY: `pthread_self` is a live thread with the interrupt handler installed.
+            assert_eq!(
+                unsafe { libc::pthread_kill(libc::pthread_self(), signal) },
+                0
+            );
+        }
+
+        impl InitThread for Init {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(
+                self: Box<Self>,
+            ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
+                Box::new(Shim {
+                    result: self.0,
+                    interrupted: core::cell::Cell::new(false),
+                })
+            }
+        }
+
+        impl EnterShim for Shim {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                interrupt_current_thread();
+                ContinueOperation::Resume
+            }
+
+            fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(
+                &self,
+                _ctx: &mut Self::ExecutionContext,
+                _info: &litebox::shim::ExceptionInfo,
+            ) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                // Misattributing the interrupt overwrites `ctx` with host
+                // registers and re-enters this handler instead of returning.
+                let ok = if self.interrupted.replace(true) {
+                    false
+                } else {
+                    let before = ctx.clone();
+                    interrupt_current_thread();
+                    format!("{ctx:?}") == format!("{before:?}")
+                };
+                self.result.send(ok).unwrap();
+                ContinueOperation::Terminate
+            }
+        }
+
+        let platform = LinuxUserland::new(None);
+        let (send, receive) = std::sync::mpsc::channel();
+        // SAFETY: the shim terminates the thread before it enters the guest.
+        unsafe {
+            platform
+                .spawn_thread(
+                    &litebox_common_linux::PtRegs::default(),
+                    Box::new(Init(send)),
+                )
+                .unwrap();
+        }
+        let ok = receive
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            ok,
+            "guest context was overwritten by an interrupt in host code"
+        );
+    }
 
     #[test]
     fn test_raw_mutex() {
