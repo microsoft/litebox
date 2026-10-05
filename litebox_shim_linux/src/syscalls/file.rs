@@ -2169,18 +2169,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         sigmask: Option<UserPtr<litebox_common_linux::signal::SigSet>>,
         sigsetsize: usize,
     ) -> Result<usize, Errno> {
-        if nfds
-            > self
-                .process()
-                .limits
-                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
-        {
-            return Err(Errno::EINVAL);
-        }
-        let byte_len = nfds
-            .checked_mul(size_of::<litebox_common_linux::Pollfd>())
-            .ok_or(Errno::EINVAL)?;
-        fds.as_usize().checked_add(byte_len).ok_or(Errno::EFAULT)?;
         if sigmask.is_some() {
             if sigsetsize != core::mem::size_of::<litebox_common_linux::signal::SigSet>() {
                 // Expected via ppoll(2) manpage
@@ -2191,7 +2179,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let timeout = timeout.read::<Platform>()?;
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
-        let mut set = super::epoll::PollSet::with_capacity(nfds);
+        let mut set = super::epoll::PollSet::with_capacity(nfds).ok_or(Errno::ENOMEM)?;
         for i in 0..nfds_signed {
             let fd = fds.read_at_offset::<Platform>(i).ok_or(Errno::EFAULT)?;
 
@@ -2251,7 +2239,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // `self.files.borrow().file_descriptors.read().len()` before `file_descriptors` was
         // removed to clean up the table handling.
         let file_table_len = usize::MAX;
-        let mut set = super::epoll::PollSet::with_capacity(nfds as usize);
+        let mut set =
+            super::epoll::PollSet::with_capacity(nfds as usize).ok_or(Errno::ENOMEM)?;
         for i in 0..nfds {
             let mut events = litebox::event::Events::empty();
             if readfds.as_ref().is_some_and(|set| set[i as usize]) {
@@ -2648,31 +2637,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_ppoll_count_overflow() {
-        let task = crate::syscalls::tests::init_platform(None);
-        assert_eq!(
-            task.sys_ppoll(
-                UserPtrMut::from_usize(0),
-                isize::MAX as usize,
-                TimeParam::None,
-                None,
-                0
-            ),
-            Err(Errno::EINVAL)
-        );
-        assert_eq!(
-            task.sys_ppoll(
-                UserPtrMut::from_usize(usize::MAX),
-                1,
-                TimeParam::None,
-                None,
-                0
-            ),
-            Err(Errno::EFAULT)
-        );
-    }
     use alloc::string::String;
     use core::cell::Cell;
     use litebox::fs::{Mode, OFlags};

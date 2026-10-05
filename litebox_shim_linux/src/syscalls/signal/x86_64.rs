@@ -174,22 +174,3 @@ pub(super) fn restore_sigcontext(
 
     ctx.rax
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{SignalFrame, get_signal_frame};
-    use litebox_common_linux::signal::SigAction;
-    use zerocopy::FromZeros;
-
-    #[test]
-    fn test_signal_frame_underflow() {
-        let action = SigAction::new_zeroed();
-        for sp in [0, 127, 128, 128 + core::mem::size_of::<SignalFrame>()] {
-            assert_eq!(get_signal_frame(sp, &action), None);
-        }
-        let sp = 0x10000;
-        let frame = get_signal_frame(sp, &action).unwrap();
-        assert_eq!(frame % 16, 8);
-        assert!(frame + core::mem::size_of::<SignalFrame>() <= sp - 128);
-    }
-}

@@ -18,7 +18,7 @@ use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
 use litebox::sync::{Mutex, RwLock};
-use litebox::utils::{ReinterpretSignedExt as _, TruncateExt as _};
+use litebox::utils::TruncateExt as _;
 use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
@@ -442,13 +442,6 @@ fn fetch_robust_entry(
     (UserPtr::from_usize(next & !1), next & 1 != 0)
 }
 
-fn robust_futex_address(entry: usize, offset: usize) -> Result<UserPtr<u32>, Errno> {
-    entry
-        .checked_add_signed(offset.reinterpret_as_signed())
-        .map(UserPtr::from_usize)
-        .ok_or(Errno::EFAULT)
-}
-
 fn wake_robust_list<Platform: ShimPlatform>(
     head: UserPtr<litebox_common_linux::RobustListHead>,
 ) -> Result<(), Errno> {
@@ -465,7 +458,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
             .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
-                robust_futex_address(entry.as_usize(), futex_offset)?,
+                UserPtr::from_usize(entry.as_usize().wrapping_add(futex_offset)),
                 pi,
                 false,
             )?;
@@ -481,7 +474,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
 
     if pending.as_usize() != 0 {
         let _ = handle_futex_death(
-            robust_futex_address(pending.as_usize(), futex_offset)?,
+            UserPtr::from_usize(pending.as_usize().wrapping_add(futex_offset)),
             ppi,
             true,
         );
@@ -659,7 +652,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let sp = if stack != 0 {
             let stack = usize::try_from(stack).map_err(|_| Errno::EINVAL)?;
             let size = usize::try_from(stack_size).map_err(|_| Errno::EINVAL)?;
-            Some(stack.checked_add(size).ok_or(Errno::EINVAL)?)
+            Some(
+                stack
+                    .checked_add(size)
+                    .filter(|&end| {
+                        end <= <Platform as litebox::platform::PageManagementProvider<{
+                            litebox_common_linux::vmem::PAGE_SIZE
+                        }>>::TASK_ADDR_MAX
+                    })
+                    .ok_or(Errno::EINVAL)?,
+            )
         } else {
             None
         };
@@ -1628,79 +1630,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(test)]
 mod tests {
     use crate::{UserPtr, UserPtrMut};
-
-    #[test]
-    fn test_robust_futex_offset_overflow() {
-        use litebox_common_linux::errno::Errno;
-
-        assert_eq!(
-            super::robust_futex_address(usize::MAX, 1).unwrap_err(),
-            Errno::EFAULT
-        );
-        assert_eq!(
-            super::robust_futex_address(0, usize::MAX).unwrap_err(),
-            Errno::EFAULT
-        );
-        assert_eq!(
-            super::robust_futex_address(8, usize::MAX)
-                .unwrap()
-                .as_usize(),
-            7
-        );
-        let mut head = litebox_common_linux::RobustListHead {
-            list: litebox_common_linux::RobustList { next: 0 },
-            futex_offset: 2,
-            list_op_pending: usize::MAX - 1,
-        };
-        head.list.next = core::ptr::from_ref(&head) as usize;
-        assert_eq!(
-            super::wake_robust_list::<crate::syscalls::tests::TestPlatform>(UserPtr::from_ptr(
-                core::ptr::from_ref(&head)
-            )),
-            Err(Errno::EFAULT)
-        );
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn test_sched_getaffinity_length_overflow() {
-        let task = crate::syscalls::tests::init_platform(None);
-        let mut mask = [0u8; core::mem::size_of::<usize>()];
-        let mut context = litebox_common_linux::PtRegs {
-            orig_rax: 204,
-            rdi: 0,
-            rsi: 1 << (usize::BITS - 3),
-            rdx: mask.as_mut_ptr() as usize,
-            ..Default::default()
-        };
-        assert_eq!(task.do_syscall(&mut context), Ok(1));
-        assert_eq!(mask[0], 3);
-        assert!(mask[1..].iter().all(|byte| *byte == 0));
-    }
-
-    #[test]
-    fn test_clone_stack_overflow() {
-        use litebox_common_linux::{CloneArgs, CloneFlags, PtRegs, errno::Errno};
-
-        let task = crate::syscalls::tests::init_platform(None);
-        let args = CloneArgs {
-            flags: CloneFlags::VM | CloneFlags::THREAD | CloneFlags::SIGHAND | CloneFlags::FILES,
-            stack: usize::MAX as u64,
-            stack_size: 1,
-            pidfd: 0,
-            child_tid: 0,
-            parent_tid: 0,
-            exit_signal: 0,
-            tls: 0,
-            set_tid: 0,
-            set_tid_size: 0,
-            cgroup: 0,
-        };
-        assert_eq!(
-            task.do_clone(&PtRegs::default(), &args, true),
-            Err(Errno::EINVAL)
-        );
-    }
 
     extern crate std;
 

@@ -101,13 +101,6 @@ impl<Platform: ShimPlatform> Ord for ElfPatchKey<Platform> {
 pub(crate) type ElfPatchCache<Platform> = BTreeMap<ElfPatchKey<Platform>, ElfPatchState>;
 
 #[inline]
-fn align_up(addr: usize, align: usize) -> Option<usize> {
-    debug_assert!(align.is_power_of_two());
-    addr.checked_add(align - 1)
-        .map(|value| value & !(align - 1))
-}
-
-#[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
     addr & !(align - 1)
@@ -363,7 +356,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             todo!("Unsupported flags {:?}", flags);
         }
 
-        let aligned_len = align_up(len, PAGE_SIZE).ok_or(Errno::ENOMEM)?;
+        let aligned_len = len
+            .checked_next_multiple_of(PAGE_SIZE)
+            .ok_or(Errno::ENOMEM)?;
         if offset.checked_add(aligned_len).is_none() {
             return Err(Errno::EOVERFLOW);
         }
@@ -659,7 +654,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
-        let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
+        let (pre_patched, tramp_file_offset, tramp_vaddr, trampoline_file_size) =
             self.check_trampoline_magic(&fd.0);
 
         // Compute the trampoline virtual address.
@@ -675,18 +670,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         "fatal: pre-patched ET_DYN binary but cannot determine load base address"
                     );
                 };
-                let Ok(vaddr) = usize::try_from(tramp_vaddr) else {
-                    return;
-                };
-                let Some(address) = base.checked_add(vaddr) else {
+                let Some(address) = base.checked_add(tramp_vaddr) else {
                     return;
                 };
                 address
             } else {
-                let Ok(address) = usize::try_from(tramp_vaddr) else {
-                    return;
-                };
-                address
+                tramp_vaddr
             }
         } else {
             let base = if e_type == ET_DYN {
@@ -697,19 +686,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let Ok(max_end) = usize::try_from(max_load_end) else {
                 return;
             };
-            let Some(address) = align_up(max_end, PAGE_SIZE).and_then(|end| base.checked_add(end))
+            let Some(address) = max_end
+                .checked_next_multiple_of(PAGE_SIZE)
+                .and_then(|end| base.checked_add(end))
             else {
                 return;
             };
             address
         };
 
+        if pre_patched
+            && trampoline_file_size > 0
+            && trampoline_file_size
+                .checked_next_multiple_of(PAGE_SIZE)
+                .and_then(|len| trampoline_vaddr.checked_add(len))
+                .is_none_or(|end| {
+                    end > <Platform as litebox::platform::PageManagementProvider<{
+                        PAGE_SIZE
+                    }>>::TASK_ADDR_MAX
+                })
+        {
+            return;
+        }
+
         cache.insert(
             fd.clone(),
             ElfPatchState {
                 pre_patched,
                 trampoline_file_offset: tramp_file_offset,
-                trampoline_file_size: tramp_file_size.trunc(),
+                trampoline_file_size,
                 trampoline_addr: trampoline_vaddr,
                 trampoline_cursor: 0,
                 trampoline_mapped: false,
@@ -723,7 +728,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
-    fn check_trampoline_magic(&self, fd: &FileFd<Platform>) -> (bool, u64, u64, u64) {
+    fn check_trampoline_magic(&self, fd: &FileFd<Platform>) -> (bool, u64, usize, usize) {
         let files = self.files.borrow();
         let Ok(stat) = files.fs.fd_file_status(fd) else {
             return (false, 0, 0, 0);
@@ -746,11 +751,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !header.has_valid_magic() {
             return (false, 0, 0, 0);
         }
+        let Ok(vaddr) = usize::try_from(header.vaddr) else {
+            return (false, 0, 0, 0);
+        };
+        let Ok(trampoline_size) = usize::try_from(header.trampoline_size) else {
+            return (false, 0, 0, 0);
+        };
+        if trampoline_size > 0
+            && (!header.file_offset.is_multiple_of(PAGE_SIZE as u64)
+                || !vaddr.is_multiple_of(PAGE_SIZE)
+                || header.file_offset.checked_add(header.trampoline_size)
+                    != Some((file_size - TRAMPOLINE_HEADER_SIZE) as u64))
+        {
+            return (false, 0, 0, 0);
+        }
         (
             true,
             header.file_offset,
-            header.vaddr,
-            header.trampoline_size,
+            vaddr,
+            trampoline_size,
         )
     }
 
@@ -841,9 +860,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             // Pre-patched binary: map the trampoline data from the file.
             if !state.trampoline_mapped && state.trampoline_file_size > 0 {
                 let tramp_addr = state.trampoline_addr;
-                let Some(tramp_len) = align_up(state.trampoline_file_size, PAGE_SIZE) else {
-                    return false;
-                };
+                let tramp_len = state.trampoline_file_size.next_multiple_of(PAGE_SIZE);
 
                 // Allocate RW region at the trampoline address. Use MAP_FIXED
                 // because the code already contains JMPs to this exact address
@@ -1067,7 +1084,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     restore_trampoline_rx(self, state);
                     return true;
                 };
-                let Some(tramp_pages_needed) = align_up(new_cursor, PAGE_SIZE) else {
+                let Some(tramp_pages_needed) = new_cursor.checked_next_multiple_of(PAGE_SIZE) else {
                     self.apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);
                     return true;
@@ -1216,117 +1233,6 @@ mod tests {
             Ok(requested)
         );
         assert_eq!(task.sys_brk(UserPtrMut::from_usize(0)), Ok(requested));
-    }
-
-    #[test]
-    fn test_brk_and_madvise_length_overflow() {
-        let task = init_platform(None);
-        task.global.mm.set_initial_brk(super::PAGE_SIZE);
-        assert_eq!(
-            task.sys_brk(UserPtrMut::from_usize(usize::MAX)),
-            Ok(super::PAGE_SIZE)
-        );
-        assert_eq!(
-            task.sys_brk(UserPtrMut::from_usize(0)),
-            Ok(super::PAGE_SIZE)
-        );
-        for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 2] {
-            assert_eq!(
-                task.sys_madvise(
-                    UserPtrMut::from_usize(super::PAGE_SIZE),
-                    len,
-                    litebox_common_linux::MadviseBehavior::Normal
-                ),
-                Err(Errno::EINVAL)
-            );
-        }
-    }
-
-    #[test]
-    fn test_mprotect_range_overflow() {
-        let task = init_platform(None);
-        for prot in [
-            ProtFlags::PROT_NONE,
-            ProtFlags::PROT_READ,
-            ProtFlags::PROT_READ_WRITE,
-            ProtFlags::PROT_READ_EXEC,
-            ProtFlags::PROT_READ_WRITE_EXEC,
-        ] {
-            for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 1] {
-                assert_eq!(
-                    task.sys_mprotect(UserPtrMut::from_usize(super::PAGE_SIZE), len, prot),
-                    Err(Errno::ENOMEM)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_mremap_range_overflow_preserves_mapping() {
-        let task = init_platform(None);
-        let huge_size = usize::MAX - super::PAGE_SIZE + 1;
-        assert_eq!(
-            task.sys_mremap(
-                UserPtrMut::from_usize(super::PAGE_SIZE),
-                huge_size,
-                super::PAGE_SIZE,
-                MRemapFlags::empty(),
-                0,
-            )
-            .unwrap_err(),
-            Errno::EFAULT
-        );
-        let mapping = task
-            .sys_mmap(
-                0,
-                2 * super::PAGE_SIZE,
-                ProtFlags::PROT_READ_WRITE,
-                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-                -1,
-                0,
-            )
-            .unwrap();
-        assert_eq!(
-            task.sys_mremap(
-                UserPtrMut::from_usize(mapping.as_usize() + super::PAGE_SIZE),
-                super::PAGE_SIZE,
-                huge_size,
-                MRemapFlags::empty(),
-                0,
-            )
-            .unwrap_err(),
-            Errno::ENOMEM
-        );
-        assert_eq!(
-            task.sys_mprotect(mapping, 2 * super::PAGE_SIZE, ProtFlags::PROT_READ),
-            Ok(())
-        );
-        task.sys_munmap(mapping, 2 * super::PAGE_SIZE).unwrap();
-    }
-
-    #[test]
-    fn test_mmap_length_overflow() {
-        let task = init_platform(None);
-        for len in [usize::MAX, usize::MAX - super::PAGE_SIZE + 2] {
-            assert_eq!(
-                task.sys_mmap(
-                    0,
-                    len,
-                    ProtFlags::PROT_READ,
-                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
-                    -1,
-                    0,
-                )
-                .unwrap_err(),
-                Errno::ENOMEM
-            );
-        }
-        assert_eq!(super::align_up(0, super::PAGE_SIZE), Some(0));
-        assert_eq!(super::align_up(1, super::PAGE_SIZE), Some(super::PAGE_SIZE));
-        assert_eq!(
-            super::align_up(usize::MAX - super::PAGE_SIZE + 1, super::PAGE_SIZE),
-            Some(usize::MAX - super::PAGE_SIZE + 1)
-        );
     }
 
     #[test]

@@ -179,13 +179,13 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
             return Ok(state.current);
         }
 
-        let old_page_end = state
-            .current
-            .checked_next_multiple_of(PAGE_SIZE)
-            .ok_or(MappingError::UnAligned)?;
-        let Some(new_page_end) = requested.checked_next_multiple_of(PAGE_SIZE) else {
+        let old_page_end = state.current.next_multiple_of(PAGE_SIZE);
+        if requested
+            > <Platform as litebox::platform::PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX
+        {
             return Ok(state.current);
-        };
+        }
+        let new_page_end = requested.next_multiple_of(PAGE_SIZE);
         if state.current >= requested {
             if let Some(length) = NonZeroPageSize::<PAGE_SIZE>::new(old_page_end - new_page_end) {
                 let ptr =
