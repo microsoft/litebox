@@ -378,11 +378,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: usize,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let op = |ptr: UserPtrMut<u8>| -> Result<usize, MappingError> {
-            // The copy below fills the mapping from its start up to the end of the file.
-            <Platform as litebox::platform::PageManagementProvider<PAGE_SIZE>>::advise_fill(
-                self.global.platform,
-                ptr.as_usize()..ptr.as_usize() + len,
-            );
             // Note a malicious user may unmap ptr while we are reading.
             // `sys_read` does not handle page faults, so we need to use a
             // temporary buffer to read the data from fs (without worrying page

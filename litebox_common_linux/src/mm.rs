@@ -821,7 +821,8 @@ where
     ///
     /// `placement` controls the allocation direction and whether an adjacent gap is reserved for
     /// callers that append trampoline code. `op` initializes the mapping while it is writable;
-    /// its error removes the new mapping.
+    /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
+    /// file's contents from its start, so the platform is hinted to back it with larger pages.
     pub fn do_mmap(
         &self,
         suggested_addr: Option<usize>,
@@ -831,7 +832,6 @@ where
         placement: MmapPlacement,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
-        let op = |p: Platform::RawMutPointer<u8>| op(UserPtrMut::from_platform_ptr::<Platform>(p));
         let mut flags = CreatePagesFlags::from(flags);
         flags.set(
             CreatePagesFlags::ENSURE_SPACE_AFTER,
@@ -848,7 +848,20 @@ where
         let length = NonZeroPageSize::new(len).ok_or(MappingError::UnAligned)?;
         let permissions =
             memory_region_permissions(prot).ok_or(MappingError::InvalidPermissions)?;
-        if flags.contains(CreatePagesFlags::MAP_FILE) || !permissions.is_empty() {
+        let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
+        let platform = self.vmem.read().platform;
+        let op = |p: Platform::RawMutPointer<u8>| {
+            if file_backed {
+                // The first write to each fresh page takes a fault, and for programs with large
+                // segments these faults dominate startup. Since `op` fills a file mapping from its
+                // start up to the end of the file, let the platform back it with larger pages,
+                // which take fewer faults and leave at most one larger page past the end of the
+                // file.
+                platform.advise_fill(p.as_usize()..p.as_usize() + len);
+            }
+            op(UserPtrMut::from_platform_ptr::<Platform>(p))
+        };
+        if file_backed || !permissions.is_empty() {
             unsafe {
                 self.create_pages_with_permissions(suggested_addr, length, flags, permissions, op)
             }
