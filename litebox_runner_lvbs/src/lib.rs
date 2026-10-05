@@ -242,7 +242,6 @@ pub fn init(is_bsp: bool) -> &'static Platform {
     if is_bsp {
         let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
             .with_ta_signing_cert(TA_SIGNING_CERT_DER)
-            .with_ta_verify_key(TA_VERIFY_KEY_DER)
             .build();
         register_embedded_tas(&shim);
     }
@@ -787,7 +786,6 @@ fn open_session_new_instance(
 ) -> Result<(), OpteeSmcReturnCode> {
     let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
         .with_ta_signing_cert(TA_SIGNING_CERT_DER)
-        .with_ta_verify_key(TA_VERIFY_KEY_DER)
         .build();
     if shim.get_ta_bin(&ta_uuid).is_none() {
         msg_args.session = 0;
@@ -1372,7 +1370,6 @@ const LDELF_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 const TA_SIGNING_CERT_DER: &[u8] = &[0u8; 0];
-const TA_VERIFY_KEY_DER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ta-signing-public.der"));
 
 /// Register all TA binaries embedded in the runner image.
 fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {

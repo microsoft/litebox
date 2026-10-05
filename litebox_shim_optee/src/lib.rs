@@ -23,11 +23,15 @@ use litebox::{
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, mm::VmemManager, vmem::PAGE_SIZE};
 use litebox_common_optee::{
-    LdelfArg, LdelfSyscallRequest, SyscallRequest, TaFlags, TeeAlgorithm, TeeAlgorithmClass,
-    TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin, TeeObjHandle,
-    TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid, UteeAttribute,
+    LdelfArg, LdelfSyscallRequest, SHDR_BOOTSTRAP_TA, SHDR_MAGIC, SHDR_UUID_LEN, SHDR_VERSION_LEN,
+    Shdr, SyscallRequest, TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256, TaFlags, TeeAlgorithm,
+    TeeAlgorithmClass, TeeAttributeType, TeeCrypStateHandle, TeeHandleFlag, TeeIdentity, TeeLogin,
+    TeeObjHandle, TeeObjectInfo, TeeObjectType, TeeOperationMode, TeeResult, TeeUuid,
+    UteeAttribute,
 };
 use sha2::{Digest, Sha256};
+use thiserror::Error;
+use zerocopy::FromBytes;
 
 pub mod loader;
 pub mod session;
@@ -179,7 +183,6 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
     session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
     ta_signing_cert: &'static [u8],
-    ta_verify_key: &'static [u8],
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
@@ -195,7 +198,6 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             session_manager,
             litebox: LiteBox::new(platform),
             ta_signing_cert: &[],
-            ta_verify_key: &[],
         }
     }
 
@@ -206,13 +208,6 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
         self
     }
 
-    /// A public key for TA signature verification. Defaults to empty (no key).
-    #[must_use]
-    pub fn with_ta_verify_key(mut self, ta_verify_key: &'static [u8]) -> Self {
-        self.ta_verify_key = ta_verify_key;
-        self
-    }
-
     /// Returns the litebox object for the shim.
     pub fn litebox(&self) -> &LiteBox<Platform> {
         &self.litebox
@@ -220,6 +215,15 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
 
     /// Build the shim.
     pub fn build(self) -> OpteeShim<Platform> {
+        let ta_signing_key = if self.ta_signing_cert.is_empty() {
+            None
+        } else {
+            TaVerifyKey::from_der(self.ta_signing_cert)
+                .map_err(|error| {
+                    litebox_util_log::error!(error:% = error; "TA signing certificate is invalid");
+                })
+                .ok()
+        };
         let global = Arc::new(GlobalState {
             platform: self.platform,
             session_manager: self.session_manager,
@@ -228,7 +232,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             _litebox: self.litebox,
             ta_uuid_map: ta_uuid_map(),
             ta_signing_cert: self.ta_signing_cert,
-            ta_verify_key: self.ta_verify_key,
+            ta_signing_key,
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
             page_table_keepalive: None,
         });
@@ -253,7 +257,7 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// The TA UUID to binary map for TA loading.
     ta_uuid_map: &'static TaUuidMap,
     ta_signing_cert: &'static [u8],
-    ta_verify_key: &'static [u8],
+    ta_signing_key: Option<TaVerifyKey>,
     /// Tracks which non-concurrent PTAs (i.e., PTAs w/o `TaFlags::CONCURRENT`)
     /// are currently busy. A busy PTA is *rejected* with `TeeResult::Busy`
     /// rather than queued.
@@ -287,29 +291,27 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     }
 
     fn store_ta(&self, expected_uuid: Option<TeeUuid>, ta_bin: &[u8], source: TaSource) -> bool {
-        let (ta_uuid, ta_elf) = match (source, expected_uuid) {
-            (TaSource::BuiltIn, Some(ta_uuid)) => (ta_uuid, ta_bin),
-            (TaSource::BuiltIn, None) => {
-                if let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) {
-                    (ta_head.uuid, ta_bin)
-                } else {
-                    let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key)
-                    else {
-                        return false;
-                    };
-                    (ta_uuid, ta_elf)
-                }
+        let (ta_uuid, ta_elf) = if ta_bin.starts_with(&SHDR_MAGIC.to_le_bytes()) {
+            let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_signing_key.as_ref())
+            else {
+                return false;
+            };
+            (ta_uuid, ta_elf)
+        } else {
+            // Dynamic TAs must be signed
+            if source == TaSource::Dynamic {
+                return false;
             }
-            (TaSource::Dynamic, expected_uuid) => {
-                let Some((ta_uuid, ta_elf)) = verify_signed_ta(ta_bin, self.ta_verify_key) else {
-                    return false;
-                };
-                if expected_uuid.is_some_and(|expected_uuid| expected_uuid != ta_uuid) {
-                    return false;
-                }
-                (ta_uuid, ta_elf)
-            }
+            let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) else {
+                return false;
+            };
+            (ta_head.uuid, ta_bin)
         };
+
+        if expected_uuid.is_some_and(|expected_uuid| expected_uuid != ta_uuid) {
+            return false;
+        }
+
         self.ta_uuid_map.insert(ta_uuid, ta_elf.into(), source)
     }
 
@@ -1603,20 +1605,154 @@ fn ta_uuid_map() -> &'static TaUuidMap {
     TA_UUID_MAP.get_or_init(|| alloc::boxed::Box::new(TaUuidMap::new()))
 }
 
-fn verify_signed_ta<'a>(ta_bin: &'a [u8], verify_key_der: &[u8]) -> Option<(TeeUuid, &'a [u8])> {
-    use litebox_common_optee::{TaVerifyKey, parse_and_verify_ta};
+struct TaVerifyKey(rsa::RsaPublicKey);
 
-    let verify_key = TaVerifyKey::from_der(verify_key_der)
-        .map_err(|error| {
-            litebox_util_log::error!(error:% = error; "TA verification key is missing or invalid");
-        })
-        .ok()?;
-    let (ta_head, ta_elf) = parse_and_verify_ta(ta_bin, &verify_key)
+impl TaVerifyKey {
+    fn from_der(der: &[u8]) -> Result<Self, &'static str> {
+        use rsa::pkcs8::DecodePublicKey;
+
+        rsa::RsaPublicKey::from_public_key_der(der)
+            .map(Self)
+            .map_err(|_| "Invalid RSA public key DER")
+    }
+}
+
+#[derive(Debug, Error)]
+enum SignedTaError {
+    #[error("invalid signed TA file")]
+    InvalidFile,
+    #[error("invalid signed TA header")]
+    InvalidHeader,
+    #[error("invalid TA magic")]
+    InvalidMagic,
+    #[error("unsupported signed TA image type")]
+    UnsupportedImageType,
+    #[error("signed TA hash size {actual} does not match SHA-256 size {expected}")]
+    InvalidHashSize { actual: usize, expected: usize },
+    #[error("signed TA image hash does not match its contents")]
+    HashMismatch,
+    #[error("invalid TA ELF binary")]
+    InvalidElf,
+    #[error("signed TA UUID {signed_uuid:?} does not match ELF UUID {elf_uuid:?}")]
+    UuidMismatch {
+        signed_uuid: TeeUuid,
+        elf_uuid: TeeUuid,
+    },
+    #[error("invalid PSS signature")]
+    InvalidPssSignature,
+    #[error("signature verification failed")]
+    SignatureVerificationFailed,
+    #[error("unsupported TA signature algorithm: {0:#x}")]
+    UnsupportedAlgorithm(u32),
+}
+
+fn verify_signed_ta<'a>(
+    ta_bin: &'a [u8],
+    verify_key: Option<&TaVerifyKey>,
+) -> Option<(TeeUuid, &'a [u8])> {
+    let Some(verify_key) = verify_key else {
+        litebox_util_log::error!("TA signing certificate is missing or invalid");
+        return None;
+    };
+    let (ta_head, ta_elf) = parse_and_verify_ta(ta_bin, verify_key)
         .map_err(|error| {
             litebox_util_log::error!(error:% = error; "signed TA verification failed");
         })
         .ok()?;
     Some((ta_head.uuid, ta_elf))
+}
+
+fn parse_and_verify_ta<'a>(
+    ta_data: &'a [u8],
+    verify_key: &TaVerifyKey,
+) -> Result<(litebox_common_optee::TaHead, &'a [u8]), SignedTaError> {
+    let header_size = core::mem::size_of::<Shdr>();
+    if ta_data.len() < header_size {
+        return Err(SignedTaError::InvalidFile);
+    }
+    let signed_header =
+        Shdr::read_from_bytes(&ta_data[..header_size]).map_err(|_| SignedTaError::InvalidHeader)?;
+    if signed_header.magic != SHDR_MAGIC {
+        return Err(SignedTaError::InvalidMagic);
+    }
+    if signed_header.img_type != SHDR_BOOTSTRAP_TA {
+        return Err(SignedTaError::UnsupportedImageType);
+    }
+    let expected_hash_size = <Sha256 as Digest>::output_size();
+    if signed_header.hash_size as usize != expected_hash_size {
+        return Err(SignedTaError::InvalidHashSize {
+            actual: signed_header.hash_size as usize,
+            expected: expected_hash_size,
+        });
+    }
+
+    let sig_offset = header_size
+        .checked_add(signed_header.hash_size as usize)
+        .ok_or(SignedTaError::InvalidFile)?;
+    let uuid_offset = sig_offset
+        .checked_add(signed_header.sig_size as usize)
+        .ok_or(SignedTaError::InvalidFile)?;
+    let version_offset = uuid_offset
+        .checked_add(SHDR_UUID_LEN)
+        .ok_or(SignedTaError::InvalidFile)?;
+    let img_offset = version_offset
+        .checked_add(SHDR_VERSION_LEN)
+        .ok_or(SignedTaError::InvalidFile)?;
+    let end = img_offset
+        .checked_add(signed_header.img_size as usize)
+        .ok_or(SignedTaError::InvalidFile)?;
+    if end != ta_data.len() {
+        return Err(SignedTaError::InvalidFile);
+    }
+
+    let sig = &ta_data[sig_offset..uuid_offset];
+    let hash = &ta_data[header_size..sig_offset];
+    let uuid_and_version = &ta_data[uuid_offset..img_offset];
+    let img = &ta_data[img_offset..end];
+    let mut hasher = Sha256::new();
+    hasher.update(&ta_data[..header_size]);
+    hasher.update(uuid_and_version);
+    hasher.update(img);
+    let message_digest = hasher.finalize();
+    if hash != message_digest.as_slice() {
+        return Err(SignedTaError::HashMismatch);
+    }
+    verify_shdr_signature(&message_digest, sig, signed_header.algo, &verify_key.0)?;
+    let ta_head = litebox_common_optee::parse_ta_head(img).ok_or(SignedTaError::InvalidElf)?;
+    let signed_uuid = TeeUuid::from_bytes(
+        uuid_and_version[..SHDR_UUID_LEN]
+            .try_into()
+            .map_err(|_| SignedTaError::InvalidFile)?,
+    );
+    if signed_uuid != ta_head.uuid {
+        return Err(SignedTaError::UuidMismatch {
+            signed_uuid,
+            elf_uuid: ta_head.uuid,
+        });
+    }
+
+    Ok((ta_head, img))
+}
+
+fn verify_shdr_signature(
+    message_digest: &[u8],
+    signature: &[u8],
+    algorithm: u32,
+    rsa_public_key: &rsa::RsaPublicKey,
+) -> Result<(), SignedTaError> {
+    use rsa::signature::hazmat::PrehashVerifier;
+
+    match algorithm {
+        TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256 => {
+            let verifying_key = rsa::pss::VerifyingKey::<Sha256>::new(rsa_public_key.clone());
+            let signature = rsa::pss::Signature::try_from(signature)
+                .map_err(|_| SignedTaError::InvalidPssSignature)?;
+            verifying_key
+                .verify_prehash(message_digest, &signature)
+                .map_err(|_| SignedTaError::SignatureVerificationFailed)
+        }
+        _ => Err(SignedTaError::UnsupportedAlgorithm(algorithm)),
+    }
 }
 
 /// Per-instance TA state which can be shared between sessions if it is

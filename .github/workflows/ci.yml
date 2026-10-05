@@ -269,12 +269,6 @@ jobs:
           #   access since it needs to actually access the file-system, pull in
           #   relevant files, and then actually trigger LiteBox itself.
           #
-          # - `litebox_common_optee` is `no_std`, but the builtin
-          #   `x86_64-unknown-none` target is soft-float, which its crypto
-          #   dependencies cannot lower. The shipped target,
-          #   `litebox_runner_lvbs/x86_64_vtl1.json`, satisfies that
-          #   requirement.
-          #
           # - `litebox_shim_optee` is `no_std`, but the builtin
           #   `x86_64-unknown-none` target is soft-float, which its crypto
           #   dependencies cannot lower. The shipped target,
@@ -306,7 +300,6 @@ jobs:
             -not -path './litebox_runner_linux_userland/Cargo.toml' \
             -not -path './litebox_runner_lvbs/Cargo.toml' \
             -not -path './litebox_runner_optee_on_linux_userland/Cargo.toml' \
-            -not -path './litebox_common_optee/Cargo.toml' \
             -not -path './litebox_shim_optee/Cargo.toml' \
             -not -path './litebox_syscall_rewriter/Cargo.toml' \
             -not -path './litebox_packager/Cargo.toml' \
