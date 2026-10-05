@@ -14,10 +14,10 @@ pub trait PageReservation: Into<Range<usize>> {
     /// Return the owned address range.
     fn range(&self) -> Range<usize>;
 
-    /// Split ownership into the prefix, requested extent, and suffix without changing memory.
+    /// Split ownership into `(lower prefix, range, upper suffix)`.
     ///
     /// `range` must be nonempty, page-aligned, and contained in the owned extent. The returned
-    /// handles must be disjoint and together own exactly the original extent.
+    /// handles are disjoint and together own the original extent; empty outer parts are `None`.
     fn split(self, range: Range<usize>) -> (Option<Self>, Self, Option<Self>)
     where
         Self: Sized;
