@@ -15,13 +15,15 @@ use litebox_platform::sync::RawMutex as _;
 
 use crate::sync::{Mutex, RawSyncPrimitivesProvider};
 
+/// Leases shared-buffer slots, always the lowest free ones, so that a light
+/// workload keeps reusing a few slots whose pages stay mapped and cache-warm
+/// in both processes.
 pub(super) struct SlotAllocator<Platform: RawSyncPrimitivesProvider> {
     state: Mutex<Platform, AllocatorState<Platform>>,
 }
 
 struct AllocatorState<Platform: RawSyncPrimitivesProvider> {
     allocated_slots: Vec<bool>,
-    next_slot: usize,
     failed: bool,
     waiters: VecDeque<Arc<SlotWaiter<Platform>>>,
 }
@@ -49,7 +51,6 @@ impl<Platform: RawSyncPrimitivesProvider> SlotAllocator<Platform> {
         Self {
             state: Mutex::new(AllocatorState {
                 allocated_slots: vec![false; SHARED_BUFFER_SLOT_COUNT as usize],
-                next_slot: 0,
                 failed: false,
                 waiters: VecDeque::new(),
             }),
@@ -223,39 +224,29 @@ impl<Platform: RawSyncPrimitivesProvider> Drop for SlotLease<'_, Platform> {
 
 impl<Platform: RawSyncPrimitivesProvider> AllocatorState<Platform> {
     fn allocate(&mut self, length: u32, slot_count: usize) -> Option<SharedBufferSequence> {
-        if self
+        let mut slot_indices = [SharedBufferSlotIndex::default(); MAX_SHARED_BUFFER_SEQUENCE_SLOTS];
+        let free_slots = self
             .allocated_slots
             .iter()
-            .filter(|allocated| !**allocated)
-            .count()
-            < slot_count
-        {
-            return None;
-        }
-
-        let mut slot_indices = [SharedBufferSlotIndex::default(); MAX_SHARED_BUFFER_SEQUENCE_SLOTS];
-        let mut next_slot = self.next_slot;
-        for stored_slot in &mut slot_indices[..slot_count] {
-            let slot_index = self
-                .next_free_slot(next_slot)
-                .expect("validated shared-buffer capacity must contain a free slot");
-            self.allocated_slots[slot_index] = true;
+            .enumerate()
+            .filter_map(|(slot_index, allocated)| (!*allocated).then_some(slot_index));
+        let mut found = 0;
+        for (stored_slot, slot_index) in slot_indices[..slot_count].iter_mut().zip(free_slots) {
             *stored_slot = SharedBufferSlotIndex(
                 u32::try_from(slot_index).expect("shared-buffer slot index must fit in u32"),
             );
-            next_slot = (slot_index + 1) % self.allocated_slots.len();
+            found += 1;
         }
-        self.next_slot = next_slot;
+        if found < slot_count {
+            return None;
+        }
+        for slot_index in &slot_indices[..slot_count] {
+            self.allocated_slots[slot_index.0 as usize] = true;
+        }
         Some(
             SharedBufferSequence::new(&slot_indices[..slot_count], length)
                 .expect("allocated shared-buffer sequence must be valid"),
         )
-    }
-
-    fn next_free_slot(&self, next_slot: usize) -> Option<usize> {
-        (0..self.allocated_slots.len())
-            .map(|offset| (next_slot + offset) % self.allocated_slots.len())
-            .find(|slot_index| !self.allocated_slots[*slot_index])
     }
 }
 
@@ -305,7 +296,6 @@ mod tests {
     fn allocator_state_supports_slots_beyond_bitmap_widths() {
         let mut state = AllocatorState::<MockPlatform> {
             allocated_slots: alloc::vec![true; 65],
-            next_slot: 64,
             failed: false,
             waiters: VecDeque::new(),
         };

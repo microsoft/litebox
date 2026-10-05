@@ -7,6 +7,7 @@ use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::os::windows::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -60,7 +61,12 @@ pub struct WindowsControlRingLocalNotificationChannel {
 
 struct LocalRingAssociation {
     request_producer: Mutex<ControlRingProducer<WindowsSharedMemory>>,
+    /// Read by whichever caller holds the pending-call reader role.
+    response_consumer: Mutex<ControlRingConsumer<WindowsSharedMemory>>,
     pending_calls: Arc<PendingCalls>,
+    /// Whether the call channel was dropped, which ends the association as a
+    /// local close rather than a failure.
+    closed: AtomicBool,
     liveness: PipeLiveness,
     request_wake: ControlRingWakeHandle<WindowsSharedMemory>,
     response_wake: ControlRingWakeHandle<WindowsSharedMemory>,
@@ -202,13 +208,11 @@ fn activate_local(
         request_wake: request_producer.wake_handle(),
         request_producer: Mutex::new(request_producer),
         response_wake: response_consumer.wake_handle(),
+        response_consumer: Mutex::new(response_consumer),
         notification_wake: notification_consumer.wake_handle(),
         pending_calls,
+        closed: AtomicBool::new(false),
     });
-    let response_association = Arc::clone(&association);
-    thread::Builder::new()
-        .name("litebox-broker-responses".to_owned())
-        .spawn(move || dispatch_responses(response_consumer, response_association))?;
     let monitor_association = Arc::clone(&association);
     thread::Builder::new()
         .name("litebox-broker-liveness".to_owned())
@@ -261,12 +265,15 @@ impl LocalCallChannel for WindowsControlRingLocalCallChannel {
         if let Err(error) = write_result {
             let _ = association.fail(error);
         }
-        pending_call.wait().map_err(|error| copy_io_error(&error))
+        pending_call
+            .wait(|| association.read_response())
+            .map_err(|error| copy_io_error(&error))
     }
 }
 
 impl Drop for WindowsControlRingLocalCallChannel {
     fn drop(&mut self) {
+        self.association.closed.store(true, Ordering::Release);
         let _ = self.association.fail(Error::new(
             ErrorKind::ConnectionAborted,
             "broker local call channel dropped",
@@ -280,17 +287,21 @@ impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
     fn recv_notification(&mut self) -> IoResult<Option<BrokerNotification>> {
         loop {
             if let Some(error) = self.association.pending_calls.current_failure() {
-                return Err(copy_io_error(&error));
+                return self.association.end_notifications(&error);
             }
             match self.consumer.try_read(decode_notification) {
                 Ok(ControlRingReadStatus::Message(notification)) => {
-                    self.association
-                        .acknowledge_notification(&mut self.consumer)?;
+                    if let Err(error) = self
+                        .association
+                        .acknowledge_notification(&mut self.consumer)
+                    {
+                        return self.association.end_notifications(&error);
+                    }
                     return Ok(Some(notification));
                 }
                 Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
                     if let Some(error) = self.association.pending_calls.current_failure() {
-                        return Err(copy_io_error(&error));
+                        return self.association.end_notifications(&error);
                     }
                     if let Err(error) = self.consumer.wait_for_message(wait_epoch) {
                         let result = Err(copy_io_error(&error));
@@ -316,6 +327,16 @@ impl LocalNotificationChannel for WindowsControlRingLocalNotificationChannel {
 }
 
 impl LocalRingAssociation {
+    /// Ends notification receipt once the association has ended with
+    /// `failure`: cleanly if the local side closed it.
+    fn end_notifications(&self, failure: &Error) -> IoResult<Option<BrokerNotification>> {
+        if self.closed.load(Ordering::Acquire) {
+            Ok(None)
+        } else {
+            Err(copy_io_error(failure))
+        }
+    }
+
     fn acknowledge_notification(
         &self,
         consumer: &mut ControlRingConsumer<WindowsSharedMemory>,
@@ -337,6 +358,51 @@ impl LocalRingAssociation {
         Ok(())
     }
 
+    /// Reads one response for the caller holding the pending-call reader
+    /// role, blocking until one arrives or the association fails.
+    fn read_response(&self) {
+        let Ok(mut consumer) = self.response_consumer.lock() else {
+            let _ = self.fail(Error::other("broker response reader mutex poisoned"));
+            return;
+        };
+        loop {
+            match consumer.try_read(decode_response) {
+                Ok(ControlRingReadStatus::Message(response)) => {
+                    if let Err(error) = consumer
+                        .publish_head()
+                        .map_err(ring_error)
+                        .and_then(|()| consumer.wake_producer())
+                        .and_then(|()| {
+                            self.pending_calls
+                                .complete(response)
+                                .map_err(pending_calls_error)
+                        })
+                    {
+                        let _ = self.fail(error);
+                    }
+                    return;
+                }
+                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                    if self.pending_calls.current_failure().is_some() {
+                        return;
+                    }
+                    if let Err(error) = consumer.wait_for_message(wait_epoch) {
+                        let _ = self.fail(error);
+                        return;
+                    }
+                }
+                Err(ControlRingReadError::Ring(error)) => {
+                    let _ = self.fail(ring_error(error));
+                    return;
+                }
+                Err(ControlRingReadError::Decode(error)) => {
+                    let _ = self.fail(wire_error(error));
+                    return;
+                }
+            }
+        }
+    }
+
     fn fail(&self, error: Error) -> IoResult<()> {
         self.pending_calls.record_failure(Arc::new(error));
         self.request_wake
@@ -344,49 +410,6 @@ impl LocalRingAssociation {
             .and(self.response_wake.interrupt_wait())
             .and(self.notification_wake.interrupt_wait())
             .and(self.liveness.shutdown())
-    }
-}
-
-fn dispatch_responses(
-    mut consumer: ControlRingConsumer<WindowsSharedMemory>,
-    association: Arc<LocalRingAssociation>,
-) {
-    loop {
-        match consumer.try_read(decode_response) {
-            Ok(ControlRingReadStatus::Message(response)) => {
-                if let Err(error) = consumer
-                    .publish_head()
-                    .map_err(ring_error)
-                    .and_then(|()| consumer.wake_producer())
-                    .and_then(|()| {
-                        association
-                            .pending_calls
-                            .complete(response)
-                            .map_err(pending_calls_error)
-                    })
-                {
-                    let _ = association.fail(error);
-                    return;
-                }
-            }
-            Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                if association.pending_calls.current_failure().is_some() {
-                    return;
-                }
-                if let Err(error) = consumer.wait_for_message(wait_epoch) {
-                    let _ = association.fail(error);
-                    return;
-                }
-            }
-            Err(ControlRingReadError::Ring(error)) => {
-                let _ = association.fail(ring_error(error));
-                return;
-            }
-            Err(ControlRingReadError::Decode(error)) => {
-                let _ = association.fail(wire_error(error));
-                return;
-            }
-        }
     }
 }
 

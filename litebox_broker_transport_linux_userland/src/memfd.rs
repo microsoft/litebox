@@ -8,10 +8,16 @@
 //! `litebox_broker_transport`, and its futex support lets portable control-ring
 //! endpoints block and wake without knowing anything about Linux.
 //!
-//! Rust never dereferences the peer-writable mapping. Byte and word access uses
-//! positional descriptor I/O into private buffers; the mapping exists only to
-//! provide checked addresses to the kernel's futex operations and to process
-//! image writes.
+//! Rust never forms references into the peer-writable mapping. Byte and word
+//! access goes through [`peer_memory`], which copies untrusted snapshots into
+//! private buffers, and futex operations and process image writes hand checked
+//! addresses to the kernel.
+//!
+//! Direct access raises `SIGBUS` instead of returning an error if a mapped page
+//! loses its backing, so every mapping must have its size sealed: the broker
+//! maps only memfds it created and sealed, and received memfds are rejected
+//! unless sealed. The broker must never map a memfd its peer created, since the
+//! peer chooses that file's backing.
 
 use std::io::{Error, Result as IoResult};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
@@ -25,7 +31,7 @@ use std::time::Instant;
 use rustix::fs::{
     MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, fstat, ftruncate, memfd_create,
 };
-use rustix::io::{Errno, pread, pwrite};
+use rustix::io::{Errno, pwrite};
 use rustix::mm::{MapFlags, ProtFlags, mmap, munmap};
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
@@ -39,6 +45,7 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::control_ring::{
     memory_permits_byte_range, memory_permits_u32, memory_permits_u64,
 };
+use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 
 use crate::unix_io::{
@@ -63,18 +70,25 @@ struct MappedRegion {
 }
 
 // SAFETY: Moving or sharing this owner does not move or invalidate its OS
-// mapping. Its metadata is immutable, and mapped contents are never
-// dereferenced by Rust.
+// mapping. Its metadata is immutable, and mapped contents are only accessed
+// through `peer_memory` or the kernel, never through Rust references.
 unsafe impl Send for MappedRegion {}
-// SAFETY: See the `Send` justification. Only checked raw futex addresses are
-// derived from the mapping and passed to the kernel.
+// SAFETY: See the `Send` justification. Every access derives a checked raw
+// address from the mapping.
 unsafe impl Sync for MappedRegion {}
 
-fn validate_u64_offset(memory: &MemfdSharedMemory, offset: usize) -> Result<(), SharedMemoryError> {
+fn checked_u64_address(
+    memory: &MemfdSharedMemory,
+    offset: usize,
+) -> Result<*mut u64, SharedMemoryError> {
     if !memory.policy.permits_u64(offset) {
         return Err(SharedMemoryError::InvalidRange);
     }
-    checked_range(&memory.mapping, offset, size_of::<u64>(), align_of::<u64>())
+    let byte_address =
+        shared_address(&memory.mapping, offset, size_of::<u64>(), align_of::<u64>())?;
+    // The runtime check above establishes the required alignment.
+    #[allow(clippy::cast_ptr_alignment)]
+    Ok(byte_address.cast::<u64>())
 }
 
 fn checked_u32_address(
@@ -133,46 +147,6 @@ fn validate_nonoverlapping_word_ranges(
     Ok(())
 }
 
-fn read_exact_at(
-    memory: &MemfdSharedMemory,
-    offset: usize,
-    destination: &mut [u8],
-) -> Result<(), SharedMemoryError> {
-    let mut completed = 0;
-    while completed < destination.len() {
-        let file_offset =
-            u64::try_from(offset + completed).map_err(|_| SharedMemoryError::InvalidRange)?;
-        match pread(&memory.fd, &mut destination[completed..], file_offset) {
-            Ok(0) => return Err(SharedMemoryError::AccessFailed),
-            Ok(read) => completed += read,
-            Err(Errno::INTR) => {}
-            Err(_) => return Err(SharedMemoryError::AccessFailed),
-        }
-    }
-    Ok(())
-}
-
-fn write_all_at(
-    memory: &MemfdSharedMemory,
-    offset: usize,
-    source: &[u8],
-) -> Result<(), SharedMemoryError> {
-    let mut completed = 0;
-    while completed < source.len() {
-        let file_offset =
-            u64::try_from(offset + completed).map_err(|_| SharedMemoryError::InvalidRange)?;
-        match pwrite(&memory.fd, &source[completed..], file_offset) {
-            Ok(0) => return Err(SharedMemoryError::AccessFailed),
-            Ok(written) => completed += written,
-            Err(Errno::INTR) => {}
-            Err(_) => return Err(SharedMemoryError::AccessFailed),
-        }
-    }
-    Ok(())
-}
-
-const FUTEX_INCREMENT_OPERATION: libc::c_int =
-    (libc::FUTEX_OP_ADD << 28) | (libc::FUTEX_OP_CMP_EQ << 24) | (1 << 12);
 const FUTEX_WAIT_RECHECK_TIMEOUT: libc::timespec = libc::timespec {
     tv_sec: 0,
     tv_nsec: 100_000_000,
@@ -180,28 +154,6 @@ const FUTEX_WAIT_RECHECK_TIMEOUT: libc::timespec = libc::timespec {
 
 // The rustix futex API requires `AtomicU32` references. Raw syscalls keep Rust
 // references out of memory that a peer can modify through an uncontrolled fd.
-fn futex_increment(address: *mut u32) -> IoResult<()> {
-    // SAFETY: `address` is aligned and lies within the live shared mapping.
-    // FUTEX_WAKE_OP atomically increments it in the kernel, so Rust never forms
-    // an atomic reference that a peer could invalidate through another alias.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            address,
-            libc::FUTEX_WAKE_OP,
-            0,
-            0,
-            address,
-            FUTEX_INCREMENT_OPERATION,
-        )
-    };
-    if result == -1 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 fn futex_wait(address: *mut u32, expected: u32) -> IoResult<()> {
     let timeout = FUTEX_WAIT_RECHECK_TIMEOUT;
     // SAFETY: `address` is aligned and lies within the live shared mapping. The
@@ -391,45 +343,53 @@ impl SharedMemory for MemfdSharedMemory {
     }
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
-        checked_range(&self.mapping, offset, destination.len(), 1)?;
+        let source = shared_address(&self.mapping, offset, destination.len(), 1)?;
         if !self.policy.permits_byte_range(offset, destination.len()) {
             return Err(SharedMemoryError::InvalidRange);
         }
-        read_exact_at(self, offset, destination)
+        // SAFETY: The range lies within the live mapping, which cannot overlap
+        // the private destination.
+        unsafe { peer_memory::copy_from_peer(source, destination) };
+        Ok(())
     }
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
-        checked_range(&self.mapping, offset, source.len(), 1)?;
+        let destination = shared_address(&self.mapping, offset, source.len(), 1)?;
         if !self.policy.permits_byte_range(offset, source.len()) {
             return Err(SharedMemoryError::InvalidRange);
         }
-        write_all_at(self, offset, source)
+        // SAFETY: The range lies within the live mapping, which cannot overlap
+        // the private source.
+        unsafe { peer_memory::copy_to_peer(source, destination) };
+        Ok(())
     }
 }
 
 impl ControlRingMemory for MemfdSharedMemory {
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
-        checked_u32_address(self, offset)?;
-        let mut bytes = [0; size_of::<u32>()];
-        read_exact_at(self, offset, &mut bytes)?;
-        Ok(u32::from_ne_bytes(bytes))
+        let address = checked_u32_address(self, offset)?;
+        // SAFETY: The address is aligned and lies within the live mapping.
+        Ok(unsafe { peer_memory::load_u32_acquire(address) })
     }
 
     fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
         let address = checked_u32_address(self, offset)?;
-        futex_increment(address).map_err(|_| SharedMemoryError::AccessFailed)
+        // SAFETY: The address is aligned and lies within the live mapping.
+        unsafe { peer_memory::increment_u32_release(address) };
+        Ok(())
     }
 
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
-        validate_u64_offset(self, offset)?;
-        let mut bytes = [0; size_of::<u64>()];
-        read_exact_at(self, offset, &mut bytes)?;
-        Ok(u64::from_ne_bytes(bytes))
+        let address = checked_u64_address(self, offset)?;
+        // SAFETY: The address is aligned and lies within the live mapping.
+        Ok(unsafe { peer_memory::load_u64_acquire(address) })
     }
 
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
-        validate_u64_offset(self, offset)?;
-        write_all_at(self, offset, &value.to_ne_bytes())
+        let address = checked_u64_address(self, offset)?;
+        // SAFETY: The address is aligned and lies within the live mapping.
+        unsafe { peer_memory::store_u64_release(address, value) };
+        Ok(())
     }
 
     fn store_u64_and_increment_u32_release(
@@ -439,10 +399,14 @@ impl ControlRingMemory for MemfdSharedMemory {
         increment_offset: usize,
     ) -> Result<(), SharedMemoryError> {
         validate_nonoverlapping_word_ranges(store_offset, increment_offset)?;
-        validate_u64_offset(self, store_offset)?;
+        let store_address = checked_u64_address(self, store_offset)?;
         let increment_address = checked_u32_address(self, increment_offset)?;
-        write_all_at(self, store_offset, &value.to_ne_bytes())?;
-        futex_increment(increment_address).map_err(|_| SharedMemoryError::AccessFailed)
+        // SAFETY: Both addresses are aligned and lie within the live mapping.
+        unsafe {
+            peer_memory::store_u64_release(store_address, value);
+            peer_memory::increment_u32_release(increment_address);
+        }
+        Ok(())
     }
 }
 
@@ -1231,7 +1195,7 @@ mod tests {
 
         assert_eq!(fstat(&image.fd).unwrap().st_size, 0x1006);
         let mut bytes = [0; 6];
-        assert_eq!(pread(&image.fd, &mut bytes, 0x1000).unwrap(), 6);
+        assert_eq!(rustix::io::pread(&image.fd, &mut bytes, 0x1000).unwrap(), 6);
         assert_eq!(&bytes, b"shared");
     }
 

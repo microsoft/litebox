@@ -76,46 +76,104 @@ pub enum PendingCallsError<Error> {
 }
 
 /// Concurrent registry of requests awaiting broker responses.
+///
+/// Callers waiting for responses also read them: while any call is pending,
+/// one waiting caller holds the reader role and completes responses for every
+/// caller until its own arrives, then hands the role to another pending call.
+/// A response therefore reaches a lone caller without a thread handoff.
 pub struct PendingCalls<Sync: PendingCallsSync, Error> {
     state: Sync::Mutex<PendingCallsInner<Sync, Error>>,
     capacity_available: Sync::Condvar<PendingCallsInner<Sync, Error>>,
 }
 
 struct PendingCallsInner<Sync: PendingCallsSync, Error> {
-    calls: BTreeMap<RequestId, Arc<PendingCall<Sync, Error>>>,
+    calls: BTreeMap<RequestId, Arc<CallSlot<Sync, Error>>>,
     failure: Option<Arc<Error>>,
+    /// The call whose caller holds the reader role, if any call is pending.
+    reader: Option<Arc<CallSlot<Sync, Error>>>,
 }
 
-/// Completion state for one request awaiting a broker response.
-pub struct PendingCall<Sync: PendingCallsSync, Error> {
-    result: Sync::Mutex<Option<Result<BrokerResponse, Arc<Error>>>>,
-    result_ready: Sync::Condvar<Option<Result<BrokerResponse, Arc<Error>>>>,
+/// Completion state shared between a pending call and its registry.
+struct CallSlot<Sync: PendingCallsSync, Error> {
+    state: Sync::Mutex<CallState<Error>>,
+    changed: Sync::Condvar<CallState<Error>>,
 }
 
-impl<Sync: PendingCallsSync, Error> PendingCall<Sync, Error> {
-    fn new() -> Self {
+struct CallState<Error> {
+    result: Option<Result<BrokerResponse, Arc<Error>>>,
+    /// Whether this call's caller holds the reader role.
+    reads_responses: bool,
+}
+
+impl<Sync: PendingCallsSync, Error> CallSlot<Sync, Error> {
+    fn new(reads_responses: bool) -> Self {
         Self {
-            result: Sync::mutex(None),
-            result_ready: Sync::condvar(),
+            state: Sync::mutex(CallState {
+                result: None,
+                reads_responses,
+            }),
+            changed: Sync::condvar(),
         }
     }
 
-    fn resolve(&self, result: Result<BrokerResponse, Arc<Error>>) {
-        let mut stored = self.result.lock();
-        assert!(stored.is_none(), "broker pending call already resolved");
-        *stored = Some(result);
-        self.result_ready.notify_one();
+    fn resolve(&self, result: Result<BrokerResponse, Arc<Error>>, notify: bool) {
+        let mut state = self.state.lock();
+        assert!(
+            state.result.is_none(),
+            "broker pending call already resolved"
+        );
+        state.result = Some(result);
+        if notify {
+            self.changed.notify_one();
+        }
     }
 
+    fn grant_reader_role(&self) {
+        self.state.lock().reads_responses = true;
+        self.changed.notify_one();
+    }
+}
+
+/// One registered request awaiting its broker response.
+///
+/// Dropping the call unregisters it and hands off the reader role if it holds
+/// it, so an abandoned call never strands other callers.
+pub struct PendingCall<'calls, Sync: PendingCallsSync, Error> {
+    pending_calls: &'calls PendingCalls<Sync, Error>,
+    request_id: RequestId,
+    slot: Arc<CallSlot<Sync, Error>>,
+}
+
+impl<Sync: PendingCallsSync, Error> PendingCall<'_, Sync, Error> {
     /// Blocks until the broker responds or the association fails.
-    pub fn wait(&self) -> Result<BrokerResponse, Arc<Error>> {
-        let mut result = self.result.lock();
+    ///
+    /// While this caller holds the reader role, it calls `read_responses`
+    /// repeatedly. Each call must block until it reads at least one response
+    /// and passes it to [`PendingCalls::complete`], or until the association
+    /// fails and the failure is recorded with [`PendingCalls::record_failure`].
+    /// Only the caller holding the reader role calls `read_responses`.
+    pub fn wait(self, mut read_responses: impl FnMut()) -> Result<BrokerResponse, Arc<Error>> {
         loop {
-            if let Some(result) = result.take() {
-                return result;
+            {
+                let mut state = self.slot.state.lock();
+                loop {
+                    if let Some(result) = state.result.take() {
+                        return result;
+                    }
+                    if state.reads_responses {
+                        break;
+                    }
+                    state = self.slot.changed.wait(state);
+                }
             }
-            result = self.result_ready.wait(result);
+            read_responses();
         }
+    }
+}
+
+impl<Sync: PendingCallsSync, Error> Drop for PendingCall<'_, Sync, Error> {
+    fn drop(&mut self) {
+        self.pending_calls.unregister(self.request_id, &self.slot);
     }
 }
 
@@ -126,53 +184,91 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
             state: Sync::mutex(PendingCallsInner {
                 calls: BTreeMap::new(),
                 failure: None,
+                reader: None,
             }),
             capacity_available: Sync::condvar(),
         }
     }
 
     /// Registers a request, blocking while the pending-call limit is full.
+    ///
+    /// The first call registered while no call is pending takes the reader
+    /// role.
     pub fn register(
         &self,
         request_id: RequestId,
-    ) -> Result<Arc<PendingCall<Sync, Error>>, PendingCallsError<Error>> {
-        let pending_call = Arc::new(PendingCall::new());
+    ) -> Result<PendingCall<'_, Sync, Error>, PendingCallsError<Error>> {
         let mut state = self.state.lock();
         while state.calls.len() >= MAX_PENDING_CALLS && state.failure.is_none() {
             state = self.capacity_available.wait(state);
         }
+        let state = &mut *state;
         if let Some(error) = state.failure.as_ref() {
             return Err(PendingCallsError::AssociationFailed(Arc::clone(error)));
         }
-        match state.calls.entry(request_id) {
-            Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(&pending_call));
-            }
-            Entry::Occupied(_) => return Err(PendingCallsError::DuplicateRequestId),
+        let Entry::Vacant(entry) = state.calls.entry(request_id) else {
+            return Err(PendingCallsError::DuplicateRequestId);
+        };
+        let slot = Arc::new(CallSlot::new(state.reader.is_none()));
+        entry.insert(Arc::clone(&slot));
+        if state.reader.is_none() {
+            state.reader = Some(Arc::clone(&slot));
         }
-        Ok(pending_call)
+        Ok(PendingCall {
+            pending_calls: self,
+            request_id,
+            slot,
+        })
     }
 
     /// Completes the pending call identified by `response`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal ordinary-call count is inconsistent with the
-    /// registered requests.
     pub fn complete(&self, response: BrokerResponse) -> Result<(), PendingCallsError<Error>> {
-        let pending_call = {
+        let (slot, notify) = {
             let mut state = self.state.lock();
             if let Some(error) = state.failure.as_ref() {
                 return Err(PendingCallsError::AssociationFailed(Arc::clone(error)));
             }
-            let Some(pending_call) = state.calls.remove(&response.request_id) else {
+            let Some(slot) = state.calls.remove(&response.request_id) else {
                 return Err(PendingCallsError::UnknownResponseId);
             };
-            self.capacity_available.notify_all();
-            pending_call
+            // Registrations wait only while the registry is full.
+            if state.calls.len() + 1 == MAX_PENDING_CALLS {
+                self.capacity_available.notify_all();
+            }
+            // The reader completes its own call while reading, not waiting.
+            let notify = !state
+                .reader
+                .as_ref()
+                .is_some_and(|reader| Arc::ptr_eq(reader, &slot));
+            (slot, notify)
         };
-        pending_call.resolve(Ok(response));
+        slot.resolve(Ok(response), notify);
         Ok(())
+    }
+
+    /// Removes `slot` if it is still registered and passes on its reader role.
+    fn unregister(&self, request_id: RequestId, slot: &Arc<CallSlot<Sync, Error>>) {
+        let mut state = self.state.lock();
+        if state
+            .calls
+            .get(&request_id)
+            .is_some_and(|registered| Arc::ptr_eq(registered, slot))
+        {
+            state.calls.remove(&request_id);
+            if state.calls.len() + 1 == MAX_PENDING_CALLS {
+                self.capacity_available.notify_all();
+            }
+        }
+        let holds_reader_role = state
+            .reader
+            .as_ref()
+            .is_some_and(|reader| Arc::ptr_eq(reader, slot));
+        if holds_reader_role && state.failure.is_none() {
+            state.reader = state.calls.values().next().map(|next| {
+                next.grant_reader_role();
+                Arc::clone(next)
+            });
+        }
     }
 
     /// Records the first terminal failure and resolves every pending call.
@@ -190,7 +286,7 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
             pending_calls
         };
         for pending_call in pending_calls.into_values() {
-            pending_call.resolve(Err(Arc::clone(&error)));
+            pending_call.resolve(Err(Arc::clone(&error)), true);
         }
         true
     }

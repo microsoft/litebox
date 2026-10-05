@@ -3,7 +3,6 @@
 
 //! Windows file-mapping-backed broker shared memory.
 
-use std::arch::asm;
 use std::io::{Error, ErrorKind, Result as IoResult};
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -11,6 +10,7 @@ use std::sync::Arc;
 use litebox_broker_transport::control_ring::{
     CONTROL_RING_MEMORY_SIZE, ControlRingDirection, MemoryAccessPolicy, WaitableSharedMemory,
 };
+use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED,
@@ -35,60 +35,6 @@ const CONTROL_RING_WAKE_OFFSETS: [usize; 6] = [
     ControlRingDirection::Notifications.producer_epoch_offset(),
     ControlRingDirection::Notifications.consumer_epoch_offset(),
 ];
-
-unsafe fn atomic_load_u32(address: *const u32) -> u32 {
-    let value;
-    // SAFETY: The caller provides a readable, naturally aligned u32 address. An aligned x86-64
-    // load is indivisible, and the compiler memory clobber plus x86-64 TSO provides acquire order.
-    unsafe {
-        asm!(
-            "mov {value:e}, dword ptr [{address}]",
-            value = out(reg) value,
-            address = in(reg) address,
-            options(nostack, preserves_flags),
-        );
-    }
-    value
-}
-
-unsafe fn atomic_increment_u32(address: *mut u32) {
-    // SAFETY: The caller provides a writable, naturally aligned u32 address.
-    unsafe {
-        asm!(
-            "lock inc dword ptr [{address}]",
-            address = in(reg) address,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
-unsafe fn atomic_load_u64(address: *const u64) -> u64 {
-    let value;
-    // SAFETY: The caller provides a readable, naturally aligned u64 address. Aligned x86-64
-    // qword loads are indivisible.
-    unsafe {
-        asm!(
-            "mov {value}, qword ptr [{address}]",
-            value = out(reg) value,
-            address = in(reg) address,
-            options(nostack, preserves_flags),
-        );
-    }
-    value
-}
-
-unsafe fn atomic_store_u64(address: *mut u64, value: u64) {
-    // SAFETY: The caller provides a writable, naturally aligned u64 address. `xchg` with memory
-    // is indivisible and fully ordered on x86-64.
-    unsafe {
-        asm!(
-            "xchg qword ptr [{address}], {value}",
-            address = in(reg) address,
-            value = inout(reg) value => _,
-            options(nostack, preserves_flags),
-        );
-    }
-}
 
 struct OwnedHandle(HANDLE);
 
@@ -445,26 +391,26 @@ impl ControlRingMemory for WindowsSharedMemory {
     fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
         let address = self.checked_u32(offset)?;
         // SAFETY: `checked_u32` validated the mapped range and alignment.
-        Ok(unsafe { atomic_load_u32(address) })
+        Ok(unsafe { peer_memory::load_u32_acquire(address) })
     }
 
     fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
         let address = self.checked_u32(offset)?;
         // SAFETY: `address` is checked and naturally aligned mapped memory.
-        unsafe { atomic_increment_u32(address) };
+        unsafe { peer_memory::increment_u32_release(address) };
         Ok(())
     }
 
     fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
         let address = self.checked_u64(offset)?;
         // SAFETY: `address` is checked and naturally aligned mapped memory.
-        Ok(unsafe { atomic_load_u64(address) })
+        Ok(unsafe { peer_memory::load_u64_acquire(address) })
     }
 
     fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
         let address = self.checked_u64(offset)?;
         // SAFETY: `address` is checked and naturally aligned mapped memory.
-        unsafe { atomic_store_u64(address, value) };
+        unsafe { peer_memory::store_u64_release(address, value) };
         Ok(())
     }
 
@@ -483,8 +429,8 @@ impl ControlRingMemory for WindowsSharedMemory {
         }
         // SAFETY: Both addresses are checked, aligned, and non-overlapping mapped words.
         unsafe {
-            atomic_store_u64(store_address, value);
-            atomic_increment_u32(increment_address);
+            peer_memory::store_u64_release(store_address, value);
+            peer_memory::increment_u32_release(increment_address);
         }
         Ok(())
     }
@@ -506,7 +452,7 @@ impl WaitableSharedMemory for WindowsSharedMemory {
         // Rechecking after resolving the event closes the publish-before-wait race. A signal that
         // arrives after this load remains pending on the auto-reset event until this waiter runs.
         // SAFETY: `checked_u32` validated the mapped range and alignment.
-        if unsafe { atomic_load_u32(address) } != expected {
+        if unsafe { peer_memory::load_u32_acquire(address) } != expected {
             return Ok(());
         }
         // SAFETY: `event` is a live event handle owned by this memory object.
