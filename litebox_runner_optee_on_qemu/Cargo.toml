@@ -5,13 +5,15 @@ edition = "2024"
 description = "Runs OP-TEE TAs with LiteBox as the guest kernel of a QEMU virtual machine"
 
 [dependencies]
-base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 arrayvec = { version = "0.7.6", default-features = false }
+base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 litebox = { version = "0.1.0", path = "../litebox" }
+litebox_bootloader = { version = "0.1.0", path = "../litebox_bootloader" }
 litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
 # `test-support` provides the in-process broker association (see src/broker.rs).
 litebox_broker_host = { version = "0.1.0", path = "../litebox_broker_host", features = ["test-support"] }
 litebox_broker_local = { version = "0.1.0", path = "../litebox_broker_local" }
+litebox_hal = { version = "0.1.0", path = "../litebox_hal" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
 litebox_platform_vm_kernel = { version = "0.1.0", path = "../litebox_platform_vm_kernel" }
@@ -20,16 +22,11 @@ litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }
 serde = { version = "1.0.142", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0.142", default-features = false, features = ["alloc"] }
-spin = { version = "0.10.0", default-features = false, features = ["once", "spin_mutex"] }
-zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }
 # Not used directly: select the software backends of the shim's `aes` and
 # `sha2`, whose SIMD backends fail to compile (LLVM error) for this target.
 aes = { version = "0.7.5", default-features = false, features = ["force-soft"] }
 sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"] }
-
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
 
 [lints]
 workspace = true

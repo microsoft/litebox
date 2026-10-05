@@ -1,0 +1,15 @@
+[package]
+name = "litebox_hal"
+version = "0.1.0"
+edition = "2024"
+description = "Hardware abstraction layer for LiteBox kernel-mode runners"
+
+[dependencies]
+litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
+spin = { version = "0.10.0", default-features = false, features = ["once", "spin_mutex"] }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
+
+[lints]
+workspace = true

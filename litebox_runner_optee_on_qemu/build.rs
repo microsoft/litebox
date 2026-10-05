@@ -2,8 +2,9 @@
 // Licensed under the MIT license.
 
 fn main() {
-    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/x86_64_qemu.ld");
+    let script = std::env::var("DEP_LITEBOX_BOOTLOADER_LINKER_SCRIPT")
+        .expect("litebox_bootloader provides its linker script");
     println!("cargo::rustc-link-arg-bins=--script={script}");
     // Cargo does not track the linker script, as it is not a Rust source.
-    println!("cargo::rerun-if-changed=x86_64_qemu.ld");
+    println!("cargo::rerun-if-changed={script}");
 }

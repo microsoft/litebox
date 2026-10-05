@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Kernel image layout from `x86_64_qemu.ld`. The addresses are only valid
+//! Kernel image layout from `x86_64_kernel.ld`. The addresses are only valid
 //! after relocation.
 
 unsafe extern "C" {
