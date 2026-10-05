@@ -5,8 +5,10 @@ extern crate std;
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::process::Stdio;
 
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
@@ -40,147 +42,72 @@ fn attach<T: transport::Read + transport::Write>(
     .expect("failed to create 9P filesystem")
 }
 
-/// A wrapper around `TcpStream` that implements the litebox 9P transport traits.
-struct TcpTransport {
-    stream: TcpStream,
+// ---------------------------------------------------------------------------
+// diod server management
+// ---------------------------------------------------------------------------
+
+/// A temporary directory exported over 9P by `diod`.
+///
+/// Each [`DiodServer::connect`] serves the export through its own `diod`
+/// process over a socketpair, so concurrent tests never contend for ports.
+struct DiodServer {
+    export_dir: tempfile::TempDir,
 }
 
-impl TcpTransport {
-    fn connect(addr: &str) -> Self {
-        let stream = TcpStream::connect(addr).expect("failed to connect to 9P server");
-        Self { stream }
+impl DiodServer {
+    /// Create a fresh temporary directory to export.
+    fn start() -> Self {
+        let export_dir = tempfile::tempdir().expect("failed to create temp dir");
+        Self { export_dir }
+    }
+
+    /// Start a `diod` process that serves the export on its stdin and return
+    /// the other end of that connection.
+    fn connect(&self) -> DiodTransport {
+        let (stream, server_end) = UnixStream::pair().expect("failed to create socketpair");
+        let diod = std::process::Command::new("diod")
+            .args(["--foreground", "--no-auth", "--export"])
+            .arg(self.export_path())
+            .args(["--rfdno", "0", "--wfdno", "0"])
+            .args(["--nwthreads", "1", "-d", "100000"])
+            .stdin(OwnedFd::from(server_end))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start diod – is it installed? (`apt install diod`)");
+        DiodTransport { stream, diod }
+    }
+
+    /// Path to the exported directory on the host.
+    fn export_path(&self) -> &Path {
+        self.export_dir.path()
     }
 }
 
-impl transport::Read for TcpTransport {
+/// A connection to a dedicated `diod` process that implements the litebox 9P
+/// transport traits.
+struct DiodTransport {
+    stream: UnixStream,
+    diod: std::process::Child,
+}
+
+impl transport::Read for DiodTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
         self.stream.read(buf).map_err(|_| transport::ReadError)
     }
 }
 
-impl transport::Write for TcpTransport {
+impl transport::Write for DiodTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
         self.stream.write(buf).map_err(|_| transport::WriteError)
     }
 }
 
-// ---------------------------------------------------------------------------
-// diod server management
-// ---------------------------------------------------------------------------
-
-/// Find a free TCP port by binding to port 0.
-fn find_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind to port 0");
-    listener.local_addr().unwrap().port()
-}
-
-/// A running `diod` 9P server instance that exports a temporary directory.
-struct DiodServer {
-    child: std::process::Child,
-    port: u16,
-    _export_dir: tempfile::TempDir,
-    export_path: std::path::PathBuf,
-}
-
-impl DiodServer {
-    /// Maximum number of attempts to start `diod` on a free port.
-    const MAX_START_ATTEMPTS: usize = 5;
-
-    /// Start a new `diod` server exporting a fresh temporary directory.
-    ///
-    /// Retries with a new port if `diod` fails to bind (e.g., due to a
-    /// TOCTOU race between [`find_free_port`] releasing the port and `diod`
-    /// binding to it).
-    fn start() -> Self {
-        let export_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let export_path = export_dir.path().to_path_buf();
-
-        for attempt in 0..Self::MAX_START_ATTEMPTS {
-            let port = find_free_port();
-
-            let mut child = std::process::Command::new("diod")
-                .args([
-                    "--foreground",
-                    "--no-auth",
-                    "--export",
-                    export_dir.path().to_str().unwrap(),
-                    "--listen",
-                    &std::format!("127.0.0.1:{port}"),
-                    "--nwthreads",
-                    "1",
-                    "-d",
-                    "100000",
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("failed to start diod – is it installed? (`apt install diod`)");
-
-            // Poll until the server is accepting connections or has exited.
-            let ready = Self::wait_until_ready(&mut child, port);
-            if ready {
-                return Self {
-                    child,
-                    port,
-                    _export_dir: export_dir,
-                    export_path,
-                };
-            }
-
-            // The server failed to start (e.g., port already in use). Clean
-            // up and retry with a different port.
-            let _ = child.kill();
-            let _ = child.wait();
-            if attempt + 1 < Self::MAX_START_ATTEMPTS {
-                std::eprintln!(
-                    "diod failed to bind to port {port}, retrying ({}/{})…",
-                    attempt + 1,
-                    Self::MAX_START_ATTEMPTS,
-                );
-            }
-        }
-
-        panic!(
-            "failed to start diod after {} attempts",
-            Self::MAX_START_ATTEMPTS,
-        );
-    }
-
-    /// Wait for `diod` to begin accepting TCP connections on `port`.
-    ///
-    /// Returns `true` if the server is ready, `false` if it exited before
-    /// becoming ready (e.g., because the port was already in use).
-    fn wait_until_ready(child: &mut std::process::Child, port: u16) -> bool {
-        let addr = std::format!("127.0.0.1:{port}");
-        for _ in 0..50 {
-            // If the child already exited, no point waiting further.
-            if let Some(_status) = child.try_wait().ok().flatten() {
-                return false;
-            }
-            if TcpStream::connect(&addr).is_ok() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        false
-    }
-
-    /// TCP address of the server (e.g., "127.0.0.1:12345").
-    fn addr(&self) -> std::string::String {
-        std::format!("127.0.0.1:{}", self.port)
-    }
-
-    /// Path to the exported directory on the host.
-    fn export_path(&self) -> &Path {
-        &self.export_path
-    }
-}
-
-impl Drop for DiodServer {
+impl Drop for DiodTransport {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(mut stderr) = self.child.stderr.take() {
+        let _ = self.diod.kill();
+        let _ = self.diod.wait();
+        if let Some(mut stderr) = self.diod.stderr.take() {
             let mut output = std::string::String::new();
             let _ = stderr.read_to_string(&mut output);
             if !output.is_empty() {
@@ -197,8 +124,8 @@ impl Drop for DiodServer {
 fn connect_9p(
     litebox: &crate::LiteBox<MockPlatform>,
     server: &DiodServer,
-) -> NinePFs<TcpTransport> {
-    let transport = TcpTransport::connect(&server.addr());
+) -> NinePFs<DiodTransport> {
+    let transport = server.connect();
     Resolver::new(litebox, attach(transport, server))
 }
 
@@ -504,7 +431,7 @@ fn test_nine_p_host_files_visible() {
 }
 
 // ---------------------------------------------------------------------------
-// Broken-connection transport: wraps TcpTransport and breaks after N writes
+// Broken-connection transport: wraps DiodTransport and breaks after N writes
 // ---------------------------------------------------------------------------
 
 /// A transport wrapper that allows a fixed number of write-message calls to
@@ -514,7 +441,7 @@ fn test_nine_p_host_files_visible() {
 /// Reads are only failed once a write has actually been rejected, so the
 /// response to the last successful write is still received.
 struct BrokenTransport {
-    inner: TcpTransport,
+    inner: DiodTransport,
     /// Number of `write` calls remaining before the connection "breaks".
     remaining_writes: AtomicUsize,
     /// Set to `true` once a write has been rejected.
@@ -524,7 +451,7 @@ struct BrokenTransport {
 impl BrokenTransport {
     /// Create a new `BrokenTransport` that allows `allowed_writes` successful
     /// `write` calls before all I/O starts failing.
-    fn new(inner: TcpTransport, allowed_writes: usize) -> Self {
+    fn new(inner: DiodTransport, allowed_writes: usize) -> Self {
         Self {
             inner,
             remaining_writes: AtomicUsize::new(allowed_writes),
@@ -565,10 +492,10 @@ fn connect_9p_broken(
     server: &DiodServer,
     allowed_writes: usize,
 ) -> NinePFs<BrokenTransport> {
-    let tcp = TcpTransport::connect(&server.addr());
+    let transport = server.connect();
     Resolver::new(
         litebox,
-        attach(BrokenTransport::new(tcp, allowed_writes), server),
+        attach(BrokenTransport::new(transport, allowed_writes), server),
     )
 }
 
