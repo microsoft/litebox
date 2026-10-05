@@ -3,6 +3,12 @@
 
 //! Serves entry requests for the process's one TA instance, in the message
 //! format of [`litebox_common_optee::envelope`].
+//!
+//! Lockdown: after the broker connects, no new association and only
+//! [`SERVING_BROKER_OPS`]; once the TA's code is mapped, or the first open
+//! fails before that, and before the TA first runs, only [`SERVING_CALLS`] and
+//! no new executable memory. The TA's code includes its syscall trampoline,
+//! which the first TA context load maps.
 
 use alloc::boxed::Box;
 use core::cell::RefCell;
@@ -19,7 +25,9 @@ use litebox_common_optee::{
     UteeParams,
 };
 use litebox_common_vm_abi::envelope::{Envelope, Protocol};
-use litebox_common_vm_abi::{Image, Message, StartupInfo, UserRange};
+use litebox_common_vm_abi::{
+    BrokerOp, BrokerOpSet, CallId, CallSet, Image, Message, ProtSet, StartupInfo, UserRange,
+};
 use litebox_platform_vm_userland::{VmUserland, kcall};
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 use litebox_shim_optee::{LoadedProgram, OpteeShim, TaMemrefAddresses, UserConstPtr};
@@ -103,7 +111,23 @@ struct Runner {
     /// One instance per process: the kernel starts a process for each. Set
     /// before loading, as a failed first open also ends the instance.
     loaded: bool,
+    locked_down: bool,
 }
+
+/// Besides [`CallId::Exit`], which is always allowed. Executable memory is
+/// not, and asking for it kills the process: nothing may need it once the TA
+/// runs (no runtime `dlopen`, ldelf re-entry, or executable `mprotect`).
+const SERVING_CALLS: CallSet = CallSet::EMPTY
+    .with(CallId::ReplyAndWait)
+    .with(CallId::Map)
+    .with(CallId::Unmap)
+    .with(CallId::Protect)
+    .with(CallId::BrokerCall)
+    .with(CallId::DeriveKey)
+    .with(CallId::Log);
+
+/// All the OP-TEE shim uses.
+const SERVING_BROKER_OPS: BrokerOpSet = BrokerOpSet::EMPTY.with(BrokerOp::FillRandom);
 
 /// The session manager tells instances apart by page-table ID; with one
 /// instance per process, any constant works.
@@ -115,6 +139,12 @@ pub fn serve(info: &StartupInfo) -> ! {
         Box::leak(Box::new(SessionManager::new()));
     let local = litebox_platform_vm_userland::broker::connect(info.broker_shared_memory)
         .unwrap_or_else(|e| panic!("broker association: {e:?}"));
+    kcall::restrict(
+        CallSet::ALL.without(CallId::BrokerHandshake),
+        SERVING_BROKER_OPS,
+        ProtSet::ALL,
+    )
+    .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     let shim =
         litebox_shim_optee::OpteeShimBuilder::new_with_litebox(platform, session_manager, litebox)
@@ -141,6 +171,7 @@ pub fn serve(info: &StartupInfo) -> ! {
         // Safety: mapped for the process's lifetime; only `Runner` uses it.
         window: unsafe { MessageWindow::new(info.message_window) },
         loaded: false,
+        locked_down: false,
     };
 
     let mut request = kcall::ready(VmUserland::upcall_entry_address())
@@ -148,6 +179,7 @@ pub fn serve(info: &StartupInfo) -> ! {
     if cfg!(debug_assertions) {
         // Requires upcalls, registered by `ready`.
         check_guest_memory_access();
+        check_lockdown_validation();
     }
     loop {
         let reply = runner.serve(request);
@@ -367,15 +399,15 @@ impl Runner {
             return error_reply(TeeResult::Busy, TeeOrigin::Tee, 0);
         }
         self.loaded = true;
-        let mut token = match self.new_session_token(request) {
-            Ok(token) => token,
-            Err(error) => return session_error(error, 0),
+        let (mut token, program) = match self.load_instance(request) {
+            Ok(loaded) => loaded,
+            Err(reply) => {
+                // No TA will run: lock down now.
+                self.lock_down();
+                return reply;
+            }
         };
         let session = token.session_id().expect("open-session tokens carry an id");
-        let program = match self.load() {
-            Ok(program) => program,
-            Err(result) => return error_reply(result, TeeOrigin::Tee, 0),
-        };
         let reply = self.enter(
             &program,
             request,
@@ -394,6 +426,25 @@ impl Runner {
             token.disarm();
         }
         reply
+    }
+
+    fn load_instance(
+        &mut self,
+        request: &Request,
+    ) -> Result<
+        (
+            SessionToken<'static, Platform>,
+            Box<LoadedProgram<Platform>>,
+        ),
+        Reply,
+    > {
+        let token = self
+            .new_session_token(request)
+            .map_err(|error| session_error(error, 0))?;
+        let program = self
+            .load()
+            .map_err(|result| error_reply(result, TeeOrigin::Tee, 0))?;
+        Ok((token, program))
     }
 
     fn open_session_sibling(
@@ -521,6 +572,15 @@ impl Runner {
         }
     }
 
+    /// The final lockdown stage (see the module docs); idempotent.
+    fn lock_down(&mut self) {
+        if !self.locked_down {
+            kcall::restrict(SERVING_CALLS, SERVING_BROKER_OPS, ProtSet::NO_EXEC)
+                .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
+            self.locked_down = true;
+        }
+    }
+
     /// Boxed before it runs: the program must not move afterwards.
     fn load(&mut self) -> Result<Box<LoadedProgram<Platform>>, TeeResult> {
         let program = Box::new(
@@ -561,13 +621,16 @@ impl Runner {
             .entrypoints
             .as_ref()
             .expect("entrypoints after load");
-        let memrefs = match entrypoints.load_ta_context_with_shm(
+        let context = entrypoints.load_ta_context_with_shm(
             params,
             &[],
             session,
             func as u32,
             Some(request.cmd_id),
-        ) {
+        );
+        // The first context load maps the last code: the syscall trampoline.
+        self.lock_down();
+        let memrefs = match context {
             Ok(memrefs) => memrefs,
             Err(e) => {
                 litebox_util_log::error!(error:? = e; "failed to load the TA context");
@@ -668,4 +731,28 @@ fn check_guest_memory_access() {
     assert_eq!(read(), Some(0x5a));
     kcall::unmap(addr, len).unwrap();
     assert_eq!(read(), None, "read from unmapped guest memory");
+}
+
+/// Self-check (debug builds): unknown lockdown bits are rejected.
+fn check_lockdown_validation() {
+    use litebox_common_vm_abi::{RestrictRequest, Status};
+    let raw = |calls: u64, broker_ops: u64, prots: u32| {
+        RestrictRequest::new(
+            CallSet::read_from_bytes(calls.as_bytes()).unwrap(),
+            BrokerOpSet::read_from_bytes(broker_ops.as_bytes()).unwrap(),
+            ProtSet::read_from_bytes(prots.as_bytes()).unwrap(),
+        )
+    };
+    let (calls, ops, prots) = (
+        CallSet::ALL.bits(),
+        BrokerOpSet::ALL.bits(),
+        ProtSet::ALL.bits(),
+    );
+    for request in [
+        raw(calls | 1, ops, prots),
+        raw(calls, ops + 1, prots),
+        raw(calls, ops, prots + 1),
+    ] {
+        assert_eq!(kcall::call(&request), Err(Status::InvalidArgument));
+    }
 }
