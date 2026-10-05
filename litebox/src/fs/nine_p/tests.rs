@@ -5,10 +5,8 @@ extern crate std;
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::io::{Read as _, Write as _};
-use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::fs::errors::{
     FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
@@ -49,7 +47,8 @@ fn attach<T: transport::Read + transport::Write>(
 /// A temporary directory exported over 9P by `diod`.
 ///
 /// Each [`DiodServer::connect`] serves the export through its own `diod`
-/// process over a socketpair, so concurrent tests never contend for ports.
+/// process over that process's stdin and stdout, so concurrent tests never
+/// contend for ports.
 struct DiodServer {
     export_dir: tempfile::TempDir,
 }
@@ -61,21 +60,25 @@ impl DiodServer {
         Self { export_dir }
     }
 
-    /// Start a `diod` process that serves the export on its stdin and return
-    /// the other end of that connection.
+    /// Start a `diod` process that serves the export over its stdin and stdout.
     fn connect(&self) -> DiodTransport {
-        let (stream, server_end) = UnixStream::pair().expect("failed to create socketpair");
-        let diod = std::process::Command::new("diod")
+        let mut diod = Command::new("diod")
             .args(["--foreground", "--no-auth", "--export"])
             .arg(self.export_path())
-            .args(["--rfdno", "0", "--wfdno", "0"])
+            .args(["--rfdno", "0", "--wfdno", "1"])
             .args(["--nwthreads", "1", "-d", "100000"])
-            .stdin(OwnedFd::from(server_end))
-            .stdout(Stdio::null())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("failed to start diod – is it installed? (`apt install diod`)");
-        DiodTransport { stream, diod }
+        let requests = diod.stdin.take().unwrap();
+        let responses = diod.stdout.take().unwrap();
+        DiodTransport {
+            diod,
+            requests,
+            responses,
+        }
     }
 
     /// Path to the exported directory on the host.
@@ -87,19 +90,20 @@ impl DiodServer {
 /// A connection to a dedicated `diod` process that implements the litebox 9P
 /// transport traits.
 struct DiodTransport {
-    stream: UnixStream,
-    diod: std::process::Child,
+    diod: Child,
+    requests: ChildStdin,
+    responses: ChildStdout,
 }
 
 impl transport::Read for DiodTransport {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, transport::ReadError> {
-        self.stream.read(buf).map_err(|_| transport::ReadError)
+        self.responses.read(buf).map_err(|_| transport::ReadError)
     }
 }
 
 impl transport::Write for DiodTransport {
     fn write(&mut self, buf: &[u8]) -> Result<usize, transport::WriteError> {
-        self.stream.write(buf).map_err(|_| transport::WriteError)
+        self.requests.write(buf).map_err(|_| transport::WriteError)
     }
 }
 
