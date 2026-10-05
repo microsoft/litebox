@@ -825,16 +825,23 @@ interrupt_callback:
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
         "switch_to_guest_start:",
-        // Set `in_guest` now, then check if there is a pending interrupt. If
-        // so, jump to the interrupt handler.
-        //
-        // If an interrupt arrives after the check, then the signal handler will
+        // Set `in_guest` now, then check if there is a pending interrupt. If an
+        // interrupt arrives while `in_guest` is set, the signal handler will
         // see that the IP is between `switch_to_guest_start` and
-        // `switch_to_guest_end` and will set the `interrupt` and jump to
+        // `switch_to_guest_end` and will set `interrupt` and jump to
         // `interrupt_callback`.
+        //
+        // If an interrupt is already pending, clear `in_guest` and jump to
+        // `interrupt_callback` without entering the guest. `interrupt_callback`
+        // runs host code, and a signal arriving there with `in_guest` still set
+        // would be taken for a guest interrupt and overwrite the saved guest
+        // context with host registers.
         "mov BYTE PTR fs:in_guest@tpoff, 1",
         "cmp BYTE PTR fs:interrupt@tpoff, 0",
-        "jne interrupt_callback",
+        "je 2f",
+        "mov BYTE PTR fs:in_guest@tpoff, 0",
+        "jmp interrupt_callback",
+        "2:",
         // Restore guest context from ctx.
         "mov rsp, rdi",
         // Switch to the guest fsbase
@@ -2239,6 +2246,62 @@ mod tests {
     use crate::LinuxUserland;
 
     extern crate std;
+
+    /// An interrupt pending at guest entry diverts to the interrupt handler
+    /// without entering the guest, so a further interrupt taken while that
+    /// handler runs host code must not be treated as a guest interrupt, which
+    /// would re-enter the handler.
+    #[test]
+    fn interrupt_in_diverted_interrupt_handler_is_not_a_guest_interrupt() {
+        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+        use litebox_common_linux::PtRegs;
+
+        // The signal is delivered to the calling thread before `pthread_kill` returns.
+        fn interrupt_current_thread() {
+            let signal = super::INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed);
+            // SAFETY: `pthread_self` is a live thread with the interrupt handler installed.
+            assert_eq!(
+                unsafe { libc::pthread_kill(libc::pthread_self(), signal) },
+                0
+            );
+        }
+
+        #[derive(Default)]
+        struct Shim {
+            interrupts: core::cell::Cell<u32>,
+        }
+
+        impl EnterShim for Shim {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                interrupt_current_thread();
+                ContinueOperation::Resume
+            }
+
+            fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.interrupts.set(self.interrupts.get() + 1);
+                if self.interrupts.get() == 1 {
+                    interrupt_current_thread();
+                }
+                ContinueOperation::Terminate
+            }
+        }
+
+        let _platform = LinuxUserland::new(None);
+        let shim = Shim::default();
+        // SAFETY: the shim terminates the thread before it enters the guest.
+        unsafe { super::run_thread_ref(&shim, &mut PtRegs::default()) };
+        assert_eq!(shim.interrupts.get(), 1);
+    }
 
     #[test]
     fn test_raw_mutex() {
