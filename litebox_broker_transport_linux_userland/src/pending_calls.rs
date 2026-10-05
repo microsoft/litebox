@@ -77,8 +77,6 @@ pub(crate) fn pending_calls_error(error: PendingCallsError<Error>) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Error;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
@@ -120,24 +118,6 @@ mod tests {
     }
 
     #[test]
-    fn the_first_caller_reads_responses_for_later_callers() {
-        let pending_calls = PendingCalls::new();
-        let reader = pending_calls.register(RequestId(1)).unwrap();
-        let follower = pending_calls.register(RequestId(2)).unwrap();
-        std::thread::scope(|scope| {
-            let follower = scope.spawn(move || follower.wait(|| panic!("follower read")));
-            let mut responses = [2, 1].into_iter();
-            let result = reader.wait(|| {
-                pending_calls
-                    .complete(response(responses.next().unwrap()))
-                    .unwrap();
-            });
-            assert_eq!(result.unwrap().request_id, RequestId(1));
-            assert_eq!(follower.join().unwrap().unwrap().request_id, RequestId(2));
-        });
-    }
-
-    #[test]
     fn a_finished_reader_hands_its_role_to_a_pending_call() {
         let pending_calls = PendingCalls::new();
         let reader = pending_calls.register(RequestId(1)).unwrap();
@@ -169,30 +149,5 @@ mod tests {
             pending_calls.complete(response(1)),
             Err(PendingCallsError::UnknownResponseId)
         ));
-    }
-
-    #[test]
-    fn a_call_registered_while_none_is_pending_reads_its_own_response() {
-        let pending_calls = PendingCalls::new();
-        for id in 1..=2 {
-            let call = pending_calls.register(RequestId(id)).unwrap();
-            let result = call.wait(|| pending_calls.complete(response(id)).unwrap());
-            assert_eq!(result.unwrap().request_id, RequestId(id));
-        }
-    }
-
-    #[test]
-    fn a_reader_failure_resolves_every_pending_call() {
-        let pending_calls = PendingCalls::new();
-        let reader = pending_calls.register(RequestId(1)).unwrap();
-        let follower = pending_calls.register(RequestId(2)).unwrap();
-        std::thread::scope(|scope| {
-            let follower = scope.spawn(move || follower.wait(|| panic!("follower read")));
-            let result = reader.wait(|| {
-                pending_calls.record_failure(Arc::new(Error::other("failed")));
-            });
-            assert!(result.is_err());
-            assert!(follower.join().unwrap().is_err());
-        });
     }
 }

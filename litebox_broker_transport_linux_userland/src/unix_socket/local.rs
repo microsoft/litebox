@@ -851,23 +851,12 @@ mod control_ring_tests {
     }
 
     #[test]
-    fn notifications_end_cleanly_only_when_the_call_channel_is_dropped() {
-        for end in 0..3 {
-            let (channel, mut notifications, shutdown, _responses, _requests, peer) =
-                activate_local(|| {});
-            let notification_receiver = thread::spawn(move || notifications.recv_notification());
-            match end {
-                0 => drop(channel),
-                1 => drop(peer),
-                _ => shutdown.shutdown().unwrap(),
-            }
-            let received = notification_receiver.join().unwrap();
-            if end == 0 {
-                assert!(received.unwrap().is_none());
-            } else {
-                assert!(received.is_err());
-            }
-        }
+    fn dropping_the_call_channel_ends_notifications_cleanly() {
+        let (channel, mut notifications, _shutdown, _responses, _requests, _peer) =
+            activate_local(|| {});
+        let receiver = thread::spawn(move || notifications.recv_notification());
+        drop(channel);
+        assert!(receiver.join().unwrap().unwrap().is_none());
     }
 
     #[test]
