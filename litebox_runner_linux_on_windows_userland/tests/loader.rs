@@ -193,6 +193,23 @@ fn test_fork_with_windows_broker() {
     assert_eq!(numeric_field(output_line(&output, "raw-fork "), "code="), 9);
 }
 
+/// Runs `fork_threads_parent`, which forks while sibling threads run guest code, block, and
+/// sleep, and forks from several threads at once.
+///
+/// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/fork_threads_parent.c`.
+#[test]
+fn test_fork_with_threads_with_windows_broker() {
+    let (broker, runner) = build_windows_broker();
+    let output =
+        run_progs_with_process_duplication(&broker, &runner, &["fork_threads_parent"], &[]);
+
+    let line = output_line(&output, "threads-fork ");
+    assert_eq!(numeric_field(line, "code="), 7);
+    assert_eq!(numeric_field(line, "failures="), 0);
+    assert_eq!(numeric_field(line, "read="), 1);
+    assert_eq!(numeric_field(line, "slept="), 1);
+}
+
 /// Runs `vfork_exec_parent`, whose child execs `vfork_exec_child` in a new runner.
 ///
 /// Built with `gcc -static -m64` from `litebox_runner_linux_userland/tests/vfork_exec_*.c`.
