@@ -794,10 +794,10 @@ fn open_session_new_instance(
         write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
         return Ok(());
     }
-    let ta_source = shim
-        .get_ta_source(&ta_uuid)
-        .expect("successfully loaded TA must have a source");
-    debug_serial_println!("Loading TA: uuid={:?}, source={:?}", ta_uuid, ta_source);
+    let ta_dynamic = shim
+        .get_ta_dynamic(&ta_uuid)
+        .expect("successfully loaded TA must have dynamic-loading metadata");
+    debug_serial_println!("Loading TA: uuid={:?}, dynamic={}", ta_uuid, ta_dynamic);
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
     // Marker only releases once CR3 is back to base. See
