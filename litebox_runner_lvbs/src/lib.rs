@@ -5,7 +5,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, vec};
+use alloc::{boxed::Box, sync::Arc, vec};
 use core::{ops::Neg, panic::PanicInfo};
 use litebox::{
     platform::RawConstPointer,
@@ -14,19 +14,22 @@ use litebox::{
 use litebox_common_linux::{errno::Errno, vmem::PAGE_SIZE};
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
-    OpteeMessageCommand, OpteeMsgArgs, OpteeRpcArgs, OpteeSmcArgs, OpteeSmcResult,
-    OpteeSmcReturnCode, TeeOrigin, TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
+    OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,
+    OpteeRpcShmType, OpteeSmcArgs, OpteeSmcFunction, OpteeSmcResult, OpteeSmcReturnCode, TeeOrigin,
+    TeeResult, UteeEntryFunc, UteeParams, optee_msg_args_total_size,
 };
 use litebox_platform_lvbs::host::LvbsLinuxKernel as Platform;
 use litebox_platform_lvbs::mshv::vsm::{LvbsVtl0Gate, LvbsVtl0PrivilegedWriter, LvbsVtl1Gate};
 use litebox_platform_lvbs::{
-    arch::{gdt, instrs::hlt_loop, interrupts, timer},
+    arch::instrs::hlt_loop, mshv::vsm_intercept::raise_vtl0_gp_fault, serial_println,
+};
+use litebox_platform_lvbs::{
+    arch::{gdt, interrupts, timer},
     debug_serial_println,
     host::{bootparam::get_vtl1_memory_info, per_cpu_variables},
     mm::MemoryProvider,
     mshv::{
         hvcall,
-        vsm_intercept::raise_vtl0_gp_fault,
         vtl_switch::{vtl_switch, vtl_switch_init},
         vtl1_mem_layout::{
             VSM_SK_PTE_PAGES_COUNT, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
@@ -36,13 +39,17 @@ use litebox_platform_lvbs::{
             get_text_start_address,
         },
     },
-    serial_println,
-};
-use litebox_shim_optee::msg_handler::{
-    decode_ta_request, handle_optee_msg_args, handle_optee_smc_args, update_optee_msg_args,
 };
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
+use litebox_shim_optee::{
+    msg_handler::{
+        checked_memref_size, decode_ta_request, handle_optee_msg_args, handle_optee_smc_args,
+        read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm, unregister_rpc_shm,
+        update_optee_msg_args, write_rpc_args_to_regd_shm,
+    },
+    rpc_context::{RpcCompletion, RpcContext, rpc_context_map},
+};
 
 /// The session registry shared by all shims in this runner.
 fn session_manager() -> &'static SessionManager<Platform> {
@@ -228,7 +235,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
     per_cpu_variables::allocate_xsave_area();
 
     if let Err(e) = hvcall::init(is_bsp) {
-        panic!("Err: {:?}", e);
+        panic!("Err: {e:?}");
     }
     gdt::init();
     interrupts::init_idt();
@@ -448,6 +455,17 @@ impl Drop for TaskPageTableGuard {
     }
 }
 
+struct DynamicTaBinaryGuard {
+    shim: litebox_shim_optee::OpteeShim<Platform>,
+    ta_uuid: litebox_common_optee::TeeUuid,
+}
+
+impl Drop for DynamicTaBinaryGuard {
+    fn drop(&mut self) {
+        self.shim.remove_ta_bin(&self.ta_uuid);
+    }
+}
+
 /// Switches to base and unregisters the task table.
 ///
 /// All user-memory accesses on this core must be complete.
@@ -512,48 +530,402 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
     let Ok(mut smc_args) = smc_args_ptr.read_at_offset(0) else {
         return make_error_response(OpteeSmcReturnCode::EBadAddr);
     };
-    let Ok(smc_result) = handle_optee_smc_args(platform, &mut smc_args) else {
+    let (smc_result, rpc_context) = if smc_args.func_id() == Ok(OpteeSmcFunction::ReturnFromRpc) {
+        let context_id = match smc_args.get_rpc_context_id() {
+            Ok(context_id) => context_id,
+            Err(error) => {
+                smc_args.set_return_code(error);
+                return *smc_args;
+            }
+        };
+        let Some(context) = rpc_context_map().take(context_id) else {
+            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+            return *smc_args;
+        };
+        let common = match &context {
+            RpcContext::LoadTaSize { common }
+            | RpcContext::ShmAlloc { common, .. }
+            | RpcContext::LoadTaBinary { common, .. }
+            | RpcContext::ShmFree { common, .. } => common,
+        };
+        let result = match read_optee_msg_args_from_regd_shm(
+            platform,
+            common.registered_shm_ref,
+            common.regd_shm_offset,
+        ) {
+            Ok((msg_args, Some(rpc_args), msg_args_phys_addr)) => {
+                Ok(OpteeSmcResult::ReturnFromRpc {
+                    msg_args,
+                    rpc_args,
+                    msg_args_phys_addr,
+                })
+            }
+            Ok((_msg_args, None, _msg_args_phys_addr)) => Err(OpteeSmcReturnCode::EBadAddr),
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            if let RpcContext::LoadTaBinary { shm_ref, .. } = &context {
+                let _ = unregister_rpc_shm(*shm_ref);
+            }
+            rpc_context_map().release(context_id);
+        }
+        (result, Some((context_id, context)))
+    } else {
+        (handle_optee_smc_args(platform, &mut smc_args), None)
+    };
+    let Ok(smc_result) = smc_result else {
         smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
         return *smc_args;
     };
-    if let OpteeSmcResult::CallWithArg {
-        msg_args,
-        rpc_args: _,
-        msg_args_phys_addr,
-    } = smc_result
-    {
-        let mut msg_args = *msg_args;
-        debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
-        let result = match msg_args.cmd {
-            OpenSession => handle_open_session(platform, &mut msg_args, msg_args_phys_addr),
-            InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
-            CloseSession => handle_close_session(platform, &mut msg_args, msg_args_phys_addr),
-            _ => {
-                let r = handle_optee_msg_args(platform, &msg_args);
-                if r.is_ok() {
-                    msg_args.ret = TeeResult::Success;
-                } else {
-                    msg_args.ret = TeeResult::BadParameters;
+    match smc_result {
+        OpteeSmcResult::CallWithArg {
+            msg_args,
+            mut rpc_args,
+            msg_args_phys_addr,
+        } => {
+            let mut msg_args = *msg_args;
+            debug_serial_println!("OP-TEE SMC with MsgArgs Command: {:?}", msg_args.cmd);
+            let result = match msg_args.cmd {
+                OpenSession => handle_open_session(
+                    platform,
+                    &mut msg_args,
+                    &mut rpc_args,
+                    msg_args_phys_addr,
+                    None,
+                ),
+                InvokeCommand => handle_invoke_command(platform, &mut msg_args, msg_args_phys_addr),
+                CloseSession => handle_close_session(platform, &mut msg_args, msg_args_phys_addr),
+                _ => {
+                    let r = handle_optee_msg_args(platform, &msg_args);
+                    if r.is_ok() {
+                        msg_args.ret = TeeResult::Success;
+                    } else {
+                        msg_args.ret = TeeResult::BadParameters;
+                    }
+                    msg_args.ret_origin = TeeOrigin::Tee;
+                    let _ = write_non_ta_msg_args_to_normal_world(
+                        platform,
+                        &msg_args,
+                        msg_args_phys_addr,
+                    );
+                    r
                 }
-                msg_args.ret_origin = TeeOrigin::Tee;
-                let _ =
-                    write_non_ta_msg_args_to_normal_world(platform, &msg_args, msg_args_phys_addr);
-                r
+            };
+
+            // Always switch back to base page table before returning to VTL0
+            // Safety: No user-space memory references are held after this point
+            unsafe { switch_to_base_page_table(platform) };
+
+            if let Err(e) = result {
+                if e == OpteeSmcReturnCode::RpcCmd {
+                    debug_serial_println!("OP-TEE SMC returning RPC command to normal world");
+
+                    // Dynamic TA RPC continuation requires CallWithRegdArg because the request
+                    // buffer must be identified by a registered SHM reference and offset.
+                    // CallWithArg and CallWithRpcArg do not provide that registered-SHM identity.
+                    if smc_args.func_id() != Ok(OpteeSmcFunction::CallWithRegdArg) {
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
+                    }
+                    let Some(rpc_args_ref) = rpc_args.as_ref() else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
+                    };
+
+                    let (registered_shm_ref, regd_shm_offset) =
+                        match smc_args.optee_regd_shm_ref_and_offset() {
+                            Ok(location) => location,
+                            Err(error) => {
+                                smc_args.set_return_code(error);
+                                return *smc_args;
+                            }
+                        };
+                    let Some(ta_uuid) = decode_ta_request(platform, &msg_args)
+                        .ok()
+                        .and_then(|request| request.uuid)
+                    else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
+                    };
+                    let context_id = match rpc_context_map().allocate(
+                        ta_uuid,
+                        registered_shm_ref,
+                        regd_shm_offset,
+                    ) {
+                        Ok(context_id) => context_id,
+                        Err(error) => {
+                            debug_serial_println!(
+                                "Failed to allocate RPC context for LOAD_TA request: {:?}",
+                                error
+                            );
+                            smc_args.set_return_code(OpteeSmcReturnCode::EThreadLimit);
+                            return *smc_args;
+                        }
+                    };
+                    smc_args.set_rpc_context_id(context_id);
+
+                    if let Err(e) = write_rpc_args_to_regd_shm(
+                        platform,
+                        registered_shm_ref,
+                        regd_shm_offset,
+                        msg_args.num_params,
+                        rpc_args_ref,
+                    ) {
+                        let _ = rpc_context_map().take(context_id);
+                        rpc_context_map().release(context_id);
+                        smc_args.set_return_code(e);
+                    } else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+                    }
+                } else {
+                    debug_serial_println!("OP-TEE SMC returning error code: {:?}", e);
+                    smc_args.set_return_code(e);
+                }
+            } else {
+                smc_args.set_return_code(OpteeSmcReturnCode::Ok);
             }
-        };
-
-        // Always switch back to base page table before returning to VTL0
-        // Safety: No user-space memory references are held after this point
-        unsafe { switch_to_base_page_table(platform) };
-
-        if let Err(e) = result {
-            smc_args.set_return_code(e);
-        } else {
-            smc_args.set_return_code(OpteeSmcReturnCode::Ok);
+            *smc_args
         }
-        *smc_args
-    } else {
-        smc_result.into()
+        OpteeSmcResult::ReturnFromRpc {
+            msg_args,
+            rpc_args,
+            msg_args_phys_addr,
+        } => {
+            let mut msg_args = *msg_args;
+            let mut rpc_args = *rpc_args;
+
+            let Some((context_id, context)) = rpc_context else {
+                smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                return *smc_args;
+            };
+            let next_context = match context {
+                RpcContext::LoadTaSize { common } => {
+                    handle_return_from_load_ta_rpc(common, &mut rpc_args)
+                }
+                RpcContext::ShmAlloc {
+                    common,
+                    requested_size,
+                } => handle_return_from_shm_alloc_rpc(
+                    platform,
+                    common,
+                    requested_size,
+                    &mut rpc_args,
+                ),
+                RpcContext::LoadTaBinary {
+                    common,
+                    requested_size,
+                    shm_ref,
+                } => handle_return_from_load_ta_binary_rpc(
+                    platform,
+                    common,
+                    requested_size,
+                    shm_ref,
+                    &mut rpc_args,
+                ),
+                RpcContext::ShmFree {
+                    common,
+                    shm_ref,
+                    completion,
+                } => {
+                    let return_code = handle_return_from_shm_free_rpc(
+                        platform,
+                        &mut msg_args,
+                        &rpc_args,
+                        msg_args_phys_addr,
+                        &completion,
+                    );
+                    if return_code == OpteeSmcReturnCode::EThreadLimit {
+                        if rpc_context_map()
+                            .insert(
+                                context_id,
+                                RpcContext::ShmFree {
+                                    common,
+                                    shm_ref,
+                                    completion,
+                                },
+                            )
+                            .is_err()
+                        {
+                            smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        } else {
+                            smc_args.set_return_code(return_code);
+                        }
+                    } else {
+                        rpc_context_map().release(context_id);
+                        smc_args.set_return_code(return_code);
+                    }
+                    return *smc_args;
+                }
+            };
+            match next_context {
+                Err(error) => {
+                    rpc_context_map().release(context_id);
+                    smc_args.set_return_code(error);
+                }
+                Ok(context) => {
+                    let (RpcContext::ShmAlloc { common, .. }
+                    | RpcContext::LoadTaBinary { common, .. }
+                    | RpcContext::ShmFree { common, .. }) = &context
+                    else {
+                        rpc_context_map().release(context_id);
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                        return *smc_args;
+                    };
+                    let cleanup_shm_ref = match &context {
+                        RpcContext::LoadTaBinary { shm_ref, .. } => Some(*shm_ref),
+                        _ => None,
+                    };
+                    let result = match write_rpc_args_to_regd_shm(
+                        platform,
+                        common.registered_shm_ref,
+                        common.regd_shm_offset,
+                        msg_args.num_params,
+                        &rpc_args,
+                    ) {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        if let Some(shm_ref) = cleanup_shm_ref {
+                            let _ = unregister_rpc_shm(shm_ref);
+                        }
+                        rpc_context_map().release(context_id);
+                        smc_args.set_return_code(error);
+                    } else if rpc_context_map().insert(context_id, context).is_err() {
+                        if let Some(shm_ref) = cleanup_shm_ref {
+                            let _ = unregister_rpc_shm(shm_ref);
+                        }
+                        smc_args.set_return_code(OpteeSmcReturnCode::EBadCmd);
+                    } else {
+                        smc_args.set_return_code(OpteeSmcReturnCode::RpcCmd);
+                    }
+                }
+            }
+            *smc_args
+        }
+        _ => smc_result.into(),
+    }
+}
+
+fn handle_return_from_load_ta_rpc(
+    common: litebox_shim_optee::rpc_context::RpcCommon,
+    rpc_args: &mut OpteeRpcArgs,
+) -> Result<RpcContext, OpteeSmcReturnCode> {
+    let ta_size = rpc_args.load_ta_size_response()?;
+    debug_serial_println!("First LOAD_TA request, TA size: {}", ta_size);
+    if checked_memref_size(ta_size).is_err() {
+        debug_serial_println!("Invalid TA size in first LOAD_TA request");
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    }
+
+    rpc_args.prepare_shm_alloc_rpc(OpteeRpcShmType::Appl, ta_size)?;
+    Ok(RpcContext::ShmAlloc {
+        common,
+        requested_size: ta_size,
+    })
+}
+
+fn handle_return_from_load_ta_binary_rpc(
+    platform: &Platform,
+    common: litebox_shim_optee::rpc_context::RpcCommon,
+    requested_size: u64,
+    shm_ref: u64,
+    rpc_args: &mut OpteeRpcArgs,
+) -> Result<RpcContext, OpteeSmcReturnCode> {
+    let completion = match rpc_args.load_ta_binary_response(shm_ref, requested_size) {
+        Ok(rmem) => match checked_memref_size(rmem.size) {
+            Ok(ta_size) => {
+                let mut ta_binary = alloc::vec![0u8; ta_size];
+                match read_rpc_shm(platform, rmem.shm_ref, 0, &mut ta_binary) {
+                    Ok(()) => RpcCompletion::OpenSession {
+                        ta_binary: Arc::from(ta_binary),
+                    },
+                    Err(error) => RpcCompletion::ReturnError(error),
+                }
+            }
+            Err(error) => RpcCompletion::ReturnError(error),
+        },
+        Err(error) => RpcCompletion::ReturnError(error),
+    };
+    let _ = unregister_rpc_shm(shm_ref);
+    rpc_args.prepare_shm_free_rpc(OpteeRpcShmType::Appl, shm_ref)?;
+    Ok(RpcContext::ShmFree {
+        common,
+        shm_ref,
+        completion,
+    })
+}
+
+fn handle_return_from_shm_free_rpc(
+    platform: &'static Platform,
+    msg_args: &mut OpteeMsgArgs,
+    rpc_args: &OpteeRpcArgs,
+    msg_args_phys_addr: u64,
+    completion: &RpcCompletion,
+) -> OpteeSmcReturnCode {
+    if rpc_args.cmd != OpteeRpcCommand::ShmFree
+        || rpc_args.ret != TeeResult::Success
+        || rpc_args.num_params != 1
+    {
+        return OpteeSmcReturnCode::EBadCmd;
+    }
+
+    match completion {
+        RpcCompletion::OpenSession { ta_binary } => {
+            let mut no_rpc_args = None;
+            handle_open_session(
+                platform,
+                msg_args,
+                &mut no_rpc_args,
+                msg_args_phys_addr,
+                Some(ta_binary.clone()),
+            )
+            .err()
+            .unwrap_or(OpteeSmcReturnCode::Ok)
+        }
+        RpcCompletion::ReturnError(error) => *error,
+    }
+}
+
+fn handle_return_from_shm_alloc_rpc(
+    platform: &Platform,
+    common: litebox_shim_optee::rpc_context::RpcCommon,
+    requested_size: u64,
+    rpc_args: &mut OpteeRpcArgs,
+) -> Result<RpcContext, OpteeSmcReturnCode> {
+    let tmem = rpc_args.shm_alloc_response(requested_size)?;
+    let mut registered = false;
+    let load_result =
+        if checked_memref_size(tmem.size).is_err() || register_rpc_shm(platform, &tmem).is_err() {
+            Err(OpteeSmcReturnCode::EBadCmd)
+        } else {
+            registered = true;
+            rpc_args.prepare_load_ta_rpc(
+                common.ta_uuid,
+                Some(OpteeMsgParamRmem {
+                    offs: 0,
+                    size: requested_size,
+                    shm_ref: tmem.shm_ref,
+                }),
+            )
+        };
+    match load_result {
+        Ok(()) => Ok(RpcContext::LoadTaBinary {
+            common,
+            requested_size,
+            shm_ref: tmem.shm_ref,
+        }),
+        Err(error) => {
+            if registered {
+                let _ = unregister_rpc_shm(tmem.shm_ref);
+            }
+            rpc_args.prepare_shm_free_rpc(OpteeRpcShmType::Appl, tmem.shm_ref)?;
+            Ok(RpcContext::ShmFree {
+                common,
+                shm_ref: tmem.shm_ref,
+                completion: RpcCompletion::ReturnError(error),
+            })
+        }
     }
 }
 
@@ -569,7 +941,9 @@ fn optee_smc_handler(platform: &'static Platform, smc_args_addr: usize) -> Optee
 fn handle_open_session(
     platform: &'static Platform,
     msg_args: &mut OpteeMsgArgs,
+    rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     msg_args_phys_addr: u64,
+    ta_binary: Option<Arc<[u8]>>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let ta_req_info =
         decode_ta_request(platform, msg_args).map_err(|_| OpteeSmcReturnCode::EBadCmd)?;
@@ -595,10 +969,12 @@ fn handle_open_session(
             platform,
             msg_args,
             msg_args_phys_addr,
+            rpc_args,
             params,
             ta_uuid,
             client_identity,
             &ta_req_info,
+            ta_binary,
         ),
         OpenSessionTarget::Busy => {
             // Single-instance TA without MULTI_SESSION already has a live
@@ -776,24 +1152,40 @@ fn open_session_single_instance(
 ///
 /// If ldelf loading or OpenSession entry point fails, the page table is torn down.
 /// Per OP-TEE OS semantics: if OpenSession returns non-success, cleanup happens.
+#[allow(clippy::too_many_arguments)]
 fn open_session_new_instance(
     platform: &'static Platform,
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
+    rpc_args: &mut Option<Box<OpteeRpcArgs>>,
     params: &[litebox_common_optee::UteeParamOwned],
     ta_uuid: litebox_common_optee::TeeUuid,
     client_identity: Option<litebox_common_optee::TeeIdentity>,
     ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
+    ta_binary: Option<Arc<[u8]>>,
 ) -> Result<(), OpteeSmcReturnCode> {
     let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
         .with_ta_signing_cert(TA_SIGNING_CERT_DER)
         .build();
-    if shim.get_ta_bin(&ta_uuid).is_none() {
-        msg_args.session = 0;
-        msg_args.ret = TeeResult::ItemNotFound;
-        msg_args.ret_origin = TeeOrigin::Tee;
-        write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
-        return Ok(());
+
+    if ta_binary.is_none() && !shim.contains_ta_bin(&ta_uuid) {
+        debug_serial_println!(
+            "TA binary not found for uuid={:?}, requesting load from normal world",
+            ta_uuid
+        );
+
+        let Some(rpc) = rpc_args.as_deref_mut() else {
+            debug_serial_println!(
+                "RPC args not present in incoming request, cannot request LOAD_TA from normal world"
+            );
+            msg_args.session = 0;
+            msg_args.ret = TeeResult::ItemNotFound;
+            msg_args.ret_origin = TeeOrigin::Tee;
+            write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
+            return Ok(());
+        };
+        rpc.prepare_load_ta_rpc(ta_uuid, None)?;
+        return Err(OpteeSmcReturnCode::RpcCmd);
     }
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
@@ -825,6 +1217,17 @@ fn open_session_new_instance(
         teardown_ta_page_table(platform, task_pt_id);
         OpteeSmcReturnCode::ENotAvail
     })?;
+
+    if let Some(ta_binary) = ta_binary
+        && !shim.store_ta_bin(&ta_uuid, &ta_binary)
+    {
+        teardown_ta_page_table(platform, task_pt_id);
+        return Err(OpteeSmcReturnCode::EBadCmd);
+    }
+    let _ta_binary_guard = DynamicTaBinaryGuard {
+        shim: shim.clone(),
+        ta_uuid,
+    };
 
     // Load ldelf and TA - Box immediately to keep at fixed heap address
     let loaded_program = Box::new(shim.load_ldelf(LDELF_BINARY, ta_uuid).map_err(|_| {
@@ -1330,38 +1733,6 @@ fn write_non_ta_msg_args_to_normal_world(
     Ok(())
 }
 
-/// Write `OpteeRpcArgs` to the normal world. Its write address is determined by
-/// `msg_args_phys_addr` and the size of `OpteeMsgArgs`.
-///
-/// Unlike [`write_msg_args_to_normal_world`], this function does not access TA userspace
-/// memory and can be called from the base page table context. It simply serializes the
-/// rpc_args and writes it to the normal world physical address.
-#[expect(dead_code)]
-#[inline]
-fn write_rpc_args_to_normal_world(
-    platform: &'static Platform,
-    msg_args: &OpteeMsgArgs,
-    msg_args_phys_addr: u64,
-    rpc_args: &OpteeRpcArgs,
-) -> Result<(), OpteeSmcReturnCode> {
-    let msg_args_size = optee_msg_args_total_size(msg_args.num_params);
-
-    let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
-    let mut blob = vec![0u8; rpc_args_size];
-    rpc_args.serialize(&mut blob)?;
-
-    let rpc_pa: usize = <u64 as litebox::utils::TruncateExt<usize>>::trunc(msg_args_phys_addr)
-        .checked_add(msg_args_size)
-        .ok_or(OpteeSmcReturnCode::EBadAddr)?; // RPC args are placed right after the main msg_args blob
-    let ptr = NormalWorldMutPtr::<Platform, u8, PAGE_SIZE>::with_contiguous_pages(
-        platform,
-        rpc_pa,
-        rpc_args_size,
-    )?;
-    ptr.write_slice_at_offset(0, &blob)?;
-    Ok(())
-}
-
 // use include_bytes! to include ldelf
 const LDELF_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARY: &[u8] = &[0u8; 0];
@@ -1376,7 +1747,7 @@ fn register_embedded_ta(
     let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
         return false;
     };
-    shim.store_ta_bin(&ta_head.uuid, ta_binary)
+    shim.store_embedded_ta_bin(&ta_head.uuid, ta_binary)
 }
 
 /// Register all TA binaries embedded in the runner image.
