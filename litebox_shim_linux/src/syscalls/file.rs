@@ -2239,8 +2239,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // `self.files.borrow().file_descriptors.read().len()` before `file_descriptors` was
         // removed to clean up the table handling.
         let file_table_len = usize::MAX;
-        let mut set =
-            super::epoll::PollSet::with_capacity(nfds as usize).ok_or(Errno::ENOMEM)?;
+        let mut set = super::epoll::PollSet::with_capacity(nfds as usize).ok_or(Errno::ENOMEM)?;
         for i in 0..nfds {
             let mut events = litebox::event::Events::empty();
             if readfds.as_ref().is_some_and(|set| set[i as usize]) {

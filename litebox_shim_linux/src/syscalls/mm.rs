@@ -639,10 +639,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                let Ok(vaddr) = usize::try_from(p_vaddr) else {
-                    return;
-                };
-                let Some(base) = mapped_addr.checked_sub(vaddr) else {
+                let Some(base) = mapped_addr.checked_sub(p_vaddr.trunc()) else {
                     return;
                 };
                 base_addr = Some(base);
@@ -683,9 +680,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } else {
                 0
             };
-            let Ok(max_end) = usize::try_from(max_load_end) else {
-                return;
-            };
+            let max_end: usize = max_load_end.trunc();
             let Some(address) = max_end
                 .checked_next_multiple_of(PAGE_SIZE)
                 .and_then(|end| base.checked_add(end))
@@ -765,12 +760,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return (false, 0, 0, 0);
         }
-        (
-            true,
-            header.file_offset,
-            vaddr,
-            trampoline_size,
-        )
+        (true, header.file_offset, vaddr, trampoline_size)
     }
 
     /// Apply the trap fallback to a mapped code segment: replace all `syscall`
@@ -1084,7 +1074,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     restore_trampoline_rx(self, state);
                     return true;
                 };
-                let Some(tramp_pages_needed) = new_cursor.checked_next_multiple_of(PAGE_SIZE) else {
+                let Some(tramp_pages_needed) = new_cursor.checked_next_multiple_of(PAGE_SIZE)
+                else {
                     self.apply_trap_fallback(mapped_addr, len, true);
                     restore_trampoline_rx(self, state);
                     return true;
