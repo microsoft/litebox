@@ -825,20 +825,20 @@ interrupt_callback:
 unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
     core::arch::naked_asm!(
         "switch_to_guest_start:",
-        // Set `in_guest` now, then check if there is a pending interrupt. If
-        // so, jump to the interrupt handler.
-        //
-        // If an interrupt arrives after the check, then the signal handler will
+        // Set `in_guest` now, then check if there is a pending interrupt. If an
+        // interrupt arrives while `in_guest` is set, the signal handler will
         // see that the IP is between `switch_to_guest_start` and
-        // `switch_to_guest_end` and will set the `interrupt` and jump to
+        // `switch_to_guest_end` and will set `interrupt` and jump to
         // `interrupt_callback`.
+        //
+        // If an interrupt is already pending, clear `in_guest` and jump to
+        // `interrupt_callback` without entering the guest. `interrupt_callback`
+        // runs host code, and a signal arriving there with `in_guest` still set
+        // would be taken for a guest interrupt and overwrite the saved guest
+        // context with host registers.
         "mov BYTE PTR fs:in_guest@tpoff, 1",
         "cmp BYTE PTR fs:interrupt@tpoff, 0",
         "je 2f",
-        // The guest is not entered after all, so `in_guest` must not stay set:
-        // `interrupt_callback` runs host code, and a signal arriving there with
-        // `in_guest` set is taken for a guest interrupt and overwrites the
-        // saved guest context with the host register file.
         "mov BYTE PTR fs:in_guest@tpoff, 0",
         "jmp interrupt_callback",
         "2:",
