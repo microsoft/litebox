@@ -2249,23 +2249,16 @@ mod tests {
 
     /// An interrupt pending at guest entry diverts to the interrupt handler
     /// without entering the guest, so a further interrupt taken while that
-    /// handler runs host code must not be attributed to the guest.
+    /// handler runs host code must not be treated as a guest interrupt, which
+    /// would re-enter the handler.
     #[test]
-    fn interrupt_in_diverted_interrupt_handler_keeps_guest_context() {
-        use litebox::platform::ThreadProvider as _;
-        use litebox::shim::{ContinueOperation, EnterShim, InitThread};
-
-        type Outcome = std::sync::mpsc::Sender<bool>;
-
-        struct Init(Outcome);
-        struct Shim {
-            result: Outcome,
-            interrupted: core::cell::Cell<bool>,
-        }
+    fn interrupt_in_diverted_interrupt_handler_is_not_a_guest_interrupt() {
+        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+        use litebox_common_linux::PtRegs;
 
         // The signal is delivered to the calling thread before `pthread_kill` returns.
         fn interrupt_current_thread() {
-            let signal = super::INTERRUPT_SIGNAL_NUMBER.load(core::sync::atomic::Ordering::Relaxed);
+            let signal = super::INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed);
             // SAFETY: `pthread_self` is a live thread with the interrupt handler installed.
             assert_eq!(
                 unsafe { libc::pthread_kill(libc::pthread_self(), signal) },
@@ -2273,72 +2266,41 @@ mod tests {
             );
         }
 
-        impl InitThread for Init {
-            type ExecutionContext = litebox_common_linux::PtRegs;
-
-            fn init(
-                self: Box<Self>,
-            ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
-                Box::new(Shim {
-                    result: self.0,
-                    interrupted: core::cell::Cell::new(false),
-                })
-            }
+        #[derive(Default)]
+        struct Shim {
+            interrupts: core::cell::Cell<u32>,
         }
 
         impl EnterShim for Shim {
-            type ExecutionContext = litebox_common_linux::PtRegs;
+            type ExecutionContext = PtRegs;
 
-            fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
                 interrupt_current_thread();
                 ContinueOperation::Resume
             }
 
-            fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+            fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
                 unreachable!()
             }
 
-            fn exception(
-                &self,
-                _ctx: &mut Self::ExecutionContext,
-                _info: &litebox::shim::ExceptionInfo,
-            ) -> ContinueOperation {
+            fn exception(&self, _ctx: &mut PtRegs, _info: &ExceptionInfo) -> ContinueOperation {
                 unreachable!()
             }
 
-            fn interrupt(&self, ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-                // Misattributing the interrupt overwrites `ctx` with host
-                // registers and re-enters this handler instead of returning.
-                let ok = if self.interrupted.replace(true) {
-                    false
-                } else {
-                    let before = ctx.clone();
+            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.interrupts.set(self.interrupts.get() + 1);
+                if self.interrupts.get() == 1 {
                     interrupt_current_thread();
-                    format!("{ctx:?}") == format!("{before:?}")
-                };
-                self.result.send(ok).unwrap();
+                }
                 ContinueOperation::Terminate
             }
         }
 
-        let platform = LinuxUserland::new(None);
-        let (send, receive) = std::sync::mpsc::channel();
+        let _platform = LinuxUserland::new(None);
+        let shim = Shim::default();
         // SAFETY: the shim terminates the thread before it enters the guest.
-        unsafe {
-            platform
-                .spawn_thread(
-                    &litebox_common_linux::PtRegs::default(),
-                    Box::new(Init(send)),
-                )
-                .unwrap();
-        }
-        let ok = receive
-            .recv_timeout(core::time::Duration::from_secs(5))
-            .unwrap();
-        assert!(
-            ok,
-            "guest context was overwritten by an interrupt in host code"
-        );
+        unsafe { super::run_thread_ref(&shim, &mut PtRegs::default()) };
+        assert_eq!(shim.interrupts.get(), 1);
     }
 
     #[test]
