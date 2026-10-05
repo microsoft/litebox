@@ -25,6 +25,7 @@ alarm_fallback = []
 aarch64_virtualize_x18 = []
 
 [dev-dependencies]
+litebox_syscall_rewriter = { version = "0.1.0", path = "../litebox_syscall_rewriter", default-features = false, features = ["test-support"] }
 litebox_broker_core = { path = "../litebox_broker_core/", version = "0.1.0", features = ["test-support"] }
 litebox_broker_host = { path = "../litebox_broker_host/", version = "0.1.0", features = ["test-support"] }
 litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }

@@ -142,7 +142,8 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
         macho::{CodeMetadata, Rewriter},
     };
     let mut plan = MachoParsedFile::parse(rewritten).unwrap();
-    let trampoline = plan.parse_trampoline(rewritten).unwrap().unwrap();
+    let trampolines = plan.parse_trampoline(rewritten).unwrap();
+    assert!(!trampolines.is_empty());
     let metadata = CodeMetadata::parse(original).unwrap();
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let mut count = 0;
@@ -175,7 +176,10 @@ fn assert_svc_gates(original: &[u8], rewritten: &[u8]) -> usize {
                         .expect("SVC must become a branch, not BRK"),
                 )
                 .unwrap();
-                assert!(trampoline.virtual_range.contains(&target));
+                let trampoline = trampolines
+                    .iter()
+                    .find(|trampoline| trampoline.virtual_range.contains(&target))
+                    .expect("SVC must branch into a sub-trampoline");
                 let gate_offset =
                     trampoline.file_range.start + target - trampoline.virtual_range.start;
                 let gate_len = GateMetadata::Svc.slot_size_for_host(TargetHost::MacOs);
@@ -393,6 +397,39 @@ fn syscall_free_image_delivers_guest_faults() {
     assert_eq!(output.status.code(), Some(139));
 }
 
+/// More than 1 MiB of SVC gates exceeds the callback literal's reach from one
+/// header, so the rewriter splits them over several sub-trampolines, each
+/// mapped and finalized independently by the loader.
+#[test]
+fn split_trampoline_image_runs() {
+    const SITES: usize = 20_000;
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!(
+        ".global _start\n_start:\n mov x16, #20\n{} mov x0, #42\n mov x16, #1\n svc #0x80\n",
+        " svc #0x80\n mov x16, #20\n".repeat(SITES - 1),
+    );
+    let binary = assemble(dir.path(), &source);
+    let hooked = rewrite(&binary);
+    let original = std::fs::read(&binary).unwrap();
+    let rewritten = std::fs::read(&hooked).unwrap();
+    let trampolines = MachoParsedFile::parse(&rewritten)
+        .unwrap()
+        .parse_trampoline(&rewritten)
+        .unwrap();
+    assert!(trampolines.len() >= 2, "{trampolines:?}");
+    assert_eq!(assert_svc_gates(&original, &rewritten), SITES);
+    let output = Command::new(env!("CARGO_BIN_EXE_litebox_runner_macos_userland"))
+        .arg(hooked)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(42),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn invalid_images_are_rejected_and_dynamic_images_require_dyld() {
     let dir = tempfile::tempdir().unwrap();
@@ -433,11 +470,13 @@ fn incompatible_aot_gate_is_rejected_before_execution() {
     );
     let hooked = rewrite(&binary);
     let mut data = std::fs::read(&hooked).unwrap();
-    let trampoline = MachoParsedFile::parse(&data)
+    let trampolines = MachoParsedFile::parse(&data)
         .unwrap()
         .parse_trampoline(&data)
-        .unwrap()
         .unwrap();
+    let [trampoline] = &trampolines[..] else {
+        panic!("expected one sub-trampoline");
+    };
     // Mach-O SVC gates require the Darwin frame layout. Incompatible payloads
     // are rejected during finalization.
     let first_gate =
@@ -473,7 +512,10 @@ fn loader_teardown_and_argument_limit() {
         .load_program_from_bytes(TaskParams::default(), "/guest", &data, vec![], vec![])
         .unwrap();
     let mut plan = MachoParsedFile::parse(&data).unwrap();
-    let trampoline = plan.parse_trampoline(&data).unwrap().unwrap();
+    let trampolines = plan.parse_trampoline(&data).unwrap();
+    let [trampoline] = &trampolines[..] else {
+        panic!("expected one sub-trampoline");
+    };
     let base = program.initial_ctx.pc - (plan.entry - plan.virtual_range.start);
     let code_page = program.initial_ctx.pc & !(PAGE_SIZE - 1);
     let trampoline_page = base + (trampoline.virtual_range.start - plan.virtual_range.start);

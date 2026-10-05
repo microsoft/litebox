@@ -8,6 +8,8 @@ default = ["std", "anyhow", "clap"]
 std = []
 anyhow = ["dep:anyhow"]
 clap = ["dep:clap"]
+# Rewriting helpers that only tests use.
+test-support = []
 
 [dependencies]
 gimli = { version = "0.32", default-features = false, features = ["read-core"] }

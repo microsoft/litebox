@@ -15,7 +15,11 @@ use litebox_common_linux::PtRegs;
 use litebox_platform_macos_userland::{
     GuestAbi, HOST_PAGE_SIZE, MacosUserland, run_thread, set_guest_abi,
 };
-use litebox_syscall_rewriter::{TargetHost, macho::Rewriter};
+use litebox_syscall_rewriter::{
+    TargetHost,
+    aarch64::{GATE_ALIGNMENT, TrampolineSpace},
+    macho::{GatePlacement, Rewriter},
+};
 use std::cell::Cell;
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
@@ -116,24 +120,34 @@ fn spawned_threads_use_configured_darwin_gates() {
     let base = memory.as_usize();
     let mut code = [0xd4001001u32.to_le_bytes(); 2].concat();
     let gate_offset = HOST_PAGE_SIZE / 2;
-    let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
+    let (subs, trapped) = Rewriter::new(TargetHost::MacOs)
         .unwrap()
         .patch_code_segment(
             &mut code,
             base as u64,
             &[0..8],
-            (base + gate_offset) as u64,
-            platform.get_syscall_entry_point() as u64,
-            platform
-                .guest_thread_pointer_offset()
-                .unwrap()
-                .try_into()
-                .unwrap(),
+            GatePlacement {
+                spaces: &[TrampolineSpace {
+                    start: (base + gate_offset) as u64,
+                    end: None,
+                }],
+                granule: GATE_ALIGNMENT as u64,
+                callback: platform.get_syscall_entry_point() as u64,
+                guest_tp_offset: platform
+                    .guest_thread_pointer_offset()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            },
         )
         .unwrap();
     assert_eq!(trapped, []);
+    let [sub] = &subs[..] else {
+        panic!("expected one sub-trampoline");
+    };
+    let gates = &sub.data;
     memory.copy_from_slice(0, &code).unwrap();
-    memory.copy_from_slice(gate_offset, &gates).unwrap();
+    memory.copy_from_slice(gate_offset, gates).unwrap();
     // SAFETY: code and gates are initialized and have no active users.
     unsafe {
         platform

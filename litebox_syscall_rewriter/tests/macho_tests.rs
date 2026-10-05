@@ -5,10 +5,10 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use litebox_syscall_rewriter::{
-    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost,
+    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost, TrampolineRegion,
     aarch64::{self, GateMetadata},
-    hook_syscalls_in_macho, hook_syscalls_in_macho_with_options,
-    macho::{CodeMetadata, Rewriter},
+    aarch64_trampoline_regions, hook_syscalls_in_macho, hook_syscalls_in_macho_with_options,
+    macho::{CodeMetadata, GatePlacement, Rewriter},
     rewrite_binary,
 };
 use object::macho;
@@ -28,9 +28,6 @@ fn put64(bytes: &mut [u8], offset: usize, value: u64) {
 }
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
-}
-fn u64_at(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
 
 fn image(words: &[u32]) -> Vec<u8> {
@@ -97,14 +94,50 @@ fn add_segment(bytes: &mut [u8], start: u64, size: u64) {
     put32(bytes, command + 60, 3);
 }
 
+fn regions(bytes: &[u8]) -> Vec<TrampolineRegion> {
+    assert_eq!(&bytes[bytes.len() - 32..][..8], TRAMPOLINE_MAGIC);
+    aarch64_trampoline_regions(bytes)
+        .expect("well-formed trailer")
+        .expect("LiteBox trailer")
+}
+
+/// `(file_offset, vaddr, size)` of the only sub-trampoline.
 fn footer(bytes: &[u8]) -> (usize, u64, usize) {
-    let header = &bytes[bytes.len() - 32..];
-    assert_eq!(&header[..8], TRAMPOLINE_MAGIC);
+    let [region] = regions(bytes)[..] else {
+        panic!("expected exactly one sub-trampoline");
+    };
     (
-        u64_at(header, 8) as usize,
-        u64_at(header, 16),
-        u64_at(header, 24) as usize,
+        region.file_offset as usize,
+        region.vaddr,
+        region.size as usize,
     )
+}
+
+/// Load-time rewriting into one unbounded space at `trampoline`.
+fn patch(
+    code: &mut [u8],
+    code_vaddr: u64,
+    ranges: &[std::ops::Range<usize>],
+    trampoline: u64,
+    callback: u64,
+    guest_tp_offset: u16,
+) -> Result<(Vec<aarch64::SubTrampoline>, Vec<u64>), Error> {
+    Rewriter::new(TargetHost::MacOs)
+        .unwrap()
+        .patch_code_segment(
+            code,
+            code_vaddr,
+            ranges,
+            GatePlacement {
+                spaces: &[aarch64::TrampolineSpace {
+                    start: trampoline,
+                    end: None,
+                }],
+                granule: aarch64::GATE_ALIGNMENT as u64,
+                callback,
+                guest_tp_offset,
+            },
+        )
 }
 
 #[test]
@@ -179,10 +212,14 @@ fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     let slide = 0x4000_0000;
     let code_vaddr = BASE + TEXT as u64 + slide;
     let mut code = input[TEXT..TEXT + 16].to_vec();
-    let (gates, trapped) = rewriter
-        .patch_code_segment(&mut code, code_vaddr, &ranges, base + slide, callback, 96)
-        .unwrap();
+    let (subs, trapped) =
+        patch(&mut code, code_vaddr, &ranges, base + slide, callback, 96).unwrap();
     assert_eq!(trapped, []);
+    let [sub] = &subs[..] else {
+        panic!("expected one sub-trampoline");
+    };
+    assert_eq!(sub.vaddr, base + slide);
+    let gates = &sub.data;
     assert_eq!(code, aot[TEXT..TEXT + 16]);
     assert_eq!(u32_at(&code, 8), SVC); // data-in-code is untouched
     assert!(
@@ -195,7 +232,7 @@ fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     rewriter
         .finalize_trampoline_gates(&mut aot_gates, 96)
         .unwrap();
-    assert_eq!(gates, aot_gates);
+    assert_eq!(*gates, aot_gates);
     let svc = rewriter
         .classify_gate_slot(&gates[16..80], base + slide + 16, base + slide + 16)
         .unwrap();
@@ -205,8 +242,8 @@ fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
         .classify_gate_slot(&gates[80..], base + slide + 80, base + slide + 80)
         .unwrap();
     assert_eq!(tp.original_site(), code_vaddr + 4);
-    assert_eq!(u32_at(&gates, 88), 0xf940_3063); // finalized runtime TSD slot
-    assert_eq!(u32_at(&gates, 92), 0xf940_0063); // logical TP within the TLS block
+    assert_eq!(u32_at(gates, 88), 0xf940_3063); // finalized runtime TSD slot
+    assert_eq!(u32_at(gates, 92), 0xf940_0063); // logical TP within the TLS block
 }
 
 #[test]
@@ -219,19 +256,11 @@ fn load_time_rewriting_errors_leave_code_unchanged() {
     let original = [SVC.to_le_bytes(), MRS.to_le_bytes()].concat();
     let mut code = original.clone();
     // Finalization fails after emission; the mapping must remain untouched.
-    assert!(
-        rewriter
-            .patch_code_segment(&mut code, 0x1000, &[0..8], 0x2000, 0x1234, 0)
-            .is_err()
-    );
+    assert!(patch(&mut code, 0x1000, &[0..8], 0x2000, 0x1234, 0).is_err());
     assert_eq!(code, original);
     let mut code = [SVC.to_le_bytes(), 0xd51b_d060u32.to_le_bytes()].concat();
     let before = code.clone();
-    assert!(
-        rewriter
-            .patch_code_segment(&mut code, 0x1000, &[0..8], 0x2000, 0x1234, 96)
-            .is_err()
-    );
+    assert!(patch(&mut code, 0x1000, &[0..8], 0x2000, 0x1234, 96).is_err());
     assert_eq!(code, before);
     assert!(
         rewriter
@@ -250,11 +279,9 @@ fn load_time_out_of_range_sites_match_trap_fallback() {
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let original = [SVC.to_le_bytes(), MRS.to_le_bytes()].concat();
     let mut code = original.clone();
-    let (gates, trapped) = rewriter
-        .patch_code_segment(&mut code, 0x1000, &[0..8], 0x900_0000, 0x1234, 96)
-        .unwrap();
+    let (subs, trapped) = patch(&mut code, 0x1000, &[0..8], 0x900_0000, 0x1234, 96).unwrap();
     assert_eq!(trapped, vec![0x1000, 0x1004]);
-    assert_eq!(gates.len(), 16); // callback header only
+    assert_eq!(subs, []);
     for offset in [0, 4] {
         assert_eq!(u32_at(&code, offset) & 0xffe0_001f, 0xd420_0000);
     }
@@ -330,18 +357,47 @@ fn placement_uses_native_page_holes_and_counts_zerofill() {
     ));
 }
 
+/// Mach-O holes and the fallback are 16 KiB-granular, and gates that outgrow
+/// the hole spill past the image without rewriting patched code twice.
 #[test]
-fn small_hole_retries_past_the_image_without_rewriting_patched_code() {
+fn gates_fill_the_hole_before_spilling_past_the_image() {
     let mut input = image(&vec![SVC; 300]); // > 16 KiB of gates
     add_segment(&mut input, BASE + 0x8000, 0x4000);
     let out = hook_syscalls_in_macho(&input, None).unwrap();
-    let (_, base, size) = footer(&out);
-    assert!(base >= BASE + 0xc000);
-    assert_eq!(size, 16 + 300 * 64);
-    assert_eq!(
-        aarch64::decode_branch_target(u32_at(&out, TEXT), BASE + TEXT as u64),
-        Some(base + 16)
-    );
+    let regions = regions(&out);
+    assert_eq!(regions.len(), 2);
+    assert_eq!(regions[0].vaddr, BASE + 0x4000);
+    assert!(regions[0].vaddr + regions[0].size <= BASE + 0x8000);
+    assert!(regions[1].vaddr >= BASE + 0xc000);
+    assert!(regions[1].vaddr.is_multiple_of(0x4000));
+    let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
+    for (index, word) in out[TEXT..TEXT + 300 * 4]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .enumerate()
+    {
+        let site = BASE + (TEXT + index * 4) as u64;
+        let target = aarch64::decode_branch_target(u32::from_le_bytes(*word), site).unwrap();
+        let region = regions
+            .iter()
+            .find(|region| (region.vaddr..region.vaddr + region.size).contains(&target))
+            .unwrap();
+        let slot = (region.file_offset + target - region.vaddr) as usize;
+        let gate = rewriter
+            .classify_gate_slot(&out[slot..slot + 64], target, target)
+            .unwrap();
+        assert_eq!(gate.original_site(), site);
+    }
+    // Rewriting is idempotent, and a corrupted trailer is not rewritten again.
+    assert_eq!(hook_syscalls_in_macho(&out, None).unwrap(), out);
+    let mut corrupt = out.clone();
+    let reserved = corrupt.len() - 8;
+    corrupt[reserved] = 1;
+    assert!(matches!(
+        hook_syscalls_in_macho(&corrupt, None),
+        Err(Error::MalformedTrailer(_))
+    ));
 }
 
 #[test]

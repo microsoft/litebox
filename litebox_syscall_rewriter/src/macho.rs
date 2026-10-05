@@ -9,18 +9,25 @@
 //! outbound stub with SP still pointing to the gate frame.
 //!
 //! Unmarked inline data matching syscall/TLS encodings may be rewritten.
+//!
+//! Gates always go in sub-trampolines, each a callback header followed by gates
+//! that reference only that header. Ahead-of-time rewriting places them in the
+//! image; see [`hook_syscalls_in_macho_with_options`]. Load-time
+//! rewriting through [`Rewriter`] splits each call's gates the same way, over
+//! spaces the caller reserves; see [`GatePlacement`].
 
-use alloc::{format, string::ToString as _, vec, vec::Vec};
+use alloc::{string::ToString as _, vec, vec::Vec};
 use core::ops::Range;
 use object::read::macho::{MachHeader as _, Segment as _};
 use object::{LittleEndian as LE, macho};
 use zerocopy::IntoBytes as _;
 
 use crate::{
-    Arch, Error, LoadSegment, MACOS_TRAMPOLINE_PAGE_SIZE, Result, RewriteOptions, TRAMPOLINE_MAGIC,
-    TargetHost, TextSectionInfo, TrampolineHeader64, TrampolinePlacement,
+    Error, LoadSegment, MACOS_TRAMPOLINE_PAGE_SIZE, Result, RewriteOptions, TargetHost,
+    TextSectionInfo,
     aarch64::{self, INSN_BYTES_U64},
-    append_trampoline_footer, checked_add_u64, is_already_hooked, trampoline_placement_for,
+    aarch64_trampoline_regions, aarch64_trampoline_spaces, append_aarch64_trampolines,
+    checked_add_u64, trampoline_placement_for, unpatchable_aarch64_sites,
 };
 
 const LOAD_COMMAND_ALIGNMENT: u32 = 8;
@@ -58,6 +65,22 @@ impl CodeMetadata {
     }
 }
 
+/// Where and how [`Rewriter`] load-time rewriting places sub-trampolines.
+#[derive(Clone, Copy, Debug)]
+pub struct GatePlacement<'a> {
+    /// Address ranges, in preference order, that may hold sub-trampolines.
+    pub spaces: &'a [aarch64::TrampolineSpace],
+    /// Alignment of every sub-trampoline; no two share a `granule`. A caller
+    /// that maps and protects each space as a whole may pass
+    /// [`aarch64::GATE_ALIGNMENT`] to pack them.
+    pub granule: u64,
+    /// Written into every sub-trampoline's callback header.
+    pub callback: u64,
+    /// Host TSD byte offset of the guest TLS-block pointer, finalized into
+    /// every gate.
+    pub guest_tp_offset: u16,
+}
+
 #[derive(Clone, Copy)]
 pub struct Rewriter {
     host: TargetHost,
@@ -68,28 +91,26 @@ impl Rewriter {
         Ok(Self { host })
     }
 
-    /// Returns (finalized gates, trapped PCs). Code is unchanged on error.
+    /// Returns (finalized sub-trampolines, trapped PCs). Code is unchanged on
+    /// error.
     ///
-    /// Ranges are sorted, non-overlapping and relative to `code`. Copy returned gates
-    /// to reserved storage at `trampoline_vaddr` and synchronize instruction caches
-    /// for code and gates before execution. `guest_tp_offset` is the host TSD byte
-    /// offset of the guest TLS-block pointer.
+    /// Ranges are sorted, non-overlapping and relative to `code`. Gates are
+    /// spread over sub-trampolines in `placement.spaces`, exactly like
+    /// ahead-of-time rewriting; see [`aarch64::TrampolineSpace`]. Copy each
+    /// returned sub-trampoline to reserved storage at its `vaddr` and
+    /// synchronize instruction caches for code and gates before execution.
     pub fn patch_code_segment(
         self,
         code: &mut [u8],
         code_vaddr: u64,
         ranges: &[Range<usize>],
-        trampoline_vaddr: u64,
-        callback: u64,
-        guest_tp_offset: u16,
-    ) -> Result<(Vec<u8>, Vec<u64>)> {
+        placement: GatePlacement<'_>,
+    ) -> Result<(Vec<aarch64::SubTrampoline>, Vec<u64>)> {
         self.patch_code_segment_with_options(
             code,
             code_vaddr,
             ranges,
-            trampoline_vaddr,
-            callback,
-            guest_tp_offset,
+            placement,
             RewriteOptions::new(self.host, false),
         )
     }
@@ -100,17 +121,13 @@ impl Rewriter {
         code: &mut [u8],
         code_vaddr: u64,
         ranges: &[Range<usize>],
-        trampoline_vaddr: u64,
-        callback: u64,
-        guest_tp_offset: u16,
-    ) -> Result<(Vec<u8>, Vec<u64>)> {
+        placement: GatePlacement<'_>,
+    ) -> Result<(Vec<aarch64::SubTrampoline>, Vec<u64>)> {
         self.patch_code_segment_with_options(
             code,
             code_vaddr,
             ranges,
-            trampoline_vaddr,
-            callback,
-            guest_tp_offset,
+            placement,
             RewriteOptions::native_guest_thread_pointer(self.host),
         )
     }
@@ -122,32 +139,25 @@ impl Rewriter {
         code: &mut [u8],
         code_vaddr: u64,
         ranges: &[Range<usize>],
-        trampoline_vaddr: u64,
-        callback: u64,
-        guest_tp_offset: u16,
-    ) -> Result<(Vec<u8>, Vec<u64>)> {
+        placement: GatePlacement<'_>,
+    ) -> Result<(Vec<aarch64::SubTrampoline>, Vec<u64>)> {
         self.patch_code_segment_with_options(
             code,
             code_vaddr,
             ranges,
-            trampoline_vaddr,
-            callback,
-            guest_tp_offset,
+            placement,
             RewriteOptions::host_aware_thread_pointer(self.host),
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn patch_code_segment_with_options(
         self,
         code: &mut [u8],
         code_vaddr: u64,
         ranges: &[Range<usize>],
-        trampoline_vaddr: u64,
-        callback: u64,
-        guest_tp_offset: u16,
+        placement: GatePlacement<'_>,
         options: RewriteOptions,
-    ) -> Result<(Vec<u8>, Vec<u64>)> {
+    ) -> Result<(Vec<aarch64::SubTrampoline>, Vec<u64>)> {
         checked_add_u64(code_vaddr, code.len() as u64, "Mach-O mapping end")?;
         if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
             return Err(Error::ParseError(
@@ -156,14 +166,22 @@ impl Rewriter {
         }
         let sections = crate::scan_sections(code_vaddr, ranges, code.len())?;
         let mut patched = code.to_vec();
-        let Some(mut outcome) =
-            aarch64::hook_macho(&mut patched, &sections, trampoline_vaddr, callback, options)?
+        let Some(mut outcome) = aarch64::hook_split_macho(
+            &mut patched,
+            &sections,
+            placement.spaces,
+            placement.granule,
+            placement.callback,
+            options,
+        )?
         else {
             return Ok((Vec::new(), Vec::new()));
         };
-        self.finalize_trampoline_gates(&mut outcome.trampoline, guest_tp_offset)?;
+        for sub in &mut outcome.trampolines {
+            self.finalize_trampoline_gates(&mut sub.data, placement.guest_tp_offset)?;
+        }
         code.copy_from_slice(&patched);
-        Ok((outcome.trampoline, outcome.trapped_sites))
+        Ok((outcome.trampolines, outcome.trapped_sites))
     }
 
     /// Allocation-failure fallback for [`Self::patch_code_segment`].
@@ -219,10 +237,17 @@ pub fn hook_syscalls_in_macho(input: &[u8], callback: Option<u64>) -> Result<Vec
     )
 }
 
-/// The loader must map the footer payload at its recorded address plus the image
-/// slide, install the callback, finalize TLS offsets, and synchronize instruction
-/// caches. The payload is 4 KiB file-aligned; copy it if larger alignment is required.
-/// Rewriting invalidates code signatures.
+/// Gates are split into independently mapped sub-trampolines, each a callback
+/// header followed by gates, placed first in holes between the image's
+/// segments (largest first) and then past its last segment; see
+/// [`crate::parse_aarch64_trampoline_footer`] for the appended table and footer.
+/// Every sub-trampoline is 16 KiB-aligned and starts on its own 16 KiB page.
+///
+/// The loader must map each sub-trampoline at its recorded address plus the
+/// image slide, install the callback into its first 8 bytes, finalize its TLS
+/// offsets, and synchronize instruction caches. Payloads are 4 KiB
+/// file-aligned; copy them if larger alignment is required. Rewriting
+/// invalidates code signatures.
 pub fn hook_syscalls_in_macho_with_options(
     input: &[u8],
     callback: Option<u64>,
@@ -232,7 +257,8 @@ pub fn hook_syscalls_in_macho_with_options(
         return Ok(input.to_vec());
     };
     Rewriter::new(options.target_host())?;
-    if is_already_hooked(input, Arch::Aarch64) {
+    // A malformed or unknown trailer is an error, not an image to rewrite again.
+    if aarch64_trampoline_regions(input)?.is_some() {
         return Ok(input.to_vec());
     }
     let placement = trampoline_placement_for(
@@ -240,26 +266,28 @@ pub fn hook_syscalls_in_macho_with_options(
         object::elf::EM_AARCH64,
         MACOS_TRAMPOLINE_PAGE_SIZE,
     )?;
-    let attempt = |addr, limit| {
-        rewrite_at(
-            input,
-            &metadata.code,
-            addr,
-            limit,
-            callback.unwrap_or(0),
-            options,
-        )
+    let spaces =
+        aarch64_trampoline_spaces(&metadata.segments, MACOS_TRAMPOLINE_PAGE_SIZE, placement)?;
+    let mut out = input.to_vec();
+    let Some(outcome) = aarch64::hook_split_macho(
+        &mut out,
+        &metadata.code,
+        &spaces,
+        MACOS_TRAMPOLINE_PAGE_SIZE,
+        callback.unwrap_or(0),
+        options,
+    )?
+    else {
+        // No patch sites: `out` is still the original image; append an empty
+        // table.
+        append_aarch64_trampolines(&mut out, &[])?;
+        return Ok(out);
     };
-    if let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement {
-        let result = attempt(addr, Some(limit));
-        if !matches!(
-            result,
-            Err(Error::TrampolineTooLarge { .. } | Error::UnpatchableSyscalls(_))
-        ) {
-            return result;
-        }
+    if !outcome.trapped_sites.is_empty() {
+        return Err(unpatchable_aarch64_sites(&outcome.trapped_sites));
     }
-    attempt(placement.fallback_addr(), None)
+    append_aarch64_trampolines(&mut out, &outcome.trampolines)?;
+    Ok(out)
 }
 
 fn parse_image(input: &[u8]) -> Result<Option<CodeMetadata>> {
@@ -510,43 +538,4 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
         }
     }
     Ok((code, segments))
-}
-
-fn rewrite_at(
-    input: &[u8],
-    sections: &[TextSectionInfo],
-    addr: u64,
-    limit: Option<u64>,
-    callback: u64,
-    options: RewriteOptions,
-) -> Result<Vec<u8>> {
-    let mut out = input.to_vec();
-    let Some(mut outcome) = aarch64::hook_macho(&mut out, sections, addr, callback, options)?
-    else {
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0,
-            vaddr: 0,
-            trampoline_size: 0,
-        };
-        out.extend_from_slice(header.as_bytes());
-        return Ok(out);
-    };
-    let needed = (outcome.trampoline.len() as u64)
-        .checked_next_multiple_of(MACOS_TRAMPOLINE_PAGE_SIZE)
-        .ok_or_else(|| Error::AddressOverflow("Mach-O trampoline size".into()))?;
-    checked_add_u64(addr, needed, "Mach-O trampoline end")?;
-    if let Some(available) = limit
-        && needed > available
-    {
-        return Err(Error::TrampolineTooLarge { needed, available });
-    }
-    if !outcome.trapped_sites.is_empty() {
-        return Err(Error::UnpatchableSyscalls(format!(
-            "Mach-O sites at {:?}",
-            outcome.trapped_sites
-        )));
-    }
-    append_trampoline_footer(&mut out, &mut outcome.trampoline, addr, false);
-    Ok(out)
 }
