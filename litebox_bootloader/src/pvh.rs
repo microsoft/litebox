@@ -1,56 +1,25 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! PVH boot (`qemu -kernel`).
+//! PVH front end: direct kernel boot (e.g. `qemu -kernel`) through the
+//! `XEN_ELFNOTE_PHYS32_ENTRY` note. Maps the low 4 GiB, applies relocations,
+//! and hands off (see `handoff`) on the boot stack in the scratch region.
 //!
-//! On entry to [`crate::kernel_start`]: long mode, interrupts off, running at
-//! `PA + KERNEL_OFFSET` with the low 4 GiB mapped read/write there,
-//! relocations applied, on the boot stack in the scratch region. The linker
-//! script must define `_memory_base`, `_rela_start` and `_rela_end`.
+//! The linker script must define `_memory_base`, `_rela_start` and
+//! `_rela_end`.
 
+use crate::handoff::{BootInfo, MAX_MODULES, MAX_RAM_REGIONS, MAX_RESERVED};
 use arrayvec::{ArrayString, ArrayVec};
 use core::arch::global_asm;
+use core::ops::Range;
 use litebox_platform_vm_kernel::KERNEL_OFFSET;
+use x86_64::PhysAddr;
 use zerocopy::FromBytes;
-
-/// A half-open physical range `[start, end)`.
-#[derive(Clone, Copy, Debug)]
-pub struct Range {
-    pub start: u64,
-    pub end: u64,
-}
-
-// Boot fails rather than dropping entries beyond these limits.
-pub const MAX_RAM_REGIONS: usize = 32;
-pub const MAX_RESERVED: usize = 16;
-pub const MAX_MODULES: usize = 8;
-pub const MAX_CMDLINE: usize = 1024;
-
-pub struct BootInfo {
-    /// Usable RAM from the memory map, not clamped to `mapped_limit`.
-    pub usable: ArrayVec<Range, MAX_RAM_REGIONS>,
-    /// Boot structures and modules inside `usable` that must not reach the heap.
-    pub reserved: ArrayVec<Range, MAX_RESERVED>,
-    /// Boot modules (`-initrd`), in order.
-    pub modules: ArrayVec<Range, MAX_MODULES>,
-    pub cmdline: ArrayString<MAX_CMDLINE>,
-    /// Physical memory below this is mapped at `PA + KERNEL_OFFSET` on entry.
-    pub mapped_limit: u64,
-}
-
-impl BootInfo {
-    pub fn cmdline_value(&self, key: &str) -> Option<&str> {
-        self.cmdline.split_ascii_whitespace().find_map(|arg| {
-            arg.strip_prefix(key)
-                .and_then(|rest| rest.strip_prefix('='))
-        })
-    }
-}
 
 /// Physical address of `_start`; must match the linker script.
 const PVH_ENTRY_ADDR: u32 = 0x0020_0000;
 
-/// ELF note type that makes QEMU boot the image via PVH.
+/// ELF note type that makes a VMM boot the image via PVH.
 const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18;
 
 /// `KERNEL_OFFSET` must be 512 GiB aligned so the identity map and the
@@ -62,7 +31,7 @@ const _: () = assert!(KERNEL_OFFSET.trailing_zeros() >= 39);
 const PD_COUNT: u32 = 4;
 const PD_ENTRIES: u32 = PD_COUNT * 512;
 /// Covers every address PVH hands over (all are 32-bit).
-pub const MAPPED_LIMIT: u64 = 1 << 32;
+const MAPPED_LIMIT: u64 = 1 << 32;
 
 /// Must match `.boot_scratch` in the linker script. Everything below lives
 /// there; the region is `NOLOAD`, so the stub initializes what it uses.
@@ -239,8 +208,8 @@ _start:
     off_sinfo = const OFF_HVM_START_INFO,
     off_stack_top = const OFF_STACK_TOP,
     r_x86_64_relative = const 8,
-    debug_exit_port = const crate::machine::DEBUG_EXIT_PORT,
-    debug_exit_failure = const crate::machine::DEBUG_EXIT_FAILURE,
+    debug_exit_port = const litebox_hal::power::DEBUG_EXIT_PORT,
+    debug_exit_failure = const litebox_hal::power::DEBUG_EXIT_FAILURE,
     rust_entry = sym pvh_entry,
 );
 
@@ -298,21 +267,25 @@ unsafe fn read_phys<T: FromBytes>(pa: u64) -> T {
     unsafe { ((pa + KERNEL_OFFSET) as *const T).read_unaligned() }
 }
 
-fn range_end(start: u64, size: u64, what: &str) -> u64 {
-    start.checked_add(size).unwrap_or_else(|| {
-        panic!("{what} at {start:#x} with size {size:#x} overflows the address space")
-    })
+/// # Panics
+///
+/// If the range overflows or exceeds the physical address width.
+fn phys_range(start: u64, size: u64, what: &str) -> Range<PhysAddr> {
+    let bad = || -> ! { panic!("{what} at {start:#x} with size {size:#x} is not physical memory") };
+    let end = start.checked_add(size).unwrap_or_else(|| bad());
+    let start = PhysAddr::try_new(start).unwrap_or_else(|_| bad());
+    let end = PhysAddr::try_new(end).unwrap_or_else(|_| bad());
+    start..end
 }
 
 extern "C" fn pvh_entry() -> ! {
-    crate::early_console_init();
-    crate::kernel_start(boot_info())
+    crate::kernel_start(boot_info)
 }
 
 /// # Panics
 ///
 /// Panics on a malformed or unsupported `hvm_start_info`.
-pub fn boot_info() -> BootInfo {
+fn boot_info() -> BootInfo {
     let slot = u64::from(BOOT_SCRATCH_BASE + OFF_HVM_START_INFO) + KERNEL_OFFSET;
     // Safety: written by the entry stub before any Rust code ran.
     let start_info_pa = unsafe { (slot as *const u64).read() };
@@ -325,12 +298,9 @@ pub fn boot_info() -> BootInfo {
     );
     assert!(info.version >= 1, "hvm_start_info has no memory map");
 
-    let mut reserved = ArrayVec::<Range, MAX_RESERVED>::new();
+    let mut reserved = ArrayVec::<Range<PhysAddr>, MAX_RESERVED>::new();
     let mut reserve = |start: u64, len: u64| {
-        let range = Range {
-            start,
-            end: start.saturating_add(len),
-        };
+        let range = phys_range(start, len, "firmware-reserved range");
         assert!(
             reserved.try_push(range).is_ok(),
             "more than {MAX_RESERVED} firmware-reserved ranges (at {start:#x}); \
@@ -366,39 +336,31 @@ pub fn boot_info() -> BootInfo {
         nr_modules <= MAX_MODULES,
         "the VMM passed {nr_modules} boot modules; at most {MAX_MODULES} are supported"
     );
-    let mut modules = ArrayVec::<Range, MAX_MODULES>::new();
+    let mut modules = ArrayVec::<Range<PhysAddr>, MAX_MODULES>::new();
     if nr_modules != 0 {
         let entry_size = size_of::<HvmModlistEntry>() as u64;
         reserve(info.modlist_paddr, u64::from(info.nr_modules) * entry_size);
         for i in 0..u64::from(info.nr_modules) {
             // Safety: `i`th element of the module list named by start_info.
             let module: HvmModlistEntry = unsafe { read_phys(info.modlist_paddr + i * entry_size) };
-            let range = Range {
-                start: module.paddr,
-                end: range_end(module.paddr, module.size, "boot module"),
-            };
-            reserve(range.start, module.size);
-            modules.push(range);
+            reserve(module.paddr, module.size);
+            modules.push(phys_range(module.paddr, module.size, "boot module"));
         }
     }
 
-    let mut usable = ArrayVec::<Range, MAX_RAM_REGIONS>::new();
+    let mut usable = ArrayVec::<Range<PhysAddr>, MAX_RAM_REGIONS>::new();
     for i in 0..u64::from(info.memmap_entries) {
         // Safety: `i`th element of the memory map named by start_info.
         let entry: HvmMemmapTableEntry =
             unsafe { read_phys(info.memmap_paddr + i * size_of::<HvmMemmapTableEntry>() as u64) };
-        let end = range_end(entry.addr, entry.size, "memory map entry");
+        let range = phys_range(entry.addr, entry.size, "memory map entry");
         log::debug!(
             "memmap {:#014x}..{:#014x} type {}",
-            entry.addr,
-            end,
+            range.start.as_u64(),
+            range.end.as_u64(),
             entry.type_
         );
         if entry.type_ == HVM_MEMMAP_TYPE_RAM {
-            let range = Range {
-                start: entry.addr,
-                end,
-            };
             assert!(
                 usable.try_push(range).is_ok(),
                 "the memory map has more than {MAX_RAM_REGIONS} RAM regions; \
@@ -412,6 +374,6 @@ pub fn boot_info() -> BootInfo {
         reserved,
         modules,
         cmdline,
-        mapped_limit: MAPPED_LIMIT,
+        mapped_limit: PhysAddr::new(MAPPED_LIMIT),
     }
 }

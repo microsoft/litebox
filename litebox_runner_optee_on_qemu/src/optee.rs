@@ -6,8 +6,8 @@
 //! `litebox_runner_optee_on_linux_userland/tests/*-cmds.json`). Without
 //! `cmds.json`, only a session is opened.
 
-use crate::boot::BootInfo;
 use alloc::boxed::Box;
+use litebox_bootloader::handoff::BootInfo;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
 use litebox_platform_vm_kernel::{KERNEL_OFFSET, VmKernel};
@@ -27,8 +27,9 @@ fn payload(info: &BootInfo) -> Result<Payload, &'static str> {
     let len = usize::try_from(module.end - module.start).unwrap();
     // Safety: boot modules are excluded from the heap and stay mapped at
     // `PA + KERNEL_OFFSET` for the kernel's lifetime.
-    let data: &'static [u8] =
-        unsafe { core::slice::from_raw_parts((module.start + KERNEL_OFFSET) as *const u8, len) };
+    let data: &'static [u8] = unsafe {
+        core::slice::from_raw_parts((module.start.as_u64() + KERNEL_OFFSET) as *const u8, len)
+    };
     let archive = tar_no_std::TarArchiveRef::new(data).map_err(|_| "payload is not a tar")?;
 
     let mut ldelf = None;

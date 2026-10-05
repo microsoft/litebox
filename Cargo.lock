@@ -1464,6 +1464,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_bootloader"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "litebox",
+ "litebox_hal",
+ "litebox_platform_vm_kernel",
+ "litebox_util_log",
+ "log",
+ "spin 0.10.0",
+ "x86_64",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_broker_core"
 version = "0.1.0"
 dependencies = [
@@ -1666,6 +1681,15 @@ dependencies = [
  "hyper-util",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "litebox_hal"
+version = "0.1.0"
+dependencies = [
+ "litebox_util_log",
+ "spin 0.10.0",
+ "x86_64",
 ]
 
 [[package]]
@@ -1930,11 +1954,13 @@ dependencies = [
  "arrayvec",
  "base64",
  "litebox",
+ "litebox_bootloader",
  "litebox_broker_core",
  "litebox_broker_host",
  "litebox_broker_local",
  "litebox_common_linux",
  "litebox_common_optee",
+ "litebox_hal",
  "litebox_platform_vm_kernel",
  "litebox_shim_optee",
  "litebox_util_log",
@@ -1942,10 +1968,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "spin 0.10.0",
  "tar-no-std",
- "x86_64",
- "zerocopy",
 ]
 
 [[package]]
