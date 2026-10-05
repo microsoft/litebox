@@ -4212,7 +4212,9 @@ mod tests {
     fn child_inherits_vector_state_and_dispatches_on_host_stack() {
         use litebox::shim::InitThread;
         use litebox_syscall_rewriter::{
-            RewriteOptions, TargetHost, patch_code_segment_with_options,
+            RewriteOptions, TargetHost,
+            aarch64::{GATE_ALIGNMENT, TrampolineSpace},
+            patch_aarch64_code_segment_in_spaces,
         };
 
         #[derive(Debug, PartialEq)]
@@ -4294,18 +4296,27 @@ mod tests {
             .unwrap();
         let base = memory.as_usize();
         let mut code = 0xd4000001u32.to_le_bytes();
-        let (trampoline, trapped) = patch_code_segment_with_options(
+        let (subs, trapped) = patch_aarch64_code_segment_in_spaces(
             &mut code,
             base as u64,
-            (base + HOST_PAGE_SIZE / 2) as u64,
+            None,
+            &[TrampolineSpace {
+                start: (base + HOST_PAGE_SIZE / 2) as u64,
+                end: None,
+            }],
+            GATE_ALIGNMENT as u64,
             platform.get_syscall_entry_point() as u64,
             RewriteOptions::new(TargetHost::MacOs, true),
         )
         .unwrap();
         assert_eq!(trapped, []);
+        let [sub] = &subs[..] else {
+            panic!("expected one sub-trampoline");
+        };
+        let trampoline = &sub.data;
         assert_eq!(memory.write_slice_at_offset(0, &code), Some(()));
         assert_eq!(
-            memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), &trampoline),
+            memory.write_slice_at_offset((HOST_PAGE_SIZE / 2).cast_signed(), trampoline),
             Some(())
         );
         // SAFETY: code is initialized and has no active readers before publication.

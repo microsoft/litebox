@@ -1694,6 +1694,7 @@ mod tests {
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
+    use litebox_syscall_rewriter::patch_aarch64_code_segment_contiguous;
 
     fn live_fp_state() -> FpState {
         let status: u64;
@@ -1757,8 +1758,14 @@ mod tests {
         const ALIGN: u16 = litebox_syscall_rewriter::aarch64::GUEST_TPIDR_OFFSET_ALIGN;
 
         let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
-        let (mut tramp, trapped) =
-            litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
+        let (mut tramp, trapped) = patch_aarch64_code_segment_contiguous(
+            &mut code,
+            0x1000,
+            0x400000,
+            0,
+            litebox_syscall_rewriter::RewriteOptions::default(),
+        )
+        .unwrap();
         assert_eq!(trapped, []);
         assert_eq!(
             litebox_syscall_rewriter::aarch64::find_guest_tpidr_placeholder(&tramp),
@@ -1945,8 +1952,14 @@ mod tests {
         litebox_common_linux::PtRegs,
     ) {
         let mut code = original.to_le_bytes().to_vec();
-        let (trampoline, trapped) =
-            litebox_syscall_rewriter::patch_code_segment(&mut code, 0x1000, 0x400000, 0).unwrap();
+        let (trampoline, trapped) = patch_aarch64_code_segment_contiguous(
+            &mut code,
+            0x1000,
+            0x400000,
+            0,
+            litebox_syscall_rewriter::RewriteOptions::default(),
+        )
+        .unwrap();
         assert_eq!(trapped, []);
         let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
         for (index, reg) in context.uc_mcontext.regs.iter_mut().enumerate() {
@@ -2229,14 +2242,9 @@ mod tests {
             true,
         );
         let mut code = 0xaa12_03f2u32.to_le_bytes().to_vec(); // mov x18, x18
-        let (trampoline, _) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let (trampoline, _) =
+            patch_aarch64_code_segment_contiguous(&mut code, SITE as u64, 0x400000, 0, options)
+                .unwrap();
 
         let mut saved = PtRegs::default();
         saved.regs[16] = SAVED_ANCHOR;
@@ -2447,14 +2455,9 @@ mod tests {
         );
         // stp x18, x19, [sp, #-16]!
         let mut code = 0xa9bf_4ff2u32.to_le_bytes().to_vec();
-        let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let (trampoline, trapped) =
+            patch_aarch64_code_segment_contiguous(&mut code, SITE as u64, 0x400000, 0, options)
+                .unwrap();
         assert_eq!(trapped, []);
 
         let gate =
@@ -2582,14 +2585,9 @@ mod tests {
             (0xd65f_0240, "RET X18", false),
         ] {
             let mut code = word.to_le_bytes().to_vec();
-            let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
-                &mut code,
-                SITE as u64,
-                0x400000,
-                0,
-                options,
-            )
-            .unwrap();
+            let (trampoline, trapped) =
+                patch_aarch64_code_segment_contiguous(&mut code, SITE as u64, 0x400000, 0, options)
+                    .unwrap();
             assert_eq!(trapped, []);
 
             let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
@@ -2652,14 +2650,9 @@ mod tests {
             true,
         );
         let mut code = 0xaa12_03f2u32.to_le_bytes().to_vec(); // mov x18, x18
-        let (trampoline, trapped) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let (trampoline, trapped) =
+            patch_aarch64_code_segment_contiguous(&mut code, SITE as u64, 0x400000, 0, options)
+                .unwrap();
         assert_eq!(trapped, []);
         let mut context: libc::ucontext_t = unsafe { core::mem::zeroed() };
         context.uc_mcontext.pc = SLOT as u64;
@@ -2697,14 +2690,9 @@ mod tests {
             true,
         );
         let mut code = 0x3500_0332u32.to_le_bytes().to_vec();
-        let (trampoline, _) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let (trampoline, _) =
+            patch_aarch64_code_segment_contiguous(&mut code, SITE as u64, 0x400000, 0, options)
+                .unwrap();
 
         let mut saved = PtRegs::default();
         saved.regs[16] = 0x1616;
@@ -2786,14 +2774,9 @@ mod tests {
             true,
         );
         let mut code = 0x1000_0072u32.to_le_bytes().to_vec(); // adr x18, +0xc
-        let (trampoline, _) = litebox_syscall_rewriter::patch_code_segment_with_options(
-            &mut code,
-            SITE as u64,
-            0x400000,
-            0,
-            options,
-        )
-        .unwrap();
+        let (trampoline, _) =
+            patch_aarch64_code_segment_contiguous(&mut code, SITE as u64, 0x400000, 0, options)
+                .unwrap();
 
         let mut saved = PtRegs::default();
         saved.regs[16] = 0x1616;
@@ -3048,11 +3031,12 @@ mod tests {
         let mut second_slot = second_slot[16..80].to_vec();
         let first_slot = trampoline[16..80].to_vec();
         let mut source = 0xd400_0001u32.to_le_bytes();
-        let (relocated, trapped) = litebox_syscall_rewriter::patch_code_segment(
+        let (relocated, trapped) = patch_aarch64_code_segment_contiguous(
             &mut source,
             0x1000,
             second_start as u64 - 16,
             0,
+            litebox_syscall_rewriter::RewriteOptions::default(),
         )
         .unwrap();
         assert_eq!(trapped, []);

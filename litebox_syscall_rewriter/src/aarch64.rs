@@ -39,7 +39,8 @@
 //!
 //! ELF callers must finalize placeholders with [`finalize_trampoline_gates`]
 //! (Linux without x18) or [`finalize_trampoline_gates_for_host`] before execution.
-//! [`crate::macho::Rewriter::patch_code_segment`] returns finalized gates.
+//! [`crate::macho::Rewriter::patch_code_segment`] returns finalized
+//! sub-trampolines.
 //! Unpatched gates can corrupt host memory without faulting.
 //!
 //! ## Gate scratch storage
@@ -98,14 +99,14 @@
 //!
 //! ### Sub-trampolines
 //!
-//! An ELF's gates are emitted as one or more *sub-trampolines*, each a
-//! callback header followed by slots at a page-aligned address; see
-//! `hook_split_aarch64_with_code_ranges`. A slot references only its own
-//! sub-trampoline's header, so each sub-trampoline is installed independently
-//! and recovery needs only the interrupted PC. Gates fill the object's
-//! inter-segment holes before the space past its last segment, and each
-//! sub-trampoline is capped at [`MAX_SUB_TRAMPOLINE_BYTES`]. The file format is
-//! described at [`crate::parse_aarch64_trampoline_footer`].
+//! An ELF's or Mach-O's gates are emitted as one or more *sub-trampolines*,
+//! each a callback header followed by slots at a page-aligned address; see
+//! `hook_split_aarch64_with_code_ranges` and `hook_split_macho`. A slot
+//! references only its own sub-trampoline's header, so each sub-trampoline is
+//! installed independently and recovery needs only the interrupted PC. Gates
+//! fill the object's inter-segment holes before the space past its last
+//! segment, and each sub-trampoline is capped at [`MAX_SUB_TRAMPOLINE_BYTES`].
+//! The file format is described at [`crate::parse_aarch64_trampoline_footer`].
 //!
 //! `rt_sigreturn` needs no gate: the runtime installs its own trampoline
 //! address into the signal frame, and an absolute address is reachable
@@ -3199,33 +3200,46 @@ fn find_patch_sites_with_code_ranges(
 // Main hooking entry point
 // ============================================================
 
-/// Outcome of rewriting one AArch64 image's patch sites.
+/// One-trampoline view of [`hook_split_aarch64_with_code_ranges`] for unit
+/// tests: every gate in one sub-trampoline at `trampoline_base_addr`.
+#[cfg(test)]
 pub(crate) struct HookOutcome {
-    /// Emitted gates, including the callback header.
+    /// The sub-trampoline's header and gates; just the header when every site
+    /// was trapped.
     pub trampoline: Vec<u8>,
-    /// Virtual addresses of patch sites replaced with a trap instead of a
-    /// redirect, because the inbound `B` or one of the gate's own branches fell
-    /// outside ±128MB. A non-empty list means the rewrite is incomplete: those
-    /// sites fault at runtime rather than entering the trampoline.
+    /// See [`SplitHookOutcome::trapped_sites`].
     pub trapped_sites: Vec<u64>,
 }
 
-/// Hook all `SVC #imm`, `MSR TPIDR_EL0` writes, and `MRS TPIDR_EL0` reads in an
-/// AArch64 ELF image. (`MRS XZR, TPIDR_EL0` is a discarded read and is left
-/// native — see the module docs.)
-///
-/// `buf` is patched in place. `trampoline_base_addr` is the virtual address the
-/// trampoline will be mapped at; `callback` is the absolute address stored in
-/// the callback slot (0 if the loader fills it in later).
-///
-/// Returns `Ok(None)` when the image contains no patch sites. Signal returns
-/// are handled by the runtime rather than a per-binary gate, so a syscall-free
-/// binary needs no trampoline at all.
-///
-/// Otherwise returns `Ok(Some(outcome))`. A site that cannot reach its gate, or
-/// whose gate cannot branch back, is replaced with a trap and listed in
-/// [`HookOutcome::trapped_sites`] so the caller can reject the incomplete
-/// rewrite, mirroring the x86-64 unpatchable-syscall path.
+#[cfg(test)]
+impl HookOutcome {
+    fn from_split(outcome: SplitHookOutcome, callback: u64) -> Self {
+        let trampoline = match <[SubTrampoline; 1]>::try_from(outcome.trampolines) {
+            Ok([sub]) => sub.data,
+            Err(subs) => {
+                assert!(subs.is_empty(), "expected one sub-trampoline");
+                let mut header = Vec::new();
+                emit_shared_prologue(&mut header, callback);
+                header
+            }
+        };
+        Self {
+            trampoline,
+            trapped_sites: outcome.trapped_sites,
+        }
+    }
+}
+
+/// The single space a unit test places its gates in.
+#[cfg(test)]
+fn test_space(trampoline_base_addr: u64) -> [TrampolineSpace; 1] {
+    [TrampolineSpace {
+        start: trampoline_base_addr,
+        end: None,
+    }]
+}
+
+/// Hooks `text_sections` into one sub-trampoline at `trampoline_base_addr`.
 #[cfg(test)]
 pub(crate) fn hook_syscalls_aarch64(
     buf: &mut [u8],
@@ -3234,43 +3248,22 @@ pub(crate) fn hook_syscalls_aarch64(
     callback: u64,
     config: RewriteConfig,
 ) -> Result<Option<HookOutcome>> {
-    hook_syscalls_aarch64_with_code_ranges(
+    Ok(hook_split_aarch64_with_code_ranges(
         buf,
-        text_sections,
-        text_sections,
-        trampoline_base_addr,
+        ScanSections {
+            executable: text_sections,
+            code: text_sections,
+        },
+        &test_space(trampoline_base_addr),
+        GATE_ALIGNMENT as u64,
         callback,
         config,
-    )
+    )?
+    .map(|outcome| HookOutcome::from_split(outcome, callback)))
 }
 
-#[cfg(any(test, target_arch = "aarch64"))]
-pub(crate) fn hook_syscalls_aarch64_with_code_ranges(
-    buf: &mut [u8],
-    executable_sections: &[TextSectionInfo],
-    code_sections: &[TextSectionInfo],
-    trampoline_base_addr: u64,
-    callback: u64,
-    config: RewriteConfig,
-) -> Result<Option<HookOutcome>> {
-    if !trampoline_base_addr.is_multiple_of(GATE_ALIGNMENT as u64) {
-        return Err(Error::AddressOverflow(format!(
-            "AArch64 trampoline base {trampoline_base_addr:#x} is not {GATE_ALIGNMENT}-byte aligned"
-        )));
-    }
-    let sites = find_patch_sites_with_code_ranges(executable_sections, code_sections, buf, config)?;
-
-    hook_sites(
-        buf,
-        &sites,
-        trampoline_base_addr,
-        callback,
-        config,
-        GateLayout::linux(config.host),
-    )
-}
-
-/// Rewrite Darwin SVC and TPIDRRO_EL0 accesses into trampoline gates.
+/// [`hook_syscalls_aarch64`] for Darwin sites; see [`hook_split_macho`].
+#[cfg(test)]
 pub(crate) fn hook_macho(
     buf: &mut [u8],
     sections: &[TextSectionInfo],
@@ -3278,17 +3271,15 @@ pub(crate) fn hook_macho(
     callback: u64,
     options: crate::RewriteOptions,
 ) -> Result<Option<HookOutcome>> {
-    let config = RewriteConfig::new(options.target_host(), false)
-        .with_host_thread_state_preservation(options.preserves_host_thread_state());
-    let sites = find_macho_patch_sites(sections, buf, !options.uses_native_guest_thread_pointer())?;
-    hook_sites(
+    Ok(hook_split_macho(
         buf,
-        &sites,
-        trampoline_base_addr,
+        sections,
+        &test_space(trampoline_base_addr),
+        GATE_ALIGNMENT as u64,
         callback,
-        config,
-        GateLayout::darwin(config.host),
-    )
+        options,
+    )?
+    .map(|outcome| HookOutcome::from_split(outcome, callback)))
 }
 
 fn find_macho_patch_sites(
@@ -3380,51 +3371,6 @@ pub(crate) fn macho_trampoline_size_upper_bound(
             .and_then(|size| size.checked_add(gate_bytes))
             .ok_or_else(|| Error::AddressOverflow("Mach-O trampoline size".into()))
     })
-}
-
-fn hook_sites(
-    buf: &mut [u8],
-    sites: &[PatchSite],
-    trampoline_base_addr: u64,
-    callback: u64,
-    config: RewriteConfig,
-    layout: GateLayout,
-) -> Result<Option<HookOutcome>> {
-    if !trampoline_base_addr.is_multiple_of(GATE_ALIGNMENT as u64) {
-        return Err(Error::AddressOverflow(
-            "unaligned AArch64 trampoline address".into(),
-        ));
-    }
-    if sites.is_empty() {
-        return Ok(None);
-    }
-
-    let mut trampoline_data: Vec<u8> = Vec::new();
-    emit_shared_prologue(&mut trampoline_data, callback);
-
-    let mut trapped_sites: Vec<u64> = Vec::new();
-
-    for site in sites {
-        // A gate whose inbound or own branches are out of range appends
-        // nothing; the site is trapped instead.
-        if let Some(b_insn) = emit_site_gate(
-            &mut trampoline_data,
-            trampoline_base_addr,
-            site,
-            config,
-            layout,
-        )? {
-            patch_branch(buf, site, b_insn);
-        } else {
-            trap_site(buf, site.file_offset);
-            trapped_sites.push(site.vaddr);
-        }
-    }
-
-    Ok(Some(HookOutcome {
-        trampoline: trampoline_data,
-        trapped_sites,
-    }))
 }
 
 /// Appends `site`'s gate to the sub-trampoline `trampoline_data`, whose callback
@@ -3573,7 +3519,11 @@ pub struct SubTrampoline {
 pub(crate) struct SplitHookOutcome {
     /// Non-empty sub-trampolines, in creation order.
     pub(crate) trampolines: Vec<SubTrampoline>,
-    /// Sites no space could serve; see [`HookOutcome::trapped_sites`].
+    /// Virtual addresses of patch sites replaced with a trap instead of a
+    /// redirect, because no space had room for the gate within reach of the
+    /// site's inbound `B` and the gate's own branches, or the site is an
+    /// unsupported x18 form. A non-empty list means the rewrite is incomplete:
+    /// those sites fault at runtime rather than entering a gate.
     pub(crate) trapped_sites: Vec<u64>,
 }
 
@@ -3607,9 +3557,48 @@ pub(crate) fn hook_split_aarch64_with_code_ranges(
     callback: u64,
     config: RewriteConfig,
 ) -> Result<Option<SplitHookOutcome>> {
-    let mut placer = SubTrampolinePlacer::new(spaces, granule, callback, config)?;
-    let mut sites =
-        find_patch_sites_with_code_ranges(sections.executable, sections.code, buf, config)?;
+    let placer = SubTrampolinePlacer::new(
+        spaces,
+        granule,
+        callback,
+        config,
+        GateLayout::linux(config.host),
+    )?;
+    let sites = find_patch_sites_with_code_ranges(sections.executable, sections.code, buf, config)?;
+    hook_split_sites(buf, sites, placer)
+}
+
+/// [`hook_split_aarch64_with_code_ranges`] for Darwin SVC and `TPIDRRO_EL0`
+/// sites, emitting Darwin-layout gates with a [`DARWIN_SVC_FRAME_BYTES`] SVC
+/// frame.
+pub(crate) fn hook_split_macho(
+    buf: &mut [u8],
+    sections: &[TextSectionInfo],
+    spaces: &[TrampolineSpace],
+    granule: u64,
+    callback: u64,
+    options: crate::RewriteOptions,
+) -> Result<Option<SplitHookOutcome>> {
+    let config = RewriteConfig::new(options.target_host(), false)
+        .with_host_thread_state_preservation(options.preserves_host_thread_state());
+    let placer = SubTrampolinePlacer::new(
+        spaces,
+        granule,
+        callback,
+        config,
+        GateLayout::darwin(config.host),
+    )?;
+    let sites = find_macho_patch_sites(sections, buf, !options.uses_native_guest_thread_pointer())?;
+    hook_split_sites(buf, sites, placer)
+}
+
+/// Places every site's gate with `placer`, patching each site with its inbound
+/// branch, or with a trap if no space can serve it.
+fn hook_split_sites(
+    buf: &mut [u8],
+    mut sites: Vec<PatchSite>,
+    mut placer: SubTrampolinePlacer,
+) -> Result<Option<SplitHookOutcome>> {
     if sites.is_empty() {
         return Ok(None);
     }
@@ -3679,6 +3668,7 @@ impl SubTrampolinePlacer {
         granule: u64,
         callback: u64,
         config: RewriteConfig,
+        layout: GateLayout,
     ) -> Result<Self> {
         Ok(Self {
             spaces: normalize_spaces(spaces, granule)?
@@ -3689,7 +3679,7 @@ impl SubTrampolinePlacer {
             granule,
             callback,
             config,
-            layout: GateLayout::linux(config.host),
+            layout,
         })
     }
 
@@ -8321,7 +8311,7 @@ mod tests {
                     preserve_host_thread_state: false,
                 },
             ),
-            Err(Error::AddressOverflow(_))
+            Err(Error::InvalidTrampolineSpace(_))
         ));
     }
 
@@ -9118,20 +9108,6 @@ mod tests {
     fn svc_sites_beyond_one_callback_literal_reach_split() {
         let count = MAX_SUB_TRAMPOLINE_BYTES / SVC_SLOT_BYTES + 8;
         let words = vec![SVC_0; count];
-        let mut unsplit = words
-            .iter()
-            .flat_map(|word| word.to_le_bytes())
-            .collect::<Vec<u8>>();
-        let sections = vec![TextSectionInfo {
-            vaddr: 0x1000,
-            file_offset: 0,
-            size: unsplit.len() as u64,
-        }];
-        assert!(matches!(
-            hook_syscalls_aarch64(&mut unsplit, &sections, 0x400000, 0, linux_config()),
-            Err(Error::AddressOverflow(_))
-        ));
-
         let spaces = [TrampolineSpace {
             start: 0x40_0000,
             end: None,

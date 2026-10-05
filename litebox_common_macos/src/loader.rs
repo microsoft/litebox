@@ -48,16 +48,6 @@ struct UnixThreadCommand64 {
     state: Aarch64ThreadState64,
 }
 
-/// On-disk AOT footer, with explicitly little-endian fields.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
-struct TrampolineHeader64 {
-    magic: [u8; 8],
-    file_offset: U64<LittleEndian>,
-    vaddr: U64<LittleEndian>,
-    trampoline_size: U64<LittleEndian>,
-}
-
 /// Shared admission limit for runner reads, shim snapshots and parsed virtual spans.
 pub const MAX_IMAGE_SIZE: usize = 256 * 1024 * 1024;
 
@@ -97,10 +87,12 @@ pub struct MachoParsedFile {
     pub is_dyld: bool,
 }
 
-/// AOT trampoline payload described by the rewriter's 64-bit footer.
+/// One AOT sub-trampoline described by the rewriter's table: a callback header
+/// followed by gates, mapped and finalized independently of the others.
 #[derive(Debug)]
 pub struct TrampolineInfo {
     pub file_range: Range<usize>,
+    /// Page-aligned pages the sub-trampoline occupies, unslid.
     pub virtual_range: Range<usize>,
 }
 
@@ -133,73 +125,70 @@ pub fn may_contain_arm64_macho(data: &[u8]) -> bool {
 }
 
 impl MachoParsedFile {
-    /// Validate the rewriter's AOT footer and include the trampoline in the
-    /// image reservation so code and gates receive the same slide.
-    /// `None` means the rewriter processed an image with no patch sites.
+    /// Validate the rewriter's AOT sub-trampoline table (see
+    /// [`litebox_syscall_rewriter::parse_aarch64_trampoline_footer`]) and
+    /// include every sub-trampoline in the image reservation so code and gates
+    /// receive the same slide. Sub-trampolines occupy pages disjoint from the
+    /// segments; the table's 4 KiB page rule keeps 16 KiB-aligned regions off
+    /// each other's pages. An empty list means the rewriter
+    /// processed an image with no patch sites.
     pub fn parse_trampoline(
         &mut self,
         data: &[u8],
-    ) -> Result<Option<TrampolineInfo>, MachoLoaderError> {
-        let footer_start = data
-            .len()
-            .checked_sub(size_of::<TrampolineHeader64>())
+    ) -> Result<Vec<TrampolineInfo>, MachoLoaderError> {
+        use litebox_syscall_rewriter::{
+            AARCH64_TRAMPOLINE_FOOTER_BYTES, parse_aarch64_trampoline_footer,
+            parse_aarch64_trampoline_table,
+        };
+        let footer = data
+            .last_chunk::<AARCH64_TRAMPOLINE_FOOTER_BYTES>()
             .ok_or(MachoLoaderError::Unrewritten)?;
-        let header = TrampolineHeader64::read_from_bytes(&data[footer_start..])
-            .map_err(|_| MachoLoaderError::Rewrite)?;
-        if header.magic != *litebox_syscall_rewriter::TRAMPOLINE_MAGIC {
-            return Err(if header.magic.starts_with(b"LITEBOX") {
-                MachoLoaderError::Rewrite
-            } else {
-                MachoLoaderError::Unrewritten
+        let location = parse_aarch64_trampoline_footer(footer, data.len() as u64)
+            .map_err(|_| MachoLoaderError::Rewrite)?
+            .ok_or(MachoLoaderError::Unrewritten)?;
+        // The footer check bounds the table to the file.
+        let table_start =
+            usize::try_from(location.file_offset).map_err(|_| MachoLoaderError::Rewrite)?;
+        let regions =
+            parse_aarch64_trampoline_table(&data[table_start..][..location.len], location)
+                .map_err(|_| MachoLoaderError::Rewrite)?;
+        if self.segments.iter().any(|s| s.file_range.end > table_start) {
+            return Err(MachoLoaderError::Rewrite);
+        }
+        let mut trampolines = Vec::with_capacity(regions.len());
+        let mut span = self.virtual_range.clone();
+        for region in regions {
+            let usize_of =
+                |value: u64| usize::try_from(value).map_err(|_| MachoLoaderError::Rewrite);
+            let file_offset = usize_of(region.file_offset)?;
+            let address = usize_of(region.vaddr)?;
+            let size = usize_of(region.size)?;
+            let end = address
+                .checked_add(size)
+                .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+                .ok_or(MachoLoaderError::Rewrite)?;
+            if !file_offset.is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT)
+                || !address.is_multiple_of(PAGE_SIZE)
+                || size < litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT
+                || !size.is_multiple_of(size_of::<u32>())
+                || self.segments.iter().any(|s| {
+                    s.file_range.end > file_offset
+                        || (address < s.virtual_range.end && s.virtual_range.start < end)
+                })
+            {
+                return Err(MachoLoaderError::Rewrite);
+            }
+            span = span.start.min(address)..span.end.max(end);
+            trampolines.push(TrampolineInfo {
+                file_range: file_offset..file_offset + size,
+                virtual_range: address..end,
             });
         }
-        let file_offset =
-            usize::try_from(header.file_offset.get()).map_err(|_| MachoLoaderError::Rewrite)?;
-        let address = usize::try_from(header.vaddr.get()).map_err(|_| MachoLoaderError::Rewrite)?;
-        let size =
-            usize::try_from(header.trampoline_size.get()).map_err(|_| MachoLoaderError::Rewrite)?;
-        if self
-            .segments
-            .iter()
-            .any(|s| s.file_range.end > footer_start)
-        {
-            return Err(MachoLoaderError::Rewrite);
-        }
-        if size == 0 {
-            return if file_offset == 0 && address == 0 {
-                Ok(None)
-            } else {
-                Err(MachoLoaderError::Rewrite)
-            };
-        }
-        let file_end = file_offset
-            .checked_add(size)
-            .ok_or(MachoLoaderError::Rewrite)?;
-        let end = address
-            .checked_add(size)
-            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
-            .ok_or(MachoLoaderError::Rewrite)?;
-        if !file_offset.is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT)
-            || !address.is_multiple_of(PAGE_SIZE)
-            || size < litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT
-            || !size.is_multiple_of(size_of::<u32>())
-            || file_end != footer_start
-            || self.segments.iter().any(|s| {
-                s.file_range.end > file_offset
-                    || (address < s.virtual_range.end && s.virtual_range.start < end)
-            })
-        {
-            return Err(MachoLoaderError::Rewrite);
-        }
-        let span = self.virtual_range.start.min(address)..self.virtual_range.end.max(end);
         if span.len() > MAX_IMAGE_SIZE {
             return Err(MachoLoaderError::Rewrite);
         }
         self.virtual_range = span;
-        Ok(Some(TrampolineInfo {
-            file_range: file_offset..file_end,
-            virtual_range: address..end,
-        }))
+        Ok(trampolines)
     }
 
     pub fn parse(data: &[u8]) -> Result<Self, MachoLoaderError> {
@@ -885,88 +874,101 @@ mod tests {
         }
     }
 
+    /// Appends sub-trampolines of `size` bytes at each `vaddr`, then the
+    /// table and footer, returning the table's offset.
+    fn append_trampolines(data: &mut Vec<u8>, regions: &[(u64, usize)]) -> usize {
+        let mut table = Vec::new();
+        for &(vaddr, size) in regions {
+            data.resize(data.len().next_multiple_of(TRAMPOLINE_FILE_ALIGNMENT), 0);
+            for value in [data.len() as u64, vaddr, size as u64] {
+                table.extend_from_slice(&value.to_le_bytes());
+            }
+            data.resize(data.len() + size, 0);
+        }
+        let table_offset = data.len();
+        data.extend_from_slice(&table);
+        data.extend_from_slice(litebox_syscall_rewriter::TRAMPOLINE_MAGIC);
+        for value in [table_offset as u64, regions.len() as u64, 0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        table_offset
+    }
+
     #[test]
-    fn trampoline_footer_is_bounded_and_disjoint() {
+    fn trampoline_table_is_bounded_and_disjoint() {
         const TRAMPOLINE_BYTES: usize = litebox_syscall_rewriter::aarch64::GATE_ALIGNMENT;
-        let mut data = image();
-        let file_offset = data.len();
-        data.extend_from_slice(&[0u8; TRAMPOLINE_BYTES]);
-        let header = TrampolineHeader64 {
-            magic: *litebox_syscall_rewriter::TRAMPOLINE_MAGIC,
-            file_offset: (file_offset as u64).into(),
-            vaddr: (IMAGE_BASE + PAGE_SIZE as u64).into(),
-            trampoline_size: (TRAMPOLINE_BYTES as u64).into(),
-        };
-        let footer = data.len();
-        data.extend_from_slice(header.as_bytes());
-        let mut plan = MachoParsedFile::parse(&data).unwrap();
-        let trampoline = plan.parse_trampoline(&data).unwrap().unwrap();
-        assert_eq!(
-            trampoline.file_range,
-            file_offset..file_offset + TRAMPOLINE_BYTES
-        );
+        const PAGE: u64 = PAGE_SIZE as u64;
         let base = usize::try_from(IMAGE_BASE).unwrap();
-        assert_eq!(plan.virtual_range, base..base + 2 * PAGE_SIZE);
-        for invalid_header in [
-            TrampolineHeader64 {
-                file_offset: 1.into(),
-                ..header
-            },
-            TrampolineHeader64 {
-                file_offset: 0.into(),
-                ..header
-            },
-            TrampolineHeader64 {
-                vaddr: IMAGE_BASE.into(),
-                ..header
-            },
-            TrampolineHeader64 {
-                vaddr: u64::MAX.into(),
-                ..header
-            },
-            TrampolineHeader64 {
-                trampoline_size: ((TRAMPOLINE_BYTES - 1) as u64).into(),
-                ..header
-            },
-            TrampolineHeader64 {
-                trampoline_size: ((TRAMPOLINE_BYTES + size_of::<u32>()) as u64).into(),
-                ..header
-            },
-            TrampolineHeader64 {
-                magic: *b"LITEBOX9",
-                ..header
-            },
+        let mut data = image();
+        let table = append_trampolines(
+            &mut data,
+            &[
+                (IMAGE_BASE + 3 * PAGE, TRAMPOLINE_BYTES),
+                (IMAGE_BASE + PAGE, TRAMPOLINE_BYTES * 2),
+            ],
+        );
+        let mut plan = MachoParsedFile::parse(&data).unwrap();
+        let trampolines = plan.parse_trampoline(&data).unwrap();
+        assert_eq!(trampolines.len(), 2);
+        assert_eq!(
+            trampolines[0].file_range,
+            PAGE_SIZE..PAGE_SIZE + TRAMPOLINE_BYTES
+        );
+        assert_eq!(
+            trampolines[0].virtual_range,
+            base + 3 * PAGE_SIZE..base + 4 * PAGE_SIZE
+        );
+        assert_eq!(
+            trampolines[1].virtual_range,
+            base + PAGE_SIZE..base + 2 * PAGE_SIZE
+        );
+        assert_eq!(plan.virtual_range, base..base + 4 * PAGE_SIZE);
+
+        // Rules beyond the shared table format, which the rewriter's parser
+        // tests cover: Mach-O pages are 16 KiB, and a region must neither
+        // overlap the image's segments nor push the image past its limit.
+        let entry = |index: usize, field: usize| table + index * 24 + field * 8;
+        for (offset, value) in [
+            // 4 KiB-aligned but not 16 KiB-aligned.
+            (entry(0, 1), IMAGE_BASE + 3 * PAGE + 0x1000),
+            // Inside the image's only segment.
+            (entry(0, 1), IMAGE_BASE),
+            // Beyond the image limit.
+            (entry(0, 1), IMAGE_BASE + MAX_IMAGE_SIZE as u64),
+            // File bytes inside the segment's file range.
+            (entry(0, 0), 0),
+            // Smaller than one gate slot.
+            (entry(0, 2), (TRAMPOLINE_BYTES - 4) as u64),
         ] {
             let mut invalid = data.clone();
-            invalid[footer..].copy_from_slice(invalid_header.as_bytes());
+            invalid[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
             assert!(
                 MachoParsedFile::parse(&invalid)
                     .unwrap()
                     .parse_trampoline(&invalid)
-                    .is_err()
+                    .is_err(),
+                "accepted {value:#x} at {offset:#x}"
             );
         }
+        let footer = data.len() - 32;
+        let mut unknown = data.clone();
+        unknown[footer..footer + 8].copy_from_slice(b"LITEBOX9");
+        assert!(matches!(
+            MachoParsedFile::parse(&unknown)
+                .unwrap()
+                .parse_trampoline(&unknown),
+            Err(MachoLoaderError::Rewrite)
+        ));
+
         let raw = image();
         assert!(matches!(
             MachoParsedFile::parse(&raw).unwrap().parse_trampoline(&raw),
             Err(MachoLoaderError::Unrewritten)
         ));
-        let mut sentinel = raw;
-        sentinel.extend_from_slice(
-            TrampolineHeader64 {
-                magic: *litebox_syscall_rewriter::TRAMPOLINE_MAGIC,
-                file_offset: 0.into(),
-                vaddr: 0.into(),
-                trampoline_size: 0.into(),
-            }
-            .as_bytes(),
-        );
-        assert!(
-            MachoParsedFile::parse(&sentinel)
-                .unwrap()
-                .parse_trampoline(&sentinel)
-                .unwrap()
-                .is_none()
-        );
+        let mut empty = raw;
+        append_trampolines(&mut empty, &[]);
+        let mut plan = MachoParsedFile::parse(&empty).unwrap();
+        assert!(plan.parse_trampoline(&empty).unwrap().is_empty());
+        assert_eq!(plan.virtual_range, base..base + PAGE_SIZE);
     }
 }

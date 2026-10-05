@@ -96,7 +96,7 @@ fn protect<P: ShimPlatform>(
 struct Image<'a> {
     data: Cow<'a, [u8]>,
     plan: MachoParsedFile,
-    trampoline: Option<TrampolineInfo>,
+    trampolines: Vec<TrampolineInfo>,
 }
 
 impl<'a> Image<'a> {
@@ -106,11 +106,11 @@ impl<'a> Image<'a> {
     ) -> Result<Self, MachoLoaderError> {
         let data = arm64_slice(data)?;
         let mut plan = MachoParsedFile::parse(data)?;
-        let (data, trampoline) = match plan.parse_trampoline(data) {
+        let (data, trampolines) = match plan.parse_trampoline(data) {
             Ok(_) if plan.is_dyld => {
                 return Err(MachoLoaderError::Unsupported("pre-rewritten dyld"));
             }
-            Ok(trampoline) => (Cow::Borrowed(data), trampoline),
+            Ok(trampolines) => (Cow::Borrowed(data), trampolines),
             Err(MachoLoaderError::Unrewritten) => {
                 // Only absent rewrite metadata permits rewriting; invalid metadata is an error.
                 let rewritten = match dyld_thread_pointer {
@@ -131,8 +131,8 @@ impl<'a> Image<'a> {
                 }
                 .map_err(|_| MachoLoaderError::Rewrite)?;
                 plan = MachoParsedFile::parse(&rewritten)?;
-                let trampoline = plan.parse_trampoline(&rewritten)?;
-                (Cow::Owned(rewritten), trampoline)
+                let trampolines = plan.parse_trampoline(&rewritten)?;
+                (Cow::Owned(rewritten), trampolines)
             }
             Err(error) => return Err(error),
         };
@@ -140,7 +140,7 @@ impl<'a> Image<'a> {
         Ok(Self {
             data,
             plan,
-            trampoline,
+            trampolines,
         })
     }
 
@@ -148,9 +148,11 @@ impl<'a> Image<'a> {
         let platform = task.global.platform;
         let rewriter = Rewriter::new(crate::aarch64_rewrite_options().target_host())
             .map_err(|_| MachoLoaderError::Rewrite)?;
-        // Callback and TLS-offset placeholders must be resolved before gates become executable.
-        let gates = if let Some(trampoline) = &self.trampoline {
-            let mut gates = self.data[trampoline.file_range.clone()].to_vec();
+        // Callback and TLS-offset placeholders must be resolved before gates
+        // become executable. Each sub-trampoline has its own callback header.
+        let gates = if self.trampolines.is_empty() {
+            Vec::new()
+        } else {
             let callback = platform.get_syscall_entry_point();
             if callback == 0 {
                 return Err(MachoLoaderError::Rewrite);
@@ -159,13 +161,17 @@ impl<'a> Image<'a> {
                 .guest_thread_pointer_offset()
                 .and_then(|offset| u16::try_from(offset).ok())
                 .ok_or(MachoLoaderError::Rewrite)?;
-            gates[..size_of::<usize>()].copy_from_slice(&callback.to_le_bytes());
-            rewriter
-                .finalize_trampoline_gates(&mut gates, tls_offset)
-                .map_err(|_| MachoLoaderError::Rewrite)?;
-            gates
-        } else {
-            Vec::new()
+            self.trampolines
+                .iter()
+                .map(|trampoline| {
+                    let mut gates = self.data[trampoline.file_range.clone()].to_vec();
+                    gates[..size_of::<usize>()].copy_from_slice(&callback.to_le_bytes());
+                    rewriter
+                        .finalize_trampoline_gates(&mut gates, tls_offset)
+                        .map_err(|_| MachoLoaderError::Rewrite)?;
+                    Ok(gates)
+                })
+                .collect::<Result<Vec<_>, MachoLoaderError>>()?
         };
         // TODO: support images requiring preferred-address placement (without
         // replacing host mappings) or rebasing when slid.
@@ -200,7 +206,7 @@ impl<'a> Image<'a> {
                 };
             protect(task, range, final_protection)?;
         }
-        if let Some(trampoline) = &self.trampoline {
+        for (trampoline, gates) in self.trampolines.iter().zip(&gates) {
             let start = relocate(trampoline.virtual_range.start);
             let range = start..start + trampoline.virtual_range.len();
             protect(
@@ -209,7 +215,7 @@ impl<'a> Image<'a> {
                 VmProtection::READ | VmProtection::WRITE,
             )?;
             P::RawMutPointer::<u8>::from_usize(start)
-                .copy_from_slice(0, &gates)
+                .copy_from_slice(0, gates)
                 .ok_or(MachoLoaderError::Memory)?;
             protect(task, range, VmProtection::READ | VmProtection::EXECUTE)?;
         }

@@ -156,7 +156,7 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
 
-/// Most sub-trampolines an AArch64 ELF footer may describe.
+/// Most sub-trampolines an AArch64 ELF or Mach-O footer may describe.
 pub const MAX_AARCH64_TRAMPOLINE_REGIONS: usize = 4096;
 
 /// Required file alignment of the appended trampoline payload.
@@ -317,7 +317,7 @@ struct TrampolineHeader64 {
     trampoline_size: u64,
 }
 
-/// One entry of an AArch64 ELF's sub-trampoline table; see
+/// One entry of an AArch64 ELF or Mach-O sub-trampoline table; see
 /// [`parse_aarch64_trampoline_footer`].
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, Immutable)]
@@ -327,7 +327,7 @@ struct Aarch64TrampolineTableEntry64 {
     size: U64,
 }
 
-/// Footer of an AArch64 ELF; see [`parse_aarch64_trampoline_footer`].
+/// Footer of an AArch64 ELF or Mach-O; see [`parse_aarch64_trampoline_footer`].
 #[repr(C)]
 #[derive(FromBytes, IntoBytes, Immutable)]
 struct Aarch64TrampolineFooter64 {
@@ -337,7 +337,7 @@ struct Aarch64TrampolineFooter64 {
     reserved: U64,
 }
 
-/// Size of an AArch64 ELF's footer.
+/// Size of an AArch64 ELF or Mach-O footer.
 pub const AARCH64_TRAMPOLINE_FOOTER_BYTES: usize = size_of::<Aarch64TrampolineFooter64>();
 
 /// Metadata about an executable section, extracted from a read-only object parse.
@@ -1138,7 +1138,7 @@ fn hook_aarch64_elf_in_spaces(
     Ok(out)
 }
 
-fn unpatchable_aarch64_sites(trapped_sites: &[u64]) -> Error {
+pub(crate) fn unpatchable_aarch64_sites(trapped_sites: &[u64]) -> Error {
     Error::UnpatchableSyscalls(format!(
         "{} unpatchable AArch64 patch site(s) (SVC / TPIDR_EL0 / x18) at {:?}",
         trapped_sites.len(),
@@ -1146,9 +1146,9 @@ fn unpatchable_aarch64_sites(trapped_sites: &[u64]) -> Error {
     ))
 }
 
-/// Appends sub-trampolines, their table, and the AArch64 ELF footer described
-/// at [`parse_aarch64_trampoline_footer`].
-fn append_aarch64_trampolines(
+/// Appends sub-trampolines, their table, and the AArch64 ELF or Mach-O footer
+/// described at [`parse_aarch64_trampoline_footer`].
+pub(crate) fn append_aarch64_trampolines(
     out: &mut Vec<u8>,
     trampolines: &[aarch64::SubTrampoline],
 ) -> Result<()> {
@@ -1221,12 +1221,13 @@ fn text_sections(
     Ok(text_sections)
 }
 
-/// One independently mapped sub-trampoline of an AArch64 ELF.
+/// One independently mapped sub-trampoline of an AArch64 ELF or Mach-O.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrampolineRegion {
     /// File offset of the region's bytes.
     pub file_offset: u64,
-    /// Virtual address the region is mapped at (object-relative for `ET_DYN`).
+    /// Virtual address the region is mapped at (object-relative for `ET_DYN`,
+    /// unslid for Mach-O).
     pub vaddr: u64,
     /// Size of the region's bytes.
     pub size: u64,
@@ -1252,7 +1253,7 @@ pub enum TrampolineTableError {
     Malformed,
 }
 
-/// Where an AArch64 ELF's sub-trampoline table lies in the file.
+/// Where an AArch64 ELF or Mach-O sub-trampoline table lies in the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrampolineTableLocation {
     /// File offset of the table.
@@ -1261,12 +1262,12 @@ pub struct TrampolineTableLocation {
     pub len: usize,
 }
 
-/// Parses the footer that ends a `file_len`-byte AArch64 ELF the rewriter has
-/// processed, returning where its sub-trampoline table lies, or `None` if the
-/// file carries no LiteBox trailer.
+/// Parses the footer that ends a `file_len`-byte AArch64 ELF or thin Mach-O
+/// the rewriter has processed, returning where its sub-trampoline table lies,
+/// or `None` if the file carries no LiteBox trailer.
 ///
 /// The file layout is
-/// `[ELF][padding][sub 0][padding][sub 1]...[sub N-1][table][footer]`, all
+/// `[image][padding][sub 0][padding][sub 1]...[sub N-1][table][footer]`, all
 /// little-endian. The 32-byte footer is
 /// `(TRAMPOLINE_MAGIC, table_file_offset, N, 0)`, and the table that ends at it
 /// holds `N` 24-byte `(file_offset, vaddr, size)` entries in file order; see
@@ -1364,7 +1365,7 @@ pub fn parse_aarch64_trampoline_table(
     Ok(regions)
 }
 
-/// The sub-trampolines of a whole rewritten AArch64 ELF, or `None` if it
+/// The sub-trampolines of a whole rewritten AArch64 ELF or Mach-O, or `None` if it
 /// carries no LiteBox trailer; see [`parse_aarch64_trampoline_footer`].
 ///
 /// # Errors
@@ -1906,34 +1907,23 @@ fn rel32_bytes(target: u64, base: u64, context: &'static str) -> Result<[u8; 4]>
     Ok(disp.to_le_bytes())
 }
 
-/// Runtime counterpart to [`hook_syscalls_in_elf`], operating on one
+/// Runtime counterpart to [`hook_syscalls_in_elf`] on x86-64, operating on one
 /// already-mapped code region. The caller makes the region writable before
 /// calling and restores permissions afterwards.
 ///
-/// The region is rewritten for the architecture this crate is running on.
-/// `syscall_entry_addr` means:
-/// * x86-64: the address of the shared [`TRAMPOLINE_ENTRY_POINT_BYTES`]-sized
-///   slot the caller placed at the trampoline base, which holds the callback.
-/// * AArch64: the callback address itself; the emitter writes its callback slot.
-///
-/// TODO: give both architectures the same meaning -- always the callback
-/// address -- once the x86-64 stubs branch directly rather than through the
-/// slot. Drop this list when `TRAMPOLINE_ENTRY_POINT_BYTES` is zero on every
-/// supported architecture.
+/// `syscall_entry_addr` is the address of the shared
+/// [`TRAMPOLINE_ENTRY_POINT_BYTES`]-sized slot the caller placed at the
+/// trampoline base, which holds the callback. x86-64 stubs are small and reach
+/// the whole `rel32` range, so one trampoline serves every region. AArch64
+/// splits its gates into sub-trampolines instead; see
+/// [`patch_aarch64_code_segment_in_spaces`].
 ///
 /// # Returns
 ///
 /// `(trampoline_stubs, unredirected_addrs)`, both empty if `code` has no
 /// patchable instructions. The caller must copy the stubs to
-/// `trampoline_write_vaddr`. On x86-64 the addresses were left native; on
-/// AArch64 they were overwritten with `BRK`.
-///
-/// # Caller obligations on AArch64
-///
-/// The I-cache is not coherent with the D-cache, so the caller **must**
-/// synchronize the instruction stream over the patched `code` and the written
-/// stubs before either is fetched, and must pass the emitted gates through
-/// [`aarch64::finalize_trampoline_gates`]. Neither omission fails cleanly.
+/// `trampoline_write_vaddr`. The unredirected addresses were left native.
+#[cfg(target_arch = "x86_64")]
 pub fn patch_code_segment(
     code: &mut [u8],
     code_vaddr: u64,
@@ -1949,7 +1939,8 @@ pub fn patch_code_segment(
     )
 }
 
-/// Runtime code-segment rewriting with explicit architecture-specific options.
+/// [`patch_code_segment`] with explicit options, which x86-64 ignores.
+#[cfg(target_arch = "x86_64")]
 pub fn patch_code_segment_with_options(
     code: &mut [u8],
     code_vaddr: u64,
@@ -1957,28 +1948,11 @@ pub fn patch_code_segment_with_options(
     syscall_entry_addr: u64,
     options: RewriteOptions,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let _ = options;
-        patch_x86_64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        patch_aarch64_code_segment(
-            code,
-            code_vaddr,
-            trampoline_write_vaddr,
-            syscall_entry_addr,
-            options,
-        )
-    }
+    let _ = options;
+    patch_x86_64_code_segment(code, code_vaddr, trampoline_write_vaddr, syscall_entry_addr)
 }
 
-/// [`patch_code_segment`] for an x86-64 host.
-///
-/// The emitted stubs jump *indirectly* through a shared 8-byte slot the caller
-/// places once per trampoline allocation, so `syscall_entry_addr` is the
-/// address of that slot.
+/// [`patch_code_segment`]'s implementation.
 #[cfg(target_arch = "x86_64")]
 fn patch_x86_64_code_segment(
     code: &mut [u8],
@@ -2011,38 +1985,6 @@ fn patch_x86_64_code_segment(
         Err(InternalError::Public(e)) => Err(e),
         Err(e) => unreachable!("unexpected internal error: {e:?}"),
     }
-}
-
-/// [`patch_code_segment`] for an AArch64 host, where `syscall_entry_addr` is
-/// the callback address itself, not a slot holding it.
-///
-/// The caller must pass the returned gates through
-/// [`aarch64::finalize_trampoline_gates`] before making them executable.
-#[cfg(any(test, target_arch = "aarch64"))]
-fn patch_aarch64_code_segment(
-    code: &mut [u8],
-    code_vaddr: u64,
-    trampoline_write_vaddr: u64,
-    syscall_entry_addr: u64,
-    options: RewriteOptions,
-) -> Result<(Vec<u8>, Vec<u64>)> {
-    let sections = [TextSectionInfo {
-        vaddr: code_vaddr,
-        file_offset: 0,
-        size: code.len() as u64,
-    }];
-    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
-        code,
-        &sections,
-        &sections,
-        trampoline_write_vaddr,
-        syscall_entry_addr,
-        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
-    )?
-    else {
-        return Ok((Vec::new(), Vec::new()));
-    };
-    Ok((outcome.trampoline, outcome.trapped_sites))
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]
@@ -2109,6 +2051,49 @@ pub fn patch_aarch64_code_segment_in_spaces(
     Ok((outcome.trampolines, outcome.trapped_sites))
 }
 
+/// [`patch_aarch64_code_segment_in_spaces`] into one contiguous run of
+/// sub-trampolines starting at `trampoline_vaddr`, for a caller that maps the
+/// run as a single blob.
+///
+/// The gates go in one unbounded space at [`aarch64::GATE_ALIGNMENT`]
+/// granularity, so each sub-trampoline starts where the previous one ends and
+/// the returned bytes are their concatenation. A run longer than
+/// [`aarch64::MAX_SUB_TRAMPOLINE_BYTES`] therefore holds several callback
+/// headers. Both results are empty if `code` has no patchable instructions;
+/// the caller's obligations are those of
+/// [`patch_aarch64_code_segment_in_spaces`].
+pub fn patch_aarch64_code_segment_contiguous(
+    code: &mut [u8],
+    code_vaddr: u64,
+    trampoline_vaddr: u64,
+    callback: u64,
+    options: RewriteOptions,
+) -> Result<(Vec<u8>, Vec<u64>)> {
+    let (subs, trapped) = patch_aarch64_code_segment_in_spaces(
+        code,
+        code_vaddr,
+        None,
+        &[aarch64::TrampolineSpace {
+            start: trampoline_vaddr,
+            end: None,
+        }],
+        aarch64::GATE_ALIGNMENT as u64,
+        callback,
+        options,
+    )?;
+    let mut run = Vec::new();
+    for sub in subs {
+        if sub.vaddr != trampoline_vaddr + run.len() as u64 {
+            return Err(Error::TrampolinePatchFailure(format!(
+                "sub-trampoline at {:#x} does not continue the run",
+                sub.vaddr
+            )));
+        }
+        run.extend_from_slice(&sub.data);
+    }
+    Ok((run, trapped))
+}
+
 fn scan_sections(
     code_vaddr: u64,
     ranges: &[Range<usize>],
@@ -2143,7 +2128,7 @@ fn scan_sections(
 /// fails safe on nothing.
 ///
 /// On AArch64 the caller must synchronize the instruction stream over `code`
-/// before it is fetched again; see [`patch_code_segment`].
+/// before it is fetched again; see [`patch_aarch64_code_segment_in_spaces`].
 pub fn trap_all_syscalls_in_code(code: &mut [u8], code_vaddr: u64) -> Result<usize> {
     trap_all_syscalls_in_code_with_options(code, code_vaddr, RewriteOptions::default())
 }
@@ -3531,7 +3516,7 @@ mod tests {
         let trampoline_vaddr = 0x1000_1000;
         let syscall_entry_addr = 0x1000_0000_0000;
 
-        let (trampoline, trapped) = patch_aarch64_code_segment(
+        let (trampoline, trapped) = patch_aarch64_code_segment_contiguous(
             &mut code,
             code_vaddr,
             trampoline_vaddr,
@@ -3562,6 +3547,51 @@ mod tests {
         );
     }
 
+    /// Past one callback literal's reach the run holds several sub-trampolines
+    /// back to back: every site still branches into the run, and a gate's
+    /// header is the one that starts the sub-trampoline containing it.
+    #[test]
+    fn aarch64_contiguous_run_spans_several_sub_trampolines() {
+        const SITES: usize = aarch64::MAX_SUB_TRAMPOLINE_BYTES / aarch64::SVC_SLOT_BYTES + 8;
+        let mut code: Vec<u8> = core::iter::repeat_n(0xD400_0001u32.to_le_bytes(), SITES)
+            .flatten()
+            .collect();
+        let (run, trapped) = patch_aarch64_code_segment_contiguous(
+            &mut code,
+            0x1000_0000,
+            0x1000_0000 + 0x20_0000,
+            0x1234,
+            RewriteOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(trapped, []);
+        // The first sub-trampoline holds as many 64-byte SVC slots as fit
+        // under the cap after its 16-byte header; the second follows it.
+        let per_sub = (aarch64::MAX_SUB_TRAMPOLINE_BYTES - 16) / aarch64::SVC_SLOT_BYTES;
+        let second = 16 + per_sub * aarch64::SVC_SLOT_BYTES;
+        assert_eq!(
+            run.len(),
+            second + 16 + (SITES - per_sub) * aarch64::SVC_SLOT_BYTES
+        );
+        for header in [0, second] {
+            assert_eq!(
+                u64::from_le_bytes(run[header..header + 8].try_into().unwrap()),
+                0x1234
+            );
+        }
+        let base = 0x1000_0000 + 0x20_0000;
+        let last = (SITES - 1) * 4;
+        let site = 0x1000_0000 + last as u64;
+        let target = aarch64::decode_branch_target(
+            u32::from_le_bytes(code[last..last + 4].try_into().unwrap()),
+            site,
+        )
+        .unwrap();
+        assert!(target >= base + second as u64 && target < base + run.len() as u64);
+        let gate = aarch64::classify_gate_pc(&run[second..], base + second as u64, target).unwrap();
+        assert_eq!(gate.original_site(), site);
+    }
+
     /// A region with no patch sites must not produce a trampoline: the caller
     /// would otherwise map and charge a page for nothing, and — on the shim's
     /// runtime path — advance its trampoline cursor past a blob no code
@@ -3570,7 +3600,7 @@ mod tests {
     fn aarch64_runtime_patch_of_syscall_free_code_emits_nothing() {
         let mut code = 0xD503_201Fu32.to_le_bytes().to_vec(); // NOP
         let before = code.clone();
-        let (trampoline, trapped) = patch_aarch64_code_segment(
+        let (trampoline, trapped) = patch_aarch64_code_segment_contiguous(
             &mut code,
             0x1000,
             0x2000,
@@ -3592,7 +3622,7 @@ mod tests {
     fn aarch64_runtime_gates_carry_the_thread_pointer_placeholder() {
         // MRS X0, TPIDR_EL0 — a thread-pointer read, which is gated.
         let mut code = 0xD53B_D040u32.to_le_bytes().to_vec();
-        let (mut trampoline, trapped) = patch_aarch64_code_segment(
+        let (mut trampoline, trapped) = patch_aarch64_code_segment_contiguous(
             &mut code,
             0x1000,
             0x2000,
@@ -3623,7 +3653,7 @@ mod tests {
         let code_vaddr = 0x1000;
         let trampoline_vaddr = 0x400000;
 
-        let (runtime, skipped) = patch_aarch64_code_segment(
+        let (runtime, skipped) = patch_aarch64_code_segment_contiguous(
             &mut runtime_code,
             code_vaddr,
             trampoline_vaddr,

@@ -3262,7 +3262,7 @@ mod tests {
         use litebox_syscall_rewriter::{
             RewriteOptions,
             aarch64::{GateMetadata, classify_copied_gate_slot_for_host},
-            patch_code_segment_with_options,
+            patch_aarch64_code_segment_contiguous,
         };
 
         struct StubPlatform(Option<usize>);
@@ -3283,7 +3283,8 @@ mod tests {
             let options = crate::aarch64_rewrite_options();
             let mut code = 0xD53B_D049u32.to_le_bytes(); // MRS X9, TPIDR_EL0
             let (tramp, trapped) =
-                patch_code_segment_with_options(&mut code, 0x1000, 0x400000, 0, options).unwrap();
+                patch_aarch64_code_segment_contiguous(&mut code, 0x1000, 0x400000, 0, options)
+                    .unwrap();
             assert_eq!(trapped, []);
             let classified = classify_copied_gate_slot_for_host(
                 &tramp[16..],
@@ -3303,7 +3304,7 @@ mod tests {
         fn x18_gate_matches_configured_policy() {
             let options = crate::aarch64_rewrite_options();
             let mut code = 0xaa00_03f2u32.to_le_bytes(); // mov x18, x0
-            let (mut trampoline, trapped) = patch_code_segment_with_options(
+            let (mut trampoline, trapped) = patch_aarch64_code_segment_contiguous(
                 &mut code,
                 0x1000,
                 0x400000,
@@ -3340,7 +3341,7 @@ mod tests {
             const SYSCALL_ENTRY: u64 = 0xDEAD_0000;
             let options = crate::aarch64_rewrite_options();
             let mut code = 0xD400_0001u32.to_le_bytes(); // SVC #0
-            let (mut stubs, trapped) = patch_code_segment_with_options(
+            let (mut stubs, trapped) = patch_aarch64_code_segment_contiguous(
                 &mut code,
                 0x1000,
                 TRAMPOLINE_BASE,
@@ -3367,7 +3368,7 @@ mod tests {
             ));
             let mut code = 0xD400_0001u32.to_le_bytes();
             assert!(
-                patch_code_segment_with_options(
+                patch_aarch64_code_segment_contiguous(
                     &mut code,
                     0x1000,
                     TRAMPOLINE_BASE + 8,

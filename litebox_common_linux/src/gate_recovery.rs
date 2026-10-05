@@ -726,7 +726,10 @@ fn canonicalize_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox_syscall_rewriter::{aarch64::DARWIN_SVC_FRAME_BYTES, macho::Rewriter};
+    use litebox_syscall_rewriter::{
+        aarch64::{DARWIN_SVC_FRAME_BYTES, GATE_ALIGNMENT, TrampolineSpace},
+        macho::{GatePlacement, Rewriter},
+    };
 
     #[test]
     #[expect(clippy::single_range_in_vec_init, reason = "one executable code range")]
@@ -738,18 +741,28 @@ mod tests {
         const DESTINATION: usize = 9;
 
         let mut code = 0xd53b_d069u32.to_le_bytes(); // mrs x9, tpidrro_el0
-        let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
+        let (subs, trapped) = Rewriter::new(TargetHost::MacOs)
             .unwrap()
             .patch_host_shared_cache_code(
                 &mut code,
                 SITE as u64,
                 &[0..4],
-                TRAMPOLINE as u64,
-                0x1234,
-                96,
+                GatePlacement {
+                    spaces: &[TrampolineSpace {
+                        start: TRAMPOLINE as u64,
+                        end: None,
+                    }],
+                    granule: GATE_ALIGNMENT as u64,
+                    callback: 0x1234,
+                    guest_tp_offset: 96,
+                },
             )
             .unwrap();
         assert_eq!(trapped, []);
+        let [sub] = &subs[..] else {
+            panic!("expected one sub-trampoline");
+        };
+        let gates = &sub.data;
         let guest_tp = GUEST_TP.to_ne_bytes();
         let read = |address: usize, output: &mut [u8]| {
             for (base, bytes) in [
@@ -810,18 +823,28 @@ mod tests {
         const STACK: usize = 0x2000_0000;
         const GUEST_SP: usize = STACK + DARWIN_SVC_FRAME_BYTES as usize;
         let mut code = 0xd4001001u32.to_le_bytes();
-        let (gates, trapped) = Rewriter::new(TargetHost::MacOs)
+        let (subs, trapped) = Rewriter::new(TargetHost::MacOs)
             .unwrap()
             .patch_code_segment(
                 &mut code,
                 SITE as u64,
                 &[0..4],
-                TRAMPOLINE as u64,
-                0x1234,
-                96,
+                GatePlacement {
+                    spaces: &[TrampolineSpace {
+                        start: TRAMPOLINE as u64,
+                        end: None,
+                    }],
+                    granule: GATE_ALIGNMENT as u64,
+                    callback: 0x1234,
+                    guest_tp_offset: 96,
+                },
             )
             .unwrap();
         assert_eq!(trapped, []);
+        let [sub] = &subs[..] else {
+            panic!("expected one sub-trampoline");
+        };
+        let gates = &sub.data;
         let mut frame = [0u8; DARWIN_SVC_FRAME_BYTES as usize];
         frame[..8].copy_from_slice(&20usize.to_ne_bytes());
         let read = |address: usize, output: &mut [u8]| {
