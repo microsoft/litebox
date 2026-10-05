@@ -10,7 +10,6 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::{
     HOST_PAGE_SIZE, MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
-    loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
     vmem::{MappingError, PAGE_SIZE, VmemProtectError},
 };
 
@@ -25,9 +24,14 @@ use alloc::vec::Vec;
 use core::ops::Range;
 use litebox::utils::TruncateExt as _;
 #[cfg(target_arch = "aarch64")]
+use litebox_common_linux::loader::{ElfParseError, ReadAt, read_trampoline_regions};
+#[cfg(target_arch = "x86_64")]
+use litebox_common_linux::loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64};
+#[cfg(target_arch = "aarch64")]
 use litebox_common_linux::vmem::VmFlags;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
+#[cfg(target_arch = "x86_64")]
 use zerocopy::FromBytes as _;
 #[cfg(target_arch = "aarch64")]
 use zerocopy::FromZeros as _;
@@ -115,13 +119,7 @@ fn push_patch_range(
 ///
 /// Tracks base address and trampoline write cursor for each ELF file that
 /// has executable segments mapped via `do_mmap_file()`.
-#[cfg_attr(
-    target_arch = "aarch64",
-    expect(
-        clippy::struct_excessive_bools,
-        reason = "independent ELF patch state flags"
-    )
-)]
+#[cfg(target_arch = "x86_64")]
 pub(crate) struct ElfPatchState {
     /// Whether this file is already pre-patched (trampoline magic found at file tail).
     pre_patched: bool,
@@ -130,8 +128,6 @@ pub(crate) struct ElfPatchState {
     trampoline_file_size: usize,
     /// Start address of the trampoline region (runtime).
     trampoline_addr: usize,
-    #[cfg(target_arch = "aarch64")]
-    load_span: Option<Range<usize>>,
     /// Current write position within the trampoline (byte offset from `trampoline_addr`).
     trampoline_cursor: usize,
     /// Whether the trampoline region has been allocated.
@@ -141,13 +137,6 @@ pub(crate) struct ElfPatchState {
     /// Whether any runtime-generated stubs were successfully linked from code
     /// in this fd to the trampoline.
     runtime_patches_committed: bool,
-    #[cfg(target_arch = "aarch64")]
-    trampoline_invalidated: bool,
-    #[cfg(target_arch = "aarch64")]
-    code_metadata: Option<litebox_syscall_rewriter::aarch64::ElfCodeMetadata>,
-    /// Pre-scanned, page-aligned trampoline capacity.
-    #[cfg(target_arch = "aarch64")]
-    trampoline_capacity: usize,
     /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
     /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
     /// Cleared on munmap to allow re-patching.
@@ -159,10 +148,239 @@ pub(crate) struct ElfPatchState {
     patched_ranges: BTreeSet<(usize, usize)>,
 }
 
+/// Per-descriptor state for the shim's ELF syscall rewriter: the trampoline
+/// of each ELF file that has executable segments mapped via `do_mmap_file()`.
+#[cfg(target_arch = "aarch64")]
+pub(crate) struct ElfPatchState {
+    trampoline: TrampolineState,
+    /// The object's load span, when its load base is known.
+    load_span: Option<Range<usize>>,
+    /// Whether a trampoline area was partly unmapped, leaving its gates
+    /// unusable.
+    invalidated: bool,
+    /// Tracks file-backed mappings for this fd as (vaddr, len) pairs.
+    /// Used to find mappings that need patching when mprotect adds PROT_EXEC.
+    /// Cleared on munmap to allow re-patching.
+    file_mappings: BTreeSet<(usize, usize)>,
+    /// Ranges that have already been patched by the runtime rewriter.
+    /// This is a performance guard only — re-running the rewriter on
+    /// already-patched code is safe because the second run will not see
+    /// syscall instructions. Cleared on munmap alongside file_mappings.
+    patched_ranges: BTreeSet<(usize, usize)>,
+}
+
+/// An AArch64 ELF file's trampoline.
+#[cfg(target_arch = "aarch64")]
+enum TrampolineState {
+    /// Pre-patched: the sub-trampolines to install from the file, none if the
+    /// rewriter found nothing to patch.
+    Aot(Vec<AotTrampoline>),
+    /// Pre-patched, but the trailer is unusable, so the file must not run.
+    Unusable,
+    /// Rewritten as its code is mapped.
+    Runtime(RuntimeTrampolines),
+}
+
+#[cfg(target_arch = "aarch64")]
 impl ElfPatchState {
-    #[cfg(target_arch = "aarch64")]
+    /// Whether every sub-trampoline of a pre-patched file is installed.
     pub(crate) fn trampoline_is_populated(&self) -> bool {
-        self.trampoline_mapped && !self.trampoline_invalidated
+        !self.invalidated
+            && matches!(&self.trampoline, TrampolineState::Aot(regions)
+                if regions.iter().all(|region| region.mapped))
+    }
+
+    /// Address ranges of every currently mapped trampoline area.
+    fn mapped_trampoline_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        let (aot, runtime) = match &self.trampoline {
+            TrampolineState::Aot(regions) => (Some(regions), None),
+            TrampolineState::Runtime(runtime) => (None, Some(runtime)),
+            TrampolineState::Unusable => (None, None),
+        };
+        aot.into_iter()
+            .flatten()
+            .filter(|region| region.mapped)
+            .map(AotTrampoline::mapped_range)
+            .chain(
+                runtime
+                    .into_iter()
+                    .flat_map(RuntimeTrampolines::mapped_ranges),
+            )
+    }
+}
+
+/// One sub-trampoline of a pre-patched AArch64 binary, at its runtime address.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy, Debug)]
+struct AotTrampoline {
+    file_offset: u64,
+    addr: usize,
+    size: usize,
+    /// Whether the region is currently mapped.
+    mapped: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl AotTrampoline {
+    /// `region` of an object loaded at `base`, or `None` if its pages would
+    /// overflow.
+    fn new(region: &litebox_syscall_rewriter::TrampolineRegion, base: usize) -> Option<Self> {
+        let addr = base.checked_add(usize::try_from(region.vaddr).ok()?)?;
+        let size = usize::try_from(region.size).ok()?;
+        addr.checked_add(size)?
+            .checked_next_multiple_of(PAGE_SIZE)?;
+        Some(Self {
+            file_offset: region.file_offset,
+            addr,
+            size,
+            mapped: false,
+        })
+    }
+
+    /// The pages the region occupies once mapped.
+    fn mapped_range(&self) -> Range<usize> {
+        self.addr..align_up(self.addr + self.size, PAGE_SIZE)
+    }
+}
+
+/// Trampoline memory for an object rewritten as its code is mapped: the
+/// object's holes, then a runtime region reserved on first need.
+#[cfg(target_arch = "aarch64")]
+struct RuntimeTrampolines {
+    /// Where the runtime region is preferably reserved.
+    preferred_addr: usize,
+    region: Option<RuntimeRegion>,
+    /// Inter-segment holes inside the load span, used before the region.
+    holes: Vec<RuntimeHole>,
+    code_metadata: Option<litebox_syscall_rewriter::aarch64::ElfCodeMetadata>,
+    /// Pre-scanned, page-aligned region capacity.
+    capacity: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl RuntimeTrampolines {
+    /// Address ranges of the mapped runtime trampoline memory: the region and
+    /// every hole holding sub-trampolines.
+    fn mapped_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.region.iter().map(RuntimeRegion::range).chain(
+            self.holes
+                .iter()
+                .filter(|hole| hole.mapped)
+                .map(|hole| hole.range.clone()),
+        )
+    }
+}
+
+/// The runtime trampoline region, reserved within branch reach of the code.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug)]
+struct RuntimeRegion {
+    addr: usize,
+    /// Mapped bytes.
+    len: usize,
+    /// Bytes in use.
+    cursor: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl RuntimeRegion {
+    fn range(&self) -> Range<usize> {
+        self.addr..self.addr + self.len
+    }
+}
+
+/// A host-page-aligned hole between an unpatched object's segments, inside the
+/// load span the dynamic loader reserves, used for runtime sub-trampolines.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Debug)]
+struct RuntimeHole {
+    range: Range<usize>,
+    /// Next free byte.
+    cursor: usize,
+    /// Whether the hole is mapped as trampoline memory; done on first use.
+    mapped: bool,
+}
+
+/// What a file's LiteBox trailer says about its trampoline.
+#[cfg(target_arch = "aarch64")]
+enum Trailer {
+    /// No trailer: the file is rewritten at runtime.
+    Unpatched,
+    /// The sub-trampolines of a pre-patched file.
+    Regions(Vec<litebox_syscall_rewriter::TrampolineRegion>),
+    /// A trailer that is malformed, overlaps the object, or cannot be read.
+    Unusable,
+}
+
+/// Why a batch of runtime gates was not installed; its sites are trapped
+/// instead.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, thiserror::Error)]
+enum RuntimeGateError {
+    #[error("rewriting failed: {0}")]
+    Rewrite(litebox_syscall_rewriter::Error),
+    #[error("the holes cannot take every gate and {0}")]
+    NoRegion(ReserveError),
+    #[error("{0}")]
+    Finalize(alloc::string::String),
+    #[error("failed to map trampoline hole {0:#x?}")]
+    MapHole(Range<usize>),
+    #[error("failed to grow the runtime trampoline region")]
+    GrowRegion,
+}
+
+/// Why no runtime trampoline region could be reserved.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, thiserror::Error)]
+enum ReserveError {
+    #[error("no runtime trampoline region could be mapped")]
+    NoMemory,
+    #[error("the only runtime trampoline region was {distance:#x} bytes from the code")]
+    OutOfReach { distance: usize },
+}
+
+/// One rewritten batch: the patched code, its sub-trampolines, and the sites
+/// that were trapped.
+#[cfg(target_arch = "aarch64")]
+struct RuntimeBatch {
+    code: Vec<u8>,
+    subs: Vec<litebox_syscall_rewriter::aarch64::SubTrampoline>,
+    trapped: Vec<u64>,
+    /// Indices of the holes offered as spaces. Only these can hold `subs`; a
+    /// hole that was not offered may even contain the runtime region.
+    offered_holes: Vec<usize>,
+}
+
+/// Runtime trampoline state from before a batch, to restore if it fails.
+#[cfg(target_arch = "aarch64")]
+struct RuntimeSnapshot {
+    holes: Vec<RuntimeHole>,
+    region: Option<RuntimeRegion>,
+}
+
+/// Reads a descriptor's contents for [`read_trampoline_regions`].
+#[cfg(target_arch = "aarch64")]
+struct PatchFileReader<'a, Platform: ShimPlatform> {
+    task: &'a Task<Platform>,
+    fd: &'a FileFd,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl<Platform: ShimPlatform> ReadAt for PatchFileReader<'_, Platform> {
+    type Error = Errno;
+
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Errno> {
+        let offset = usize::try_from(offset).map_err(|_| Errno::EOVERFLOW)?;
+        self.task.read_file_exact_at(self.fd, buf, offset)
+    }
+
+    fn size(&mut self) -> Result<u64, Errno> {
+        self.task
+            .global
+            .litebox
+            .file_status(self.fd)
+            .map(|stat| stat.size)
+            .map_err(Errno::from)
     }
 }
 
@@ -269,6 +487,96 @@ fn choose_trampoline_reservation<T>(
                 None
             }
         })
+}
+
+/// The host-page-granular holes between `segments` of an object loaded at
+/// `load_base`.
+#[cfg(target_arch = "aarch64")]
+fn runtime_holes(
+    segments: &[litebox_syscall_rewriter::LoadSegment],
+    load_base: usize,
+) -> Vec<RuntimeHole> {
+    litebox_syscall_rewriter::inter_segment_holes(segments, HOST_PAGE_SIZE as u64)
+        .expect("the host page size is a power of two")
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let start = load_base.checked_add(start.trunc())?;
+            let end = load_base.checked_add(end.trunc())?;
+            Some(RuntimeHole {
+                range: start..end,
+                cursor: start,
+                mapped: false,
+            })
+        })
+        .collect()
+}
+
+/// How an unmapped range affects one trampoline area.
+#[cfg(target_arch = "aarch64")]
+enum AreaUnmap {
+    Untouched,
+    Removed,
+    Partial,
+}
+
+#[cfg(target_arch = "aarch64")]
+fn area_unmap(area: &Range<usize>, unmapped: &Range<usize>) -> AreaUnmap {
+    if area.end <= unmapped.start || unmapped.end <= area.start {
+        AreaUnmap::Untouched
+    } else if unmapped.start <= area.start && area.end <= unmapped.end {
+        AreaUnmap::Removed
+    } else {
+        AreaUnmap::Partial
+    }
+}
+
+/// Stops tracking trampoline areas -- AOT regions, holes, and the runtime
+/// region -- that `unmapped` removed, so later `mprotect` requests stop
+/// excluding them. Each area is independent: unloading an object removes its
+/// holes but not a region past its last segment. Only an area left partly
+/// mapped makes its gates unusable, which invalidates the trampoline.
+///
+/// A removed AOT region is reinstalled by the file's next executable mapping,
+/// at the address its first mapping's load base gave it.
+#[cfg(target_arch = "aarch64")]
+fn forget_unmapped_trampolines(state: &mut ElfPatchState, unmapped: Range<usize>) {
+    let mut partial = false;
+    let mut removed = |area: &Range<usize>| match area_unmap(area, &unmapped) {
+        AreaUnmap::Untouched => false,
+        AreaUnmap::Removed => true,
+        AreaUnmap::Partial => {
+            partial = true;
+            false
+        }
+    };
+    match &mut state.trampoline {
+        TrampolineState::Aot(regions) => {
+            for region in regions {
+                if region.mapped && removed(&region.mapped_range()) {
+                    region.mapped = false;
+                }
+            }
+        }
+        TrampolineState::Runtime(runtime) => {
+            for hole in &mut runtime.holes {
+                if hole.mapped && removed(&hole.range) {
+                    hole.mapped = false;
+                    hole.cursor = hole.range.start;
+                }
+            }
+            if runtime
+                .region
+                .as_ref()
+                .is_some_and(|region| removed(&region.range()))
+            {
+                runtime.region = None;
+            }
+        }
+        TrampolineState::Unusable => {}
+    }
+    if partial {
+        state.invalidated = true;
+    }
 }
 
 impl<Platform: ShimPlatform> Task<Platform> {
@@ -517,23 +825,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut cache = self.global.elf_patch_cache.lock();
         for state in cache.values_mut() {
             #[cfg(target_arch = "aarch64")]
-            if state.trampoline_mapped && state.trampoline_mapped_len > 0 {
-                // Stop excluding unmapped trampoline ranges from later
-                // `mprotect` requests.
-                let trampoline_end = state
-                    .trampoline_addr
-                    .saturating_add(state.trampoline_mapped_len);
-                let overlaps = state.trampoline_addr < unmap_end && unmap_start < trampoline_end;
-                let removes_all =
-                    unmap_start <= state.trampoline_addr && unmap_end >= trampoline_end;
-                if overlaps && !removes_all {
-                    state.trampoline_invalidated = true;
-                }
-                if removes_all {
-                    state.trampoline_mapped = false;
-                    state.trampoline_mapped_len = 0;
-                }
-            }
+            forget_unmapped_trampolines(state, unmap_start..unmap_end);
             state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
                 seg_end <= unmap_start || vaddr >= unmap_end
@@ -577,8 +869,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         result
     }
 
-    /// Applies `prot`, excluding AOT trampolines placed inside their load spans.
-    /// Runtime trampolines are outside the span and are not excluded.
+    /// Applies `prot`, excluding every mapped trampoline.
     #[cfg(target_arch = "aarch64")]
     fn mprotect_around_trampolines(
         &self,
@@ -591,17 +882,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let cache = self.global.elf_patch_cache.lock();
             cache
                 .values()
-                .filter(|state| {
-                    !state.trampoline_invalidated
-                        && state.trampoline_mapped
-                        && state.trampoline_mapped_len > 0
-                })
-                .filter_map(|state| {
-                    let addr = state.trampoline_addr;
-                    let range = addr..addr.saturating_add(state.trampoline_mapped_len);
-                    let span = state.load_span.as_ref()?;
-                    (range.start >= span.start && range.end <= span.end).then_some(range)
-                })
+                .filter(|state| !state.invalidated)
+                .flat_map(ElfPatchState::mapped_trampoline_ranges)
                 .collect()
         };
 
@@ -839,6 +1121,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut min_load_start: u64 = u64::MAX;
         let mut max_load_align: u64 = 0;
         let mut base_addr: Option<usize> = None;
+        #[cfg(target_arch = "aarch64")]
+        let mut load_segments = Vec::new();
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
             let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LittleEndian>>(ph_bytes) else {
@@ -861,6 +1145,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 max_load_end = end;
             }
             min_load_start = min_load_start.min(align_down(p_vaddr.trunc(), PAGE_SIZE) as u64);
+            #[cfg(target_arch = "aarch64")]
+            load_segments.push(litebox_syscall_rewriter::LoadSegment {
+                vaddr: p_vaddr,
+                filesz: ph.p_filesz.get(ENDIAN),
+                memsz: p_memsz,
+                align: ph.p_align.get(ENDIAN),
+            });
             max_load_align = max_load_align.max(ph.p_align.get(ENDIAN));
             // Match segment by page-aligned file offset to derive base address.
             if base_addr.is_none()
@@ -891,64 +1182,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // Check if file is pre-patched by reading the last 32 bytes for magic
+        #[cfg(target_arch = "x86_64")]
         let (pre_patched, tramp_file_offset, tramp_vaddr, tramp_file_size) =
             self.check_trampoline_magic(&fd.0);
 
         #[cfg(target_arch = "aarch64")]
-        let (code_metadata, trampoline_capacity) = if pre_patched {
-            (None, 0)
-        } else {
-            let scanned = self
-                .global
-                .litebox
-                .file_status(&fd.0)
-                .ok()
-                .and_then(|stat| {
-                    let file_size = usize::try_from(stat.size).ok()?;
-                    let word_len = file_size.div_ceil(8);
-                    let mut words = u64::new_vec_zeroed(word_len).ok()?;
-                    let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
-                    self.read_file_exact_at(&fd.0, &mut bytes[..file_size], 0)
-                        .ok()?;
-                    let metadata =
-                        litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
-                            &mut words, file_size,
-                        )
-                        .ok()?;
-                    let upper_bound = metadata
-                        .trampoline_size_upper_bound(
-                            &zerocopy::IntoBytes::as_bytes(words.as_slice())[..file_size],
-                            crate::aarch64_rewrite_options(),
-                        )
-                        .ok();
-                    Some((metadata, upper_bound))
-                });
-            if let Some((metadata, upper_bound)) = scanned {
-                let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
-                let initial_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES
-                    .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN);
-                let capacity = upper_bound
-                    .zip(initial_cursor)
-                    .and_then(|(bound, cursor)| bound.checked_add(cursor))
-                    .and_then(|bound| bound.checked_next_multiple_of(PAGE_SIZE))
-                    .unwrap_or(PAGE_SIZE);
-                litebox_util_log::debug!(
-                    fd:? = fd,
-                    executable_bytes:? = executable_bytes,
-                    identified_bytes:? = identified_bytes,
-                    trampoline_upper_bound:? = upper_bound,
-                    trampoline_capacity:? = capacity;
-                    "pre-scanned AArch64 ELF for runtime rewriting"
-                );
-                (Some(metadata), capacity)
-            } else {
-                litebox_util_log::warn!(
-                    fd:? = fd;
-                    "AArch64 ELF pre-scan unavailable; using one-page trampoline with incremental fallback"
-                );
-                (None, PAGE_SIZE)
-            }
-        };
+        let trailer = self.check_trampoline_magic(&fd.0, &load_segments);
+        // Sub-trampolines carry their own addresses, so AArch64 only needs the
+        // runtime region's address below. A pre-patched file whose load base
+        // is unknown becomes `TrampolineState::Unusable` rather than a panic.
+        #[cfg(target_arch = "aarch64")]
+        let (pre_patched, tramp_vaddr) = (false, 0u64);
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
@@ -1006,28 +1250,119 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Some(min_load_start.trunc()..align_up(max_load_end.trunc(), PAGE_SIZE))
         };
 
+        // Holes and AOT regions are relative to the load base, which must be
+        // known.
+        #[cfg(target_arch = "aarch64")]
+        let load_base = if e_type == ET_DYN { base_addr } else { Some(0) };
+        #[cfg(target_arch = "aarch64")]
+        let trampoline = match trailer {
+            Trailer::Regions(regions) => load_base
+                .and_then(|base| {
+                    regions
+                        .iter()
+                        .map(|region| AotTrampoline::new(region, base))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .map_or(TrampolineState::Unusable, TrampolineState::Aot),
+            Trailer::Unusable => TrampolineState::Unusable,
+            Trailer::Unpatched => {
+                let (code_metadata, capacity) = self.prescan_for_runtime_rewriting(fd);
+                TrampolineState::Runtime(RuntimeTrampolines {
+                    preferred_addr: trampoline_vaddr,
+                    region: None,
+                    holes: load_base
+                        .map_or_else(Vec::new, |base| runtime_holes(&load_segments, base)),
+                    code_metadata,
+                    capacity,
+                })
+            }
+        };
+
         // Insert under lock (re-check for races).
         let mut cache = self.global.elf_patch_cache.lock();
+        #[cfg(target_arch = "x86_64")]
         cache.entry(fd.clone()).or_insert(ElfPatchState {
             pre_patched,
             trampoline_file_offset: tramp_file_offset,
             trampoline_file_size: tramp_file_size.trunc(),
             trampoline_addr: trampoline_vaddr,
-            #[cfg(target_arch = "aarch64")]
-            load_span,
             trampoline_cursor: 0,
             trampoline_mapped: false,
             trampoline_mapped_len: 0,
             runtime_patches_committed: false,
-            #[cfg(target_arch = "aarch64")]
-            trampoline_invalidated: false,
-            #[cfg(target_arch = "aarch64")]
-            code_metadata,
-            #[cfg(target_arch = "aarch64")]
-            trampoline_capacity,
             file_mappings: BTreeSet::new(),
             patched_ranges: BTreeSet::new(),
         });
+        #[cfg(target_arch = "aarch64")]
+        cache.entry(fd.clone()).or_insert(ElfPatchState {
+            trampoline,
+            load_span,
+            invalidated: false,
+            file_mappings: BTreeSet::new(),
+            patched_ranges: BTreeSet::new(),
+        });
+    }
+
+    /// Scans an unpatched file's code ahead of runtime rewriting, returning its
+    /// code metadata and the runtime region capacity its gates may need.
+    #[cfg(target_arch = "aarch64")]
+    fn prescan_for_runtime_rewriting(
+        &self,
+        fd: &ElfPatchKey,
+    ) -> (
+        Option<litebox_syscall_rewriter::aarch64::ElfCodeMetadata>,
+        usize,
+    ) {
+        let scanned = self
+            .global
+            .litebox
+            .file_status(&fd.0)
+            .ok()
+            .and_then(|stat| {
+                let file_size = usize::try_from(stat.size).ok()?;
+                let word_len = file_size.div_ceil(8);
+                let mut words = u64::new_vec_zeroed(word_len).ok()?;
+                let bytes = zerocopy::IntoBytes::as_mut_bytes(words.as_mut_slice());
+                self.read_file_exact_at(&fd.0, &mut bytes[..file_size], 0)
+                    .ok()?;
+                let metadata =
+                    litebox_syscall_rewriter::aarch64::ElfCodeMetadata::parse_aligned_in_place(
+                        &mut words, file_size,
+                    )
+                    .ok()?;
+                let upper_bound = metadata
+                    .trampoline_size_upper_bound(
+                        &zerocopy::IntoBytes::as_bytes(words.as_slice())[..file_size],
+                        crate::aarch64_rewrite_options(),
+                    )
+                    .ok();
+                Some((metadata, upper_bound))
+            });
+        if let Some((metadata, upper_bound)) = scanned {
+            let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
+            let initial_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES
+                .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN);
+            let capacity = upper_bound
+                .zip(initial_cursor)
+                .and_then(|(bound, cursor)| bound.checked_add(cursor))
+                .and_then(|bound| bound.checked_next_multiple_of(PAGE_SIZE))
+                .unwrap_or(PAGE_SIZE);
+            litebox_util_log::debug!(
+                fd:? = fd,
+                executable_bytes:? = executable_bytes,
+                identified_bytes:? = identified_bytes,
+                trampoline_upper_bound:? = upper_bound,
+                trampoline_capacity:? = capacity;
+                "pre-scanned AArch64 ELF for runtime rewriting"
+            );
+            (Some(metadata), capacity)
+        } else {
+            litebox_util_log::warn!(
+                fd:? = fd;
+                "AArch64 ELF pre-scan unavailable; using one-page trampoline with incremental fallback"
+            );
+            (None, PAGE_SIZE)
+        }
     }
 
     /// Allows `MAP_FIXED` inside the computed load span. Outside it, rejects
@@ -1035,17 +1370,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     #[cfg(target_arch = "aarch64")]
     fn trampoline_range_is_safe_to_map(
         &self,
-        state: &ElfPatchState,
+        load_span: Option<&Range<usize>>,
         start: usize,
         len: usize,
     ) -> bool {
         let range = start..start.saturating_add(len);
         let end = range.end;
-        if state
-            .load_span
-            .as_ref()
-            .is_some_and(|span| range.start >= span.start && range.end <= span.end)
-        {
+        if load_span.is_some_and(|span| range.start >= span.start && range.end <= span.end) {
             return true;
         }
         for (range, flags) in self.global.mm.mappings() {
@@ -1088,6 +1419,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Check if a file has the LITEBOX trampoline magic at its tail.
     /// Returns (is_pre_patched, file_offset, vaddr, trampoline_size).
+    #[cfg(target_arch = "x86_64")]
     fn check_trampoline_magic(&self, fd: &FileFd) -> (bool, u64, u64, u64) {
         let Ok(stat) = self.global.litebox.file_status(fd) else {
             return (false, 0, 0, 0);
@@ -1120,6 +1452,30 @@ impl<Platform: ShimPlatform> Task<Platform> {
             header.vaddr,
             header.trampoline_size,
         )
+    }
+
+    /// Reads a file's LiteBox trailer, whose regions must not overlap
+    /// `segments`; see [`read_trampoline_regions`]. A file whose trailer cannot
+    /// be read is [`Trailer::Unusable`] rather than rewritten at runtime, since
+    /// it may be pre-patched.
+    #[cfg(target_arch = "aarch64")]
+    fn check_trampoline_magic(
+        &self,
+        fd: &FileFd,
+        segments: &[litebox_syscall_rewriter::LoadSegment],
+    ) -> Trailer {
+        let segments: Vec<Range<u64>> = segments
+            .iter()
+            .map(|segment| segment.vaddr..segment.vaddr.saturating_add(segment.memsz))
+            .collect();
+        match read_trampoline_regions(&mut PatchFileReader { task: self, fd }, &segments) {
+            Ok(regions) => Trailer::Regions(regions),
+            Err(ElfParseError::UnpatchedBinary) => Trailer::Unpatched,
+            Err(error) => {
+                litebox_util_log::error!(err:? = error; "unusable LiteBox trampoline trailer");
+                Trailer::Unusable
+            }
+        }
     }
 
     /// Apply the trap fallback to a mapped code segment: replace every patch
@@ -1239,6 +1595,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Returns an error when a pre-patched binary's trampoline cannot be set
     /// up or the caller-selected code permissions cannot be restored.
+    #[cfg(target_arch = "x86_64")]
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: UserPtrMut<u8>,
@@ -1262,10 +1619,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(state) = cache.get_mut(fd) else {
             return Ok(()); // No patch state — not an ELF we're tracking
         };
-        #[cfg(target_arch = "aarch64")]
-        if state.trampoline_invalidated {
-            return Err(Errno::ENOMEM);
-        }
 
         if state.pre_patched {
             // Pre-patched binary: map the trampoline data from the file.
@@ -1273,12 +1626,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let tramp_addr = state.trampoline_addr;
                 let tramp_len = align_up(state.trampoline_file_size, PAGE_SIZE);
 
-                // MAP_FIXED_NOREPLACE would reject the legitimate PROT_NONE or
-                // object-span reservation, so validate ownership before MAP_FIXED.
-                #[cfg(target_arch = "aarch64")]
-                if !self.trampoline_range_is_safe_to_map(state, tramp_addr, tramp_len) {
-                    return Err(Errno::ENOMEM);
-                }
                 let alloc_result = self.do_mmap_anonymous(
                     Some(tramp_addr),
                     tramp_len,
@@ -1312,14 +1659,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     tramp_data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
                 }
 
-                // Finalize in staging so an unpatched gate is never published.
-                #[cfg(target_arch = "aarch64")]
-                if let Err(e) = finalize_trampoline_gates(self.global.platform, &mut tramp_data) {
-                    litebox_util_log::error!(err:% = e; "refusing to map a trampoline whose guest thread-pointer gates are not patched");
-                    let _ = self.sys_munmap_raw(tramp_ptr, tramp_len);
-                    return Err(Errno::ENOMEM);
-                }
-
                 // Write to the mapped region.
                 if tramp_ptr
                     .copy_from_slice::<Platform>(0, &tramp_data)
@@ -1350,24 +1689,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // ── Runtime patching path (unpatched binaries) ───────────────
 
-        #[cfg(target_arch = "aarch64")]
-        let scan_ranges = file_offset.and_then(|file_offset| {
-            state
-                .code_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
-        });
-        #[cfg(target_arch = "aarch64")]
-        let apply_trap_fallback = |mapped_addr, len, already_rw| {
-            self.apply_aarch64_trap_fallback(
-                mapped_addr,
-                len,
-                already_rw,
-                scan_ranges.as_ref(),
-                restore_protections,
-            )
-        };
-        #[cfg(target_arch = "x86_64")]
         let apply_trap_fallback = |mapped_addr, len, already_rw| {
             self.apply_trap_fallback(mapped_addr, len, already_rw, restore_protections)
         };
@@ -1376,9 +1697,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let addr_usize = mapped_addr.as_usize();
         if !state.trampoline_mapped {
             let tramp_addr = state.trampoline_addr;
-            #[cfg(target_arch = "aarch64")]
-            let initial_trampoline_len = state.trampoline_capacity.max(PAGE_SIZE);
-            #[cfg(target_arch = "x86_64")]
             let initial_trampoline_len = PAGE_SIZE;
 
             let map_preferred = |reservation_len| match self.do_mmap_anonymous(
@@ -1540,26 +1858,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
             syscall_entry as u64
         };
 
-        #[cfg(target_arch = "aarch64")]
-        let patch_result = if let Some(ranges) = &scan_ranges {
-            litebox_syscall_rewriter::patch_aarch64_code_segment_with_options_and_ranges(
-                &mut code_buf,
-                code_vaddr,
-                ranges,
-                trampoline_write_vaddr,
-                syscall_entry_addr,
-                crate::aarch64_rewrite_options(),
-            )
-        } else {
-            litebox_syscall_rewriter::patch_code_segment_with_options(
-                &mut code_buf,
-                code_vaddr,
-                trampoline_write_vaddr,
-                syscall_entry_addr,
-                crate::aarch64_rewrite_options(),
-            )
-        };
-        #[cfg(target_arch = "x86_64")]
         let patch_result = litebox_syscall_rewriter::patch_code_segment(
             &mut code_buf,
             code_vaddr,
@@ -1580,19 +1878,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         match patch_result {
             Ok(stubs) if !stubs.is_empty() => {
-                // Replace recognized sites with traps before discarding gates
-                // whose thread-pointer placeholder could not be finalized.
-                #[cfg(target_arch = "aarch64")]
-                let stubs = {
-                    let mut stubs = stubs;
-                    if let Err(e) = finalize_trampoline_gates(self.global.platform, &mut stubs) {
-                        litebox_util_log::error!(err:% = e; "refusing to install runtime gates whose guest thread-pointer is not patched");
-                        let restored = apply_trap_fallback(mapped_addr, len, true);
-                        restore_trampoline_rx(self, state);
-                        return restored;
-                    }
-                    stubs
-                };
                 let Some(new_cursor) = state.trampoline_cursor.checked_add(stubs.len()) else {
                     litebox_util_log::warn!("trampoline cursor overflow");
                     let restored = apply_trap_fallback(mapped_addr, len, true);
@@ -1677,9 +1962,658 @@ impl<Platform: ShimPlatform> Task<Platform> {
         restored
     }
 
+    /// Gives back the pages of an AOT region that could not be installed.
+    /// Inside the load span they become an inaccessible reservation again, so
+    /// nothing else can be mapped into the object; elsewhere they are unmapped.
+    #[cfg(target_arch = "aarch64")]
+    fn release_aot_trampoline(&self, load_span: Option<&Range<usize>>, range: Range<usize>) {
+        if load_span.is_some_and(|span| range.start >= span.start && range.end <= span.end) {
+            let _ = self.do_mmap_anonymous(
+                Some(range.start),
+                range.len(),
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            );
+        } else {
+            let _ = self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(range.start), range.len());
+        }
+    }
+
+    /// Maps one region of a pre-patched binary's trampoline from the file,
+    /// writes the syscall entry point into its callback slot, finalizes its
+    /// gates, and protects it read+execute. On error its pages are released;
+    /// see [`Self::release_aot_trampoline`].
+    #[cfg(target_arch = "aarch64")]
+    fn map_aot_trampoline(
+        &self,
+        fd: &ElfPatchKey,
+        load_span: Option<&Range<usize>>,
+        region: &AotTrampoline,
+        syscall_entry: usize,
+    ) -> Result<(), Errno> {
+        let range = region.mapped_range();
+        // MAP_FIXED_NOREPLACE would reject the legitimate PROT_NONE or
+        // object-span reservation, so validate ownership before MAP_FIXED.
+        if !self.trampoline_range_is_safe_to_map(load_span, range.start, range.len()) {
+            return Err(Errno::ENOMEM);
+        }
+        match self.do_mmap_anonymous(
+            Some(range.start),
+            range.len(),
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+        ) {
+            Ok(ptr) if ptr.as_usize() == range.start => {}
+            Ok(ptr) => {
+                let _ = self.sys_munmap_raw(ptr, range.len());
+                return Err(Errno::ENOMEM);
+            }
+            Err(_) => return Err(Errno::ENOMEM),
+        }
+        let filled = self.fill_aot_trampoline(fd, region, syscall_entry);
+        if filled.is_err() {
+            self.release_aot_trampoline(load_span, range);
+        }
+        filled
+    }
+
+    /// Writes `region`'s finalized bytes from the file into its mapped pages
+    /// and protects them read+execute.
+    #[cfg(target_arch = "aarch64")]
+    fn fill_aot_trampoline(
+        &self,
+        fd: &ElfPatchKey,
+        region: &AotTrampoline,
+        syscall_entry: usize,
+    ) -> Result<(), Errno> {
+        let mut data = alloc::vec![0u8; region.size];
+        self.read_file_exact_at(&fd.0, &mut data, region.file_offset.trunc())
+            .map_err(|_| Errno::ENOMEM)?;
+        if data.len() >= 8 {
+            data[..8].copy_from_slice(&syscall_entry.to_le_bytes());
+        }
+        // Finalize in staging so an unpatched gate is never published.
+        finalize_trampoline_gates(self.global.platform, &mut data).map_err(|e| {
+            litebox_util_log::error!(err:% = e; "refusing to map a trampoline whose guest thread-pointer gates are not patched");
+            Errno::ENOMEM
+        })?;
+        let ptr = UserPtrMut::<u8>::from_usize(region.addr);
+        ptr.copy_from_slice::<Platform>(0, &data)
+            .ok_or(Errno::ENOMEM)?;
+        self.sys_mprotect_raw(
+            ptr,
+            region.mapped_range().len(),
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+        )
+        .map_err(|_| Errno::ENOMEM)
+    }
+
+    /// Installs every region of a pre-patched binary that is not mapped: all of
+    /// them, or on error none.
+    #[cfg(target_arch = "aarch64")]
+    fn install_aot_trampolines(
+        &self,
+        fd: &ElfPatchKey,
+        regions: &mut [AotTrampoline],
+        load_span: Option<&Range<usize>>,
+        syscall_entry: usize,
+    ) -> Result<(), Errno> {
+        let missing: Vec<usize> = (0..regions.len())
+            .filter(|&index| !regions[index].mapped)
+            .collect();
+        for (installed, &index) in missing.iter().enumerate() {
+            if let Err(error) =
+                self.map_aot_trampoline(fd, load_span, &regions[index], syscall_entry)
+            {
+                for &undo in &missing[..installed] {
+                    self.release_aot_trampoline(load_span, regions[undo].mapped_range());
+                }
+                return Err(error);
+            }
+        }
+        for index in missing {
+            regions[index].mapped = true;
+        }
+        Ok(())
+    }
+
+    /// Patch an AArch64 executable segment in place after it has been mapped.
+    ///
+    /// A pre-patched binary gets its sub-trampolines installed from the file;
+    /// otherwise the segment is rewritten by [`Self::patch_runtime_segment`].
+    ///
+    /// Returns an error when a pre-patched binary's trampoline cannot be set
+    /// up or the caller-selected code permissions cannot be restored.
+    #[cfg(target_arch = "aarch64")]
+    fn maybe_patch_exec_segment(
+        &self,
+        mapped_addr: UserPtrMut<u8>,
+        len: usize,
+        fd: &ElfPatchKey,
+        syscall_entry: usize,
+        file_offset: Option<usize>,
+        restore_protections: &[ProtectionRange],
+    ) -> Result<(), Errno> {
+        // Initialize patch state if this is the first mmap for this fd.
+        // Typically the first mapping is at offset 0 (the ELF header), but
+        // some loaders may map an executable segment at a non-zero offset first.
+        if let Some(file_offset) = file_offset {
+            self.init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset);
+        }
+
+        // This lock guards the elf_patch_cache and is held for the entire
+        // patching operation. In practice this is fine because the dynamic
+        // linker loads shared libraries sequentially.
+        let mut cache = self.global.elf_patch_cache.lock();
+        let Some(state) = cache.get_mut(fd) else {
+            return Ok(()); // No patch state — not an ELF we're tracking
+        };
+        if state.invalidated {
+            return Err(Errno::ENOMEM);
+        }
+        match &mut state.trampoline {
+            TrampolineState::Unusable => {
+                litebox_util_log::error!(fd:? = fd; "refusing to execute a binary with an unusable trampoline");
+                Err(Errno::ENOMEM)
+            }
+            TrampolineState::Aot(regions) => {
+                self.install_aot_trampolines(fd, regions, state.load_span.as_ref(), syscall_entry)
+            }
+            TrampolineState::Runtime(runtime) => {
+                // Performance guard: skip if this exact range was already patched.
+                if !state.patched_ranges.insert((mapped_addr.as_usize(), len)) {
+                    return Ok(());
+                }
+                self.patch_runtime_segment(
+                    runtime,
+                    mapped_addr,
+                    len,
+                    syscall_entry,
+                    file_offset,
+                    restore_protections,
+                )
+            }
+        }
+    }
+
+    /// Rewrites one mapped code range of an unpatched object, trapping its
+    /// sites when gates cannot be installed.
+    ///
+    /// Returns an error when the caller-selected code permissions cannot be
+    /// restored.
+    #[cfg(target_arch = "aarch64")]
+    fn patch_runtime_segment(
+        &self,
+        runtime: &mut RuntimeTrampolines,
+        mapped_addr: UserPtrMut<u8>,
+        len: usize,
+        syscall_entry: usize,
+        file_offset: Option<usize>,
+        restore_protections: &[ProtectionRange],
+    ) -> Result<(), Errno> {
+        let scan_ranges = file_offset.and_then(|file_offset| {
+            runtime
+                .code_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.ranges_for_mapping(file_offset as u64, len).ok())
+        });
+
+        for range in runtime.mapped_ranges() {
+            if self
+                .sys_mprotect_raw(
+                    UserPtrMut::<u8>::from_usize(range.start),
+                    range.len(),
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                )
+                .is_err()
+            {
+                panic!("fatal: failed to mprotect trampoline to RW");
+            }
+        }
+        if self
+            .sys_mprotect_raw(
+                mapped_addr,
+                len,
+                ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            )
+            .is_err()
+        {
+            self.restore_runtime_trampoline_rx(runtime);
+            panic!("fatal: failed to mprotect code segment to RW for patching");
+        }
+        let Some(code) = mapped_addr.to_owned_slice::<Platform>(len) else {
+            let _ = self.restore_page_permissions(restore_protections);
+            self.restore_runtime_trampoline_rx(runtime);
+            panic!("fatal: failed to read code segment for patching");
+        };
+
+        let restored = match self.install_aarch64_runtime_gates(
+            runtime,
+            mapped_addr,
+            &code,
+            scan_ranges.as_ref(),
+            syscall_entry,
+            restore_protections,
+        ) {
+            Ok(()) => self.restore_page_permissions(restore_protections),
+            Err(error) => {
+                litebox_util_log::warn!(err:% = error; "trapping AArch64 patch sites instead of installing gates");
+                self.apply_aarch64_trap_fallback(
+                    mapped_addr,
+                    len,
+                    true,
+                    scan_ranges.as_ref(),
+                    restore_protections,
+                )
+            }
+        };
+        self.restore_runtime_trampoline_rx(runtime);
+        restored
+    }
+
+    /// Makes all runtime trampoline memory read+execute.
+    #[cfg(target_arch = "aarch64")]
+    fn restore_runtime_trampoline_rx(&self, runtime: &RuntimeTrampolines) {
+        for range in runtime.mapped_ranges() {
+            let _ = self.sys_mprotect_raw(
+                UserPtrMut::<u8>::from_usize(range.start),
+                range.len(),
+                ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+            );
+        }
+    }
+
+    /// Rewrites one AArch64 batch, the mapped `code` at `mapped_addr`, and
+    /// installs its gates; see [`Self::rewrite_runtime_batch`] for where they
+    /// go.
+    ///
+    /// Trampoline memory and the code mapping must already be writable. On
+    /// error, `runtime` and its memory are as they were before the batch.
+    #[cfg(target_arch = "aarch64")]
+    fn install_aarch64_runtime_gates(
+        &self,
+        runtime: &mut RuntimeTrampolines,
+        mapped_addr: UserPtrMut<u8>,
+        code: &[u8],
+        scan_ranges: Option<&litebox_syscall_rewriter::aarch64::CodeScanRanges>,
+        syscall_entry: usize,
+        restore_protections: &[ProtectionRange],
+    ) -> Result<(), RuntimeGateError> {
+        let code_range = mapped_addr.as_usize()..mapped_addr.as_usize() + code.len();
+        let snapshot = RuntimeSnapshot {
+            holes: runtime.holes.clone(),
+            region: runtime.region.clone(),
+        };
+        let prepared = self
+            .rewrite_runtime_batch(runtime, code, &code_range, scan_ranges, syscall_entry)
+            .and_then(|mut batch| {
+                // Trap the sites rather than install gates whose thread-pointer
+                // placeholder could not be finalized.
+                for sub in &mut batch.subs {
+                    finalize_trampoline_gates(self.global.platform, &mut sub.data)
+                        .map_err(RuntimeGateError::Finalize)?;
+                }
+                self.make_room_for_batch(runtime, &batch)?;
+                Ok(batch)
+            });
+        let batch = match prepared {
+            Ok(batch) => batch,
+            Err(error) => {
+                self.roll_back_runtime_batch(runtime, snapshot, &code_range);
+                return Err(error);
+            }
+        };
+        if !batch.trapped.is_empty() {
+            litebox_util_log::warn!(
+                count:? = batch.trapped.len(), addrs:? = batch.trapped;
+                "syscall instruction(s) could not be patched"
+            );
+        }
+        self.write_runtime_batch(runtime, &code_range, code, &batch, restore_protections);
+        if !batch.subs.is_empty() {
+            litebox_util_log::debug!(
+                code:? = code_range.start,
+                sub_trampolines:? = batch
+                    .subs
+                    .iter()
+                    .map(|sub| (sub.vaddr, sub.data.len()))
+                    .collect::<Vec<_>>();
+                "installed AArch64 runtime sub-trampolines"
+            );
+        }
+        Ok(())
+    }
+
+    /// Rewrites `code` with its gates in the object's holes, largest first,
+    /// then in the runtime region. The region is reserved only once a batch
+    /// does not fit the holes; if it cannot be, the holes take what they can
+    /// and the remaining sites are trapped.
+    #[cfg(target_arch = "aarch64")]
+    fn rewrite_runtime_batch(
+        &self,
+        runtime: &mut RuntimeTrampolines,
+        code: &[u8],
+        code_range: &Range<usize>,
+        scan_ranges: Option<&litebox_syscall_rewriter::aarch64::CodeScanRanges>,
+        syscall_entry: usize,
+    ) -> Result<RuntimeBatch, RuntimeGateError> {
+        use litebox_syscall_rewriter::aarch64::{GATE_ALIGNMENT, TrampolineSpace};
+
+        // The shim maps and protects each space as a whole, so sub-trampolines
+        // are packed at gate alignment.
+        let mut offered_holes: Vec<usize> = (0..runtime.holes.len())
+            .filter(|&index| {
+                let hole = &runtime.holes[index];
+                hole.cursor < hole.range.end
+                    && (hole.mapped || self.runtime_hole_is_reserved(&hole.range, code_range))
+            })
+            .collect();
+        offered_holes.sort_by_key(|&index| {
+            let hole = &runtime.holes[index];
+            core::cmp::Reverse(hole.range.end - hole.cursor)
+        });
+        let mut spaces: Vec<TrampolineSpace> = offered_holes
+            .iter()
+            .map(|&index| TrampolineSpace {
+                start: runtime.holes[index].cursor as u64,
+                end: Some(runtime.holes[index].range.end as u64),
+            })
+            .collect();
+
+        let rewrite = |spaces: &[TrampolineSpace]| {
+            let mut patched = code.to_vec();
+            litebox_syscall_rewriter::patch_aarch64_code_segment_in_spaces(
+                &mut patched,
+                code_range.start as u64,
+                scan_ranges,
+                spaces,
+                GATE_ALIGNMENT as u64,
+                syscall_entry as u64,
+                crate::aarch64_rewrite_options(),
+            )
+            .map(|(subs, trapped)| RuntimeBatch {
+                code: patched,
+                subs,
+                trapped,
+                offered_holes: offered_holes.clone(),
+            })
+            .map_err(RuntimeGateError::Rewrite)
+        };
+
+        if runtime.region.is_none() {
+            // Without a hole to try, go straight to the region.
+            let holes_only = (!spaces.is_empty()).then(|| rewrite(&spaces));
+            if let Some(Ok(batch)) = &holes_only
+                && batch.trapped.is_empty()
+            {
+                return holes_only.expect("matched above");
+            }
+            if let Err(reason) = self.reserve_runtime_trampoline_region(runtime, code_range) {
+                litebox_util_log::warn!(err:% = reason; "no runtime trampoline region");
+                return match holes_only {
+                    Some(Ok(batch)) => Ok(batch),
+                    _ => Err(RuntimeGateError::NoRegion(reason)),
+                };
+            }
+        }
+        let region = runtime.region.as_ref().expect("reserved above");
+        spaces.push(TrampolineSpace {
+            start: (region.addr + align_up(region.cursor, GATE_ALIGNMENT)) as u64,
+            end: None,
+        });
+        rewrite(&spaces)
+    }
+
+    /// Maps the trampoline memory `batch` needs: holes on first use, and growth
+    /// of the runtime region.
+    #[cfg(target_arch = "aarch64")]
+    fn make_room_for_batch(
+        &self,
+        runtime: &mut RuntimeTrampolines,
+        batch: &RuntimeBatch,
+    ) -> Result<(), RuntimeGateError> {
+        for sub in &batch.subs {
+            let start: usize = sub.vaddr.trunc();
+            let end = start + sub.data.len();
+            if let Some(&index) = batch
+                .offered_holes
+                .iter()
+                .find(|&&index| runtime.holes[index].range.contains(&start))
+            {
+                let hole = &mut runtime.holes[index];
+                if !hole.mapped {
+                    let mapped = self
+                        .do_mmap_anonymous(
+                            Some(hole.range.start),
+                            hole.range.len(),
+                            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                        )
+                        .is_ok_and(|ptr| ptr.as_usize() == hole.range.start);
+                    if !mapped {
+                        return Err(RuntimeGateError::MapHole(hole.range.clone()));
+                    }
+                    hole.mapped = true;
+                }
+                hole.cursor = hole.cursor.max(end);
+                continue;
+            }
+            let region = runtime
+                .region
+                .as_mut()
+                .ok_or(RuntimeGateError::GrowRegion)?;
+            let needed = align_up(end - region.addr, PAGE_SIZE);
+            if needed > region.len {
+                self.do_mmap_anonymous(
+                    Some(region.addr + region.len),
+                    needed - region.len,
+                    ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                    MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                )
+                .map_err(|_| RuntimeGateError::GrowRegion)?;
+                region.len = needed;
+            }
+            region.cursor = region.cursor.max(end - region.addr);
+        }
+        Ok(())
+    }
+
+    /// Restores `runtime` and its memory to `snapshot`, taken before a failed
+    /// batch. Holes the batch mapped go back to inaccessible outside the code
+    /// mapping, and region memory it reserved or grew is unmapped.
+    ///
+    /// A hole part inside the code mapping gets the code's permissions back
+    /// with the code, but holds zeros rather than the file's bytes; loaders
+    /// never read the gap between segments.
+    #[cfg(target_arch = "aarch64")]
+    fn roll_back_runtime_batch(
+        &self,
+        runtime: &mut RuntimeTrampolines,
+        snapshot: RuntimeSnapshot,
+        code: &Range<usize>,
+    ) {
+        for (hole, saved) in runtime.holes.iter().zip(&snapshot.holes) {
+            if hole.mapped && !saved.mapped {
+                for part in subtract_ranges(hole.range.clone(), core::slice::from_ref(code)) {
+                    let _ = self.sys_mprotect_raw(
+                        UserPtrMut::<u8>::from_usize(part.start),
+                        part.len(),
+                        ProtFlags::PROT_NONE,
+                    );
+                }
+            }
+        }
+        if let Some(region) = &runtime.region {
+            let kept = snapshot.region.as_ref().map_or(0, |saved| saved.len);
+            if region.len > kept {
+                let _ = self.sys_munmap_raw(
+                    UserPtrMut::<u8>::from_usize(region.addr + kept),
+                    region.len - kept,
+                );
+            }
+        }
+        runtime.holes = snapshot.holes;
+        runtime.region = snapshot.region;
+    }
+
+    /// Writes a prepared batch: its sub-trampolines, then its patched code,
+    /// except over holes holding trampolines.
+    #[cfg(target_arch = "aarch64")]
+    fn write_runtime_batch(
+        &self,
+        runtime: &RuntimeTrampolines,
+        code_range: &Range<usize>,
+        original: &[u8],
+        batch: &RuntimeBatch,
+        restore_protections: &[ProtectionRange],
+    ) {
+        let fail = |what| self.fail_runtime_write(runtime, restore_protections, what);
+        // Sub-trampolines go first, so rewritten branches never target an
+        // uninitialized gate.
+        for sub in &batch.subs {
+            if UserPtrMut::<u8>::from_usize(sub.vaddr.trunc())
+                .copy_from_slice::<Platform>(0, &sub.data)
+                .is_none()
+            {
+                fail("trampoline stubs");
+            }
+        }
+        if batch.code == original {
+            return;
+        }
+        let holes: Vec<Range<usize>> = runtime
+            .holes
+            .iter()
+            .filter(|hole| hole.mapped)
+            .map(|hole| hole.range.clone())
+            .collect();
+        for keep in subtract_ranges(code_range.clone(), &holes) {
+            let offset = keep.start - code_range.start;
+            let bytes = offset..offset + keep.len();
+            let ptr = UserPtrMut::<u8>::from_usize(keep.start);
+            if ptr
+                .copy_from_slice::<Platform>(0, &batch.code[bytes.clone()])
+                .is_none()
+            {
+                let _ = ptr.copy_from_slice::<Platform>(0, &original[bytes]);
+                fail("patched code back to code segment");
+            }
+        }
+    }
+
+    /// Restores the code's and the trampolines' permissions, then panics: a
+    /// partly written batch cannot be undone.
+    #[cfg(target_arch = "aarch64")]
+    fn fail_runtime_write(
+        &self,
+        runtime: &RuntimeTrampolines,
+        restore_protections: &[ProtectionRange],
+        what: &str,
+    ) -> ! {
+        let _ = self.restore_page_permissions(restore_protections);
+        self.restore_runtime_trampoline_rx(runtime);
+        panic!("fatal: failed to write {what}");
+    }
+
+    /// Whether `hole` is still reserved for its object: every page is mapped,
+    /// either by `code`, the mapping being patched, or inaccessibly, as a
+    /// loader leaves the slack inside an object's reservation.
+    #[cfg(target_arch = "aarch64")]
+    fn runtime_hole_is_reserved(&self, hole: &Range<usize>, code: &Range<usize>) -> bool {
+        let mut covered: Vec<Range<usize>> = Vec::new();
+        for (range, flags) in self.global.mm.mappings() {
+            let part = range.start.max(hole.start)..range.end.min(hole.end);
+            if part.is_empty() {
+                continue;
+            }
+            let inside_code = part.start >= code.start && part.end <= code.end;
+            if flags.intersects(VmFlags::VM_ACCESS_FLAGS) && !inside_code {
+                return false;
+            }
+            covered.push(part);
+        }
+        subtract_ranges(hole.clone(), &covered).is_empty()
+    }
+
+    /// Reserves the runtime trampoline region within branch reach of `code`:
+    /// at the preferred address with full capacity, anywhere in reach with
+    /// full capacity, or at the preferred address with one page.
+    #[cfg(target_arch = "aarch64")]
+    fn reserve_runtime_trampoline_region(
+        &self,
+        runtime: &mut RuntimeTrampolines,
+        code: &Range<usize>,
+    ) -> Result<(), ReserveError> {
+        let preferred_addr = runtime.preferred_addr;
+        let capacity = runtime.capacity.max(PAGE_SIZE);
+
+        let map_preferred = |reservation_len| match self.do_mmap_anonymous(
+            Some(preferred_addr),
+            reservation_len,
+            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+            MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+        ) {
+            Ok(ptr) if ptr.as_usize() == preferred_addr => Some(ptr),
+            Ok(ptr) => {
+                let _ = self.sys_munmap_raw(ptr, reservation_len);
+                None
+            }
+            Err(_) => None,
+        };
+        let distance_from_code =
+            |addr: usize| addr.abs_diff(code.start).max(addr.abs_diff(code.end));
+        let mut rejected_distance = None;
+        let reservation =
+            choose_trampoline_reservation(capacity, PAGE_SIZE, map_preferred, |reservation_len| {
+                let ptr = self
+                    .do_mmap_anonymous(
+                        None,
+                        reservation_len,
+                        ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
+                        MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE,
+                    )
+                    .ok()?;
+                let distance = distance_from_code(ptr.as_usize());
+                if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
+                    litebox_util_log::debug!(
+                        distance:? = distance;
+                        "rejecting arbitrary trampoline reservation outside branch range"
+                    );
+                    rejected_distance = Some(distance);
+                    let _ = self.sys_munmap_raw(ptr, reservation_len);
+                    return None;
+                }
+                Some(ptr)
+            });
+        let Some((ptr, len)) = reservation else {
+            return Err(
+                rejected_distance.map_or(ReserveError::NoMemory, |distance| {
+                    ReserveError::OutOfReach { distance }
+                }),
+            );
+        };
+        let addr = ptr.as_usize();
+        // Defend the preferred paths; individual gates also check reach.
+        let distance = distance_from_code(addr);
+        if distance > litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT {
+            let _ = self.sys_munmap_raw(ptr, len);
+            return Err(ReserveError::OutOfReach { distance });
+        }
+        // Every sub-trampoline carries its own callback header, so the region
+        // has no shared entry-point slot.
+        runtime.region = Some(RuntimeRegion {
+            addr,
+            len,
+            cursor: 0,
+        });
+        litebox_util_log::debug!(addr:? = addr, len:? = len; "reserved runtime trampoline region");
+        Ok(())
+    }
+
     /// Finalize the ELF patching state for `fd`.
     ///
     /// Removes the cache entry and unmaps any trampoline that was allocated but never used.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd>) {
         let state = self.global.elf_patch_cache.lock().remove(&ElfPatchKey(fd));
         if let Some(state) = state
@@ -1694,6 +2628,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     tramp_len,
                 );
             }
+        }
+    }
+
+    /// Finalize the ELF patching state for `fd`.
+    ///
+    /// Removes the cache entry and unmaps a runtime trampoline region that holds
+    /// no gates, which happens when every gate went to a hole.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd>) {
+        let state = self.global.elf_patch_cache.lock().remove(&ElfPatchKey(fd));
+        if let Some(ElfPatchState {
+            trampoline: TrampolineState::Runtime(runtime),
+            ..
+        }) = state
+            && let Some(region) = runtime.region
+            && region.cursor == 0
+        {
+            let _ = self.sys_munmap(UserPtrMut::<u8>::from_usize(region.addr), region.len);
         }
     }
 }
@@ -1725,6 +2677,7 @@ mod tests {
         ElfPatchKey(fd)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn runtime_patch_state(
         file_mappings: BTreeSet<(usize, usize)>,
         trampoline_addr: usize,
@@ -1735,18 +2688,34 @@ mod tests {
             trampoline_file_offset: 0,
             trampoline_file_size: 0,
             trampoline_addr,
-            #[cfg(target_arch = "aarch64")]
-            load_span: None,
             trampoline_cursor: 0,
             trampoline_mapped,
             trampoline_mapped_len: 0,
             runtime_patches_committed: false,
-            #[cfg(target_arch = "aarch64")]
-            trampoline_invalidated: false,
-            #[cfg(target_arch = "aarch64")]
-            code_metadata: None,
-            #[cfg(target_arch = "aarch64")]
-            trampoline_capacity: 0,
+            file_mappings,
+            patched_ranges: BTreeSet::new(),
+        }
+    }
+
+    /// An unpatched object's state with no trampoline memory yet; AArch64
+    /// tests that need any set it up themselves, so `_trampoline_mapped` is
+    /// ignored.
+    #[cfg(target_arch = "aarch64")]
+    fn runtime_patch_state(
+        file_mappings: BTreeSet<(usize, usize)>,
+        trampoline_addr: usize,
+        _trampoline_mapped: bool,
+    ) -> ElfPatchState {
+        ElfPatchState {
+            trampoline: super::TrampolineState::Runtime(super::RuntimeTrampolines {
+                preferred_addr: trampoline_addr,
+                region: None,
+                holes: alloc::vec::Vec::new(),
+                code_metadata: None,
+                capacity: 0,
+            }),
+            load_span: None,
+            invalidated: false,
             file_mappings,
             patched_ranges: BTreeSet::new(),
         }
@@ -2025,6 +2994,248 @@ mod tests {
             .expect("second test mapping should unmap");
     }
 
+    #[cfg(target_arch = "aarch64")]
+    mod trampoline_unmap {
+        use super::super::{
+            AotTrampoline, ElfPatchState, RuntimeHole, RuntimeRegion, TrampolineState,
+            forget_unmapped_trampolines,
+        };
+        use super::{BTreeSet, PAGE_SIZE, runtime_patch_state};
+        use alloc::vec::Vec;
+
+        const HOLE: core::ops::Range<usize> = 0x10_0000..0x10_4000;
+        const REGION: usize = 0x20_0000;
+
+        fn runtime_state() -> ElfPatchState {
+            let mut state = runtime_patch_state(BTreeSet::new(), REGION, true);
+            let TrampolineState::Runtime(runtime) = &mut state.trampoline else {
+                unreachable!()
+            };
+            runtime.region = Some(RuntimeRegion {
+                addr: REGION,
+                len: PAGE_SIZE,
+                cursor: 0x100,
+            });
+            runtime.holes = alloc::vec![RuntimeHole {
+                range: HOLE,
+                cursor: HOLE.start + 0x100,
+                mapped: true,
+            }];
+            state
+        }
+
+        fn mapped(state: &ElfPatchState) -> Vec<core::ops::Range<usize>> {
+            state.mapped_trampoline_ranges().collect()
+        }
+
+        /// Unloading an object removes its holes but not the runtime region
+        /// past it; that leaves both usable.
+        #[test]
+        fn removing_a_whole_hole_forgets_only_that_hole() {
+            let mut state = runtime_state();
+            forget_unmapped_trampolines(&mut state, 0..HOLE.end + PAGE_SIZE);
+            assert!(!state.invalidated);
+            let TrampolineState::Runtime(runtime) = &state.trampoline else {
+                unreachable!()
+            };
+            assert!(!runtime.holes[0].mapped);
+            assert_eq!(runtime.holes[0].cursor, HOLE.start);
+            assert_eq!(
+                mapped(&state),
+                core::slice::from_ref(&(REGION..REGION + PAGE_SIZE))
+            );
+
+            forget_unmapped_trampolines(&mut state, REGION..REGION + PAGE_SIZE);
+            assert!(!state.invalidated);
+            assert_eq!(mapped(&state), []);
+        }
+
+        #[test]
+        fn removing_part_of_an_area_invalidates() {
+            let mut state = runtime_state();
+            forget_unmapped_trampolines(&mut state, HOLE.start..HOLE.start + PAGE_SIZE);
+            assert!(state.invalidated);
+
+            let mut state = runtime_state();
+            forget_unmapped_trampolines(&mut state, 0..1);
+            assert!(!state.invalidated);
+        }
+
+        #[test]
+        fn aot_regions_are_forgotten_and_reinstalled_one_at_a_time() {
+            let mut state = runtime_patch_state(BTreeSet::new(), 0, true);
+            state.trampoline = TrampolineState::Aot(alloc::vec![
+                AotTrampoline {
+                    file_offset: 0x1000,
+                    addr: HOLE.start,
+                    size: 0x10,
+                    mapped: true,
+                },
+                AotTrampoline {
+                    file_offset: 0x2000,
+                    addr: REGION,
+                    size: 0x10,
+                    mapped: true,
+                },
+            ]);
+            assert!(state.trampoline_is_populated());
+            forget_unmapped_trampolines(&mut state, HOLE);
+            assert!(!state.invalidated);
+            assert_eq!(
+                mapped(&state),
+                core::slice::from_ref(&(REGION..REGION + PAGE_SIZE))
+            );
+            // One region is gone, so the next executable mapping must
+            // reinstall it before remapped code can branch there.
+            assert!(!state.trampoline_is_populated());
+            let TrampolineState::Aot(regions) = &state.trampoline else {
+                unreachable!()
+            };
+            let missing: Vec<usize> = regions
+                .iter()
+                .filter(|region| !region.mapped)
+                .map(|region| region.addr)
+                .collect();
+            assert_eq!(missing, [HOLE.start]);
+
+            forget_unmapped_trampolines(&mut state, REGION..REGION + PAGE_SIZE);
+            assert_eq!(mapped(&state), []);
+        }
+    }
+
+    /// A sub-trampoline in a runtime region that lies inside a hole the batch
+    /// did not offer belongs to the region, not to that hole.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn only_offered_holes_take_sub_trampolines() {
+        use super::{RuntimeBatch, RuntimeHole, RuntimeRegion, TrampolineState};
+
+        const HOLE: core::ops::Range<usize> = 0x10_0000..0x20_0000;
+        const REGION: usize = 0x18_0000;
+        let task = init_platform();
+        let mut state = runtime_patch_state(BTreeSet::new(), REGION, true);
+        let TrampolineState::Runtime(runtime) = &mut state.trampoline else {
+            unreachable!()
+        };
+        runtime.holes = alloc::vec![RuntimeHole {
+            range: HOLE,
+            cursor: HOLE.start,
+            mapped: false,
+        }];
+        runtime.region = Some(RuntimeRegion {
+            addr: REGION,
+            len: PAGE_SIZE,
+            cursor: 0,
+        });
+        let batch = RuntimeBatch {
+            code: alloc::vec::Vec::new(),
+            subs: alloc::vec![litebox_syscall_rewriter::aarch64::SubTrampoline {
+                vaddr: REGION as u64,
+                data: alloc::vec![0; 0x40],
+            }],
+            trapped: alloc::vec::Vec::new(),
+            offered_holes: alloc::vec::Vec::new(),
+        };
+        task.make_room_for_batch(runtime, &batch).unwrap();
+        assert!(!runtime.holes[0].mapped);
+        assert_eq!(runtime.holes[0].cursor, HOLE.start);
+        assert_eq!(runtime.region.as_ref().unwrap().cursor, 0x40);
+    }
+
+    /// A failed batch gives back the region memory it reserved or grew, and
+    /// the holes it mapped, leaving the earlier state.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn failed_runtime_batch_is_rolled_back() {
+        use super::{RuntimeHole, RuntimeRegion, RuntimeSnapshot, TrampolineState};
+
+        let task = init_platform();
+        let map = |addr: Option<usize>, len, prot, extra| {
+            task.do_mmap_anonymous(
+                addr,
+                len,
+                prot,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | extra,
+            )
+            .expect("test mapping should succeed")
+            .as_usize()
+        };
+        // A reserved span with a one-page hole, and a one-page runtime region
+        // with room to grow.
+        let span = map(None, 3 * PAGE_SIZE, ProtFlags::PROT_NONE, MapFlags::empty());
+        let hole = span + PAGE_SIZE..span + 2 * PAGE_SIZE;
+        let region = map(
+            None,
+            2 * PAGE_SIZE,
+            ProtFlags::PROT_READ_WRITE,
+            MapFlags::empty(),
+        );
+        task.sys_munmap(UserPtrMut::from_usize(region + PAGE_SIZE), PAGE_SIZE)
+            .unwrap();
+        let before = RuntimeSnapshot {
+            holes: alloc::vec![RuntimeHole {
+                range: hole.clone(),
+                cursor: hole.start,
+                mapped: false,
+            }],
+            region: Some(RuntimeRegion {
+                addr: region,
+                len: PAGE_SIZE,
+                cursor: 0x40,
+            }),
+        };
+
+        // The batch mapped the hole and grew the region by a page.
+        let mut state = runtime_patch_state(BTreeSet::new(), region, true);
+        let TrampolineState::Runtime(runtime) = &mut state.trampoline else {
+            unreachable!()
+        };
+        map(
+            Some(hole.start),
+            PAGE_SIZE,
+            ProtFlags::PROT_READ_WRITE,
+            MapFlags::MAP_FIXED,
+        );
+        map(
+            Some(region + PAGE_SIZE),
+            PAGE_SIZE,
+            ProtFlags::PROT_READ_WRITE,
+            MapFlags::MAP_FIXED_NOREPLACE,
+        );
+        runtime.holes = alloc::vec![RuntimeHole {
+            range: hole.clone(),
+            cursor: hole.end,
+            mapped: true,
+        }];
+        runtime.region = Some(RuntimeRegion {
+            addr: region,
+            len: 2 * PAGE_SIZE,
+            cursor: PAGE_SIZE + 0x40,
+        });
+
+        task.roll_back_runtime_batch(runtime, before, &(0..0));
+        assert_eq!(runtime.holes[0].cursor, hole.start);
+        assert!(!runtime.holes[0].mapped);
+        let restored = runtime.region.as_ref().unwrap();
+        assert_eq!((restored.len, restored.cursor), (PAGE_SIZE, 0x40));
+        // The hole is inaccessible again, and the growth page is free.
+        assert!(task.runtime_hole_is_reserved(&hole, &(0..0)));
+        assert_eq!(
+            map(
+                Some(region + PAGE_SIZE),
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_FIXED_NOREPLACE,
+            ),
+            region + PAGE_SIZE
+        );
+
+        task.sys_munmap(UserPtrMut::from_usize(span), 3 * PAGE_SIZE)
+            .unwrap();
+        task.sys_munmap(UserPtrMut::from_usize(region), 2 * PAGE_SIZE)
+            .unwrap();
+    }
+
     #[test]
     fn full_capacity_anywhere_precedes_preferred_one_page() {
         let calls = core::cell::RefCell::new(alloc::vec::Vec::new());
@@ -2250,6 +3461,47 @@ mod tests {
             .unwrap();
         assert_eq!(addr.read_at_offset::<Platform>(0x1000).unwrap(), 0xff,);
         task.sys_munmap(addr, 0x2000).unwrap();
+    }
+
+    /// A computed hole is used only while it is still this object's: covered
+    /// by the mapping being patched or by inaccessible reservation, with no
+    /// unmapped gap and nothing live.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn runtime_holes_must_still_be_reserved() {
+        let task = init_platform();
+        let span = task
+            .sys_mmap(
+                0,
+                0x4000,
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_ANON | MapFlags::MAP_PRIVATE,
+                -1,
+                0,
+            )
+            .unwrap()
+            .as_usize();
+        let hole = span + 0x1000..span + 0x3000;
+        let no_code = 0..0;
+        assert!(task.runtime_hole_is_reserved(&hole, &no_code));
+
+        // Live memory inside the hole is someone else's.
+        task.sys_mprotect(
+            crate::UserPtrMut::<u8>::from_usize(span + 0x2000),
+            0x1000,
+            ProtFlags::PROT_READ,
+        )
+        .unwrap();
+        assert!(!task.runtime_hole_is_reserved(&hole, &no_code));
+        // Unless it is the mapping being patched.
+        assert!(task.runtime_hole_is_reserved(&hole, &(span + 0x2000..span + 0x3000)));
+
+        // An unmapped gap is not reserved for anybody.
+        task.sys_munmap(crate::UserPtrMut::<u8>::from_usize(span + 0x2000), 0x1000)
+            .unwrap();
+        assert!(!task.runtime_hole_is_reserved(&hole, &no_code));
+        task.sys_munmap(crate::UserPtrMut::<u8>::from_usize(span), 0x4000)
+            .unwrap();
     }
 
     #[test]

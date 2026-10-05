@@ -66,6 +66,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "gate_signals.c",
     "sigreturn.c",
     "sigreturn_simd.c",
+    "split_trampoline.c",
     "svc_scratch_regs.c",
     "vfork_fault_parent.c",
     "vfork_exec_child.c",

@@ -56,6 +56,7 @@ impl MappingInfo {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug)]
 struct TrampolineInfo {
     /// The virtual memory of the trampoline code.
@@ -68,10 +69,33 @@ struct TrampolineInfo {
     syscall_entry_point: usize,
 }
 
+/// An AArch64 ELF's trampoline: independently mapped sub-trampolines.
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug)]
+struct TrampolineInfo {
+    /// The sub-trampolines, in file order.
+    regions: Vec<TrampolineRegion>,
+    /// The entry point to jump to in the trampoline.
+    syscall_entry_point: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+use litebox_syscall_rewriter::TrampolineRegion;
+
+/// The pages `region` occupies when its object is loaded at `base_addr`.
+#[cfg(target_arch = "aarch64")]
+fn loaded_pages(region: &TrampolineRegion, base_addr: usize) -> Option<core::ops::Range<usize>> {
+    let pages = region.page_range(PAGE_SIZE as u64)?;
+    let start = base_addr.checked_add(usize::try_from(pages.start).ok()?)?;
+    let end = base_addr.checked_add(usize::try_from(pages.end).ok()?)?;
+    Some(start..end)
+}
+
 /// The magic number used to identify the LiteBox trampoline.
 /// This must match `TRAMPOLINE_MAGIC` in `litebox_syscall_rewriter`.
 const TRAMPOLINE_MAGIC: u64 = u64::from_le_bytes(*b"LITEBOX0");
 /// This must match `litebox_syscall_rewriter::TRAMPOLINE_FILE_ALIGNMENT`.
+#[cfg(target_arch = "x86_64")]
 const TRAMPOLINE_FILE_ALIGNMENT: u64 = 4096;
 
 /// Trampoline header for 64-bit: 8 (magic) + 8 (file_offset) + 8 (vaddr) + 8 (size) = 32 bytes
@@ -296,6 +320,7 @@ impl ElfParsedFile {
     ///
     /// `None` if the binary has no trampoline or, like [`Self::has_trampoline`],
     /// if [`Self::parse_trampoline`] has not run yet.
+    #[cfg(target_arch = "x86_64")]
     pub fn trampoline_page_range(&self, base_addr: usize) -> Option<core::ops::Range<usize>> {
         let trampoline = self.trampoline.as_ref()?;
         let start = base_addr.checked_add(trampoline.vaddr)?;
@@ -303,6 +328,14 @@ impl ElfParsedFile {
             .checked_add(trampoline.size)?
             .checked_next_multiple_of(PAGE_SIZE)?;
         Some(start..end)
+    }
+
+    /// The independently mapped sub-trampolines of the parsed trampoline.
+    #[cfg(target_arch = "aarch64")]
+    pub fn trampoline_regions(&self) -> &[TrampolineRegion] {
+        self.trampoline
+            .as_ref()
+            .map_or(&[], |trampoline| trampoline.regions.as_slice())
     }
 
     /// Parse the LiteBox trampoline data, if any.
@@ -313,6 +346,7 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
+    #[cfg(target_arch = "x86_64")]
     #[expect(
         clippy::missing_panics_doc,
         reason = "cannot panic: array slices are always the correct size"
@@ -417,6 +451,40 @@ impl ElfParsedFile {
         Ok(())
     }
 
+    /// Parse the LiteBox trampoline data of an AArch64 ELF, if any.
+    ///
+    /// See [`read_trampoline_regions`] for the file layout.
+    ///
+    /// `syscall_entry_point` is the address of the syscall entry point to write
+    /// into every sub-trampoline at map time.
+    #[cfg(target_arch = "aarch64")]
+    pub fn parse_trampoline<F: ReadAt>(
+        &mut self,
+        file: &mut F,
+        syscall_entry_point: usize,
+    ) -> Result<(), ElfParseError<F::Error>> {
+        if syscall_entry_point == 0 {
+            // Platform running in kernel mode does not need trampoline
+            // and may give zero as entry point.
+            return Ok(());
+        }
+
+        let segments: Vec<core::ops::Range<u64>> = self
+            .pt_loads()
+            .map(|ph| ph.p_vaddr..ph.p_vaddr.saturating_add(ph.p_memsz))
+            .collect();
+        let regions = read_trampoline_regions(file, &segments)?;
+        // No regions means the rewriter checked this binary and found no
+        // syscall instructions.
+        if !regions.is_empty() {
+            self.trampoline = Some(TrampolineInfo {
+                regions,
+                syscall_entry_point,
+            });
+        }
+        Ok(())
+    }
+
     fn program_headers(
         &self,
     ) -> elf::parse::ParsingIterator<'_, Endian, elf::segment::ProgramHeader> {
@@ -482,6 +550,7 @@ impl ElfParsedFile {
                     align = align.max(ph.p_align.trunc());
                 }
             }
+            #[cfg(target_arch = "x86_64")]
             if let Some(trampoline) = &self.trampoline {
                 min = min.min(trampoline.vaddr);
                 max = max.max(
@@ -490,6 +559,12 @@ impl ElfParsedFile {
                         .checked_add(trampoline.size)
                         .ok_or(ElfLoadError::InvalidProgramHeader)?,
                 );
+            }
+            #[cfg(target_arch = "aarch64")]
+            for region in self.trampoline_regions() {
+                let pages = loaded_pages(region, 0).ok_or(ElfLoadError::InvalidProgramHeader)?;
+                min = min.min(pages.start);
+                max = max.max(pages.end);
             }
             let min = page_align_down(min);
             let max = max
@@ -605,6 +680,7 @@ impl ElfParsedFile {
     }
 
     /// Load the LiteBox trampoline into memory.
+    #[cfg(target_arch = "x86_64")]
     fn load_trampoline<M: MapMemory>(
         &self,
         mapper: &mut M,
@@ -663,6 +739,65 @@ impl ElfParsedFile {
         Ok(())
     }
 
+    /// Load an AArch64 ELF's trampoline into memory, one sub-trampoline at a
+    /// time.
+    #[cfg(target_arch = "aarch64")]
+    fn load_trampoline<M: MapMemory>(
+        &self,
+        mapper: &mut M,
+        mem: &mut impl AccessMemory,
+        info: &mut MappingInfo,
+    ) -> Result<(), ElfLoadError<M::Error>> {
+        let trampoline = self.trampoline.as_ref().unwrap();
+        for region in &trampoline.regions {
+            let range =
+                loaded_pages(region, info.base_addr).ok_or(ElfLoadError::InvalidProgramHeader)?;
+            let trampoline_start = range.start;
+            let trampoline_end = range.end;
+            if M::POPULATES_TRAMPOLINE {
+                info.brk = info.brk.max(trampoline_end);
+                continue;
+            }
+            debug_assert!(
+                region.file_offset.is_multiple_of(PAGE_SIZE as u64),
+                "non-populating loaders map the trampoline directly from its file offset"
+            );
+            mapper
+                .map_file(
+                    trampoline_start,
+                    trampoline_end - trampoline_start,
+                    region.file_offset,
+                    &Protection {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                )
+                .map_err(ElfLoadError::Map)?;
+
+            // Each region starts with its own callback slot.
+            mem.write(
+                trampoline_start,
+                &trampoline.syscall_entry_point.to_ne_bytes(),
+            )?;
+
+            mapper
+                .protect(
+                    trampoline_start,
+                    trampoline_end - trampoline_start,
+                    &Protection {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                )
+                .map_err(ElfLoadError::Map)?;
+
+            info.brk = info.brk.max(trampoline_end);
+        }
+        Ok(())
+    }
+
     /// Load the secondary LiteBox trampoline into memory whose location is relative to
     /// the based address which is the difference of `loaded_entry_point` and `e_entry`
     /// in the ELF header.
@@ -688,6 +823,72 @@ impl ElfParsedFile {
         };
         self.load_trampoline(mapper, mem, &mut info)
     }
+}
+
+/// Reads the sub-trampoline table the LiteBox rewriter appends to an AArch64
+/// ELF; see [`litebox_syscall_rewriter::parse_aarch64_trampoline_footer`].
+/// Additionally rejects any region whose pages overlap those of one of
+/// `segments`, the object's `PT_LOAD` address ranges, since mapping it would
+/// replace the object's own memory.
+///
+/// Returns the regions in file order, which is empty when nothing was patched.
+///
+/// # Errors
+///
+/// [`ElfParseError::UnpatchedBinary`] if the file carries no LiteBox trailer,
+/// [`ElfParseError::BadTrampolineVersion`] for an unknown `LITEBOX` version,
+/// and [`ElfParseError::BadTrampoline`] for a malformed table.
+#[cfg(target_arch = "aarch64")]
+pub fn read_trampoline_regions<F: ReadAt>(
+    file: &mut F,
+    segments: &[core::ops::Range<u64>],
+) -> Result<Vec<TrampolineRegion>, ElfParseError<F::Error>> {
+    use litebox_syscall_rewriter::{
+        AARCH64_TRAMPOLINE_FOOTER_BYTES, TrampolineTableError, parse_aarch64_trampoline_footer,
+        parse_aarch64_trampoline_table,
+    };
+    let table_error = |error| match error {
+        TrampolineTableError::UnknownVersion => ElfParseError::BadTrampolineVersion,
+        TrampolineTableError::Malformed => ElfParseError::BadTrampoline,
+    };
+
+    let file_len = file.size().map_err(ElfParseError::Io)?;
+    let footer_offset = file_len
+        .checked_sub(AARCH64_TRAMPOLINE_FOOTER_BYTES as u64)
+        .ok_or(ElfParseError::UnpatchedBinary)?;
+    let mut footer = [0u8; AARCH64_TRAMPOLINE_FOOTER_BYTES];
+    file.read_at(footer_offset, &mut footer)
+        .map_err(ElfParseError::Io)?;
+    let location = parse_aarch64_trampoline_footer(&footer, file_len)
+        .map_err(table_error)?
+        .ok_or(ElfParseError::UnpatchedBinary)?;
+    let mut table = alloc::vec![0u8; location.len];
+    file.read_at(location.file_offset, &mut table)
+        .map_err(ElfParseError::Io)?;
+    let regions = parse_aarch64_trampoline_table(&table, location).map_err(table_error)?;
+
+    let page = PAGE_SIZE as u64;
+    let segment_pages = |segment: &core::ops::Range<u64>| {
+        segment.start & !(page - 1)
+            ..segment
+                .end
+                .checked_next_multiple_of(page)
+                .unwrap_or(u64::MAX)
+    };
+    for region in &regions {
+        let pages = region
+            .page_range(page)
+            .ok_or(ElfParseError::BadTrampoline)?;
+        if loaded_pages(region, 0).is_none()
+            || segments
+                .iter()
+                .map(segment_pages)
+                .any(|segment| segment.start < pages.end && pages.start < segment.end)
+        {
+            return Err(ElfParseError::BadTrampoline);
+        }
+    }
+    Ok(regions)
 }
 
 /// Trait for reading ELF binary data at specific offsets.
@@ -1026,6 +1227,146 @@ mod reserve_regions_tests {
             let tail = r.tail_unmap.map_or(0, |(_, s)| s);
             assert_eq!(head + tail, align - PAGE_SIZE);
             assert_page_aligned(&r);
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod aarch64_trampoline_footer_tests {
+    use super::{ElfParseError, ReadAt, TrampolineRegion, read_trampoline_regions};
+    use alloc::vec::Vec;
+
+    struct Bytes(Vec<u8>);
+
+    impl ReadAt for Bytes {
+        type Error = ();
+
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(buf.len()).ok_or(())?;
+            buf.copy_from_slice(self.0.get(start..end).ok_or(())?);
+            Ok(())
+        }
+
+        fn size(&mut self) -> Result<u64, ()> {
+            Ok(self.0.len() as u64)
+        }
+    }
+
+    fn push_u64s(out: &mut Vec<u8>, words: &[u64]) {
+        for word in words {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn unpatched_and_unknown_versions_are_reported() {
+        assert!(matches!(
+            read_trampoline_regions(&mut Bytes(alloc::vec![0u8; 0x80]), &[]),
+            Err(ElfParseError::UnpatchedBinary)
+        ));
+        let mut future = alloc::vec![0u8; 0x80];
+        future.extend_from_slice(b"LITEBOX9");
+        push_u64s(&mut future, &[0, 0, 0]);
+        assert!(matches!(
+            read_trampoline_regions(&mut Bytes(future), &[]),
+            Err(ElfParseError::BadTrampolineVersion)
+        ));
+    }
+
+    /// `[0x1000 bytes][sub-trampoline of `size` bytes at `vaddr`]...[table][footer]`.
+    fn aarch64_file(regions: &[(u64, u64)]) -> (Vec<u8>, Vec<TrampolineRegion>) {
+        let mut out = alloc::vec![0u8; 0x1000];
+        let mut table = Vec::new();
+        let mut expected = Vec::new();
+        for &(vaddr, size) in regions {
+            out.resize(out.len().next_multiple_of(0x1000), 0);
+            let file_offset = out.len() as u64;
+            push_u64s(&mut table, &[file_offset, vaddr, size]);
+            expected.push(TrampolineRegion {
+                file_offset,
+                vaddr,
+                size,
+            });
+            out.resize(out.len() + usize::try_from(size).unwrap(), 0xAA);
+        }
+        let table_offset = out.len() as u64;
+        out.extend_from_slice(&table);
+        out.extend_from_slice(b"LITEBOX0");
+        push_u64s(&mut out, &[table_offset, regions.len() as u64, 0]);
+        (out, expected)
+    }
+
+    #[test]
+    fn aarch64_sub_trampolines_are_read_in_file_order() {
+        let (file, expected) = aarch64_file(&[(0x5000, 0x1010), (0x2000, 0x40), (0x9000, 0x800)]);
+        assert_eq!(
+            read_trampoline_regions(&mut Bytes(file), &[0x1000..0x2000, 0x3000..0x5000]).unwrap(),
+            expected
+        );
+
+        let (sentinel, _) = aarch64_file(&[]);
+        assert_eq!(
+            read_trampoline_regions(&mut Bytes(sentinel), &[]).unwrap(),
+            []
+        );
+    }
+
+    #[test]
+    fn malformed_aarch64_tables_are_rejected() {
+        let bad = |file: Vec<u8>| {
+            matches!(
+                read_trampoline_regions(&mut Bytes(file), &[]),
+                Err(ElfParseError::BadTrampoline)
+            )
+        };
+        // Sub-trampolines sharing a page.
+        assert!(bad(aarch64_file(&[(0x5000, 0x1010), (0x6000, 0x40)]).0));
+        // An unaligned address.
+        assert!(bad(aarch64_file(&[(0x5010, 0x10), (0x8000, 0x40)]).0));
+        // An empty sub-trampoline.
+        assert!(bad(aarch64_file(&[(0x5000, 0), (0x8000, 0x40)]).0));
+
+        let (good, _) = aarch64_file(&[(0x5000, 0x10), (0x8000, 0x40)]);
+        let footer = good.len() - 32;
+        // Nonzero reserved word.
+        let mut file = good.clone();
+        file[footer + 24] = 1;
+        assert!(bad(file));
+        // A table that does not end at the footer.
+        let mut file = good.clone();
+        file[footer + 16] = 1;
+        assert!(bad(file));
+        // Entries out of file order.
+        let mut file = good.clone();
+        let table = footer - 48;
+        let (first, second) = file[table..footer].split_at_mut(24);
+        first.swap_with_slice(second);
+        assert!(bad(file));
+        // An unaligned file offset.
+        let mut file = good.clone();
+        file[table] = 8;
+        assert!(bad(file));
+    }
+
+    #[test]
+    fn aarch64_sub_trampolines_must_not_overlap_segments() {
+        let (file, _) = aarch64_file(&[(0x5000, 0x10), (0x8000, 0x40)]);
+        let read = |segments: &[core::ops::Range<u64>]| {
+            read_trampoline_regions(&mut Bytes(file.clone()), segments)
+        };
+        assert!(read(&[0x1000..0x5000, 0x6000..0x8000]).is_ok());
+        for segment in [
+            // Inside a segment.
+            0x1000..0x9000,
+            // Sharing a page with a segment's start or end.
+            0x5800..0x7000,
+            0x2000..0x8001,
+        ] {
+            assert!(matches!(
+                read(core::slice::from_ref(&segment)),
+                Err(ElfParseError::BadTrampoline)
+            ));
         }
     }
 }

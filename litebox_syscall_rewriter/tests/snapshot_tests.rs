@@ -6,7 +6,7 @@ fn objdump(objdump_cmd: &str, binary: &[u8]) -> String {
     use std::process::Command;
     use tempfile::NamedTempFile;
 
-    let trampoline_range = trampoline_range(binary);
+    let trampoline_ranges = trampoline_ranges(binary);
     let mut temp_file = NamedTempFile::new().unwrap();
     temp_file.write_all(binary).unwrap();
 
@@ -25,7 +25,7 @@ fn objdump(objdump_cmd: &str, binary: &[u8]) -> String {
                 .rsplit_once(':')
                 .is_some_and(|(_, banner)| banner.trim_start().starts_with("file format "))
         })
-        .map(|line| normalize_objdump_line(line, trampoline_range.as_ref()))
+        .map(|line| normalize_objdump_line(line, &trampoline_ranges))
         .collect::<Vec<_>>();
     let first_content = lines
         .iter()
@@ -63,23 +63,40 @@ fn find_objdump(candidates: &[&str], arch_token: &str) -> Option<String> {
         .map(|cmd| (*cmd).to_owned())
 }
 
-fn trampoline_range(binary: &[u8]) -> Option<std::ops::Range<u64>> {
+/// Address ranges of the trampoline appended to a rewritten ELF: one range on
+/// x86-64, one per sub-trampoline on AArch64.
+fn trampoline_ranges(binary: &[u8]) -> Vec<std::ops::Range<u64>> {
     const MAGIC: &[u8; 8] = litebox_syscall_rewriter::TRAMPOLINE_MAGIC;
+    const E_MACHINE: std::ops::Range<usize> = 18..20;
+    const EM_AARCH64: u16 = 183;
 
     if binary.len() < 32 {
-        return None;
+        return Vec::new();
+    }
+    let machine = u16::from_le_bytes(binary[E_MACHINE].try_into().unwrap());
+    if machine == EM_AARCH64 {
+        return litebox_syscall_rewriter::aarch64_trampoline_regions(binary)
+            .expect("valid LiteBox trailer")
+            .into_iter()
+            .flatten()
+            .map(|region| region.vaddr..region.vaddr + region.size)
+            .collect();
     }
 
     let header = &binary[binary.len() - 32..];
     if &header[..8] != MAGIC {
-        return None;
+        return Vec::new();
     }
     let vaddr = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let size = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    (size != 0).then_some(vaddr..vaddr.checked_add(size)?)
+    (size != 0)
+        .then(|| vaddr.checked_add(size).map(|end| vaddr..end))
+        .flatten()
+        .into_iter()
+        .collect()
 }
 
-fn normalize_objdump_line(line: &str, trampoline_range: Option<&std::ops::Range<u64>>) -> String {
+fn normalize_objdump_line(line: &str, trampoline_ranges: &[std::ops::Range<u64>]) -> String {
     let Some((address, rest)) = line.split_once(':') else {
         return line.trim_end().to_owned();
     };
@@ -87,23 +104,23 @@ fn normalize_objdump_line(line: &str, trampoline_range: Option<&std::ops::Range<
 
     // A control-transfer into the trampoline appears as a branch mnemonic
     // (`jmp` on x86, `b`/`bl` on AArch64) followed by an absolute target. When
-    // that target lands in the trampoline region, render it relative to the
-    // trampoline base so the snapshot is independent of the trampoline's exact
+    // that target lands in a trampoline region, render it relative to that
+    // region's base so the snapshot is independent of the trampoline's exact
     // address. Other branches (and same-mnemonic branches that stay in the
     // original code) are left untouched.
-    if let Some(trampoline_range) = trampoline_range {
-        for (i, token) in tokens.iter().enumerate() {
-            if !matches!(*token, "jmp" | "b" | "bl") {
-                continue;
-            }
-            if let Some(target) = tokens
-                .get(i + 1)
-                .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
-                && trampoline_range.contains(&target)
-            {
-                let offset = target - trampoline_range.start;
-                return format!("{address}:\t<trampoline-{token}+0x{offset:x}>");
-            }
+    for (i, token) in tokens.iter().enumerate() {
+        if !matches!(*token, "jmp" | "b" | "bl") {
+            continue;
+        }
+        if let Some(target) = tokens
+            .get(i + 1)
+            .and_then(|t| u64::from_str_radix(t.trim_start_matches("0x"), 16).ok())
+            && let Some(region) = trampoline_ranges
+                .iter()
+                .find(|range| range.contains(&target))
+        {
+            let offset = target - region.start;
+            return format!("{address}:\t<trampoline-{token}+0x{offset:x}>");
         }
     }
 
