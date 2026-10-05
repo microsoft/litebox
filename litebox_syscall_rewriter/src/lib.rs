@@ -12,8 +12,7 @@
 //! However, as an explicit goal, it is intended to provide low-overhead hooking of syscalls,
 //! without needing to undergo a user-kernel transition.
 //!
-//! This crate currently supports x86-64 ELFs for syscall hooking and x86-64 PEs for syscall
-//! hooking plus rewriting Windows TEB accesses from GS segment overrides to FS segment overrides.
+//! This crate currently supports x86-64 ELFs and PEs for syscall hooking.
 //!
 //! It also supports AArch64 ELFs with syscall and guest thread-pointer gates
 //! on Linux and macOS. Guest x18 virtualization is optional on Linux and always
@@ -255,10 +254,9 @@ impl RewriteOptions {
 
 /// Rewrite a supported binary for LiteBox.
 ///
-/// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 inputs have
-/// executable-section GS segment overrides rewritten to FS and `syscall`
-/// instructions redirected through a LiteBox trampoline footer. AArch64 Mach-O
-/// inputs are passed through [`hook_syscalls_in_macho_with_options`].
+/// ELF64 inputs are passed through [`hook_syscalls_in_elf`]. PE64 `syscall`
+/// instructions are redirected through a LiteBox trampoline footer. AArch64
+/// Mach-O inputs are passed through [`hook_syscalls_in_macho_with_options`].
 pub fn rewrite_binary(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     rewrite_binary_with_options(
         input_binary,
@@ -527,10 +525,9 @@ pub fn hook_syscalls_in_elf_with_options(
 
 /// Rewrite an x86-64 PE for LiteBox's current Windows shim.
 ///
-/// The PE file layout is preserved, but executable-section GS segment overrides
-/// are rewritten to FS and `syscall` instructions are redirected through a
-/// LiteBox trampoline appended as a file overlay. The Windows shim loader maps
-/// that overlay by reading the footer this function appends.
+/// The PE file layout is preserved, but `syscall` instructions are redirected
+/// through a LiteBox trampoline appended as a file overlay. The Windows shim
+/// loader maps that overlay by reading the footer this function appends.
 pub fn rewrite_pe_for_litebox(input_binary: &[u8], trampoline: Option<u64>) -> Result<Vec<u8>> {
     if is_already_hooked(input_binary, Arch::X86_64) {
         return Ok(input_binary.to_vec());

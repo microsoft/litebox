@@ -13,7 +13,7 @@
 
 use std::cell::Cell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
 
@@ -141,6 +141,22 @@ pub struct LinuxUserland {
     boot_id: std::sync::OnceLock<Vec<u8>>,
 }
 
+/// Determines how an x86-64 guest accesses its thread-local storage.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestTlsMode {
+    /// A Linux guest uses FS as its TLS base.
+    Linux = 1,
+    /// A Windows guest uses GS as its TEB base.
+    Windows = 2,
+}
+
+const GUEST_TLS_MODE_UNCONFIGURED: u8 = 0;
+
+#[cfg(target_arch = "x86_64")]
+#[unsafe(no_mangle)]
+static GUEST_TLS_MODE: AtomicU8 = AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);
+
 impl core::fmt::Debug for LinuxUserland {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LinuxUserland").finish_non_exhaustive()
@@ -171,6 +187,35 @@ impl LinuxUserland {
             boot_id: std::sync::OnceLock::new(),
         };
         Box::leak(Box::new(platform))
+    }
+
+    /// Configures the process-wide guest TLS mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a different mode has already been configured.
+    pub fn set_guest_tls_mode(&self, mode: GuestTlsMode) {
+        let mode = mode as u8;
+        if let Err(configured_mode) = GUEST_TLS_MODE.compare_exchange(
+            GUEST_TLS_MODE_UNCONFIGURED,
+            mode,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            assert_eq!(
+                configured_mode, mode,
+                "guest TLS mode is already configured"
+            );
+        }
+    }
+
+    fn guest_tls_mode(&self) -> GuestTlsMode {
+        match GUEST_TLS_MODE.load(Ordering::Relaxed) {
+            mode if mode == GuestTlsMode::Linux as u8 => GuestTlsMode::Linux,
+            mode if mode == GuestTlsMode::Windows as u8 => GuestTlsMode::Windows,
+            GUEST_TLS_MODE_UNCONFIGURED => panic!("guest TLS mode is not configured"),
+            _ => unreachable!("invalid guest TLS mode"),
+        }
     }
 
     /// Initializes support for KDFs by using boot-specific uniqueness.
@@ -664,6 +709,9 @@ guest_context_top:
 .globl guest_fsbase
 guest_fsbase:
     .quad 0
+.globl guest_thread
+guest_thread:
+    .byte 0
 in_guest:
     .byte 0
 .globl interrupt
@@ -704,9 +752,43 @@ fn get_guest_fsbase() -> usize {
     value
 }
 
-/// Tracks the whole guest-thread lifetime on AArch64 and preserves nested-entry
-/// state. On x86-64, `gsbase` provides the marker.
+#[cfg(target_arch = "x86_64")]
+fn is_guest_thread() -> bool {
+    let marker: u8;
+    match GUEST_TLS_MODE.load(Ordering::Relaxed) {
+        mode if mode == GuestTlsMode::Windows as u8 => {
+            // SAFETY: Windows guests leave host TLS active in FS.
+            unsafe {
+                core::arch::asm!(
+                    concat!("mov {marker}, BYTE PTR ", tls!("guest_thread")),
+                    marker = out(reg_byte) marker,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+        _ => {
+            // SAFETY: this platform requires FSGSBASE support.
+            if unsafe { litebox_common_linux::rdgsbase() } == 0 {
+                return false;
+            }
+            // SAFETY: nonzero GS holds this thread's host TLS in Linux guest mode,
+            // including after guest exit, when the lifetime marker has been cleared.
+            unsafe {
+                core::arch::asm!(
+                    concat!("mov {marker}, BYTE PTR ", saved_tls!("guest_thread")),
+                    marker = out(reg_byte) marker,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+    }
+    marker != 0
+}
+
+/// Tracks the whole guest-thread lifetime and preserves nested-entry state.
 struct GuestThreadMarker {
+    #[cfg(target_arch = "x86_64")]
+    previous: u8,
     #[cfg(target_arch = "aarch64")]
     previous: bool,
 }
@@ -715,7 +797,17 @@ impl GuestThreadMarker {
     fn enter() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
-            Self {}
+            let previous: u8;
+            // SAFETY: entry runs with host TLS active in FS and accesses this thread's marker.
+            unsafe {
+                core::arch::asm!(
+                    concat!("mov {previous}, BYTE PTR ", tls!("guest_thread")),
+                    concat!("mov BYTE PTR ", tls!("guest_thread"), ", 1"),
+                    previous = out(reg_byte) previous,
+                    options(nostack, preserves_flags),
+                );
+            }
+            Self { previous }
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -728,6 +820,15 @@ impl GuestThreadMarker {
 
 impl Drop for GuestThreadMarker {
     fn drop(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: drop runs after host FS is restored and accesses this thread's marker.
+        unsafe {
+            core::arch::asm!(
+            concat!("mov BYTE PTR ", tls!("guest_thread"), ", {previous}"),
+                previous = in(reg_byte) self.previous,
+                options(nostack, preserves_flags),
+            );
+        }
         #[cfg(target_arch = "aarch64")]
         set_is_guest_thread(self.previous);
     }
@@ -770,10 +871,13 @@ unsafe extern "C-unwind" fn run_thread_arch(
     lea r8, [rsi + {GUEST_CONTEXT_SIZE}]
     mov fs:guest_context_top@tpoff, r8
 
-    // Save host fs base in gs base. This will stay set for the lifetime
-    // of this call stack.
+    // Linux guests use FS, so preserve host FS in GS. Windows guests retain
+    // their GS base and leave host FS active.
+    cmp BYTE PTR [rip + GUEST_TLS_MODE], {WINDOWS_TLS_MODE}
+    je 2f
     rdfsbase r8
     wrgsbase r8
+2:
 
     // Call init_handler or reenter_handler based on reenter flag (in dl).
     test dl, dl
@@ -792,15 +896,21 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // contain rflags if the syscall instruction had actually been issued).
     .globl syscall_callback
 syscall_callback:
-    // Clear in_guest flag. This must be the first instruction to match the
-    // expectations of `interrupt_signal_handler`.
+    // Restore host FS and save the Linux guest's FS.
     mov      BYTE PTR gs:in_guest@tpoff, 0
-
-    // Restore host fs base.
     rdfsbase r11
     mov      gs:guest_fsbase@tpoff, r11
     rdgsbase r11
     wrfsbase r11
+    jmp .Lhost_tls_restored
+
+    .globl windows_syscall_callback
+windows_syscall_callback:
+    // Windows guests use GS, different from Linux hosts which use FS.
+    // Thus no need to swap FS and GS like we do for Linux guests.
+    mov      BYTE PTR fs:in_guest@tpoff, 0
+
+.Lhost_tls_restored:
 
     // Switch to the top of the guest context.
     mov     r11, rsp
@@ -878,6 +988,7 @@ interrupt_callback:
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
+    WINDOWS_TLS_MODE = const GuestTlsMode::Windows as u8,
     );
 }
 
@@ -914,7 +1025,9 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "2:",
         // Restore guest context from ctx.
         "mov rsp, rdi",
-        // Switch to the guest fsbase
+        "cmp BYTE PTR [rip + GUEST_TLS_MODE], {WINDOWS_TLS_MODE}",
+        "je 2f",
+        // Linux guest: switch FS and use saved host FS through GS.
         "mov rdx, fs:guest_fsbase@tpoff",
         "wrfsbase rdx",
         "pop r15",
@@ -938,7 +1051,31 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "popfq",
         "pop rsp",
         "jmp gs:scratch@tpoff", // jump to the guest
+        "2:",
+        // Windows guest: host FS and guest GS are already active.
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbp",
+        "pop rbx",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rax",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "add rsp, 8",
+        "pop fs:scratch@tpoff",
+        "add rsp, 8",
+        "popfq",
+        "pop rsp",
+        "jmp fs:scratch@tpoff",
         "switch_to_guest_end:",
+        WINDOWS_TLS_MODE = const GuestTlsMode::Windows as u8,
     );
 }
 
@@ -1136,13 +1273,15 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // to mirror the TLS base used in guest context, so that test threads can use the
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!(
-                "rdfsbase {tmp}",
-                "wrgsbase {tmp}",
-                tmp = out(reg) _,
-                options(nostack, preserves_flags),
-            );
+        if GUEST_TLS_MODE.load(Ordering::Relaxed) == GuestTlsMode::Linux as u8 {
+            unsafe {
+                core::arch::asm!(
+                    "rdfsbase {tmp}",
+                    "wrgsbase {tmp}",
+                    tmp = out(reg) _,
+                    options(nostack, preserves_flags),
+                );
+            }
         }
 
         let _guest_thread = GuestThreadMarker::enter();
@@ -1406,10 +1545,6 @@ impl SystemTimeTrait for SystemTime {
 
 #[cfg(target_arch = "x86_64")]
 impl litebox::platform::ArchSpecificProvider for LinuxUserland {
-    // We swap gs and fs before and after a syscall, so while handling a guest
-    // syscall the guest's fs base is stored in the gs base register; the
-    // per-thread `guest_fsbase` slot holds the value that will be programmed
-    // into fs base on guest re-entry.
     fn set_arch_specific_register(
         &self,
         reg: &litebox::platform::ArchSpecificRegister,
@@ -1425,10 +1560,21 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
                 }
             }
             litebox::platform::ArchSpecificRegister::GsBase => {
-                // GS base is used internally by this platform to hold the host
-                // TLS base across the guest/host fs-gs swap, so it is not
-                // directly programmable by the guest.
-                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+                match self.guest_tls_mode() {
+                    GuestTlsMode::Windows => {
+                        if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                            // SAFETY: this platform requires FSGSBASE support.
+                            unsafe { litebox_common_linux::wrgsbase(val) };
+                            Ok(())
+                        } else {
+                            Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
+                        }
+                    }
+                    GuestTlsMode::Linux => {
+                        // GS holds host TLS across guest/host fs-gs swaps for Linux guests.
+                        Err(litebox::platform::ArchSpecificError::RegisterReserved)
+                    }
+                }
             }
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
@@ -1440,9 +1586,15 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => Ok(get_guest_fsbase()),
             litebox::platform::ArchSpecificRegister::GsBase => {
-                // See note above: gs base is reserved for host TLS on this
-                // platform and is not exposed to the guest.
-                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+                match self.guest_tls_mode() {
+                    GuestTlsMode::Windows => {
+                        // SAFETY: this platform requires FSGSBASE support.
+                        Ok(unsafe { litebox_common_linux::rdgsbase() })
+                    }
+                    GuestTlsMode::Linux => {
+                        Err(litebox::platform::ArchSpecificError::RegisterReserved)
+                    }
+                }
             }
             _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
         }
@@ -1542,6 +1694,8 @@ fn futex_val2(
 
 unsafe extern "C" {
     fn syscall_callback() -> isize;
+    #[cfg(target_arch = "x86_64")]
+    fn windows_syscall_callback() -> isize;
     #[cfg(target_arch = "aarch64")]
     fn syscall_callback_in_guest_cleared();
     fn exception_callback();
@@ -1609,14 +1763,20 @@ fn in_switch_to_guest(pc: usize) -> bool {
 /// frame's shifted sp, and `syscallno = NO_SYSCALL` — silently dropping the
 /// in-flight guest syscall.
 fn in_syscall_callback_prologue(ip: usize) -> bool {
-    let start = syscall_callback as *const () as usize;
     #[cfg(target_arch = "x86_64")]
     {
+        let start = match GUEST_TLS_MODE.load(Ordering::Relaxed) {
+            mode if mode == GuestTlsMode::Windows as u8 => {
+                windows_syscall_callback as *const () as usize
+            }
+            _ => syscall_callback as *const () as usize,
+        };
         ip == start
     }
     // The label keeps the multi-instruction AArch64 bound tied to the asm.
     #[cfg(target_arch = "aarch64")]
     {
+        let start = syscall_callback as *const () as usize;
         (start..syscall_callback_in_guest_cleared as *const () as usize).contains(&ip)
     }
 }
@@ -1735,7 +1895,10 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        syscall_callback as *const () as usize
+        match self.guest_tls_mode() {
+            GuestTlsMode::Windows => windows_syscall_callback as *const () as usize,
+            GuestTlsMode::Linux => syscall_callback as *const () as usize,
+        }
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -1957,40 +2120,51 @@ fn signal_handler_exit_guest(
     _capture_vector_state: bool,
 ) -> Option<*mut litebox_common_linux::PtRegs> {
     unsafe {
-        let gsbase: u64;
-        core::arch::asm! {
-            "rdgsbase {}", out(reg) gsbase
-        };
-        let is_in_guest = if gsbase == 0 {
-            false
-        } else {
-            let in_guest: u8;
-            core::arch::asm! {
-                "mov {in_guest}, BYTE PTR gs:in_guest@tpoff",
-                "mov BYTE PTR gs:in_guest@tpoff, 0",
-                in_guest = out(reg_byte) in_guest,
-                options(nostack, preserves_flags)
+        macro_rules! take_guest {
+            ($access:ident) => {{
+                let in_guest: u8;
+                core::arch::asm!(
+                    concat!("mov {in_guest}, BYTE PTR ", $access!("in_guest")),
+                    concat!("mov BYTE PTR ", $access!("in_guest"), ", 0"),
+                    in_guest = out(reg_byte) in_guest,
+                    options(nostack, preserves_flags)
+                );
+                if set_interrupt {
+                    core::arch::asm!(
+                        concat!("mov BYTE PTR ", $access!("interrupt"), ", 1"),
+                        options(nostack, preserves_flags)
+                    );
+                }
+                in_guest != 0
+            }};
+        }
+        match GUEST_TLS_MODE.load(Ordering::Relaxed) {
+            mode if mode == GuestTlsMode::Windows as u8 => {
+                if !take_guest!(tls) {
+                    return None;
+                }
             }
-            if set_interrupt {
+            _ => {
+                let gsbase: u64;
                 core::arch::asm! {
-                    "mov BYTE PTR gs:interrupt@tpoff, 1",
+                    "rdgsbase {}", out(reg) gsbase
+                };
+                if gsbase == 0 || !take_guest!(saved_tls) {
+                    return None;
+                }
+                core::arch::asm! {
+                    "wrfsbase {gsbase}",
+                    gsbase = in(reg) gsbase,
                     options(nostack, preserves_flags)
                 };
             }
-            in_guest != 0
-        };
-        if !is_in_guest {
-            return None;
         }
-
         let guest_context_top: *mut litebox_common_linux::PtRegs;
-        core::arch::asm! {
-            "wrfsbase {gsbase}",
-            "mov {guest_context_top}, fs:guest_context_top@tpoff",
-            gsbase = in(reg) gsbase,
+        core::arch::asm!(
+            concat!("mov {guest_context_top}, ", tls!("guest_context_top")),
             guest_context_top = out(reg) guest_context_top,
             options(nostack, preserves_flags)
-        };
+        );
         Some(guest_context_top.sub(1))
     }
 }
@@ -2339,8 +2513,8 @@ unsafe fn next_signal_handler(
 ///
 /// Must be called from a signal handler on a guest thread.
 ///
-/// On x86-64 that additionally requires the thread's saved host TLS segment
-/// register (`gsbase`) to be valid, since the bitmask is reached through it.
+/// On x86-64, host TLS must be accessible through GS in Linux guest mode or
+/// through FS in Windows guest mode.
 unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     let mask: u32 = 1u32 << (signal.as_i32() - 1);
     let waker_addr: usize;
@@ -2350,16 +2524,23 @@ unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     // accesses are naturally aligned.
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::asm!(
-            concat!("lock or DWORD PTR ", saved_tls!("pending_host_signals"), ", {mask:e}"),
-            mask = in(reg) mask,
-            options(nostack)
-        );
-        core::arch::asm!(
-            concat!("mov {}, ", saved_tls!("wait_waker_addr")),
-            out(reg) waker_addr,
-            options(nostack, preserves_flags)
-        );
+        macro_rules! record {
+            ($access:ident) => {{
+                let waker: usize;
+                core::arch::asm!(
+                    concat!("lock or DWORD PTR ", $access!("pending_host_signals"), ", {mask:e}"),
+                    concat!("mov {waker}, ", $access!("wait_waker_addr")),
+                    mask = in(reg) mask,
+                    waker = out(reg) waker,
+                    options(nostack)
+                );
+                waker
+            }};
+        }
+        waker_addr = match GUEST_TLS_MODE.load(Ordering::Relaxed) {
+            mode if mode == GuestTlsMode::Windows as u8 => record!(tls),
+            _ => record!(saved_tls),
+        };
     }
 
     // Atomic against an interrupted exchange; a plain load/or/store can lose a bit.
@@ -2445,19 +2626,7 @@ unsafe fn interrupt_signal_handler(
         if let Ok(signal) = litebox_common_linux::signal::Signal::try_from(guest_signum) {
             // Check whether this is a guest thread. If not, re-raise the signal
             // process-wide.
-            let is_guest_thread;
-            #[cfg(target_arch = "x86_64")]
-            {
-                let gsbase: u64;
-                unsafe { core::arch::asm!("rdgsbase {}", out(reg) gsbase) };
-                is_guest_thread = gsbase != 0;
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                is_guest_thread = self::is_guest_thread();
-            }
-
-            if is_guest_thread {
+            if is_guest_thread() {
                 // SAFETY: we verified above that this is a guest thread.
                 unsafe { record_pending_signal(signal) };
             } else {
