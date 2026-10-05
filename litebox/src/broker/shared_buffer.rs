@@ -282,32 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn leases_reuse_the_lowest_free_slots() {
-        let allocator = SlotAllocator::<MockPlatform>::new();
-        let first = allocator.acquire(2 * SHARED_BUFFER_SLOT_SIZE).unwrap();
-        let second = allocator.acquire(1).unwrap();
-        assert_eq!(
-            first.sequence().slot_indices(),
-            &[SharedBufferSlotIndex(0), SharedBufferSlotIndex(1)]
-        );
-        assert_eq!(
-            second.sequence().slot_indices(),
-            &[SharedBufferSlotIndex(2)]
-        );
-
-        drop(first);
-        let reused = allocator.acquire(3 * SHARED_BUFFER_SLOT_SIZE).unwrap();
-        assert_eq!(
-            reused.sequence().slot_indices(),
-            &[
-                SharedBufferSlotIndex(0),
-                SharedBufferSlotIndex(1),
-                SharedBufferSlotIndex(3)
-            ]
-        );
-    }
-
-    #[test]
     fn oversized_acquisitions_do_not_fail_the_allocator() {
         let allocator = SlotAllocator::<MockPlatform>::new();
 

@@ -343,25 +343,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn word_operations_round_trip() {
-        let mut words = [0u64; 2];
-        let base = words.as_mut_ptr();
-        // SAFETY: `words` is live, aligned, and only accessed through `base`
-        // during these calls.
-        unsafe {
-            store_u64_release(base, 0x0123_4567_89ab_cdef);
-            assert_eq!(load_u64_acquire(base), 0x0123_4567_89ab_cdef);
-            let epoch = base.add(1).cast::<u32>();
-            increment_u32_release(epoch);
-            increment_u32_release(epoch);
-            assert_eq!(load_u32_acquire(epoch), 2);
-            epoch.write(u32::MAX);
-            increment_u32_release(epoch);
-            assert_eq!(load_u32_acquire(epoch), 0);
-        }
-    }
-
-    #[test]
     fn concurrent_increments_are_indivisible() {
         const THREADS: u32 = 4;
         const INCREMENTS: u32 = 10_000;

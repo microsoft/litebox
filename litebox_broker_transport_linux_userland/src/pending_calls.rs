@@ -158,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn an_abandoned_reader_withdraws_and_hands_off_its_role() {
+    fn an_abandoned_reader_hands_off_its_role() {
         let pending_calls = PendingCalls::new();
         let reader = pending_calls.register(RequestId(1)).unwrap();
         let follower = pending_calls.register(RequestId(2)).unwrap();

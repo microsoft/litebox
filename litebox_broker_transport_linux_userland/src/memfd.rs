@@ -12,6 +12,12 @@
 //! access goes through [`peer_memory`], which copies untrusted snapshots into
 //! private buffers, and futex operations and process image writes hand checked
 //! addresses to the kernel.
+//!
+//! Direct access raises `SIGBUS` instead of returning an error if a mapped page
+//! loses its backing, so every mapping must have its size sealed: the broker
+//! maps only memfds it created and sealed, and received memfds are rejected
+//! unless sealed. The broker must never map a memfd its peer created, since the
+//! peer chooses that file's backing.
 
 use std::io::{Error, Result as IoResult};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};

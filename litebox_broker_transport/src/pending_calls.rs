@@ -128,7 +128,7 @@ impl<Sync: PendingCallsSync, Error> CallSlot<Sync, Error> {
         }
     }
 
-    fn hand_reader_role(&self) {
+    fn grant_reader_role(&self) {
         self.state.lock().reads_responses = true;
         self.changed.notify_one();
     }
@@ -136,8 +136,8 @@ impl<Sync: PendingCallsSync, Error> CallSlot<Sync, Error> {
 
 /// One registered request awaiting its broker response.
 ///
-/// Dropping the call withdraws it from its registry and hands off the reader
-/// role if it holds it, so an abandoned call never strands other callers.
+/// Dropping the call unregisters it and hands off the reader role if it holds
+/// it, so an abandoned call never strands other callers.
 pub struct PendingCall<'calls, Sync: PendingCallsSync, Error> {
     pending_calls: &'calls PendingCalls<Sync, Error>,
     request_id: RequestId,
@@ -173,7 +173,7 @@ impl<Sync: PendingCallsSync, Error> PendingCall<'_, Sync, Error> {
 
 impl<Sync: PendingCallsSync, Error> Drop for PendingCall<'_, Sync, Error> {
     fn drop(&mut self) {
-        self.pending_calls.withdraw(self.request_id, &self.slot);
+        self.pending_calls.unregister(self.request_id, &self.slot);
     }
 }
 
@@ -246,7 +246,8 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
         Ok(())
     }
 
-    fn withdraw(&self, request_id: RequestId, slot: &Arc<CallSlot<Sync, Error>>) {
+    /// Removes `slot` if it is still registered and passes on its reader role.
+    fn unregister(&self, request_id: RequestId, slot: &Arc<CallSlot<Sync, Error>>) {
         let mut state = self.state.lock();
         if state
             .calls
@@ -264,7 +265,7 @@ impl<Sync: PendingCallsSync, Error> PendingCalls<Sync, Error> {
             .is_some_and(|reader| Arc::ptr_eq(reader, slot));
         if holds_reader_role && state.failure.is_none() {
             state.reader = state.calls.values().next().map(|next| {
-                next.hand_reader_role();
+                next.grant_reader_role();
                 Arc::clone(next)
             });
         }
