@@ -95,7 +95,7 @@ pub fn write_kernel_gsbase_msr(addr: VirtAddr) {
 ///
 /// Panics if CPUID does not advertise NX support.
 #[cfg(target_arch = "x86_64")]
-pub fn enable_dep() {
+pub(crate) fn enable_dep() {
     // CPUID.80000001h:EDX bit 20 = NX support
     let ext_features = cpuid_count(0x8000_0001, 0);
     assert!(
@@ -109,6 +109,15 @@ pub fn enable_dep() {
             efer | x86_64::registers::model_specific::EferFlags::NO_EXECUTE_ENABLE,
         );
     }
+}
+
+/// Enable supervisor write protection (`CR0.WP`) on the current CPU.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn enable_write_protect() {
+    use x86_64::registers::control::{Cr0, Cr0Flags};
+    // Safety: setting WP only restricts ring-0 writes to read-only pages; it
+    // does not alter translation or any other CR0 state.
+    unsafe { Cr0::update(|cr0| cr0.insert(Cr0Flags::WRITE_PROTECT)) };
 }
 
 /// Enable Supervisor Mode Execution/Access Prevention (SMEP & SMAP).

@@ -57,6 +57,8 @@ unsafe extern "C" {
     static _heap_start: u8;
     static _text_start: u8;
     static _text_end: u8;
+    static _rodata_start: u8;
+    static _rodata_end: u8;
     static _hvcall_page_start: u8;
     static _rela_start: u8;
     static _rela_end: u8;
@@ -87,6 +89,18 @@ pub fn get_text_start_address() -> u64 {
 #[inline]
 pub fn get_text_end_address() -> u64 {
     &raw const _text_end as u64
+}
+
+/// Returns the start address of the VTL1 kernel `.rodata` section.
+#[inline]
+pub fn get_rodata_start_address() -> u64 {
+    &raw const _rodata_start as u64
+}
+
+/// Returns the end address (exclusive) of the VTL1 kernel `.rodata` section.
+#[inline]
+pub fn get_rodata_end_address() -> u64 {
+    &raw const _rodata_end as u64
 }
 
 /// Returns the start address of the Hyper-V hypercall code page.
