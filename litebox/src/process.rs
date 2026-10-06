@@ -1,18 +1,19 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-backed guest process creation, child termination, process groups
+//! Broker-backed guest process creation, the process tree, process groups
 //! and sessions, and signals between processes.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
-    MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity, ProcessTermination,
+    ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo,
 };
-use litebox_broker_protocol::process_group::ProcessGroupMembership;
-use litebox_broker_protocol::signal::{PendingSignal, SignalTarget};
+use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use litebox_platform::time::TimeProvider;
 
@@ -59,14 +60,18 @@ pub enum ProcessError {
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Allocates one pending child process.
-    pub fn allocate_child_process(&self) -> Result<Process<Platform>, ProcessError> {
+    pub fn allocate_child_process(&self) -> Result<PendingChild, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let child = broker.allocate_child_process()?;
-        Ok(Process::new(self, broker, child.identity, child.handle))
+        let identity = broker.allocate_child_process()?;
+        Ok(PendingChild {
+            broker,
+            identity,
+            pending: AtomicBool::new(true),
+        })
     }
 
     /// Reports this process's final termination status, which its parent
-    /// observes once this process's runner exits.
+    /// reaps once this process's runner exits.
     pub fn report_exit_status(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.report_exit_status(exit_status)?)
@@ -81,6 +86,39 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         Ok(broker.set_child_reaping(enabled)?)
     }
 
+    /// Sets whether this process adopts the children of its exiting
+    /// descendants.
+    ///
+    /// The children of an exiting process move to its nearest ancestor that
+    /// adopts them, or are left without a parent, which reaps each as it
+    /// terminates.
+    pub fn set_orphan_adoption(&self, enabled: bool) -> Result<(), ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(broker.set_orphan_adoption(enabled)?)
+    }
+
+    /// Reaps the oldest of this process's terminated children that `selector`
+    /// matches, in the order this process gained them, returning its exit.
+    ///
+    /// Returns `None` if every matching child is live, and
+    /// [`ProcessError::NoSuchProcess`] if no child matches. Each child that
+    /// terminates, or leaves without terminating, such as a child whose
+    /// startup failed, is also reported through [`Signals`].
+    pub fn reap_child(&self, selector: ChildSelector) -> Result<Option<ChildExit>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        match broker.reap_child(selector) {
+            Ok(exit) => Ok(Some(exit)),
+            Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
+            Err(error) => Err(no_such_process(error)),
+        }
+    }
+
+    /// Returns the place of process `process_id` in the process tree.
+    pub fn process_info(&self, process_id: ProcessId) -> Result<ProcessInfo, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        broker.process_info(process_id).map_err(no_such_process)
+    }
+
     /// Sends `signal` to the processes `target` selects, or only checks that
     /// one exists if `signal` is zero.
     ///
@@ -90,15 +128,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn send_signal(&self, target: SignalTarget, signal: u32) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         broker.send_signal(target, signal).map_err(no_such_process)
-    }
-
-    /// Returns the process group and session of process `process_id`.
-    pub fn process_group(
-        &self,
-        process_id: ProcessId,
-    ) -> Result<ProcessGroupMembership, ProcessError> {
-        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        broker.process_group(process_id).map_err(no_such_process)
     }
 
     /// Moves process `process_id`, which is this process or one of its
@@ -129,8 +158,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         broker.create_session(process_id).map_err(no_such_process)
     }
 
-    /// Opens the signals other processes send to this process, including
-    /// those sent before it is opened.
+    /// Opens the signals other processes send to this process and the exits
+    /// of its children, including those before it is opened.
     ///
     /// A process may hold only one [`Signals`] at a time.
     pub fn open_signals(&self) -> Result<Signals<Platform>, ProcessError> {
@@ -140,7 +169,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 }
 
-/// A descriptor a pending child process can inherit through [`Process::inherit`].
+/// A descriptor a pending child process can inherit through [`PendingChild::inherit`].
 ///
 /// This identifies only the object. The shim records guest-specific details, such as the
 /// descriptor number, in the child's startup payload alongside the handle `inherit` returns.
@@ -151,50 +180,18 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Pipe(Arc<PipeFd<Platform>>),
 }
 
-/// Termination state of a child process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ChildStatus {
-    /// The process has not terminated.
-    Live,
-    /// The process terminated with this status and waits to be reported.
-    Terminated(ProcessExitStatus),
-    /// The process terminated with this status and was reaped as it
-    /// terminated, so no wait reports it.
-    Reaped(ProcessExitStatus),
-}
-
-/// A broker process object.
+/// A child process that has not started.
 ///
-/// It reports [`Events::IN`] once the process terminates. Dropping it closes
-/// its handle, releases the process's retained exit status, and wakes its
-/// observers to recheck their state.
-pub struct Process<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+/// Dropping it before it starts or exits discards the child, as if it had
+/// never been created.
+pub struct PendingChild {
     broker: Arc<dyn BrokerControl>,
     identity: ProcessIdentity,
-    handle: ObjectHandle,
-    pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
-    pollee: Arc<Pollee<Platform>>,
+    /// Cleared once the child starts or exits.
+    pending: AtomicBool,
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
-    fn new(
-        litebox: &LiteBox<Platform>,
-        broker: Arc<dyn BrokerControl>,
-        identity: ProcessIdentity,
-        handle: ObjectHandle,
-    ) -> Self {
-        let pollable_registry = litebox.broker_pollable_registry();
-        let pollee = Arc::new(Pollee::new());
-        pollable_registry.register_pollable(handle, &pollee);
-        Self {
-            broker,
-            identity,
-            handle,
-            pollable_registry,
-            pollee,
-        }
-    }
-
+impl PendingChild {
     /// Returns the broker-assigned process and initial thread IDs.
     pub fn identity(&self) -> ProcessIdentity {
         self.identity
@@ -202,9 +199,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
 
     /// Starts this pending child process in a fresh runner.
     pub fn start(&self, payload: &[u8]) -> Result<(), ProcessError> {
-        Ok(self
-            .broker
-            .start_child_process(self.identity.process_id, payload)?)
+        self.broker
+            .start_child_process(self.identity.process_id, payload)?;
+        self.pending.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Gives this pending child process its own references to the objects
@@ -220,7 +218,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     /// # Panics
     ///
     /// Panics if the broker returns fewer handles than were duplicated.
-    pub fn inherit(
+    pub fn inherit<Platform: RawSyncPrimitivesProvider + TimeProvider>(
         &self,
         litebox: &LiteBox<Platform>,
         fds: &[InheritableFd<Platform>],
@@ -286,53 +284,26 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
     /// Records that this pending child process exited without starting a
     /// runner, leaving it a zombie reporting `exit_status`.
     pub fn exit(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
-        Ok(self
-            .broker
-            .exit_child_process(self.identity.process_id, exit_status)?)
+        self.broker
+            .exit_child_process(self.identity.process_id, exit_status)?;
+        self.pending.store(false, Ordering::Relaxed);
+        Ok(())
     }
+}
 
-    /// Returns the process's termination state.
-    pub fn status(&self) -> Result<ChildStatus, ProcessError> {
-        match self.broker.process_exit_status(self.handle) {
-            Ok(ProcessTermination {
-                exit_status,
-                reaped: false,
-            }) => Ok(ChildStatus::Terminated(exit_status)),
-            Ok(ProcessTermination {
-                exit_status,
-                reaped: true,
-            }) => Ok(ChildStatus::Reaped(exit_status)),
-            Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(ChildStatus::Live),
-            Err(error) => Err(error.into()),
+impl Drop for PendingChild {
+    fn drop(&mut self) {
+        if self.pending.load(Ordering::Relaxed) {
+            // Failure means the child is already gone or the process service failed.
+            let _ = self.broker.cancel_child_process(self.identity.process_id);
         }
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for Process<Platform> {
-    fn drop(&mut self) {
-        self.pollable_registry.unregister_pollable(self.handle);
-        let _ = self.broker.close_object(self.handle);
-        // Another waiter may still be blocked on this process's exit
-        // notification, which is discarded once the handle is unregistered.
-        self.pollee.wake_observers();
-    }
-}
-
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for Process<Platform> {
-    fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
-        self.pollee.register_observer(observer, mask);
-    }
-
-    fn check_io_events(&self) -> Events {
-        self.broker
-            .check_readiness(self.handle)
-            .map_or(Events::ERR, readiness_events)
-    }
-}
-
-/// The signals other processes send to this process.
+/// The signals other processes send to this process, and the exits of its
+/// children.
 ///
-/// It reports [`Events::IN`] while a signal is pending.
+/// It reports [`Events::IN`] while either is pending.
 pub struct Signals<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
@@ -357,11 +328,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Signals<Platform> {
         }
     }
 
-    /// Takes the lowest-numbered pending signal, or returns `None` if none is
+    /// Takes the lowest-numbered pending signal, or else a pending child
+    /// exit, or else a pending child removal, or returns `None` if none is
     /// pending.
-    pub fn take(&self) -> Result<Option<PendingSignal>, ProcessError> {
+    ///
+    /// Child events are coalesced: while one is pending, later events of its
+    /// kind are not reported, so a taker reaps children until none has
+    /// terminated.
+    pub fn take(&self) -> Result<Option<SignalEvent>, ProcessError> {
         match self.broker.take_signal(self.handle) {
-            Ok(signal) => Ok(Some(signal)),
+            Ok(event) => Ok(Some(event)),
             Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
             Err(error) => Err(error.into()),
         }
@@ -416,12 +392,13 @@ impl From<BrokerControlError> for ProcessError {
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::AtomicUsize;
 
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::message::{
         BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     };
+    use litebox_broker_protocol::process::{CreateThreadRequest, CreateThreadResponse};
     use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
     use litebox_broker_protocol::{ProcessId, ThreadId};
     use litebox_broker_transport::channel::LocalCallChannel;
@@ -431,51 +408,49 @@ mod tests {
     use crate::platform::mock::MockPlatform;
 
     #[test]
-    fn dropping_process_wakes_observers() {
+    fn dropping_a_pending_child_cancels_it() {
+        let cancels = Arc::new(AtomicUsize::new(0));
         let litebox = LiteBox::new_with_broker_local(
             MockPlatform::new(),
-            test_broker_local(CloseChannel, Arc::new(NoopSharedMemory)),
+            test_broker_local(ChildChannel(cancels.clone()), Arc::new(NoopSharedMemory)),
         );
-        let process = Process::new(
-            &litebox,
-            litebox.broker_control().unwrap(),
-            ProcessIdentity {
-                process_id: ProcessId(3),
-                initial_thread_id: ThreadId(4),
-            },
-            ObjectHandle(7),
-        );
-        let observer = Arc::new(WakeObserver(AtomicBool::new(false)));
-        process.register_observer(Arc::downgrade(&observer) as _, Events::IN);
 
-        // A waiter that reaps this process may drop it before the exit
-        // notification arrives, so other waiters must still wake.
-        drop(process);
+        drop(litebox.allocate_child_process().unwrap());
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
 
-        assert!(observer.0.load(Ordering::SeqCst));
+        let child = litebox.allocate_child_process().unwrap();
+        child.exit(ProcessExitStatus::Exited { code: 0 }).unwrap();
+        drop(child);
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
     }
 
-    struct WakeObserver(AtomicBool);
+    /// Serves one pending child at a time, counting its cancellations.
+    struct ChildChannel(Arc<AtomicUsize>);
 
-    impl Observer<Events> for WakeObserver {
-        fn on_events(&self, _events: &Events) {
-            self.0.store(true, Ordering::SeqCst);
-        }
-    }
-
-    struct CloseChannel;
-
-    impl LocalCallChannel for CloseChannel {
+    impl LocalCallChannel for ChildChannel {
         type Error = ();
 
         fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
-            assert_eq!(
-                request.operation,
-                BrokerOperation::CloseObject(ObjectHandle(7))
-            );
+            let child = ProcessId(3);
+            let result = match request.operation {
+                BrokerOperation::CreateThread(CreateThreadRequest::Process) => {
+                    BrokerResult::CreateThread(CreateThreadResponse::Process(ProcessIdentity {
+                        process_id: child,
+                        initial_thread_id: ThreadId(4),
+                    }))
+                }
+                BrokerOperation::ExitChildProcess(request) if request.child_process_id == child => {
+                    BrokerResult::ProcessExited
+                }
+                BrokerOperation::CancelChildProcess(process_id) if process_id == child => {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    BrokerResult::ChildProcessCancelled
+                }
+                operation => panic!("unexpected operation {operation:?}"),
+            };
             Ok(BrokerResponse {
                 request_id: request.request_id,
-                result: BrokerResult::ObjectClosed,
+                result,
             })
         }
     }

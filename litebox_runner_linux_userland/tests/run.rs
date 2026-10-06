@@ -66,6 +66,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_aarch64_state.c",
     "gate_signals.c",
     "process_group_parent.c",
+    "process_tree_parent.c",
     "sigreturn.c",
     "sigreturn_simd.c",
     "svc_scratch_regs.c",
@@ -1086,6 +1087,25 @@ fn process_groups_and_sessions_span_processes() {
         output
             .lines()
             .any(|line| line == "process-group failures=0"),
+        "{output}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn orphans_are_adopted_by_subreapers_and_the_initial_process() {
+    let parent = common::compile(
+        "./tests/process_tree_parent.c",
+        "process_tree_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "process_tree_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    assert!(
+        output.lines().any(|line| line == "process-tree failures=0"),
         "{output}"
     );
 }

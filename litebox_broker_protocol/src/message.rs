@@ -19,14 +19,14 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    CreateThreadRequest, CreateThreadResponse, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, ProcessExitStatus, ProcessStartupDescriptor, ProcessTermination,
-    StartChildProcessRequest, WriteChildMemoryRequest,
+    ChildExit, ChildSelector, CreateThreadRequest, CreateThreadResponse,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, ProcessExitStatus, ProcessInfo,
+    ProcessStartupDescriptor, StartChildProcessRequest, WriteChildMemoryRequest,
 };
-use crate::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
+use crate::process_group::SetProcessGroupRequest;
 use crate::readiness::ReadinessFlags;
 use crate::shared_buffer::SharedBufferSequence;
-use crate::signal::{OpenSignalsResponse, PendingSignal, SendSignalRequest, TakeSignalRequest};
+use crate::signal::{OpenSignalsResponse, SendSignalRequest, SignalEvent, TakeSignalRequest};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
     ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
@@ -76,13 +76,18 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one pending child process.
     StartChildProcess(StartChildProcessRequest),
-    /// Read a process's termination status through a process handle without
+    /// Reap one exited child matching the selector, oldest first, without
     /// blocking.
     ///
-    /// The broker returns `WouldBlock` while the process is live.
-    GetProcessExitStatus(ObjectHandle),
+    /// The broker returns `WouldBlock` if only live children match, and
+    /// `UnknownObject` if none does. Each matching child's exit or removal is
+    /// then reported through the caller's signals.
+    ReapChild(ChildSelector),
     /// Record the exit of one pending child process that never started.
     ExitChildProcess(ExitChildProcessRequest),
+    /// Discard one pending child process that never started, as if it had
+    /// never been created.
+    CancelChildProcess(ProcessId),
     /// Report this process's final termination status before its runner exits.
     ///
     /// The status is published once the runner exits, replacing the status the
@@ -94,6 +99,16 @@ pub enum BrokerOperation {
     /// Each child applies the setting in effect when it terminates, so a change
     /// does not affect children that already terminated.
     SetChildReaping(bool),
+    /// Set whether this process adopts the orphaned children of its exiting
+    /// descendants.
+    ///
+    /// When a process exits, its children move to its nearest ancestor that
+    /// adopts orphans, and are otherwise reaped when they exit.
+    SetOrphanAdoption(bool),
+    /// Read a process's place in the process tree.
+    ///
+    /// The broker returns `UnknownObject` if no such process exists.
+    GetProcessInfo(ProcessId),
     /// Duplicate object references into this process's pending child.
     DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
     /// Write bytes into this process's pending child's memory image.
@@ -147,9 +162,12 @@ impl BrokerOperation {
             | Self::ExitThread(_)
             | Self::CloseObject(_)
             | Self::ExitChildProcess(_)
+            | Self::CancelChildProcess(_)
             | Self::ReportExitStatus(_)
             | Self::SetChildReaping(_)
-            | Self::GetProcessExitStatus(_)
+            | Self::SetOrphanAdoption(_)
+            | Self::GetProcessInfo(_)
+            | Self::ReapChild(_)
             | Self::CheckReadiness(_)
             | Self::GetStatusFlags(_)
             | Self::SetStatusFlags(_)
@@ -249,10 +267,6 @@ pub enum TimerRequest {
 /// Request about process groups and sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessGroupRequest {
-    /// Read a process's group and session.
-    ///
-    /// The broker returns `UnknownObject` if no such process exists.
-    Get(ProcessId),
     /// Move a process into a process group.
     Set(SetProcessGroupRequest),
     /// Make a process the leader of a new session and of a new process group
@@ -275,7 +289,8 @@ pub enum SignalRequest {
     Open,
     /// Send a signal to a process.
     Send(SendSignalRequest),
-    /// Take one of the caller's pending signals, lowest-numbered first.
+    /// Take one of the caller's pending signals, lowest-numbered first, then
+    /// its pending child exit, and then its pending child removal.
     Take(TakeSignalRequest),
 }
 
@@ -348,14 +363,20 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A pending child established its broker association.
     ProcessStarted,
-    /// Termination status of a child process.
-    ProcessExitStatus(ProcessTermination),
+    /// An exited child was reaped.
+    ChildReaped(ChildExit),
     /// A pending child's exit was recorded.
     ProcessExited,
+    /// A pending child was discarded.
+    ChildProcessCancelled,
     /// This process's final termination status was recorded.
     ExitStatusReported,
     /// This process's child-reaping setting was recorded.
     ChildReapingSet,
+    /// This process's orphan-adoption setting was recorded.
+    OrphanAdoptionSet,
+    /// A process's place in the process tree.
+    ProcessInfo(ProcessInfo),
     /// Object references were duplicated into a pending child, whose handles
     /// replaced the request's handles in its shared buffer.
     ObjectsDuplicated,
@@ -407,8 +428,6 @@ pub enum TimerResponse {
 /// Response to a process group request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessGroupResponse {
-    /// Get operation response.
-    Get(ProcessGroupMembership),
     /// The process moved into the group.
     Set,
     /// The session was created.
@@ -423,7 +442,7 @@ pub enum SignalResponse {
     /// The signal was sent.
     Sent,
     /// Take operation response.
-    Take(PendingSignal),
+    Take(SignalEvent),
 }
 
 /// Broker-owned pipe object response.

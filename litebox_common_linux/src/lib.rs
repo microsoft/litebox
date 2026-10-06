@@ -1434,8 +1434,6 @@ pub const TASK_COMM_LEN: usize = 16;
 pub struct TaskParams {
     /// Process ID
     pub pid: i32,
-    /// Parent Process ID
-    pub ppid: i32,
     /// The initial uid.
     pub uid: u32,
     /// The initial effective uid.
@@ -1979,6 +1977,10 @@ pub enum PrctlArg {
     SetName(UserPtr<u8>),
     GetName(UserPtrMut<u8>),
     CapBSetRead(usize),
+    /// PR_SET_CHILD_SUBREAPER: set whether this process adopts orphaned descendants
+    SetChildSubreaper(usize),
+    /// PR_GET_CHILD_SUBREAPER: read whether this process adopts orphaned descendants
+    GetChildSubreaper(UserPtrMut<i32>),
 }
 
 #[repr(i32)]
@@ -3041,6 +3043,12 @@ impl SyscallRequest {
                         },
                         PrctlOption::CapBSetRead => SyscallRequest::Prctl {
                             args: PrctlArg::CapBSetRead(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::SetChildSubreaper => SyscallRequest::Prctl {
+                            args: PrctlArg::SetChildSubreaper(ctx.sys_req_arg(1)),
+                        },
+                        PrctlOption::GetChildSubreaper => SyscallRequest::Prctl {
+                            args: PrctlArg::GetChildSubreaper(ctx.sys_req_ptr(1)),
                         },
                         _ => {
                             return Err(unsupported_einval(format_args!("prctl({op:?})")));

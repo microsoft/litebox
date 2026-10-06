@@ -3,10 +3,11 @@
 
 use alloc::vec::Vec;
 
+use crate::process_group::ProcessGroupMembership;
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
 };
-use crate::{ObjectHandle, ProcessId, ThreadId};
+use crate::{ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
 pub const MAX_PROCESS_BOOTSTRAP_SIZE: u32 = 64 * 1024;
@@ -49,27 +50,41 @@ pub enum ProcessExitStatus {
     Unknown,
 }
 
-/// A terminated process's status as its handle observes it.
+/// A child process's exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ProcessTermination {
-    /// Termination status.
+pub struct ChildExit {
+    /// Child that exited.
+    pub process_id: ProcessId,
+    /// Child's termination status.
     pub exit_status: ProcessExitStatus,
-    /// Whether the process was reaped when it terminated, so no wait reports
-    /// it.
-    pub reaped: bool,
 }
 
-/// One newly created process and the creator's handle to it.
-///
-/// The handle reports [`ReadinessFlags::READ`](crate::readiness::ReadinessFlags::READ)
-/// once the process terminates. Closing it releases the process's retained
-/// exit status.
+/// Selects which of the caller's children a reap considers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreatedProcess {
-    /// Broker-assigned process identity.
-    pub identity: ProcessIdentity,
-    /// Handle used to observe process termination.
-    pub handle: ObjectHandle,
+pub enum ChildSelector {
+    /// Any child.
+    Any,
+    /// One child.
+    Process(ProcessId),
+    /// Any child in a process group.
+    ProcessGroup(ProcessId),
+}
+
+/// A process's place in the process tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessInfo {
+    /// Process that created this one, absent for a root process.
+    ///
+    /// The creator never changes, even after it exits.
+    pub creator: Option<ProcessId>,
+    /// Process that reaps this one.
+    ///
+    /// The parent starts as the creator. When it exits, the nearest
+    /// ancestor that adopts orphans becomes the parent, or none does and the
+    /// process is reaped when it exits.
+    pub parent: Option<ProcessId>,
+    /// Process group and session.
+    pub membership: ProcessGroupMembership,
 }
 
 /// Selects whether thread creation extends the current process or creates a child process.
@@ -87,7 +102,7 @@ pub enum CreateThreadResponse {
     /// A thread was created in the requesting process.
     Thread(ThreadId),
     /// A pending child process was created.
-    Process(CreatedProcess),
+    Process(ProcessIdentity),
 }
 
 /// Starts a pending child created earlier.

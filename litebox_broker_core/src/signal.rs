@@ -1,18 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Signals sent between broker processes.
+//! Signals sent between broker processes, and child event notifications.
 //!
-//! Every process has pending signals that any process may send to. A process
-//! opens a handle to take them, which becomes readable while any is pending.
-//! Signals sent before the process opens its handle stay pending until it
-//! takes them.
+//! Every process has pending signals that any process may send to, and learns
+//! of its children's exits and removals alongside them. A process opens a handle to take
+//! these events, which becomes readable while any is pending. Events that
+//! occur before the process opens its handle stay pending until it takes
+//! them.
 
 use alloc::sync::Arc;
 use alloc::vec;
 
+use litebox_broker_protocol::process::ChildExit;
 use litebox_broker_protocol::readiness::ReadinessFlags;
-use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal, SignalTarget};
+use litebox_broker_protocol::signal::{MAX_SIGNAL, PendingSignal, SignalEvent, SignalTarget};
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::Mutex;
 
@@ -21,7 +23,7 @@ use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Opens the caller's signals, returning a handle that becomes readable while
-/// any is pending.
+/// any event is pending.
 ///
 /// A process may hold only one such handle at a time; opening another fails
 /// with `ResourceExhausted`. Fails with `PolicyDenied` if the caller may not
@@ -64,14 +66,14 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         SignalTarget::Process(id) => vec![process.core.registered_process(id)?],
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
-            let _serialized = process.core.process_groups.lock();
+            let _tree = process.core.process_tree.lock();
             let mut targets = process.core.registered_processes();
             targets.retain(|target| target.membership().process_group == process_group);
             targets
         }
         SignalTarget::All => {
             let mut targets = process.core.registered_processes();
-            targets.retain(|target| target.id() != process.id() && target.has_parent());
+            targets.retain(|target| target.id() != process.id() && target.has_creator());
             targets
         }
     };
@@ -86,10 +88,11 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
     Ok(())
 }
 
-/// Takes the caller's lowest-numbered pending signal.
+/// Takes the caller's lowest-numbered pending signal, or else its pending
+/// child exit, or else its pending child removal.
 ///
-/// Returns `WouldBlock` if none is pending.
-pub fn take(process: &BrokerProcess, handle: ObjectHandle) -> Result<PendingSignal> {
+/// Returns `WouldBlock` if no event is pending.
+pub fn take(process: &BrokerProcess, handle: ObjectHandle) -> Result<SignalEvent> {
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let object = object.read();
     object.as_signals()?.signals.take()
@@ -104,13 +107,21 @@ impl ObjectEntry {
     }
 }
 
-/// The pending signals of one process.
+/// The pending signals and child events of one process.
 pub(crate) struct ProcessSignals(Mutex<ProcessSignalsState>);
 
 struct ProcessSignalsState {
     /// The process that first sent each pending signal, indexed by signal
     /// number minus one.
     senders: [Option<ProcessId>; MAX_SIGNAL as usize],
+    /// The earliest child exit since the process last took one.
+    ///
+    /// Like a pending signal, later exits coalesce into it. The process
+    /// reaps its children separately, so only the notification coalesces.
+    child_exit: Option<ChildExit>,
+    /// Whether a child left the process without exiting since the process
+    /// last took this event.
+    child_removed: bool,
     /// Publication for the process's open handle, if any.
     readiness: Option<ReadinessRegistration>,
 }
@@ -119,6 +130,8 @@ impl ProcessSignals {
     pub(crate) fn new() -> Self {
         Self(Mutex::new(ProcessSignalsState {
             senders: [None; MAX_SIGNAL as usize],
+            child_exit: None,
+            child_removed: false,
             readiness: None,
         }))
     }
@@ -129,32 +142,73 @@ impl ProcessSignals {
             return;
         }
         state.senders[index] = Some(sender);
-        // Republish, since a waiter that took the previous signals may not
-        // have observed readiness change since.
-        if let Some(readiness) = &state.readiness {
-            let _ = readiness.republish(ReadinessFlags::READ);
-        }
+        state.republish();
     }
 
-    fn take(&self) -> Result<PendingSignal> {
+    /// Notifies the process that its child exited, unless an earlier exit
+    /// is still pending.
+    pub(crate) fn post_child_exit(&self, exit: ChildExit) {
         let mut state = self.0.lock();
-        let (index, sender) = state
+        if state.child_exit.is_some() {
+            return;
+        }
+        state.child_exit = Some(exit);
+        state.republish();
+    }
+
+    /// Notifies the process that a child left it without exiting, unless an
+    /// earlier removal is still pending.
+    pub(crate) fn post_child_removed(&self) {
+        let mut state = self.0.lock();
+        if state.child_removed {
+            return;
+        }
+        state.child_removed = true;
+        state.republish();
+    }
+
+    fn take(&self) -> Result<SignalEvent> {
+        let mut state = self.0.lock();
+        let signal = state
             .senders
             .iter_mut()
             .enumerate()
-            .find_map(|(index, sender)| Some((index, sender.take()?)))
-            .ok_or(BrokerError::WouldBlock)?;
-        Ok(PendingSignal {
-            signal: u32::try_from(index + 1).expect("signal numbers fit in u32"),
-            sender,
-        })
+            .find_map(|(index, sender)| Some((index, sender.take()?)));
+        if let Some((index, sender)) = signal {
+            return Ok(SignalEvent::Signal(PendingSignal {
+                signal: u32::try_from(index + 1).expect("signal numbers fit in u32"),
+                sender,
+            }));
+        }
+        if let Some(exit) = state.child_exit.take() {
+            return Ok(SignalEvent::ChildExited(exit));
+        }
+        if core::mem::take(&mut state.child_removed) {
+            return Ok(SignalEvent::ChildRemoved);
+        }
+        Err(BrokerError::WouldBlock)
     }
 
     fn readiness(&self) -> ReadinessFlags {
-        if self.0.lock().senders.iter().any(Option::is_some) {
+        let state = self.0.lock();
+        if state.child_exit.is_some()
+            || state.child_removed
+            || state.senders.iter().any(Option::is_some)
+        {
             ReadinessFlags::READ
         } else {
             ReadinessFlags::default()
+        }
+    }
+}
+
+impl ProcessSignalsState {
+    /// Republishes readiness after an event becomes pending, since a waiter
+    /// that took the previous events may not have observed readiness change
+    /// since.
+    fn republish(&self) {
+        if let Some(readiness) = &self.readiness {
+            let _ = readiness.republish(ReadinessFlags::READ);
         }
     }
 }
@@ -183,8 +237,9 @@ impl Drop for SignalsObject {
 mod tests {
     use alloc::sync::Arc;
 
+    use litebox_broker_protocol::process::{ChildExit, ProcessExitStatus};
     use litebox_broker_protocol::readiness::ReadinessFlags;
-    use litebox_broker_protocol::signal::{PendingSignal, SignalTarget};
+    use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
     use litebox_broker_protocol::{ObjectHandle, ProcessId};
 
     use crate::readiness::tests::TestReadinessSink;
@@ -207,8 +262,8 @@ mod tests {
             .unwrap()
     }
 
-    fn pending(signal: u32, sender: ProcessId) -> PendingSignal {
-        PendingSignal { signal, sender }
+    fn pending(signal: u32, sender: ProcessId) -> SignalEvent {
+        SignalEvent::Signal(PendingSignal { signal, sender })
     }
 
     fn to(process: &BrokerProcess) -> SignalTarget {
@@ -298,7 +353,7 @@ mod tests {
         let first = broker
             .create_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
-        // No process other than the caller has a parent yet.
+        // No process other than the caller has a creator yet.
         assert_eq!(
             super::send(&first, SignalTarget::All, 0),
             Err(BrokerError::UnknownObject)
@@ -313,8 +368,9 @@ mod tests {
         let take_all = || {
             handles
                 .iter()
-                .filter_map(|(process, handle)| {
-                    Some((process.id(), super::take(process, *handle).ok()?.signal))
+                .filter_map(|(process, handle)| match super::take(process, *handle) {
+                    Ok(SignalEvent::Signal(signal)) => Some((process.id(), signal.signal)),
+                    _ => None,
                 })
                 .collect::<std::vec::Vec<_>>()
         };
@@ -329,7 +385,7 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
 
-        // Processes without a parent and the sender are spared.
+        // Root processes and the sender are spared.
         super::send(&first, SignalTarget::All, 15).unwrap();
         assert_eq!(take_all(), [(second.id(), 15)]);
         super::send(&root, SignalTarget::All, 15).unwrap();
@@ -338,6 +394,81 @@ mod tests {
             super::send(&root, SignalTarget::All, 65),
             Err(BrokerError::UnsupportedOperation)
         );
+    }
+
+    #[test]
+    fn child_exits_coalesce_and_follow_pending_signals() {
+        let broker = broker();
+        let parent = process(&broker);
+        let sink = Arc::new(TestReadinessSink::default());
+        let handle = super::open(&parent, sink.clone()).unwrap();
+        let exit = |id, code| ChildExit {
+            process_id: ProcessId(id),
+            exit_status: ProcessExitStatus::Exited { code },
+        };
+
+        parent.signals.post_child_exit(exit(100, 1));
+        parent.signals.post_child_exit(exit(101, 2));
+        super::send(&parent, to(&parent), 17).unwrap();
+        assert_eq!(
+            *sink.republished.lock().unwrap(),
+            [
+                (handle, ReadinessFlags::READ),
+                (handle, ReadinessFlags::READ)
+            ]
+        );
+        assert_eq!(super::take(&parent, handle), Ok(pending(17, parent.id())));
+        assert_eq!(parent.check_readiness(handle), Ok(ReadinessFlags::READ));
+        assert_eq!(
+            super::take(&parent, handle),
+            Ok(SignalEvent::ChildExited(exit(100, 1)))
+        );
+        assert_eq!(super::take(&parent, handle), Err(BrokerError::WouldBlock));
+        assert_eq!(
+            parent.check_readiness(handle),
+            Ok(ReadinessFlags::default())
+        );
+
+        // Once taken, the next exit is notified again.
+        parent.signals.post_child_exit(exit(102, 3));
+        assert_eq!(sink.republished.lock().unwrap().len(), 3);
+        assert_eq!(
+            super::take(&parent, handle),
+            Ok(SignalEvent::ChildExited(exit(102, 3)))
+        );
+    }
+
+    #[test]
+    fn child_removals_coalesce_and_follow_child_exits() {
+        let broker = broker();
+        let parent = process(&broker);
+        let sink = Arc::new(TestReadinessSink::default());
+        let handle = super::open(&parent, sink.clone()).unwrap();
+        let exit = ChildExit {
+            process_id: ProcessId(100),
+            exit_status: ProcessExitStatus::Exited { code: 1 },
+        };
+
+        parent.signals.post_child_removed();
+        parent.signals.post_child_removed();
+        parent.signals.post_child_exit(exit);
+        assert_eq!(sink.republished.lock().unwrap().len(), 2);
+        assert_eq!(
+            super::take(&parent, handle),
+            Ok(SignalEvent::ChildExited(exit))
+        );
+        assert_eq!(parent.check_readiness(handle), Ok(ReadinessFlags::READ));
+        assert_eq!(super::take(&parent, handle), Ok(SignalEvent::ChildRemoved));
+        assert_eq!(super::take(&parent, handle), Err(BrokerError::WouldBlock));
+        assert_eq!(
+            parent.check_readiness(handle),
+            Ok(ReadinessFlags::default())
+        );
+
+        // Once taken, the next removal is notified again.
+        parent.signals.post_child_removed();
+        assert_eq!(sink.republished.lock().unwrap().len(), 3);
+        assert_eq!(super::take(&parent, handle), Ok(SignalEvent::ChildRemoved));
     }
 
     #[test]

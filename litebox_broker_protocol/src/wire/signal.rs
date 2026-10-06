@@ -3,11 +3,12 @@
 
 use crate::message::{SignalRequest, SignalResponse};
 use crate::signal::{
-    OpenSignalsResponse, PendingSignal, SendSignalRequest, SignalTarget, TakeSignalRequest,
+    OpenSignalsResponse, PendingSignal, SendSignalRequest, SignalEvent, SignalTarget,
+    TakeSignalRequest,
 };
 
-use super::WireError;
 use super::primitive::{Decoder, Encoder};
+use super::{WireError, decode_child_exit, encode_child_exit};
 
 const SIGNAL_REQUEST_TAG_OPEN: u8 = 0;
 const SIGNAL_REQUEST_TAG_SEND: u8 = 1;
@@ -20,6 +21,10 @@ const SIGNAL_TARGET_TAG_ALL: u8 = 2;
 const SIGNAL_RESPONSE_TAG_OPEN: u8 = 0;
 const SIGNAL_RESPONSE_TAG_SENT: u8 = 1;
 const SIGNAL_RESPONSE_TAG_TAKE: u8 = 2;
+
+const SIGNAL_EVENT_TAG_SIGNAL: u8 = 0;
+const SIGNAL_EVENT_TAG_CHILD_EXITED: u8 = 1;
+const SIGNAL_EVENT_TAG_CHILD_REMOVED: u8 = 2;
 
 pub(super) fn encode_signal_request(encoder: &mut Encoder, request: SignalRequest) {
     match request {
@@ -80,10 +85,20 @@ pub(super) fn encode_signal_response(encoder: &mut Encoder, response: SignalResp
             encoder.handle(response.handle);
         }
         SignalResponse::Sent => encoder.u8(SIGNAL_RESPONSE_TAG_SENT),
-        SignalResponse::Take(response) => {
+        SignalResponse::Take(event) => {
             encoder.u8(SIGNAL_RESPONSE_TAG_TAKE);
-            encoder.u32(response.signal);
-            encoder.process_id(response.sender);
+            match event {
+                SignalEvent::Signal(signal) => {
+                    encoder.u8(SIGNAL_EVENT_TAG_SIGNAL);
+                    encoder.u32(signal.signal);
+                    encoder.process_id(signal.sender);
+                }
+                SignalEvent::ChildExited(child_exit) => {
+                    encoder.u8(SIGNAL_EVENT_TAG_CHILD_EXITED);
+                    encode_child_exit(encoder, child_exit);
+                }
+                SignalEvent::ChildRemoved => encoder.u8(SIGNAL_EVENT_TAG_CHILD_REMOVED),
+            }
         }
     }
 }
@@ -96,9 +111,14 @@ pub(super) fn decode_signal_response(
             handle: decoder.handle()?,
         }),
         SIGNAL_RESPONSE_TAG_SENT => SignalResponse::Sent,
-        SIGNAL_RESPONSE_TAG_TAKE => SignalResponse::Take(PendingSignal {
-            signal: decoder.u32()?,
-            sender: decoder.process_id()?,
+        SIGNAL_RESPONSE_TAG_TAKE => SignalResponse::Take(match decoder.u8()? {
+            SIGNAL_EVENT_TAG_SIGNAL => SignalEvent::Signal(PendingSignal {
+                signal: decoder.u32()?,
+                sender: decoder.process_id()?,
+            }),
+            SIGNAL_EVENT_TAG_CHILD_EXITED => SignalEvent::ChildExited(decode_child_exit(decoder)?),
+            SIGNAL_EVENT_TAG_CHILD_REMOVED => SignalEvent::ChildRemoved,
+            _ => return Err(WireError::InvalidTag),
         }),
         _ => return Err(WireError::InvalidTag),
     })

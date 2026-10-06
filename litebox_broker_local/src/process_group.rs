@@ -5,28 +5,12 @@ use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessGroupRequest, ProcessGroupResponse,
 };
-use litebox_broker_protocol::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
+use litebox_broker_protocol::process_group::SetProcessGroupRequest;
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Returns the group and session of process `process_id`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the broker reports an unrecoverable error or returns a protocol
-    /// response that does not match the issued process group request.
-    pub fn process_group(
-        &self,
-        process_id: ProcessId,
-    ) -> Result<ProcessGroupMembership, Channel::Error> {
-        match self.request_process_group(ProcessGroupRequest::Get(process_id))? {
-            ProcessGroupResponse::Get(membership) => Ok(membership),
-            response => panic!("broker returned unexpected process group response: {response:?}"),
-        }
-    }
-
     /// Moves process `process_id` into `process_group`.
     ///
     /// # Panics
@@ -43,7 +27,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             process_group,
         }))? {
             ProcessGroupResponse::Set => Ok(()),
-            response => panic!("broker returned unexpected process group response: {response:?}"),
+            response @ ProcessGroupResponse::CreateSession => {
+                panic!("broker returned unexpected process group response: {response:?}")
+            }
         }
     }
 
@@ -57,7 +43,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn create_session(&self, process_id: ProcessId) -> Result<(), Channel::Error> {
         match self.request_process_group(ProcessGroupRequest::CreateSession(process_id))? {
             ProcessGroupResponse::CreateSession => Ok(()),
-            response => panic!("broker returned unexpected process group response: {response:?}"),
+            response @ ProcessGroupResponse::Set => {
+                panic!("broker returned unexpected process group response: {response:?}")
+            }
         }
     }
 

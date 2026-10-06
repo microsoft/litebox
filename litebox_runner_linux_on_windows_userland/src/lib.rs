@@ -114,7 +114,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
         }
         Some(LinuxProcessStartup::Program(startup)) => {
             let LinuxProgramStartup {
-                parent_process_id,
                 uid,
                 euid,
                 gid,
@@ -131,7 +130,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    ppid: parent_process_id,
                     uid,
                     euid,
                     gid,
@@ -179,7 +177,6 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    ppid: 0,
                     uid: 1000,
                     gid: 1000,
                     euid: 1000,

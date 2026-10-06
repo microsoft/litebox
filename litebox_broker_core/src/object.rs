@@ -13,7 +13,6 @@ use spin::rwlock::RwLock;
 use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
-use crate::process::ProcessObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::signal::SignalsObject;
 use crate::socket::SocketObject;
@@ -50,7 +49,6 @@ pub(crate) enum ObjectEntry {
     File(File),
     Pipe(PipeObject),
     Socket(SocketObject),
-    Process(ProcessObject),
     Signals(SignalsObject),
     Timer(TimerObject),
 }
@@ -67,7 +65,7 @@ impl ObjectEntry {
     pub(crate) fn is_duplicable(&self) -> bool {
         match self {
             Self::Event(_) | Self::File(_) | Self::Pipe(_) => true,
-            Self::Socket(_) | Self::Process(_) | Self::Signals(_) | Self::Timer(_) => false,
+            Self::Socket(_) | Self::Signals(_) | Self::Timer(_) => false,
         }
     }
 
@@ -86,11 +84,7 @@ impl ObjectEntry {
                 pipe.watch(&registration)?;
                 Ok(Some(registration))
             }
-            Self::Event(_)
-            | Self::Socket(_)
-            | Self::Process(_)
-            | Self::Signals(_)
-            | Self::Timer(_) => Ok(None),
+            Self::Event(_) | Self::Socket(_) | Self::Signals(_) | Self::Timer(_) => Ok(None),
         }
     }
 }
@@ -105,7 +99,6 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::Event(event) => return Ok(event.readiness()),
             ObjectEntry::File(file) => return file.readiness(),
             ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
-            ObjectEntry::Process(process) => return Ok(process.readiness()),
             ObjectEntry::Signals(signals) => return Ok(signals.readiness()),
             ObjectEntry::Timer(timer) => return Ok(timer.readiness()),
             ObjectEntry::Socket(socket) => socket.resource(),
@@ -124,7 +117,6 @@ pub(crate) fn get_status_flags(
         ObjectEntry::Pipe(pipe) => return Ok(pipe.get_status_flags()),
         ObjectEntry::Event(_)
         | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_)
         | ObjectEntry::Signals(_)
         | ObjectEntry::Timer(_) => return Err(BrokerError::InvalidRights),
     };
@@ -146,7 +138,6 @@ pub(crate) fn set_status_flags(
         }
         ObjectEntry::Event(_)
         | ObjectEntry::Socket(_)
-        | ObjectEntry::Process(_)
         | ObjectEntry::Signals(_)
         | ObjectEntry::Timer(_) => return Err(BrokerError::InvalidRights),
     };

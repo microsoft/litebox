@@ -98,7 +98,6 @@ pub fn run(cli_args: CliArgs) -> Result<i32> {
             .load_program(
                 litebox_common_linux::TaskParams {
                     pid: setup.process_id,
-                    ppid: 0,
                     uid: 1000,
                     euid: 1000,
                     gid: 1000,

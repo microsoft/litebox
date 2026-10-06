@@ -21,13 +21,14 @@ use litebox::event::{Events, IOPollable as _};
 use litebox::platform::ArchSpecificRegister;
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
-use litebox::process::{ChildStatus, ProcessError};
+use litebox::process::ProcessError;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
-use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
+use litebox_broker_protocol::signal::SignalEvent;
 use litebox_common_linux::ProtFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
@@ -223,11 +224,13 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     /// the `inner` mutex lock.
     fork_pause: <Platform as RawMutexProvider>::RawMutex,
     inner: Arc<Mutex<Platform, ProcessInner<Platform>>>,
-    /// Started child processes that have not been reaped, mapped by process ID.
-    children: Mutex<Platform, BTreeMap<i32, Child<Platform>>>,
-    /// Termination events of the children, shared with each child's watcher.
-    child_events: Arc<ChildEvents<Platform>>,
-    /// Signals other processes send to this process, once opened.
+    /// Notified when a child's exit or removal is taken from `signals`, waking the threads waiting
+    /// for a child.
+    child_exits: Pollee<Platform>,
+    /// Whether this process is a child subreaper (`PR_SET_CHILD_SUBREAPER`). Held while the
+    /// broker is updated, so concurrent changes apply in order.
+    child_subreaper: Mutex<Platform, bool>,
+    /// Signals other processes send to this process and its children's exits, once opened.
     signals: once_cell::race::OnceBox<litebox::process::Signals<Platform>>,
     /// Watcher of `signals`.
     signal_watcher: Arc<SignalWatcher<Platform>>,
@@ -239,64 +242,10 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
 }
 
-/// A started child process.
-struct Child<Platform: ShimPlatform> {
-    process: litebox::process::Process<Platform>,
-    /// Watcher of the child's termination, registered on `process`.
-    watcher: Arc<ChildWatcher<Platform>>,
-    /// Termination status once observed. Observing a termination queues the child's `SIGCHLD`.
-    exit_status: Option<ProcessExitStatus>,
-}
-
-/// Children a `wait4` call waits for.
-#[derive(Clone, Copy)]
-enum WaitTarget {
-    Any,
-    Process(i32),
-    ProcessGroup(ProcessId),
-}
-
-/// A process's view of its children's terminations, which its threads observe.
-///
-/// This does not own the children, so a watcher holding it cannot drop them while its child's
-/// handle notifies it.
-struct ChildEvents<Platform: ShimPlatform> {
-    /// Set when a child may have terminated since child terminations were last observed.
-    changed: AtomicBool,
-    /// Notified when a child may have terminated, waking the threads waiting for a child.
-    pollee: Pollee<Platform>,
-    /// The process's locked state, to interrupt its threads.
-    process: Arc<Mutex<Platform, ProcessInner<Platform>>>,
-}
-
-/// Watcher of one child's termination, which wakes and interrupts its parent's threads to observe
-/// it.
-struct ChildWatcher<Platform: ShimPlatform> {
-    /// Set when the child may have terminated since its status was last queried.
-    changed: AtomicBool,
-    /// The parent's view of its children's terminations.
-    parent: Arc<ChildEvents<Platform>>,
-}
-
-impl<Platform: ShimPlatform> Observer<Events> for ChildWatcher<Platform> {
-    fn on_events(&self, events: &Events) {
-        // Closing a child's handle wakes its observers without events, and the closing thread
-        // already removed that child.
-        if events.is_empty() {
-            return;
-        }
-        // Set the child's flag first, so an observation that sees the parent's also sees it.
-        self.changed.store(true, Ordering::SeqCst);
-        self.parent.changed.store(true, Ordering::SeqCst);
-        self.parent.pollee.notify_observers(Events::IN);
-        interrupt_threads(&self.parent.process, None);
-    }
-}
-
-/// Watcher of the signals other processes send to a process, which interrupts its threads to take
-/// them.
+/// Watcher of the signals other processes send to a process and its children's exits, which
+/// interrupts its threads to take them.
 struct SignalWatcher<Platform: ShimPlatform> {
-    /// Set when a signal may have been sent since signals were last taken.
+    /// Set when a signal or child exit may have arrived since signals were last taken.
     changed: AtomicBool,
     /// Held while taking signals, so a forced take waits for one in progress to queue the
     /// signals it took.
@@ -391,11 +340,8 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         Self {
             nr_threads,
             fork_pause: <Platform as RawMutexProvider>::RawMutex::INIT,
-            child_events: Arc::new(ChildEvents {
-                changed: AtomicBool::new(false),
-                pollee: Pollee::new(),
-                process: inner.clone(),
-            }),
+            child_exits: Pollee::new(),
+            child_subreaper: Mutex::new(false),
             signals: once_cell::race::OnceBox::new(),
             // Signals sent before they are opened are taken at the first check.
             signal_watcher: Arc::new(SignalWatcher {
@@ -404,7 +350,6 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
                 process: inner.clone(),
             }),
             inner,
-            children: Mutex::new(BTreeMap::new()),
             limits: ResourceLimits::default(),
             alarm_timer: Mutex::new(Alarm {
                 handle: None,
@@ -423,104 +368,6 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
     fn has_default_alarm_state(&self) -> bool {
         let alarm = self.alarm_timer.lock();
         alarm.handle.is_none() && alarm.deadline.is_none()
-    }
-
-    /// Adds a started child process and watches its termination.
-    ///
-    /// The child may have terminated before its watcher was registered, so the watcher starts
-    /// changed and the caller then observes child terminations.
-    fn add_child(&self, pid: i32, process: litebox::process::Process<Platform>) {
-        let watcher = Arc::new(ChildWatcher {
-            changed: AtomicBool::new(true),
-            parent: self.child_events.clone(),
-        });
-        process.register_observer(
-            Arc::downgrade(&watcher) as Weak<dyn Observer<Events>>,
-            Events::IN,
-        );
-        let previous = self.children.lock().insert(
-            pid,
-            Child {
-                process,
-                watcher,
-                exit_status: None,
-            },
-        );
-        assert!(
-            previous.is_none(),
-            "broker child process IDs must be unique"
-        );
-    }
-
-    /// Records the termination of each child whose termination was not yet observed and whose
-    /// watcher saw a change since its status was last queried, returning their process IDs and
-    /// statuses.
-    ///
-    /// Children the broker reaped as they terminated are released, since no wait reports them
-    /// and each holds broker process capacity until its handle closes. Nothing is recorded if a
-    /// status query fails.
-    fn record_child_terminations(&self) -> Result<Vec<(i32, ProcessExitStatus)>, ProcessError> {
-        // Clear each flag before querying, so a termination published during the queries sets it
-        // again.
-        self.child_events.changed.store(false, Ordering::SeqCst);
-        let mut children = self.children.lock();
-        let statuses = children
-            .iter()
-            .filter(|(_, child)| {
-                child.exit_status.is_none() && child.watcher.changed.swap(false, Ordering::SeqCst)
-            })
-            .map(|(&pid, child)| Ok((pid, child.process.status()?)))
-            .collect::<Result<Vec<_>, ProcessError>>()?;
-        let mut terminated = Vec::new();
-        let mut reaped = Vec::new();
-        for (pid, status) in statuses {
-            match status {
-                ChildStatus::Live => {}
-                ChildStatus::Terminated(exit_status) => {
-                    children
-                        .get_mut(&pid)
-                        .expect("observed child must remain present")
-                        .exit_status = Some(exit_status);
-                    terminated.push((pid, exit_status));
-                }
-                ChildStatus::Reaped(exit_status) => {
-                    reaped.push(children.remove(&pid));
-                    terminated.push((pid, exit_status));
-                }
-            }
-        }
-        drop(children);
-        drop(reaped);
-        Ok(terminated)
-    }
-
-    /// Returns the process IDs of this process's children.
-    fn child_pids(&self) -> Vec<i32> {
-        self.children.lock().keys().copied().collect()
-    }
-
-    /// Removes one child whose process ID `matches` and whose termination was observed.
-    ///
-    /// The caller drops the returned child outside the children lock to reap it.
-    fn take_exited_child(
-        &self,
-        matches: impl Fn(i32) -> bool,
-    ) -> Result<(i32, litebox::process::Process<Platform>, ProcessExitStatus), TryOpError<Errno>>
-    {
-        let mut children = self.children.lock();
-        let mut matching = children.iter().filter(|&(&pid, _)| matches(pid)).peekable();
-        if matching.peek().is_none() {
-            return Err(TryOpError::Other(Errno::ECHILD));
-        }
-        let Some((pid, exit_status)) =
-            matching.find_map(|(&pid, child)| child.exit_status.map(|status| (pid, status)))
-        else {
-            return Err(TryOpError::TryAgain);
-        };
-        let child = children
-            .remove(&pid)
-            .expect("matched child must remain present");
-        Ok((pid, child.process, exit_status))
     }
 
     /// Waits for all threads in this process to exit, returning the exit code.
@@ -623,45 +470,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         interrupt_threads(&self.thread.process.inner, Some(self.tid()));
     }
 
-    /// Queues `SIGCHLD` for each child whose termination was not yet observed.
-    ///
-    /// During a `vfork` window the signal state is the child's, so the parent observes the
-    /// terminations once it resumes.
-    pub(crate) fn observe_child_terminations(&self) -> Result<(), ProcessError> {
-        if self.vfork.borrow().is_some() {
-            return Ok(());
-        }
-        let terminated = self.thread.process.record_child_terminations()?;
-        // Like Linux, a child terminating while `SIGCHLD` is set to `SIG_IGN` sends no signal,
-        // even if `SIGCHLD` is blocked.
-        if terminated.is_empty() || self.signals.ignored().contains(Signal::SIGCHLD) {
-            return Ok(());
-        }
-        for (pid, exit_status) in terminated {
-            self.send_shared_signal(
-                Signal::SIGCHLD,
-                siginfo_child(pid, self.credentials.uid, exit_status),
-            );
-        }
-        Ok(())
-    }
-
-    /// Queues `SIGCHLD` for children that may have terminated since child terminations were last
-    /// observed.
-    pub(crate) fn check_for_child_terminations(&self) {
-        if self
-            .thread
-            .process
-            .child_events
-            .changed
-            .load(Ordering::SeqCst)
-        {
-            // Failure means the process service failed, so no termination can be observed.
-            let _ = self.observe_child_terminations();
-        }
-    }
-
-    /// Opens the signals other processes send to this process, so its threads take them.
+    /// Opens the signals other processes send to this process and its children's exits, so its
+    /// threads take them.
     pub(crate) fn open_signals(&self) {
         let process = &self.thread.process;
         // Failure means the process service is unavailable or has failed, so no signal can be
@@ -679,7 +489,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
     }
 
-    /// Queues the signals other processes sent since signals were last taken.
+    /// Queues the signals other processes sent, and `SIGCHLD` for the children that exited, since
+    /// signals were last taken, waking the threads waiting for a child.
     ///
     /// Unless `force` is set, this only takes signals after being notified of them. A forced take
     /// does not wait for the notification, so, like Linux, a process that signals its own process
@@ -705,18 +516,58 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return;
         }
         // Failure means the process service failed, so no more signals can be taken.
-        while let Ok(Some(received)) = signals.take() {
-            if let Ok(signal) = Signal::try_from(received.signal.cast_signed()) {
-                self.send_shared_signal(
-                    signal,
-                    siginfo_kill_from(
-                        signal,
-                        received.sender.0.cast_signed(),
-                        self.credentials.uid,
-                    ),
-                );
+        while let Ok(Some(event)) = signals.take() {
+            match event {
+                SignalEvent::Signal(received) => {
+                    if let Ok(signal) = Signal::try_from(received.signal.cast_signed()) {
+                        self.send_shared_signal(
+                            signal,
+                            siginfo_kill_from(
+                                signal,
+                                received.sender.0.cast_signed(),
+                                self.credentials.uid,
+                            ),
+                        );
+                    }
+                }
+                SignalEvent::ChildExited(exit) => {
+                    // Like Linux, a child terminating while `SIGCHLD` is set to `SIG_IGN` sends
+                    // no signal, even if `SIGCHLD` is blocked. The broker coalesces exits, so one
+                    // `SIGCHLD` may stand for several, as when a pending `SIGCHLD` absorbs others.
+                    if !self.signals.ignored().contains(Signal::SIGCHLD) {
+                        self.send_shared_signal(
+                            Signal::SIGCHLD,
+                            siginfo_child(
+                                exit.process_id.0.cast_signed(),
+                                self.credentials.uid,
+                                exit.exit_status,
+                            ),
+                        );
+                    }
+                    process.child_exits.notify_observers(Events::IN);
+                }
+                // A child that never started sends no `SIGCHLD`, but waits for it must end.
+                SignalEvent::ChildRemoved => process.child_exits.notify_observers(Events::IN),
             }
         }
+    }
+
+    /// Makes this process adopt the orphans of its descendants if it is the first process, which,
+    /// like Linux init, no process created.
+    pub(crate) fn adopt_orphans_if_first(&self) {
+        // Failure means the process service is unavailable or has failed, so no child can be
+        // created.
+        if self.is_first_process() {
+            let _ = self.global.litebox.set_orphan_adoption(true);
+        }
+    }
+
+    /// Returns whether this process is the first process, which no process created.
+    fn is_first_process(&self) -> bool {
+        self.global
+            .litebox
+            .process_info(ProcessId(self.pid.cast_unsigned()))
+            .is_ok_and(|info| info.creator.is_none())
     }
 
     /// Updates the process exit status for a thread exit.
@@ -953,6 +804,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // Note we don't support capabilities in LiteBox, so we always return 0.
                 Ok(0)
             }
+            PrctlArg::SetChildSubreaper(enabled) => {
+                let enabled = enabled != 0;
+                let mut subreaper = self.thread.process.child_subreaper.lock();
+                // The first process adopts orphans regardless, like Linux init.
+                match self
+                    .global
+                    .litebox
+                    .set_orphan_adoption(enabled || self.is_first_process())
+                {
+                    Ok(()) | Err(ProcessError::Unavailable) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                *subreaper = enabled;
+                Ok(0)
+            }
+            PrctlArg::GetChildSubreaper(subreaper) => {
+                let enabled = *self.thread.process.child_subreaper.lock();
+                subreaper
+                    .write_at_offset::<Platform>(0, i32::from(enabled))
+                    .ok_or(Errno::EFAULT)
+                    .map(|()| 0)
+            }
             _ => unimplemented!(),
         }
     }
@@ -1118,9 +991,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.files.replace(state.parent_files);
         self.fs.replace(state.parent_fs);
         self.signals.restore_vfork_parent(state.parent_signals);
-        self.thread.process.add_child(state.child_pid, state.child);
-        // Failure means the process service failed, so no termination can be observed.
-        let _ = self.observe_child_terminations();
         *ctx = state.parent_context;
         self.global
             .platform
@@ -1280,7 +1150,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let (blocked_signals, signal_actions, alternate_signal_stack) = self.signals.fork_state();
         let (initial_program_break, program_break) = self.global.mm.program_break();
         let mut startup = LinuxForkStartup {
-            parent_process_id: self.pid,
             uid: self.credentials.uid,
             euid: self.credentials.euid,
             gid: self.credentials.gid,
@@ -1308,8 +1177,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // The child keeps the references it inherits until it exits, so check the size first.
         startup.encode().map_err(|_| Errno::ENOMEM)?;
 
-        // Release the children the broker reaped, which hold process capacity until observed.
-        let _ = self.observe_child_terminations();
+        // Dropping the pending child on failure discards it.
         let child = self
             .global
             .litebox
@@ -1317,21 +1185,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        let prepared = self
-            .write_fork_image(&child, &startup.regions)
-            .and_then(|()| {
-                child
-                    .inherit(&self.global.litebox, &objects)
-                    .map_err(Errno::from)
-            });
-        let handles = match prepared {
-            Ok(handles) => handles,
-            Err(errno) => {
-                // The pending child never runs, and no one observes its status.
-                let _ = child.exit(ProcessExitStatus::Unknown);
-                return Err(errno);
-            }
-        };
+        self.write_fork_image(&child, &startup.regions)?;
+        let handles = child
+            .inherit(&self.global.litebox, &objects)
+            .map_err(Errno::from)?;
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
@@ -1340,11 +1197,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let payload = startup
             .encode()
             .expect("the startup fit with placeholder handles");
-        // The broker no longer holds a pending child if starting it fails.
         child.start(&payload).map_err(Errno::from)?;
-        self.thread.process.add_child(child_pid, child);
-        // Failure means the process service failed, so no termination can be observed.
-        let _ = self.observe_child_terminations();
         Ok(child_pid.cast_unsigned() as usize)
     }
 
@@ -1352,7 +1205,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// process image, back to back, skipping zero-filled pages at the ends of each chunk.
     fn write_fork_image(
         &self,
-        child: &litebox::process::Process<Platform>,
+        child: &litebox::process::PendingChild,
         regions: &[ForkMemoryRegion],
     ) -> Result<(), Errno> {
         const CHUNK_SIZE: usize = MAX_CHILD_MEMORY_WRITE_SIZE as usize;
@@ -1495,8 +1348,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EAGAIN);
         }
-        // Release the children the broker reaped, which hold process capacity until observed.
-        let _ = self.observe_child_terminations();
         let child = self
             .global
             .litebox
@@ -1767,7 +1618,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         thread,
                         vfork: core::cell::RefCell::new(None),
                         pid: self.pid,
-                        ppid: self.ppid,
                         credentials: self.credentials.clone(),
                         comm: self.comm.clone(),
                         fs: fs.into(),
@@ -2311,8 +2161,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Only terminated children are reported. Like Linux, children that terminate while
     /// `SIGCHLD` is ignored or has `SA_NOCLDWAIT` are reaped instead of reported, and `pid == 0`
     /// waits for the children in the process group this process is in when it starts waiting.
-    /// Unlike Linux, children's groups are read one at a time, so a wait that overlaps children
-    /// moving between groups may miss a member. Resource usage is reported as zero.
+    /// Resource usage is reported as zero.
     /// A child without an observable termination status is reported as killed by `SIGSEGV`.
     /// Children belong to the process rather than the creating thread, so `__WNOTHREAD` is
     /// accepted but does not restrict which children match.
@@ -2333,17 +2182,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if options & !(WNOHANG | WUNTRACED | WCONTINUED | WNOTHREAD | WALL | WCLONE) != 0 {
             return Err(Errno::EINVAL);
         }
-        let target = match pid {
-            -1 => WaitTarget::Any,
-            1.. => WaitTarget::Process(pid),
+        let selector = match pid {
+            -1 => ChildSelector::Any,
+            1.. => ChildSelector::Process(ProcessId(pid.cast_unsigned())),
             i32::MIN => return Err(Errno::ESRCH),
             0 => match self.membership(self.pid) {
-                Ok(membership) => WaitTarget::ProcessGroup(membership.process_group),
+                Ok(membership) => ChildSelector::ProcessGroup(membership.process_group),
                 // Without a process service, this process has no children.
                 Err(ProcessError::Unavailable) => return Err(Errno::ECHILD),
                 Err(error) => return Err(error.into()),
             },
-            _ => WaitTarget::ProcessGroup(ProcessId(pid.unsigned_abs())),
+            _ => ChildSelector::ProcessGroup(ProcessId(pid.unsigned_abs())),
         };
         // Every child is created with the default exit signal, so only __WALL selects it
         // together with __WCLONE.
@@ -2351,42 +2200,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ECHILD);
         }
         let process = &self.thread.process;
-        let mut take_exited_child = || {
-            self.observe_child_terminations()
-                .map_err(|error| TryOpError::Other(error.into()))?;
-            match target {
-                WaitTarget::Any => process.take_exited_child(|_| true),
-                WaitTarget::Process(target) => process.take_exited_child(|pid| pid == target),
-                WaitTarget::ProcessGroup(process_group) => {
-                    let members = self
-                        .children_in_process_group(process_group)
-                        .map_err(|error| TryOpError::Other(error.into()))?;
-                    process.take_exited_child(|pid| members.contains(&pid))
-                }
+        let mut reap_child = || match self.global.litebox.reap_child(selector) {
+            Ok(Some(exit)) => Ok(exit),
+            Ok(None) => Err(TryOpError::TryAgain),
+            // Without a process service, or a matching child, there is nothing to wait for.
+            Err(ProcessError::Unavailable | ProcessError::NoSuchProcess) => {
+                Err(TryOpError::Other(Errno::ECHILD))
             }
+            Err(error) => Err(TryOpError::Other(error.into())),
         };
-        let exited = match process.child_events.pollee.wait(
+        let exited = match process.child_exits.wait(
             &self.wait_cx(),
             options & WNOHANG != 0,
             Events::IN,
-            &mut take_exited_child,
+            &mut reap_child,
         ) {
             // Like Linux, which checks for terminated children before pending signals, report a
             // child whose termination queued the interrupting `SIGCHLD`.
-            Err(TryOpError::WaitError(WaitError::Interrupted)) => match take_exited_child() {
+            Err(TryOpError::WaitError(WaitError::Interrupted)) => match reap_child() {
                 Err(TryOpError::TryAgain) => Err(TryOpError::WaitError(WaitError::Interrupted)),
                 result => result,
             },
             result => result,
         };
-        let (child_pid, child, exit_status) = match exited {
-            Ok(exited) => exited,
+        let exit = match exited {
+            Ok(exit) => exit,
             Err(TryOpError::TryAgain) => return Ok(0),
             Err(error) => return Err(error.into()),
         };
-        // Closing the child handle reaps the child.
-        drop(child);
-        let (code, status) = child_termination(exit_status);
+        let (code, status) = child_termination(exit.exit_status);
         let status = if code == CLD_EXITED {
             status << 8
         } else {
@@ -2402,31 +2244,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .write_at_offset::<Platform>(0, Rusage::default())
                 .ok_or(Errno::EFAULT)?;
         }
-        Ok(child_pid.cast_unsigned() as usize)
-    }
-
-    /// Returns the process IDs of this process's children in `process_group`.
-    fn children_in_process_group(
-        &self,
-        process_group: ProcessId,
-    ) -> Result<Vec<i32>, ProcessError> {
-        let mut members = Vec::new();
-        for pid in self.thread.process.child_pids() {
-            match self.membership(pid) {
-                Ok(membership) if membership.process_group == process_group => members.push(pid),
-                // A child reaped since its ID was read is in no group.
-                Ok(_) | Err(ProcessError::NoSuchProcess) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        Ok(members)
+        Ok(exit.process_id.0 as usize)
     }
 
     /// Returns the process group and session of process `pid`.
     fn membership(&self, pid: i32) -> Result<ProcessGroupMembership, ProcessError> {
         self.global
             .litebox
-            .process_group(ProcessId(pid.cast_unsigned()))
+            .process_info(ProcessId(pid.cast_unsigned()))
+            .map(|info| info.membership)
     }
 
     /// Returns the process group and session of process `pid`, or of this process if `pid` is
@@ -2499,8 +2325,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_or(self.pid, |state| state.child_pid)
     }
 
+    /// Handle syscall `getppid`.
+    ///
+    /// Like Linux, a process without a parent, such as the first process, has parent ID zero.
     pub(crate) fn sys_getppid(&self) -> i32 {
-        self.vfork.borrow().as_ref().map_or(self.ppid, |_| self.pid)
+        if self.vfork.borrow().is_some() {
+            return self.pid;
+        }
+        // Failure means the process service is unavailable or has failed, so the process tree
+        // cannot be read.
+        self.global
+            .litebox
+            .process_info(ProcessId(self.pid.cast_unsigned()))
+            .ok()
+            .and_then(|info| info.parent)
+            .map_or(0, |parent| parent.0.cast_signed())
     }
 
     /// Handle syscall `getuid`.
@@ -2737,7 +2576,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let umask = u32::from(fs.umask().bits());
         drop(fs);
         let mut startup = LinuxProgramStartup {
-            parent_process_id: self.pid,
             uid: self.credentials.uid,
             euid: self.credentials.euid,
             gid: self.credentials.gid,

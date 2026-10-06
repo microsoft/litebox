@@ -44,7 +44,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::{Mutex, rwlock::RwLock};
 
@@ -237,9 +236,13 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) ids: Arc<Mutex<IdAllocator>>,
     pub(crate) processes: Arc<RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>>,
-    /// Serializes changes to process group and session membership, and
-    /// selecting the members of a group.
-    pub(crate) process_groups: Arc<Mutex<()>>,
+    /// Serializes changes to the process tree, namely parent and child links,
+    /// exits and reaping, and process group and session membership, and
+    /// selections over it.
+    ///
+    /// Lock order: this lock, then process state locks, then the registry
+    /// and ID allocator, then process tree links.
+    pub(crate) process_tree: Arc<Mutex<()>>,
     /// Number of broker threads created and not normally retired.
     pub(crate) active_thread_count: Arc<AtomicUsize>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
@@ -303,7 +306,7 @@ impl BrokerCore {
             limits,
             ids: Arc::new(Mutex::new(ids)),
             processes: Arc::new(RwLock::new(HashMap::new())),
-            process_groups: Arc::new(Mutex::new(())),
+            process_tree: Arc::new(Mutex::new(())),
             active_thread_count: Arc::new(AtomicUsize::new(0)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
@@ -329,23 +332,30 @@ impl BrokerCore {
         }
     }
 
-    /// Returns the registered process `id`, or `UnknownObject` if none.
+    /// Returns the process `id`, or `UnknownObject` if none exists.
+    ///
+    /// A process that was reaped or never started no longer exists.
     pub(crate) fn registered_process(&self, id: ProcessId) -> Result<Arc<BrokerProcess>> {
         // The registry lock is released before the process can drop, since a
         // final process drop removes itself from the registry.
-        self.processes
-            .read()
-            .get(&id)
-            .and_then(Weak::upgrade)
+        let process = self.processes.read().get(&id).and_then(Weak::upgrade);
+        process
+            .filter(|process| !process.is_released())
             .ok_or(BrokerError::UnknownObject)
     }
 
-    /// Returns every registered process.
+    /// Returns every existing process.
     pub(crate) fn registered_processes(&self) -> Vec<Arc<BrokerProcess>> {
         // The registry lock is released before any process can drop, since a
         // final process drop removes itself from the registry.
-        let processes = self.processes.read();
-        processes.values().filter_map(Weak::upgrade).collect()
+        let mut processes = self
+            .processes
+            .read()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        processes.retain(|process| !process.is_released());
+        processes
     }
 
     /// Returns whether any broker process remains registered.
@@ -386,7 +396,10 @@ impl BrokerCore {
         Ok((first, second))
     }
 
-    /// Allocates one authenticated process without an initial thread.
+    /// Allocates one authenticated process without an initial thread, as a
+    /// child of the process `parent_id` if given.
+    ///
+    /// Returns `PeerClosed` if the parent's owner died or the parent exited.
     ///
     /// # Panics
     ///
@@ -405,44 +418,39 @@ impl BrokerCore {
             processes
                 .try_reserve(1)
                 .map_err(|_| BrokerError::OutOfMemory)?;
+            if let Some(parent) = parent {
+                parent.reserve_child()?;
+            }
             let raw_id = self.ids.lock().allocate()?;
             let id = ProcessId(raw_id);
-            let membership = parent.map_or(
-                ProcessGroupMembership {
-                    process_group: id,
-                    session: id,
-                },
-                |parent| parent.membership(),
-            );
             let process = Arc::new(BrokerProcess::new(
                 self.clone(),
                 id,
-                parent.map(Arc::downgrade),
-                membership,
+                parent,
                 caller_credential,
             ));
             assert!(
                 processes.insert(id, Arc::downgrade(&process)).is_none(),
                 "the ID allocator returned an occupied process ID"
             );
+            if let Some(parent) = parent {
+                parent.add_child(Arc::clone(&process));
+            }
             Ok(process)
         };
 
-        if let Some(parent_id) = parent_id {
-            let parent = self
-                .processes
-                .read()
-                .get(&parent_id)
-                .and_then(Weak::upgrade)
-                .ok_or(BrokerError::UnknownObject)?;
-            return parent.with_live_owner(|| allocate_process(Some(&parent)))?;
-        }
-        allocate_process(None)
+        // The tree lock orders the new link against the parent's exit.
+        let _tree = self.process_tree.lock();
+        let Some(parent_id) = parent_id else {
+            return allocate_process(None);
+        };
+        let parent = self.registered_process(parent_id)?;
+        parent.with_live_owner(|| allocate_process(Some(&parent)))?
     }
 
     /// Creates one process and its initial thread.
     ///
-    /// If initial-thread creation fails, the process is retired before the
+    /// If initial-thread creation fails, the process is discarded before the
     /// error is returned.
     ///
     /// # Panics
@@ -461,6 +469,7 @@ impl BrokerCore {
                 Ok(process)
             }
             Err(error) => {
+                let _ = process.fail_start(error, false, true);
                 process.retire(true);
                 Err(error)
             }
