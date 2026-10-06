@@ -855,7 +855,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // The group may include this process.
         if signal.is_some() && matches!(target, SignalTarget::ProcessGroup(_)) {
-            self.take_signals_now();
+            self.take_signals(true);
         }
         Ok(0)
     }
