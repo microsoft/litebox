@@ -134,7 +134,7 @@ pub enum SocketState {
 /// Possible errors from [`NetworkProxy::try_read`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelReadError {
-    /// The local read side has been shut down.
+    /// The read side has been shut down (locally or by the peer) and no data is left.
     ReadShutdown,
     /// The stream has not reached a connected state.
     NotConnected,
@@ -261,6 +261,34 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => unimplemented!(),
         }
     }
+
+    /// Shut down the read and/or write side of the socket.
+    pub(super) fn shutdown(&self, how: super::Shutdown) {
+        let (read, write) = match how {
+            super::Shutdown::Read => (true, false),
+            super::Shutdown::Write => (false, true),
+            super::Shutdown::Both => (true, true),
+        };
+        match self {
+            NetworkProxy::Stream(channel) => {
+                if read {
+                    channel.shutdown_read();
+                }
+                if write {
+                    channel.shutdown_write();
+                }
+            }
+            NetworkProxy::Datagram(channel) => {
+                if read {
+                    channel.shutdown_read();
+                }
+                if write {
+                    channel.shutdown_write();
+                }
+            }
+            NetworkProxy::Raw => unimplemented!(),
+        }
+    }
 }
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkProxy<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
@@ -324,9 +352,9 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 
     /// Current socket state
     state: AtomicU32,
-    /// Whether the read side is shut down (SHUT_RD)
+    /// Whether the read side is shut down (`SHUT_RD` or a FIN from the peer)
     read_shutdown: AtomicBool,
-    /// Whether the write side is shut down (SHUT_WR)
+    /// Whether the write side is shut down (`SHUT_WR`)
     write_shutdown: AtomicBool,
     /// Bytes available in RX buffer (for quick poll checks)
     rx_available: AtomicUsize,
@@ -409,15 +437,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// This reads from the RX ring buffer without blocking.
     /// Returns the number of bytes read, or an error if the socket is closed
     /// or not connected.
+    ///
+    /// Like Linux, data received before the read side was shut down can still be read;
+    /// once it is consumed, this returns [`ChannelReadError::ReadShutdown`].
     pub fn try_read(
         &self,
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, ChannelReadError> {
-        if self.inner.read_shutdown.load(Ordering::Acquire) {
-            return Err(ChannelReadError::ReadShutdown);
-        }
+        // Load the flag before reading: the worker sets it only after queuing all data
+        // received before the peer's FIN.
+        let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
 
         let mut rx_cons = self.inner.rx_cons.lock();
         let n = if flags.contains(super::ReceiveFlags::DISCARD) {
@@ -441,6 +472,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         if n > 0 {
             return Ok(n);
         }
+        if read_shutdown {
+            return Err(ChannelReadError::ReadShutdown);
+        }
         match self.inner.state() {
             SocketState::Connected => Ok(0),
             SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
@@ -456,6 +490,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Returns the number of bytes written, or an error if the socket is closed,
     /// not connected, or the buffer is full.
     pub fn try_write(&self, buf: &[u8]) -> Result<usize, ChannelWriteError> {
+        // Check the flag under the TX lock; see `shutdown_write`.
+        let mut tx_prod = self.inner.tx_prod.lock();
         if self.inner.write_shutdown.load(Ordering::Acquire) {
             return Err(ChannelWriteError::WriteShutdown);
         }
@@ -468,7 +504,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             _ => return Err(ChannelWriteError::NotConnected),
         }
 
-        let mut tx_prod = self.inner.tx_prod.lock();
         let n = tx_prod.push_slice(buf);
 
         if n > 0 {
@@ -485,14 +520,29 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.tx_available.load(Ordering::Acquire) > 0
     }
 
-    /// Shutdown the read side of the socket.
+    /// Shut down the read side of the socket, like Linux's `RCV_SHUTDOWN`.
+    ///
+    /// Data already received can still be read; after that, reads report end-of-file.
     pub fn shutdown_read(&self) {
-        self.inner.read_shutdown.store(true, Ordering::Release);
+        if !self.inner.read_shutdown.swap(true, Ordering::AcqRel) {
+            self.inner.pollee.notify_observers(self.check_io_events());
+        }
     }
 
-    /// Shutdown the write side of the socket.
+    /// Shut down the write side of the socket, like Linux's `SEND_SHUTDOWN`.
+    ///
+    /// Further writes fail with [`ChannelWriteError::WriteShutdown`]. The network worker
+    /// sends FIN once the data written before this call has been handed to TCP.
     pub fn shutdown_write(&self) {
-        self.inner.write_shutdown.store(true, Ordering::Release);
+        // Set the flag under the TX lock so that a concurrent `try_write` either queues its
+        // data before the worker can observe the flag, or fails.
+        let was_shutdown = {
+            let _tx_prod = self.inner.tx_prod.lock();
+            self.inner.write_shutdown.swap(true, Ordering::AcqRel)
+        };
+        if !was_shutdown {
+            self.inner.pollee.notify_observers(self.check_io_events());
+        }
     }
 }
 
@@ -508,6 +558,19 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 
         if self.is_readable() {
             events |= Events::IN;
+        }
+
+        // Like Linux, a shut-down side never blocks: reads return end-of-file and writes fail.
+        let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
+        let write_shutdown = self.inner.write_shutdown.load(Ordering::Acquire);
+        if read_shutdown {
+            events |= Events::IN | Events::RDHUP;
+        }
+        if write_shutdown {
+            events |= Events::OUT;
+        }
+        if read_shutdown && write_shutdown {
+            events |= Events::HUP;
         }
 
         match self.inner.state() {
@@ -646,6 +709,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         !tx_cons.is_empty()
     }
 
+    /// Check if the write side has been shut down.
+    pub(super) fn is_write_shutdown(&self) -> bool {
+        self.inner.write_shutdown.load(Ordering::Acquire)
+    }
+
     /// Get the available space in the RX buffer.
     ///
     /// This indicates how many bytes can be pushed before the buffer is full.
@@ -747,6 +815,11 @@ struct DatagramChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> 
     /// For UDP, this indicates that a default destination has been set via connect().
     is_connected: AtomicBool,
 
+    /// Whether the read side is shut down (`SHUT_RD`)
+    read_shutdown: AtomicBool,
+    /// Whether the write side is shut down (`SHUT_WR`)
+    write_shutdown: AtomicBool,
+
     /// Socket error.
     socket_error: SocketAsyncErrorState,
 
@@ -777,6 +850,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramChannelInner<Pl
 
             local_port: AtomicU16::new(0),
             is_connected: AtomicBool::new(false),
+
+            read_shutdown: AtomicBool::new(false),
+            write_shutdown: AtomicBool::new(false),
 
             socket_error: SocketAsyncErrorState::new(),
 
@@ -816,12 +892,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// Copies the datagram payload into `buf` and optionally returns the source address.
     /// If the datagram is larger than `buf`, behavior depends on `flags`.
     /// Returns the original message size (which may exceed `buf.len()`).
+    ///
+    /// Like Linux, datagrams can still be received after the read side is shut down;
+    /// [`ChannelReadError::ReadShutdown`] is returned only when none is queued.
     pub fn try_read(
         &self,
         buf: &mut [u8],
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, ChannelReadError> {
+        let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
         let mut rx_cons = self.inner.rx_cons.lock();
 
         if let Some(msg) = rx_cons.try_pop() {
@@ -835,6 +915,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
             }
             self.inner.rx_count.fetch_sub(1, Ordering::Release);
             Ok(data.len())
+        } else if read_shutdown {
+            Err(ChannelReadError::ReadShutdown)
         } else {
             Ok(0)
         }
@@ -849,6 +931,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         data: &[u8],
         addr: Option<SocketAddr>,
     ) -> Result<usize, ChannelWriteError> {
+        if self.inner.write_shutdown.load(Ordering::Acquire) {
+            return Err(ChannelWriteError::WriteShutdown);
+        }
         if addr.is_none() && !self.inner.is_connected.load(Ordering::Acquire) {
             // No destination specified and socket is not connected
             return Err(ChannelWriteError::DestinationAddressRequired);
@@ -905,6 +990,20 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
             Err(current) => Err(current),
         }
     }
+
+    /// Shut down the read side of the socket, like Linux's `RCV_SHUTDOWN`.
+    pub fn shutdown_read(&self) {
+        if !self.inner.read_shutdown.swap(true, Ordering::AcqRel) {
+            self.inner.pollee.notify_observers(self.check_io_events());
+        }
+    }
+
+    /// Shut down the write side of the socket, like Linux's `SEND_SHUTDOWN`.
+    pub fn shutdown_write(&self) {
+        if !self.inner.write_shutdown.swap(true, Ordering::AcqRel) {
+            self.inner.pollee.notify_observers(self.check_io_events());
+        }
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
@@ -923,6 +1022,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
 
         if self.inner.tx_space.load(Ordering::Acquire) > 0 {
             events |= Events::OUT;
+        }
+
+        let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
+        if read_shutdown {
+            events |= Events::IN | Events::RDHUP;
+        }
+        if read_shutdown && self.inner.write_shutdown.load(Ordering::Acquire) {
+            events |= Events::HUP;
         }
 
         events
@@ -1134,11 +1241,23 @@ mod tests {
 
         // Shutdown read side
         channel.shutdown_read();
+        assert!(
+            channel
+                .check_io_events()
+                .contains(Events::IN | Events::RDHUP)
+        );
 
-        // Should fail to read
+        // Data received before the shutdown is still readable, then end-of-file
         let mut buf = [0u8; 32];
+        let read = channel
+            .try_read(&mut buf, super::super::ReceiveFlags::empty(), None)
+            .unwrap();
+        assert_eq!(&buf[..read], data);
         let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
         assert!(matches!(result, Err(ChannelReadError::ReadShutdown)));
+
+        // Writing is unaffected
+        assert_eq!(channel.try_write(b"data").unwrap(), 4);
     }
 
     #[test]
@@ -1169,13 +1288,61 @@ mod tests {
     fn stream_channel_shutdown_write() {
         let channel: StreamSocketChannel<TestPlatform> = StreamSocketChannel::new();
         channel.set_state(SocketState::Connected);
+        assert_eq!(channel.try_write(b"data").unwrap(), 4);
 
         // Shutdown write side
         channel.shutdown_write();
+        assert!(channel.is_write_shutdown());
+        assert!(!channel.check_io_events().contains(Events::HUP));
 
-        // Should fail to write
+        // Should fail to write, but data written before the shutdown is still pending
         let result = channel.try_write(b"data");
         assert!(matches!(result, Err(ChannelWriteError::WriteShutdown)));
+        assert!(channel.has_pending_tx());
+
+        // Shutting down both sides reports a hang-up
+        channel.shutdown_read();
+        assert!(
+            channel
+                .check_io_events()
+                .contains(Events::IN | Events::OUT | Events::HUP | Events::RDHUP)
+        );
+    }
+
+    #[test]
+    fn datagram_channel_shutdown() {
+        let channel: DatagramSocketChannel<TestPlatform> = DatagramSocketChannel::new();
+        channel.set_connected(true);
+        let addr: SocketAddr = "10.0.0.1:1234".parse().unwrap();
+        channel.try_recv_datagram_with(|| Some((Box::from(&b"data"[..]), addr)));
+
+        // Queued datagrams are still received after the read side is shut down
+        channel.shutdown_read();
+        assert!(
+            channel
+                .check_io_events()
+                .contains(Events::IN | Events::RDHUP)
+        );
+        let mut buf = [0u8; 32];
+        let read = channel
+            .try_read(&mut buf, super::super::ReceiveFlags::empty(), None)
+            .unwrap();
+        assert_eq!(&buf[..read], b"data");
+        let result = channel.try_read(&mut buf, super::super::ReceiveFlags::empty(), None);
+        assert!(matches!(result, Err(ChannelReadError::ReadShutdown)));
+        assert_eq!(channel.send_to(b"data", None).unwrap(), 4);
+
+        // Any send fails once the write side is shut down
+        channel.shutdown_write();
+        assert!(matches!(
+            channel.send_to(b"data", None),
+            Err(ChannelWriteError::WriteShutdown)
+        ));
+        assert!(matches!(
+            channel.send_to(b"data", Some(addr)),
+            Err(ChannelWriteError::WriteShutdown)
+        ));
+        assert!(channel.check_io_events().contains(Events::HUP));
     }
 
     #[test]

@@ -621,7 +621,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let files = self.files.borrow();
-        let mut is_datagram = false;
         let result = fd.dispatch(
             |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
             |fd| {
@@ -668,14 +667,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .entry_handle(fd)
                     .ok_or(Errno::EBADF)?;
                 handle.with_entry(|file| {
-                    is_datagram = !file.is_stream();
                     file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
         );
-        // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
+        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = result
-            && !is_datagram
+            && !self.is_datagram_socket(fd)
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }

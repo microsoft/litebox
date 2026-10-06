@@ -363,8 +363,18 @@ impl From<litebox::net::errors::AcceptError> for Errno {
     fn from(value: litebox::net::errors::AcceptError) -> Self {
         match value {
             litebox::net::errors::AcceptError::InvalidFd => Errno::EBADF,
-            litebox::net::errors::AcceptError::NotListening => Errno::ENOTCONN,
+            litebox::net::errors::AcceptError::NotListening => Errno::EINVAL,
             litebox::net::errors::AcceptError::NoConnectionsReady => Errno::EAGAIN,
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl From<litebox::net::errors::ShutdownError> for Errno {
+    fn from(value: litebox::net::errors::ShutdownError) -> Self {
+        match value {
+            litebox::net::errors::ShutdownError::InvalidFd => Errno::EBADF,
+            litebox::net::errors::ShutdownError::NotConnected => Errno::ENOTCONN,
             _ => unimplemented!(),
         }
     }
