@@ -1,0 +1,116 @@
+name: LVBS Smoke Test
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lvbs_smoke_test:
+    name: LVBS Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Azure login
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ secrets.ADO_SP_ClientID }}
+          tenant-id: ${{ secrets.ADO_SP_TenantID }}
+          allow-no-subscriptions: true
+
+      - name: Trigger ADO pipeline and wait for completion
+        shell: bash
+        env:
+          ADO_ORGANIZATION: https://dev.azure.com/msazure
+          ADO_PIPELINE_ID: "471678"
+          ADO_PROJECT: LSG-linux
+          LITEBOX_COMMIT: ${{ github.event.pull_request.head.sha }}
+          LITEBOX_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+        run: |
+          set -eu
+
+          BUILD_ID=""
+          cancel_build() {
+            trap - INT TERM
+            if [ -n "${BUILD_ID}" ]; then
+              echo "Cancelling superseded ADO build ${BUILD_ID}..."
+              az pipelines build cancel \
+                --build-id "${BUILD_ID}" \
+                --organization "${ADO_ORGANIZATION}" \
+                --project "${ADO_PROJECT}" \
+                --output none || true
+            fi
+            exit 130
+          }
+          trap cancel_build INT TERM
+
+          az config set extension.use_dynamic_install=yes_without_prompt
+
+          echo "Triggering ADO pipeline for Litebox commit ${LITEBOX_COMMIT}..."
+          BUILD_RESULT="$(az pipelines run \
+            --id "${ADO_PIPELINE_ID}" \
+            --organization "${ADO_ORGANIZATION}" \
+            --project "${ADO_PROJECT}" \
+            --parameters "liteboxCommit=${LITEBOX_COMMIT}" "liteboxRepoUrl=${LITEBOX_REPO_URL}" \
+            --output json)"
+
+          BUILD_ID="$(printf '%s\n' "${BUILD_RESULT}" | jq -r '.id // empty')"
+          if [ -z "${BUILD_ID}" ]; then
+            echo "Failed to get the build ID from the pipeline trigger."
+            exit 1
+          fi
+          echo "ADO_BUILD_ID=${BUILD_ID}" >> "${GITHUB_ENV}"
+
+          BUILD_URL="https://msazure.visualstudio.com/${ADO_PROJECT}/_build/results?buildId=${BUILD_ID}"
+          echo "Triggered ADO build ${BUILD_ID}: ${BUILD_URL}"
+
+          while true; do
+            BUILD_JSON="$(az pipelines build show \
+              --id "${BUILD_ID}" \
+              --organization "${ADO_ORGANIZATION}" \
+              --project "${ADO_PROJECT}" \
+              --output json)"
+
+            BUILD_STATUS="$(printf '%s\n' "${BUILD_JSON}" | jq -r '.status')"
+            BUILD_RESULT_STATUS="$(printf '%s\n' "${BUILD_JSON}" | jq -r '.result // "none"')"
+            echo "ADO build status: ${BUILD_STATUS}; result: ${BUILD_RESULT_STATUS}"
+
+            if [ "${BUILD_STATUS}" = "completed" ]; then
+              trap - INT TERM
+              if [ "${BUILD_RESULT_STATUS}" = "succeeded" ]; then
+                exit 0
+              fi
+
+              echo "ADO build ${BUILD_ID} did not succeed: ${BUILD_URL}"
+              exit 1
+            fi
+
+            sleep 60
+          done
+
+      - name: Cancel superseded ADO pipeline
+        if: cancelled() && env.ADO_BUILD_ID != ''
+        shell: bash
+        env:
+          ADO_ORGANIZATION: https://dev.azure.com/msazure
+          ADO_PROJECT: LSG-linux
+        run: |
+          echo "Cancelling superseded ADO build ${ADO_BUILD_ID}..."
+          az config set extension.use_dynamic_install=yes_without_prompt
+          az pipelines build cancel \
+            --build-id "${ADO_BUILD_ID}" \
+            --organization "${ADO_ORGANIZATION}" \
+            --project "${ADO_PROJECT}" \
+            --output none
