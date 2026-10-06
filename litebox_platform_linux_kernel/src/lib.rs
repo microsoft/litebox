@@ -362,7 +362,8 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { self.page_table.unmap_pages(range, true).unwrap() };
+                unsafe { self.page_table.unmap_pages(range, true) }
+                    .map_err(|_| litebox::platform::page_mgmt::AllocationError::Unaligned)?;
             }
         }
         let flags = u32::from(initial_permissions.bits())
@@ -372,9 +373,8 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox_common_linux::vmem::VmFlags::from_bits(flags).unwrap();
-        Ok(self
-            .page_table
-            .map_pages(range, flags, populate_pages_immediately))
+        self.page_table
+            .map_pages(range, flags, populate_pages_immediately)
     }
 
     unsafe fn release_pages(
