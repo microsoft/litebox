@@ -89,7 +89,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     where
         Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
     {
-        debug_assert!(!suggested_range.is_empty());
         debug_assert!(
             suggested_range.start
                 >= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
@@ -104,6 +103,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             fixed_address_behavior,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp)
         ));
+        if !suggested_range.start.is_multiple_of(
+            <Self as litebox::platform::PageManagementProvider<ALIGN>>::RESERVATION_ALIGNMENT,
+        ) || !suggested_range.end.is_multiple_of(ALIGN)
+            || suggested_range.is_empty()
+        {
+            return Err(litebox::platform::page_mgmt::AllocationError::Unaligned);
+        }
         let flags = MapFlags::MAP_PRIVATE
             | MapFlags::MAP_ANONYMOUS
             | match fixed_address_behavior {

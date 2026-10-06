@@ -452,18 +452,22 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
     where
         Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
     {
-        debug_assert!(!suggested_range.is_empty());
+        debug_assert!(
+            suggested_range.end <= <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+        );
+        if !suggested_range
+            .start
+            .is_multiple_of(<Self as PageManagementProvider<ALIGN>>::RESERVATION_ALIGNMENT)
+            || !suggested_range.end.is_multiple_of(ALIGN)
+            || suggested_range.is_empty()
+        {
+            return Err(litebox::platform::page_mgmt::AllocationError::Unaligned);
+        }
         if suggested_range.start == 0
             && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_))
         {
             return Err(litebox::platform::page_mgmt::AllocationError::UnsupportedByPlatform);
         }
-        debug_assert!(
-            suggested_range.start >= <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
-        );
-        debug_assert!(
-            suggested_range.end <= <Self as PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
-        );
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(litebox::platform::page_mgmt::AllocationError::Unaligned)?;
         match fixed_address_behavior {

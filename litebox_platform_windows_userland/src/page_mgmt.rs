@@ -225,19 +225,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
     where
         Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
     {
-        debug_assert!(!suggested_range.is_empty());
-        debug_assert!(
-            suggested_range
-                .start
-                .is_multiple_of(Self::RESERVATION_ALIGNMENT)
-        );
-        debug_assert!(suggested_range.end.is_multiple_of(ALIGN));
         debug_assert!(
             suggested_range.start >= Self::TASK_ADDR_MIN
                 || (suggested_range.start == 0
                     && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
         );
         debug_assert!(suggested_range.end <= Self::TASK_ADDR_MAX);
+        if !suggested_range
+            .start
+            .is_multiple_of(Self::RESERVATION_ALIGNMENT)
+            || !suggested_range.end.is_multiple_of(ALIGN)
+            || suggested_range.is_empty()
+        {
+            return Err(AllocationError::Unaligned);
+        }
         if fixed_address_behavior == FixedAddressBehavior::Replace {
             return Err(AllocationError::UnsupportedByPlatform);
         }
@@ -266,7 +267,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         Reservations: Iterator<Item = WindowsUserlandReservation<ALIGN>>,
     {
         debug_assert!(ALIGN.is_multiple_of(self.sys_info.read().unwrap().dwPageSize as usize));
-        debug_assert_alignment!(suggested_range, ALIGN);
         debug_assert!(
             (suggested_range.start == 0
                 && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
@@ -277,6 +277,14 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
             suggested_range.end
                 <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
         );
+        if !(suggested_range
+            .start
+            .is_multiple_of(Self::RESERVATION_ALIGNMENT))
+            || !suggested_range.end.is_multiple_of(ALIGN)
+            || suggested_range.is_empty()
+        {
+            return Err(AllocationError::Unaligned);
+        }
         if fixed_address_behavior == FixedAddressBehavior::Replace {
             return Err(AllocationError::UnsupportedByPlatform);
         }

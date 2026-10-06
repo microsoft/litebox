@@ -411,7 +411,7 @@ where
         permissions: MemoryRegionPermissions,
     ) -> Result<(), PermissionUpdateError> {
         // SAFETY: The caller guarantees complete mapping coverage and access exclusion. Tracked
-        // stores yield covering handles; handle-free stores yield an empty iterator.
+        // stores yield covering handles; reservation-free stores yield an empty iterator.
         unsafe {
             platform.protect_pages(
                 || self.overlapping(range.clone()),
@@ -443,7 +443,7 @@ where
         let length = range.len();
         let permissions = (vma.flags & VmFlags::VM_ACCESS_FLAGS).into();
         let can_grow_down = vma.flags.contains(VmFlags::VM_GROWSDOWN);
-        // SAFETY: The caller authorizes replacement and this handle-free store owns mapping ranges.
+        // SAFETY: The caller authorizes replacement and this reservation-free store owns mapping ranges.
         let reservation = unsafe {
             platform.reserve_and_commit_pages(
                 core::iter::empty,
@@ -1842,6 +1842,12 @@ mod tests {
                 Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
         {
             debug_assert!(!suggested_range.is_empty());
+            debug_assert!(
+                suggested_range
+                    .start
+                    .is_multiple_of(Self::RESERVATION_ALIGNMENT)
+            );
+            debug_assert!(suggested_range.end.is_multiple_of(PAGE_SIZE));
             debug_assert!(
                 suggested_range.start >= Self::TASK_ADDR_MIN
                     || (suggested_range.start == 0

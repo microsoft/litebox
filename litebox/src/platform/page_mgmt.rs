@@ -179,8 +179,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// - `replaced_reservations`: On replacement, lazily transfers handles whose extents together
     ///   cover exactly the replaced range, which may be smaller than `suggested_range`;
-    ///   handle-free mappings may yield no handles.
-    /// - `suggested_range`: A suggested address range for the allocation.
+    ///   reservation-free mappings may yield no handles.
+    /// - `suggested_range`: A suggested address range for the allocation. A relocatable hint may
+    ///   instead start at zero to specify only the requested length.
     /// - `can_grow_down`: If `true`, the region is allowed to grow downward (towards zero) upon
     ///   a page fault.
     /// - `fixed_address_behavior`: Specifies the required semantics of `suggested_range`.
@@ -193,10 +194,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Safety
     ///
-    /// `suggested_range` must be nonempty and lie within
-    /// [`Self::TASK_ADDR_MIN`]..[`Self::TASK_ADDR_MAX`] for fixed placement. A relocatable hint may
-    /// instead start at zero to specify only the requested length. Its start must be aligned to
-    /// [`Self::RESERVATION_ALIGNMENT`], and its end must be aligned to `ALIGN`.
     /// When `fixed_address_behavior` is [`FixedAddressBehavior::Replace`], the caller must ensure
     /// any replaced mappings are not in active use.
     unsafe fn reserve_pages<Reservations>(
@@ -231,7 +228,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// # Parameters
     ///
     /// - `covering_reservations`: Lazily supplies borrowed reservations covering `range`; their
-    ///   extents may extend beyond it.
+    ///   extents may extend beyond it. Reservation-free mappings may yield no reservations.
     /// - `range`: The address range to commit.
     /// - `permissions`: The permissions to apply to the committed pages.
     /// - `populate_pages_immediately`: If `true`, populate pages immediately; otherwise,
@@ -239,8 +236,9 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Safety
     ///
-    /// The supplied reservations must collectively cover `range`. The caller must exclude
-    /// accesses to `range` that could conflict with changes to its backing or permissions.
+    /// For handle-retaining providers, the supplied reservations must collectively cover `range`.
+    /// The caller must exclude accesses to `range` that could conflict with changes to its backing
+    /// or permissions.
     unsafe fn commit_pages<'reservation, Reservations>(
         &self,
         covering_reservations: impl FnOnce() -> Reservations,
@@ -256,10 +254,11 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Parameters
     ///
-    /// - `suggested_range`: A suggested address range for the allocation.
+    /// - `suggested_range`: A suggested address range for the allocation. A relocatable hint may
+    ///   start at zero to indicate only the requested length.
     /// - `replaced_reservations`: On replacement, lazily transfers handles whose extents together
     ///   cover exactly the replaced range, which may be smaller than `suggested_range`;
-    ///   handle-free mappings may yield no handles. Ownership outside the replaced range remains
+    ///   reservation-free mappings may yield no handles. Ownership outside the replaced range remains
     ///   with the caller.
     /// - `initial_permissions`: The permissions to apply to the allocated memory region.
     /// - `can_grow_down`: If `true`, the region is allowed to grow downward (towards zero) upon
@@ -280,13 +279,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// # Safety
     ///
-    /// `suggested_range` must be nonempty and lie within
-    /// [`Self::TASK_ADDR_MIN`]..[`Self::TASK_ADDR_MAX`] for fixed placement. A relocatable hint may
-    /// instead start at zero to specify only the requested length. Its start must be aligned to
-    /// [`Self::RESERVATION_ALIGNMENT`], and its end must be aligned to `ALIGN`. The caller must
-    /// ensure any replaced mappings are not in active use when `fixed_address_behavior` is
-    /// [`FixedAddressBehavior::Replace`], and retain the returned reservation as the unique
-    /// ownership handle for the allocated extent.
+    /// The caller must ensure any replaced mappings are not in active use when `fixed_address_behavior`
+    /// is [`FixedAddressBehavior::Replace`].
     unsafe fn reserve_and_commit_pages<Reservations>(
         &self,
         replaced_reservations: impl FnOnce() -> Reservations,
@@ -357,6 +351,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// # Parameters
     ///
     /// - `source_reservations`: Lazily transfers ownership of reservations covering `old_range`.
+    ///   Reservation-free mappings may yield no handles.
     /// - `old_range`: The existing address range to remap.
     /// - `new_range`: The requested address range for the remapped pages.
     /// - `permissions`: The permissions to apply to the remapped pages.
@@ -368,9 +363,8 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// # Safety
     ///
     /// `source_reservations` must yield every retained reservation covering `old_range`,
-    /// transferring their ownership to the provider. Handle-free mappings transfer ownership
-    /// through `old_range` and may yield no handles. The provider must not invoke the supplier on
-    /// recoverable failure. The caller must ensure that the source pages are not in active use.
+    /// transferring their ownership to the provider. Reservation-free mappings may yield no handles.
+    /// The caller must ensure that the source pages are not in active use.
     ///
     /// The `new_range` must be larger than `old_range`, and must not overlap with `old_range`.
     ///
