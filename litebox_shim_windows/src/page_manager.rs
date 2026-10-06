@@ -21,8 +21,6 @@ use rangemap::RangeMap;
 
 use crate::PAGE_SIZE;
 
-const ALLOCATION_GRANULARITY: usize = 0x1_0000;
-
 type Reservations<Platform> = TrackedReservations<<Platform as crate::ShimPlatform>::Reservation>;
 
 struct WindowsVmem<Platform>
@@ -65,84 +63,124 @@ where
         }
     }
 
-    unsafe fn create_pages<F>(
+    /// Reserves aligned private address space within exclusive bounds, optionally committing it.
+    ///
+    /// # Safety
+    /// The caller must not access uncommitted pages and must exclude accesses conflicting with
+    /// the requested permissions.
+    pub(crate) unsafe fn create_private_pages(
         &self,
         suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
+        address_bounds: Range<usize>,
         length: NonZeroPageSize<PAGE_SIZE>,
+        alignment: usize,
         flags: CreatePagesFlags,
         permissions: Option<MemoryRegionPermissions>,
-        op: F,
-    ) -> Result<Platform::RawMutPointer<u8>, MappingError>
-    where
-        F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
-    {
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        if !alignment.is_power_of_two() || !alignment.is_multiple_of(PAGE_SIZE) {
+            return Err(MappingError::UnAligned);
+        }
         if flags.intersects(CreatePagesFlags::MAP_FILE | CreatePagesFlags::SHARED) {
             return Err(MappingError::InvalidPermissions);
         }
-
+        let alignment = alignment.max(Platform::RESERVATION_ALIGNMENT);
         let direction = if flags.contains(CreatePagesFlags::TOP_DOWN) {
             AllocationDirection::TopDown
         } else {
             AllocationDirection::BottomUp
         };
-        let mut start = suggested_address.map_or(0, NonZeroAddress::as_usize);
-        if start != 0 && !start.is_multiple_of(ALLOCATION_GRANULARITY) {
+        let fixed = flags.contains(CreatePagesFlags::FIXED_ADDR);
+        let mut preferred = suggested_address.map_or(0, NonZeroAddress::as_usize);
+        if !preferred.is_multiple_of(alignment) {
             return Err(MappingError::UnAligned);
         }
-        let padding = if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-            0
-        } else {
-            ALLOCATION_GRANULARITY.saturating_sub(PAGE_SIZE)
-        };
-        let requested_len = length
-            .as_usize()
-            .checked_add(padding)
-            .ok_or(MappingError::OutOfMemory)?;
-        let behavior = if flags.contains(CreatePagesFlags::FIXED_ADDR) {
-            FixedAddressBehavior::NoReplace
-        } else if !Platform::HINT_PLACEMENT_BEHAVIOR.supports(direction)
-            && direction == AllocationDirection::BottomUp
+        let mut address_bounds = address_bounds.start.max(Platform::TASK_ADDR_MIN)
+            ..address_bounds.end.min(Platform::TASK_ADDR_MAX);
+        let mut vmem = self.vmem.write();
+        loop {
+            let start = if fixed {
+                if preferred < address_bounds.start {
+                    return Err(AllocationError::BelowMinAddress.into());
+                }
+                if preferred
+                    .checked_add(length.as_usize())
+                    .is_none_or(|end| end > address_bounds.end)
+                {
+                    return Err(AllocationError::AboveMaxAddress.into());
+                }
+                preferred
+            } else {
+                find_reservation_gap::<Platform>(
+                    &vmem.reservations,
+                    preferred,
+                    length.as_usize(),
+                    alignment,
+                    &address_bounds,
+                    direction,
+                )
+                .ok_or(MappingError::OutOfMemory)?
+            };
+            let requested = start..start + length.as_usize();
+            // SAFETY: Selection and publication share the ownership lock; native allocation never
+            // replaces mappings, and the caller observes commitment and permission requirements.
+            match unsafe {
+                self.allocate_private_pages(&mut vmem, requested.clone(), flags, permissions)
+            } {
+                Err(MappingError::MapError(
+                    AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
+                )) if !fixed => {
+                    if preferred == start && preferred != 0 {
+                        preferred = 0;
+                    } else if direction == AllocationDirection::TopDown {
+                        preferred = 0;
+                        address_bounds.end = requested
+                            .end
+                            .checked_sub(alignment)
+                            .ok_or(MappingError::OutOfMemory)?;
+                    } else {
+                        preferred = 0;
+                        address_bounds.start = start
+                            .checked_add(alignment)
+                            .ok_or(MappingError::OutOfMemory)?;
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
+    unsafe fn allocate_private_pages(
+        &self,
+        vmem: &mut WindowsVmem<Platform>,
+        requested: Range<usize>,
+        flags: CreatePagesFlags,
+        permissions: Option<MemoryRegionPermissions>,
+    ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
+        if vmem
+            .reservations
+            .overlapping(requested.clone())
+            .next()
+            .is_some()
         {
-            start = find_bottom_up_gap::<Platform>(
-                &self.vmem.read().reservations,
-                start,
-                requested_len,
-            )
-            .ok_or(MappingError::OutOfMemory)?;
-            FixedAddressBehavior::NoReplace
-        } else {
-            FixedAddressBehavior::Hint(direction)
+            return Err(AllocationError::AddressInUse.into());
+        }
+        let platform_allocation_error = |error| match error {
+            AllocationError::AddressInUse => AllocationError::AddressInUseByPlatform,
+            other => other,
         };
-        let end = start
-            .checked_add(requested_len)
-            .ok_or(MappingError::OutOfMemory)?;
-        let requested = start..end;
-        let initial_permissions =
-            permissions.map(|_| MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE);
 
         let reservation = {
-            let vmem = self.vmem.write();
-            if start != 0
-                && vmem
-                    .reservations
-                    .overlapping(requested.clone())
-                    .next()
-                    .is_some()
-            {
-                return Err(AllocationError::AddressInUse.into());
-            }
-
-            if let Some(initial_permissions) = initial_permissions {
+            if let Some(permissions) = permissions {
                 // SAFETY: Existing reservations were checked above and Windows allocations never
                 // replace ownership. The returned handle remains private until it is tracked.
                 match unsafe {
                     self.platform.reserve_and_commit_pages(
                         core::iter::empty,
                         requested.clone(),
-                        initial_permissions,
+                        permissions,
                         false,
                         flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
-                        behavior,
+                        FixedAddressBehavior::NoReplace,
                     )
                 } {
                     Ok(reservation) => reservation,
@@ -153,9 +191,10 @@ where
                                 core::iter::empty,
                                 requested.clone(),
                                 false,
-                                behavior,
+                                FixedAddressBehavior::NoReplace,
                             )
-                        }?;
+                        }
+                        .map_err(platform_allocation_error)?;
                         let actual = reservation.range();
                         // SAFETY: The fresh reservation exclusively covers `actual` and is not
                         // visible to another manager operation yet.
@@ -163,7 +202,7 @@ where
                             self.platform.commit_pages(
                                 || core::iter::once(&reservation),
                                 actual,
-                                initial_permissions,
+                                permissions,
                                 flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
                             )
                         } {
@@ -176,84 +215,32 @@ where
                         }
                         reservation
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(platform_allocation_error(error).into()),
                 }
             } else {
                 // SAFETY: Existing reservations were checked above and replacement is disabled.
                 unsafe {
-                    self.platform
-                        .reserve_pages(core::iter::empty, requested, false, behavior)
-                }?
+                    self.platform.reserve_pages(
+                        core::iter::empty,
+                        requested.clone(),
+                        false,
+                        FixedAddressBehavior::NoReplace,
+                    )
+                }
+                .map_err(platform_allocation_error)?
             }
         };
 
-        let extent = reservation.range();
-        let aligned_start = extent
-            .start
-            .checked_next_multiple_of(ALLOCATION_GRANULARITY)
-            .ok_or(MappingError::OutOfMemory)?;
-        let aligned_end = aligned_start
-            .checked_add(length.as_usize())
-            .ok_or(MappingError::OutOfMemory)?;
-        if aligned_end > extent.end {
-            // SAFETY: The fresh reservation has not been published.
-            let _ = unsafe {
-                self.platform
-                    .release_pages(into_release_target::<Platform>(reservation))
-            };
-            return Err(MappingError::OutOfMemory);
-        }
-        let (prefix, reservation, suffix) = reservation.split(aligned_start..aligned_end);
-        for remainder in prefix.into_iter().chain(suffix) {
-            // SAFETY: Alignment trimming is unpublished and has no users.
-            unsafe {
-                self.platform
-                    .release_pages(into_release_target::<Platform>(remainder))
-            }
-            .expect("failed to release unpublished alignment padding");
-        }
         let range = reservation.range();
+        assert_eq!(range, requested);
         let ptr = Platform::RawMutPointer::<u8>::from_usize(range.start);
-        {
-            let mut vmem = self.vmem.write();
-            if vmem
-                .reservations
-                .overlapping(range.clone())
-                .next()
-                .is_some()
-            {
-                // SAFETY: The fresh reservation has not been published to the caller.
-                let _ = unsafe {
-                    self.platform
-                        .release_pages(into_release_target::<Platform>(reservation))
-                };
-                return Err(AllocationError::AddressInUse.into());
-            }
-            if let Some(initial_permissions) = initial_permissions {
-                vmem.mappings.insert(
-                    range.clone(),
-                    VmFlags::VM_MAY_ACCESS_FLAGS | VmFlags::from(initial_permissions),
-                );
-            }
-            assert!(vmem.reservations.insert(range.start, reservation).is_none());
+        if let Some(permissions) = permissions {
+            vmem.mappings.insert(
+                range.clone(),
+                VmFlags::VM_MAY_ACCESS_FLAGS | VmFlags::from(permissions),
+            );
         }
-
-        if let Err(error) = op(ptr) {
-            // SAFETY: The callback failed before publishing the new allocation.
-            let _ = unsafe { self.remove_pages(ptr, range.len()) };
-            return Err(error);
-        }
-
-        if let Some(permissions) = permissions
-            && permissions != (MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE)
-            && let Err(error) =
-                unsafe { self.protect_committed_pages(ptr, range.len(), permissions) }
-        {
-            // SAFETY: Final protection failed before publishing the allocation.
-            let _ = unsafe { self.remove_pages(ptr, range.len()) };
-            return Err(MappingError::ProtectError(error));
-        }
-
+        assert!(vmem.reservations.insert(range.start, reservation).is_none());
         Ok(ptr)
     }
 
@@ -264,11 +251,17 @@ where
         alignment: usize,
         flags: CreatePagesFlags,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
-        if alignment != ALLOCATION_GRANULARITY {
-            return Err(MappingError::UnAligned);
-        }
         // SAFETY: Forwarded caller contract; the fresh reservation remains inaccessible.
-        unsafe { self.create_pages(suggested_address, length, flags, None, |_| Ok(0)) }
+        unsafe {
+            self.create_private_pages(
+                suggested_address,
+                Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX,
+                length,
+                alignment,
+                flags,
+                None,
+            )
+        }
     }
 
     pub(crate) unsafe fn create_reserved_and_committed_pages(
@@ -279,14 +272,16 @@ where
         flags: CreatePagesFlags,
         permissions: MemoryRegionPermissions,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
-        if alignment != ALLOCATION_GRANULARITY {
-            return Err(MappingError::UnAligned);
-        }
         // SAFETY: Forwarded caller contract; initialization is completed before publication.
         unsafe {
-            self.create_pages(suggested_address, length, flags, Some(permissions), |_| {
-                Ok(0)
-            })
+            self.create_private_pages(
+                suggested_address,
+                Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX,
+                length,
+                alignment,
+                flags,
+                Some(permissions),
+            )
         }
     }
 
@@ -402,36 +397,6 @@ where
         Ok(())
     }
 
-    unsafe fn protect_committed_pages(
-        &self,
-        ptr: Platform::RawMutPointer<u8>,
-        len: usize,
-        permissions: MemoryRegionPermissions,
-    ) -> Result<(), VmemProtectError> {
-        let start = ptr.as_usize();
-        let range = page_range(start, len)
-            .ok_or_else(|| VmemProtectError::UnAligned(start..start.saturating_add(len)))?;
-        let mut vmem = self.vmem.write();
-        let Some(reservation) = containing_reservation::<Platform>(&vmem.reservations, &range)
-        else {
-            return Err(VmemProtectError::InvalidRange(range));
-        };
-        // SAFETY: The range is committed and covered by the retained reservation; the caller
-        // excludes accesses that conflict with the permission change.
-        unsafe {
-            self.platform.protect_pages(
-                || core::iter::once(reservation),
-                range.clone(),
-                permissions,
-            )
-        }?;
-        vmem.mappings.insert(
-            range,
-            VmFlags::VM_MAY_ACCESS_FLAGS | VmFlags::from(permissions),
-        );
-        Ok(())
-    }
-
     pub(crate) unsafe fn make_pages_inaccessible(
         &self,
         ptr: Platform::RawMutPointer<u8>,
@@ -530,17 +495,20 @@ where
     }
 }
 
-fn find_bottom_up_gap<Platform>(
+fn find_reservation_gap<Platform>(
     reservations: &Reservations<Platform>,
     preferred: usize,
     len: usize,
+    alignment: usize,
+    address_bounds: &Range<usize>,
+    direction: AllocationDirection,
 ) -> Option<usize>
 where
     Platform: crate::ShimPlatform,
 {
     let is_available = |start: usize| {
         let end = start.checked_add(len)?;
-        (start >= Platform::TASK_ADDR_MIN && end <= Platform::TASK_ADDR_MAX)
+        (start >= address_bounds.start && end <= address_bounds.end)
             .then(|| {
                 reservations
                     .overlapping(start..end)
@@ -556,16 +524,42 @@ where
         return Some(start);
     }
 
-    let mut candidate = Platform::TASK_ADDR_MIN.checked_next_multiple_of(ALLOCATION_GRANULARITY)?;
+    let low = address_bounds.start.checked_next_multiple_of(alignment)?;
+    if address_bounds.end.checked_sub(low)? < len {
+        return None;
+    }
+    if direction == AllocationDirection::TopDown {
+        let mut boundary = address_bounds.end;
+        for (_, reservation) in reservations.iter().rev() {
+            let range = reservation.range();
+            if range.start >= boundary {
+                continue;
+            }
+            if range.end <= low {
+                break;
+            }
+            let candidate = boundary.checked_sub(len)? & !(alignment - 1);
+            if candidate >= range.end.max(low) {
+                return Some(candidate);
+            }
+            boundary = boundary.min(range.start);
+        }
+        let candidate = boundary.checked_sub(len)? & !(alignment - 1);
+        return (candidate >= low).then_some(candidate);
+    }
+    let mut candidate = low;
     for (_, reservation) in reservations.iter() {
         let range = reservation.range();
         if range.end <= candidate {
             continue;
         }
-        if candidate.checked_add(len)? <= range.start {
+        if candidate.checked_add(len)? <= range.start.min(address_bounds.end) {
             return Some(candidate);
         }
-        candidate = range.end.checked_next_multiple_of(ALLOCATION_GRANULARITY)?;
+        candidate = range.end.checked_next_multiple_of(alignment)?;
+        if candidate.checked_add(len)? > address_bounds.end {
+            return None;
+        }
     }
     is_available(candidate)
 }

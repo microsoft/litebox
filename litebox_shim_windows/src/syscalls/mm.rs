@@ -20,7 +20,6 @@ use crate::{
 };
 
 pub(super) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
-const ALLOCATION_SEARCH_ATTEMPTS: usize = 8;
 const MEMORY_WORKING_SET_LIST_MIN_SIZE: usize = 16;
 const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
 const READ_VIRTUAL_MEMORY_CHUNK_BYTES: usize = 4 * 1024;
@@ -397,13 +396,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         let top_down = allocation_type.contains(AllocationType::MEM_TOP_DOWN);
         let allocation = if base == 0 {
-            create_allocation_granularity_aligned_pages::<Platform>(
-                &self.global.page_manager,
-                length,
-                initial_state,
-                zero_bits,
-                top_down,
-            )
+            let upper_bound = zero_bits_address_limit(zero_bits)
+                .unwrap_or(Platform::TASK_ADDR_MAX)
+                .min(Platform::TASK_ADDR_MAX);
+            // SAFETY: The manager chooses fresh aligned address space within the guest's bounds,
+            // and the allocation remains unpublished until output writeback succeeds.
+            unsafe {
+                self.global.page_manager.create_private_pages(
+                    None,
+                    Platform::TASK_ADDR_MIN..upper_bound,
+                    length,
+                    ALLOCATION_GRANULARITY,
+                    if top_down {
+                        CreatePagesFlags::TOP_DOWN
+                    } else {
+                        CreatePagesFlags::empty()
+                    },
+                    allocation_type
+                        .contains(AllocationType::MEM_COMMIT)
+                        .then_some(permissions),
+                )
+            }
+            .map_err(mapping_error_to_nt_status)
         } else {
             create_pages_with_state::<Platform>(
                 &self.global.page_manager,
@@ -1455,73 +1469,6 @@ pub(crate) fn create_pages<Platform: ShimPlatform>(
     Ok(ptr)
 }
 
-enum HoleSearchResult<Platform: ShimPlatform> {
-    Allocated(MutPtr<Platform, u8>),
-    RetryWithFreshMappings,
-    Exhausted,
-}
-
-fn create_aligned_pages_in_hole<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    hole_start: usize,
-    hole_end: usize,
-    length: NonZeroPageSize<PAGE_SIZE>,
-    state: PageState,
-    top_down: bool,
-) -> Result<HoleSearchResult<Platform>, MappingError> {
-    let Some(mut candidate) =
-        allocation_granularity_aligned_candidate(hole_start, hole_end, length.as_usize(), top_down)
-    else {
-        return Ok(HoleSearchResult::Exhausted);
-    };
-
-    loop {
-        match create_pages_with_state(
-            page_manager,
-            NonZeroAddress::new(candidate),
-            length,
-            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-            state,
-        ) {
-            Ok(ptr) => return Ok(HoleSearchResult::Allocated(ptr)),
-            Err(MappingError::MapError(AllocationError::AddressInUse)) => {
-                return Ok(HoleSearchResult::RetryWithFreshMappings);
-            }
-            Err(MappingError::MapError(AllocationError::AddressInUseByPlatform)) => {}
-            Err(error) => return Err(error),
-        }
-
-        let Some(next_candidate) = next_allocation_granularity_candidate(
-            candidate,
-            length.as_usize(),
-            hole_start,
-            hole_end,
-            top_down,
-        ) else {
-            return Ok(HoleSearchResult::Exhausted);
-        };
-        candidate = next_candidate;
-    }
-}
-
-fn next_allocation_granularity_candidate(
-    candidate: usize,
-    length: usize,
-    hole_start: usize,
-    hole_end: usize,
-    top_down: bool,
-) -> Option<usize> {
-    if top_down {
-        candidate
-            .checked_sub(ALLOCATION_GRANULARITY)
-            .filter(|next| *next >= hole_start)
-    } else {
-        let next_candidate = candidate.checked_add(ALLOCATION_GRANULARITY)?;
-        let next_end = next_candidate.checked_add(length)?;
-        (next_end <= hole_end).then_some(next_candidate)
-    }
-}
-
 fn zero_bits_address_limit(zero_bits: usize) -> Option<usize> {
     if zero_bits > 32 {
         // NtAllocateVirtualMemory treats ZeroBits as a bitmask when > 32.
@@ -1556,139 +1503,6 @@ fn mapping_error_to_nt_status(error: MappingError) -> NtStatus {
     }
 }
 
-fn create_allocation_granularity_aligned_pages<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    length: NonZeroPageSize<PAGE_SIZE>,
-    state: PageState,
-    zero_bits: usize,
-    top_down: bool,
-) -> Result<MutPtr<Platform, u8>, NtStatus> {
-    let mut max_start = Platform::TASK_ADDR_MAX
-        .checked_sub(length.as_usize())
-        .ok_or(NtStatus::NO_MEMORY)?;
-    if let Some(limit) = zero_bits_address_limit(zero_bits) {
-        max_start = max_start.min(
-            limit
-                .checked_sub(length.as_usize())
-                .ok_or(NtStatus::NO_MEMORY)?,
-        );
-    }
-    let min_start = Platform::TASK_ADDR_MIN.next_multiple_of(ALLOCATION_GRANULARITY);
-    let search_end = max_start
-        .checked_add(length.as_usize())
-        .ok_or(NtStatus::NO_MEMORY)?;
-
-    // TODO: consider adding support for different allocation strategies and granularity to page manager
-    'search: for _ in 0..ALLOCATION_SEARCH_ATTEMPTS {
-        let mut mappings: alloc::vec::Vec<_> = page_manager
-            .reservations()
-            .into_iter()
-            .map(|range| (range, VmFlags::empty()))
-            .collect();
-        mappings.sort_by_key(|(range, _)| range.start);
-
-        if top_down {
-            let mut hole_end = search_end;
-            for (range, _) in mappings.iter().rev() {
-                if range.end <= min_start {
-                    break;
-                }
-                if range.start >= search_end {
-                    continue;
-                }
-                if range.end < hole_end {
-                    match create_aligned_pages_in_hole(
-                        page_manager,
-                        range.end.max(min_start),
-                        hole_end,
-                        length,
-                        state,
-                        true,
-                    )
-                    .map_err(mapping_error_to_nt_status)?
-                    {
-                        HoleSearchResult::Allocated(ptr) => return Ok(ptr),
-                        HoleSearchResult::RetryWithFreshMappings => continue 'search,
-                        HoleSearchResult::Exhausted => {}
-                    }
-                }
-                if range.start < hole_end {
-                    hole_end = range.start;
-                }
-                if hole_end <= min_start {
-                    break;
-                }
-            }
-
-            match create_aligned_pages_in_hole(
-                page_manager,
-                min_start,
-                hole_end,
-                length,
-                state,
-                true,
-            )
-            .map_err(mapping_error_to_nt_status)?
-            {
-                HoleSearchResult::Allocated(ptr) => return Ok(ptr),
-                HoleSearchResult::RetryWithFreshMappings => continue 'search,
-                HoleSearchResult::Exhausted => {}
-            }
-        } else {
-            let mut hole_start = min_start;
-            for (range, _) in &mappings {
-                if range.start >= search_end {
-                    break;
-                }
-                if range.end <= hole_start {
-                    continue;
-                }
-                if range.start > hole_start {
-                    match create_aligned_pages_in_hole(
-                        page_manager,
-                        hole_start,
-                        range.start.min(search_end),
-                        length,
-                        state,
-                        false,
-                    )
-                    .map_err(mapping_error_to_nt_status)?
-                    {
-                        HoleSearchResult::Allocated(ptr) => return Ok(ptr),
-                        HoleSearchResult::RetryWithFreshMappings => continue 'search,
-                        HoleSearchResult::Exhausted => {}
-                    }
-                }
-                if range.end > hole_start {
-                    hole_start = range.end;
-                }
-                if hole_start >= search_end {
-                    break;
-                }
-            }
-
-            match create_aligned_pages_in_hole(
-                page_manager,
-                hole_start,
-                search_end,
-                length,
-                state,
-                false,
-            )
-            .map_err(mapping_error_to_nt_status)?
-            {
-                HoleSearchResult::Allocated(ptr) => return Ok(ptr),
-                HoleSearchResult::RetryWithFreshMappings => continue 'search,
-                HoleSearchResult::Exhausted => {}
-            }
-        }
-
-        return Err(NtStatus::NO_MEMORY);
-    }
-
-    Err(NtStatus::NO_MEMORY)
-}
-
 fn create_pages_with_state<Platform: ShimPlatform>(
     page_manager: &WindowsPageManager<Platform>,
     suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
@@ -1713,24 +1527,6 @@ fn create_pages_with_state<Platform: ShimPlatform>(
             permissions,
             |_| Ok(0),
         ),
-    }
-}
-
-fn allocation_granularity_aligned_candidate(
-    hole_start: usize,
-    hole_end: usize,
-    length: usize,
-    top_down: bool,
-) -> Option<usize> {
-    if top_down {
-        let max_candidate = hole_end.checked_sub(length)? & !(ALLOCATION_GRANULARITY - 1);
-        (max_candidate >= hole_start).then_some(max_candidate)
-    } else {
-        let min_candidate = hole_start.next_multiple_of(ALLOCATION_GRANULARITY);
-        min_candidate
-            .checked_add(length)
-            .is_some_and(|end| end <= hole_end)
-            .then_some(min_candidate)
     }
 }
 
@@ -1964,6 +1760,136 @@ mod tests {
         );
         assert_eq!(return_length, size_of::<MemoryBasicInformation>());
         info
+    }
+
+    #[test]
+    fn page_manager_distinguishes_platform_collisions_from_guest_overlaps() {
+        run_with_test_platform_pointers(|| {
+            let platform = crate::tests::test_platform();
+            let host_manager = WindowsPageManager::<TestPlatform>::new(platform);
+            let guest_manager = WindowsPageManager::<TestPlatform>::new(platform);
+            let length = NonZeroPageSize::new(ALLOCATION_GRANULARITY).unwrap();
+            // SAFETY: Both managers request fresh reservations without replacing mappings.
+            let (host, guest) = unsafe {
+                (
+                    host_manager.create_reserved_pages(
+                        None,
+                        length,
+                        ALLOCATION_GRANULARITY,
+                        CreatePagesFlags::TOP_DOWN,
+                    ),
+                    guest_manager.create_reserved_pages(
+                        None,
+                        length,
+                        ALLOCATION_GRANULARITY,
+                        CreatePagesFlags::TOP_DOWN,
+                    ),
+                )
+            };
+            let host = host.unwrap();
+            let guest = guest.unwrap();
+            for state in [
+                PageState::Reserved,
+                PageState::Committed(
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                ),
+            ] {
+                assert!(matches!(
+                    create_pages_with_state(
+                        &guest_manager,
+                        NonZeroAddress::new(host.as_usize()),
+                        length,
+                        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                        state,
+                    ),
+                    Err(MappingError::MapError(
+                        AllocationError::AddressInUseByPlatform
+                    ))
+                ));
+                assert!(matches!(
+                    create_pages_with_state(
+                        &guest_manager,
+                        NonZeroAddress::new(guest.as_usize()),
+                        length,
+                        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                        state,
+                    ),
+                    Err(MappingError::MapError(AllocationError::AddressInUse))
+                ));
+            }
+            // SAFETY: These unpublished reservations have no users and remain owned by their managers.
+            unsafe {
+                host_manager.remove_pages(host, length.as_usize()).unwrap();
+                guest_manager
+                    .remove_pages(guest, length.as_usize())
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn page_manager_allocates_with_bounds_alignment_and_directional_host_retries() {
+        run_with_test_platform_pointers(|| {
+            let platform = crate::tests::test_platform();
+            let host_manager = WindowsPageManager::<TestPlatform>::new(platform);
+            let guest_manager = WindowsPageManager::<TestPlatform>::new(platform);
+            let alignment = ALLOCATION_GRANULARITY * 2;
+            let length = NonZeroPageSize::new(ALLOCATION_GRANULARITY).unwrap();
+            // SAFETY: The fixture retains exclusive ownership of the fresh envelope reservation.
+            let host = unsafe {
+                host_manager.create_reserved_pages(
+                    None,
+                    NonZeroPageSize::new(alignment * 3).unwrap(),
+                    alignment,
+                    CreatePagesFlags::empty(),
+                )
+            }
+            .unwrap();
+            let base = host.as_usize();
+            let middle = MutPtr::<TestPlatform, u8>::from_usize(base + alignment);
+            let suffix = MutPtr::<TestPlatform, u8>::from_usize(base + alignment * 2);
+            // SAFETY: The fixture owns the envelope and releases its unused middle segment.
+            unsafe { host_manager.remove_pages(middle, alignment) }.unwrap();
+            let _cleanup = litebox::utils::defer(|| {
+                // SAFETY: Both retained host segments are unused and exclusively fixture-owned.
+                unsafe {
+                    host_manager.remove_pages(host, alignment).unwrap();
+                    host_manager.remove_pages(suffix, alignment).unwrap();
+                }
+            });
+            for permissions in [
+                None,
+                Some(MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE),
+            ] {
+                for flags in [CreatePagesFlags::empty(), CreatePagesFlags::TOP_DOWN] {
+                    // SAFETY: The manager selects fresh bounded address space without replacement.
+                    let guest = unsafe {
+                        guest_manager.create_private_pages(
+                            None,
+                            base..base + alignment * 3,
+                            length,
+                            alignment,
+                            flags,
+                            permissions,
+                        )
+                    }
+                    .unwrap();
+                    let _release = litebox::utils::defer(|| {
+                        // SAFETY: The test relinquishes its guest allocation after all assertions.
+                        unsafe { guest_manager.remove_pages(guest, length.as_usize()) }.unwrap();
+                    });
+                    assert_eq!(guest.as_usize(), middle.as_usize());
+                    assert_eq!(guest.as_usize() % alignment, 0);
+                    assert_eq!(
+                        guest_manager.get_memory_permissions(
+                            NonZeroAddress::new(guest.as_usize()).unwrap(),
+                            length,
+                        ),
+                        permissions,
+                    );
+                }
+            }
+        });
     }
 
     #[test]
