@@ -91,16 +91,9 @@ pub(crate) struct InetSocketPin<'a, Platform: ShimPlatform> {
     state: SocketIoState,
     proxy: Arc<NetworkProxy<Platform>>,
     recv_timeout: Option<core::time::Duration>,
-    send_timeout: Option<core::time::Duration>,
     is_nonblock: bool,
     socket_type: SockType,
     recvmmsg_lock: SocketRecvmmsgLock<Platform>,
-}
-
-impl<Platform: ShimPlatform> InetSocketPin<'_, Platform> {
-    pub(crate) fn is_broker_datagram(&self) -> bool {
-        matches!(self.proxy.as_ref(), NetworkProxy::BrokerDatagram(_))
-    }
 }
 
 impl<Platform: ShimPlatform> Drop for InetSocketPin<'_, Platform> {
@@ -1019,10 +1012,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
-        let (recv_timeout, send_timeout) = descriptor_table
-            .with_metadata(fd, |options: &SocketOptions| {
-                (options.recv_timeout, options.send_timeout)
-            })
+        let recv_timeout = descriptor_table
+            .with_metadata(fd, |options: &SocketOptions| options.recv_timeout)
             .map_err(|error| match error {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
@@ -1064,7 +1055,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             state,
             proxy,
             recv_timeout,
-            send_timeout,
             is_nonblock,
             socket_type,
             recvmmsg_lock,
@@ -1217,41 +1207,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 
             Err(error) => Err(wait_errno(timeout, socket_io_errno(error))),
         }
-    }
-
-    pub(crate) fn send_to_pinned_socket(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        socket: &InetSocketPin<'_, Platform>,
-        buf: &[u8],
-        flags: SendFlags,
-    ) -> Result<usize, Errno> {
-        let new_flags = convert_flags!(
-            flags,
-            SendFlags,
-            litebox::net::SendFlags,
-            CONFIRM,
-            DONTROUTE,
-            EOR,
-            MORE,
-            OOB,
-        );
-        cx.with_timeout(socket.send_timeout)
-            .wait_on_events(
-                socket.is_nonblock || flags.contains(SendFlags::DONTWAIT),
-                Events::OUT,
-                |observer, filter| {
-                    socket.proxy.register_observer(observer, filter);
-                    Ok(())
-                },
-                || match socket.proxy.try_write(buf, new_flags, None) {
-                    Ok(0) if buf.is_empty() => Ok(0),
-                    Ok(0) | Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
-                    Ok(n) => Ok(n),
-                    Err(error) => Err(TryOpError::Other(Errno::from(error))),
-                },
-            )
-            .map_err(|error| wait_errno(socket.send_timeout, socket_io_errno(error)))
     }
 
     pub(crate) fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
@@ -2848,49 +2803,6 @@ mod tests {
             state.0.load(core::sync::atomic::Ordering::Acquire) & super::SOCKET_IO_CLOSE_PENDING
                 != 0
         );
-
-        drop(socket);
-        assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);
-    }
-
-    #[test]
-    #[ignore = "requires broker-backed socket test setup"]
-    fn socket_io_pin_keeps_backend_alive_for_send_after_close() {
-        let task = init_platform();
-        let fd = task
-            .do_socket(
-                AddressFamily::INET,
-                SockType::Datagram,
-                SockFlags::NONBLOCK,
-                0,
-            )
-            .unwrap();
-        let typed_fd = typed_socket(&task, fd);
-        let socket = task
-            .files
-            .borrow()
-            .pin_receive_socket(&task.global, &typed_fd)
-            .unwrap();
-        let state = match &socket {
-            super::ReceiveSocket::Inet(socket) => socket.state.clone(),
-            super::ReceiveSocket::Unix(_) => unreachable!(),
-        };
-
-        close_socket(&task, fd);
-        assert!(
-            state.0.load(core::sync::atomic::Ordering::Acquire) & super::SOCKET_IO_CLOSE_PENDING
-                != 0
-        );
-        let result = match &socket {
-            super::ReceiveSocket::Inet(socket) => task.global.send_to_pinned_socket(
-                &task.wait_cx(),
-                socket,
-                b"pinned",
-                SendFlags::empty(),
-            ),
-            super::ReceiveSocket::Unix(_) => unreachable!(),
-        };
-        assert_eq!(result, Err(Errno::EDESTADDRREQ));
 
         drop(socket);
         assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);

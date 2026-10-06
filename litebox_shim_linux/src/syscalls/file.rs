@@ -1464,8 +1464,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let iovs: &[IoReadVec] = &iovec
                 .to_owned_slice::<Platform>(iovcnt)
                 .ok_or(Errno::EFAULT)?;
-            if let Some(received) = self.try_read_datagram_from_iovec(fd, iovs)? {
-                return Ok(received);
+            if self.datagram_size_limit(fd).is_some() {
+                return read_datagram_from_iovec::<Platform>(iovs, |buf| {
+                    self.do_read(fd, buf, None)
+                });
             }
             let mut kernel_buffer = vec![0u8; PAGE_SIZE];
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
@@ -1477,100 +1479,24 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
-    /// Reads one datagram into `iovs` if `fd` is a datagram socket, which a
-    /// series of reads would split.
-    fn try_read_datagram_from_iovec(
-        &self,
-        fd: &AnyTypedFd<Platform>,
-        iovs: &[IoReadVec],
-    ) -> Result<Option<usize>, Errno> {
-        let receive_flags = litebox_common_linux::ReceiveFlags::empty();
+    /// Returns the size limit of one datagram if `fd` is a datagram socket,
+    /// whose `readv` and `writev` must move one whole datagram rather than one
+    /// datagram per iovec.
+    fn datagram_size_limit(&self, fd: &AnyTypedFd<Platform>) -> Option<usize> {
         match fd {
-            AnyTypedFd::Network(fd) => {
-                let socket = self.global.pin_socket(fd)?;
-                if !socket.is_broker_datagram() {
-                    return Ok(None);
-                }
-                read_datagram_from_iovec::<Platform>(iovs, |buffer| {
-                    self.global.receive_from_socket(
-                        &self.wait_cx(),
-                        &socket,
-                        buffer,
-                        receive_flags,
-                        super::net::ReceiveContext::new(None, false),
-                        None,
-                    )
-                })
-                .map(Some)
-            }
+            AnyTypedFd::Network(fd) => matches!(
+                self.global.get_socket_type(fd),
+                Ok(litebox_common_linux::SockType::Datagram)
+            )
+            .then_some(litebox::net::MAX_UDP_DATAGRAM_SIZE),
             AnyTypedFd::Unix(fd) => {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(fd)
-                    .ok_or(Errno::EBADF)?;
-                handle.with_entry(|socket| {
-                    if socket.is_stream() {
-                        return Ok(None);
-                    }
-                    read_datagram_from_iovec::<Platform>(iovs, |buffer| {
-                        socket.recvfrom(&self.wait_cx(), buffer, receive_flags, None, None)
-                    })
-                    .map(Some)
-                })
+                let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                // Like `sendmsg`, Unix datagrams have no size limit of their own.
+                handle
+                    .with_entry(|socket| !socket.is_stream())
+                    .then_some(usize::MAX)
             }
-            _ => Ok(None),
-        }
-    }
-
-    /// Writes `iovs` as one datagram if `fd` is a datagram socket, which a
-    /// series of writes would split.
-    fn try_write_datagram_to_iovec(
-        &self,
-        fd: &AnyTypedFd<Platform>,
-        iovs: &[IoWriteVec],
-    ) -> Result<Option<usize>, Errno> {
-        let send_flags = litebox_common_linux::SendFlags::empty();
-        match fd {
-            AnyTypedFd::Network(fd) => {
-                let socket = self.global.pin_socket(fd)?;
-                if !socket.is_broker_datagram() {
-                    return Ok(None);
-                }
-                write_datagram_to_iovec::<Platform>(
-                    iovs,
-                    litebox::net::MAX_UDP_DATAGRAM_SIZE,
-                    |buffer| {
-                        self.global.send_to_pinned_socket(
-                            &self.wait_cx(),
-                            &socket,
-                            buffer,
-                            send_flags,
-                        )
-                    },
-                )
-                .map(Some)
-            }
-            AnyTypedFd::Unix(fd) => {
-                let handle = self
-                    .global
-                    .litebox
-                    .descriptor_table()
-                    .entry_handle(fd)
-                    .ok_or(Errno::EBADF)?;
-                handle.with_entry(|socket| {
-                    if socket.is_stream() {
-                        return Ok(None);
-                    }
-                    // Like `sendmsg`, Unix datagrams have no size limit of their own.
-                    write_datagram_to_iovec::<Platform>(iovs, usize::MAX, |buffer| {
-                        socket.sendto(self, buffer, send_flags, None)
-                    })
-                    .map(Some)
-                })
-            }
-            _ => Ok(None),
+            _ => None,
         }
     }
 }
@@ -1776,10 +1702,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let iovs: &[IoWriteVec] = &iovec
                 .to_owned_slice::<Platform>(iovcnt)
                 .ok_or(Errno::EFAULT)?;
-            match self.try_write_datagram_to_iovec(fd, iovs) {
-                Ok(Some(written)) => return Ok(written),
-                Ok(None) => {}
-                Err(error) => return Err(error),
+            if let Some(max_length) = self.datagram_size_limit(fd) {
+                return write_datagram_to_iovec::<Platform>(iovs, max_length, |buf| {
+                    self.do_write(fd, buf, None)
+                });
             }
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with
