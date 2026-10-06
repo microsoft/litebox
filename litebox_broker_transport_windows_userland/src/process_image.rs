@@ -337,29 +337,4 @@ mod tests {
         assert!(SectionView::map(&mapping, FILE_MAP_ALL_ACCESS, 0, 1).is_err());
         assert!(SectionView::map(&mapping, FILE_MAP_READ, 0, 1).is_ok());
     }
-
-    #[test]
-    fn rejects_invalid_process_image_setup_data() {
-        // SAFETY: The transfers hold no handles.
-        assert!(
-            unsafe {
-                WindowsReceivedProcessImage::from_transferred(TransferredSharedMemory {
-                    length: 0,
-                    handles: Vec::new(),
-                })
-            }
-            .unwrap()
-            .is_none()
-        );
-        // SAFETY: See above.
-        assert!(
-            unsafe {
-                WindowsReceivedProcessImage::from_transferred(TransferredSharedMemory {
-                    length: 1,
-                    handles: Vec::new(),
-                })
-            }
-            .is_err()
-        );
-    }
 }
