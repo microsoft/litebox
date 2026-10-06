@@ -75,7 +75,27 @@ pub struct CliArgs {
 /// panic. If it does actually panic, then ping the authors of LiteBox, and likely a better error
 /// message could be thrown instead.
 pub fn run(cli_args: CliArgs) -> Result<i32> {
+    // Only out-of-process runners continue forked children.
+    #[cfg(target_arch = "aarch64")]
+    disable_pointer_authentication();
     run_with_seccomp(cli_args, SeccompScope::AllThreads)
+}
+
+/// Disables pointer-authentication address keys for this thread and threads it creates later.
+///
+/// A forked child continues in a fresh runner, whose `exec` chose new keys, so return addresses
+/// the parent signed would fail to authenticate. Disabled keys leave pointers unsigned in every
+/// runner. The generic key cannot be disabled.
+///
+/// Frames that signed their return address before the call must not return.
+#[cfg(target_arch = "aarch64")]
+fn disable_pointer_authentication() {
+    let keys =
+        libc::PR_PAC_APIAKEY | libc::PR_PAC_APIBKEY | libc::PR_PAC_APDAKEY | libc::PR_PAC_APDBKEY;
+    // SAFETY: no frame that signed its return address before this call returns.
+    let result = unsafe { libc::prctl(libc::PR_PAC_SET_ENABLED_KEYS, keys, 0, 0, 0) };
+    // Failure means no pointer authentication or no kernel support; nothing to do either way.
+    let _ = result;
 }
 
 /// Like [`run`], but the seccomp filter confines only the calling thread and
@@ -295,7 +315,6 @@ fn run_program(
 
 /// Continues the process a parent duplicated by `fork`, whose memory contents are in
 /// `process_image`, if any.
-#[cfg(target_arch = "x86_64")]
 fn restore_fork(
     shim: &litebox_shim_linux::LinuxShim<Platform>,
     startup: LinuxForkStartup,
@@ -324,22 +343,11 @@ fn restore_fork(
     .context("failed to continue the forked process")
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn restore_fork(
-    _shim: &litebox_shim_linux::LinuxShim<Platform>,
-    _startup: LinuxForkStartup,
-    _initial_thread: litebox::thread::Thread,
-    _process_image: Option<std::os::fd::OwnedFd>,
-) -> Result<litebox_shim_linux::LoadedProgram<Platform>> {
-    anyhow::bail!("fork is unsupported on this architecture")
-}
-
 /// Maps `image`, which is `image_len` bytes long, privately over the page-aligned whole `pages`
 /// from `offset`, so they share the image's memory until written instead of copying it.
 ///
 /// The pages start zero-filled, and those past the image's end stay so, as accessing a mapping
 /// there would fault.
-#[cfg(target_arch = "x86_64")]
 fn map_process_image(
     image: &std::fs::File,
     image_len: u64,

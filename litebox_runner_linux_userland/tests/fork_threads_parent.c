@@ -18,6 +18,15 @@
 #define FORKERS 2
 #define FORKS_PER_FORKER 3
 
+// Forks by system call, bypassing glibc. AArch64 has no `fork`, so use `clone(SIGCHLD)`.
+static pid_t raw_fork(void) {
+#ifdef SYS_fork
+    return (pid_t)syscall(SYS_fork);
+#else
+    return (pid_t)syscall(SYS_clone, SIGCHLD, 0, NULL, NULL, 0);
+#endif
+}
+
 // Two counters far enough apart that copying memory reaches one long after the other.
 static struct {
     volatile unsigned long head;
@@ -79,7 +88,7 @@ static void *fork_repeatedly(void *arg) {
         atomic_fetch_add(&forkers_ready, 1);
         while (atomic_load(&forkers_ready) < (i + 1) * FORKERS) {
         }
-        pid_t child = (pid_t)syscall(SYS_fork);
+        pid_t child = raw_fork();
         if (child == 0) {
             _exit(counters_consistent() ? 0 : 1);
         }

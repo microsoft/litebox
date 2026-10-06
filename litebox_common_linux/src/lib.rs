@@ -1859,6 +1859,7 @@ pub struct LinuxDirent64 {
 pub enum ClockId {
     RealTime = 0,
     Monotonic = 1,
+    RealTimeCoarse = 5,
     MonotonicCoarse = 6,
 }
 

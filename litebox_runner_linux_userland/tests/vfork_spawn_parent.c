@@ -47,7 +47,13 @@ static void __attribute__((noreturn, used)) clear_sighand_child(void) {
     if (frame < (uintptr_t)child_stack || frame >= (uintptr_t)child_stack + sizeof(child_stack)) {
         _exit(55);
     }
+#if defined(__x86_64__)
     __asm__ volatile("ud2");
+#elif defined(__aarch64__)
+    __asm__ volatile("udf #0");
+#else
+#error "unsupported architecture"
+#endif
     _exit(56);
 }
 
@@ -59,6 +65,7 @@ static pid_t clone3_clear_sighand(void) {
         .stack_size = sizeof(child_stack),
     };
     long ret;
+#if defined(__x86_64__)
     __asm__ volatile("syscall\n\t"
                      "test %%rax, %%rax\n\t"
                      "jnz 1f\n\t"
@@ -67,6 +74,21 @@ static pid_t clone3_clear_sighand(void) {
                      : "=a"(ret)
                      : "a"((long)SYS_clone3), "D"(&args), "S"(sizeof(args))
                      : "rcx", "r11", "memory");
+#elif defined(__aarch64__)
+    register long x0 __asm__("x0") = (long)&args;
+    register long x1 __asm__("x1") = sizeof(args);
+    register long x8 __asm__("x8") = SYS_clone3;
+    __asm__ volatile("svc #0\n\t"
+                     "cbnz x0, 1f\n\t"
+                     "bl clear_sighand_child\n\t"
+                     "1:"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x8)
+                     : "x30", "memory");
+    ret = x0;
+#else
+#error "unsupported architecture"
+#endif
     return ret;
 }
 

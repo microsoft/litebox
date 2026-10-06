@@ -15,6 +15,15 @@
 
 #define BUFFER_SIZE (4 * 1024 * 1024)
 
+// Forks by system call, bypassing glibc. AArch64 has no `fork`, so use `clone(SIGCHLD)`.
+static pid_t raw_fork(void) {
+#ifdef SYS_fork
+    return (pid_t)syscall(SYS_fork);
+#else
+    return (pid_t)syscall(SYS_clone, SIGCHLD, 0, NULL, NULL, 0);
+#endif
+}
+
 static int global_value = 1;
 static volatile sig_atomic_t usr1_count;
 static volatile sig_atomic_t sigchld_count;
@@ -116,14 +125,22 @@ int main(void) {
     if (pipe2(pipe_fds, O_CLOEXEC) != 0) {
         return 3;
     }
+#if defined(__x86_64__)
     // `mov eax, 42; ret`
     static const unsigned char return_42[] = {0xb8, 0x2a, 0x00, 0x00, 0x00, 0xc3};
+#elif defined(__aarch64__)
+    // `mov w0, #42; ret`
+    static const unsigned char return_42[] = {0x40, 0x05, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
+#else
+#error "unsupported architecture"
+#endif
     unsigned char *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
                                -1, 0);
     if (code == MAP_FAILED) {
         return 3;
     }
     memcpy(code, return_42, sizeof return_42);
+    __builtin___clear_cache((char *)code, (char *)code + sizeof return_42);
     if (mprotect(code, 4096, PROT_EXEC) != 0) {
         return 3;
     }
@@ -163,12 +180,12 @@ int main(void) {
     printf("pipe %s", message);
     int failures = wait_for(child, "fork");
 
-    pid_t raw_child = syscall(SYS_fork);
+    pid_t raw_child = raw_fork();
     if (raw_child == 0) {
         syscall(SYS_exit_group, global_value == 2 ? 9 : 10);
     }
     if (raw_child < 0) {
-        perror("SYS_fork");
+        perror("raw fork");
         return 5;
     }
     failures += wait_for(raw_child, "raw-fork");

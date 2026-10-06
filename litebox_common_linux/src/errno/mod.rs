@@ -782,7 +782,6 @@ impl From<litebox::fs::errors::TruncateError> for Errno {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 impl From<litebox::platform::ArchSpecificError> for Errno {
     fn from(value: litebox::platform::ArchSpecificError) -> Self {
         match value {

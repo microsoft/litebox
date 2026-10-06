@@ -15,6 +15,7 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::process::MAX_PROCESS_BOOTSTRAP_SIZE;
 use zerocopy::{FromBytes, IntoBytes};
 
+use crate::GuestVectorState;
 use crate::signal::{NSIG, SigAction, SigAltStack, SigSet};
 use crate::vmem::VmFlags;
 use crate::{PtRegs, TASK_COMM_LEN};
@@ -147,7 +148,9 @@ pub struct LinuxForkStartup {
     pub alternate_signal_stack: SigAltStack,
     /// Registers at the `fork` system call, which the child returns from.
     pub registers: PtRegs,
-    /// Thread pointer, such as the FS base on x86-64.
+    /// Floating-point and vector state at the `fork` system call (encoded only on AArch64).
+    pub vector_state: GuestVectorState,
+    /// Thread pointer, such as the FS base on x86-64 or `TPIDR_EL0` on AArch64.
     pub thread_pointer: usize,
     /// The parent's system call entry point, which the child's must match because the
     /// duplicated code calls it.
@@ -380,6 +383,8 @@ impl LinuxForkStartup {
         output.extend_from_slice(self.signal_actions.as_bytes());
         output.extend_from_slice(self.alternate_signal_stack.as_bytes());
         output.extend_from_slice(self.registers.as_bytes());
+        #[cfg(target_arch = "aarch64")]
+        push_vector_state(&mut output, &self.vector_state);
         for value in [
             self.thread_pointer,
             self.syscall_entry_point,
@@ -438,6 +443,8 @@ impl LinuxForkStartup {
         let signal_actions = read_value(&mut input)?;
         let alternate_signal_stack = read_value(&mut input)?;
         let registers = read_value(&mut input)?;
+        #[cfg(target_arch = "aarch64")]
+        let vector_state = read_vector_state(&mut input)?;
         let thread_pointer = read_usize(&mut input)?;
         let syscall_entry_point = read_usize(&mut input)?;
         let set_child_tid = read_usize(&mut input)?;
@@ -499,6 +506,10 @@ impl LinuxForkStartup {
             signal_actions,
             alternate_signal_stack,
             registers,
+            #[cfg(target_arch = "aarch64")]
+            vector_state,
+            #[cfg(not(target_arch = "aarch64"))]
+            vector_state: (),
             thread_pointer,
             syscall_entry_point,
             set_child_tid,
@@ -638,6 +649,32 @@ fn read_u8(input: &mut &[u8]) -> Result<u8, LinuxProgramStartupError> {
     Ok(take_bytes(input, size_of::<u8>())?[0])
 }
 
+/// Appends `state`, the Q registers followed by FPSR and FPCR.
+#[cfg(target_arch = "aarch64")]
+fn push_vector_state(output: &mut Vec<u8>, state: &GuestVectorState) {
+    for register in &state.registers {
+        output.extend_from_slice(&register.to_le_bytes());
+    }
+    push_u32(output, state.fpsr);
+    push_u32(output, state.fpcr);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgramStartupError> {
+    let mut state = GuestVectorState::default();
+    for register in &mut state.registers {
+        let bytes = take_bytes(input, size_of::<u128>())?;
+        *register = u128::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| LinuxProgramStartupError::Malformed)?,
+        );
+    }
+    state.fpsr = read_u32(input)?;
+    state.fpcr = read_u32(input)?;
+    Ok(state)
+}
+
 fn read_u32(input: &mut &[u8]) -> Result<u32, LinuxProgramStartupError> {
     let bytes = take_bytes(input, size_of::<u32>())?;
     Ok(u32::from_le_bytes(
@@ -759,6 +796,20 @@ mod tests {
         );
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn fork_vector_state() -> GuestVectorState {
+        let mut state = GuestVectorState::default();
+        for (index, register) in state.registers.iter_mut().enumerate() {
+            *register = u128::MAX / 3 - index as u128;
+        }
+        state.fpsr = 0x0800_0010;
+        state.fpcr = 0x0300_0000;
+        state
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    fn fork_vector_state() -> GuestVectorState {}
+
     fn fork_startup() -> LinuxForkStartup {
         let mut signal_actions = [SigAction {
             sigaction: crate::signal::SIG_DFL,
@@ -792,6 +843,7 @@ mod tests {
                 size: 0x4000,
             },
             registers: PtRegs::default(),
+            vector_state: fork_vector_state(),
             thread_pointer: 0x7fff_0000,
             syscall_entry_point: 0x5555_0000,
             set_child_tid: 0x7fff_1000,
@@ -842,6 +894,8 @@ mod tests {
         assert_eq!(decoded.fds, startup.fds);
         assert_eq!(decoded.comm, startup.comm);
         assert_eq!(decoded.signal_actions[0].restorer, 0x5678);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(decoded.vector_state, startup.vector_state);
         assert_eq!(decoded.encode().unwrap(), encoded);
     }
 

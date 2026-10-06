@@ -12,6 +12,15 @@
 static volatile pid_t usr2_pid;
 static volatile pid_t ill_pid;
 static volatile int ill_on_child_stack;
+// Raises SIGILL.
+#if defined(__x86_64__)
+#define UNDEFINED_INSTRUCTION() __asm__ volatile("ud2")
+#elif defined(__aarch64__)
+#define UNDEFINED_INSTRUCTION() __asm__ volatile("udf #0")
+#else
+#error "unsupported architecture"
+#endif
+
 static char child_stack[64 * 1024];
 
 static void on_usr2(int signal) {
@@ -25,8 +34,14 @@ static void on_ill(int signal, siginfo_t *info, void *context) {
     char local;
     ill_pid = getpid();
     ill_on_child_stack = (uintptr_t)&local - (uintptr_t)child_stack < sizeof(child_stack);
-    // Resume after the two-byte `ud2`.
+    // Resume after the faulting instruction.
+#if defined(__x86_64__)
     ((ucontext_t *)context)->uc_mcontext.gregs[REG_RIP] += 2;
+#elif defined(__aarch64__)
+    ((ucontext_t *)context)->uc_mcontext.pc += 4;
+#else
+#error "unsupported architecture"
+#endif
 }
 
 int main(int argc, char **argv) {
@@ -59,7 +74,7 @@ int main(int argc, char **argv) {
         if (sigaltstack(&ss, NULL) != 0) {
             _exit(57);
         }
-        __asm__ volatile("ud2");
+        UNDEFINED_INSTRUCTION();
         _exit(ill_pid == getpid() && ill_on_child_stack ? 55 : 56);
     }
     if (fault_child < 0) {
