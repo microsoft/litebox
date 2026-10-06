@@ -439,7 +439,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// or not connected.
     ///
     /// Like Linux, data received before the read side was shut down can still be read;
-    /// once it is consumed, this returns [`ChannelReadError::ReadShutdown`].
+    /// once it is consumed, this returns [`ChannelReadError::ReadShutdown`], or
+    /// [`ChannelReadError::ConnectionClosed`] if the connection has closed.
     pub fn try_read(
         &self,
         buf: &mut [u8],
@@ -473,12 +474,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         if n > 0 {
             return Ok(n);
         }
-        if read_shutdown {
-            return Err(ChannelReadError::ReadShutdown);
-        }
+        // Like Linux, a closed connection reports its error even after `SHUT_RD`.
         match state {
-            SocketState::Connected => Ok(0),
             SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
+            _ if read_shutdown => Err(ChannelReadError::ReadShutdown),
+            SocketState::Connected => Ok(0),
             _ => Err(ChannelReadError::NotConnected),
         }
     }
@@ -572,6 +572,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
         }
         if read_shutdown && write_shutdown {
             events |= Events::HUP;
+        }
+        // Like Linux, a pending socket error is reported until it is consumed.
+        if self.get_async_error(false).is_some() {
+            events |= Events::ERR;
         }
 
         match self.inner.state() {
