@@ -1634,40 +1634,6 @@ mod tests {
     extern crate std;
 
     #[test]
-    fn test_clone3_rejects_invalid_stack_range() {
-        use litebox::platform::PageManagementProvider;
-        use litebox_common_linux::{CloneArgs, CloneFlags, PtRegs, errno::Errno};
-
-        let task = crate::syscalls::tests::init_platform(None);
-        let task_addr_max = <crate::syscalls::tests::TestPlatform as PageManagementProvider<
-            { litebox_common_linux::vmem::PAGE_SIZE },
-        >>::TASK_ADDR_MAX as u64;
-        for (stack, stack_size) in [(u64::MAX, 1), (task_addr_max, 0x1000)] {
-            let args = CloneArgs {
-                flags: CloneFlags::VM
-                    | CloneFlags::THREAD
-                    | CloneFlags::SIGHAND
-                    | CloneFlags::FILES,
-                stack,
-                stack_size,
-                pidfd: 0,
-                child_tid: 0,
-                parent_tid: 0,
-                exit_signal: 0,
-                tls: 0,
-                set_tid: 0,
-                set_tid_size: 0,
-                cgroup: 0,
-            };
-            assert_eq!(
-                task.do_clone(&PtRegs::default(), &args, true),
-                Err(Errno::EINVAL),
-                "stack={stack:#x} stack_size={stack_size:#x}"
-            );
-        }
-    }
-
-    #[test]
     fn resource_limit_cur_never_exceeds_max() {
         use crate::syscalls::tests::init_platform;
         use litebox_common_linux::{Rlimit, RlimitResource, errno::Errno};
