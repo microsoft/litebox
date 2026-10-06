@@ -1420,7 +1420,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        let is_datagram = core::cell::Cell::new(false);
+        let mut is_datagram = false;
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1437,14 +1437,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                is_datagram.set(!file.is_stream());
+                is_datagram = !file.is_stream();
                 file.sendto(self, buf, flags, addr)
             },
         );
         // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_datagram.get()
+            && !is_datagram
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -1494,7 +1494,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EFAULT)?,
             )
         };
-        let is_datagram = core::cell::Cell::new(false);
+        let mut is_datagram = false;
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1513,14 +1513,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
-                is_datagram.set(!file.is_stream());
+                is_datagram = !file.is_stream();
                 file.sendto(self, &data, flags, unix_addr)
             },
         );
         // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_datagram.get()
+            && !is_datagram
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
