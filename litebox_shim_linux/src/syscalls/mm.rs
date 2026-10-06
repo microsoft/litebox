@@ -630,10 +630,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             _ => return ElfPatchInit::Untracked,
         }
 
-        // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
+        // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute the relocation offset
         // by matching the segment whose p_offset corresponds to file_offset.
         let mut max_load_end: u64 = 0;
-        let mut base_addr: Option<usize> = None;
+        let mut relocation_offset: Option<usize> = None;
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
             let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LittleEndian>>(ph_bytes) else {
@@ -655,12 +655,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if end > max_load_end {
                 max_load_end = end;
             }
-            // Match segment by page-aligned file offset to derive the ET_DYN load base.
+            // Match segment by page-aligned file offset to derive the ET_DYN relocation offset.
             if e_type == ET_DYN
-                && base_addr.is_none()
+                && relocation_offset.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                base_addr = mapped_addr.checked_sub(align_down(p_vaddr.trunc(), PAGE_SIZE));
+                relocation_offset =
+                    Some(mapped_addr.wrapping_sub(align_down(p_vaddr.trunc(), PAGE_SIZE)));
             }
         }
 
@@ -684,27 +685,27 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     return ElfPatchInit::Malformed;
                 }
                 Ok(Some(layout)) => {
-                    let base = if e_type == ET_DYN {
-                        let Some(base) = base_addr else {
+                    let relocation_offset = if e_type == ET_DYN {
+                        let Some(relocation_offset) = relocation_offset else {
                             litebox_util_log::debug!(
                                 file_offset:? = file_offset, mapped_addr:? = mapped_addr;
                                 "pre-patched ET_DYN load base is unknown for this mapping"
                             );
                             return ElfPatchInit::MissingLoadBase;
                         };
-                        base
+                        relocation_offset
                     } else {
                         0
                     };
-                    let Some(addr) = base.checked_add(layout.vaddr).filter(|addr| {
-                        layout
-                            .size
-                            .checked_next_multiple_of(PAGE_SIZE)
-                            .and_then(|len| addr.checked_add(len))
-                            .is_some_and(|end| end <= Platform::TASK_ADDR_MAX)
-                    }) else {
+                    let addr = relocation_offset.wrapping_add(layout.vaddr);
+                    if !layout
+                        .size
+                        .checked_next_multiple_of(PAGE_SIZE)
+                        .and_then(|len| addr.checked_add(len))
+                        .is_some_and(|end| end <= Platform::TASK_ADDR_MAX)
+                    {
                         litebox_util_log::debug!(
-                            base:? = base, layout:? = layout;
+                            relocation_offset:? = relocation_offset, layout:? = layout;
                             "pre-patched trampoline range is invalid"
                         );
                         return ElfPatchInit::Malformed;
@@ -712,15 +713,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     (true, layout.file_offset, layout.size, addr)
                 }
                 Ok(None) => {
-                    let base = if e_type == ET_DYN {
-                        base_addr.unwrap_or(mapped_addr)
+                    let relocation_offset = if e_type == ET_DYN {
+                        relocation_offset.unwrap_or(mapped_addr)
                     } else {
                         0
                     };
                     let max_end: usize = max_load_end.trunc();
                     let Some(addr) = max_end
                         .checked_next_multiple_of(PAGE_SIZE)
-                        .and_then(|end| base.checked_add(end))
+                        .map(|end| relocation_offset.wrapping_add(end))
                     else {
                         return ElfPatchInit::Untracked;
                     };
