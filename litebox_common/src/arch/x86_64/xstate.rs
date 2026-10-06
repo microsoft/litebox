@@ -1,3 +1,6 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
 //! Host-independent x86-64 XSAVE layout discovery and aligned state storage.
 
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -85,12 +88,14 @@ pub struct XsaveChunk(
 
 /// Standard-layout XSAVE requirements for the host's enabled CPU state.
 pub struct XsaveLayout {
-    /// Required buffer size in bytes for the state enabled in XCR0.
+    /// Required buffer size in bytes for the state components in `mask`.
     pub size: usize,
-    /// Enabled user-state feature mask, suitable for XSAVE and XRSTOR.
+    /// Saved user-state feature mask, suitable for XSAVE and XRSTOR.
     pub mask: u64,
-    /// Locations of enabled state components beyond the legacy x87/SSE area.
+    /// Locations of saved state components beyond the legacy x87/SSE area.
     pub components: Vec<XsaveComponent>,
+    /// Whether the CPU supports XSAVEOPT.
+    pub xsaveopt: bool,
 }
 
 /// An extended state component in the standard XSAVE layout.
@@ -104,9 +109,22 @@ pub struct XsaveComponent {
 }
 
 impl XsaveLayout {
-    /// Detects the current host's enabled XSAVE features and standard layout.
+    /// AMX tile state (XTILECFG and XTILEDATA). Hosts gate it per process via
+    /// XFD, and it adds about 8 KiB per save area, so it is never saved.
+    pub const EXCLUDED_FEATURES: u64 = (1 << 17) | (1 << 18);
+
+    /// Returns the host layout, detecting it on first use.
     ///
-    /// Platform crates may cache this result while XCR0 remains unchanged.
+    /// # Panics
+    /// Panics under the same conditions as [`Self::detect`].
+    #[must_use]
+    pub fn get() -> &'static Self {
+        static LAYOUT: spin::Once<XsaveLayout> = spin::Once::new();
+        LAYOUT.call_once(Self::detect)
+    }
+
+    /// Detects the current host's enabled XSAVE features and standard layout,
+    /// excluding [`Self::EXCLUDED_FEATURES`].
     ///
     /// # Panics
     /// Panics if XSAVE is unavailable, disabled by the host OS, or reports an
@@ -125,11 +143,11 @@ impl XsaveLayout {
         );
         let features = core::arch::x86_64::__cpuid_count(0x0d, 0);
         // SAFETY: CPUID confirms that the OS has enabled XSAVE and XGETBV.
-        let mask = unsafe { core::arch::x86_64::_xgetbv(0) };
+        let mask = unsafe { core::arch::x86_64::_xgetbv(0) } & !Self::EXCLUDED_FEATURES;
         assert_eq!(mask & 3, 3, "x87 and SSE state must be enabled");
-        let size = features.ebx as usize;
-        assert!(size >= XSAVE_HEADER_OFFSET + XSAVE_HEADER_SIZE);
-        let components = (2..64)
+        let max_size = features.ebx as usize;
+        assert!(max_size >= XSAVE_HEADER_OFFSET + XSAVE_HEADER_SIZE);
+        let components: Vec<XsaveComponent> = (2..64)
             .filter(|id| mask & (1 << id) != 0)
             .map(|id| {
                 let feature = core::arch::x86_64::__cpuid_count(0x0d, id);
@@ -138,14 +156,20 @@ impl XsaveLayout {
                     offset: feature.ebx as usize,
                     size: feature.eax as usize,
                 };
-                assert!(component.offset + component.size <= size);
+                assert!(component.offset + component.size <= max_size);
                 component
             })
             .collect();
+        let size = components
+            .iter()
+            .map(|component| component.offset + component.size)
+            .fold(XSAVE_HEADER_OFFSET + XSAVE_HEADER_SIZE, usize::max);
+        let xsaveopt = core::arch::x86_64::__cpuid_count(0x0d, 1).eax & 1 != 0;
         Self {
             size,
             mask,
             components,
+            xsaveopt,
         }
     }
 }
@@ -269,6 +293,7 @@ mod tests {
             size,
             mask: 3,
             components: Vec::new(),
+            xsaveopt: false,
         }
     }
 

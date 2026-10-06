@@ -103,6 +103,19 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     }
 }
 
+/// Clears the x87 exception flags and restores the Windows ABI's host x87 control word and MXCSR.
+///
+/// Requires `HOST_X87_CONTROL_WORD` and `HOST_MXCSR` symbol operands.
+macro_rules! restore_host_fp_controls {
+    () => {
+        "
+    fnclex
+    fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
+    ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
+"
+    };
+}
+
 /// Runs the Rust handler with host FP controls
 #[unsafe(naked)]
 unsafe extern "system" fn vectored_exception_handler(
@@ -115,10 +128,7 @@ unsafe extern "system" fn vectored_exception_handler(
         ".seh_endprologue",
         "fnstcw WORD PTR [rsp + 32]",
         "stmxcsr DWORD PTR [rsp + 36]",
-        // Clear the x87 exception flags and restore the host FP control state
-        "fnclex",
-        "fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]",
-        "ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]",
+        restore_host_fp_controls!(),
         "call {handler}",
         "fldcw WORD PTR [rsp + 32]",
         "ldmxcsr DWORD PTR [rsp + 36]",
@@ -450,29 +460,28 @@ const _: () = assert!(
         == size_of::<XsaveLegacyArea>()
 );
 
-fn xsave_layout() -> &'static XsaveLayout {
-    static LAYOUT: OnceLock<XsaveLayout> = OnceLock::new();
-    LAYOUT.get_or_init(XsaveLayout::detect)
-}
-
 fn restore_xsave_to_context(
     xsave: &XsaveArea,
     context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
 ) {
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        CONTEXT_XSTATE_AMD64, LocateXStateFeature, SetXStateFeaturesMask,
+        CONTEXT_XSTATE_AMD64, LocateXStateFeature, SetXStateFeaturesMask, XSAVE_FORMAT,
     };
 
     let legacy_state = xsave.materialized_legacy_area();
     context.MxCsr = legacy_state.mxcsr;
     // SAFETY: XSAVE_FORMAT is Windows' representation of the architectural
     // legacy area, and its size is checked above.
-    context.Anonymous.FltSave = unsafe { core::mem::transmute(legacy_state) };
+    context.Anonymous.FltSave = unsafe {
+        core::ptr::from_ref(&legacy_state)
+            .cast::<XSAVE_FORMAT>()
+            .read_unaligned()
+    };
     if context.ContextFlags & CONTEXT_XSTATE_AMD64 != CONTEXT_XSTATE_AMD64 {
         return;
     }
 
-    let layout = xsave_layout();
+    let layout = XsaveLayout::get();
     let xstate_bv = xsave.xstate_bv();
     for component in &layout.components {
         if xstate_bv & (1 << component.id) == 0 {
@@ -540,7 +549,7 @@ impl ExtendedContext {
             )
         };
         assert_ne!(ok, 0, "InitializeContext failed");
-        let ok = unsafe { SetXStateFeaturesMask(context, xsave_layout().mask) };
+        let ok = unsafe { SetXStateFeaturesMask(context, XsaveLayout::get().mask) };
         assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
         Self {
             _storage: storage,
@@ -566,7 +575,7 @@ impl ExtendedContext {
         let context = self.context_mut();
         context.ContextFlags = CONTEXT_ALL_AMD64 | CONTEXT_XSTATE_AMD64;
         // SAFETY: The context retains its initialized extended storage across captures.
-        let ok = unsafe { SetXStateFeaturesMask(context, xsave_layout().mask) };
+        let ok = unsafe { SetXStateFeaturesMask(context, XsaveLayout::get().mask) };
         assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
         context
     }
@@ -605,7 +614,7 @@ struct TlsState {
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
     fn new() -> Self {
-        let mut guest_xsave_area = XsaveArea::initial(xsave_layout());
+        let mut guest_xsave_area = XsaveArea::initial(XsaveLayout::get());
         let guest_xsave_ptr = guest_xsave_area.as_mut_ptr();
         Self {
             host_sp: Cell::new(core::ptr::null_mut()),
@@ -618,7 +627,7 @@ impl TlsState {
             interrupt_context: UnsafeCell::new(ExtendedContext::new()),
             guest_xsave_ptr: Cell::new(guest_xsave_ptr),
             guest_xsave_area: UnsafeCell::new(guest_xsave_area),
-            guest_xsave_mask: xsave_layout().mask,
+            guest_xsave_mask: XsaveLayout::get().mask,
             guest_xstate_format: Cell::new(GuestXstateFormat::Native),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
@@ -778,11 +787,9 @@ syscall_callback:
     mov     r10, QWORD PTR [r11 + {GUEST_XSAVE_PTR}]
     xsave64 [r10]
     mov     BYTE PTR [r11 + {GUEST_XSTATE_FORMAT}], 0
-    // Clear the x87 exception flags and restore the Windows ABI's standard host x87 control word and mxcsr.
-    fnclex
-    fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
-    ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
-
+",
+    restore_host_fp_controls!(),
+"
     /// Reestablish the stack and frame pointers.
     mov     rsp, [r11 + {HOST_SP}]
     mov     rbp, [r11 + {HOST_BP}]
@@ -794,10 +801,9 @@ syscall_callback:
     jmp .Ldone
 
 exception_callback:
-    // Clear the x87 exception flags and restore the Windows ABI's standard host x87 control word and mxcsr.
-    fnclex
-    fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
-    ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
+",
+    restore_host_fp_controls!(),
+"
     // Handle the exception. The stack and frame pointers are already restored,
     // and the guest context is up to date. rcx contains a pointer to the
     // guest pt_regs, and rdx contains a pointer to the exception record.
@@ -809,10 +815,9 @@ interrupt_callback:
     mov     r11, QWORD PTR gs:[r11 * 8 + TEB_TLS_SLOTS_OFFSET]
     mov     rsp, [r11 + {HOST_SP}]
     mov     rbp, [r11 + {HOST_BP}]
-    // Clear the x87 exception flags and restore the Windows ABI's standard host x87 control word and mxcsr.
-    fnclex
-    fldcw WORD PTR [rip + {HOST_X87_CONTROL_WORD}]
-    ldmxcsr DWORD PTR [rip + {HOST_MXCSR}]
+",
+    restore_host_fp_controls!(),
+"
     mov  rcx, QWORD PTR [rsp] // thread_ctx
     call {interrupt_handler}
     jmp .Ldone
@@ -1976,7 +1981,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use crate::{PAGE_SIZE, WindowsXsaveArea as _, XsaveArea, xsave_layout};
+    use crate::{PAGE_SIZE, XsaveArea, XsaveLayout};
     use litebox::platform::RawMutex;
 
     #[test]
@@ -2332,21 +2337,14 @@ mod tests {
                 self.calls.set(call);
                 // SAFETY: This is the active guest's host callback; capture has finished.
                 let area = unsafe { &*(*crate::get_tls_ptr().unwrap()).guest_xsave_area.get() };
-                let legacy = area.legacy_state_for_context();
-                assert_eq!(legacy.ControlWord, TEST_CW);
-                assert_eq!(legacy.StatusWord & pending_status, pending_status);
-                assert_eq!(legacy.MxCsr, TEST_MXCSR);
+                let legacy = area.materialized_legacy_area();
+                assert_eq!(legacy.control_word, TEST_CW);
+                assert_eq!(legacy.status_word & pending_status, pending_status);
+                assert_eq!(legacy.mxcsr, TEST_MXCSR);
                 let expected = if call >= 4 { 0 } else { 0x5a };
-                assert_eq!(
-                    legacy.XmmRegisters[0].Low,
-                    u64::from_le_bytes([expected; 8])
-                );
-                assert_eq!(
-                    legacy.XmmRegisters[0].High.cast_unsigned(),
-                    u64::from_le_bytes([expected; 8])
-                );
+                assert_eq!(legacy.xmm_registers[0], [expected; 16]);
                 if self.avx {
-                    let component = xsave_layout()
+                    let component = XsaveLayout::get()
                         .components
                         .iter()
                         .find(|component| component.id == 2)

@@ -14,7 +14,6 @@ use std::cell::{Cell, RefCell};
 use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
@@ -536,28 +535,27 @@ struct ThreadContext<'a> {
     ctx: &'a mut litebox_common_linux::PtRegs,
 }
 
-fn xsave_layout() -> &'static XsaveLayout {
-    static LAYOUT: OnceLock<XsaveLayout> = OnceLock::new();
-    LAYOUT.get_or_init(XsaveLayout::detect)
-}
-
 thread_local! {
-    static GUEST_XSTATE: RefCell<XsaveArea> = RefCell::new(XsaveArea::initial(xsave_layout()));
+    static GUEST_XSTATE: RefCell<Option<XsaveArea>> = const { RefCell::new(None) };
 }
 
 fn activate_xstate(reenter: bool) {
+    let layout = XsaveLayout::get();
     GUEST_XSTATE.with_borrow_mut(|guest| {
-        if !reenter {
-            *guest = XsaveArea::initial(xsave_layout());
+        if !reenter || guest.is_none() {
+            *guest = Some(XsaveArea::initial(layout));
         }
+        let guest = guest.as_mut().unwrap();
         // SAFETY: The buffer remains owned by this thread's TLS until thread exit.
         // No guest is running while these assembly TLS slots are initialized.
         unsafe {
             core::arch::asm!(
                 "mov fs:guest_xsave@tpoff, {guest}",
                 "mov fs:xsave_mask@tpoff, {mask}",
+                "mov BYTE PTR fs:use_xsaveopt@tpoff, {xsaveopt}",
                 guest = in(reg) guest.as_mut_ptr(),
-                mask = in(reg) xsave_layout().mask,
+                mask = in(reg) layout.mask,
+                xsaveopt = in(reg_byte) u8::from(layout.xsaveopt),
                 options(nostack, preserves_flags),
             );
         }
@@ -611,6 +609,9 @@ in_guest:
 .globl interrupt
 interrupt:
     .byte 0
+.globl use_xsaveopt
+use_xsaveopt:
+    .byte 0
     .align 4
 .globl pending_host_signals
 pending_host_signals:
@@ -644,6 +645,35 @@ fn get_guest_fsbase() -> usize {
         }
     }
     value
+}
+
+/// Saves the guest's extended state to its TLS save area. Clobbers rax, rdx, r10, and flags.
+macro_rules! save_guest_xstate {
+    () => {
+        "
+    mov     r10, fs:guest_xsave@tpoff
+    mov     eax, DWORD PTR fs:xsave_mask@tpoff
+    mov     edx, DWORD PTR fs:xsave_mask@tpoff+4
+    cmp     BYTE PTR fs:use_xsaveopt@tpoff, 0
+    je      8f
+    xsaveopt64 [r10]
+    jmp     9f
+8:
+    xsave64 [r10]
+9:
+"
+    };
+}
+
+/// Clears the x87 exception flags and restores the host x87 FPU and SSE control words.
+macro_rules! restore_host_fp_controls {
+    () => {
+        "
+    fnclex
+    fldcw   WORD PTR fs:host_x87_control_word@tpoff
+    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
+"
+    };
 }
 
 /// Runs the guest thread until it terminates.
@@ -747,16 +777,10 @@ syscall_callback:
     push    r13         // pt_regs->r13
     push    r14         // pt_regs->r14
     push    r15         // pt_regs->r15
-
-    mov     r10, fs:guest_xsave@tpoff
-    mov     eax, DWORD PTR fs:xsave_mask@tpoff
-    mov     edx, DWORD PTR fs:xsave_mask@tpoff+4
-    xsave64 [r10]
-    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
-    fnclex
-    fldcw   WORD PTR fs:host_x87_control_word@tpoff
-    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
-
+",
+    save_guest_xstate!(),
+    restore_host_fp_controls!(),
+"
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -771,16 +795,13 @@ syscall_callback:
 exception_callback:
     // rt_sigreturn restored the guest FP state. Save it before entering host code.
     mov     r8, rdx
-    mov     r10, fs:guest_xsave@tpoff
-    mov     eax, DWORD PTR fs:xsave_mask@tpoff
-    mov     edx, DWORD PTR fs:xsave_mask@tpoff+4
-    xsave64 [r10]
+",
+    save_guest_xstate!(),
+"
     mov     rdx, r8
-    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
-    fnclex
-    fldcw   WORD PTR fs:host_x87_control_word@tpoff
-    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
-
+",
+    restore_host_fp_controls!(),
+"
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -791,17 +812,14 @@ exception_callback:
 
 interrupt_callback:
     // rt_sigreturn restored the guest FP state. Save it before entering host code.
-    mov     r10, fs:guest_xsave@tpoff
-    mov     eax, DWORD PTR fs:xsave_mask@tpoff
-    mov     edx, DWORD PTR fs:xsave_mask@tpoff+4
-    xsave64 [r10]
+",
+    save_guest_xstate!(),
+"
 .globl interrupt_callback_no_xsave
 interrupt_callback_no_xsave:
-    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
-    fnclex
-    fldcw   WORD PTR fs:host_x87_control_word@tpoff
-    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
-
+",
+    restore_host_fp_controls!(),
+"
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -810,11 +828,10 @@ interrupt_callback_no_xsave:
     call {interrupt_handler}
 
 .Ldone:
-
-    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
-    fnclex
-    fldcw   WORD PTR fs:host_x87_control_word@tpoff
-    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
+    // Shim handlers may leave modified FP controls when terminating the guest.
+",
+    restore_host_fp_controls!(),
+"
     lea  rsp, [rbp - 5*8]
     pop  r15
     pop  r14

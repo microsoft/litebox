@@ -3,5 +3,8 @@ name = "litebox_common"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+spin = { version = "0.9.8", default-features = false, features = ["once"] }
+
 [lints]
 workspace = true
