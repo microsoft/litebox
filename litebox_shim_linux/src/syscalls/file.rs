@@ -1464,8 +1464,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let iovs: &[IoReadVec] = &iovec
                 .to_owned_slice::<Platform>(iovcnt)
                 .ok_or(Errno::EFAULT)?;
-            if let Some(received) = self.try_read_datagram_from_iovec(fd, iovs)? {
-                return Ok(received);
+            if self.datagram_size_limit(fd).is_some() {
+                return read_datagram_from_iovec::<Platform>(iovs, |buf| {
+                    self.do_read(fd, buf, None)
+                });
             }
             let mut kernel_buffer = vec![0u8; PAGE_SIZE];
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
@@ -1477,117 +1479,93 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
-    fn try_read_datagram_from_iovec(
-        &self,
-        fd: &AnyTypedFd<Platform>,
-        iovs: &[IoReadVec],
-    ) -> Result<Option<usize>, Errno> {
-        let AnyTypedFd::Network(fd) = fd else {
-            return Ok(None);
-        };
-        let socket = self.global.pin_socket(fd)?;
-        if socket.is_broker_datagram() {
-            self.read_datagram_from_iovec(&socket, iovs).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn read_datagram_from_iovec(
-        &self,
-        socket: &super::net::InetSocketPin<'_, Platform>,
-        iovs: &[IoReadVec],
-    ) -> Result<usize, Errno> {
-        check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-        let capacity = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
-        if capacity == 0 {
-            return Ok(0);
-        }
-        let mut buffer = alloc::vec::Vec::new();
-        let capacity = capacity.min(litebox::net::SOCKET_RECEIVE_OPERATION_SIZE);
-        buffer
-            .try_reserve_exact(capacity)
-            .map_err(|_| Errno::ENOMEM)?;
-        buffer.resize(capacity, 0);
-        let received = self
-            .global
-            .receive_from_socket(
-                &self.wait_cx(),
-                socket,
-                &mut buffer,
-                litebox_common_linux::ReceiveFlags::empty(),
-                super::net::ReceiveContext::new(None, false),
-                None,
-            )?
-            .min(buffer.len());
-        let mut copied = 0;
-        for iov in iovs {
-            if copied == received {
-                break;
+    /// Returns the size limit of one datagram if `fd` is a datagram socket,
+    /// whose `readv` and `writev` must move one whole datagram rather than one
+    /// datagram per iovec.
+    fn datagram_size_limit(&self, fd: &AnyTypedFd<Platform>) -> Option<usize> {
+        match fd {
+            AnyTypedFd::Network(fd) => matches!(
+                self.global.get_socket_type(fd),
+                Ok(litebox_common_linux::SockType::Datagram)
+            )
+            .then_some(litebox::net::MAX_UDP_DATAGRAM_SIZE),
+            AnyTypedFd::Unix(fd) => {
+                let handle = self.global.litebox.descriptor_table().entry_handle(fd)?;
+                // Like `sendmsg`, Unix datagrams have no size limit of their own.
+                handle
+                    .with_entry(|socket| !socket.is_stream())
+                    .then_some(usize::MAX)
             }
-            let length = (received - copied).min(iov.iov_len);
-            if iov
-                .iov_base
-                .copy_from_slice::<Platform>(0, &buffer[copied..copied + length])
-                .is_none()
-            {
-                return Err(Errno::EFAULT);
-            }
-            copied += length;
+            _ => None,
         }
-        Ok(received)
     }
+}
 
-    fn try_write_datagram_to_iovec(
-        &self,
-        fd: &AnyTypedFd<Platform>,
-        iovs: &[IoWriteVec],
-    ) -> Result<Option<usize>, Errno> {
-        let AnyTypedFd::Network(fd) = fd else {
-            return Ok(None);
-        };
-        let socket = self.global.pin_socket(fd)?;
-        if socket.is_broker_datagram() {
-            self.write_datagram_to_iovec(&socket, iovs).map(Some)
-        } else {
-            Ok(None)
-        }
+/// Receives one datagram with `receive` and scatters it into `iovs`.
+fn read_datagram_from_iovec<Platform: ShimPlatform>(
+    iovs: &[IoReadVec],
+    receive: impl FnOnce(&mut [u8]) -> Result<usize, Errno>,
+) -> Result<usize, Errno> {
+    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+    let capacity = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    if capacity == 0 {
+        return Ok(0);
     }
+    let mut buffer = alloc::vec::Vec::new();
+    let capacity = capacity.min(litebox::net::SOCKET_RECEIVE_OPERATION_SIZE);
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| Errno::ENOMEM)?;
+    buffer.resize(capacity, 0);
+    let received = receive(&mut buffer)?.min(buffer.len());
+    let mut copied = 0;
+    for iov in iovs {
+        if copied == received {
+            break;
+        }
+        let length = (received - copied).min(iov.iov_len);
+        if iov
+            .iov_base
+            .copy_from_slice::<Platform>(0, &buffer[copied..copied + length])
+            .is_none()
+        {
+            return Err(Errno::EFAULT);
+        }
+        copied += length;
+    }
+    Ok(received)
+}
 
-    fn write_datagram_to_iovec(
-        &self,
-        socket: &super::net::InetSocketPin<'_, Platform>,
-        iovs: &[IoWriteVec],
-    ) -> Result<usize, Errno> {
-        check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-        let length = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
-        if length == 0 {
-            return Ok(0);
-        }
-        if length > litebox::net::MAX_UDP_DATAGRAM_SIZE {
-            return Err(Errno::EMSGSIZE);
-        }
-        let mut buffer = alloc::vec::Vec::new();
-        buffer
-            .try_reserve_exact(length)
-            .map_err(|_| Errno::ENOMEM)?;
-        for iov in iovs {
-            for offset in 0..iov.iov_len {
-                let offset = isize::try_from(offset).map_err(|_| Errno::EFAULT)?;
-                buffer.push(
-                    iov.iov_base
-                        .read_at_offset::<Platform>(offset)
-                        .ok_or(Errno::EFAULT)?,
-                );
-            }
-        }
-        self.global.send_to_pinned_socket(
-            &self.wait_cx(),
-            socket,
-            &buffer,
-            litebox_common_linux::SendFlags::empty(),
-        )
+/// Gathers `iovs` into one datagram of at most `max_length` bytes and sends it
+/// with `send`.
+fn write_datagram_to_iovec<Platform: ShimPlatform>(
+    iovs: &[IoWriteVec],
+    max_length: usize,
+    send: impl FnOnce(&[u8]) -> Result<usize, Errno>,
+) -> Result<usize, Errno> {
+    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+    let length = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    if length == 0 {
+        return Ok(0);
     }
+    if length > max_length {
+        return Err(Errno::EMSGSIZE);
+    }
+    let mut buffer = alloc::vec::Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| Errno::ENOMEM)?;
+    for iov in iovs {
+        for offset in 0..iov.iov_len {
+            let offset = isize::try_from(offset).map_err(|_| Errno::EFAULT)?;
+            buffer.push(
+                iov.iov_base
+                    .read_at_offset::<Platform>(offset)
+                    .ok_or(Errno::EFAULT)?,
+            );
+        }
+    }
+    send(&buffer)
 }
 
 /// Linux's `IOV_MAX` / `UIO_MAXIOV`: the kernel rejects iovec counts above this
@@ -1724,10 +1702,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let iovs: &[IoWriteVec] = &iovec
                 .to_owned_slice::<Platform>(iovcnt)
                 .ok_or(Errno::EFAULT)?;
-            match self.try_write_datagram_to_iovec(fd, iovs) {
-                Ok(Some(written)) => return Ok(written),
-                Ok(None) => {}
-                Err(error) => return Err(error),
+            if let Some(max_length) = self.datagram_size_limit(fd) {
+                return write_datagram_to_iovec::<Platform>(iovs, max_length, |buf| {
+                    self.do_write(fd, buf, None)
+                });
             }
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with

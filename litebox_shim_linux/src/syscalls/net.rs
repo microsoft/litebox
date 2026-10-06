@@ -91,16 +91,9 @@ pub(crate) struct InetSocketPin<'a, Platform: ShimPlatform> {
     state: SocketIoState,
     proxy: Arc<NetworkProxy<Platform>>,
     recv_timeout: Option<core::time::Duration>,
-    send_timeout: Option<core::time::Duration>,
     is_nonblock: bool,
     socket_type: SockType,
     recvmmsg_lock: SocketRecvmmsgLock<Platform>,
-}
-
-impl<Platform: ShimPlatform> InetSocketPin<'_, Platform> {
-    pub(crate) fn is_broker_datagram(&self) -> bool {
-        matches!(self.proxy.as_ref(), NetworkProxy::BrokerDatagram(_))
-    }
 }
 
 impl<Platform: ShimPlatform> Drop for InetSocketPin<'_, Platform> {
@@ -1019,10 +1012,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
             })?;
-        let (recv_timeout, send_timeout) = descriptor_table
-            .with_metadata(fd, |options: &SocketOptions| {
-                (options.recv_timeout, options.send_timeout)
-            })
+        let recv_timeout = descriptor_table
+            .with_metadata(fd, |options: &SocketOptions| options.recv_timeout)
             .map_err(|error| match error {
                 litebox::fd::MetadataError::NoSuchMetadata => unreachable!(),
                 litebox::fd::MetadataError::ClosedFd => Errno::EBADF,
@@ -1064,7 +1055,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             state,
             proxy,
             recv_timeout,
-            send_timeout,
             is_nonblock,
             socket_type,
             recvmmsg_lock,
@@ -1217,41 +1207,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
 
             Err(error) => Err(wait_errno(timeout, socket_io_errno(error))),
         }
-    }
-
-    pub(crate) fn send_to_pinned_socket(
-        &self,
-        cx: &WaitContext<'_, Platform>,
-        socket: &InetSocketPin<'_, Platform>,
-        buf: &[u8],
-        flags: SendFlags,
-    ) -> Result<usize, Errno> {
-        let new_flags = convert_flags!(
-            flags,
-            SendFlags,
-            litebox::net::SendFlags,
-            CONFIRM,
-            DONTROUTE,
-            EOR,
-            MORE,
-            OOB,
-        );
-        cx.with_timeout(socket.send_timeout)
-            .wait_on_events(
-                socket.is_nonblock || flags.contains(SendFlags::DONTWAIT),
-                Events::OUT,
-                |observer, filter| {
-                    socket.proxy.register_observer(observer, filter);
-                    Ok(())
-                },
-                || match socket.proxy.try_write(buf, new_flags, None) {
-                    Ok(0) if buf.is_empty() => Ok(0),
-                    Ok(0) | Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
-                    Ok(n) => Ok(n),
-                    Err(error) => Err(TryOpError::Other(Errno::from(error))),
-                },
-            )
-            .map_err(|error| wait_errno(socket.send_timeout, socket_io_errno(error)))
     }
 
     pub(crate) fn get_socket_type(&self, fd: &SocketFd<Platform>) -> Result<SockType, Errno> {
@@ -2855,49 +2810,6 @@ mod tests {
 
     #[test]
     #[ignore = "requires broker-backed socket test setup"]
-    fn socket_io_pin_keeps_backend_alive_for_send_after_close() {
-        let task = init_platform();
-        let fd = task
-            .do_socket(
-                AddressFamily::INET,
-                SockType::Datagram,
-                SockFlags::NONBLOCK,
-                0,
-            )
-            .unwrap();
-        let typed_fd = typed_socket(&task, fd);
-        let socket = task
-            .files
-            .borrow()
-            .pin_receive_socket(&task.global, &typed_fd)
-            .unwrap();
-        let state = match &socket {
-            super::ReceiveSocket::Inet(socket) => socket.state.clone(),
-            super::ReceiveSocket::Unix(_) => unreachable!(),
-        };
-
-        close_socket(&task, fd);
-        assert!(
-            state.0.load(core::sync::atomic::Ordering::Acquire) & super::SOCKET_IO_CLOSE_PENDING
-                != 0
-        );
-        let result = match &socket {
-            super::ReceiveSocket::Inet(socket) => task.global.send_to_pinned_socket(
-                &task.wait_cx(),
-                socket,
-                b"pinned",
-                SendFlags::empty(),
-            ),
-            super::ReceiveSocket::Unix(_) => unreachable!(),
-        };
-        assert_eq!(result, Err(Errno::EDESTADDRREQ));
-
-        drop(socket);
-        assert_eq!(state.0.load(core::sync::atomic::Ordering::Acquire), 0);
-    }
-
-    #[test]
-    #[ignore = "requires broker-backed socket test setup"]
     fn raw_inet_socket_pin_does_not_follow_dup2_replacement() {
         let task = init_platform();
         let old_fd = task
@@ -4289,6 +4201,67 @@ mod unix_tests {
 
         unix_socketpair_bidirectional(SockType::Stream, true);
         unix_socketpair_bidirectional(SockType::Datagram, true);
+    }
+
+    #[test]
+    fn unix_datagram_reads_and_vectors_keep_boundaries() {
+        use litebox_common_linux::{IoReadVec, IoWriteVec};
+
+        let task = init_platform();
+        // Non-blocking, so a split `readv` fails rather than waiting for another datagram.
+        let (sender, receiver) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Datagram,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let sender_fd = i32::try_from(sender).unwrap();
+        let receiver_fd = i32::try_from(receiver).unwrap();
+
+        let (first, second) = (b"ab", b"cdef");
+        let write_iovs = [
+            IoWriteVec {
+                iov_base: UserPtr::from_usize(first.as_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoWriteVec {
+                iov_base: UserPtr::from_usize(second.as_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+        let write_iovs_ptr = UserPtr::from_usize(write_iovs.as_ptr().expose_provenance());
+        assert_eq!(task.sys_writev(sender_fd, write_iovs_ptr, 2), Ok(6));
+        assert_eq!(task.sys_writev(sender_fd, write_iovs_ptr, 2), Ok(6));
+
+        let mut short = [0; 3];
+        assert_eq!(task.sys_read(receiver_fd, &mut short, None), Ok(3));
+        assert_eq!(&short, b"abc");
+
+        let (mut head, mut tail) = ([0; 1], [0; 8]);
+        let read_iovs = [
+            IoReadVec {
+                iov_base: UserPtrMut::from_usize(head.as_mut_ptr().expose_provenance()),
+                iov_len: head.len(),
+            },
+            IoReadVec {
+                iov_base: UserPtrMut::from_usize(tail.as_mut_ptr().expose_provenance()),
+                iov_len: tail.len(),
+            },
+        ];
+        let read_iovs_ptr = UserPtr::from_usize(read_iovs.as_ptr().expose_provenance());
+        assert_eq!(task.sys_readv(receiver_fd, read_iovs_ptr, 2), Ok(6));
+        assert_eq!(&head, b"a");
+        assert_eq!(&tail[..5], b"bcdef");
+
+        let receiver_typed = typed_socket(&task, receiver);
+        assert_eq!(
+            task.do_recvfrom(&receiver_typed, &mut short, ReceiveFlags::DONTWAIT, None),
+            Err(Errno::EAGAIN)
+        );
+        close_socket(&task, sender);
+        close_socket(&task, receiver);
     }
 
     #[test]
