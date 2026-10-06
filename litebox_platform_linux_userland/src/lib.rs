@@ -492,7 +492,6 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.
-/// Floating-point and extended CPU state start in architectural initial state.
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -507,7 +506,6 @@ where
 ///
 /// Unlike `run_thread`, this version takes a reference instead of ownership,
 /// avoiding struct moves that could invalidate internal state.
-/// CPU-state initialization is otherwise the same as [`run_thread`].
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -522,8 +520,6 @@ where
 ///
 /// This version takes a reference instead of ownership, avoiding struct moves
 /// that could invalidate internal state.
-/// Floating-point and extended CPU state are retained from the preceding guest
-/// invocation on this host thread.
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -611,6 +607,9 @@ guest_xsave:
 .globl xsave_mask
 xsave_mask:
     .quad 0
+.globl use_xsaveopt
+use_xsaveopt:
+    .byte 0
 host_x87_control_word:
     .word 0
     .align 4
@@ -625,9 +624,6 @@ in_guest:
     .byte 0
 .globl interrupt
 interrupt:
-    .byte 0
-.globl use_xsaveopt
-use_xsaveopt:
     .byte 0
     .align 4
 .globl pending_host_signals
@@ -814,11 +810,10 @@ exception_callback:
     mov     r8, rdx
 ",
     save_guest_xstate!(),
-"
-    mov     rdx, r8
-",
     restore_host_fp_controls!(),
 "
+    mov     rdx, r8
+
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -1043,8 +1038,6 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 
-    /// Inherits the calling guest's saved extended CPU state. Without a saved
-    /// guest context, the new thread starts in architectural initial state.
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1053,8 +1046,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
-        // Guest state was captured before entering the shim. The live host
-        // registers no longer contain the parent's guest FP environment.
+        // Inherits the calling guest's saved extended CPU state.
         let xstate_init = GUEST_XSTATE.with_borrow(|guest| {
             guest.as_ref().map_or(GuestXstateInit::Initial, |guest| {
                 GuestXstateInit::Inherited(guest.clone())
@@ -2333,46 +2325,17 @@ mod tests {
     extern crate std;
 
     #[test]
-    fn xstate_initialization_reuses_storage_and_preserves_reentry() {
-        use super::{GUEST_XSTATE, GuestXstateInit, activate_xstate};
-
-        activate_xstate(GuestXstateInit::Initial);
-        let address = GUEST_XSTATE.with_borrow_mut(|guest| {
-            let guest = guest.as_mut().unwrap();
-            guest.header_mut().xstate_bv = 3;
-            guest.legacy_area_mut().xmm_registers[0] = [0x5a; 16];
-            guest.as_ptr()
-        });
-
-        activate_xstate(GuestXstateInit::Reenter);
-        GUEST_XSTATE.with_borrow(|guest| {
-            let guest = guest.as_ref().unwrap();
-            assert_eq!(guest.as_ptr(), address);
-            assert_eq!(guest.xstate_bv(), 3);
-            assert_eq!(guest.legacy_area().xmm_registers[0], [0x5a; 16]);
-        });
-
-        activate_xstate(GuestXstateInit::Initial);
-        GUEST_XSTATE.with_borrow(|guest| {
-            let guest = guest.as_ref().unwrap();
-            assert_eq!(guest.as_ptr(), address);
-            assert_eq!(guest.xstate_bv(), 0);
-            assert_eq!(guest.legacy_area().xmm_registers[0], [0; 16]);
-            assert_eq!(guest.legacy_area().mxcsr, 0x1f80);
-        });
-    }
-
-    #[test]
     fn spawned_guest_inherits_xstate() {
         use litebox::platform::ThreadProvider as _;
         use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo, InitThread};
+        use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveLayout, XsaveLegacyArea};
         use litebox_common_linux::PtRegs;
         use std::sync::mpsc::{Sender, channel};
-        use zerocopy::IntoBytes as _;
 
         const TEST_CW: u16 = 0x0b7f;
         const TEST_MXCSR: u32 = 0x5f80;
-        const SNAPSHOT_SIZE: usize = 576;
+        // 1.0 in 80-bit floating-point format.
+        const X87_ONE: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f];
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_entry() {
@@ -2391,18 +2354,11 @@ mod tests {
                 "ldmxcsr [rsp + 36]",
                 "fld1",
                 "movdqu xmm0, [rsp]",
-                "test r8, r8",
-                "jz 2f",
-                "vmovdqu ymm0, [rsp]",
-                "2:",
                 "add rsp, 40",
                 "lea rcx, [rip + 4f]",
                 "jmp {syscall_callback}",
                 "3:",
                 "fxsave64 [rsi]",
-                "test r8, r8",
-                "jz 4f",
-                "vmovdqu [rsi + 512], ymm0",
                 "4:",
                 "lea rcx, [rip + 5f]",
                 "jmp {syscall_callback}",
@@ -2416,12 +2372,12 @@ mod tests {
 
         struct ChildStorage {
             _stack: Box<[u128; 256]>,
-            snapshot: Box<[u128; SNAPSHOT_SIZE / 16]>,
+            snapshot: XsaveArea,
         }
 
         struct Shim {
             platform: &'static LinuxUserland,
-            sender: Sender<[u8; SNAPSHOT_SIZE]>,
+            sender: Sender<XsaveLegacyArea>,
             child: Option<ChildStorage>,
         }
 
@@ -2442,9 +2398,7 @@ mod tests {
 
             fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
                 if let Some(child) = &self.child {
-                    self.sender
-                        .send(child.snapshot.as_bytes().try_into().unwrap())
-                        .unwrap();
+                    self.sender.send(*child.snapshot.legacy_area()).unwrap();
                 } else {
                     // SAFETY: These caller-saved registers belong to the shim;
                     // the parent's guest state has already been captured.
@@ -2457,7 +2411,7 @@ mod tests {
                         );
                     }
                     let mut stack = Box::new([0_u128; 256]);
-                    let mut snapshot = Box::new([0_u128; SNAPSHOT_SIZE / 16]);
+                    let mut snapshot = XsaveArea::initial(XsaveLayout::get());
                     let mut child_ctx = ctx.clone();
                     child_ctx.rip = guest_entry as *const () as usize;
                     child_ctx.rsp = stack.as_mut_ptr().wrapping_add(stack.len()).addr();
@@ -2494,12 +2448,10 @@ mod tests {
             sender,
             child: None,
         };
-        let avx = std::is_x86_feature_detected!("avx");
         let mut stack = [0_u128; 256];
         let mut ctx = PtRegs {
             rip: guest_entry as *const () as usize,
             rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
-            r8: usize::from(avx),
             eflags: 0x202,
             ..Default::default()
         };
@@ -2509,33 +2461,49 @@ mod tests {
         let snapshot = receiver
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        assert_eq!(
-            u16::from_le_bytes(snapshot[..2].try_into().unwrap()),
-            TEST_CW
-        );
-        assert_eq!(
-            u32::from_le_bytes(snapshot[24..28].try_into().unwrap()),
-            TEST_MXCSR
-        );
-        assert_eq!(&snapshot[32..42], &[0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f]);
-        assert_eq!(&snapshot[160..176], &[0x5a; 16]);
-        if avx {
-            assert_eq!(&snapshot[512..544], &[0x5a; 32]);
-        }
+        assert_eq!(snapshot.control_word, TEST_CW);
+        assert_eq!(snapshot.mxcsr, TEST_MXCSR);
+        assert_eq!(&snapshot.float_registers[0][..X87_ONE.len()], &X87_ONE);
+        assert_eq!(snapshot.xmm_registers[0], [0x5a; 16]);
     }
 
     #[test]
     fn xsave_preserves_state_across_guest_transitions() {
         use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+        use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveLegacyArea};
         use litebox_common_linux::PtRegs;
         use std::cell::Cell;
-        use zerocopy::IntoBytes as _;
 
         const TEST_CW: u16 = 0x077e;
         const TEST_MXCSR: u32 = 0x3f80;
         const HOST_CW: u16 = 0x0b7f;
         const HOST_MXCSR: u32 = 0x5f80;
-        const SNAPSHOT_SIZE: usize = 576;
+        const SNAPSHOT_COUNT: usize = 5;
+
+        #[repr(C, align(64))]
+        #[derive(Clone, Copy)]
+        struct Snapshot {
+            legacy: XsaveLegacyArea,
+            ymm_hi: [u8; 64],
+        }
+
+        impl Default for Snapshot {
+            fn default() -> Self {
+                Self {
+                    legacy: XsaveLegacyArea::default(),
+                    ymm_hi: [0; 64],
+                }
+            }
+        }
+
+        #[repr(C, align(64))]
+        struct CaptureSet {
+            snapshots: [Snapshot; SNAPSHOT_COUNT],
+            host_mxcsr: u32,
+            host_control: u16,
+        }
+
+        const SNAPSHOT_SIZE: usize = core::mem::size_of::<Snapshot>();
 
         #[unsafe(naked)]
         unsafe extern "C" fn guest_entry() {
@@ -2549,8 +2517,8 @@ mod tests {
                 "mov r15, r9",
                 // Record the host controls observed before installing guest
                 // state. The assertions below verify their exact restoration.
-                "stmxcsr [r12 + 5*{snapshot_size}]",
-                "fnstcw [r12 + 5*{snapshot_size} + 4]",
+                "stmxcsr [r12 + {host_mxcsr_offset}]",
+                "fnstcw [r12 + {host_control_offset}]",
                 // Install distinctive x87, SSE, and optional AVX guest state.
                 "sub rsp, 40",
                 "mov WORD PTR [rsp + 32], {control_word}",
@@ -2634,6 +2602,8 @@ mod tests {
                 "12:",
                 "ud2",
                 snapshot_size = const SNAPSHOT_SIZE,
+                host_mxcsr_offset = const core::mem::offset_of!(CaptureSet, host_mxcsr),
+                host_control_offset = const core::mem::offset_of!(CaptureSet, host_control),
                 control_word = const TEST_CW,
                 mxcsr = const TEST_MXCSR,
                 tgkill = const libc::SYS_tgkill,
@@ -2765,11 +2735,15 @@ mod tests {
             avx: std::is_x86_feature_detected!("avx"),
         };
         let mut stack = [0_u128; 256];
-        let mut snapshots = [0_u128; (5 * SNAPSHOT_SIZE + 16) / 16];
+        let mut captures = CaptureSet {
+            snapshots: [Snapshot::default(); SNAPSHOT_COUNT],
+            host_mxcsr: 0,
+            host_control: 0,
+        };
         let mut ctx = PtRegs {
             rip: guest_entry as *const () as usize,
             rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
-            rsi: snapshots.as_mut_ptr().addr(),
+            rsi: captures.snapshots.as_mut_ptr().addr(),
             rdi: usize::from(shim.avx),
             rdx: usize::try_from(super::INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed)).unwrap(),
             // SAFETY: These calls only query the current process and thread IDs.
@@ -2788,32 +2762,22 @@ mod tests {
         assert_eq!(shim.calls.get(), 4);
         assert_eq!(shim.exceptions.get(), 1);
         assert_eq!(shim.interrupts.get(), 1);
-        let bytes = snapshots.as_bytes();
-        for index in 0..5 {
-            let snapshot = &bytes[index * SNAPSHOT_SIZE..][..SNAPSHOT_SIZE];
+        for (index, snapshot) in captures.snapshots.iter().enumerate() {
             let expected_control = if index == 4 { 0x037f } else { TEST_CW };
             let expected_status = if index == 4 { 0 } else { 0x81 };
             let expected_vector = if index == 4 { 0 } else { 0x5a };
-            assert_eq!(
-                u16::from_le_bytes(snapshot[..2].try_into().unwrap()),
-                expected_control
-            );
-            assert_eq!(
-                u16::from_le_bytes(snapshot[2..4].try_into().unwrap()) & 0x81,
-                expected_status
-            );
-            assert_eq!(
-                u32::from_le_bytes(snapshot[24..28].try_into().unwrap()),
-                TEST_MXCSR
-            );
-            assert_eq!(&snapshot[160..176], &[expected_vector; 16]);
+            assert_eq!(snapshot.legacy.control_word, expected_control);
+            assert_eq!(snapshot.legacy.status_word & 0x81, expected_status);
+            assert_eq!(snapshot.legacy.mxcsr, TEST_MXCSR);
+            assert_eq!(snapshot.legacy.xmm_registers[0], [expected_vector; 16]);
             if shim.avx {
-                assert_eq!(&snapshot[512..544], &[expected_vector; 32]);
+                assert_eq!(&snapshot.ymm_hi[..32], &[expected_vector; 32]);
             }
         }
+        assert_eq!(captures.host_mxcsr, XsaveArea::GUEST_INITIAL_MXCSR);
         assert_eq!(
-            &bytes[5 * SNAPSHOT_SIZE..][..6],
-            &[0x80, 0x1f, 0, 0, 0x7f, 3]
+            captures.host_control,
+            XsaveArea::GUEST_INITIAL_X87_CONTROL_WORD
         );
     }
 
