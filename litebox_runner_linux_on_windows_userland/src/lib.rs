@@ -24,8 +24,9 @@ pub struct CliArgs {
     /// The program and arguments passed to it (e.g., `/bin/ls --color`).
     ///
     /// The program path refers to a path inside the broker-owned file system.
-    /// All binaries must be pre-rewritten with the syscall rewriter. Runners
-    /// the broker starts for child processes receive no program.
+    /// All binaries must be pre-rewritten with the syscall rewriter. This is
+    /// omitted when the broker starts this runner for a forked or exec'd child,
+    /// which gets what to run from the broker instead.
     #[arg(trailing_var_arg = true, value_hint = clap::ValueHint::CommandWithArguments)]
     pub program_and_arguments: Vec<String>,
     /// Environment variables passed to the program (`K=V` pairs; can be invoked multiple times)
