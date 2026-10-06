@@ -976,7 +976,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         buf: &[u8],
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
-        let is_inet_datagram = core::cell::Cell::new(false);
+        let is_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| {
                 self.global
@@ -986,7 +986,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
-                is_inet_datagram.set(matches!(
+                is_datagram.set(matches!(
                     self.global.get_socket_type(fd)?,
                     litebox_common_linux::SockType::Datagram
                 ));
@@ -1032,13 +1032,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .entry_handle(fd)
                     .ok_or(Errno::EBADF)?;
                 handle.with_entry(|file| {
+                    is_datagram.set(!file.is_stream());
                     file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
             |_fd| Err(Errno::EINVAL),
         );
+        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = result
-            && !is_inet_datagram.get()
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
