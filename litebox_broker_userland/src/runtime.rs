@@ -574,7 +574,7 @@ struct Workers<Memory: SharedMemory, RequestSource, ResponseSink, Shutdown> {
 /// request it received, so the requests of a mostly sequential peer keep going
 /// to one worker with a warm cache instead of rotating through ones that have
 /// gone cold. A worker passes the role on only before executing a request that
-/// waits (see [`waits`]), so a slow request does not hold up later ones.
+/// waits (see [`Workers::run`]), so a slow request does not hold up later ones.
 struct ReceivingRole {
     state: Mutex<Receivers>,
 }
@@ -591,17 +591,6 @@ struct Receivers {
     idle: Vec<Thread>,
     /// Workers started by [`ReceivingRole::pass`].
     started: Vec<JoinHandle<()>>,
-}
-
-/// Whether executing `operation` can wait long enough that later requests
-/// should not wait behind it.
-///
-/// Starting a child process waits for its runner's setup to finish. Other
-/// requests wait at most briefly for broker threads such as the socket
-/// reactor, and never for the guest, which learns of readiness through
-/// notifications instead.
-fn waits(operation: &BrokerOperation) -> bool {
-    matches!(operation, BrokerOperation::StartChildProcess(_))
 }
 
 impl ReceivingRole {
@@ -717,7 +706,11 @@ where
             let Some(request) = self.next_request() else {
                 return;
             };
-            holds_role = !waits(&request.operation);
+            // Starting a child process waits for its runner's setup, so another
+            // worker receives meanwhile. Other requests wait at most briefly for
+            // broker threads such as the socket reactor, and never for the
+            // guest, which learns of readiness through notifications instead.
+            holds_role = !matches!(request.operation, BrokerOperation::StartChildProcess(_));
             if !holds_role {
                 self.pass_role();
             }
