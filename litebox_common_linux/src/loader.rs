@@ -110,6 +110,84 @@ pub const TRAMPOLINE_HEADER_SIZE: usize = if cfg!(target_pointer_width = "64") {
     size_of::<TrampolineHeader32>()
 };
 
+/// Location of the LiteBox trampoline code described by a validated trampoline header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrampolineLayout {
+    /// File offset of the trampoline code.
+    pub file_offset: u64,
+    /// Virtual address of the trampoline code; relative to the load base for `ET_DYN`.
+    pub vaddr: usize,
+    /// Size of the trampoline code; zero if the rewriter found no syscalls to patch.
+    pub size: usize,
+}
+
+/// Errors from decoding a LiteBox trampoline header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrampolineHeaderError {
+    /// The header has the LiteBox prefix but an unsupported version.
+    UnsupportedVersion,
+    /// The header fields do not describe a valid trampoline layout.
+    Malformed,
+}
+
+/// Decodes and validates a LiteBox trampoline header read from `header_offset`,
+/// which must be the last [`TRAMPOLINE_HEADER_SIZE`] bytes of the file.
+///
+/// The expected file layout is `[ELF][padding][trampoline code][header]`.
+/// Returns `Ok(None)` if the header does not carry the LiteBox magic.
+pub fn parse_trampoline_header(
+    header: &[u8; TRAMPOLINE_HEADER_SIZE],
+    header_offset: u64,
+) -> Result<Option<TrampolineLayout>, TrampolineHeaderError> {
+    fn malformed<E>(_: E) -> TrampolineHeaderError {
+        TrampolineHeaderError::Malformed
+    }
+
+    // Format: "LITEBOX" + version byte.
+    if !header.starts_with(&TRAMPOLINE_MAGIC.to_le_bytes()) {
+        return if header.starts_with(b"LITEBOX") {
+            Err(TrampolineHeaderError::UnsupportedVersion)
+        } else {
+            Ok(None)
+        };
+    }
+
+    let layout = if cfg!(target_pointer_width = "64") {
+        let header = TrampolineHeader64::read_from_bytes(header).map_err(malformed)?;
+        TrampolineLayout {
+            file_offset: header.file_offset,
+            vaddr: usize::try_from(header.vaddr).map_err(malformed)?,
+            size: usize::try_from(header.trampoline_size).map_err(malformed)?,
+        }
+    } else {
+        let header = TrampolineHeader32::read_from_bytes(header).map_err(malformed)?;
+        TrampolineLayout {
+            file_offset: u64::from(header.file_offset),
+            vaddr: header.vaddr as usize,
+            size: header.trampoline_size as usize,
+        }
+    };
+
+    if layout.size == 0 {
+        return Ok(Some(layout));
+    }
+    let valid = layout.file_offset.is_multiple_of(PAGE_SIZE as u64)
+        && layout.vaddr.is_multiple_of(PAGE_SIZE)
+        // The trampoline code must immediately precede the header.
+        && layout.file_offset.checked_add(layout.size as u64) == Some(header_offset)
+        // Reject ranges that cannot be represented so later address arithmetic cannot wrap.
+        && layout
+            .vaddr
+            .checked_add(layout.size)
+            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
+            .is_some();
+    if valid {
+        Ok(Some(layout))
+    } else {
+        Err(TrampolineHeaderError::Malformed)
+    }
+}
+
 const CLASS: elf::file::Class = if cfg!(target_pointer_width = "64") {
     elf::file::Class::ELF64
 } else {
@@ -265,10 +343,6 @@ impl ElfParsedFile {
     ///
     /// `syscall_entry_point` is the address of the syscall entry point to write
     /// into the trampoline at map time.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "cannot panic: array slices are always the correct size"
-    )]
     pub fn parse_trampoline<F: ReadAt>(
         &mut self,
         file: &mut F,
@@ -282,88 +356,36 @@ impl ElfParsedFile {
 
         let file_size = file.size().map_err(ElfParseError::Io)?;
 
-        let header_size = TRAMPOLINE_HEADER_SIZE;
-
         // File must be large enough to contain the header
-        if file_size < header_size as u64 {
+        let Some(header_offset) = file_size.checked_sub(TRAMPOLINE_HEADER_SIZE as u64) else {
             // Too small for a trampoline header — binary is unpatched.
             return Err(ElfParseError::UnpatchedBinary);
-        }
-
-        // Read the header from the end of the file
-        let header_offset = file_size - header_size as u64;
-        let mut header_buf = [0u8; size_of::<TrampolineHeader64>()]; // Max header size
-        file.read_at(header_offset, &mut header_buf[..header_size])
-            .map_err(ElfParseError::Io)?;
-
-        // Check magic and version. Format: "LITEBOX" + version byte.
-        let magic = u64::from_le_bytes(header_buf[0..8].try_into().unwrap());
-        if magic != TRAMPOLINE_MAGIC {
-            // If the prefix matches but the version differs, fail explicitly.
-            if &header_buf[0..7] == b"LITEBOX" {
-                return Err(ElfParseError::BadTrampolineVersion);
-            }
-            // No trampoline found.
-            return Err(ElfParseError::UnpatchedBinary);
-        }
-
-        let (file_offset, vaddr, trampoline_size) = if cfg!(target_pointer_width = "64") {
-            let header = TrampolineHeader64::read_from_bytes(&header_buf)
-                .map_err(|_| ElfParseError::BadTrampoline)?;
-            let vaddr: usize = header
-                .vaddr
-                .try_into()
-                .map_err(|_| ElfParseError::BadTrampoline)?;
-            let trampoline_size: usize = header
-                .trampoline_size
-                .try_into()
-                .map_err(|_| ElfParseError::BadTrampoline)?;
-            (header.file_offset, vaddr, trampoline_size)
-        } else {
-            let header = TrampolineHeader32::read_from_bytes(&header_buf[..header_size])
-                .map_err(|_| ElfParseError::BadTrampoline)?;
-            (
-                u64::from(header.file_offset),
-                header.vaddr as usize,
-                header.trampoline_size as usize,
-            )
         };
 
-        // trampoline_size == 0 means the rewriter checked this binary and found
-        // no syscall instructions.
-        if trampoline_size == 0 {
+        // Read the header from the end of the file
+        let mut header_buf = [0u8; TRAMPOLINE_HEADER_SIZE];
+        file.read_at(header_offset, &mut header_buf)
+            .map_err(ElfParseError::Io)?;
+
+        let layout = match parse_trampoline_header(&header_buf, header_offset) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => return Err(ElfParseError::UnpatchedBinary),
+            Err(TrampolineHeaderError::UnsupportedVersion) => {
+                return Err(ElfParseError::BadTrampolineVersion);
+            }
+            Err(TrampolineHeaderError::Malformed) => return Err(ElfParseError::BadTrampoline),
+        };
+
+        // A zero size means the rewriter checked this binary and found no
+        // syscall instructions.
+        if layout.size == 0 {
             return Ok(());
         }
 
-        // Verify the file offset is page-aligned (as required by the rewriter)
-        if !file_offset.is_multiple_of(PAGE_SIZE as u64) {
-            return Err(ElfParseError::BadTrampoline);
-        }
-
-        // Verify the trampoline virtual address is page-aligned
-        if vaddr % PAGE_SIZE != 0 {
-            return Err(ElfParseError::BadTrampoline);
-        }
-
-        // The trampoline code should immediately precede the header.
-        if file_offset.checked_add(trampoline_size as u64) != Some(header_offset) {
-            return Err(ElfParseError::BadTrampoline);
-        }
-
-        // Reject a vaddr whose range cannot be represented, so that later
-        // address arithmetic cannot wrap.
-        if vaddr
-            .checked_add(trampoline_size)
-            .and_then(|end| end.checked_next_multiple_of(PAGE_SIZE))
-            .is_none()
-        {
-            return Err(ElfParseError::BadTrampoline);
-        }
-
         self.trampoline = Some(TrampolineInfo {
-            vaddr,
-            size: trampoline_size,
-            file_offset,
+            vaddr: layout.vaddr,
+            size: layout.size,
+            file_offset: layout.file_offset,
             syscall_entry_point,
         });
         Ok(())

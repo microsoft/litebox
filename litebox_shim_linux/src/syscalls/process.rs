@@ -14,12 +14,12 @@ use core::ops::Range;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use litebox::event::wait::WaitError;
+use litebox::platform::TimerHandle;
 use litebox::platform::{ArchSpecificRegister, RawMutex as _};
 use litebox::platform::{Instant as _, SystemTime as _, TimeProvider};
-use litebox::platform::{PageManagementProvider, TimerHandle};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::vmem::{PAGE_SIZE, VmFlags};
+use litebox_common_linux::vmem::VmFlags;
 use litebox_common_linux::{
     ArchPrctlArg, CloneFlags, FutexArgs, IntervalTimer, ItimerVal, PrctlArg, TimeParam,
     errno::Errno,
@@ -649,19 +649,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
-        let sp = if stack != 0 {
+        let sp = if stack == 0 {
+            None
+        } else if clone3 {
+            // Like Linux's `clone3_stack_valid`, require the whole stack to be user-addressable.
             let stack = usize::try_from(stack).map_err(|_| Errno::EINVAL)?;
             let size = usize::try_from(stack_size).map_err(|_| Errno::EINVAL)?;
             Some(
                 stack
                     .checked_add(size)
-                    .filter(|&end| {
-                        end <= <Platform as PageManagementProvider<PAGE_SIZE>>::TASK_ADDR_MAX
-                    })
+                    .filter(|&end| end <= Platform::TASK_ADDR_MAX)
                     .ok_or(Errno::EINVAL)?,
             )
         } else {
-            None
+            // Legacy `clone` passes the stack pointer through unchecked, as Linux does.
+            Some(stack.trunc())
         };
 
         let tls = if flags.contains(CloneFlags::SETTLS) {
@@ -1630,6 +1632,40 @@ mod tests {
     use crate::{UserPtr, UserPtrMut};
 
     extern crate std;
+
+    #[test]
+    fn test_clone3_rejects_invalid_stack_range() {
+        use litebox::platform::PageManagementProvider;
+        use litebox_common_linux::{CloneArgs, CloneFlags, PtRegs, errno::Errno};
+
+        let task = crate::syscalls::tests::init_platform(None);
+        let task_addr_max = <crate::syscalls::tests::TestPlatform as PageManagementProvider<
+            { litebox_common_linux::vmem::PAGE_SIZE },
+        >>::TASK_ADDR_MAX as u64;
+        for (stack, stack_size) in [(u64::MAX, 1), (task_addr_max, 0x1000)] {
+            let args = CloneArgs {
+                flags: CloneFlags::VM
+                    | CloneFlags::THREAD
+                    | CloneFlags::SIGHAND
+                    | CloneFlags::FILES,
+                stack,
+                stack_size,
+                pidfd: 0,
+                child_tid: 0,
+                parent_tid: 0,
+                exit_signal: 0,
+                tls: 0,
+                set_tid: 0,
+                set_tid_size: 0,
+                cgroup: 0,
+            };
+            assert_eq!(
+                task.do_clone(&PtRegs::default(), &args, true),
+                Err(Errno::EINVAL),
+                "stack={stack:#x} stack_size={stack_size:#x}"
+            );
+        }
+    }
 
     #[test]
     fn resource_limit_cur_never_exceeds_max() {

@@ -11,7 +11,9 @@ use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
-    loader::{TRAMPOLINE_HEADER_SIZE, TrampolineHeader64},
+    loader::{
+        TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, TrampolineLayout, parse_trampoline_header,
+    },
     vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError},
 };
 
@@ -23,12 +25,24 @@ use crate::syscalls::file::AnyTypedFd;
 use litebox::utils::TruncateExt as _;
 use object::elf::{ET_DYN, FileHeader64, PT_LOAD, ProgramHeader64};
 use object::endian::LittleEndian;
-use zerocopy::FromBytes as _;
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("ELF patching code assumes 64-bit pointers (u64 <-> usize is lossless)");
 
 const ENDIAN: LittleEndian = LittleEndian;
+
+/// Outcome of initializing [`ElfPatchState`] for a file mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElfPatchInit {
+    /// Patch state is cached for the file.
+    Ready,
+    /// The file is not a patchable ELF; nothing is cached.
+    Untracked,
+    /// The file is a pre-patched `ET_DYN`, but this mapping does not reveal its load base.
+    MissingLoadBase,
+    /// The file carries malformed LiteBox trampoline metadata.
+    Malformed,
+}
 
 /// Per-descriptor state for the shim's runtime ELF syscall rewriter.
 ///
@@ -186,7 +200,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
-            if !self.try_init_elf_patch_state(&patch_key, result.as_usize(), offset) {
+            // A missing load base is not fatal here: a later mapping may reveal it.
+            if self.try_init_elf_patch_state(&patch_key, result.as_usize(), offset)
+                == ElfPatchInit::Malformed
+            {
                 let _ = self.sys_munmap(result, len);
                 return Err(Errno::ENOMEM);
             }
@@ -551,11 +568,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// For ET_DYN binaries (PIE/shared libs), virtual addresses in program
     /// headers are relative to a base address chosen at load time. We derive
-    /// the base from the caller's mapping: `base = mapped_addr - p_vaddr` of
-    /// the segment being mapped. The `file_offset` parameter identifies which
-    /// segment is being mapped so we can look up its `p_vaddr`.
-    ///
-    /// Returns `false` only when malformed pre-patched metadata requires the mmap to fail.
+    /// the base from the caller's mapping: segments are mapped at
+    /// `base + align_down(p_vaddr)`. The `file_offset` parameter identifies
+    /// which segment is being mapped so we can look up its `p_vaddr`.
     ///
     /// x86_64 only: assumes 64-bit ELF layout and program header offsets.
     fn try_init_elf_patch_state(
@@ -563,28 +578,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: &ElfPatchKey<Platform>,
         mapped_addr: usize,
         file_offset: usize,
-    ) -> bool {
+    ) -> ElfPatchInit {
         // Quick check: skip if already initialized.
         let mut cache = self.global.elf_patch_cache.lock();
         if cache.contains_key(fd) {
-            return true;
+            return ElfPatchInit::Ready;
         }
 
         // Read the ELF header (64 bytes for Elf64).
         let mut ehdr_buf = [0u8; core::mem::size_of::<FileHeader64<LittleEndian>>()];
         match self.files.borrow().fs.read(&fd.0, &mut ehdr_buf, Some(0)) {
             Ok(n) if n == ehdr_buf.len() => {}
-            _ => return true, // Not readable or short read, skip
+            _ => return ElfPatchInit::Untracked, // Not readable or short read, skip
         }
 
         // Parse as typed ELF64 header.
         let Ok((ehdr, _)) = object::from_bytes::<FileHeader64<LittleEndian>>(&ehdr_buf) else {
-            return true;
+            return ElfPatchInit::Untracked;
         };
 
         // Verify ELF magic
         if &ehdr.e_ident.magic != b"\x7fELF" {
-            return true;
+            return ElfPatchInit::Untracked;
         }
 
         let e_type = ehdr.e_type.get(ENDIAN);
@@ -594,15 +609,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         // Validate e_phentsize: must be at least sizeof(Elf64_Phdr).
         if e_phentsize < core::mem::size_of::<ProgramHeader64<LittleEndian>>() {
-            return true;
+            return ElfPatchInit::Untracked;
         }
 
         // Read program headers.
         let Some(phdrs_size) = e_phentsize.checked_mul(e_phnum) else {
-            return true;
+            return ElfPatchInit::Untracked;
         };
         if phdrs_size == 0 || phdrs_size > 0x10000 {
-            return true; // Sanity check
+            return ElfPatchInit::Untracked; // Sanity check
         }
         let mut phdrs_buf = alloc::vec![0u8; phdrs_size];
         match self
@@ -612,7 +627,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .read(&fd.0, &mut phdrs_buf, Some(e_phoff))
         {
             Ok(n) if n == phdrs_buf.len() => {}
-            _ => return true,
+            _ => return ElfPatchInit::Untracked,
         }
 
         // Find highest PT_LOAD end (p_vaddr + p_memsz) and compute base_addr
@@ -640,32 +655,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if end > max_load_end {
                 max_load_end = end;
             }
-            // Match segment by page-aligned file offset to derive base address.
-            if base_addr.is_none()
+            // Match segment by page-aligned file offset to derive the ET_DYN load base.
+            if e_type == ET_DYN
+                && base_addr.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                let Some(base) = mapped_addr.checked_sub(p_vaddr.trunc()) else {
-                    return true;
-                };
-                base_addr = Some(base);
+                base_addr = mapped_addr.checked_sub(align_down(p_vaddr.trunc(), PAGE_SIZE));
             }
         }
 
         if max_load_end == 0 {
-            return true; // No PT_LOAD segments
+            return ElfPatchInit::Untracked; // No PT_LOAD segments
         }
-
-        // Check if file is pre-patched by reading the last 32 bytes for magic
-        let Ok(trampoline) = self.check_trampoline_magic(&fd.0) else {
-            litebox_util_log::debug!(file_offset:? = file_offset; "malformed LiteBox trampoline");
-            return false;
-        };
-        let (pre_patched, tramp_file_offset, tramp_vaddr, trampoline_file_size) =
-            if let Some((file_offset, vaddr, size)) = trampoline {
-                (true, file_offset, vaddr, size)
-            } else {
-                (false, 0, 0, 0)
-            };
 
         // Compute the trampoline virtual address.
         // - Pre-patched: use the exact address from the trampoline header (the
@@ -673,68 +674,67 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // - Unpatched: place it just past the highest PT_LOAD end (this is just
         //   a hint — validated by the ±2GB distance check with trap fallback).
         // For ET_DYN, virtual addresses are relative to the load base.
-        let trampoline_vaddr = if pre_patched {
-            if e_type == ET_DYN {
-                let Some(base) = base_addr else {
+        let (pre_patched, trampoline_file_offset, trampoline_file_size, trampoline_addr) =
+            match self.read_trampoline_layout(&fd.0) {
+                Err(error) => {
                     litebox_util_log::debug!(
-                        file_offset:? = file_offset, mapped_addr:? = mapped_addr;
-                        "skipping pre-patched ET_DYN initialization without a load base"
+                        file_offset:? = file_offset, error:? = error;
+                        "malformed LiteBox trampoline"
                     );
-                    return true;
-                };
-                let Some(address) = base.checked_add(tramp_vaddr) else {
-                    litebox_util_log::debug!(
-                        base:? = base, trampoline_vaddr:? = tramp_vaddr;
-                        "pre-patched trampoline address overflows"
-                    );
-                    return false;
-                };
-                address
-            } else {
-                tramp_vaddr
-            }
-        } else {
-            let base = if e_type == ET_DYN {
-                base_addr.unwrap_or(mapped_addr)
-            } else {
-                0
+                    return ElfPatchInit::Malformed;
+                }
+                Ok(Some(layout)) => {
+                    let base = if e_type == ET_DYN {
+                        let Some(base) = base_addr else {
+                            litebox_util_log::debug!(
+                                file_offset:? = file_offset, mapped_addr:? = mapped_addr;
+                                "pre-patched ET_DYN load base is unknown for this mapping"
+                            );
+                            return ElfPatchInit::MissingLoadBase;
+                        };
+                        base
+                    } else {
+                        0
+                    };
+                    let Some(addr) = base.checked_add(layout.vaddr).filter(|addr| {
+                        layout
+                            .size
+                            .checked_next_multiple_of(PAGE_SIZE)
+                            .and_then(|len| addr.checked_add(len))
+                            .is_some_and(|end| end <= Platform::TASK_ADDR_MAX)
+                    }) else {
+                        litebox_util_log::debug!(
+                            base:? = base, layout:? = layout;
+                            "pre-patched trampoline range is invalid"
+                        );
+                        return ElfPatchInit::Malformed;
+                    };
+                    (true, layout.file_offset, layout.size, addr)
+                }
+                Ok(None) => {
+                    let base = if e_type == ET_DYN {
+                        base_addr.unwrap_or(mapped_addr)
+                    } else {
+                        0
+                    };
+                    let max_end: usize = max_load_end.trunc();
+                    let Some(addr) = max_end
+                        .checked_next_multiple_of(PAGE_SIZE)
+                        .and_then(|end| base.checked_add(end))
+                    else {
+                        return ElfPatchInit::Untracked;
+                    };
+                    (false, 0, 0, addr)
+                }
             };
-            let max_end: usize = max_load_end.trunc();
-            let Some(address) = max_end
-                .checked_next_multiple_of(PAGE_SIZE)
-                .and_then(|end| base.checked_add(end))
-            else {
-                return true;
-            };
-            address
-        };
-
-        if pre_patched
-            && trampoline_file_size > 0
-            && trampoline_file_size
-                .checked_next_multiple_of(PAGE_SIZE)
-                .and_then(|len| trampoline_vaddr.checked_add(len))
-                .is_none_or(|end| {
-                    end > <Platform as litebox::platform::PageManagementProvider<{
-                        PAGE_SIZE
-                    }>>::TASK_ADDR_MAX
-                })
-        {
-            litebox_util_log::debug!(
-                trampoline_vaddr:? = trampoline_vaddr,
-                trampoline_file_size:? = trampoline_file_size;
-                "pre-patched trampoline range is invalid"
-            );
-            return false;
-        }
 
         cache.insert(
             fd.clone(),
             ElfPatchState {
                 pre_patched,
-                trampoline_file_offset: tramp_file_offset,
+                trampoline_file_offset,
                 trampoline_file_size,
-                trampoline_addr: trampoline_vaddr,
+                trampoline_addr,
                 trampoline_cursor: 0,
                 trampoline_mapped: false,
                 trampoline_mapped_len: 0,
@@ -743,56 +743,28 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 patched_ranges: BTreeSet::new(),
             },
         );
-        true
+        ElfPatchInit::Ready
     }
 
-    /// Check if a file has the LITEBOX trampoline magic at its tail.
-    /// Returns `Ok(None)` for an unpatched file and `Err(())` for malformed LiteBox metadata.
-    fn check_trampoline_magic(
+    /// Reads the LiteBox trampoline header at the file tail.
+    /// Returns `Ok(None)` if the file is unreadable or carries no LiteBox header.
+    fn read_trampoline_layout(
         &self,
         fd: &FileFd<Platform>,
-    ) -> Result<Option<(u64, usize, usize)>, ()> {
+    ) -> Result<Option<TrampolineLayout>, TrampolineHeaderError> {
         let files = self.files.borrow();
         let Ok(stat) = files.fs.fd_file_status(fd) else {
             return Ok(None);
         };
-        let file_size = stat.size;
-        if file_size < TRAMPOLINE_HEADER_SIZE {
+        let Some(header_offset) = stat.size.checked_sub(TRAMPOLINE_HEADER_SIZE) else {
             return Ok(None);
-        }
+        };
         let mut tail = [0u8; TRAMPOLINE_HEADER_SIZE];
-        match files
-            .fs
-            .read(fd, &mut tail, Some(file_size - TRAMPOLINE_HEADER_SIZE))
-        {
+        match files.fs.read(fd, &mut tail, Some(header_offset)) {
             Ok(n) if n == TRAMPOLINE_HEADER_SIZE => {}
             _ => return Ok(None),
         }
-        let Ok(header) = TrampolineHeader64::read_from_bytes(&tail) else {
-            return Err(());
-        };
-        if !header.has_valid_magic() {
-            return if &tail[..7] == b"LITEBOX" {
-                Err(())
-            } else {
-                Ok(None)
-            };
-        }
-        let Ok(vaddr) = usize::try_from(header.vaddr) else {
-            return Err(());
-        };
-        let Ok(trampoline_size) = usize::try_from(header.trampoline_size) else {
-            return Err(());
-        };
-        if trampoline_size > 0
-            && (!header.file_offset.is_multiple_of(PAGE_SIZE as u64)
-                || !vaddr.is_multiple_of(PAGE_SIZE)
-                || header.file_offset.checked_add(header.trampoline_size)
-                    != Some((file_size - TRAMPOLINE_HEADER_SIZE) as u64))
-        {
-            return Err(());
-        }
-        Ok(Some((header.file_offset, vaddr, trampoline_size)))
+        parse_trampoline_header(&tail, header_offset as u64)
     }
 
     /// Apply the trap fallback to a mapped code segment: replace all `syscall`
@@ -866,10 +838,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Initialize patch state if this is the first mmap for this fd.
         // Typically the first mapping is at offset 0 (the ELF header), but
         // some loaders may map an executable segment at a non-zero offset first.
-        if let Some(file_offset) = file_offset {
-            if !self.try_init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset) {
-                return false;
-            }
+        // Executing pre-patched code without its trampoline would fault on the
+        // first rewritten syscall, so both pre-patched failures are fatal here.
+        if let Some(file_offset) = file_offset
+            && matches!(
+                self.try_init_elf_patch_state(fd, mapped_addr.as_usize(), file_offset),
+                ElfPatchInit::MissingLoadBase | ElfPatchInit::Malformed
+            )
+        {
+            return false;
         }
 
         // This lock guards the elf_patch_cache and is held for the entire
@@ -1233,6 +1210,125 @@ mod tests {
 
     use crate::syscalls::tests::TestPlatform as Platform;
     use crate::{UserPtrMut, syscalls::tests::init_platform};
+
+    use super::{ElfPatchInit, ElfPatchKey};
+
+    /// Builds an ELF64 file with a single `PT_LOAD` segment and an optional LiteBox trailer
+    /// laid out as `[ELF][padding][trampoline][header]`.
+    fn elf_with_load(
+        e_type: u16,
+        p_offset: u64,
+        p_vaddr: u64,
+        trailer: Option<(&[u8; 8], u64)>,
+    ) -> alloc::vec::Vec<u8> {
+        let mut elf = alloc::vec![0u8; 64 + 56];
+        elf[..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&e_type.to_le_bytes());
+        elf[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum
+        let ph = &mut elf[64..];
+        ph[..4].copy_from_slice(&object::elf::PT_LOAD.to_le_bytes());
+        ph[8..16].copy_from_slice(&p_offset.to_le_bytes());
+        ph[16..24].copy_from_slice(&p_vaddr.to_le_bytes());
+        ph[40..48].copy_from_slice(&0x100u64.to_le_bytes()); // p_memsz
+        if let Some((magic, tramp_vaddr)) = trailer {
+            let tramp_offset = super::PAGE_SIZE as u64;
+            let tramp_size = 0x10u64;
+            elf.resize(super::PAGE_SIZE + 0x10, 0);
+            elf.extend_from_slice(magic);
+            elf.extend_from_slice(&tramp_offset.to_le_bytes());
+            elf.extend_from_slice(&tramp_vaddr.to_le_bytes());
+            elf.extend_from_slice(&tramp_size.to_le_bytes());
+        }
+        elf
+    }
+
+    fn open_patch_key(
+        task: &crate::Task<Platform>,
+        path: &str,
+        bytes: &[u8],
+    ) -> ElfPatchKey<Platform> {
+        let fd = task
+            .sys_open(path, OFlags::RDWR | OFlags::CREAT, Mode::RWXU)
+            .unwrap();
+        let fd = i32::try_from(fd).unwrap();
+        assert_eq!(task.sys_write(fd, bytes, None).unwrap(), bytes.len());
+        let crate::syscalls::file::AnyTypedFd::Fs(typed_fd) = task.typed_fd(fd).unwrap() else {
+            panic!("expected a filesystem fd");
+        };
+        ElfPatchKey(typed_fd)
+    }
+
+    #[test]
+    fn elf_patch_init_et_exec_with_unaligned_vaddr() {
+        let task = init_platform(None);
+        let key = open_patch_key(
+            &task,
+            "exec.elf",
+            &elf_with_load(object::elf::ET_EXEC, 0x40, 0x40_0040, None),
+        );
+        // The segment is mapped at `align_down(p_vaddr)`, below `p_vaddr` itself.
+        assert_eq!(
+            task.try_init_elf_patch_state(&key, 0x40_0000, 0),
+            ElfPatchInit::Ready
+        );
+        let cache = task.global.elf_patch_cache.lock();
+        let state = cache.get(&key).unwrap();
+        assert!(!state.pre_patched);
+        assert_eq!(state.trampoline_addr, 0x40_1000);
+    }
+
+    #[test]
+    fn elf_patch_init_pre_patched_et_dyn_requires_load_base() {
+        let task = init_platform(None);
+        let key = open_patch_key(
+            &task,
+            "dyn.elf",
+            &elf_with_load(object::elf::ET_DYN, 0, 0, Some((b"LITEBOX0", 0x2000))),
+        );
+        let unknown_offset = 0x5000;
+        assert_eq!(
+            task.try_init_elf_patch_state(&key, 0x7000_0000, unknown_offset),
+            ElfPatchInit::MissingLoadBase
+        );
+        // An executable mapping cannot proceed without the trampoline.
+        assert!(!task.maybe_patch_exec_segment(
+            UserPtrMut::from_usize(0x7000_0000),
+            0x1000,
+            &key,
+            0x1234,
+            Some(unknown_offset),
+        ));
+        assert!(task.global.elf_patch_cache.lock().get(&key).is_none());
+
+        assert_eq!(
+            task.try_init_elf_patch_state(&key, 0x7000_0000, 0),
+            ElfPatchInit::Ready
+        );
+        let cache = task.global.elf_patch_cache.lock();
+        let state = cache.get(&key).unwrap();
+        assert!(state.pre_patched);
+        assert_eq!(state.trampoline_addr, 0x7000_2000);
+    }
+
+    #[test]
+    fn elf_patch_init_rejects_unsupported_trampoline_version() {
+        let task = init_platform(None);
+        let key = open_patch_key(
+            &task,
+            "bad.elf",
+            &elf_with_load(object::elf::ET_DYN, 0, 0, Some((b"LITEBOX9", 0x2000))),
+        );
+        assert_eq!(
+            task.try_init_elf_patch_state(&key, 0x7000_0000, 0),
+            ElfPatchInit::Malformed
+        );
+    }
 
     #[test]
     fn brk_respects_initial_break_and_shrinks_within_current_page() {

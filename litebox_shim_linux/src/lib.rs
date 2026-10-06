@@ -183,9 +183,7 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
         let Some(new_page_end) = requested.checked_next_multiple_of(PAGE_SIZE) else {
             return Ok(state.current);
         };
-        if new_page_end
-            > <Platform as litebox::platform::PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX
-        {
+        if new_page_end > Platform::TASK_ADDR_MAX {
             return Ok(state.current);
         }
         if state.current >= requested {
