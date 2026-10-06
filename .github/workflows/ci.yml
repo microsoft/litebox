@@ -93,6 +93,11 @@ jobs:
         run: |
           QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh
+      - name: Run unmodified OP-TEE TAs in a QEMU VM with stacked runners (TCG)
+        # The kernel reflects their syscalls to the userland runner.
+        run: |
+          QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_optee_on_vm_userland.sh -u
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests

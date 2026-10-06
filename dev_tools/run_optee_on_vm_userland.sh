@@ -6,14 +6,15 @@
 # Run the OP-TEE TAs in litebox_runner_optee_on_linux_userland/tests under
 # QEMU with stacked runners: litebox_runner_vm_kernel as the guest kernel and
 # litebox_runner_optee_on_vm_userland as a ring-3 process serving the TA.
-# ldelf and each TA are syscall-rewritten ahead of time, then
+# ldelf and each TA are syscall-rewritten ahead of time (unless -u), then
 # packed with the userland runner and the TA's cmds.json into a tar passed as
 # the initrd.
 #
-# Usage: dev_tools/run_optee_on_vm_userland.sh [-t <ta>]... [-r] [-v]
+# Usage: dev_tools/run_optee_on_vm_userland.sh [-t <ta>]... [-u] [-r] [-v]
 #   -t   TA to run, e.g. hello-ta; append @default to omit its cmds.json
 #        (repeatable; default: every TA with a *-cmds.json, plus
 #        hello-ta@default for the default-commands path)
+#   -u   use unmodified ldelf and TAs; the kernel reflects their syscalls
 #   -r   build and run the release kernel
 #   -v   print the full guest log for passing runs too
 #
@@ -22,8 +23,8 @@
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
-#   CARGO_BUILD   command that builds the runners and the rewriter, run in
-#                 their directories (default: "cargo build"; CI uses
+#   CARGO_BUILD   command that builds the runners (and the rewriter unless
+#                 -u), run in their directories (default: "cargo build"; CI uses
 #                 ".github/tools/github_actions_run_cargo build")
 
 set -euo pipefail
@@ -40,9 +41,11 @@ tas=()
 profile=debug
 cargo_flags=()
 verbose=0
-while getopts "t:rvh" opt; do
+rewrite=1
+while getopts "t:urvh" opt; do
     case $opt in
         t) tas+=("$OPTARG") ;;
+        u) rewrite=0 ;;
         r) profile=release; cargo_flags+=(--release) ;;
         v) verbose=1 ;;
         *) awk 'NR >= 6 { if (!/^#/) exit; print }' "$0"; exit 2 ;;
@@ -61,14 +64,24 @@ echo "[*] building litebox_runner_vm_kernel and litebox_runner_optee_on_vm_userl
 # RUSTFLAGS would replace the codegen flags in its .cargo/config.toml.
 # shellcheck disable=SC2086
 (cd "$USERLAND_DIR" && env -u RUSTFLAGS $CARGO_BUILD "${cargo_flags[@]}")
-# shellcheck disable=SC2086
-(cd "$REPO_DIR" && $CARGO_BUILD -p litebox_syscall_rewriter)
-for f in "$KERNEL" "$USERLAND" "$REWRITER"; do
+built=("$KERNEL" "$USERLAND")
+if [[ $rewrite -eq 1 ]]; then
+    # shellcheck disable=SC2086
+    (cd "$REPO_DIR" && $CARGO_BUILD -p litebox_syscall_rewriter)
+    built+=("$REWRITER")
+fi
+for f in "${built[@]}"; do
     [[ -x $f ]] || { echo "error: the build did not produce $f" >&2; exit 2; }
 done
 echo "[*] kernel: $KERNEL"
 echo "[*] userland runner: $USERLAND"
 echo "[*] QEMU: $QEMU_ACCEL, -cpu $CPU"
+if [[ $rewrite -eq 1 ]]; then echo "[*] TAs: syscall-rewritten"; else echo "[*] TAs: unmodified"; fi
+
+# Copies a guest binary, syscall-rewritten unless -u.
+prepare() {
+    if [[ $rewrite -eq 1 ]]; then "$REWRITER" "$1" -o "$2"; else cp "$1" "$2"; fi
+}
 
 for ta in "${tas[@]}"; do
     name=${ta%@default}
@@ -76,8 +89,8 @@ for ta in "${tas[@]}"; do
     [[ -f "$TESTS_DIR/$name.elf" ]] || { echo "error: no TA $TESTS_DIR/$name.elf" >&2; exit 2; }
     mkdir -p "$WORK/$ta"
     cp "$USERLAND" "$WORK/$ta/runner.elf"
-    "$REWRITER" "$TESTS_DIR/ldelf.elf" -o "$WORK/$ta/ldelf.elf"
-    "$REWRITER" "$TESTS_DIR/$name.elf" -o "$WORK/$ta/ta.elf"
+    prepare "$TESTS_DIR/ldelf.elf" "$WORK/$ta/ldelf.elf"
+    prepare "$TESTS_DIR/$name.elf" "$WORK/$ta/ta.elf"
     files=(runner.elf ldelf.elf ta.elf)
     if [[ $ta != *@default && -f "$cmds" ]]; then
         cp "$cmds" "$WORK/$ta/cmds.json"
