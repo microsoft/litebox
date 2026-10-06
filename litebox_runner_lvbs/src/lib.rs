@@ -1744,8 +1744,7 @@ fn write_non_ta_msg_args_to_normal_world(
     Ok(())
 }
 
-// use include_bytes! to include ldelf
-const LDELF_BINARY: &[u8] = &[0u8; 0];
+const LDELF_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ldelf.elf"));
 const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
 const TA_SIGNING_CERT_DER: &[u8] = &[0u8; 0];
