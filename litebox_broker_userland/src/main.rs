@@ -112,7 +112,7 @@ struct CliArgs {
     #[arg(long, hide = true, requires = "unstable", conflicts_with = "runner")]
     in_process_runner: bool,
     /// Enable the experimental constrained process-duplication path.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[arg(
         long,
         hide = true,
@@ -375,7 +375,7 @@ mod cli_tests {
         assert_eq!(args.allow_udp_destination.len(), 1);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
     #[test]
     fn cli_rejects_process_duplication_with_in_process_runner() {
         let error = CliArgs::try_parse_from([

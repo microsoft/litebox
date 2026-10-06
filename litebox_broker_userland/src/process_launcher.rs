@@ -223,9 +223,11 @@ impl ProcessLauncher for UserlandProcessLauncher {
         )
     }
 
-    #[cfg(target_os = "linux")]
-    fn create_image(&self) -> Result<Box<dyn litebox_broker_core::ProcessImage>, BrokerError> {
-        crate::runner::create_image()
+    fn create_image(
+        &self,
+        capacity: u64,
+    ) -> Result<Box<dyn litebox_broker_core::ProcessImage>, BrokerError> {
+        crate::runner::create_image(capacity)
     }
 }
 

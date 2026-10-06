@@ -33,6 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 use crate::control_ring::PipeLiveness;
 use crate::named_pipe::{TRANSFER_FRAME_TAG, WindowsNamedPipeStream};
 use crate::pending_calls::{PendingCalls, pending_calls_error};
+use crate::process_image::WindowsReceivedProcessImage;
 use crate::setup::{
     copy_io_error, invalid_data, read_frame, read_pipe_until_cancelled, ring_error, wire_error,
     write_frame,
@@ -135,6 +136,22 @@ impl WindowsNamedPipeLocalSetupChannel {
         // SAFETY: The authenticated broker duplicated these handles into this process and encoded
         // their target-process values in the setup frame.
         unsafe { WindowsSharedMemory::control_ring_from_transferred(transfer) }
+    }
+
+    /// Receives and maps the optional process image the broker sent with
+    /// [`WindowsNamedPipeHostSetupChannel::send_process_image`](crate::named_pipe::WindowsNamedPipeHostSetupChannel::send_process_image).
+    pub fn receive_process_image(&mut self) -> IoResult<Option<WindowsReceivedProcessImage>> {
+        let frame =
+            read_frame(file_handle(&self.stream), self.setup_deadline)?.ok_or_else(|| {
+                Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "broker closed before transferring the process image",
+                )
+            })?;
+        let transfer = decode_transfer(&frame)?;
+        // SAFETY: The authenticated broker duplicated these handles into this process and encoded
+        // their target-process values in the setup frame.
+        unsafe { WindowsReceivedProcessImage::from_transferred(transfer) }
     }
 
     /// Activates calls and notifications over the transferred shared control ring.

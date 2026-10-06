@@ -559,15 +559,15 @@ impl BrokerProcess {
     /// Lets `write` store `length` bytes at `offset` in the memory image of
     /// the pending child selected by `child_process_id`.
     ///
-    /// The first write creates the image with `create`. The image ends no
-    /// later than the broker's child image size limit, and all child images
-    /// together stay within the broker's total child image size limit.
+    /// The first write creates the image with `create`, given the broker's
+    /// child image size limit, which the image never grows past. All child
+    /// images together stay within the broker's total child image size limit.
     pub fn write_child_memory<E: From<BrokerError>>(
         &self,
         child_process_id: ProcessId,
         offset: u64,
         length: u64,
-        create: impl FnOnce() -> Result<Box<dyn ProcessImage>>,
+        create: impl FnOnce(u64) -> Result<Box<dyn ProcessImage>>,
         write: impl FnOnce(&mut dyn ProcessImage) -> core::result::Result<(), E>,
     ) -> core::result::Result<(), E> {
         let limits = self.core.limits;
@@ -581,7 +581,7 @@ impl BrokerProcess {
         let image = match &mut pending.image {
             Some(image) => image,
             None => pending.image.insert(ChildImage::new(
-                create()?,
+                create(limits.max_child_image_size)?,
                 Arc::clone(&self.core.reserved_child_image_size),
             )),
         };
@@ -2370,7 +2370,8 @@ mod tests {
             .process_id;
         let writes = Arc::new(std::sync::Mutex::new(Vec::new()));
         let created = AtomicUsize::new(0);
-        let create = || {
+        let create = |capacity| {
+            assert_eq!(capacity, 8);
             created.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(TestImage(Arc::clone(&writes))) as Box<dyn ProcessImage>)
         };
@@ -2448,7 +2449,7 @@ mod tests {
                 child,
                 offset,
                 length,
-                || Ok(Box::new(TestImage)),
+                |_| Ok(Box::new(TestImage)),
                 |_| Ok(()),
             )
         };

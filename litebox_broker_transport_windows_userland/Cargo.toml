@@ -16,6 +16,7 @@ windows-sys = { version = "0.60.2", features = [
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 
