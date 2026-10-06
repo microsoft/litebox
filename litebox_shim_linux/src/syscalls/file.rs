@@ -1062,14 +1062,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// one whole datagram rather than one datagram per iovec.
     fn is_datagram_socket(&self, fd: &AnyTypedFd<Platform>) -> bool {
         match fd {
-            AnyTypedFd::Network(fd) => self
-                .global
-                .litebox
-                .descriptor_table()
-                .with_metadata(fd, |ty: &litebox_common_linux::SockType| {
-                    matches!(ty, litebox_common_linux::SockType::Datagram)
-                })
-                .unwrap_or(false),
+            AnyTypedFd::Network(fd) => self.global.get_proxy(fd).is_ok_and(|proxy| {
+                matches!(
+                    *proxy,
+                    litebox::net::socket_channel::NetworkProxy::Datagram(_)
+                )
+            }),
             AnyTypedFd::Unix(fd) => {
                 let handle = self.global.litebox.descriptor_table().entry_handle(fd);
                 handle.is_some_and(|handle| handle.with_entry(|socket| !socket.is_stream()))

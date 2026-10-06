@@ -2751,7 +2751,11 @@ mod tests {
             .unwrap();
         task.do_connect(&socket, SocketAddress::Inet(host.local_addr().unwrap()))
             .unwrap();
-        let fd = i32::try_from(raw_fd).unwrap();
+        // Use a duplicate, which must still be recognized as a datagram socket.
+        let raw_dup_fd = task
+            .sys_dup(i32::try_from(raw_fd).unwrap(), None, None)
+            .unwrap();
+        let fd = i32::try_from(raw_dup_fd).unwrap();
 
         let (first, second) = (b"ab", b"cdef");
         let write_iovs = [
@@ -2791,6 +2795,7 @@ mod tests {
         assert_eq!(task.sys_read(fd, &mut next, None), Ok(2));
         assert_eq!(&next[..2], b"lm");
 
+        close_socket(&task, raw_dup_fd);
         close_socket(&task, raw_fd);
     }
 
