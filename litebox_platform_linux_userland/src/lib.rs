@@ -754,17 +754,22 @@ fn get_guest_fsbase() -> usize {
 
 #[cfg(target_arch = "x86_64")]
 fn is_guest_thread() -> bool {
-    let marker: u8;
-    match GUEST_TLS_MODE.load(Ordering::Relaxed) {
+    macro_rules! read_guest_thread {
+        ($access:ident) => {{
+            let marker: u8;
+            core::arch::asm!(
+                concat!("mov {marker}, BYTE PTR ", $access!("guest_thread")),
+                marker = out(reg_byte) marker,
+                options(nostack, preserves_flags),
+            );
+            marker
+        }};
+    }
+
+    let marker = match GUEST_TLS_MODE.load(Ordering::Relaxed) {
         mode if mode == GuestTlsMode::Windows as u8 => {
             // SAFETY: Windows guests leave host TLS active in FS.
-            unsafe {
-                core::arch::asm!(
-                    concat!("mov {marker}, BYTE PTR ", tls!("guest_thread")),
-                    marker = out(reg_byte) marker,
-                    options(nostack, preserves_flags),
-                );
-            }
+            unsafe { read_guest_thread!(tls) }
         }
         _ => {
             // SAFETY: this platform requires FSGSBASE support.
@@ -773,15 +778,9 @@ fn is_guest_thread() -> bool {
             }
             // SAFETY: nonzero GS holds this thread's host TLS in Linux guest mode,
             // including after guest exit, when the lifetime marker has been cleared.
-            unsafe {
-                core::arch::asm!(
-                    concat!("mov {marker}, BYTE PTR ", saved_tls!("guest_thread")),
-                    marker = out(reg_byte) marker,
-                    options(nostack, preserves_flags),
-                );
-            }
+            unsafe { read_guest_thread!(saved_tls) }
         }
-    }
+    };
     marker != 0
 }
 
@@ -2145,18 +2144,11 @@ fn signal_handler_exit_guest(
                 }
             }
             _ => {
-                let gsbase: u64;
-                core::arch::asm! {
-                    "rdgsbase {}", out(reg) gsbase
-                };
+                let gsbase = litebox_common_linux::rdgsbase();
                 if gsbase == 0 || !take_guest!(saved_tls) {
                     return None;
                 }
-                core::arch::asm! {
-                    "wrfsbase {gsbase}",
-                    gsbase = in(reg) gsbase,
-                    options(nostack, preserves_flags)
-                };
+                litebox_common_linux::wrfsbase(gsbase);
             }
         }
         let guest_context_top: *mut litebox_common_linux::PtRegs;
