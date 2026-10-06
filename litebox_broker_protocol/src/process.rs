@@ -79,7 +79,7 @@ pub struct ProcessInfo {
     pub creator: Option<ProcessId>,
     /// Process that reaps this one.
     ///
-    /// The parent starts as the creator. When it exits, the nearest
+    /// The parent starts as the creator. When it exits, the nearest running
     /// ancestor that adopts orphans becomes the parent, or none does and the
     /// process is reaped when it exits.
     pub parent: Option<ProcessId>,

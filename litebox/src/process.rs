@@ -89,8 +89,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Sets whether this process adopts the children of its exiting
     /// descendants.
     ///
-    /// The children of an exiting process move to its nearest ancestor that
-    /// adopts them, or are left without a parent, which reaps each as it
+    /// The children of an exiting process move to its nearest running ancestor
+    /// that adopts them, or are left without a parent, which reaps each as it
     /// terminates.
     pub fn set_orphan_adoption(&self, enabled: bool) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
@@ -183,7 +183,7 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 /// A child process that has not started.
 ///
 /// Dropping it before it starts or exits discards the child, as if it had
-/// never been created.
+/// never been created, except that its parent learns it was removed.
 pub struct PendingChild {
     broker: Arc<dyn BrokerControl>,
     identity: ProcessIdentity,

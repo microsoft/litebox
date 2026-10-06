@@ -10,6 +10,7 @@ use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use crate::id::IdAllocator;
 use crate::object::{self, ObjectEntry, ObjectReference, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::signal::ProcessSignals;
@@ -196,7 +197,7 @@ struct ProcessLinks {
     /// Process that reaps this one, if any.
     ///
     /// This starts as the creator. Once the parent exits, it becomes the
-    /// nearest ancestor that adopts orphans, or none.
+    /// nearest running ancestor that adopts orphans, or none.
     parent: Option<Weak<BrokerProcess>>,
     /// Children not yet reaped, in the order this process gained them.
     ///
@@ -302,7 +303,7 @@ enum ProcessShutdownRequest {
 }
 
 impl BrokerProcess {
-    /// Creates authenticated broker process state.
+    /// Creates authenticated broker process state for the allocated ID `id`.
     ///
     /// A child of `creator` starts in its group and session, while a root
     /// process leads its own.
@@ -319,6 +320,7 @@ impl BrokerProcess {
             },
             |creator| creator.membership(),
         );
+        Self::retain_membership_ids(&mut core.ids.lock(), membership);
         Self {
             core,
             id,
@@ -470,7 +472,8 @@ impl BrokerProcess {
         result
     }
 
-    /// Discards a child that never started, as if it had never been created.
+    /// Discards a child that never started, as if it had never been created,
+    /// except that its parent learns it was removed.
     fn discard(&self) {
         let _ = self.fail_start(BrokerError::PeerClosed, false, true);
         self.retire(true);
@@ -584,7 +587,8 @@ impl BrokerProcess {
     }
 
     /// Discards the pending child selected by `child_process_id`, as if it
-    /// had never been created.
+    /// had never been created, except that this process learns it was
+    /// removed.
     pub fn cancel_child_process(&self, child_process_id: ProcessId) -> Result<()> {
         self.take_child_process(child_process_id)?.discard();
         Ok(())
@@ -616,9 +620,9 @@ impl BrokerProcess {
     /// Sets whether this running process adopts the orphaned children of its
     /// exiting descendants.
     ///
-    /// When a process exits, its children move to its nearest ancestor that
-    /// adopts orphans. Without one, they have no parent and are reaped as soon
-    /// as they exit.
+    /// When a process exits, its children move to its nearest running ancestor
+    /// that adopts orphans. Without one, they have no parent and are reaped as
+    /// soon as they exit.
     pub fn set_orphan_adoption(&self, enabled: bool) -> Result<()> {
         self.update_links(|links| links.adopts_orphans = enabled)
     }
@@ -744,7 +748,24 @@ impl BrokerProcess {
     ///
     /// Callers hold the core's process tree lock.
     pub(crate) fn set_membership(&self, membership: ProcessGroupMembership) {
-        self.links.lock().membership = membership;
+        let mut ids = self.core.ids.lock();
+        Self::retain_membership_ids(&mut ids, membership);
+        let previous = core::mem::replace(&mut self.links.lock().membership, membership);
+        Self::release_membership_ids(&mut ids, previous);
+    }
+
+    /// Keeps the IDs of the group and session in `membership` from being
+    /// reused while a process belongs to them, as Linux keeps a PID in use as
+    /// a process group or session ID.
+    fn retain_membership_ids(ids: &mut IdAllocator, membership: ProcessGroupMembership) {
+        ids.retain(membership.process_group.0);
+        ids.retain(membership.session.0);
+    }
+
+    /// Releases the IDs that [`Self::retain_membership_ids`] retained.
+    fn release_membership_ids(ids: &mut IdAllocator, membership: ProcessGroupMembership) {
+        ids.release(membership.process_group.0);
+        ids.release(membership.session.0);
     }
 
     /// Returns whether another process created this one.
@@ -777,15 +798,17 @@ impl BrokerProcess {
         self.links.lock().children.push(child);
     }
 
-    /// Returns the pending child selected by `child_process_id`.
-    pub(crate) fn pending_child_process(
+    /// Calls `f` with the pending child selected by `child_process_id`, which
+    /// stays pending until `f` returns.
+    pub(crate) fn with_pending_child<R>(
         &self,
         child_process_id: ProcessId,
-    ) -> Result<Arc<BrokerProcess>> {
+        f: impl FnOnce(&Arc<BrokerProcess>) -> R,
+    ) -> Result<R> {
         let mut state = self.state.lock();
-        Ok(Arc::clone(
-            &self.pending_child(&mut state, child_process_id)?.process,
-        ))
+        Ok(f(&self
+            .pending_child(&mut state, child_process_id)?
+            .process))
     }
 
     /// Returns whether this process completed broker startup.
@@ -834,8 +857,8 @@ impl BrokerProcess {
     /// Publishes one runner termination outcome.
     ///
     /// Exit releases object references, socket state, and, after clean
-    /// retirement, thread IDs. A zombie keeps only its process ID, registry
-    /// entry, and exit status, and remains until its parent reaps it and
+    /// retirement, thread IDs. A zombie keeps only its process ID, group and
+    /// session, registry entry, and exit status, and remains until its parent reaps it and
     /// runner supervision releases it. Only the first completion releases
     /// resources and records its status; later or concurrent completions
     /// return without effect.
@@ -868,7 +891,7 @@ impl BrokerProcess {
     /// then makes it a zombie retaining `exit_status`.
     ///
     /// The exit is reported to the parent, which keeps the zombie until it
-    /// reaps it. This process's children move to the nearest of its
+    /// reaps it. This process's children move to the nearest of its running
     /// ancestors that adopts orphans, if any.
     fn finish_exit(&self, exit_status: ProcessExitStatus, release_thread_ids: bool) -> Result<()> {
         // Like Linux, release resources before the exit becomes observable, so
@@ -914,14 +937,17 @@ impl BrokerProcess {
         Ok(())
     }
 
-    /// Returns the nearest of `ancestor` and its ancestors that adopts
-    /// orphans.
+    /// Returns the nearest of `ancestor` and its ancestors that is running and
+    /// adopts orphans.
     ///
+    /// Like Linux, this skips exiting ancestors, which could otherwise reap a
+    /// zombie orphan before passing their children on.
     /// Callers hold the core's process tree lock.
     fn nearest_adopter(mut ancestor: Option<Arc<Self>>) -> Option<Arc<Self>> {
         while let Some(process) = ancestor {
+            let running = process.accepts_operations(&process.state.lock());
             let links = process.links.lock();
-            if links.adopts_orphans {
+            if running && links.adopts_orphans {
                 drop(links);
                 return Some(process);
             }
@@ -1728,7 +1754,10 @@ impl BrokerProcess {
         let release_ids = release_ids && !invariant_fault;
         self.release_threads(release_ids);
         if release_ids {
-            self.core.ids.lock().release(self.id.0);
+            let membership = self.membership();
+            let mut ids = self.core.ids.lock();
+            ids.release(self.id.0);
+            Self::release_membership_ids(&mut ids, membership);
         }
         self.core.process_lifecycle_sink.changed();
     }
@@ -2355,6 +2384,49 @@ mod tests {
     }
 
     #[test]
+    fn orphans_skip_exiting_adopters() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .allocate_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let adopter = child_of(&root);
+        adopter.complete_start().unwrap();
+        let middle = child_of(&adopter);
+        middle.complete_start().unwrap();
+        let exiting = child_of(&middle);
+        exiting.complete_start().unwrap();
+        let running = child_of(&exiting);
+        running.complete_start().unwrap();
+        let zombie = child_of(&exiting);
+        run_to_exit(&zombie, SIGNALED);
+        adopter.set_orphan_adoption(true).unwrap();
+        middle.set_orphan_adoption(true).unwrap();
+        middle.set_child_reaping(true).unwrap();
+        let (signals, _) = open_signals(&adopter);
+        // Another caller has claimed the middle process's exit.
+        middle.state.lock().status = ProcessStatus::Exiting;
+
+        run_to_exit(&exiting, EXITED);
+
+        // The exiting middle process would have reaped the zombie at once.
+        assert_eq!(parent_id(&running), Some(adopter.id()));
+        assert_eq!(parent_id(&zombie), Some(adopter.id()));
+        assert_eq!(
+            crate::signal::take(&adopter, signals),
+            Ok(child_exited(&zombie, SIGNALED))
+        );
+        assert_eq!(
+            adopter.reap_child(ChildSelector::Any),
+            Ok(child_exit(&zombie, SIGNALED))
+        );
+    }
+
+    #[test]
     fn orphans_without_an_adopter_are_reaped_when_they_exit() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
@@ -2651,7 +2723,7 @@ mod tests {
         parent.complete_start().unwrap();
         let (signals, _) = open_signals(&parent);
         let process_id = parent.allocate_child_process().unwrap().process_id;
-        let child = parent.pending_child_process(process_id).unwrap();
+        let child = parent.with_pending_child(process_id, Arc::clone).unwrap();
         assert_eq!(
             parent.cancel_child_process(ProcessId(process_id.0 + 1)),
             Err(BrokerError::UnknownObject)

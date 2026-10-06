@@ -86,7 +86,7 @@ pub enum BrokerOperation {
     /// Record the exit of one pending child process that never started.
     ExitChildProcess(ExitChildProcessRequest),
     /// Discard one pending child process that never started, as if it had
-    /// never been created.
+    /// never been created, except that this process learns it was removed.
     CancelChildProcess(ProcessId),
     /// Report this process's final termination status before its runner exits.
     ///
@@ -102,8 +102,8 @@ pub enum BrokerOperation {
     /// Set whether this process adopts the orphaned children of its exiting
     /// descendants.
     ///
-    /// When a process exits, its children move to its nearest ancestor that
-    /// adopts orphans, and are otherwise reaped when they exit.
+    /// When a process exits, its children move to its nearest running ancestor
+    /// that adopts orphans, and are otherwise reaped when they exit.
     SetOrphanAdoption(bool),
     /// Read a process's place in the process tree.
     ///
