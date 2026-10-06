@@ -538,14 +538,12 @@ where
         }
 
         // SAFETY: NoReplace limits acquisition to unowned gaps in the requested range.
-        let acquired = match unsafe {
-            self.reserve_gaps(
-                platform,
-                range.clone(),
-                can_grow_down,
-                FixedAddressBehavior::NoReplace,
-            )
-        } {
+        let acquired = match self.reserve_gaps(
+            platform,
+            range.clone(),
+            can_grow_down,
+            FixedAddressBehavior::NoReplace,
+        ) {
             Ok(acquired) => acquired,
             Err(
                 AllocationError::AddressInUse
@@ -553,9 +551,8 @@ where
                 | AllocationError::AddressPartiallyInUse,
             ) if matches!(behavior, FixedAddressBehavior::Hint(_)) => {
                 // SAFETY: A zero-address hint requests a fresh extent and cannot replace memory.
-                let reservation = unsafe {
-                    Self::reserve_gap(platform, 0..range.len(), can_grow_down, behavior)
-                }?;
+                let reservation =
+                    Self::reserve_gap(platform, 0..range.len(), can_grow_down, behavior)?;
                 let base = reservation.range().start;
                 assert!(self.insert(base, reservation).is_none());
                 range = base..base + range.len();

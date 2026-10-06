@@ -161,7 +161,7 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
 
     /// Round and reserve one currently unowned gap, or allow platform to pick a suitable address
     /// to reserve if the requested start address is zero.
-    pub unsafe fn reserve_gap<Platform, const ALIGN: usize>(
+    pub fn reserve_gap<Platform, const ALIGN: usize>(
         platform: &Platform,
         requested: Range<usize>,
         can_grow_down: bool,
@@ -197,7 +197,7 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
     ///
     /// Panics if `requested` starts at zero.
     /// Panics if the platform returns a reservation whose base is already tracked.
-    pub unsafe fn reserve_gaps<Platform, const ALIGN: usize>(
+    pub fn reserve_gaps<Platform, const ALIGN: usize>(
         &mut self,
         platform: &Platform,
         requested: Range<usize>,
@@ -212,7 +212,7 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
         for gap in self.gaps(requested) {
             // SAFETY: The gap is disjoint from tracked reservations, or a zero-address hint that
             // permits relocation without replacement.
-            match unsafe { Self::reserve_gap(platform, gap, can_grow_down, placement) } {
+            match Self::reserve_gap(platform, gap, can_grow_down, placement) {
                 Ok(reservation) => acquired.push(reservation),
                 Err(error) => {
                     for reservation in acquired {
