@@ -2176,6 +2176,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             unimplemented!("no sigmask support yet");
         }
+        let timeout = timeout.read::<Platform>()?;
         if nfds
             > self
                 .process()
@@ -2184,7 +2185,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             return Err(Errno::EINVAL);
         }
-        let timeout = timeout.read::<Platform>()?;
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
         let mut set = super::epoll::PollSet::with_capacity(nfds).ok_or(Errno::ENOMEM)?;
