@@ -160,8 +160,6 @@ impl UserlandProcessLauncher {
         config: RunnerConfig,
         completion_sender: Option<SyncSender<IoResult<ExitStatus>>>,
     ) -> Result<(), BrokerError> {
-        // Starting a runner waits for its setup to finish.
-        crate::runtime::before_blocking();
         let process = Arc::clone(&association.process);
         let process_id = process.id();
         let Ok(instance) = RunnerInstance::start(config) else {

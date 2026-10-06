@@ -17,7 +17,6 @@
 //! surface. Both association entry points delegate to one internal runtime
 //! that owns the worker count.
 
-use std::cell::Cell;
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -31,7 +30,7 @@ use litebox_broker_host::{
     setup_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::BrokerRequest;
+use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
@@ -512,7 +511,7 @@ where
             association: &association,
         };
 
-        // This thread is the first worker; others start when requests block.
+        // This thread is the first worker; others start when requests wait.
         workers.run(false);
         drop(cancellation);
         for worker in workers.role.take_started() {
@@ -557,7 +556,7 @@ where
 /// The workers serving one association's requests.
 ///
 /// The association's own thread is the first worker; [`ReceivingRole::pass`]
-/// starts others only when a request is about to block while no worker is
+/// starts others only when a request is about to wait while no worker is
 /// idle.
 struct Workers<Memory: SharedMemory, RequestSource, ResponseSink, Shutdown> {
     association: Arc<BrokerHostAssociation<Memory>>,
@@ -574,8 +573,8 @@ struct Workers<Memory: SharedMemory, RequestSource, ResponseSink, Shutdown> {
 /// One worker at a time receives, and it keeps the role while it executes the
 /// request it received, so the requests of a mostly sequential peer keep going
 /// to one worker with a warm cache instead of rotating through ones that have
-/// gone cold. A worker passes the role on only when execution is about to wait
-/// (see [`before_blocking`]), so a slow request does not hold up later ones.
+/// gone cold. A worker passes the role on only before executing a request that
+/// waits (see [`waits`]), so a slow request does not hold up later ones.
 struct ReceivingRole {
     state: Mutex<Receivers>,
 }
@@ -594,26 +593,15 @@ struct Receivers {
     started: Vec<JoinHandle<()>>,
 }
 
-/// A receiving role held by the worker executing a request.
-trait HeldReceivingRole {
-    fn pass(self: Arc<Self>);
-}
-
-std::thread_local! {
-    /// The receiving role this thread holds while executing a request.
-    static HELD_RECEIVING_ROLE: Cell<Option<Arc<dyn HeldReceivingRole>>> =
-        const { Cell::new(None) };
-}
-
-/// Lets another worker receive requests while the calling thread waits.
+/// Whether executing `operation` can wait long enough that later requests
+/// should not wait behind it.
 ///
-/// Request execution calls this before it waits for anything other than the
-/// CPU, such as another thread or process. It does nothing on a thread that is
-/// not executing a request while holding its association's receiving role.
-pub(crate) fn before_blocking() {
-    if let Some(role) = HELD_RECEIVING_ROLE.take() {
-        role.pass();
-    }
+/// Starting a child process waits for its runner's setup to finish. Other
+/// requests wait at most briefly for broker threads such as the socket
+/// reactor, and never for the guest, which learns of readiness through
+/// notifications instead.
+fn waits(operation: &BrokerOperation) -> bool {
+    matches!(operation, BrokerOperation::StartChildProcess(_))
 }
 
 impl ReceivingRole {
@@ -707,24 +695,6 @@ impl ReceivingRole {
     }
 }
 
-impl<Memory, RequestSource, ResponseSink, Shutdown> HeldReceivingRole
-    for Workers<Memory, RequestSource, ResponseSink, Shutdown>
-where
-    Memory: SharedMemory,
-    RequestSource: HostRequestSource<Error = IoError> + Send + 'static,
-    ResponseSink: HostResponseSink<Error = IoError> + Send + Sync + 'static,
-    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
-{
-    fn pass(self: Arc<Self>) {
-        self.role.pass(|index| {
-            let workers = Arc::clone(&self);
-            std::thread::Builder::new()
-                .name(format!("litebox-broker-worker-{index}"))
-                .spawn(move || workers.run(true))
-        });
-    }
-}
-
 impl<Memory, RequestSource, ResponseSink, Shutdown>
     Workers<Memory, RequestSource, ResponseSink, Shutdown>
 where
@@ -747,7 +717,10 @@ where
             let Some(request) = self.next_request() else {
                 return;
             };
-            HELD_RECEIVING_ROLE.set(Some(Arc::clone(self) as Arc<dyn HeldReceivingRole>));
+            holds_role = !waits(&request.operation);
+            if !holds_role {
+                self.pass_role();
+            }
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.association.execute_request_with(
                     request,
@@ -766,8 +739,19 @@ where
                         .report_panic(IoError::other("broker request worker panicked"));
                 }
             }
-            holds_role = HELD_RECEIVING_ROLE.take().is_some();
         }
+    }
+
+    /// Passes the receiving role on before executing a request that waits.
+    ///
+    /// See [`ReceivingRole::pass`] for which worker takes it.
+    fn pass_role(self: &Arc<Self>) {
+        self.role.pass(|index| {
+            let workers = Arc::clone(self);
+            std::thread::Builder::new()
+                .name(format!("litebox-broker-worker-{index}"))
+                .spawn(move || workers.run(true))
+        });
     }
 
     /// Receives the next request while holding the receiving role, or returns

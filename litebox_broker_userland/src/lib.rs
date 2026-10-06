@@ -31,5 +31,6 @@ mod timer;
 /// The maximum number of worker threads that serve one association's requests.
 ///
 /// An association starts with a single worker, its own thread. Another worker is started only
-/// when a request is about to block and no worker is idle to receive the next request.
+/// when a request is about to wait, such as for a child process to start, and no worker is idle
+/// to receive the next request.
 const WORKER_COUNT: usize = 8;

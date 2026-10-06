@@ -171,22 +171,8 @@ pub struct LinuxSocketProvider {
 impl LinuxSocketProvider {
     /// Starts a provider with global and per-process socket limits.
     pub fn new(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
-        Self::with_blocking_hook(max_sockets, max_sockets_per_process, || {})
-    }
-
-    /// Starts a provider that calls `before_blocking` before a broker worker blocks
-    /// on the reactor.
-    pub fn with_blocking_hook(
-        max_sockets: usize,
-        max_sockets_per_process: usize,
-        before_blocking: fn(),
-    ) -> IoResult<Self> {
         Ok(Self {
-            reactor: Arc::new(ReactorClient::start(
-                max_sockets,
-                max_sockets_per_process,
-                before_blocking,
-            )?),
+            reactor: Arc::new(ReactorClient::start(max_sockets, max_sockets_per_process)?),
         })
     }
 }
@@ -429,15 +415,10 @@ struct ReactorClient {
     wake: Arc<OwnedFd>,
     next_socket_id: AtomicU64,
     thread: Mutex<Option<JoinHandle<()>>>,
-    before_blocking: fn(),
 }
 
 impl ReactorClient {
-    fn start(
-        max_sockets: usize,
-        max_sockets_per_process: usize,
-        before_blocking: fn(),
-    ) -> IoResult<Self> {
+    fn start(max_sockets: usize, max_sockets_per_process: usize) -> IoResult<Self> {
         let epoll_fd = epoll::create(epoll::CreateFlags::CLOEXEC)?;
         let wake = Arc::new(eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?);
         epoll::add(
@@ -502,7 +483,6 @@ impl ReactorClient {
             wake,
             next_socket_id: AtomicU64::new(1),
             thread: Mutex::new(Some(reactor_thread)),
-            before_blocking,
         })
     }
 
@@ -518,7 +498,6 @@ impl ReactorClient {
         &self,
         make_command: impl FnOnce(SyncSender<BrokerResult<T>>) -> ReactorCommand,
     ) -> BrokerResult<T> {
-        (self.before_blocking)();
         let (response, receive) = sync_channel(1);
         let command = make_command(response);
         // Block until the reactor has queue space rather than surfacing a
@@ -543,7 +522,6 @@ impl ReactorClient {
         address: SocketAddrV4,
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
-        (self.before_blocking)();
         let (response, receive) = sync_channel(1);
         let command = ReactorCommand::Connect {
             id,
@@ -569,7 +547,6 @@ impl ReactorClient {
     }
 
     fn close_socket(&self, id: u64) {
-        (self.before_blocking)();
         let (response, receive) = sync_channel(1);
         if self
             .commands
@@ -740,7 +717,6 @@ impl ReactorClient {
     }
 
     fn close_process(&self, process_authority: ProcessId) {
-        (self.before_blocking)();
         let (response, receive) = sync_channel(1);
         if self
             .commands

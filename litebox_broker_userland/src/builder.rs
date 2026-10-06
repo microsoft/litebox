@@ -137,10 +137,9 @@ fn platform_socket_provider(
     limits: &BrokerCoreLimits,
 ) -> Result<Arc<dyn SocketProvider>, BrokerBuildError> {
     Ok(Arc::new(
-        litebox_broker_platform_linux_userland::LinuxSocketProvider::with_blocking_hook(
+        litebox_broker_platform_linux_userland::LinuxSocketProvider::new(
             limits.max_sockets,
             limits.max_sockets_per_process,
-            crate::runtime::before_blocking,
         )?,
     ))
 }
