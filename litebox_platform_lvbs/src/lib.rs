@@ -518,6 +518,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// entire kernel physical range, and loaded via CR3. Pages inside the kernel
     /// text section (`text_phys_start..text_phys_end`) and the Hyper-V hypercall
     /// code page are mapped executable; every other page is marked `NO_EXECUTE`.
+    /// `.rodata` is mapped read-only and `CR0.WP` is enabled.
     ///
     /// # Prerequisites
     ///
@@ -550,6 +551,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// - CR3 points to the new base page table covering the **full** kernel
     ///   physical range with DEP enforcement.
+    /// - `CR0.WP` is set on the calling CPU; APs inherit it via their VP context.
     /// - The previous trampoline page table frames (early page table pages and
     ///   any Phase 1 scratch pages) are no longer referenced and may be
     ///   reclaimed by the caller.
@@ -563,20 +565,44 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// * `text_phys_start` / `text_phys_end`: Page-aligned physical address
     ///   range of the kernel `.text` section (converted to PA after
     ///   relocation).
+    /// * `rodata_phys_start` / `rodata_phys_end`: Same, for `.rodata`.
     ///
     /// # Panics
     ///
     /// Panics if the heap is not seeded, if any address argument is invalid
-    /// or misaligned, or if the text section falls outside the VTL1 range.
+    /// or misaligned, or if the text or rodata section falls outside the VTL1
+    /// range or they overlap.
     pub fn new(
         phys_start: x86_64::PhysAddr,
         phys_end: x86_64::PhysAddr,
         text_phys_start: x86_64::PhysAddr,
         text_phys_end: x86_64::PhysAddr,
+        rodata_phys_start: x86_64::PhysAddr,
+        rodata_phys_end: x86_64::PhysAddr,
     ) -> &'static Self {
         let physframe_start = PhysFrame::containing_address(phys_start);
         let physframe_end = PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE));
         let vtl1_range = PhysFrame::range(physframe_start, physframe_end);
+
+        let text = text_phys_start..text_phys_end;
+        let rodata = rodata_phys_start..rodata_phys_end;
+        let vtl1_phys = physframe_start.start_address()..physframe_end.start_address();
+        for region in [&text, &rodata] {
+            assert!(region.start <= region.end, "reversed kernel image range");
+            assert!(
+                region.start.is_aligned(Size4KiB::SIZE) && region.end.is_aligned(Size4KiB::SIZE),
+                "kernel image range {region:?} must be page-aligned"
+            );
+            assert!(
+                region.is_empty()
+                    || (vtl1_phys.start <= region.start && region.end <= vtl1_phys.end),
+                "kernel image range {region:?} is outside VTL1 memory"
+            );
+        }
+        assert!(
+            rodata.is_empty() || text.end <= rodata.start || rodata.end <= text.start,
+            "kernel text and read-only data overlap"
+        );
 
         // Create the base page table with DEP enforcement.
         //
@@ -585,7 +611,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         //   2. The Hyper-V hypercall code page (defined in the linker script;
         //      the hypervisor writes executable code into it at runtime)
         #[allow(unused_mut)]
-        let mut exec_ranges = alloc::vec![text_phys_start..text_phys_end];
+        let mut exec_ranges = alloc::vec![text];
         #[cfg(not(test))]
         {
             use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
@@ -603,6 +629,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
                 vtl1_range,
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
                 Some(&exec_ranges),
+                Some(core::slice::from_ref(&rodata)),
             )
             .is_err()
         {
@@ -621,6 +648,8 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         // in use. The Phase 1 trampoline page table (VTL0's PML4) is no
         // longer needed.
         base_pt.load();
+
+        crate::arch::enable_write_protect();
 
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.

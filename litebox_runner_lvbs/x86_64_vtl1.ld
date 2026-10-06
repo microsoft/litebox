@@ -2,6 +2,14 @@ OUTPUT_FORMAT("elf64-x86-64")
 OUTPUT_ARCH(i386:x86-64)
 ENTRY(_start)
 
+/* A single LOAD segment: the VTL0 loader requires each LOAD segment's p_align
+   to be a multiple of 2 MiB, which .text's alignment provides without padding.
+   Page permissions are set by the platform, not by segment flags. */
+PHDRS
+{
+    image PT_LOAD FLAGS(7);
+}
+
 SECTIONS
 {
     . = 0x0;
@@ -16,13 +24,16 @@ SECTIONS
         _text_start = .;
         KEEP(*(.text._start))
         *(.text .text.*)
-        *(.got)
+        . = ALIGN(0x1000);
         _text_end = .;
-    }
-    .data : ALIGN(0x200000) { 
-        _data_start = .;
+    } :image
+
+    /* Writable only during self-relocation; mapped R/NX by the platform afterward. */
+    .rodata : ALIGN(0x1000) {
+        _rodata_start = .;
         *(.rodata .rodata.*)
-        *(.data .data.*)
+        *(.data.rel.ro .data.rel.ro.*)
+        *(.got .got.*)
 
         /* Exception table for fallible memory operations (memcpy_fallible, etc.) */
         . = ALIGN(4);
@@ -30,6 +41,13 @@ SECTIONS
         KEEP(*(ex_table))
         __stop_ex_table = .;
 
+        . = ALIGN(0x1000);
+        _rodata_end = .;
+    }
+
+    .data : ALIGN(0x1000) {
+        _data_start = .;
+        *(.data .data.*)
         _data_end = .;
 
         . = ALIGN(0x1000);
@@ -49,7 +67,7 @@ SECTIONS
     }
 
     /* Relocation section for position-independent execution */
-    .rela.dyn : ALIGN(0x200000) {
+    .rela.dyn : ALIGN(0x1000) {
         _rela_start = .;
         *(.rela.text .rela.text*)
         *(.rela.data .rela.data*)

@@ -35,8 +35,8 @@ use litebox_platform_lvbs::{
             VSM_SK_PTE_PAGES_COUNT, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
             VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE, VTL1_PTE_0_PAGE, VTL1_REMAP_PDE_PAGE,
             VTL1_REMAP_PDPT_PAGE, get_heap_start_address, get_memory_base_address,
-            get_rela_end_address, get_rela_start_address, get_text_end_address,
-            get_text_start_address,
+            get_rela_end_address, get_rela_start_address, get_rodata_end_address,
+            get_rodata_start_address, get_text_end_address, get_text_start_address,
         },
     },
 };
@@ -142,6 +142,10 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         let text_phys_start = Platform::va_to_pa(x86_64::VirtAddr::new(get_text_start_address()));
         let text_phys_end = Platform::va_to_pa(x86_64::VirtAddr::new(get_text_end_address()));
 
+        let rodata_phys_start =
+            Platform::va_to_pa(x86_64::VirtAddr::new(get_rodata_start_address()));
+        let rodata_phys_end = Platform::va_to_pa(x86_64::VirtAddr::new(get_rodata_end_address()));
+
         // Reclaim .rela.dyn section memory now that relocations have been applied
         // and we are running at high-canonical addresses.
         // After two-phase relocation, `get_rela_start/end_address()` return
@@ -160,7 +164,14 @@ pub fn init(is_bsp: bool) -> &'static Platform {
             );
         }
 
-        let platform = Platform::new(vtl1_start, vtl1_end, text_phys_start, text_phys_end);
+        let platform = Platform::new(
+            vtl1_start,
+            vtl1_end,
+            text_phys_start,
+            text_phys_end,
+            rodata_phys_start,
+            rodata_phys_end,
+        );
         assert!(
             BOOT_PLATFORM.set(platform).is_ok(),
             "the BSP must publish the platform exactly once"
