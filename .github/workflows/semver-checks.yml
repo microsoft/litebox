@@ -1,6 +1,6 @@
 name: SemverChecks
 
-# Run on pull requests or merge groups
+# Run on pull requests, merge groups, or PR comments (to re-run fork checks)
 on:
   pull_request:
     types:
@@ -15,10 +15,11 @@ on:
       - deleted
   merge_group:
 
-# If a new commit is pushed to the branch before ongoing runs finish, cancel the ongoing runs
+# One group per PR (or merge group ref); comment runs get their own group so they never cancel checks.
+# New runs cancel in-progress ones, except PR edits, which wait and replace any pending run instead.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ (github.event_name == 'issue_comment' && github.run_id) || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'pull_request' || github.event.action != 'edited' }}
 
 permissions:
   contents: read
