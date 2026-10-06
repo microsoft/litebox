@@ -184,6 +184,7 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
         } else {
             FixedAddressBehavior::NoReplace
         };
+        // SAFETY: only pass `Hint` and `NoReplace` to the platform.
         unsafe { platform.reserve_pages(core::iter::empty, start..end, can_grow_down, placement) }
     }
 
@@ -210,8 +211,6 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
         assert_ne!(requested.start, 0, "reserve_gaps requires a concrete range");
         let mut acquired = Vec::new();
         for gap in self.gaps(requested) {
-            // SAFETY: The gap is disjoint from tracked reservations, or a zero-address hint that
-            // permits relocation without replacement.
             match Self::reserve_gap(platform, gap, can_grow_down, placement) {
                 Ok(reservation) => acquired.push(reservation),
                 Err(error) => {
