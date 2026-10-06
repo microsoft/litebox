@@ -163,7 +163,6 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     }
 
     /// Returns the initial and current program break.
-    #[cfg(target_arch = "x86_64")]
     fn program_break(&self) -> (usize, usize) {
         let state = self.brk.lock();
         (state.initial, state.current)
@@ -175,7 +174,6 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     /// # Panics
     ///
     /// Panics if the initial program break has already been set.
-    #[cfg(target_arch = "x86_64")]
     fn restore_program_break(&self, initial: usize, current: usize) {
         let mut state = self.brk.lock();
         assert_eq!(state.initial, 0, "initial brk is already set");
@@ -529,7 +527,6 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
     ///
     /// Each memory region is restored at the parent's address and fails if the address is in
     /// use. Regions formerly backed by files are restored as anonymous memory.
-    #[cfg(target_arch = "x86_64")]
     pub fn restore_fork(
         &self,
         startup: litebox_common_linux::program_startup::LinuxForkStartup,
@@ -549,6 +546,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             signal_actions,
             alternate_signal_stack,
             registers,
+            vector_state,
             thread_pointer,
             syscall_entry_point,
             set_child_tid,
@@ -586,7 +584,13 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
         fs_state.set_umask(umask);
 
         let thread = syscalls::process::ThreadState::new_process(pid);
-        thread.set_forked_init_state(registers, thread_pointer, set_child_tid, clear_child_tid);
+        thread.set_forked_init_state(
+            registers,
+            vector_state,
+            thread_pointer,
+            set_child_tid,
+            clear_child_tid,
+        );
         let entrypoints = crate::LinuxShimEntrypoints {
             _not_send: core::marker::PhantomData,
             task: Task {
@@ -641,7 +645,6 @@ pub struct LoadedProgram<Platform: ShimPlatform> {
 }
 
 /// A failure to continue a process duplicated by `fork`.
-#[cfg(target_arch = "x86_64")]
 #[derive(Debug, thiserror::Error)]
 pub enum ForkRestoreError {
     /// The runner's code addresses differ from the parent's runner.
@@ -1394,26 +1397,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             SyscallRequest::Clone { args } => self.sys_clone(ctx, &args),
             SyscallRequest::Clone3 { args } => self.sys_clone3(ctx, args),
-            SyscallRequest::Fork => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    self.sys_fork(ctx)
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    Err(Errno::ENOSYS)
-                }
-            }
-            SyscallRequest::Vfork => {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    self.sys_vfork(ctx)
-                }
-                #[cfg(not(target_arch = "x86_64"))]
-                {
-                    Err(Errno::ENOSYS)
-                }
-            }
+            SyscallRequest::Fork => self.sys_fork(ctx),
+            SyscallRequest::Vfork => self.sys_vfork(ctx),
             SyscallRequest::SetThreadArea { user_desc } => {
                 // Neither x86-64 nor AArch64 supports `set_thread_area`.
                 let _ = user_desc;
@@ -1571,6 +1556,8 @@ struct VforkState<Platform: ShimPlatform> {
     child: litebox::process::Process<Platform>,
     child_pid: i32,
     parent_context: litebox_common_linux::PtRegs,
+    /// The parent's floating-point and vector state, which the child may change.
+    parent_vector_state: litebox_common_linux::GuestVectorState,
     parent_fs: Arc<syscalls::file::FsState<Platform>>,
     parent_files: Arc<syscalls::file::FilesState<Platform>>,
     parent_signals: syscalls::signal::VforkParentSignals<Platform>,

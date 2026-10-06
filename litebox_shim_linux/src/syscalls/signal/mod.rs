@@ -132,7 +132,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     /// Returns the initial signal state of a process duplicated by `fork`, which inherits the
     /// `blocked` mask, the dispositions in `actions`, indexed by signal number minus one, and
     /// the alternate signal stack, but none of the pending signals.
-    #[cfg(target_arch = "x86_64")]
     pub fn forked(blocked: SigSet, actions: &[SigAction; NSIG], altstack: SigAltStack) -> Self {
         let mut state = Self::new_process();
         state.set_signal_mask(blocked);
@@ -152,7 +151,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
 
     /// Returns the blocked mask, the dispositions indexed by signal number minus one, and the
     /// alternate signal stack, which a child duplicated by `fork` inherits.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn fork_state(&self) -> (SigSet, [SigAction; NSIG], SigAltStack) {
         let handlers = self.handlers.borrow();
         let handlers = handlers.inner.lock();
@@ -192,7 +190,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
     ///
     /// If `reset_handlers` is set, like `CLONE_CLEAR_SIGHAND`, the child's handled signals take
     /// their default action. Process-directed pending signals stay queued for the parent.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn begin_vfork_child(&self, reset_handlers: bool) -> VforkParentSignals<Platform> {
         let mut child_handlers = SignalHandlers::clone(&self.handlers.borrow());
         if reset_handlers {

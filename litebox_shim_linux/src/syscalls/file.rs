@@ -330,7 +330,6 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
 
     /// Installs the descriptors a process duplicated by `fork` inherited, with their
     /// close-on-exec flags.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn install_forked_fds(
         &self,
         global: &GlobalState<Platform>,
@@ -470,7 +469,6 @@ impl<Platform: ShimPlatform> core::fmt::Debug for AnyTypedFd<Platform> {
 impl<Platform: ShimPlatform> FilesState<Platform> {
     /// Returns a `vfork` child's copy of this table, whose descriptors keep their numbers and
     /// close-on-exec flags and share this table's open file descriptions.
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn copy_for_vfork(&self, global: &GlobalState<Platform>) -> Self {
         // Sibling threads cannot change the table while it is locked for the copy.
         let rds = self.raw_descriptor_store.read();
@@ -585,7 +583,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Each is returned as its startup record, whose handle the caller replaces with the child's,
     /// and the object the child inherits. This fails like [`Self::inheritable_fds`].
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn fds_inherited_across_fork(
         &self,
     ) -> Result<alloc::vec::Vec<(ForkedFd, InheritableFd<Platform>)>, Errno> {

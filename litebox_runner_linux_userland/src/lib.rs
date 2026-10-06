@@ -295,7 +295,6 @@ fn run_program(
 
 /// Continues the process a parent duplicated by `fork`, whose memory contents are in
 /// `process_image`, if any.
-#[cfg(target_arch = "x86_64")]
 fn restore_fork(
     shim: &litebox_shim_linux::LinuxShim<Platform>,
     startup: LinuxForkStartup,
@@ -324,22 +323,11 @@ fn restore_fork(
     .context("failed to continue the forked process")
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn restore_fork(
-    _shim: &litebox_shim_linux::LinuxShim<Platform>,
-    _startup: LinuxForkStartup,
-    _initial_thread: litebox::thread::Thread,
-    _process_image: Option<std::os::fd::OwnedFd>,
-) -> Result<litebox_shim_linux::LoadedProgram<Platform>> {
-    anyhow::bail!("fork is unsupported on this architecture")
-}
-
 /// Maps `image`, which is `image_len` bytes long, privately over the page-aligned whole `pages`
 /// from `offset`, so they share the image's memory until written instead of copying it.
 ///
 /// The pages start zero-filled, and those past the image's end stay so, as accessing a mapping
 /// there would fault.
-#[cfg(target_arch = "x86_64")]
 fn map_process_image(
     image: &std::fs::File,
     image_len: u64,

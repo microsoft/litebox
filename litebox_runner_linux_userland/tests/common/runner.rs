@@ -143,7 +143,7 @@ impl Runner {
         self
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn broker_socket(&mut self, control_socket_path: &Path) -> &mut Self {
         self.use_userland_broker = false;
         self.command
@@ -152,7 +152,7 @@ impl Runner {
         self
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn use_in_process_runner(&mut self) -> &mut Self {
         self.use_userland_broker = true;
         self.in_process_mode = true;

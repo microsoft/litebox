@@ -8,13 +8,13 @@ use std::path::{Path, PathBuf};
 
 use common::runner::Runner;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(target_os = "linux")]
 const BROKER_HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 struct TestRandomProvider;
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl litebox_broker_core::random::RandomProvider for TestRandomProvider {
     fn fill(
         &self,
@@ -25,12 +25,12 @@ impl litebox_broker_core::random::RandomProvider for TestRandomProvider {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 struct CapturingStdioProvider {
     stdout_tx: std::sync::mpsc::Sender<Vec<u8>>,
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl litebox_broker_core::stdio::StdioProvider for CapturingStdioProvider {
     fn is_terminal(&self, _stream: litebox_broker_core::stdio::StdioStream) -> bool {
         false
@@ -63,6 +63,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "async_x16.c",
     "fork_parent.c",
     "fork_threads_parent.c",
+    "fork_vector_state.c",
     "gate_signals.c",
     "sigreturn.c",
     "sigreturn_simd.c",
@@ -93,7 +94,7 @@ const BROKER_ONLY_C_TESTS: &[&str] = &[
     "urandom_broker.c",
 ];
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn gateway_destination_rule() -> litebox_broker_core::DestinationRule {
     use litebox_broker_protocol::socket::{Ipv4Address, Port};
 
@@ -104,14 +105,14 @@ fn gateway_destination_rule() -> litebox_broker_core::DestinationRule {
     )
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn gateway_tcp_policy() -> litebox_broker_core::SocketPolicy {
     litebox_broker_core::SocketPolicy::guest_network()
         .with_tcp_destination_rules(&[gateway_destination_rule()])
         .unwrap()
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn gateway_udp_policy() -> litebox_broker_core::SocketPolicy {
     litebox_broker_core::SocketPolicy::guest_network()
         .with_udp_destination_rules(&[gateway_destination_rule()])
@@ -191,7 +192,13 @@ fn test_static_exec_with_rewriter() {
     }
 }
 
+/// The signal `__builtin_trap` raises: it executes `ud2` on x86-64 and `brk` on AArch64.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const TRAP_SIGNAL: i32 = libc::SIGILL;
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const TRAP_SIGNAL: i32 = libc::SIGTRAP;
+
+#[cfg(target_os = "linux")]
 fn numeric_field(line: &str, name: &str) -> i32 {
     line.split_whitespace()
         .find_map(|field| {
@@ -204,7 +211,7 @@ fn numeric_field(line: &str, name: &str) -> i32 {
 
 /// Runs `vfork_exec_parent.c`, which execs `vfork_exec_child.c` with
 /// `child_args`, and returns the combined output.
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn run_vfork_exec(name: &str, child_args: &[&str]) -> String {
     let parent_name = format!("{name}_parent");
     let child_name = format!("{name}_child");
@@ -223,7 +230,7 @@ fn run_vfork_exec(name: &str, child_args: &[&str]) -> String {
     String::from_utf8(runner.output()).unwrap()
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
     let output = run_vfork_exec("vfork_exec", &[]);
@@ -253,7 +260,7 @@ fn vfork_exec_starts_fresh_runner_and_resumes_parent() {
     assert!(child_line.contains("env=1"));
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_exec_child_inherits_descriptors_not_marked_close_on_exec() {
     let parent = common::compile("./tests/vfork_fd_parent.c", "vfork_fd_parent", true, false);
@@ -298,7 +305,7 @@ fn vfork_exec_child_inherits_descriptors_not_marked_close_on_exec() {
     assert_eq!(usize::try_from(length).unwrap(), log.join("\n").len() + 1);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_children_change_their_own_descriptors() {
     let parent = common::compile(
@@ -359,7 +366,7 @@ fn vfork_children_change_their_own_descriptors() {
     assert_eq!(numeric_field(vfork_line, "second="), 0);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_exec_children_share_pipes_with_their_parent() {
     let parent = common::compile(
@@ -421,7 +428,7 @@ fn vfork_exec_children_share_pipes_with_their_parent() {
     assert_eq!(numeric_field(early_line, "epipe="), 1);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_exec_child_signal_death_is_reported_to_parent() {
     let output = run_vfork_exec("vfork_exec_abort", &["abort"]);
@@ -439,7 +446,7 @@ fn vfork_exec_child_signal_death_is_reported_to_parent() {
     assert_eq!(numeric_field(parent_line, "signal="), libc::SIGABRT);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_child_exit_resumes_parent_with_waitable_child() {
     let parent = common::compile(
@@ -472,7 +479,7 @@ fn vfork_child_exit_resumes_parent_with_waitable_child() {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_exec_failure_returns_error_to_child() {
     let parent = common::compile(
@@ -502,7 +509,7 @@ fn vfork_exec_failure_returns_error_to_child() {
     assert_eq!(numeric_field(parent_line, "echild="), 1);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_child_fault_resumes_parent_with_signaled_child() {
     let parent = common::compile(
@@ -525,12 +532,11 @@ fn vfork_child_fault_resumes_parent_with_signaled_child() {
     assert_ne!(child, parent_pid);
     assert_eq!(numeric_field(parent_line, "waited="), child);
     assert_eq!(numeric_field(parent_line, "signaled="), 1);
-    // `__builtin_trap` executes `ud2`.
-    assert_eq!(numeric_field(parent_line, "signal="), libc::SIGILL);
+    assert_eq!(numeric_field(parent_line, "signal="), TRAP_SIGNAL);
     assert_eq!(numeric_field(parent_line, "echild="), 1);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_child_has_its_own_signal_state() {
     let parent = common::compile(
@@ -597,7 +603,7 @@ fn vfork_child_has_its_own_signal_state() {
     assert_eq!(numeric_field(child_line, "usr2_blocked="), 0);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_children_are_reaped_automatically_when_sigchld_says_so() {
     let parent = common::compile(
@@ -650,7 +656,7 @@ fn vfork_children_are_reaped_automatically_when_sigchld_says_so() {
     assert_eq!(numeric_field(line("reap-reset "), "reaped="), 0);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn kill_signals_other_processes() {
     let parent = common::compile(
@@ -734,7 +740,7 @@ fn kill_signals_other_processes() {
     assert_eq!(numeric_field(missing, "self_check="), 1, "{missing}");
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_children_signal_parent_on_termination() {
     let parent = common::compile(
@@ -791,7 +797,7 @@ fn vfork_children_signal_parent_on_termination() {
     assert_eq!(numeric_field(exited, "early="), 1);
     let killed = line("killed ");
     reaped(killed);
-    assert_handled(killed, libc::CLD_KILLED, libc::SIGILL);
+    assert_handled(killed, libc::CLD_KILLED, TRAP_SIGNAL);
     assert_eq!(numeric_field(killed, "early="), 1);
     let paused = line("paused ");
     reaped(paused);
@@ -817,7 +823,7 @@ fn vfork_children_signal_parent_on_termination() {
     assert_eq!(numeric_field(default, "exit="), 42);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn clone_vfork_children_start_like_vfork_children() {
     let parent = common::compile(
@@ -895,7 +901,7 @@ fn clone_vfork_children_start_like_vfork_children() {
 }
 
 /// Stages the host's `dash`, with its libraries, as the guest's `/bin/sh`, and a `/tmp` directory.
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn stage_shell(root: &Path) {
     const SHELL: &str = "/usr/bin/dash";
     assert!(common::rewrite_with_cache(
@@ -913,7 +919,7 @@ fn stage_shell(root: &Path) {
     std::fs::create_dir_all(root.join("tmp")).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn vfork_children_run_shell_commands() {
     let parent = common::compile(
@@ -949,7 +955,7 @@ fn vfork_children_run_shell_commands() {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn fork_child_resumes_from_parent_snapshot() {
     let parent = common::compile("./tests/fork_parent.c", "fork_parent", true, false);
@@ -990,7 +996,7 @@ fn fork_child_resumes_from_parent_snapshot() {
     assert_eq!(numeric_field(raw_line, "code="), 9);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn fork_pauses_sibling_threads() {
     let parent = common::compile(
@@ -1013,7 +1019,36 @@ fn fork_pauses_sibling_threads() {
     assert_eq!(numeric_field(line, "slept="), 1);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+/// Checks that `fork` copies d8 and FPCR to the child and that a `vfork` child's changes to them
+/// do not reach the parent. x86-64 platforms do not capture vector state yet.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[test]
+fn fork_and_vfork_preserve_vector_state() {
+    let program = common::compile(
+        "./tests/fork_vector_state.c",
+        "fork_vector_state",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&program, "fork_vector_state");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = |prefix: &str| {
+        output
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix:?} output in {output:?}"))
+    };
+    let fork_line = line("fork ");
+    assert_eq!(numeric_field(fork_line, "parent="), 1, "{fork_line}");
+    assert_eq!(numeric_field(fork_line, "child="), 1, "{fork_line}");
+    let vfork_line = line("vfork ");
+    assert_eq!(numeric_field(vfork_line, "parent="), 1, "{vfork_line}");
+    assert_eq!(numeric_field(vfork_line, "child="), 1, "{vfork_line}");
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn fork_requires_process_duplication() {
     let parent = common::compile(
@@ -1031,7 +1066,7 @@ fn fork_requires_process_duplication() {
     assert_eq!(numeric_field(line, "errno="), libc::EPERM);
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn forked_shell_subshells_and_pipelines() {
     const SCRIPT: &str = r#"
@@ -1081,7 +1116,7 @@ fn run_which(prog: &str) -> std::path::PathBuf {
     prog_path
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn unique_test_socket_path(name: &str) -> PathBuf {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1093,7 +1128,7 @@ fn unique_test_socket_path(name: &str) -> PathBuf {
     ))
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 struct TestBroker {
     thread: Option<std::thread::JoinHandle<()>>,
     done_rx: std::sync::mpsc::Receiver<()>,
@@ -1103,7 +1138,7 @@ struct TestBroker {
     control_socket_path: PathBuf,
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl TestBroker {
     fn next_close_object_count(&self) -> usize {
         self.close_object_count_rx
@@ -1168,14 +1203,14 @@ impl TestBroker {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 impl Drop for TestBroker {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.control_socket_path);
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn spawn_test_broker(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
@@ -1191,7 +1226,7 @@ fn spawn_test_broker(
     )
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn spawn_concurrent_test_broker(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
@@ -1207,7 +1242,7 @@ fn spawn_concurrent_test_broker(
     )
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn test_file_service(
     file_roots: &[PathBuf],
     stdio: std::sync::Arc<dyn litebox_broker_core::stdio::StdioProvider>,
@@ -1299,7 +1334,7 @@ fn test_file_service(
     std::sync::Arc::new(Resolver::<LinuxSyncPrimitivesProvider, _>::new(backend))
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn spawn_test_broker_with_mode(
     control_socket_path: &Path,
     policy: litebox_broker_core::PolicyEngine,
@@ -1387,7 +1422,7 @@ fn spawn_test_broker_with_mode(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn run_test_broker_connection(
     broker: &litebox_broker_core::BrokerCore,
     control_stream: std::os::unix::net::UnixStream,
@@ -1495,9 +1530,12 @@ fn run_test_broker_connection(
         .expect("failed to report broker close-object count");
 }
 
-// TODO: un-gate when an AArch64 broker exists.
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"),
+    ignore = "node has AArch64 patch sites the x18-virtualizing rewriter cannot patch"
+)]
 fn test_runner_broker_integration_with_rewriter() {
     const HELLO_WORLD_JS: &str = r"
 const fs = require('node:fs');
@@ -1567,7 +1605,7 @@ console.log(content);
     broker_thread.join();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn brokered_getrandom() {
     let target = common::compile(
@@ -1581,7 +1619,7 @@ fn brokered_getrandom() {
     runner.run();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tcp_client_with_rewriter() {
     use std::io::{Read as _, Write as _};
@@ -1699,7 +1737,7 @@ fn test_runner_broker_tcp_client_with_rewriter() {
     server.join().unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_udp_with_rewriter() {
     use std::net::{Ipv4Addr, UdpSocket};
@@ -1789,7 +1827,7 @@ fn test_runner_broker_udp_with_rewriter() {
     server.join().unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
     use std::process::Stdio;
@@ -1848,7 +1886,7 @@ fn test_runner_broker_udp_namespace_delivers_after_sender_close() {
     broker.join();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn test_runner_broker_tcp_server_with_rewriter() {
     use std::process::Stdio;
@@ -2214,7 +2252,7 @@ fn test_runner_with_python() {
         .run();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn python_runs_child_programs() {
     const SCRIPT: &str = r#"
@@ -2260,7 +2298,7 @@ finally:
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
 fn python_os_fork() {
     const SCRIPT: &str = r#"
@@ -2320,8 +2358,12 @@ fn test_runner_with_python_repl_pty() {
     );
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"),
+    ignore = "x18-virtualized libcrypto.so.3 fails to load (failed to map segment)"
+)]
 fn test_broker_with_curl() {
     use std::io::{Read, Write};
     use std::net::{Ipv4Addr, TcpListener};
@@ -2374,8 +2416,12 @@ fn test_broker_with_curl() {
     assert!(output_str.contains(RESPONSE_BODY), "Unexpected curl output");
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"),
+    ignore = "x18-virtualized libcrypto.so.3 fails to load (failed to map segment)"
+)]
 fn test_managed_egress_proxy_with_curl() {
     const CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
@@ -2403,6 +2449,8 @@ fn test_managed_egress_proxy_with_curl() {
         .with_fs_path(|root| {
             let destination = root.join(CA_BUNDLE.trim_start_matches('/'));
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            // A read-only bundle keeps its mode when copied, so replace any earlier copy.
+            let _ = std::fs::remove_file(&destination);
             std::fs::copy(CA_BUNDLE, destination).unwrap();
         })
         .args([
@@ -2435,8 +2483,12 @@ fn test_managed_egress_proxy_with_curl() {
 /// ```
 /// cargo test --package litebox_runner_linux_userland --test run --release -- test_broker_with_iperf3 --exact --nocapture
 /// ```
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    all(target_arch = "aarch64", feature = "aarch64_virtualize_x18"),
+    ignore = "x18-virtualized libcrypto.so.3 fails to load (failed to map segment)"
+)]
 fn test_broker_with_iperf3() {
     use std::io::{BufRead, BufReader};
     use std::net::{Ipv4Addr, TcpListener};
