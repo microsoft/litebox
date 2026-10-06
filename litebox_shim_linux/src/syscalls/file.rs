@@ -621,10 +621,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let files = self.files.borrow();
+        // Classify sockets while writing: a concurrent `close` would fail a later lookup.
+        let is_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
+                is_datagram.set(self.global.is_datagram(fd)?);
                 self.global.sendto(
                     &self.wait_cx(),
                     fd,
@@ -667,13 +670,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .entry_handle(fd)
                     .ok_or(Errno::EBADF)?;
                 handle.with_entry(|file| {
+                    is_datagram.set(!file.is_stream());
                     file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
         );
         // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = result
-            && !self.is_datagram_socket(fd)
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }

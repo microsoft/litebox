@@ -296,6 +296,87 @@ fn test_tcp_listener_shutdown() {
     network.close(&listener, CloseBehavior::Immediate).unwrap();
 }
 
+fn tcp_state(network: &Network<MockPlatform>, fd: &SocketFd<MockPlatform>) -> tcp::State {
+    let table = network.litebox.descriptor_table();
+    let entry = table.get_entry(fd).unwrap();
+    network
+        .socket_set
+        .get::<tcp::Socket>(entry.entry.handle)
+        .state()
+}
+
+#[test]
+fn test_tcp_accept_half_closed_connection() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let (client_fd, client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    pump(&mut network);
+
+    // Like Linux, a connection the peer half-closes before `accept` can still be accepted.
+    assert_eq!(write(&client, b"request").unwrap(), 7);
+    network.shutdown(&client_fd, Shutdown::Write).unwrap();
+    pump(&mut network);
+    let server_fd = network.accept(&listener, None).unwrap();
+    let server = alloc::sync::Arc::new(NetworkProxy::Stream(
+        socket_channel::StreamSocketChannel::new(),
+    ));
+    assert!(network.set_socket_proxy(&server_fd, server.clone()));
+    pump(&mut network);
+    assert_eq!(read(&server).unwrap(), b"request");
+    assert!(matches!(read(&server), Err(ChannelReadError::ReadShutdown)));
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_shutdown_write_before_connect_observed() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let (client_fd, client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+
+    // Shut down writes once the handshake completes but before the worker has observed it.
+    while tcp_state(&network, &client_fd) != tcp::State::Established {
+        network.perform_platform_interaction();
+    }
+    assert!(matches!(read(&client), Err(ChannelReadError::NotConnected)));
+    network.shutdown(&client_fd, Shutdown::Write).unwrap();
+    pump(&mut network);
+
+    // The connection is still reported as established, both to the channel and to a blocked
+    // `connect` checking its progress.
+    assert_eq!(read(&client).unwrap(), b"");
+    network.connect(&client_fd, &addr, true).unwrap();
+    let server_fd = network.accept(&listener, None).unwrap();
+    let server = alloc::sync::Arc::new(NetworkProxy::Stream(
+        socket_channel::StreamSocketChannel::new(),
+    ));
+    assert!(network.set_socket_proxy(&server_fd, server.clone()));
+    pump(&mut network);
+    assert!(matches!(read(&server), Err(ChannelReadError::ReadShutdown)));
+
+    // Closing the other half is graceful.
+    network.shutdown(&server_fd, Shutdown::Write).unwrap();
+    pump(&mut network);
+    assert!(matches!(read(&client), Err(ChannelReadError::ReadShutdown)));
+    assert!(client.get_async_error(false).is_none());
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
 #[test]
 fn test_shutdown_requires_connection() {
     let litebox = LiteBox::new(MockPlatform::new());
