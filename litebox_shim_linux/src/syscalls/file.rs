@@ -321,7 +321,7 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
-                InheritedFdKind::LocalSocket => {
+                InheritedFdKind::UnixSocket => {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, || {
                         global
                             .adopt_inherited_unix_socket(handle)
@@ -645,12 +645,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     InheritableFd::Pipe(pipe),
                 ),
                 AnyTypedFd::Unix(socket) => (
-                    InheritedFdKind::LocalSocket,
-                    InheritableFd::LocalSocket(
-                        self.global.with_unix_socket(&socket, |socket| {
-                            Ok(alloc::sync::Arc::clone(socket.local_socket()))
-                        })?,
-                    ),
+                    InheritedFdKind::UnixSocket,
+                    InheritableFd::UnixSocket(self.global.with_unix_socket(&socket, |socket| {
+                        Ok(alloc::sync::Arc::clone(socket.broker_socket()))
+                    })?),
                 ),
                 _ => return Err(Errno::EAGAIN),
             };

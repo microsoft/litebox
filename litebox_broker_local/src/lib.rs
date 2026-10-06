@@ -23,7 +23,6 @@ extern crate std;
 mod error;
 mod event;
 mod fs;
-mod local_socket;
 mod pipe;
 mod process;
 mod process_group;
@@ -32,6 +31,7 @@ mod signal;
 mod socket;
 mod thread;
 mod timer;
+mod unix_socket;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

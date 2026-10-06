@@ -2110,7 +2110,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .transpose()?;
                 Ok((chunk_waitall, is_stream, deadline))
             }
-            // The local socket applies its own receive timeout to each receive.
+            // The Unix socket applies its own receive timeout to each receive.
             ReceiveSocket::Unix(handle) => {
                 Ok((false, handle.with_entry(UnixSocket::is_stream), None))
             }

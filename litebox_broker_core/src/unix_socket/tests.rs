@@ -69,11 +69,11 @@ impl Fixture {
         .unwrap()
     }
 
-    fn bind(&self, handle: ObjectHandle, address: &LocalSocketAddress) -> LocalSocketResult<()> {
+    fn bind(&self, handle: ObjectHandle, address: &UnixSocketAddress) -> UnixSocketResult<()> {
         bind(&self.process, handle, address, USER, FileMode::RWXU).unwrap()
     }
 
-    fn listener(&self, address: &LocalSocketAddress, backlog: u32) -> ObjectHandle {
+    fn listener(&self, address: &UnixSocketAddress, backlog: u32) -> ObjectHandle {
         let listener = self.create(SocketType::Stream);
         self.bind(listener, address).unwrap();
         listen(&self.process, listener, backlog).unwrap().unwrap();
@@ -83,12 +83,12 @@ impl Fixture {
     fn connect(
         &self,
         handle: ObjectHandle,
-        address: &LocalSocketAddress,
-    ) -> Result<LocalSocketResult<()>> {
+        address: &UnixSocketAddress,
+    ) -> Result<UnixSocketResult<()>> {
         connect(&self.process, handle, address, USER)
     }
 
-    fn accept(&self, listener: ObjectHandle) -> Result<LocalSocketResult<ObjectHandle>> {
+    fn accept(&self, listener: ObjectHandle) -> Result<UnixSocketResult<ObjectHandle>> {
         accept(
             &self.process,
             listener,
@@ -97,20 +97,20 @@ impl Fixture {
         )
     }
 
-    fn send(&self, handle: ObjectHandle, data: &[u8]) -> Result<LocalSocketResult<usize>> {
+    fn send(&self, handle: ObjectHandle, data: &[u8]) -> Result<UnixSocketResult<usize>> {
         send(&self.process, handle, None, data, USER)
     }
 
     fn send_to(
         &self,
         handle: ObjectHandle,
-        address: &LocalSocketAddress,
+        address: &UnixSocketAddress,
         data: &[u8],
-    ) -> Result<LocalSocketResult<usize>> {
+    ) -> Result<UnixSocketResult<usize>> {
         send(&self.process, handle, Some(address), data, USER)
     }
 
-    fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<LocalSocketResult<Received>> {
+    fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Received>> {
         receive(&self.process, handle, capacity, false, false)
     }
 
@@ -136,21 +136,21 @@ impl Fixture {
     /// Returns the broker-wide and process charges for queued bytes.
     fn queued(&self) -> (usize, usize) {
         (
-            self.process.core.local_sockets.lock().queued,
-            self.process.local_socket_bytes.load(Ordering::Relaxed),
+            self.process.core.unix_sockets.lock().queued,
+            self.process.unix_socket_bytes.load(Ordering::Relaxed),
         )
     }
 }
 
-fn path(path: &str) -> LocalSocketAddress {
-    LocalSocketAddress::Path {
+fn path(path: &str) -> UnixSocketAddress {
+    UnixSocketAddress::Path {
         path: path.into(),
         name: path.as_bytes().to_vec(),
     }
 }
 
-fn abstract_name(name: &[u8]) -> LocalSocketAddress {
-    LocalSocketAddress::Abstract(name.to_vec())
+fn abstract_name(name: &[u8]) -> UnixSocketAddress {
+    UnixSocketAddress::Abstract(name.to_vec())
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn stream_pairs_carry_bytes_in_both_directions() {
         .unwrap()
         .unwrap();
     assert_eq!(peeked.data, b"hel");
-    assert_eq!(peeked.source, LocalSocketName::Unnamed);
+    assert_eq!(peeked.source, UnixSocketName::Unnamed);
     assert_eq!(fixture.receive_data(second, 3), b"hel");
     assert_eq!(fixture.receive_data(second, 10), b"lo");
     assert_eq!(fixture.receive(second, 10), Err(BrokerError::WouldBlock));
@@ -224,7 +224,7 @@ fn path_listeners_accept_connections_with_names() {
     assert!(fixture.readiness(listener).contains(ReadinessFlags::READ));
     assert_eq!(
         fixture.connect(client, &address).unwrap(),
-        Err(LocalSocketError::AlreadyConnected)
+        Err(UnixSocketError::AlreadyConnected)
     );
 
     let server = fixture.accept(listener).unwrap().unwrap();
@@ -234,7 +234,7 @@ fn path_listeners_accept_connections_with_names() {
     );
     assert_eq!(
         name(&fixture.process, server, true).unwrap(),
-        Ok(LocalSocketName::Abstract(b"client".to_vec()))
+        Ok(UnixSocketName::Abstract(b"client".to_vec()))
     );
     assert_eq!(
         name(&fixture.process, client, true).unwrap(),
@@ -242,7 +242,7 @@ fn path_listeners_accept_connections_with_names() {
     );
     assert_eq!(
         name(&fixture.process, listener, true).unwrap(),
-        Err(LocalSocketError::NotConnected)
+        Err(UnixSocketError::NotConnected)
     );
 
     assert_eq!(fixture.send(client, b"ping").unwrap(), Ok(4));
@@ -250,7 +250,7 @@ fn path_listeners_accept_connections_with_names() {
     assert_eq!(received.data, b"ping");
     assert_eq!(
         received.source,
-        LocalSocketName::Abstract(b"client".to_vec())
+        UnixSocketName::Abstract(b"client".to_vec())
     );
     assert_eq!(fixture.send(server, b"pong").unwrap(), Ok(4));
     assert_eq!(fixture.receive_data(client, 16), b"pong");
@@ -264,34 +264,34 @@ fn path_names_stay_taken_until_unlinked() {
     let other = fixture.create(SocketType::Stream);
     assert_eq!(
         fixture.bind(other, &address),
-        Err(LocalSocketError::AddressInUse)
+        Err(UnixSocketError::AddressInUse)
     );
     assert_eq!(
         fixture.bind(listener, &path("/again")),
-        Err(LocalSocketError::InvalidArgument)
+        Err(UnixSocketError::InvalidArgument)
     );
 
     fixture.close(listener);
     let client = fixture.create(SocketType::Stream);
     assert_eq!(
         fixture.connect(client, &address).unwrap(),
-        Err(LocalSocketError::ConnectionRefused)
+        Err(UnixSocketError::ConnectionRefused)
     );
     assert_eq!(
         fixture.bind(other, &address),
-        Err(LocalSocketError::AddressInUse)
+        Err(UnixSocketError::AddressInUse)
     );
     crate::fs::unlink(&fixture.process, "/server", USER)
         .unwrap()
         .unwrap();
     assert_eq!(
         fixture.connect(client, &address).unwrap(),
-        Err(LocalSocketError::File(FileError::NoSuchFileOrDirectory))
+        Err(UnixSocketError::File(FileError::NoSuchFileOrDirectory))
     );
     assert_eq!(fixture.bind(other, &address), Ok(()));
     assert_eq!(
         fixture.connect(client, &path("/")).unwrap(),
-        Err(LocalSocketError::ConnectionRefused)
+        Err(UnixSocketError::ConnectionRefused)
     );
 }
 
@@ -304,7 +304,7 @@ fn abstract_names_are_released_on_close() {
     assert_eq!(fixture.bind(first, &address), Ok(()));
     assert_eq!(
         fixture.bind(second, &address),
-        Err(LocalSocketError::AddressInUse)
+        Err(UnixSocketError::AddressInUse)
     );
     fixture.close(first);
     assert_eq!(fixture.bind(second, &address), Ok(()));
@@ -319,7 +319,7 @@ fn abstract_names_are_held_per_socket_type() {
     let client = fixture.create(SocketType::Stream);
     assert_eq!(
         fixture.connect(client, &address).unwrap(),
-        Err(LocalSocketError::ConnectionRefused)
+        Err(UnixSocketError::ConnectionRefused)
     );
 
     let listener = fixture.listener(&address, 1);
@@ -342,7 +342,7 @@ fn path_connections_require_write_permission() {
     let client = fixture.create(SocketType::Stream);
     assert_eq!(
         connect(&fixture.process, client, &address, other).unwrap(),
-        Err(LocalSocketError::File(FileError::AccessNotAllowed))
+        Err(UnixSocketError::File(FileError::AccessNotAllowed))
     );
     crate::fs::chmod(
         &fixture.process,
@@ -372,7 +372,7 @@ fn path_connections_require_write_permission() {
     let client = fixture.create(SocketType::Stream);
     assert_eq!(
         fixture.connect(client, &path("/file")).unwrap(),
-        Err(LocalSocketError::ConnectionRefused)
+        Err(UnixSocketError::ConnectionRefused)
     );
 }
 
@@ -382,31 +382,31 @@ fn unconnected_streams_reject_data_operations() {
     let unnamed = fixture.create(SocketType::Stream);
     assert_eq!(
         listen(&fixture.process, unnamed, 1).unwrap(),
-        Err(LocalSocketError::InvalidArgument)
+        Err(UnixSocketError::InvalidArgument)
     );
     let datagram = fixture.create(SocketType::Datagram);
     assert_eq!(
         listen(&fixture.process, datagram, 1).unwrap(),
-        Err(LocalSocketError::Unsupported)
+        Err(UnixSocketError::Unsupported)
     );
     let (connected, _) = fixture.pair(SocketType::Stream);
     assert_eq!(
         listen(&fixture.process, connected, 1).unwrap(),
-        Err(LocalSocketError::InvalidArgument)
+        Err(UnixSocketError::InvalidArgument)
     );
     assert_eq!(
         fixture.receive(unnamed, 1).unwrap(),
-        Err(LocalSocketError::InvalidArgument)
+        Err(UnixSocketError::InvalidArgument)
     );
     assert_eq!(
         fixture.send(unnamed, b"x").unwrap(),
-        Err(LocalSocketError::NotConnected)
+        Err(UnixSocketError::NotConnected)
     );
     assert_eq!(
         fixture
             .send_to(unnamed, &abstract_name(b"x"), b"x")
             .unwrap(),
-        Err(LocalSocketError::Unsupported)
+        Err(UnixSocketError::Unsupported)
     );
     assert_eq!(
         fixture.readiness(unnamed),
@@ -434,7 +434,7 @@ fn full_backlogs_wait_for_accept() {
     fixture.close(server);
     assert_eq!(
         fixture.send(first, b"x").unwrap(),
-        Err(LocalSocketError::BrokenPipe)
+        Err(UnixSocketError::BrokenPipe)
     );
 }
 
@@ -456,7 +456,7 @@ fn closing_a_listener_resets_unaccepted_connections() {
     assert_eq!(fixture.receive_data(client, 8), b"");
     assert_eq!(
         fixture.send(client, b"x").unwrap(),
-        Err(LocalSocketError::BrokenPipe)
+        Err(UnixSocketError::BrokenPipe)
     );
 }
 
@@ -471,7 +471,7 @@ fn shutdown_reaches_the_stream_peer() {
     assert!(fixture.take_republished().contains(&second));
     assert_eq!(
         fixture.send(first, b"x").unwrap(),
-        Err(LocalSocketError::BrokenPipe)
+        Err(UnixSocketError::BrokenPipe)
     );
     assert!(
         fixture
@@ -489,7 +489,7 @@ fn shutdown_reaches_the_stream_peer() {
     assert!(fixture.readiness(first).contains(ReadinessFlags::CLOSED));
     assert_eq!(
         fixture.send(second, b"x").unwrap(),
-        Err(LocalSocketError::BrokenPipe)
+        Err(UnixSocketError::BrokenPipe)
     );
     assert_eq!(
         shutdown(&fixture.process, first, ShutdownMode::Abort),
@@ -507,7 +507,7 @@ fn a_read_shut_datagram_socket_ends_only_blocking_receives() {
         .unwrap();
     assert_eq!(
         fixture.send(second, b"x").unwrap(),
-        Err(LocalSocketError::BrokenPipe)
+        Err(UnixSocketError::BrokenPipe)
     );
     assert_eq!(
         receive(&fixture.process, first, 8, false, true)
@@ -546,7 +546,7 @@ fn closing_a_stream_hangs_up_its_peer() {
     assert_eq!(fixture.receive_data(second, 8), b"");
     assert_eq!(
         fixture.send(second, b"x").unwrap(),
-        Err(LocalSocketError::BrokenPipe)
+        Err(UnixSocketError::BrokenPipe)
     );
 }
 
@@ -566,7 +566,7 @@ fn full_streams_wait_for_the_reader() {
     assert_eq!(fixture.send(first, &data).unwrap(), Ok(1));
     assert_eq!(fixture.queued(), (CAPACITY, CAPACITY));
     assert_eq!(
-        fixture.send(first, &vec![0; MAX_LOCAL_SOCKET_TRANSFER_SIZE as usize + 1]),
+        fixture.send(first, &vec![0; MAX_UNIX_SOCKET_TRANSFER_SIZE as usize + 1]),
         Err(BrokerError::ResourceExhausted)
     );
 }
@@ -618,13 +618,13 @@ fn datagrams_keep_boundaries_and_sources() {
 
     assert_eq!(
         fixture.send(unnamed, b"x").unwrap(),
-        Err(LocalSocketError::NotConnected)
+        Err(UnixSocketError::NotConnected)
     );
     assert_eq!(
         fixture
             .send_to(unnamed, &receiver_address, &vec![0; CAPACITY + 1])
             .unwrap(),
-        Err(LocalSocketError::MessageTooLarge)
+        Err(UnixSocketError::MessageTooLarge)
     );
 }
 
@@ -642,11 +642,11 @@ fn connected_datagram_sockets_only_accept_their_peer() {
     assert_eq!(fixture.connect(receiver, &peer_address).unwrap(), Ok(()));
     assert_eq!(
         fixture.send_to(other, &receiver_address, b"x").unwrap(),
-        Err(LocalSocketError::NotPermitted)
+        Err(UnixSocketError::NotPermitted)
     );
     assert_eq!(
         fixture.connect(other, &receiver_address).unwrap(),
-        Err(LocalSocketError::NotPermitted)
+        Err(UnixSocketError::NotPermitted)
     );
     assert_eq!(
         fixture.send_to(peer, &receiver_address, b"x").unwrap(),
@@ -666,12 +666,12 @@ fn connected_datagram_sockets_only_accept_their_peer() {
     assert_ne!(fixture.queued(), (0, 0));
     assert_eq!(
         fixture.send(receiver, b"z").unwrap(),
-        Err(LocalSocketError::ConnectionRefused)
+        Err(UnixSocketError::ConnectionRefused)
     );
     assert_eq!(fixture.queued(), (0, 0));
     assert_eq!(
         fixture.send(receiver, b"z").unwrap(),
-        Err(LocalSocketError::NotConnected)
+        Err(UnixSocketError::NotConnected)
     );
 }
 
@@ -754,14 +754,14 @@ fn connecting_a_full_datagram_receiver_wakes_rejected_senders() {
     assert!(fixture.take_republished().contains(&sender));
     assert_eq!(
         fixture.send_to(sender, &receiver_address, b"x").unwrap(),
-        Err(LocalSocketError::NotPermitted)
+        Err(UnixSocketError::NotPermitted)
     );
 }
 
 #[test]
 fn queued_bytes_are_limited_and_refunded() {
     let fixture =
-        Fixture::with_limits(BrokerCoreLimits::DEFAULT.with_local_socket_limits(usize::MAX, 1000));
+        Fixture::with_limits(BrokerCoreLimits::DEFAULT.with_unix_socket_limits(usize::MAX, 1000));
     let (first, second) = fixture.pair(SocketType::Stream);
     assert_eq!(fixture.send(first, &[0; 600]).unwrap(), Ok(600));
     assert_eq!(
@@ -788,13 +788,13 @@ fn queued_bytes_are_limited_and_refunded() {
     fixture.close(first);
     fixture.close(second);
     assert_eq!(fixture.queued(), (0, 0));
-    assert!(fixture.process.core.local_sockets.lock().sockets.is_empty());
+    assert!(fixture.process.core.unix_sockets.lock().sockets.is_empty());
 }
 
 #[test]
 fn unaccepted_connections_are_charged_to_the_listener() {
     let fixture = Fixture::with_limits(
-        BrokerCoreLimits::DEFAULT.with_local_socket_limits(usize::MAX, CONNECTION_OVERHEAD),
+        BrokerCoreLimits::DEFAULT.with_unix_socket_limits(usize::MAX, CONNECTION_OVERHEAD),
     );
     let address = abstract_name(b"server");
     let listener = fixture.listener(&address, 8);
@@ -850,7 +850,7 @@ fn options_are_stored_with_the_socket() {
     set_option(
         &fixture.process,
         socket,
-        LocalSocketOption::ReceiveTimeout(Some(Duration::from_secs(2))),
+        UnixSocketOption::ReceiveTimeout(Some(Duration::from_secs(2))),
     )
     .unwrap();
     let (socket_type, options) = options(&fixture.process, socket).unwrap();

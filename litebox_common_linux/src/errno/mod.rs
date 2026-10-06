@@ -763,13 +763,13 @@ impl From<litebox::pipes::errors::CloseError> for Errno {
     }
 }
 
-impl From<litebox::local_sockets::errors::LocalSocketError> for Errno {
-    fn from(value: litebox::local_sockets::errors::LocalSocketError) -> Self {
-        use litebox::local_sockets::errors::LocalSocketError;
+impl From<litebox::unix_sockets::errors::UnixSocketError> for Errno {
+    fn from(value: litebox::unix_sockets::errors::UnixSocketError) -> Self {
+        use litebox::unix_sockets::errors::UnixSocketError;
         use litebox_broker_protocol::fs::FileError;
-        use litebox_broker_protocol::local_socket::LocalSocketError as SocketError;
+        use litebox_broker_protocol::unix_socket::UnixSocketError as SocketError;
         match value {
-            LocalSocketError::Socket(error) => match error {
+            UnixSocketError::Socket(error) => match error {
                 SocketError::AddressInUse => Errno::EADDRINUSE,
                 SocketError::ConnectionRefused => Errno::ECONNREFUSED,
                 SocketError::WrongType => Errno::EPROTOTYPE,
@@ -793,16 +793,16 @@ impl From<litebox::local_sockets::errors::LocalSocketError> for Errno {
                 },
                 _ => Errno::EIO,
             },
-            LocalSocketError::WouldBlock => Errno::EAGAIN,
-            LocalSocketError::Interrupted => Errno::EINTR,
-            LocalSocketError::WaitError(error) => match error {
+            UnixSocketError::WouldBlock => Errno::EAGAIN,
+            UnixSocketError::Interrupted => Errno::EINTR,
+            UnixSocketError::WaitError(error) => match error {
                 litebox::event::wait::WaitError::Interrupted => Errno::ERESTARTSYS,
                 litebox::event::wait::WaitError::TimedOut => Errno::ETIMEDOUT,
             },
-            LocalSocketError::ResourceExhausted => Errno::ENOBUFS,
-            LocalSocketError::OutOfMemory => Errno::ENOMEM,
-            LocalSocketError::PermissionDenied => Errno::EACCES,
-            LocalSocketError::Unsupported => Errno::EINVAL,
+            UnixSocketError::ResourceExhausted => Errno::ENOBUFS,
+            UnixSocketError::OutOfMemory => Errno::ENOMEM,
+            UnixSocketError::PermissionDenied => Errno::EACCES,
+            UnixSocketError::Unsupported => Errno::EINVAL,
             _ => Errno::EIO,
         }
     }
