@@ -1420,6 +1420,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
+        let is_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1436,11 +1437,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                is_datagram.set(!file.is_stream());
                 file.sendto(self, buf, flags, addr)
             },
         );
+        // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -1490,6 +1494,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EFAULT)?,
             )
         };
+        let is_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1508,11 +1513,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
+                is_datagram.set(!file.is_stream());
                 file.sendto(self, &data, flags, unix_addr)
             },
         );
+        // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -3434,6 +3442,42 @@ mod unix_tests {
     fn test_unix_socket_recv_timeout() {
         unix_socket_recv_timeout(SockType::Stream);
         unix_socket_recv_timeout(SockType::Datagram);
+    }
+
+    #[test]
+    fn only_unix_stream_sockets_raise_sigpipe() {
+        use litebox_common_linux::signal::Signal;
+
+        let task = init_platform(None);
+        // A raised SIGPIPE stays pending, so the stream socket comes last.
+        for (ty, raises) in [(SockType::Datagram, false), (SockType::Stream, true)] {
+            let (sender, receiver) = task
+                .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
+                .unwrap();
+            let sender_fd = i32::try_from(sender).unwrap();
+            task.sys_shutdown(sender_fd, litebox_common_linux::ShutdownHow::Write as i32)
+                .unwrap();
+            assert_eq!(task.sys_write(sender_fd, b"x", None), Err(Errno::EPIPE));
+            let data = b"y";
+            assert_eq!(
+                task.sys_sendto(
+                    sender_fd,
+                    UserPtr::from_usize(data.as_ptr().expose_provenance()),
+                    data.len(),
+                    SendFlags::empty(),
+                    None,
+                    0,
+                ),
+                Err(Errno::EPIPE)
+            );
+            assert_eq!(
+                task.pending_signal_set().contains(Signal::SIGPIPE),
+                raises,
+                "{ty:?}"
+            );
+            close_socket(&task, sender);
+            close_socket(&task, receiver);
+        }
     }
 
     #[test]
