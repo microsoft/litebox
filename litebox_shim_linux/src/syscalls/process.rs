@@ -1213,10 +1213,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
     /// of the calling one; the parent's other threads pause while the parent is copied.
     ///
-    /// Floating-point and vector state is copied only on AArch64. Copying it on x86-64 needs both
-    /// a [`GuestVectorStateProvider`](litebox::platform::GuestVectorStateProvider) that captures
-    /// it, instead of the no-op default, and an encoding of it in the startup payload, which only
-    /// carries it on AArch64.
+    /// Floating-point and vector state is copied only on AArch64; x86-64 needs a real
+    /// [`GuestVectorStateProvider`](litebox::platform::GuestVectorStateProvider) and a payload
+    /// encoding first.
     ///
     /// Only a process outside a `vfork` window, with default resource-limit and alarm state, no
     /// shared memory mappings, no ELF file mid-load, and only descriptors a fresh runner can
@@ -1458,9 +1457,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// child until the parent resumes, and the child ends if one of them ends the process or
     /// execs.
     ///
-    /// The child shares the parent's thread, so when the parent resumes, its registers and its
-    /// floating-point and vector state are restored as they were at the call. Other
-    /// platform-managed architectural state is not saved, so the child must not change it.
+    /// The parent's registers and vector state are restored when it resumes; the child must not
+    /// change other platform-managed architectural state.
     fn begin_vfork(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -1502,9 +1500,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child,
             child_pid,
             parent_context,
-            // The child shares the parent's thread, so the parent's vector state, whose
-            // callee-saved registers callers may keep values in across the call, is restored
-            // with its registers.
+            // Callers may keep values in callee-saved vector registers across the call.
             parent_vector_state: self.global.platform.get_guest_vector_state(),
             parent_fs,
             parent_files,
@@ -1997,8 +1993,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let duration = match clockid {
             litebox_common_linux::ClockId::RealTime
             | litebox_common_linux::ClockId::RealTimeCoarse => {
-                // CLOCK_REALTIME, or CLOCK_REALTIME_COARSE, which glibc's `time` reads on
-                // AArch64. The coarse clock reuses the precise one.
+                // glibc's AArch64 `time` reads CLOCK_REALTIME_COARSE.
                 self.real_time_as_duration_since_epoch()
             }
             litebox_common_linux::ClockId::Monotonic => {

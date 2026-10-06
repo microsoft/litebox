@@ -12,7 +12,7 @@
 static volatile pid_t usr2_pid;
 static volatile pid_t ill_pid;
 static volatile int ill_on_child_stack;
-// Raises SIGILL: the two-byte `ud2` on x86-64, a four-byte permanently undefined one on AArch64.
+// Raises SIGILL.
 #if defined(__x86_64__)
 #define UNDEFINED_INSTRUCTION() __asm__ volatile("ud2")
 #elif defined(__aarch64__)

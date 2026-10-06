@@ -587,9 +587,10 @@ mod tests {
     #[test]
     fn initial_stack_is_placed_top_down() {
         let task = crate::syscalls::tests::init_platform();
-        let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
         let placement_max =
             <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::PLACEMENT_ADDR_MAX;
+        // Upper half of the self-placement range.
+        let high = placement_max / 2;
         crate::syscalls::tests::create_file(&task, "/stack-pie", &minimal_elf(ET_DYN, None));
 
         let mut elf_loader =
@@ -603,10 +604,9 @@ mod tests {
             .expect("loader should initialize the process stack");
 
         assert!(
-            load_info.user_stack_top >= addr_max / 2,
-            "initial stack ended at {:#x}, below the top-down address range (>= {:#x})",
+            load_info.user_stack_top >= high,
+            "initial stack ended at {:#x}, below the top-down address range (>= {high:#x})",
             load_info.user_stack_top,
-            addr_max / 2,
         );
         assert!(
             load_info.user_stack_top <= placement_max,
@@ -619,7 +619,8 @@ mod tests {
     #[cfg_attr(target_os = "macos", ignore = "macOS runner supports PIE guests only")]
     fn elf_placement_keeps_main_low_and_interpreter_high() {
         let task = crate::syscalls::tests::init_platform();
-        let addr_max = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::TASK_ADDR_MAX;
+        // Upper half of the self-placement range.
+        let high = <TestPlatform as PageManagementProvider<{ PAGE_SIZE }>>::PLACEMENT_ADDR_MAX / 2;
 
         // Occupy the preferred address and verify that fallback placement remains low.
         let hint = crate::loader::DEFAULT_LOW_ADDR;
@@ -638,7 +639,7 @@ mod tests {
         let reserved =
             litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
                 .expect("PIE reservation should retry in the low address space");
-        assert!(reserved < addr_max / 2);
+        assert!(reserved < high);
         task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
             .expect("failed to release test PIE reservation");
         task.sys_munmap(occupied, PAGE_SIZE)
@@ -659,7 +660,7 @@ mod tests {
         let reserved =
             litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
                 .expect("PIE reservation should include runtime-trampoline space");
-        assert!(reserved < addr_max / 2);
+        assert!(reserved < high);
         assert_ne!(
             reserved, hint,
             "trampoline space must force rejection of the hint"
@@ -696,13 +697,12 @@ mod tests {
         // host mappings seeded into the userland VMA tree can sit near the top
         // and push that gap below the very top slot (see `mm/linux.rs`). Assert
         // the invariant that matters — placement in the high half of the
-        // address space, far above the low-heap region — not one exact slot.
+        // self-placement range, far above the low-heap region — not one exact slot.
         assert!(
-            interp.base_addr >= addr_max / 2,
-            "ET_EXEC interpreter loaded at {:#x}, near the low-heap region {:#x} rather than top-down high (>= {:#x})",
+            interp.base_addr >= high,
+            "ET_EXEC interpreter loaded at {:#x}, near the low-heap region {:#x} rather than top-down high (>= {high:#x})",
             interp.base_addr,
             crate::loader::DEFAULT_LOW_ADDR,
-            addr_max / 2,
         );
     }
 }

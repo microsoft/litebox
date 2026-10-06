@@ -1,12 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-// Checks that floating-point and vector state survives `fork` in the child and `vfork` in the
-// parent. AArch64 callers may keep values in the callee-saved d8-d15 across a call, and FPCR
-// holds the rounding mode, so both must be what they were at the system call.
-//
-// Each system call is made in the same `asm` block that sets and reads the registers, so no
-// compiled code runs between them.
+// Checks AArch64 state across `fork` and `vfork`: d8 and FPCR survive in the fork child and the
+// vfork parent, and return addresses signed before `fork` authenticate in the child.
 
 #define _GNU_SOURCE
 #include <sched.h>
@@ -63,9 +59,8 @@ static struct observed raw_fork(void) {
     return (struct observed){x0, d8, fpcr};
 }
 
-// Sets the markers and vforks with a raw `clone`. The child, sharing the parent's thread in
-// LiteBox, changes both registers and exits without touching memory; the parent reads them
-// back once it resumes.
+// Sets the markers and vforks with a raw `clone`. The child clobbers them and exits; the parent
+// reads them back after resuming.
 static struct observed raw_vfork(void) {
     register long x0 __asm__("x0") = CLONE_VM | CLONE_VFORK | SIGCHLD;
     register long x1 __asm__("x1") = 0;
@@ -92,6 +87,14 @@ static struct observed raw_vfork(void) {
                        [child_fpcr] "r"(CHILD_FPCR), [exit_group] "i"(SYS_exit_group)
                      : "v8", "memory");
     return (struct observed){x0, d8, fpcr};
+}
+
+// Signs its return address before the fork and authenticates it after.
+__attribute__((noinline, target("branch-protection=pac-ret+leaf"))) static long signed_fork(void) {
+    long ret = syscall(SYS_clone, SIGCHLD, 0, NULL, NULL, 0);
+    // Prevents a tail call.
+    __asm__ volatile("" ::: "memory");
+    return ret;
 }
 
 static int intact(const struct observed *observed) {
@@ -131,5 +134,19 @@ int main(void) {
     printf("vfork parent=%d child=%d d8=%#llx fpcr=%#llx\n", intact(&vforked),
            wait_exit_code((pid_t)vforked.ret) == 0, (unsigned long long)vforked.d8,
            (unsigned long long)vforked.fpcr);
+
+    fflush(stdout);
+    long signed_child = signed_fork();
+    if (signed_child == 0) {
+        _exit(0);
+    }
+    if (signed_child < 0) {
+        printf("signed-fork-failed ret=%ld\n", signed_child);
+        return 4;
+    }
+    int status = 0;
+    waitpid((pid_t)signed_child, &status, 0);
+    printf("signed-fork exited=%d code=%d signal=%d\n", WIFEXITED(status), WEXITSTATUS(status),
+           WIFSIGNALED(status) ? WTERMSIG(status) : 0);
     return 0;
 }

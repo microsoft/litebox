@@ -15,8 +15,7 @@
 
 #define BUFFER_SIZE (4 * 1024 * 1024)
 
-// Forks by system call, bypassing glibc's `fork()`. AArch64 has no `fork` system call, so glibc
-// uses `clone` with just the `SIGCHLD` exit signal there.
+// Forks by system call, bypassing glibc. AArch64 has no `fork`, so use `clone(SIGCHLD)`.
 static pid_t raw_fork(void) {
 #ifdef SYS_fork
     return (pid_t)syscall(SYS_fork);

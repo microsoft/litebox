@@ -61,6 +61,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     /// in a fresh runner without colliding with that runner's host mappings.
     #[cfg(target_arch = "x86_64")]
     const PLACEMENT_ADDR_MAX: usize = 0x7000_0000_0000;
+    /// As on x86-64, keeps guest memory below host mappings so `fork` can restore it in a fresh
+    /// runner. On 47- and 48-bit hosts, all host mappings lie above 64 TiB; on smaller ones,
+    /// this limit has no effect.
+    #[cfg(target_arch = "aarch64")]
+    const PLACEMENT_ADDR_MAX: usize = 0x4000_0000_0000;
     /// The kernel may place a rejected hint anywhere, including inside the
     /// host's mmap area, so vmem must pick exact addresses itself.
     #[cfg(target_arch = "x86_64")]
@@ -140,7 +145,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         &self,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
-        #[cfg_attr(target_arch = "aarch64", expect(unused_variables))]
         permissions: MemoryRegionPermissions,
     ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
         // Without `MREMAP_FIXED` the kernel ignores `new_range` and may move the pages into the
@@ -150,7 +154,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         // The claim also provides the grown tail, so only the old pages move: growing them would
         // extend pages that a fork restore mapped from its process image into the image's
         // following bytes instead of fresh zeroed pages.
-        #[cfg(target_arch = "x86_64")]
         let (flags, moved_len) = {
             <Self as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
                 self,
@@ -167,6 +170,11 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 litebox::platform::page_mgmt::AllocationError::AddressInUse => {
                     litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
                 }
+                // Hosts with fewer than 48 VA bits may refuse vmem's destination; copy instead.
+                #[cfg(target_arch = "aarch64")]
+                litebox::platform::page_mgmt::AllocationError::OutOfMemory => {
+                    litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
+                }
                 _ => litebox::platform::page_mgmt::RemapError::OutOfMemory,
             })?;
             (
@@ -174,9 +182,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 old_range.len(),
             )
         };
-        // Only a fork restore, which is x86_64-only, maps guest pages from a file.
-        #[cfg(target_arch = "aarch64")]
-        let (flags, moved_len) = (MRemapFlags::MREMAP_MAYMOVE, new_range.len());
         let res = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::mremap,
@@ -193,7 +198,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         // move several mappings but may stop partway when the host runs out of memory or
         // mappings; the moved pages are then released with the claim, and the caller's copy
         // panics on the missing source.
-        #[cfg(target_arch = "x86_64")]
         let res = res.map_err(|_| {
             // SAFETY: vmem reserved `new_range` for this move, so only the claim made above and
             // any source pages a partial move placed in it can be unmapped.
@@ -203,8 +207,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             .expect("munmap failed");
             litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
         })?;
-        #[cfg(target_arch = "aarch64")]
-        let res = res.expect("mremap failed");
         Ok(UserMutPtr::from_usize(res))
     }
 

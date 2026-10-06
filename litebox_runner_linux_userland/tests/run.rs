@@ -63,7 +63,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "async_x16.c",
     "fork_parent.c",
     "fork_threads_parent.c",
-    "fork_vector_state.c",
+    "fork_aarch64_state.c",
     "gate_signals.c",
     "sigreturn.c",
     "sigreturn_simd.c",
@@ -192,7 +192,7 @@ fn test_static_exec_with_rewriter() {
     }
 }
 
-/// The signal `__builtin_trap` raises: it executes `ud2` on x86-64 and `brk` on AArch64.
+/// The signal `__builtin_trap` raises (`ud2` on x86-64, `brk` on AArch64).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 const TRAP_SIGNAL: i32 = libc::SIGILL;
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
@@ -1019,18 +1019,17 @@ fn fork_pauses_sibling_threads() {
     assert_eq!(numeric_field(line, "slept="), 1);
 }
 
-/// Checks that `fork` copies d8 and FPCR to the child and that a `vfork` child's changes to them
-/// do not reach the parent. x86-64 platforms do not capture vector state yet.
+/// Checks vector state and pointer authentication across `fork` and `vfork`.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 #[test]
-fn fork_and_vfork_preserve_vector_state() {
+fn fork_and_vfork_preserve_aarch64_state() {
     let program = common::compile(
-        "./tests/fork_vector_state.c",
-        "fork_vector_state",
+        "./tests/fork_aarch64_state.c",
+        "fork_aarch64_state",
         true,
         false,
     );
-    let mut runner = Runner::new(&program, "fork_vector_state");
+    let mut runner = Runner::new(&program, "fork_aarch64_state");
     runner.allow_process_duplication();
 
     let output = String::from_utf8(runner.output()).unwrap();
@@ -1046,6 +1045,9 @@ fn fork_and_vfork_preserve_vector_state() {
     let vfork_line = line("vfork ");
     assert_eq!(numeric_field(vfork_line, "parent="), 1, "{vfork_line}");
     assert_eq!(numeric_field(vfork_line, "child="), 1, "{vfork_line}");
+    let signed_line = line("signed-fork ");
+    assert_eq!(numeric_field(signed_line, "exited="), 1, "{signed_line}");
+    assert_eq!(numeric_field(signed_line, "code="), 0, "{signed_line}");
 }
 
 #[cfg(target_os = "linux")]
@@ -2449,7 +2451,7 @@ fn test_managed_egress_proxy_with_curl() {
         .with_fs_path(|root| {
             let destination = root.join(CA_BUNDLE.trim_start_matches('/'));
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
-            // A read-only bundle keeps its mode when copied, so replace any earlier copy.
+            // `copy` keeps a read-only mode, so remove any earlier copy.
             let _ = std::fs::remove_file(&destination);
             std::fs::copy(CA_BUNDLE, destination).unwrap();
         })

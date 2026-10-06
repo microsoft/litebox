@@ -2321,7 +2321,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(target_os = "linux")]
     fn self_placed_mappings_stay_below_placement_limit() {
         let task = init_platform();
         let limit = <Platform as PageManagementProvider<PAGE_SIZE>>::PLACEMENT_ADDR_MAX;

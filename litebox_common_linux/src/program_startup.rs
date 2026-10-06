@@ -148,8 +148,7 @@ pub struct LinuxForkStartup {
     pub alternate_signal_stack: SigAltStack,
     /// Registers at the `fork` system call, which the child returns from.
     pub registers: PtRegs,
-    /// Floating-point and vector state at the `fork` system call, which only AArch64 platforms
-    /// capture and the payload only carries there.
+    /// Floating-point and vector state at the `fork` system call (encoded only on AArch64).
     pub vector_state: GuestVectorState,
     /// Thread pointer, such as the FS base on x86-64 or `TPIDR_EL0` on AArch64.
     pub thread_pointer: usize,
