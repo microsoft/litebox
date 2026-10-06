@@ -663,9 +663,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let trampoline_vaddr = if pre_patched {
             if e_type == ET_DYN {
                 let Some(base) = base_addr else {
-                    panic!(
-                        "fatal: pre-patched ET_DYN binary but cannot determine load base address"
+                    litebox_util_log::debug!(
+                        file_offset:? = file_offset, mapped_addr:? = mapped_addr;
+                        "skipping pre-patched ET_DYN initialization without a load base"
                     );
+                    return;
                 };
                 let Some(address) = base.checked_add(tramp_vaddr) else {
                     return;

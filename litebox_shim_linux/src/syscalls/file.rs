@@ -2176,6 +2176,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             unimplemented!("no sigmask support yet");
         }
+        if nfds
+            > self
+                .process()
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+        {
+            return Err(Errno::EINVAL);
+        }
         let timeout = timeout.read::<Platform>()?;
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 

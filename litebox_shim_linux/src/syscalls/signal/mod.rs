@@ -262,9 +262,7 @@ fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
     if stack.flags.contains(SsFlags::DISABLE) {
         return false;
     }
-    let stack_start = stack.sp;
-    let stack_end = stack.sp.wrapping_add(stack.size);
-    sp >= stack_start && sp < stack_end
+    sp > stack.sp && sp.wrapping_sub(stack.sp) <= stack.size
 }
 
 /// Creates a `Siginfo` for an exception signal.
