@@ -1716,10 +1716,9 @@ unsafe extern "C" fn run_thread_arch(
         // - All GPRs contain user-mode values
         // - Interrupts are disabled (IDT gate clears IF)
         // - GS = user (swapgs has NOT happened yet)
+        // - DF and AC are cleared by the ISR stub (interrupts.S)
         ".globl exception_callback",
         "exception_callback:",
-        "cld",
-        "clac",
         "swapgs",
         "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
         "mov al, [rsp]",
