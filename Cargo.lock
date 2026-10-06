@@ -1658,7 +1658,16 @@ dependencies = [
  "elf",
  "litebox",
  "litebox_common_linux",
+ "litebox_common_vm_abi",
  "num_enum",
+ "zerocopy",
+]
+
+[[package]]
+name = "litebox_common_vm_abi"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
  "zerocopy",
 ]
 
@@ -1813,6 +1822,24 @@ dependencies = [
  "spin 0.10.0",
  "x86_64",
  "zerocopy",
+]
+
+[[package]]
+name = "litebox_platform_vm_userland"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "litebox",
+ "litebox_broker_local",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "litebox_common_linux",
+ "litebox_common_vm_abi",
+ "litebox_platform",
+ "litebox_util_log",
+ "log",
+ "zerocopy",
+ "zeroize",
 ]
 
 [[package]]
@@ -1973,6 +2000,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_runner_optee_on_vm_userland"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "litebox",
+ "litebox_common_linux",
+ "litebox_common_optee",
+ "litebox_common_vm_abi",
+ "litebox_platform_vm_userland",
+ "litebox_shim_optee",
+ "litebox_util_log",
+ "log",
+ "sha2",
+ "zerocopy",
+]
+
+[[package]]
 name = "litebox_runner_snp"
 version = "0.1.0"
 dependencies = [
@@ -1984,6 +2028,27 @@ dependencies = [
  "litebox_util_log",
  "log",
  "once_cell",
+]
+
+[[package]]
+name = "litebox_runner_vm_kernel"
+version = "0.1.0"
+dependencies = [
+ "arrayvec",
+ "base64",
+ "litebox_bootloader",
+ "litebox_broker_core",
+ "litebox_common_optee",
+ "litebox_common_vm_abi",
+ "litebox_hal",
+ "litebox_platform_vm_kernel",
+ "litebox_shim_vm_kernel",
+ "litebox_util_log",
+ "log",
+ "serde",
+ "serde_json",
+ "tar-no-std",
+ "zerocopy",
 ]
 
 [[package]]
@@ -2117,6 +2182,29 @@ dependencies = [
  "thiserror",
  "zerocopy",
  "zeroize",
+]
+
+[[package]]
+name = "litebox_shim_vm_kernel"
+version = "0.1.0"
+dependencies = [
+ "elf",
+ "hmac",
+ "litebox",
+ "litebox_broker_core",
+ "litebox_broker_host",
+ "litebox_broker_protocol",
+ "litebox_broker_transport",
+ "litebox_common_linux",
+ "litebox_common_optee",
+ "litebox_common_vm_abi",
+ "litebox_platform_vm_kernel",
+ "litebox_util_log",
+ "log",
+ "rangemap",
+ "sha2",
+ "thiserror",
+ "zerocopy",
 ]
 
 [[package]]
