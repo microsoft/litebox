@@ -1,0 +1,12 @@
+[package]
+name = "litebox_common_vm_abi"
+version = "0.1.0"
+edition = "2024"
+description = "Type-safe ABI between a LiteBox userland runner and the LiteBox VM kernel shim"
+
+[dependencies]
+thiserror = { version = "2.0.6", default-features = false }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

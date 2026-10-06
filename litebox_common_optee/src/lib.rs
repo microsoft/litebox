@@ -17,6 +17,7 @@ use num_enum::TryFromPrimitive;
 use syscall_nr::{LdelfSyscallNr, TeeSyscallNr};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
+pub mod envelope;
 pub mod syscall_nr;
 
 /// Maximum size for a single memref parameter in syscalls that copy data
@@ -1652,6 +1653,45 @@ pub struct OpteeMsgParam {
 }
 
 impl OpteeMsgParam {
+    pub const NONE: Self = Self {
+        attr: OpteeMsgAttr(0),
+        data: [0; OPTEE_MSG_PARAM_DATA_SIZE],
+    };
+
+    /// `None` unless `attr_type` is a value type.
+    pub fn new_value(attr_type: OpteeMsgAttrType, value: OpteeMsgParamValue) -> Option<Self> {
+        matches!(
+            attr_type,
+            OpteeMsgAttrType::ValueInput
+                | OpteeMsgAttrType::ValueOutput
+                | OpteeMsgAttrType::ValueInout
+        )
+        .then(|| Self::with(OpteeMsgAttr(attr_type as u64), value.as_bytes()))
+    }
+
+    /// An `OpenSession` meta parameter ([`OpteeMsgAttr::META_VALUE_INPUT`]).
+    pub fn new_meta_value(value: OpteeMsgParamValue) -> Self {
+        Self::with(OpteeMsgAttr::META_VALUE_INPUT, value.as_bytes())
+    }
+
+    /// `None` unless `attr_type` is an rmem type.
+    pub fn new_rmem(attr_type: OpteeMsgAttrType, rmem: OpteeMsgParamRmem) -> Option<Self> {
+        matches!(
+            attr_type,
+            OpteeMsgAttrType::RmemInput
+                | OpteeMsgAttrType::RmemOutput
+                | OpteeMsgAttrType::RmemInout
+        )
+        .then(|| Self::with(OpteeMsgAttr(attr_type as u64), rmem.as_bytes()))
+    }
+
+    fn with(attr: OpteeMsgAttr, data: &[u8]) -> Self {
+        let mut param = Self::NONE;
+        param.attr = attr;
+        param.data.copy_from_slice(data);
+        param
+    }
+
     pub fn attr_type(&self) -> OpteeMsgAttrType {
         OpteeMsgAttrType::try_from(self.attr.attr_type()).unwrap_or(OpteeMsgAttrType::None)
     }
@@ -1946,6 +1986,35 @@ impl OpteeMsgArgs {
     ///
     /// This is `TEE_NUM_PARAMS + 2` = 6, matching the Linux driver's `MAX_ARG_PARAM_COUNT`.
     pub const MAX_ARG_PARAM_COUNT: usize = TEE_NUM_PARAMS + 2;
+
+    /// A request; `ret` and `ret_origin` start as success from the TEE.
+    ///
+    /// # Errors
+    ///
+    /// [`OpteeSmcReturnCode::EBadCmd`] for more than [`Self::MAX_ARG_PARAM_COUNT`]
+    /// parameters.
+    pub fn new(
+        cmd: OpteeMessageCommand,
+        func: u32,
+        session: u32,
+        params: &[OpteeMsgParam],
+    ) -> Result<Self, OpteeSmcReturnCode> {
+        let mut all = [OpteeMsgParam::NONE; Self::MAX_ARG_PARAM_COUNT];
+        all.get_mut(..params.len())
+            .ok_or(OpteeSmcReturnCode::EBadCmd)?
+            .copy_from_slice(params);
+        Ok(Self {
+            cmd,
+            func,
+            session,
+            cancel_id: 0,
+            pad: 0,
+            ret: TeeResult::Success,
+            ret_origin: TeeOrigin::Tee,
+            num_params: u32::try_from(params.len()).map_err(|_| OpteeSmcReturnCode::EBadCmd)?,
+            params: all,
+        })
+    }
 
     /// Construct an `OpteeMsgArgs` from an `OpteeMsgArgsHeader` and a raw parameter byte slice.
     ///
@@ -2771,6 +2840,41 @@ mod tests {
         let mut args = OpteeSmcArgs::default();
         args.args[3] = (u32::MAX as usize) + 1;
         assert_eq!(args.get_rpc_context_id(), Err(OpteeSmcReturnCode::EBadCmd));
+    }
+
+    #[test]
+    fn uuid_u64_array_round_trips() {
+        let uuid = TeeUuid::from_bytes([
+            0x8a, 0xaa, 0xf2, 0x00, 0x24, 0x50, 0x11, 0xe4, 0xab, 0xe2, 0x00, 0x02, 0xa5, 0xd5,
+            0xc5, 0x1b,
+        ]);
+        assert_eq!(TeeUuid::from_u64_array(uuid.to_u64_array()), uuid);
+    }
+
+    #[test]
+    fn msg_params_are_built_by_type() {
+        let value = OpteeMsgParamValue { a: 1, b: 2, c: 3 };
+        let param = OpteeMsgParam::new_value(OpteeMsgAttrType::ValueInout, value).unwrap();
+        assert_eq!(param.attr_type(), OpteeMsgAttrType::ValueInout);
+        assert_eq!(
+            param.get_param_value().map(|v| (v.a, v.b, v.c)),
+            Some((1, 2, 3))
+        );
+        assert!(OpteeMsgParam::new_value(OpteeMsgAttrType::RmemInput, value).is_none());
+        let rmem = OpteeMsgParamRmem {
+            offs: 0,
+            size: 8,
+            shm_ref: 2,
+        };
+        let param = OpteeMsgParam::new_rmem(OpteeMsgAttrType::RmemOutput, rmem).unwrap();
+        assert_eq!(
+            param.get_param_rmem().map(|r| (r.size, r.shm_ref)),
+            Some((8, 2))
+        );
+        assert!(OpteeMsgParam::new_meta_value(value).is_meta());
+        let args = OpteeMsgArgs::new(OpteeMessageCommand::InvokeCommand, 7, 1, &[param]).unwrap();
+        assert_eq!(args.num_params, 1);
+        assert!(OpteeMsgArgs::new(OpteeMessageCommand::InvokeCommand, 0, 0, &[param; 7]).is_err());
     }
 
     #[test]
