@@ -27,6 +27,6 @@
 	"panic-strategy": "abort",
 	"disable-redzone": true,
 	"stack-probes": { "kind": "inline" },
-	"features": "-avx,-avx2,-avx512f",
+	"features": "-avx,-avx2,-avx512f,+sha,+ssse3,+sse4.1,+aes",
 	"dynamic-linking": false
 }
