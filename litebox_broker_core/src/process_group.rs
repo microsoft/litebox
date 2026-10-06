@@ -7,7 +7,7 @@
 //! session, each identified by the ID of the process that created it. A child
 //! process starts in its creator's group and session, while a root process
 //! leads its own. A group or session exists while any process, including a
-//! zombie not yet reaped, belongs to it.
+//! zombie not yet reaped, belongs to it, and its ID is not reused until then.
 
 use alloc::sync::Arc;
 
@@ -58,28 +58,29 @@ pub fn set(process: &BrokerProcess, target: ProcessId, process_group: ProcessId)
 /// `UnknownObject`. Returns `PolicyDenied` if a process group already has
 /// `target`'s ID.
 pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
-    let pending_child;
-    let target = if target == process.id() {
-        process
-    } else {
-        pending_child = process.pending_child_process(target)?;
-        &pending_child
-    };
     let _tree = process.core.process_tree.lock();
-    let id = target.id();
-    if process
-        .core
-        .registered_processes()
-        .iter()
-        .any(|member| member.membership().process_group == id)
-    {
-        return Err(BrokerError::PolicyDenied);
+    let processes = process.core.registered_processes();
+    let create = |target: &BrokerProcess| {
+        let id = target.id();
+        if processes
+            .iter()
+            .any(|member| member.membership().process_group == id)
+        {
+            return Err(BrokerError::PolicyDenied);
+        }
+        target.set_membership(ProcessGroupMembership {
+            process_group: id,
+            session: id,
+        });
+        Ok(())
+    };
+    if target == process.id() {
+        create(process)
+    } else {
+        // The child cannot start, and so gain children in its old session,
+        // before it moves.
+        process.with_pending_child(target, |child| create(child))?
     }
-    target.set_membership(ProcessGroupMembership {
-        process_group: id,
-        session: id,
-    });
-    Ok(())
 }
 
 #[cfg(test)]
@@ -87,8 +88,10 @@ mod tests {
     use alloc::sync::Arc;
 
     use litebox_broker_protocol::ProcessId;
+    use litebox_broker_protocol::process::ProcessExitStatus;
     use litebox_broker_protocol::process_group::ProcessGroupMembership;
 
+    use crate::id::IdAllocator;
     use crate::test_support::TestBrokerCoreBuilder;
     use crate::{
         BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
@@ -241,5 +244,43 @@ mod tests {
         super::set(&child, grandchild.id(), root.id()).unwrap();
         super::create_session(&child, child.id()).unwrap();
         assert_eq!(get(&root, child.id()), Ok(membership(&child, &child)));
+    }
+
+    #[test]
+    fn group_and_session_ids_are_not_reused_while_in_use() {
+        let mut broker = broker();
+        broker.ids = Arc::new(spin::Mutex::new(IdAllocator::new(3).unwrap()));
+        let allocate = |parent: Option<&BrokerProcess>| {
+            broker.allocate_process(
+                CallerCredential::Unauthenticated,
+                parent.map(BrokerProcess::id),
+            )
+        };
+        let leader = allocate(None).unwrap();
+        leader.complete_start().unwrap();
+        let member = allocate(Some(&leader)).unwrap();
+        member.complete_start().unwrap();
+        let leader_id = leader.id();
+        leader.retire(true);
+        leader
+            .complete_exit(ProcessExitStatus::Exited { code: 0 })
+            .unwrap();
+        drop(leader);
+        let other = allocate(None).unwrap();
+
+        // The leader's ID stays allocated while its group and session exist.
+        assert_eq!(
+            allocate(None).map(|process| process.id()),
+            Err(BrokerError::ResourceExhausted)
+        );
+        assert_eq!(
+            get(&other, member.id()),
+            Ok(ProcessGroupMembership {
+                process_group: leader_id,
+                session: leader_id,
+            })
+        );
+        super::create_session(&member, member.id()).unwrap();
+        assert_eq!(allocate(None).unwrap().id(), leader_id);
     }
 }

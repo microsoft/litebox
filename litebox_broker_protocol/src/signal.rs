@@ -49,10 +49,10 @@ pub struct OpenSignalsResponse {
     pub handle: ObjectHandle,
 }
 
-/// Request to take one of the caller's pending signals or its pending child
-/// exit.
+/// Request to take one of the caller's pending signals, its pending child
+/// exit, or its pending child removal.
 ///
-/// The broker returns `WouldBlock` when neither is pending.
+/// The broker returns `WouldBlock` when none is pending.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TakeSignalRequest {
     /// Handle returned by the open request.
