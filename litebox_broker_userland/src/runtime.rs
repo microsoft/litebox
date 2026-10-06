@@ -15,15 +15,14 @@
 //!
 //! Concurrency and worker sizing are deliberately not part of the public
 //! surface. Both association entry points delegate to one internal runtime
-//! that owns worker counts and request queue capacity.
+//! that owns the worker count.
 
 use std::io::{Error as IoError, ErrorKind, Result as IoResult};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, MutexGuard,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::thread::{JoinHandle, Thread};
 
 use litebox_broker_core::BrokerCore;
 use litebox_broker_host::{
@@ -31,7 +30,7 @@ use litebox_broker_host::{
     setup_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::BrokerRequest;
+use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
@@ -42,10 +41,6 @@ use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPoo
 
 use crate::process_launcher::{PendingRunnerAssociation, UserlandProcessLauncher};
 use crate::readiness::ReadinessPublisherRuntime;
-
-const REQUEST_QUEUE_CAPACITY: usize = 64;
-const REQUEST_QUEUE_RETRY_DELAY: Duration = Duration::from_millis(1);
-const REQUEST_QUEUE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct AssociationOutcome {
     pub(crate) result: IoResult<()>,
@@ -96,8 +91,8 @@ pub fn serve_in_process_runner_association<
 where
     Memory: ControlRingMemory,
     SetupChannel: HostSetupChannel<Error = IoError>,
-    RequestSource: HostRequestSource<Error = IoError>,
-    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    RequestSource: HostRequestSource<Error = IoError> + Send + 'static,
+    ResponseSink: HostResponseSink<Error = IoError> + Send + Sync + 'static,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
@@ -142,8 +137,8 @@ pub(crate) fn serve_out_of_process_runner_association<
 where
     Memory: ControlRingMemory,
     SetupChannel: HostSetupChannel<Error = IoError>,
-    RequestSource: HostRequestSource<Error = IoError>,
-    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    RequestSource: HostRequestSource<Error = IoError> + Send + 'static,
+    ResponseSink: HostResponseSink<Error = IoError> + Send + Sync + 'static,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
@@ -196,8 +191,8 @@ fn serve_association_inner<
 where
     Memory: ControlRingMemory,
     SetupChannel: HostSetupChannel<Error = IoError>,
-    RequestSource: HostRequestSource<Error = IoError>,
-    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    RequestSource: HostRequestSource<Error = IoError> + Send + 'static,
+    ResponseSink: HostResponseSink<Error = IoError> + Send + Sync + 'static,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
@@ -446,7 +441,7 @@ impl<Memory: SharedMemory> Drop for AssociationCancellationGuard<'_, Memory> {
 fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, Shutdown>(
     association: BrokerHostAssociation<Memory>,
     readiness: Arc<ReadinessPublisherRuntime>,
-    mut request_source: RequestSource,
+    request_source: RequestSource,
     response_sink: ResponseSink,
     mut notification_channel: NotificationChannel,
     shutdown: Shutdown,
@@ -455,8 +450,8 @@ fn dispatch_requests<Memory, RequestSource, ResponseSink, NotificationChannel, S
 ) -> AssociationOutcome
 where
     Memory: SharedMemory,
-    RequestSource: HostRequestSource<Error = IoError>,
-    ResponseSink: HostResponseSink<Error = IoError> + Clone + Send,
+    RequestSource: HostRequestSource<Error = IoError> + Send + 'static,
+    ResponseSink: HostResponseSink<Error = IoError> + Send + Sync + 'static,
     NotificationChannel: HostNotificationChannel<Error = IoError> + Send,
     Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
 {
@@ -470,8 +465,14 @@ where
             abnormal: true,
         };
     }
-    let (request_sender, request_receiver) = sync_channel(REQUEST_QUEUE_CAPACITY);
-    let request_receiver = Arc::new(Mutex::new(request_receiver));
+    let workers = Arc::new(Workers {
+        association: Arc::clone(&association),
+        requests: Mutex::new(request_source),
+        response_sink,
+        failure_coordinator: Arc::clone(&failure_coordinator),
+        launcher,
+        role: ReceivingRole::new(),
+    });
 
     std::thread::scope(|scope| {
         let publisher_readiness = Arc::clone(&readiness);
@@ -482,9 +483,9 @@ where
                 let _panicking = PublisherPanicGuard {
                     failure_coordinator: &publisher_failure_coordinator,
                 };
-                // The request reader owns association termination. A failing
+                // The request workers own association termination. A failing
                 // notification transport must fail the association before
-                // returning an error, so a reader still running observes and
+                // returning an error, so a worker still receiving observes and
                 // reports the same failure. Reporting here would instead turn
                 // a clean peer close into an error when its transport teardown
                 // releases a blocked notification send.
@@ -510,36 +511,10 @@ where
             association: &association,
         };
 
-        let mut workers = Vec::with_capacity(crate::WORKER_COUNT);
-        for worker_id in 0..crate::WORKER_COUNT {
-            let association = Arc::clone(&association);
-            let request_receiver = Arc::clone(&request_receiver);
-            let response_sink = response_sink.clone();
-            let worker_failure_coordinator = Arc::clone(&failure_coordinator);
-            let launcher_for_worker = launcher.clone();
-            match std::thread::Builder::new()
-                .name(format!("litebox-broker-worker-{worker_id}"))
-                .spawn_scoped(scope, move || {
-                    run_worker(
-                        &association,
-                        &request_receiver,
-                        &response_sink,
-                        &worker_failure_coordinator,
-                        launcher_for_worker.as_ref(),
-                    );
-                }) {
-                Ok(worker) => workers.push(worker),
-                Err(error) => {
-                    failure_coordinator.report(error);
-                    break;
-                }
-            }
-        }
-
-        read_requests(&mut request_source, request_sender, &failure_coordinator);
+        // This thread is the first worker; others start when requests wait.
+        workers.run(false);
         drop(cancellation);
-        association.association_ending();
-        for worker in workers {
+        for worker in workers.role.take_started() {
             if worker.join().is_err() {
                 failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
             }
@@ -560,6 +535,7 @@ where
         }
     });
 
+    drop(workers);
     let result = match failure_coordinator.take_error() {
         Some(error) => Err(error),
         None => Ok(()),
@@ -577,122 +553,236 @@ where
     AssociationOutcome { result, abnormal }
 }
 
-fn read_requests<RequestSource, Shutdown>(
-    request_source: &mut RequestSource,
-    request_sender: SyncSender<BrokerRequest>,
-    failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-) where
-    RequestSource: HostRequestSource<Error = IoError>,
-    Shutdown: HostAssociationShutdown<Error = IoError>,
-{
-    loop {
-        if failure_coordinator.failed() {
-            break;
+/// The workers serving one association's requests.
+///
+/// The association's own thread is the first worker; [`ReceivingRole::pass`]
+/// starts others only when a request is about to wait while no worker is
+/// idle.
+struct Workers<Memory: SharedMemory, RequestSource, ResponseSink, Shutdown> {
+    association: Arc<BrokerHostAssociation<Memory>>,
+    /// Locked only by the worker holding `role`.
+    requests: Mutex<RequestSource>,
+    response_sink: ResponseSink,
+    failure_coordinator: Arc<HostAssociationFailureCoordinator<Shutdown>>,
+    launcher: Option<Arc<UserlandProcessLauncher>>,
+    role: ReceivingRole,
+}
+
+/// The right to receive an association's next request.
+///
+/// One worker at a time receives, and it keeps the role while it executes the
+/// request it received, so the requests of a mostly sequential peer keep going
+/// to one worker with a warm cache instead of rotating through ones that have
+/// gone cold. A worker passes the role on only before executing a request that
+/// waits (see [`Workers::run`]), so a slow request does not hold up later ones.
+struct ReceivingRole {
+    state: Mutex<Receivers>,
+}
+
+struct Receivers {
+    /// Whether the receiving worker has observed the end of the requests.
+    ended: bool,
+    /// Whether a worker holds the receiving role.
+    held: bool,
+    /// Workers waiting for the receiving role, most recently idle last.
+    ///
+    /// A worker waits only while another one holds the role, so this is empty
+    /// whenever `held` is false.
+    idle: Vec<Thread>,
+    /// Workers started by [`ReceivingRole::pass`].
+    started: Vec<JoinHandle<()>>,
+}
+
+impl ReceivingRole {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(Receivers {
+                ended: false,
+                held: false,
+                idle: Vec::with_capacity(crate::WORKER_COUNT),
+                started: Vec::with_capacity(crate::WORKER_COUNT),
+            }),
         }
-        match request_source.recv_request() {
-            Ok(HostReceive::Message(request)) => {
-                if !enqueue_request(
-                    &request_sender,
+    }
+
+    fn state(&self) -> MutexGuard<'_, Receivers> {
+        self.state
+            .lock()
+            .expect("broker receiving role mutex poisoned")
+    }
+
+    /// Waits for the role, or returns `false` once requests have ended.
+    fn take(&self) -> bool {
+        let mut state = self.state();
+        if state.ended {
+            return false;
+        }
+        if !state.held {
+            state.held = true;
+            return true;
+        }
+        let worker = std::thread::current();
+        let id = worker.id();
+        state.idle.push(worker);
+        loop {
+            if state.ended {
+                return false;
+            }
+            // Only a worker passing the role removes a waiting one.
+            if !state.idle.iter().any(|idle| idle.id() == id) {
+                return true;
+            }
+            drop(state);
+            std::thread::park();
+            state = self.state();
+        }
+    }
+
+    /// Passes the role to the most recently idle worker or, while there are
+    /// fewer than [`crate::WORKER_COUNT`] workers, to one that `start` starts
+    /// already holding it given its index.
+    ///
+    /// Without either, the role is left for the next worker to finish.
+    fn pass(&self, start: impl FnOnce(usize) -> IoResult<JoinHandle<()>>) {
+        let mut state = self.state();
+        if let Some(next) = state.idle.pop() {
+            drop(state);
+            next.unpark();
+            return;
+        }
+        let index = state.started.len() + 1;
+        // Starting under the lock records the new worker before it can end
+        // the requests, so the association thread joins it.
+        if index < crate::WORKER_COUNT
+            && let Ok(worker) = start(index)
+        {
+            state.started.push(worker);
+        } else {
+            state.held = false;
+        }
+    }
+
+    /// Ends receiving and returns every idle worker.
+    fn end(&self) {
+        let idle = {
+            let mut state = self.state();
+            state.ended = true;
+            std::mem::take(&mut state.idle)
+        };
+        for worker in idle {
+            worker.unpark();
+        }
+    }
+
+    /// Takes the workers [`Self::pass`] started.
+    ///
+    /// Once requests have ended, no worker holds the role to start another.
+    fn take_started(&self) -> Vec<JoinHandle<()>> {
+        let mut state = self.state();
+        debug_assert!(state.ended, "broker requests must end before joining");
+        std::mem::take(&mut state.started)
+    }
+}
+
+impl<Memory, RequestSource, ResponseSink, Shutdown>
+    Workers<Memory, RequestSource, ResponseSink, Shutdown>
+where
+    Memory: SharedMemory,
+    RequestSource: HostRequestSource<Error = IoError> + Send + 'static,
+    ResponseSink: HostResponseSink<Error = IoError> + Send + Sync + 'static,
+    Shutdown: HostAssociationShutdown<Error = IoError> + Send + Sync + 'static,
+{
+    /// Serves requests until the association's requests end, starting with
+    /// the receiving role if `holds_role`.
+    ///
+    /// Every worker takes its turn receiving and executes each request it
+    /// receives. Once every worker is busy, requests wait in the transport
+    /// until one finishes.
+    fn run(self: &Arc<Self>, mut holds_role: bool) {
+        loop {
+            if !holds_role && !self.role.take() {
+                return;
+            }
+            let Some(request) = self.next_request() else {
+                return;
+            };
+            // Starting a child process waits for its runner's setup, so another
+            // worker receives meanwhile. Other requests wait at most briefly for
+            // broker threads such as the socket reactor, and never for the
+            // guest, which learns of readiness through notifications instead.
+            holds_role = !matches!(request.operation, BrokerOperation::StartChildProcess(_));
+            if !holds_role {
+                self.pass_role();
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.association.execute_request_with(
                     request,
-                    failure_coordinator,
-                    REQUEST_QUEUE_STALL_TIMEOUT,
-                ) {
-                    break;
+                    |process, operation, shared_buffers| {
+                        self.launcher.as_ref().and_then(|launcher| {
+                            handle_process_operation(launcher, process, operation, shared_buffers)
+                        })
+                    },
+                    |response| self.response_sink.send_response(response),
+                )
+            })) {
+                Ok(Ok(()) | Err(BrokerHostError::AssociationFailed)) => {}
+                Ok(Err(error)) => self.failure_coordinator.report(map_host_error(error)),
+                Err(_) => {
+                    self.failure_coordinator
+                        .report_panic(IoError::other("broker request worker panicked"));
                 }
             }
-            Ok(HostReceive::ProtocolViolation) => {
-                failure_coordinator.report(IoError::new(
+        }
+    }
+
+    /// Passes the receiving role on before executing a request that waits.
+    ///
+    /// See [`ReceivingRole::pass`] for which worker takes it.
+    fn pass_role(self: &Arc<Self>) {
+        self.role.pass(|index| {
+            let workers = Arc::clone(self);
+            std::thread::Builder::new()
+                .name(format!("litebox-broker-worker-{index}"))
+                .spawn(move || workers.run(true))
+        });
+    }
+
+    /// Receives the next request while holding the receiving role, or returns
+    /// `None` once the association's requests have ended.
+    ///
+    /// The worker that observes the end reports why and starts association
+    /// teardown, so workers still executing requests see cancellation
+    /// promptly.
+    fn next_request(&self) -> Option<BrokerRequest> {
+        let received = (!self.failure_coordinator.failed()).then(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.requests
+                    .lock()
+                    .expect("broker request source mutex poisoned")
+                    .recv_request()
+            }))
+        });
+        if let Some(Ok(Ok(HostReceive::Message(request)))) = received {
+            return Some(request);
+        }
+        self.role.end();
+        match received {
+            Some(Ok(Ok(HostReceive::ProtocolViolation))) => {
+                self.failure_coordinator.report(IoError::new(
                     ErrorKind::InvalidData,
                     "runner sent a request for the wrong protocol phase",
                 ));
-                break;
             }
-            Ok(HostReceive::PeerClosed) => break,
-            Err(error) => {
-                failure_coordinator.report(error);
-                break;
+            Some(Ok(Err(error))) => self.failure_coordinator.report(error),
+            Some(Err(_)) => {
+                self.failure_coordinator
+                    .report_panic(IoError::other("broker request reader panicked"));
             }
+            Some(Ok(Ok(HostReceive::PeerClosed | HostReceive::Message(_)))) | None => {}
         }
-    }
-}
-
-fn enqueue_request<Shutdown>(
-    request_sender: &SyncSender<BrokerRequest>,
-    mut request: BrokerRequest,
-    failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-    stall_timeout: Duration,
-) -> bool
-where
-    Shutdown: HostAssociationShutdown<Error = IoError>,
-{
-    let started = Instant::now();
-    loop {
-        match request_sender.try_send(request) {
-            Ok(()) => return true,
-            Err(TrySendError::Disconnected(_)) => {
-                failure_coordinator.report(IoError::new(
-                    ErrorKind::BrokenPipe,
-                    "broker request workers stopped",
-                ));
-                return false;
-            }
-            Err(TrySendError::Full(pending)) => {
-                request = pending;
-                if failure_coordinator.failed() {
-                    return false;
-                }
-                if started.elapsed() >= stall_timeout {
-                    failure_coordinator.report(IoError::new(
-                        ErrorKind::TimedOut,
-                        "broker request queue remained full",
-                    ));
-                    return false;
-                }
-                std::thread::sleep(REQUEST_QUEUE_RETRY_DELAY);
-            }
-        }
-    }
-}
-
-fn run_worker<Memory, ResponseSink, Shutdown>(
-    association: &BrokerHostAssociation<Memory>,
-    request_receiver: &Mutex<Receiver<BrokerRequest>>,
-    response_sink: &ResponseSink,
-    failure_coordinator: &HostAssociationFailureCoordinator<Shutdown>,
-    launcher: Option<&Arc<UserlandProcessLauncher>>,
-) where
-    Memory: SharedMemory,
-    ResponseSink: HostResponseSink<Error = IoError>,
-    Shutdown: HostAssociationShutdown<Error = IoError>,
-{
-    loop {
-        let request = request_receiver
-            .lock()
-            .expect("broker request receiver mutex poisoned")
-            .recv();
-        let Ok(request) = request else {
-            break;
-        };
-        if failure_coordinator.failed() {
-            continue;
-        }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            association.execute_request_with(
-                request,
-                |process, operation, shared_buffers| {
-                    launcher.and_then(|launcher| {
-                        handle_process_operation(launcher, process, operation, shared_buffers)
-                    })
-                },
-                |response| response_sink.send_response(response),
-            )
-        })) {
-            Ok(Ok(()) | Err(BrokerHostError::AssociationFailed)) => {}
-            Ok(Err(error)) => failure_coordinator.report(map_host_error(error)),
-            Err(_) => {
-                failure_coordinator.report_panic(IoError::other("broker request worker panicked"));
-            }
-        }
+        self.association.request_cancellation();
+        self.association.association_ending();
+        None
     }
 }
 
@@ -709,13 +799,8 @@ mod tests {
     use litebox_broker_core::{ObjectRights, PolicyEngine};
     use litebox_broker_host::setup_connection;
     use litebox_broker_protocol::BROKER_PROTOCOL_VERSION;
-    use litebox_broker_protocol::RequestId;
-    use litebox_broker_protocol::message::{
-        BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
-    };
-    use litebox_broker_protocol::shared_buffer::{
-        SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SharedBufferSequence, SharedBufferSlotIndex,
-    };
+    use litebox_broker_protocol::message::{BrokerHandshakeResponse, BrokerNotification};
+    use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
     use litebox_broker_transport::channel::{
         HostNotificationChannel, HostReceive, HostSetupChannel, LocalSetupChannel,
     };
@@ -934,17 +1019,6 @@ mod tests {
         (local, notifications, shutdown, outcome, host)
     }
 
-    struct RecordingShutdown(Arc<AtomicBool>);
-
-    impl HostAssociationShutdown for RecordingShutdown {
-        type Error = IoError;
-
-        fn shutdown(&self) -> IoResult<()> {
-            self.0.store(true, Ordering::Release);
-            Ok(())
-        }
-    }
-
     #[test]
     fn publication_guard_ends_a_parked_publisher() {
         let association = live_association();
@@ -1097,34 +1171,6 @@ mod tests {
         assert_eq!(
             failure_coordinator.take_error().unwrap().kind(),
             ErrorKind::ConnectionAborted
-        );
-    }
-
-    #[test]
-    fn a_stalled_request_queue_fails_after_its_deadline() {
-        let request = |request_id| BrokerRequest {
-            request_id: RequestId(request_id),
-            operation: BrokerOperation::FillRandom(
-                SharedBufferSequence::new(&[SharedBufferSlotIndex(0)], 1).unwrap(),
-            ),
-        };
-        let shutdown_called = Arc::new(AtomicBool::new(false));
-        let failure_coordinator =
-            HostAssociationFailureCoordinator::new(RecordingShutdown(Arc::clone(&shutdown_called)));
-        let (request_sender, _request_receiver) = sync_channel(1);
-        request_sender.send(request(1)).unwrap();
-
-        assert!(!enqueue_request(
-            &request_sender,
-            request(2),
-            &failure_coordinator,
-            Duration::ZERO,
-        ));
-
-        assert!(shutdown_called.load(Ordering::Acquire));
-        assert_eq!(
-            failure_coordinator.take_error().unwrap().kind(),
-            ErrorKind::TimedOut
         );
     }
 
