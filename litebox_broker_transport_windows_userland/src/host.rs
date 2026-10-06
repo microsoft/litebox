@@ -121,19 +121,19 @@ impl WindowsNamedPipeHostSetupChannel {
         self.send_shared_memory(memory, unsafe { GetCurrentProcess() })
     }
 
-    /// Duplicates a handle that can only read `image`, if any, into the runner and sends it.
+    /// Duplicates a handle that can only read the image, if any, into its runner process and
+    /// sends it.
     ///
-    /// The broker must not write `image` afterward. An empty image is sent as no image. The peer
-    /// must call
+    /// The broker must not write the image afterward. An empty image is sent as no image. The
+    /// peer must call
     /// [`WindowsNamedPipeLocalSetupChannel::receive_process_image`](crate::named_pipe::WindowsNamedPipeLocalSetupChannel::receive_process_image)
     /// at the same setup step, even when there is no image.
     pub fn send_process_image(
         &mut self,
-        image: Option<&WindowsProcessImage>,
-        runner_process: HANDLE,
+        image: Option<(&WindowsProcessImage, HANDLE)>,
     ) -> IoResult<()> {
-        let transfer = match image.filter(|image| !image.is_empty()) {
-            Some(image) => image.duplicate_to_process(runner_process)?,
+        let transfer = match image.filter(|(image, _)| !image.is_empty()) {
+            Some((image, runner_process)) => image.duplicate_to_process(runner_process)?,
             None => TransferredSharedMemory {
                 length: 0,
                 handles: Vec::new(),
@@ -144,17 +144,6 @@ impl WindowsNamedPipeHostSetupChannel {
             &encode_transfer(&transfer)?,
             self.setup_deadline,
         )
-    }
-
-    /// Duplicates a handle that can only read `image`, if any, into this process and sends it,
-    /// as [`Self::send_process_image`] does.
-    pub fn send_process_image_to_current_process(
-        &mut self,
-        image: Option<&WindowsProcessImage>,
-    ) -> IoResult<()> {
-        // SAFETY: GetCurrentProcess returns a pseudo-handle that remains valid
-        // for the lifetime of this process and must not be closed.
-        self.send_process_image(image, unsafe { GetCurrentProcess() })
     }
 
     /// Activates host request, response, and notification control-ring endpoints.

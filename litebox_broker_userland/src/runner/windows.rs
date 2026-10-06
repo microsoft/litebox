@@ -150,7 +150,7 @@ fn serve_association(
                     .expect("the userland launcher creates every process image")
                     .0
             });
-            channel.send_process_image(image, runner_process)
+            channel.send_process_image(image.map(|image| (image, runner_process)))
         },
         WindowsNamedPipeHostSetupChannel::into_active,
         launcher,

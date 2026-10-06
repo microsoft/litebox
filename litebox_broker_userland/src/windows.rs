@@ -91,7 +91,7 @@ fn serve_runner_in_process(
         |channel, shared_memory, control_memory| {
             channel.send_shared_memory_to_current_process(shared_memory)?;
             channel.send_shared_memory_to_current_process(control_memory)?;
-            channel.send_process_image_to_current_process(None)
+            channel.send_process_image(None)
         },
     )
 }
