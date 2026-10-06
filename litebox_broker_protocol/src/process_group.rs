@@ -5,8 +5,8 @@
 //!
 //! Every process belongs to one process group, and every process group to one
 //! session. Each is identified by the ID of the process that created it, which
-//! need not still exist. A child process starts in its parent's group and
-//! session, while a process without a parent leads its own.
+//! need not still exist. A child process starts in its creator's group and
+//! session, while a root process, which has no creator, leads its own.
 
 use crate::ProcessId;
 

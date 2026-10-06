@@ -6,7 +6,7 @@ use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, SignalRequest, SignalResponse,
 };
 use litebox_broker_protocol::signal::{
-    PendingSignal, SendSignalRequest, SignalTarget, TakeSignalRequest,
+    SendSignalRequest, SignalEvent, SignalTarget, TakeSignalRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -41,13 +41,14 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Takes this process's lowest-numbered pending signal.
+    /// Takes this process's lowest-numbered pending signal, or else its
+    /// pending child exit.
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued signal request.
-    pub fn take_signal(&self, handle: ObjectHandle) -> Result<PendingSignal, Channel::Error> {
+    pub fn take_signal(&self, handle: ObjectHandle) -> Result<SignalEvent, Channel::Error> {
         match self.request_signal(SignalRequest::Take(TakeSignalRequest { handle }))? {
             SignalResponse::Take(signal) => Ok(signal),
             response => panic!("broker returned unexpected signal response: {response:?}"),

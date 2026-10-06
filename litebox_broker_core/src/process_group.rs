@@ -5,10 +5,9 @@
 //!
 //! Every process belongs to one process group, and every process group to one
 //! session, each identified by the ID of the process that created it. A child
-//! process starts in its parent's group and session, while a process without a
-//! parent leads its own. A group or session exists while any registered
-//! process, including one that has terminated but whose status is still held,
-//! belongs to it.
+//! process starts in its creator's group and session, while a root process
+//! leads its own. A group or session exists while any process, including a
+//! zombie not yet reaped, belongs to it.
 
 use alloc::sync::Arc;
 
@@ -16,13 +15,6 @@ use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 
 use crate::{BrokerError, BrokerProcess, Result};
-
-/// Returns the group and session of the process `target`.
-///
-/// Returns `UnknownObject` if no such process exists.
-pub fn get(process: &BrokerProcess, target: ProcessId) -> Result<ProcessGroupMembership> {
-    Ok(process.core.registered_process(target)?.membership())
-}
 
 /// Moves the process `target` into `process_group`, creating the group if it
 /// is `target`'s ID.
@@ -32,11 +24,11 @@ pub fn get(process: &BrokerProcess, target: ProcessId) -> Result<ProcessGroupMem
 /// than the caller or leads a session, or if `process_group` is neither
 /// `target`'s ID nor an existing group in the caller's session.
 pub fn set(process: &BrokerProcess, target: ProcessId, process_group: ProcessId) -> Result<()> {
+    let _tree = process.core.process_tree.lock();
     let target = process.core.registered_process(target)?;
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
     }
-    let _serialized = process.core.process_groups.lock();
     let session = process.membership().session;
     let membership = target.membership();
     if membership.session != session || membership.session == target.id() {
@@ -55,7 +47,7 @@ pub fn set(process: &BrokerProcess, target: ProcessId, process_group: ProcessId)
     {
         return Err(BrokerError::PolicyDenied);
     }
-    *target.membership.lock() = joined;
+    target.set_membership(joined);
     Ok(())
 }
 
@@ -73,7 +65,7 @@ pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> 
         pending_child = process.pending_child_process(target)?;
         &pending_child
     };
-    let _serialized = process.core.process_groups.lock();
+    let _tree = process.core.process_tree.lock();
     let id = target.id();
     if process
         .core
@@ -83,10 +75,10 @@ pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> 
     {
         return Err(BrokerError::PolicyDenied);
     }
-    *target.membership.lock() = ProcessGroupMembership {
+    target.set_membership(ProcessGroupMembership {
         process_group: id,
         session: id,
-    };
+    });
     Ok(())
 }
 
@@ -95,13 +87,12 @@ mod tests {
     use alloc::sync::Arc;
 
     use litebox_broker_protocol::ProcessId;
-    use litebox_broker_protocol::process::CreatedProcess;
     use litebox_broker_protocol::process_group::ProcessGroupMembership;
 
-    use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::TestBrokerCoreBuilder;
     use crate::{
         BrokerCore, BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine,
+        Result,
     };
 
     fn broker() -> BrokerCore {
@@ -122,6 +113,10 @@ mod tests {
             .unwrap()
     }
 
+    fn get(process: &BrokerProcess, target: ProcessId) -> Result<ProcessGroupMembership> {
+        process.process_info(target).map(|info| info.membership)
+    }
+
     fn membership(
         process_group: &BrokerProcess,
         session: &BrokerProcess,
@@ -139,23 +134,17 @@ mod tests {
         let child = process(&broker, Some(&root));
         let other = process(&broker, None);
 
-        assert_eq!(super::get(&other, root.id()), Ok(membership(&root, &root)));
-        assert_eq!(super::get(&other, child.id()), Ok(membership(&root, &root)));
+        assert_eq!(get(&other, root.id()), Ok(membership(&root, &root)));
+        assert_eq!(get(&other, child.id()), Ok(membership(&root, &root)));
+        assert_eq!(get(&root, other.id()), Ok(membership(&other, &other)));
         assert_eq!(
-            super::get(&root, other.id()),
-            Ok(membership(&other, &other))
-        );
-        assert_eq!(
-            super::get(&root, ProcessId(u32::MAX)),
+            get(&root, ProcessId(u32::MAX)),
             Err(BrokerError::UnknownObject)
         );
 
         super::set(&root, child.id(), child.id()).unwrap();
         let grandchild = process(&broker, Some(&child));
-        assert_eq!(
-            super::get(&root, grandchild.id()),
-            Ok(membership(&child, &root))
-        );
+        assert_eq!(get(&root, grandchild.id()), Ok(membership(&child, &root)));
     }
 
     #[test]
@@ -184,12 +173,9 @@ mod tests {
         // A process creates its own group or joins one in its session.
         super::set(&root, first.id(), first.id()).unwrap();
         super::set(&root, second.id(), first.id()).unwrap();
-        assert_eq!(
-            super::get(&root, second.id()),
-            Ok(membership(&first, &root))
-        );
+        assert_eq!(get(&root, second.id()), Ok(membership(&first, &root)));
         super::set(&second, second.id(), root.id()).unwrap();
-        assert_eq!(super::get(&root, second.id()), Ok(membership(&root, &root)));
+        assert_eq!(get(&root, second.id()), Ok(membership(&root, &root)));
         assert_eq!(
             super::set(&second, second.id(), ProcessId(u32::MAX)),
             Err(BrokerError::PolicyDenied)
@@ -234,13 +220,10 @@ mod tests {
             super::create_session(&root, child.id()),
             Err(BrokerError::UnknownObject)
         );
-        let CreatedProcess { identity, .. } = root
-            .allocate_child_process(Arc::new(TestReadinessSink::default()))
-            .unwrap();
-        let pending = identity.process_id;
+        let pending = root.allocate_child_process().unwrap().process_id;
         super::create_session(&root, pending).unwrap();
         assert_eq!(
-            super::get(&root, pending),
+            get(&root, pending),
             Ok(ProcessGroupMembership {
                 process_group: pending,
                 session: pending,
@@ -257,9 +240,6 @@ mod tests {
         );
         super::set(&child, grandchild.id(), root.id()).unwrap();
         super::create_session(&child, child.id()).unwrap();
-        assert_eq!(
-            super::get(&root, child.id()),
-            Ok(membership(&child, &child))
-        );
+        assert_eq!(get(&root, child.id()), Ok(membership(&child, &child)));
     }
 }

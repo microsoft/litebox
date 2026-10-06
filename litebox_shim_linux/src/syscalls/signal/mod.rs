@@ -753,10 +753,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         if signal == Signal::SIGCHLD && act.is_some() {
             // Linux decides whether to send `SIGCHLD` as the child terminates, so terminations
-            // already notified to this process are observed under the old action. A termination
+            // already notified to this process are taken under the old action. A termination
             // concurrent with this call, or not yet notified, which the guest cannot tell apart,
             // may still be reaped under the old action and signaled under the new one.
-            let _ = self.observe_child_terminations();
+            self.take_signals(false);
         }
 
         let handlers = self.signals.handlers.borrow();
@@ -837,7 +837,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             0 => SignalTarget::ProcessGroup(
                 self.global
                     .litebox
-                    .process_group(ProcessId(self.pid.cast_unsigned()))?
+                    .process_info(ProcessId(self.pid.cast_unsigned()))?
+                    .membership
                     .process_group,
             ),
             -1 => SignalTarget::All,

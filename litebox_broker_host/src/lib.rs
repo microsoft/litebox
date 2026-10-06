@@ -266,14 +266,13 @@ where
         None => None,
     };
     let limits = core.limits();
-    // Sockets, child process handles, and object references (shared pipes,
-    // timers, and files such as stdio devices) register readiness. Add future
-    // resource limits here so every live registration fits in the
-    // association's shared readiness sink.
+    // Sockets and object references (shared pipes, timers, signals, and files
+    // such as stdio devices) register readiness. Add future resource limits
+    // here so every live registration fits in the association's shared
+    // readiness sink.
     let max_live_readiness_registrations = limits
         .max_sockets
         .min(limits.max_sockets_per_process)
-        .saturating_add(limits.max_processes)
         .saturating_add(limits.max_references.min(limits.max_references_per_process));
     if max_live_readiness_registrations > readiness_sink.max_tracked_objects() {
         return Err(BrokerHostError::Broker(ErrorCode::ResourceExhausted));
@@ -501,7 +500,7 @@ fn handle_request<Memory: SharedMemory>(
                 .map(BrokerResult::CreateThread)
                 .map_err(RequestFailure::from),
             CreateThreadRequest::Process => process
-                .allocate_child_process(Arc::clone(readiness_sink))
+                .allocate_child_process()
                 .map(CreateThreadResponse::Process)
                 .map(BrokerResult::CreateThread)
                 .map_err(RequestFailure::from),
@@ -526,9 +525,9 @@ fn handle_request<Memory: SharedMemory>(
             .set_status_flags(request)
             .map(|()| BrokerResult::StatusFlagsSet)
             .map_err(RequestFailure::from),
-        BrokerOperation::GetProcessExitStatus(handle) => process
-            .process_exit_status(handle)
-            .map(BrokerResult::ProcessExitStatus)
+        BrokerOperation::ReapChild(selector) => process
+            .reap_child(selector)
+            .map(BrokerResult::ChildReaped)
             .map_err(RequestFailure::from),
         BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
             child_process_id,
@@ -537,6 +536,10 @@ fn handle_request<Memory: SharedMemory>(
             .exit_child_process(child_process_id, exit_status)
             .map(|()| BrokerResult::ProcessExited)
             .map_err(RequestFailure::from),
+        BrokerOperation::CancelChildProcess(child_process_id) => process
+            .cancel_child_process(child_process_id)
+            .map(|()| BrokerResult::ChildProcessCancelled)
+            .map_err(RequestFailure::from),
         BrokerOperation::ReportExitStatus(exit_status) => process
             .report_exit_status(exit_status)
             .map(|()| BrokerResult::ExitStatusReported)
@@ -544,6 +547,14 @@ fn handle_request<Memory: SharedMemory>(
         BrokerOperation::SetChildReaping(enabled) => process
             .set_child_reaping(enabled)
             .map(|()| BrokerResult::ChildReapingSet)
+            .map_err(RequestFailure::from),
+        BrokerOperation::SetOrphanAdoption(enabled) => process
+            .set_orphan_adoption(enabled)
+            .map(|()| BrokerResult::OrphanAdoptionSet)
+            .map_err(RequestFailure::from),
+        BrokerOperation::GetProcessInfo(process_id) => process
+            .process_info(process_id)
+            .map(BrokerResult::ProcessInfo)
             .map_err(RequestFailure::from),
         BrokerOperation::DuplicateObjectsToChild(request) => {
             duplicate_objects_to_child(process, request, shared_buffers, readiness_sink)
@@ -1417,10 +1428,6 @@ fn handle_process_group_request(
     request: ProcessGroupRequest,
 ) -> RequestResult<ProcessGroupResponse> {
     let response = match request {
-        ProcessGroupRequest::Get(process_id) => {
-            litebox_broker_core::process_group::get(process, process_id)
-                .map(ProcessGroupResponse::Get)
-        }
         ProcessGroupRequest::Set(request) => litebox_broker_core::process_group::set(
             process,
             request.process_id,
@@ -1474,6 +1481,9 @@ mod tests {
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
+    use litebox_broker_protocol::process::{
+        ChildExit, ChildSelector, ProcessExitStatus, ProcessInfo,
+    };
     use litebox_broker_protocol::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
@@ -1830,6 +1840,7 @@ mod tests {
         active_request_closes_object_reference(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
         active_requests_manage_process_groups(&broker);
+        active_requests_manage_children(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
@@ -2617,16 +2628,20 @@ mod tests {
         let request = |process: &BrokerProcess, request| {
             handle_test_request(process, BrokerOperation::ProcessGroup(request))
         };
-        let membership = |process_group: &BrokerProcess| {
-            BrokerResult::ProcessGroup(ProcessGroupResponse::Get(ProcessGroupMembership {
-                process_group: process_group.id(),
-                session: parent.id(),
-            }))
+        let info = |process_group: &BrokerProcess| {
+            BrokerResult::ProcessInfo(ProcessInfo {
+                creator: Some(parent.id()),
+                parent: Some(parent.id()),
+                membership: ProcessGroupMembership {
+                    process_group: process_group.id(),
+                    session: parent.id(),
+                },
+            })
         };
 
         assert_eq!(
-            request(&child, ProcessGroupRequest::Get(child.id())),
-            membership(&parent)
+            handle_test_request(&child, BrokerOperation::GetProcessInfo(child.id())),
+            info(&parent)
         );
         assert_eq!(
             request(
@@ -2639,8 +2654,8 @@ mod tests {
             BrokerResult::ProcessGroup(ProcessGroupResponse::Set)
         );
         assert_eq!(
-            request(&parent, ProcessGroupRequest::Get(child.id())),
-            membership(&child)
+            handle_test_request(&parent, BrokerOperation::GetProcessInfo(child.id())),
+            info(&child)
         );
         assert_eq!(
             request(&child, ProcessGroupRequest::CreateSession(child.id())),
@@ -2659,6 +2674,50 @@ mod tests {
                 }))
             ),
             BrokerResult::Signal(SignalResponse::Sent)
+        );
+    }
+
+    fn active_requests_manage_children(broker: &BrokerCore) {
+        let parent = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        parent.complete_start().unwrap();
+        let child = broker
+            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
+            .unwrap();
+        child.complete_start().unwrap();
+        let reap = |selector| handle_test_request(&parent, BrokerOperation::ReapChild(selector));
+
+        assert_eq!(
+            reap(ChildSelector::Any),
+            BrokerResult::Error(ErrorCode::WouldBlock)
+        );
+        assert_eq!(
+            handle_test_request(&parent, BrokerOperation::SetOrphanAdoption(true)),
+            BrokerResult::OrphanAdoptionSet
+        );
+        assert_eq!(
+            handle_test_request(&parent, BrokerOperation::CancelChildProcess(child.id())),
+            BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+        child.retire(true);
+        child
+            .complete_exit(ProcessExitStatus::Exited { code: 3 })
+            .unwrap();
+        assert_eq!(
+            reap(ChildSelector::Process(child.id())),
+            BrokerResult::ChildReaped(ChildExit {
+                process_id: child.id(),
+                exit_status: ProcessExitStatus::Exited { code: 3 },
+            })
+        );
+        assert_eq!(
+            reap(ChildSelector::Any),
+            BrokerResult::Error(ErrorCode::UnknownObject)
+        );
+        assert_eq!(
+            handle_test_request(&parent, BrokerOperation::GetProcessInfo(child.id())),
+            BrokerResult::Error(ErrorCode::UnknownObject)
         );
     }
 

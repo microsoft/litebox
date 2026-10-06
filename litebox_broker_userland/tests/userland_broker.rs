@@ -237,7 +237,7 @@ fn run_fake_runner(args: &[OsString]) {
         assert_eq!(args.len(), 5, "unexpected runner arguments: {args:?}");
         let marker = Path::new(&args[4]);
         let bootstrap = marker.as_os_str().as_encoded_bytes();
-        let failed = local.allocate_child_process().unwrap().identity;
+        let failed = local.allocate_child_process().unwrap();
         local
             .start_child_process(
                 failed.process_id,
@@ -246,7 +246,7 @@ fn run_fake_runner(args: &[OsString]) {
             )
             .unwrap();
         assert_ne!(failed.process_id.0, failed.initial_thread_id.0);
-        let started = local.allocate_child_process().unwrap().identity;
+        let started = local.allocate_child_process().unwrap();
         local
             .start_child_process(
                 started.process_id,

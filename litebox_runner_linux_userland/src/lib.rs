@@ -185,7 +185,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         }
         Some(LinuxProcessStartup::Program(startup)) => {
             let LinuxProgramStartup {
-                parent_process_id,
                 uid,
                 euid,
                 gid,
@@ -202,7 +201,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    ppid: parent_process_id,
                     uid,
                     euid,
                     gid,
@@ -249,7 +247,6 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
             (
                 litebox_common_linux::TaskParams {
                     pid: process_id,
-                    ppid: 0,
                     uid: u32::from(DEFAULT_GUEST_UID),
                     euid: u32::from(DEFAULT_GUEST_UID),
                     gid: u32::from(DEFAULT_GUEST_GID),
