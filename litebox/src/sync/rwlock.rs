@@ -85,15 +85,11 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
     }
 
     #[expect(dead_code, reason = "we may need this eventually for RwLock::try_read")]
-    #[allow(
-        deprecated,
-        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-    )]
     #[inline]
     fn try_read(&self) -> bool {
         self.state
             .underlying_atomic()
-            .fetch_update(Acquire, Relaxed, |s| {
+            .try_update(Acquire, Relaxed, |s| {
                 is_read_lockable(s).then(|| s + READ_LOCKED)
             })
             .is_ok()
@@ -184,15 +180,11 @@ impl<Platform: RawSyncPrimitivesProvider> RawRwLock<Platform> {
         dead_code,
         reason = "we may need this eventually for RwLock::try_write"
     )]
-    #[allow(
-        deprecated,
-        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-    )]
     #[inline]
     fn try_write(&self) -> bool {
         self.state
             .underlying_atomic()
-            .fetch_update(Acquire, Relaxed, |s| {
+            .try_update(Acquire, Relaxed, |s| {
                 is_unlocked(s).then(|| s + WRITE_LOCKED)
             })
             .is_ok()
