@@ -86,13 +86,6 @@ pub struct TrampolineHeader64 {
     pub trampoline_size: u64,
 }
 
-impl TrampolineHeader64 {
-    /// Returns whether the header contains the supported trampoline magic.
-    pub fn has_valid_magic(&self) -> bool {
-        self.magic == TRAMPOLINE_MAGIC
-    }
-}
-
 /// Trampoline header for 32-bit: 8 (magic) + 4 (file_offset) + 4 (vaddr) + 4 (size) = 20 bytes
 #[repr(C, packed)]
 #[derive(FromBytes)]

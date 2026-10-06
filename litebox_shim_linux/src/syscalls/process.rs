@@ -662,7 +662,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EINVAL)?,
             )
         } else {
-            // Legacy `clone` passes the stack pointer through unchecked, as Linux does.
+            // Legacy `clone` already passes the stack top.
             Some(stack.trunc())
         };
 
