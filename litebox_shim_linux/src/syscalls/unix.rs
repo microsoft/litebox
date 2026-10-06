@@ -1333,6 +1333,10 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         Some(Self::new_with_inner(inner, flags))
     }
 
+    pub(super) fn is_stream(&self) -> bool {
+        matches!(self.inner, UnixSocketInner::Stream(_))
+    }
+
     pub(super) fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.bind(task, addr),
