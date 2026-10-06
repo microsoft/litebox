@@ -3445,7 +3445,7 @@ mod unix_tests {
     }
 
     #[test]
-    fn only_unix_stream_sockets_raise_sigpipe() {
+    fn unix_dgram_epipe_does_not_raise_sigpipe() {
         use litebox_common_linux::signal::Signal;
 
         let task = init_platform(None);
