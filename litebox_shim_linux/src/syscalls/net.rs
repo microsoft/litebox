@@ -4292,6 +4292,66 @@ mod unix_tests {
     }
 
     #[test]
+    fn unix_datagram_reads_and_vectors_keep_boundaries() {
+        use litebox_common_linux::{IoReadVec, IoWriteVec};
+
+        let task = init_platform();
+        let (sender, receiver) = task
+            .do_socketpair(
+                AddressFamily::UNIX,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .unwrap();
+        let sender_fd = i32::try_from(sender).unwrap();
+        let receiver_fd = i32::try_from(receiver).unwrap();
+
+        let (first, second) = (b"ab", b"cdef");
+        let write_iovs = [
+            IoWriteVec {
+                iov_base: UserPtr::from_usize(first.as_ptr().expose_provenance()),
+                iov_len: first.len(),
+            },
+            IoWriteVec {
+                iov_base: UserPtr::from_usize(second.as_ptr().expose_provenance()),
+                iov_len: second.len(),
+            },
+        ];
+        let write_iovs_ptr = UserPtr::from_usize(write_iovs.as_ptr().expose_provenance());
+        assert_eq!(task.sys_writev(sender_fd, write_iovs_ptr, 2), Ok(6));
+        assert_eq!(task.sys_writev(sender_fd, write_iovs_ptr, 2), Ok(6));
+
+        let mut short = [0; 3];
+        assert_eq!(task.sys_read(receiver_fd, &mut short, None), Ok(3));
+        assert_eq!(&short, b"abc");
+
+        let (mut head, mut tail) = ([0; 1], [0; 8]);
+        let read_iovs = [
+            IoReadVec {
+                iov_base: UserPtrMut::from_usize(head.as_mut_ptr().expose_provenance()),
+                iov_len: head.len(),
+            },
+            IoReadVec {
+                iov_base: UserPtrMut::from_usize(tail.as_mut_ptr().expose_provenance()),
+                iov_len: tail.len(),
+            },
+        ];
+        let read_iovs_ptr = UserPtr::from_usize(read_iovs.as_ptr().expose_provenance());
+        assert_eq!(task.sys_readv(receiver_fd, read_iovs_ptr, 2), Ok(6));
+        assert_eq!(&head, b"a");
+        assert_eq!(&tail[..5], b"bcdef");
+
+        let receiver_typed = typed_socket(&task, receiver);
+        assert_eq!(
+            task.do_recvfrom(&receiver_typed, &mut short, ReceiveFlags::DONTWAIT, None),
+            Err(Errno::EAGAIN)
+        );
+        close_socket(&task, sender);
+        close_socket(&task, receiver);
+    }
+
+    #[test]
     fn pinned_receive_does_not_follow_dup2_replacement() {
         let task = init_platform();
         let (old_sender, old_receiver) = task

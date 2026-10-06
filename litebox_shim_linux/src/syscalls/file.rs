@@ -1477,117 +1477,169 @@ impl<Platform: ShimPlatform> Task<Platform> {
         })
     }
 
+    /// Reads one datagram into `iovs` if `fd` is a datagram socket, which a
+    /// series of reads would split.
     fn try_read_datagram_from_iovec(
         &self,
         fd: &AnyTypedFd<Platform>,
         iovs: &[IoReadVec],
     ) -> Result<Option<usize>, Errno> {
-        let AnyTypedFd::Network(fd) = fd else {
-            return Ok(None);
-        };
-        let socket = self.global.pin_socket(fd)?;
-        if socket.is_broker_datagram() {
-            self.read_datagram_from_iovec(&socket, iovs).map(Some)
-        } else {
-            Ok(None)
+        let receive_flags = litebox_common_linux::ReceiveFlags::empty();
+        match fd {
+            AnyTypedFd::Network(fd) => {
+                let socket = self.global.pin_socket(fd)?;
+                if !socket.is_broker_datagram() {
+                    return Ok(None);
+                }
+                read_datagram_from_iovec::<Platform>(iovs, |buffer| {
+                    self.global.receive_from_socket(
+                        &self.wait_cx(),
+                        &socket,
+                        buffer,
+                        receive_flags,
+                        super::net::ReceiveContext::new(None, false),
+                        None,
+                    )
+                })
+                .map(Some)
+            }
+            AnyTypedFd::Unix(fd) => {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|socket| {
+                    if socket.is_stream() {
+                        return Ok(None);
+                    }
+                    read_datagram_from_iovec::<Platform>(iovs, |buffer| {
+                        socket.recvfrom(&self.wait_cx(), buffer, receive_flags, None, None)
+                    })
+                    .map(Some)
+                })
+            }
+            _ => Ok(None),
         }
     }
 
-    fn read_datagram_from_iovec(
-        &self,
-        socket: &super::net::InetSocketPin<'_, Platform>,
-        iovs: &[IoReadVec],
-    ) -> Result<usize, Errno> {
-        check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-        let capacity = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
-        if capacity == 0 {
-            return Ok(0);
-        }
-        let mut buffer = alloc::vec::Vec::new();
-        let capacity = capacity.min(litebox::net::SOCKET_RECEIVE_OPERATION_SIZE);
-        buffer
-            .try_reserve_exact(capacity)
-            .map_err(|_| Errno::ENOMEM)?;
-        buffer.resize(capacity, 0);
-        let received = self
-            .global
-            .receive_from_socket(
-                &self.wait_cx(),
-                socket,
-                &mut buffer,
-                litebox_common_linux::ReceiveFlags::empty(),
-                super::net::ReceiveContext::new(None, false),
-                None,
-            )?
-            .min(buffer.len());
-        let mut copied = 0;
-        for iov in iovs {
-            if copied == received {
-                break;
-            }
-            let length = (received - copied).min(iov.iov_len);
-            if iov
-                .iov_base
-                .copy_from_slice::<Platform>(0, &buffer[copied..copied + length])
-                .is_none()
-            {
-                return Err(Errno::EFAULT);
-            }
-            copied += length;
-        }
-        Ok(received)
-    }
-
+    /// Writes `iovs` as one datagram if `fd` is a datagram socket, which a
+    /// series of writes would split.
     fn try_write_datagram_to_iovec(
         &self,
         fd: &AnyTypedFd<Platform>,
         iovs: &[IoWriteVec],
     ) -> Result<Option<usize>, Errno> {
-        let AnyTypedFd::Network(fd) = fd else {
-            return Ok(None);
-        };
-        let socket = self.global.pin_socket(fd)?;
-        if socket.is_broker_datagram() {
-            self.write_datagram_to_iovec(&socket, iovs).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    fn write_datagram_to_iovec(
-        &self,
-        socket: &super::net::InetSocketPin<'_, Platform>,
-        iovs: &[IoWriteVec],
-    ) -> Result<usize, Errno> {
-        check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
-        let length = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
-        if length == 0 {
-            return Ok(0);
-        }
-        if length > litebox::net::MAX_UDP_DATAGRAM_SIZE {
-            return Err(Errno::EMSGSIZE);
-        }
-        let mut buffer = alloc::vec::Vec::new();
-        buffer
-            .try_reserve_exact(length)
-            .map_err(|_| Errno::ENOMEM)?;
-        for iov in iovs {
-            for offset in 0..iov.iov_len {
-                let offset = isize::try_from(offset).map_err(|_| Errno::EFAULT)?;
-                buffer.push(
-                    iov.iov_base
-                        .read_at_offset::<Platform>(offset)
-                        .ok_or(Errno::EFAULT)?,
-                );
+        let send_flags = litebox_common_linux::SendFlags::empty();
+        match fd {
+            AnyTypedFd::Network(fd) => {
+                let socket = self.global.pin_socket(fd)?;
+                if !socket.is_broker_datagram() {
+                    return Ok(None);
+                }
+                write_datagram_to_iovec::<Platform>(
+                    iovs,
+                    litebox::net::MAX_UDP_DATAGRAM_SIZE,
+                    |buffer| {
+                        self.global.send_to_pinned_socket(
+                            &self.wait_cx(),
+                            &socket,
+                            buffer,
+                            send_flags,
+                        )
+                    },
+                )
+                .map(Some)
             }
+            AnyTypedFd::Unix(fd) => {
+                let handle = self
+                    .global
+                    .litebox
+                    .descriptor_table()
+                    .entry_handle(fd)
+                    .ok_or(Errno::EBADF)?;
+                handle.with_entry(|socket| {
+                    if socket.is_stream() {
+                        return Ok(None);
+                    }
+                    // Like `sendmsg`, Unix datagrams have no size limit of their own.
+                    write_datagram_to_iovec::<Platform>(iovs, usize::MAX, |buffer| {
+                        socket.sendto(self, buffer, send_flags, None)
+                    })
+                    .map(Some)
+                })
+            }
+            _ => Ok(None),
         }
-        self.global.send_to_pinned_socket(
-            &self.wait_cx(),
-            socket,
-            &buffer,
-            litebox_common_linux::SendFlags::empty(),
-        )
     }
+}
+
+/// Receives one datagram with `receive` and scatters it into `iovs`.
+fn read_datagram_from_iovec<Platform: ShimPlatform>(
+    iovs: &[IoReadVec],
+    receive: impl FnOnce(&mut [u8]) -> Result<usize, Errno>,
+) -> Result<usize, Errno> {
+    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+    let capacity = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    if capacity == 0 {
+        return Ok(0);
+    }
+    let mut buffer = alloc::vec::Vec::new();
+    let capacity = capacity.min(litebox::net::SOCKET_RECEIVE_OPERATION_SIZE);
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| Errno::ENOMEM)?;
+    buffer.resize(capacity, 0);
+    let received = receive(&mut buffer)?.min(buffer.len());
+    let mut copied = 0;
+    for iov in iovs {
+        if copied == received {
+            break;
+        }
+        let length = (received - copied).min(iov.iov_len);
+        if iov
+            .iov_base
+            .copy_from_slice::<Platform>(0, &buffer[copied..copied + length])
+            .is_none()
+        {
+            return Err(Errno::EFAULT);
+        }
+        copied += length;
+    }
+    Ok(received)
+}
+
+/// Gathers `iovs` into one datagram of at most `max_length` bytes and sends it
+/// with `send`.
+fn write_datagram_to_iovec<Platform: ShimPlatform>(
+    iovs: &[IoWriteVec],
+    max_length: usize,
+    send: impl FnOnce(&[u8]) -> Result<usize, Errno>,
+) -> Result<usize, Errno> {
+    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+    let length = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    if length == 0 {
+        return Ok(0);
+    }
+    if length > max_length {
+        return Err(Errno::EMSGSIZE);
+    }
+    let mut buffer = alloc::vec::Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| Errno::ENOMEM)?;
+    for iov in iovs {
+        for offset in 0..iov.iov_len {
+            let offset = isize::try_from(offset).map_err(|_| Errno::EFAULT)?;
+            buffer.push(
+                iov.iov_base
+                    .read_at_offset::<Platform>(offset)
+                    .ok_or(Errno::EFAULT)?,
+            );
+        }
+    }
+    send(&buffer)
 }
 
 /// Linux's `IOV_MAX` / `UIO_MAXIOV`: the kernel rejects iovec counts above this
