@@ -111,6 +111,16 @@ pub enum AcceptError {
     NoConnectionsReady,
 }
 
+/// Possible errors from [`Network::shutdown`]
+#[non_exhaustive]
+#[derive(Error, Debug)]
+pub enum ShutdownError {
+    #[error("Not a valid open file descriptor")]
+    InvalidFd,
+    #[error("Socket is not connected")]
+    NotConnected,
+}
+
 /// Possible errors from [`Network::send`]
 #[non_exhaustive]
 #[derive(Error, Debug)]
