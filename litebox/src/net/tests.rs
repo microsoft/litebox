@@ -313,10 +313,12 @@ fn test_shutdown_requires_connection() {
         socket_channel::DatagramSocketChannel::new(),
     ));
     assert!(network.set_socket_proxy(&udp_fd, udp.clone()));
+    // Like Linux, an unconnected UDP socket is shut down anyway.
     assert!(matches!(
-        network.shutdown(&udp_fd, Shutdown::Write),
+        network.shutdown(&udp_fd, Shutdown::Read),
         Err(ShutdownError::NotConnected)
     ));
+    assert!(matches!(read(&udp), Err(ChannelReadError::ReadShutdown)));
     let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
     network.connect(&udp_fd, &addr, false).unwrap();
     network.shutdown(&udp_fd, Shutdown::Write).unwrap();
