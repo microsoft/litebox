@@ -109,8 +109,12 @@ pub struct XsaveComponent {
 }
 
 impl XsaveLayout {
-    /// AMX tile state (XTILECFG and XTILEDATA). Hosts gate it per process via
-    /// XFD, and it adds about 8 KiB per save area, so it is never saved.
+    /// AMX tile state (XTILECFG and XTILEDATA), excluded to avoid about 8 KiB
+    /// of additional storage per save area.
+    ///
+    /// Excluding these bits does not disable AMX execution. Platforms must
+    /// prevent guest enablement or manage AMX state separately. On Linux,
+    /// tile-data use requires explicit permission and is lazily enabled via XFD.
     pub const EXCLUDED_FEATURES: u64 = (1 << 17) | (1 << 18);
 
     /// Returns the host layout, detecting it on first use.
@@ -206,6 +210,15 @@ impl XsaveArea {
         };
         area.legacy_area_mut().mxcsr = Self::GUEST_INITIAL_MXCSR;
         area
+    }
+
+    /// Discards saved state and restores architectural initial state without
+    /// replacing the aligned allocation.
+    pub fn reset_to_initial(&mut self) {
+        for chunk in &mut self.storage {
+            chunk.0.fill(0);
+        }
+        self.legacy_area_mut().mxcsr = Self::GUEST_INITIAL_MXCSR;
     }
 
     /// Returns the architectural x87/SSE state at the start of this area.
@@ -320,6 +333,24 @@ mod tests {
         let bitmap = 0x0123_4567_89ab_cdef_u64;
         area.header_mut().xstate_bv = bitmap;
         assert_eq!(area.xstate_bv(), bitmap);
+    }
+
+    #[test]
+    fn reset_to_initial_clears_all_state_and_reuses_storage() {
+        let layout = test_layout(577);
+        let mut area = XsaveArea::initial(&layout);
+        let address = area.as_ptr();
+        for chunk in &mut area.storage {
+            chunk.0.fill(0xff);
+        }
+
+        area.reset_to_initial();
+
+        assert_eq!(area.as_ptr(), address);
+        let initial = XsaveArea::initial(&layout);
+        for (actual, expected) in area.storage.iter().zip(initial.storage.iter()) {
+            assert_eq!(actual.0, expected.0);
+        }
     }
 
     #[test]

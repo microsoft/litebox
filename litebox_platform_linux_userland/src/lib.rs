@@ -492,6 +492,7 @@ fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates or returns.
+/// Floating-point and extended CPU state start in architectural initial state.
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -499,13 +500,14 @@ pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    run_thread_inner(&shim, ctx, false);
+    run_thread_inner(&shim, ctx, GuestXstateInit::Initial);
 }
 
 /// Run a guest thread using a reference to the shim.
 ///
 /// Unlike `run_thread`, this version takes a reference instead of ownership,
 /// avoiding struct moves that could invalidate internal state.
+/// CPU-state initialization is otherwise the same as [`run_thread`].
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -513,13 +515,15 @@ pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    run_thread_inner(shim, ctx, false);
+    run_thread_inner(shim, ctx, GuestXstateInit::Initial);
 }
 
 /// Re-enter a guest thread using a reference to the shim.
 ///
 /// This version takes a reference instead of ownership, avoiding struct moves
 /// that could invalidate internal state.
+/// Floating-point and extended CPU state are retained from the preceding guest
+/// invocation on this host thread.
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -527,7 +531,7 @@ pub unsafe fn reenter_thread<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    run_thread_inner(shim, ctx, true);
+    run_thread_inner(shim, ctx, GuestXstateInit::Reenter);
 }
 
 struct ThreadContext<'a> {
@@ -539,13 +543,25 @@ thread_local! {
     static GUEST_XSTATE: RefCell<Option<XsaveArea>> = const { RefCell::new(None) };
 }
 
-fn activate_xstate(reenter: bool) {
+enum GuestXstateInit {
+    Initial,
+    Reenter,
+    Inherited(XsaveArea),
+}
+
+fn activate_xstate(init: GuestXstateInit) {
     let layout = XsaveLayout::get();
     GUEST_XSTATE.with_borrow_mut(|guest| {
-        if !reenter || guest.is_none() {
-            *guest = Some(XsaveArea::initial(layout));
+        match init {
+            GuestXstateInit::Initial => {
+                if let Some(guest) = guest.as_mut() {
+                    guest.reset_to_initial();
+                }
+            }
+            GuestXstateInit::Reenter => {}
+            GuestXstateInit::Inherited(inherited) => *guest = Some(inherited),
         }
-        let guest = guest.as_mut().unwrap();
+        let guest = guest.get_or_insert_with(|| XsaveArea::initial(layout));
         // SAFETY: The buffer remains owned by this thread's TLS until thread exit.
         // No guest is running while these assembly TLS slots are initialized.
         unsafe {
@@ -565,9 +581,10 @@ fn activate_xstate(reenter: bool) {
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
-    reenter: bool,
+    xstate_init: GuestXstateInit,
 ) {
-    activate_xstate(reenter);
+    let reenter = matches!(xstate_init, GuestXstateInit::Reenter);
+    activate_xstate(xstate_init);
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     ThreadHandle::run_with_handle(|| {
@@ -962,11 +979,12 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
+    xstate_init: GuestXstateInit,
 ) {
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
-    run_thread_inner(shim.as_ref(), &mut ctx, false);
+    run_thread_inner(shim.as_ref(), &mut ctx, xstate_init);
     // TODO: have syscall_callback return if we need to terminate the process.
     // We should return this value to the caller so load_program can return it
     // to the user.
@@ -1025,6 +1043,8 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 
+    /// Inherits the calling guest's saved extended CPU state. Without a saved
+    /// guest context, the new thread starts in architectural initial state.
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1033,8 +1053,16 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
+        // Guest state was captured before entering the shim. The live host
+        // registers no longer contain the parent's guest FP environment.
+        let xstate_init = GUEST_XSTATE.with_borrow(|guest| {
+            guest.as_ref().map_or(GuestXstateInit::Initial, |guest| {
+                GuestXstateInit::Inherited(guest.clone())
+            })
+        });
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
+        let _handle = std::thread::Builder::new()
+            .spawn(move || thread_start(init_thread, ctx, xstate_init))?;
 
         Ok(())
     }
@@ -2303,6 +2331,198 @@ mod tests {
     use crate::LinuxUserland;
 
     extern crate std;
+
+    #[test]
+    fn xstate_initialization_reuses_storage_and_preserves_reentry() {
+        use super::{GUEST_XSTATE, GuestXstateInit, activate_xstate};
+
+        activate_xstate(GuestXstateInit::Initial);
+        let address = GUEST_XSTATE.with_borrow_mut(|guest| {
+            let guest = guest.as_mut().unwrap();
+            guest.header_mut().xstate_bv = 3;
+            guest.legacy_area_mut().xmm_registers[0] = [0x5a; 16];
+            guest.as_ptr()
+        });
+
+        activate_xstate(GuestXstateInit::Reenter);
+        GUEST_XSTATE.with_borrow(|guest| {
+            let guest = guest.as_ref().unwrap();
+            assert_eq!(guest.as_ptr(), address);
+            assert_eq!(guest.xstate_bv(), 3);
+            assert_eq!(guest.legacy_area().xmm_registers[0], [0x5a; 16]);
+        });
+
+        activate_xstate(GuestXstateInit::Initial);
+        GUEST_XSTATE.with_borrow(|guest| {
+            let guest = guest.as_ref().unwrap();
+            assert_eq!(guest.as_ptr(), address);
+            assert_eq!(guest.xstate_bv(), 0);
+            assert_eq!(guest.legacy_area().xmm_registers[0], [0; 16]);
+            assert_eq!(guest.legacy_area().mxcsr, 0x1f80);
+        });
+    }
+
+    #[test]
+    fn spawned_guest_inherits_xstate() {
+        use litebox::platform::ThreadProvider as _;
+        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo, InitThread};
+        use litebox_common_linux::PtRegs;
+        use std::sync::mpsc::{Sender, channel};
+        use zerocopy::IntoBytes as _;
+
+        const TEST_CW: u16 = 0x0b7f;
+        const TEST_MXCSR: u32 = 0x5f80;
+        const SNAPSHOT_SIZE: usize = 576;
+
+        #[unsafe(naked)]
+        unsafe extern "C" fn guest_entry() {
+            core::arch::naked_asm!(
+                "test rdi, rdi",
+                "jnz 3f",
+                "sub rsp, 40",
+                "mov WORD PTR [rsp + 32], {control_word}",
+                "mov DWORD PTR [rsp + 36], {mxcsr}",
+                "mov rax, 0x5a5a5a5a5a5a5a5a",
+                "mov [rsp], rax",
+                "mov [rsp + 8], rax",
+                "mov [rsp + 16], rax",
+                "mov [rsp + 24], rax",
+                "fldcw [rsp + 32]",
+                "ldmxcsr [rsp + 36]",
+                "fld1",
+                "movdqu xmm0, [rsp]",
+                "test r8, r8",
+                "jz 2f",
+                "vmovdqu ymm0, [rsp]",
+                "2:",
+                "add rsp, 40",
+                "lea rcx, [rip + 4f]",
+                "jmp {syscall_callback}",
+                "3:",
+                "fxsave64 [rsi]",
+                "test r8, r8",
+                "jz 4f",
+                "vmovdqu [rsi + 512], ymm0",
+                "4:",
+                "lea rcx, [rip + 5f]",
+                "jmp {syscall_callback}",
+                "5:",
+                "ud2",
+                control_word = const TEST_CW,
+                mxcsr = const TEST_MXCSR,
+                syscall_callback = sym super::syscall_callback,
+            );
+        }
+
+        struct ChildStorage {
+            _stack: Box<[u128; 256]>,
+            snapshot: Box<[u128; SNAPSHOT_SIZE / 16]>,
+        }
+
+        struct Shim {
+            platform: &'static LinuxUserland,
+            sender: Sender<[u8; SNAPSHOT_SIZE]>,
+            child: Option<ChildStorage>,
+        }
+
+        impl InitThread for Shim {
+            type ExecutionContext = PtRegs;
+
+            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
+                self
+            }
+        }
+
+        impl EnterShim for Shim {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                ContinueOperation::Resume
+            }
+
+            fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
+                if let Some(child) = &self.child {
+                    self.sender
+                        .send(child.snapshot.as_bytes().try_into().unwrap())
+                        .unwrap();
+                } else {
+                    // SAFETY: These caller-saved registers belong to the shim;
+                    // the parent's guest state has already been captured.
+                    unsafe {
+                        core::arch::asm!(
+                            "fninit",
+                            "pxor xmm0, xmm0",
+                            out("xmm0") _,
+                            options(nostack),
+                        );
+                    }
+                    let mut stack = Box::new([0_u128; 256]);
+                    let mut snapshot = Box::new([0_u128; SNAPSHOT_SIZE / 16]);
+                    let mut child_ctx = ctx.clone();
+                    child_ctx.rip = guest_entry as *const () as usize;
+                    child_ctx.rsp = stack.as_mut_ptr().wrapping_add(stack.len()).addr();
+                    child_ctx.rdi = 1;
+                    child_ctx.rsi = snapshot.as_mut_ptr().addr();
+                    let child = Box::new(Shim {
+                        platform: self.platform,
+                        sender: self.sender.clone(),
+                        child: Some(ChildStorage {
+                            _stack: stack,
+                            snapshot,
+                        }),
+                    });
+                    // SAFETY: The child owns its stack and aligned snapshot
+                    // buffer, and its shim terminates after capturing state.
+                    unsafe { self.platform.spawn_thread(&child_ctx, child).unwrap() };
+                }
+                ContinueOperation::Terminate
+            }
+
+            fn exception(&self, _ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
+                panic!("unexpected guest exception: {info:?}");
+            }
+
+            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                ContinueOperation::Resume
+            }
+        }
+
+        let platform = LinuxUserland::new(None);
+        let (sender, receiver) = channel();
+        let shim = Shim {
+            platform,
+            sender,
+            child: None,
+        };
+        let avx = std::is_x86_feature_detected!("avx");
+        let mut stack = [0_u128; 256];
+        let mut ctx = PtRegs {
+            rip: guest_entry as *const () as usize,
+            rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
+            r8: usize::from(avx),
+            eflags: 0x202,
+            ..Default::default()
+        };
+        // SAFETY: The parent uses a valid stack and terminates after spawning
+        // the child, which retains ownership of all its guest buffers.
+        unsafe { super::run_thread_ref(&shim, &mut ctx) };
+        let snapshot = receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            u16::from_le_bytes(snapshot[..2].try_into().unwrap()),
+            TEST_CW
+        );
+        assert_eq!(
+            u32::from_le_bytes(snapshot[24..28].try_into().unwrap()),
+            TEST_MXCSR
+        );
+        assert_eq!(&snapshot[32..42], &[0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f]);
+        assert_eq!(&snapshot[160..176], &[0x5a; 16]);
+        if avx {
+            assert_eq!(&snapshot[512..544], &[0x5a; 32]);
+        }
+    }
 
     #[test]
     fn xsave_preserves_state_across_guest_transitions() {
