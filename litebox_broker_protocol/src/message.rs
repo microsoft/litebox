@@ -14,14 +14,6 @@ use crate::fs::{
     SetStatusFlagsRequest, TruncateFileRequest, UnlinkFileRequest, WriteFileRequest,
     WriteFileResponse,
 };
-use crate::local_socket::{
-    AcceptLocalSocketRequest, AcceptLocalSocketResponse, BindLocalSocketRequest,
-    ConnectLocalSocketRequest, CreateLocalSocketPairResponse, CreateLocalSocketRequest,
-    CreateLocalSocketResponse, GetLocalSocketNameRequest, GetLocalSocketNameResponse,
-    GetLocalSocketOptionsResponse, ListenLocalSocketRequest, LocalSocketError,
-    ReceiveLocalSocketRequest, ReceiveLocalSocketResponse, SendLocalSocketRequest,
-    SendLocalSocketResponse, SetLocalSocketOptionRequest, ShutdownLocalSocketRequest,
-};
 use crate::pipe::{
     CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
     WritePipeResponse,
@@ -46,6 +38,14 @@ use crate::socket::{
 use crate::timer::{
     CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest, ReadTimerResponse,
     SetTimerRequest, SetTimerResponse,
+};
+use crate::unix_socket::{
+    AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
+    ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
+    CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
+    GetUnixSocketOptionsResponse, ListenUnixSocketRequest, ReceiveUnixSocketRequest,
+    ReceiveUnixSocketResponse, SendUnixSocketRequest, SendUnixSocketResponse,
+    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
 };
 use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
 
@@ -109,8 +109,8 @@ pub enum BrokerOperation {
     Timer(TimerRequest),
     /// Signal request family.
     Signal(SignalRequest),
-    /// Local socket request family.
-    LocalSocket(LocalSocketRequest),
+    /// Unix socket request family.
+    UnixSocket(UnixSocketRequest),
 }
 
 impl BrokerOperation {
@@ -150,16 +150,16 @@ impl BrokerOperation {
                 ..
             })
             | Self::WriteChildMemory(WriteChildMemoryRequest { data: buffer, .. })
-            | Self::LocalSocket(
-                LocalSocketRequest::Bind(BindLocalSocketRequest {
+            | Self::UnixSocket(
+                UnixSocketRequest::Bind(BindUnixSocketRequest {
                     address: buffer, ..
                 })
-                | LocalSocketRequest::Connect(ConnectLocalSocketRequest {
+                | UnixSocketRequest::Connect(ConnectUnixSocketRequest {
                     address: buffer, ..
                 })
-                | LocalSocketRequest::Send(SendLocalSocketRequest { buffer, .. })
-                | LocalSocketRequest::Receive(ReceiveLocalSocketRequest { buffer, .. })
-                | LocalSocketRequest::GetName(GetLocalSocketNameRequest { buffer, .. }),
+                | UnixSocketRequest::Send(SendUnixSocketRequest { buffer, .. })
+                | UnixSocketRequest::Receive(ReceiveUnixSocketRequest { buffer, .. })
+                | UnixSocketRequest::GetName(GetUnixSocketNameRequest { buffer, .. }),
             ) => Some(*buffer),
             Self::CreateThread(_)
             | Self::ExitThread(_)
@@ -192,14 +192,14 @@ impl BrokerOperation {
                 | FileRequest::HandleStatus(_)
                 | FileRequest::IsTerminal(_),
             )
-            | Self::LocalSocket(
-                LocalSocketRequest::Create(_)
-                | LocalSocketRequest::CreatePair(_)
-                | LocalSocketRequest::Listen(_)
-                | LocalSocketRequest::Accept(_)
-                | LocalSocketRequest::Shutdown(_)
-                | LocalSocketRequest::SetOption(_)
-                | LocalSocketRequest::GetOptions(_),
+            | Self::UnixSocket(
+                UnixSocketRequest::Create(_)
+                | UnixSocketRequest::CreatePair(_)
+                | UnixSocketRequest::Listen(_)
+                | UnixSocketRequest::Accept(_)
+                | UnixSocketRequest::Shutdown(_)
+                | UnixSocketRequest::SetOption(_)
+                | UnixSocketRequest::GetOptions(_),
             ) => None,
         }
     }
@@ -298,31 +298,31 @@ pub enum PipeRequest {
     Write(WritePipeRequest),
 }
 
-/// Broker-owned local socket request.
+/// Broker-owned Unix socket request.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LocalSocketRequest {
+pub enum UnixSocketRequest {
     /// Create an unbound, unconnected socket.
-    Create(CreateLocalSocketRequest),
+    Create(CreateUnixSocketRequest),
     /// Create a pair of connected unnamed sockets.
-    CreatePair(CreateLocalSocketRequest),
+    CreatePair(CreateUnixSocketRequest),
     /// Bind a socket to a name.
-    Bind(BindLocalSocketRequest),
+    Bind(BindUnixSocketRequest),
     /// Make a bound stream socket accept connections.
-    Listen(ListenLocalSocketRequest),
+    Listen(ListenUnixSocketRequest),
     /// Connect a socket to a named socket.
-    Connect(ConnectLocalSocketRequest),
+    Connect(ConnectUnixSocketRequest),
     /// Accept one pending connection.
-    Accept(AcceptLocalSocketRequest),
+    Accept(AcceptUnixSocketRequest),
     /// Send bytes staged in shared memory.
-    Send(SendLocalSocketRequest),
+    Send(SendUnixSocketRequest),
     /// Receive bytes into shared memory.
-    Receive(ReceiveLocalSocketRequest),
+    Receive(ReceiveUnixSocketRequest),
     /// Shut down one or both directions.
-    Shutdown(ShutdownLocalSocketRequest),
+    Shutdown(ShutdownUnixSocketRequest),
     /// Read the name of a socket or its peer.
-    GetName(GetLocalSocketNameRequest),
+    GetName(GetUnixSocketNameRequest),
     /// Store one socket option.
-    SetOption(SetLocalSocketOptionRequest),
+    SetOption(SetUnixSocketOptionRequest),
     /// Read a socket's type and options.
     GetOptions(ObjectHandle),
 }
@@ -402,8 +402,8 @@ pub enum BrokerResult {
     Timer(TimerResponse),
     /// Signal response family.
     Signal(SignalResponse),
-    /// Local socket response family.
-    LocalSocket(LocalSocketResponse),
+    /// Unix socket response family.
+    UnixSocket(UnixSocketResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -503,13 +503,13 @@ pub enum SocketResponse {
     Failed(SocketError),
 }
 
-/// Broker-owned local socket response.
+/// Broker-owned Unix socket response.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LocalSocketResponse {
+pub enum UnixSocketResponse {
     /// Create operation response.
-    Create(CreateLocalSocketResponse),
+    Create(CreateUnixSocketResponse),
     /// Pair create operation response.
-    CreatePair(CreateLocalSocketPairResponse),
+    CreatePair(CreateUnixSocketPairResponse),
     /// Bind operation completed.
     Bind,
     /// Listen operation completed.
@@ -517,24 +517,24 @@ pub enum LocalSocketResponse {
     /// Connect operation completed.
     Connect,
     /// Accept operation response.
-    Accept(AcceptLocalSocketResponse),
+    Accept(AcceptUnixSocketResponse),
     /// Send operation response.
-    Send(SendLocalSocketResponse),
+    Send(SendUnixSocketResponse),
     /// Receive operation response.
-    Receive(ReceiveLocalSocketResponse),
+    Receive(ReceiveUnixSocketResponse),
     /// Shutdown operation completed.
     Shutdown,
     /// Name operation response.
-    GetName(GetLocalSocketNameResponse),
+    GetName(GetUnixSocketNameResponse),
     /// Option was stored.
     SetOption,
     /// Options operation response.
-    GetOptions(GetLocalSocketOptionsResponse),
+    GetOptions(GetUnixSocketOptionsResponse),
     /// The operation failed in a way the guest ABI reports.
     ///
     /// Waiting, resource, and request-validation failures use
     /// [`BrokerResult::Error`] instead.
-    Failed(LocalSocketError),
+    Failed(UnixSocketError),
 }
 
 /// Broker-owned fs request.

@@ -1,12 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-owned local sockets.
+//! Broker-owned Unix sockets.
 //!
-//! A local socket connects processes on the same broker without host
-//! networking. Its names live in either a filesystem path, identified by the
-//! node the path resolves to, or an abstract namespace of byte strings, as
-//! Unix domain sockets name them on POSIX systems and Windows. Data moves
+//! A Unix socket connects processes on the same broker without host
+//! networking. It is named by either a filesystem path, identified by the node
+//! the path resolves to, or a byte string in an abstract namespace. Data moves
 //! through broker-owned queues, so every reference to a socket, including
 //! references in other processes, shares its state.
 
@@ -21,47 +20,46 @@ use crate::fs::{FileError, FileMode, FileOpenFlags, FileUser};
 use crate::shared_buffer::{SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence};
 use crate::socket::{ShutdownMode, SocketType};
 
-/// Maximum length in bytes of the guest-visible part of a local socket name.
-pub const MAX_LOCAL_SOCKET_NAME_SIZE: u32 = 108;
+/// Maximum length in bytes of the guest-visible part of a Unix socket name.
+pub const MAX_UNIX_SOCKET_NAME_SIZE: u32 = 108;
 
-/// Maximum length in bytes of an encoded [`LocalSocketName`].
-pub const MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE: u32 = 1 + MAX_LOCAL_SOCKET_NAME_SIZE;
+/// Maximum length in bytes of an encoded [`UnixSocketName`].
+pub const MAX_ENCODED_UNIX_SOCKET_NAME_SIZE: u32 = 1 + MAX_UNIX_SOCKET_NAME_SIZE;
 
 /// Maximum length in bytes of the absolute lookup path of a path name.
-pub const MAX_LOCAL_SOCKET_PATH_SIZE: u32 = 4096;
+pub const MAX_UNIX_SOCKET_PATH_SIZE: u32 = 4096;
 
-/// Maximum length in bytes of an encoded [`LocalSocketAddress`].
-pub const MAX_ENCODED_LOCAL_SOCKET_ADDRESS_SIZE: u32 =
-    3 + MAX_LOCAL_SOCKET_PATH_SIZE + MAX_LOCAL_SOCKET_NAME_SIZE;
+/// Maximum length in bytes of an encoded [`UnixSocketAddress`].
+pub const MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE: u32 =
+    3 + MAX_UNIX_SOCKET_PATH_SIZE + MAX_UNIX_SOCKET_NAME_SIZE;
 
 /// Bytes each direction of a connection may queue, which also bounds one
 /// datagram.
-pub const LOCAL_SOCKET_BUFFER_SIZE: u32 = 212_992;
+pub const UNIX_SOCKET_BUFFER_SIZE: u32 = 212_992;
 
 /// Maximum bytes one send or receive request transfers, including an encoded
 /// address or name staged with the data.
-pub const MAX_LOCAL_SOCKET_TRANSFER_SIZE: u32 = 4 * SHARED_BUFFER_SLOT_SIZE;
+pub const MAX_UNIX_SOCKET_TRANSFER_SIZE: u32 = 4 * SHARED_BUFFER_SLOT_SIZE;
 
 /// Largest accepted listen backlog; larger requests are clamped.
-pub const MAX_LOCAL_SOCKET_BACKLOG: u32 = 4096;
+pub const MAX_UNIX_SOCKET_BACKLOG: u32 = 4096;
 
 const _: () = assert!(
-    LOCAL_SOCKET_BUFFER_SIZE + MAX_ENCODED_LOCAL_SOCKET_ADDRESS_SIZE
-        <= MAX_LOCAL_SOCKET_TRANSFER_SIZE
+    UNIX_SOCKET_BUFFER_SIZE + MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE <= MAX_UNIX_SOCKET_TRANSFER_SIZE
 );
 const _: () = assert!(
-    MAX_LOCAL_SOCKET_TRANSFER_SIZE.div_ceil(SHARED_BUFFER_SLOT_SIZE) as usize
+    MAX_UNIX_SOCKET_TRANSFER_SIZE.div_ceil(SHARED_BUFFER_SLOT_SIZE) as usize
         <= crate::shared_buffer::MAX_SHARED_BUFFER_SEQUENCE_SLOTS
 );
-const _: () = assert!(MAX_LOCAL_SOCKET_PATH_SIZE <= u16::MAX as u32);
+const _: () = assert!(MAX_UNIX_SOCKET_PATH_SIZE <= u16::MAX as u32);
 
 const NAME_TAG_UNNAMED: u8 = 0;
 const NAME_TAG_PATH: u8 = 1;
 const NAME_TAG_ABSTRACT: u8 = 2;
 
-/// The name a local socket reports for itself or its peer.
+/// The name a Unix socket reports for itself or its peer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum LocalSocketName {
+pub enum UnixSocketName {
     /// The socket has no name.
     #[default]
     Unnamed,
@@ -71,10 +69,10 @@ pub enum LocalSocketName {
     Abstract(Vec<u8>),
 }
 
-impl LocalSocketName {
+impl UnixSocketName {
     /// Encodes this name for a shared buffer.
     ///
-    /// Returns `None` if the name is longer than [`MAX_LOCAL_SOCKET_NAME_SIZE`].
+    /// Returns `None` if the name is longer than [`MAX_UNIX_SOCKET_NAME_SIZE`].
     #[must_use]
     pub fn encode(&self) -> Option<Vec<u8>> {
         let (tag, bytes): (u8, &[u8]) = match self {
@@ -82,7 +80,7 @@ impl LocalSocketName {
             Self::Path(bytes) => (NAME_TAG_PATH, bytes),
             Self::Abstract(bytes) => (NAME_TAG_ABSTRACT, bytes),
         };
-        if bytes.len() > MAX_LOCAL_SOCKET_NAME_SIZE as usize {
+        if bytes.len() > MAX_UNIX_SOCKET_NAME_SIZE as usize {
             return None;
         }
         let mut encoded = Vec::with_capacity(1 + bytes.len());
@@ -92,25 +90,25 @@ impl LocalSocketName {
     }
 
     /// Decodes a name produced by [`Self::encode`].
-    pub fn decode(encoded: &[u8]) -> Result<Self, LocalSocketCodecError> {
+    pub fn decode(encoded: &[u8]) -> Result<Self, UnixSocketCodecError> {
         let (&tag, bytes) = encoded
             .split_first()
-            .ok_or(LocalSocketCodecError::Truncated)?;
-        if bytes.len() > MAX_LOCAL_SOCKET_NAME_SIZE as usize {
-            return Err(LocalSocketCodecError::TooLong);
+            .ok_or(UnixSocketCodecError::Truncated)?;
+        if bytes.len() > MAX_UNIX_SOCKET_NAME_SIZE as usize {
+            return Err(UnixSocketCodecError::TooLong);
         }
         match tag {
             NAME_TAG_UNNAMED if bytes.is_empty() => Ok(Self::Unnamed),
             NAME_TAG_PATH => Ok(Self::Path(bytes.into())),
             NAME_TAG_ABSTRACT => Ok(Self::Abstract(bytes.into())),
-            _ => Err(LocalSocketCodecError::Invalid),
+            _ => Err(UnixSocketCodecError::Invalid),
         }
     }
 }
 
-/// An address that binds, connects, or sends to a local socket.
+/// An address that binds, connects, or sends to a Unix socket.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LocalSocketAddress {
+pub enum UnixSocketAddress {
     /// A filesystem name.
     Path {
         /// Absolute UTF-8 path the broker resolves.
@@ -122,13 +120,13 @@ pub enum LocalSocketAddress {
     Abstract(Vec<u8>),
 }
 
-impl LocalSocketAddress {
+impl UnixSocketAddress {
     /// Returns the name a socket bound to this address reports.
     #[must_use]
-    pub fn name(&self) -> LocalSocketName {
+    pub fn name(&self) -> UnixSocketName {
         match self {
-            Self::Path { name, .. } => LocalSocketName::Path(name.clone()),
-            Self::Abstract(bytes) => LocalSocketName::Abstract(bytes.clone()),
+            Self::Path { name, .. } => UnixSocketName::Path(name.clone()),
+            Self::Abstract(bytes) => UnixSocketName::Abstract(bytes.clone()),
         }
     }
 
@@ -139,8 +137,8 @@ impl LocalSocketAddress {
     pub fn encode(&self) -> Option<Vec<u8>> {
         match self {
             Self::Path { path, name } => {
-                if path.len() > MAX_LOCAL_SOCKET_PATH_SIZE as usize
-                    || name.len() > MAX_LOCAL_SOCKET_NAME_SIZE as usize
+                if path.len() > MAX_UNIX_SOCKET_PATH_SIZE as usize
+                    || name.len() > MAX_UNIX_SOCKET_NAME_SIZE as usize
                 {
                     return None;
                 }
@@ -152,62 +150,61 @@ impl LocalSocketAddress {
                 encoded.extend_from_slice(name);
                 Some(encoded)
             }
-            Self::Abstract(bytes) => LocalSocketName::Abstract(bytes.clone()).encode(),
+            Self::Abstract(bytes) => UnixSocketName::Abstract(bytes.clone()).encode(),
         }
     }
 
     /// Decodes an address produced by [`Self::encode`].
-    pub fn decode(encoded: &[u8]) -> Result<Self, LocalSocketCodecError> {
+    pub fn decode(encoded: &[u8]) -> Result<Self, UnixSocketCodecError> {
         match encoded.split_first() {
             Some((&NAME_TAG_PATH, rest)) => {
                 let (length, rest) = rest
                     .split_first_chunk::<2>()
-                    .ok_or(LocalSocketCodecError::Truncated)?;
+                    .ok_or(UnixSocketCodecError::Truncated)?;
                 let length = usize::from(u16::from_le_bytes(*length));
-                if length > MAX_LOCAL_SOCKET_PATH_SIZE as usize {
-                    return Err(LocalSocketCodecError::TooLong);
+                if length > MAX_UNIX_SOCKET_PATH_SIZE as usize {
+                    return Err(UnixSocketCodecError::TooLong);
                 }
                 let (path, name) = rest
                     .split_at_checked(length)
-                    .ok_or(LocalSocketCodecError::Truncated)?;
-                if name.len() > MAX_LOCAL_SOCKET_NAME_SIZE as usize {
-                    return Err(LocalSocketCodecError::TooLong);
+                    .ok_or(UnixSocketCodecError::Truncated)?;
+                if name.len() > MAX_UNIX_SOCKET_NAME_SIZE as usize {
+                    return Err(UnixSocketCodecError::TooLong);
                 }
-                let path =
-                    core::str::from_utf8(path).map_err(|_| LocalSocketCodecError::Invalid)?;
+                let path = core::str::from_utf8(path).map_err(|_| UnixSocketCodecError::Invalid)?;
                 if !path.starts_with('/') {
-                    return Err(LocalSocketCodecError::Invalid);
+                    return Err(UnixSocketCodecError::Invalid);
                 }
                 Ok(Self::Path {
                     path: path.into(),
                     name: name.into(),
                 })
             }
-            Some((&NAME_TAG_ABSTRACT, _)) => match LocalSocketName::decode(encoded)? {
-                LocalSocketName::Abstract(bytes) => Ok(Self::Abstract(bytes)),
-                _ => Err(LocalSocketCodecError::Invalid),
+            Some((&NAME_TAG_ABSTRACT, _)) => match UnixSocketName::decode(encoded)? {
+                UnixSocketName::Abstract(bytes) => Ok(Self::Abstract(bytes)),
+                _ => Err(UnixSocketCodecError::Invalid),
             },
-            Some(_) => Err(LocalSocketCodecError::Invalid),
-            None => Err(LocalSocketCodecError::Truncated),
+            Some(_) => Err(UnixSocketCodecError::Invalid),
+            None => Err(UnixSocketCodecError::Truncated),
         }
     }
 }
 
-/// Failure to decode a local socket name or address from a shared buffer.
+/// Failure to decode a Unix socket name or address from a shared buffer.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-pub enum LocalSocketCodecError {
-    #[error("truncated local socket name")]
+pub enum UnixSocketCodecError {
+    #[error("truncated Unix socket name")]
     Truncated,
-    #[error("local socket name is too long")]
+    #[error("Unix socket name is too long")]
     TooLong,
-    #[error("invalid local socket name")]
+    #[error("invalid Unix socket name")]
     Invalid,
 }
 
-/// Local socket operation failure that is meaningful to the guest ABI.
+/// Unix socket operation failure that is meaningful to the guest ABI.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum LocalSocketError {
+pub enum UnixSocketError {
     #[error("address is already in use")]
     AddressInUse,
     #[error("no socket accepts connections at the address")]
@@ -232,9 +229,9 @@ pub enum LocalSocketError {
     File(FileError),
 }
 
-/// Options stored with a local socket and shared by its references.
+/// Options stored with a Unix socket and shared by its references.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct LocalSocketOptions {
+pub struct UnixSocketOptions {
     /// Longest time a blocking receive or accept waits, or `None` to wait
     /// indefinitely.
     pub receive_timeout: Option<Duration>,
@@ -251,71 +248,71 @@ pub struct LocalSocketOptions {
     pub broadcast: bool,
 }
 
-/// One local socket option value.
+/// One Unix socket option value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalSocketOption {
-    /// [`LocalSocketOptions::receive_timeout`].
+pub enum UnixSocketOption {
+    /// [`UnixSocketOptions::receive_timeout`].
     ReceiveTimeout(Option<Duration>),
-    /// [`LocalSocketOptions::send_timeout`].
+    /// [`UnixSocketOptions::send_timeout`].
     SendTimeout(Option<Duration>),
-    /// [`LocalSocketOptions::linger`].
+    /// [`UnixSocketOptions::linger`].
     Linger(Option<Duration>),
-    /// [`LocalSocketOptions::reuse_address`].
+    /// [`UnixSocketOptions::reuse_address`].
     ReuseAddress(bool),
-    /// [`LocalSocketOptions::keep_alive`].
+    /// [`UnixSocketOptions::keep_alive`].
     KeepAlive(bool),
-    /// [`LocalSocketOptions::broadcast`].
+    /// [`UnixSocketOptions::broadcast`].
     Broadcast(bool),
 }
 
-impl LocalSocketOptions {
+impl UnixSocketOptions {
     /// Stores `option`.
-    pub fn set(&mut self, option: LocalSocketOption) {
+    pub fn set(&mut self, option: UnixSocketOption) {
         match option {
-            LocalSocketOption::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
-            LocalSocketOption::SendTimeout(timeout) => self.send_timeout = timeout,
-            LocalSocketOption::Linger(timeout) => self.linger = timeout,
-            LocalSocketOption::ReuseAddress(value) => self.reuse_address = value,
-            LocalSocketOption::KeepAlive(value) => self.keep_alive = value,
-            LocalSocketOption::Broadcast(value) => self.broadcast = value,
+            UnixSocketOption::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
+            UnixSocketOption::SendTimeout(timeout) => self.send_timeout = timeout,
+            UnixSocketOption::Linger(timeout) => self.linger = timeout,
+            UnixSocketOption::ReuseAddress(value) => self.reuse_address = value,
+            UnixSocketOption::KeepAlive(value) => self.keep_alive = value,
+            UnixSocketOption::Broadcast(value) => self.broadcast = value,
         }
     }
 }
 
-/// Request to create one local socket or a connected pair.
+/// Request to create one Unix socket or a connected pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateLocalSocketRequest {
+pub struct CreateUnixSocketRequest {
     /// Socket type.
     pub socket_type: SocketType,
     /// Initial status flags, within [`FileOpenFlags::STATUS`].
     pub flags: FileOpenFlags,
 }
 
-/// Response to a local socket create request.
+/// Response to a Unix socket create request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateLocalSocketResponse {
+pub struct CreateUnixSocketResponse {
     /// Handle for the new socket.
     pub handle: ObjectHandle,
 }
 
-/// Response to a local socket pair create request.
+/// Response to a Unix socket pair create request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CreateLocalSocketPairResponse {
+pub struct CreateUnixSocketPairResponse {
     /// Handle for the first socket.
     pub first: ObjectHandle,
     /// Handle for the second socket, connected to the first.
     pub second: ObjectHandle,
 }
 
-/// Request to bind a local socket to a name.
+/// Request to bind a Unix socket to a name.
 ///
 /// A path name creates a filesystem node at the path, which fails if one
 /// exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BindLocalSocketRequest {
+pub struct BindUnixSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
-    /// Shared-buffer region holding one encoded [`LocalSocketAddress`].
+    /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
     pub address: SharedBufferSequence,
     /// Caller identity for filesystem permission checks.
     pub user: FileUser,
@@ -325,7 +322,7 @@ pub struct BindLocalSocketRequest {
 
 /// Request to make a bound stream socket accept connections.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ListenLocalSocketRequest {
+pub struct ListenUnixSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Connections that may wait to be accepted beyond the first.
@@ -335,10 +332,10 @@ pub struct ListenLocalSocketRequest {
 /// Request to connect a stream socket, or to set a datagram socket's default
 /// destination.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ConnectLocalSocketRequest {
+pub struct ConnectUnixSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
-    /// Shared-buffer region holding one encoded [`LocalSocketAddress`].
+    /// Shared-buffer region holding one encoded [`UnixSocketAddress`].
     pub address: SharedBufferSequence,
     /// Caller identity for filesystem permission checks.
     pub user: FileUser,
@@ -346,7 +343,7 @@ pub struct ConnectLocalSocketRequest {
 
 /// Request to accept one pending connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptLocalSocketRequest {
+pub struct AcceptUnixSocketRequest {
     /// Listening socket handle.
     pub handle: ObjectHandle,
     /// Status flags of the accepted socket, within [`FileOpenFlags::STATUS`].
@@ -355,7 +352,7 @@ pub struct AcceptLocalSocketRequest {
 
 /// Response to an accept request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AcceptLocalSocketResponse {
+pub struct AcceptUnixSocketResponse {
     /// Handle for the accepted connection.
     pub handle: ObjectHandle,
 }
@@ -365,11 +362,11 @@ pub struct AcceptLocalSocketResponse {
 /// A stream socket may send only part of the bytes. A datagram socket sends
 /// them as one datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendLocalSocketRequest {
+pub struct SendUnixSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Shared-buffer region holding an encoded destination
-    /// [`LocalSocketAddress`] of `address_length` bytes followed by the data.
+    /// [`UnixSocketAddress`] of `address_length` bytes followed by the data.
     pub buffer: SharedBufferSequence,
     /// Length of the destination address, or zero to send to the connected
     /// peer.
@@ -380,7 +377,7 @@ pub struct SendLocalSocketRequest {
 
 /// Response to a send request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SendLocalSocketResponse {
+pub struct SendUnixSocketResponse {
     /// Number of data bytes sent.
     pub sent: u32,
 }
@@ -390,14 +387,14 @@ pub struct SendLocalSocketResponse {
 /// A stream socket receives queued bytes. A datagram socket receives one
 /// datagram, discarding the bytes beyond `capacity` unless peeking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveLocalSocketRequest {
+pub struct ReceiveUnixSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Shared-buffer region that receives the data followed by the sender's
-    /// encoded [`LocalSocketName`].
+    /// encoded [`UnixSocketName`].
     ///
     /// It must hold `capacity` bytes plus
-    /// [`MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE`].
+    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`].
     pub buffer: SharedBufferSequence,
     /// Maximum data bytes to receive.
     pub capacity: u32,
@@ -416,7 +413,7 @@ pub struct ReceiveLocalSocketRequest {
 /// A response with zero `received` and `length` for a nonzero `capacity`
 /// means no more data can arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ReceiveLocalSocketResponse {
+pub struct ReceiveUnixSocketResponse {
     /// Number of data bytes placed in the buffer.
     pub received: u32,
     /// Length of the whole datagram, or `received` for a stream socket.
@@ -427,7 +424,7 @@ pub struct ReceiveLocalSocketResponse {
 
 /// Request to shut down one or both directions of a socket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShutdownLocalSocketRequest {
+pub struct ShutdownUnixSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// [`ShutdownMode::Read`], [`ShutdownMode::Write`], or [`ShutdownMode::Both`].
@@ -436,39 +433,39 @@ pub struct ShutdownLocalSocketRequest {
 
 /// Request to read the name of a socket or its peer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetLocalSocketNameRequest {
+pub struct GetUnixSocketNameRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Whether to read the peer's name instead of the socket's own.
     pub peer: bool,
-    /// Shared-buffer region of [`MAX_ENCODED_LOCAL_SOCKET_NAME_SIZE`] bytes
-    /// that receives the encoded [`LocalSocketName`].
+    /// Shared-buffer region of [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] bytes
+    /// that receives the encoded [`UnixSocketName`].
     pub buffer: SharedBufferSequence,
 }
 
 /// Response to a name request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetLocalSocketNameResponse {
+pub struct GetUnixSocketNameResponse {
     /// Length of the encoded name.
     pub length: u32,
 }
 
 /// Request to store one socket option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SetLocalSocketOptionRequest {
+pub struct SetUnixSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
     /// Option value.
-    pub option: LocalSocketOption,
+    pub option: UnixSocketOption,
 }
 
 /// Response describing a socket's type and options.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetLocalSocketOptionsResponse {
+pub struct GetUnixSocketOptionsResponse {
     /// Socket type.
     pub socket_type: SocketType,
     /// Stored options.
-    pub options: LocalSocketOptions,
+    pub options: UnixSocketOptions,
 }
 
 #[cfg(test)]
@@ -478,55 +475,55 @@ mod tests {
     #[test]
     fn names_round_trip() {
         for name in [
-            LocalSocketName::Unnamed,
-            LocalSocketName::Path(b"./sock".into()),
-            LocalSocketName::Abstract(b"\0x".into()),
-            LocalSocketName::Abstract(Vec::new()),
+            UnixSocketName::Unnamed,
+            UnixSocketName::Path(b"./sock".into()),
+            UnixSocketName::Abstract(b"\0x".into()),
+            UnixSocketName::Abstract(Vec::new()),
         ] {
-            assert_eq!(LocalSocketName::decode(&name.encode().unwrap()), Ok(name));
+            assert_eq!(UnixSocketName::decode(&name.encode().unwrap()), Ok(name));
         }
         assert_eq!(
-            LocalSocketName::Path(alloc::vec![1; MAX_LOCAL_SOCKET_NAME_SIZE as usize + 1]).encode(),
+            UnixSocketName::Path(alloc::vec![1; MAX_UNIX_SOCKET_NAME_SIZE as usize + 1]).encode(),
             None
         );
         assert_eq!(
-            LocalSocketName::decode(&[NAME_TAG_UNNAMED, 1]),
-            Err(LocalSocketCodecError::Invalid)
+            UnixSocketName::decode(&[NAME_TAG_UNNAMED, 1]),
+            Err(UnixSocketCodecError::Invalid)
         );
         assert_eq!(
-            LocalSocketName::decode(&[]),
-            Err(LocalSocketCodecError::Truncated)
+            UnixSocketName::decode(&[]),
+            Err(UnixSocketCodecError::Truncated)
         );
     }
 
     #[test]
     fn addresses_round_trip() {
         for address in [
-            LocalSocketAddress::Path {
+            UnixSocketAddress::Path {
                 path: "/tmp/sock".into(),
                 name: b"sock".into(),
             },
-            LocalSocketAddress::Abstract(b"name".into()),
+            UnixSocketAddress::Abstract(b"name".into()),
         ] {
             let encoded = address.encode().unwrap();
-            assert!(encoded.len() <= MAX_ENCODED_LOCAL_SOCKET_ADDRESS_SIZE as usize);
-            assert_eq!(LocalSocketAddress::decode(&encoded), Ok(address));
+            assert!(encoded.len() <= MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE as usize);
+            assert_eq!(UnixSocketAddress::decode(&encoded), Ok(address));
         }
-        let relative = LocalSocketAddress::Path {
+        let relative = UnixSocketAddress::Path {
             path: "tmp/sock".into(),
             name: Vec::new(),
         };
         assert_eq!(
-            LocalSocketAddress::decode(&relative.encode().unwrap()),
-            Err(LocalSocketCodecError::Invalid)
+            UnixSocketAddress::decode(&relative.encode().unwrap()),
+            Err(UnixSocketCodecError::Invalid)
         );
         assert_eq!(
-            LocalSocketAddress::decode(&[NAME_TAG_UNNAMED]),
-            Err(LocalSocketCodecError::Invalid)
+            UnixSocketAddress::decode(&[NAME_TAG_UNNAMED]),
+            Err(UnixSocketCodecError::Invalid)
         );
         assert_eq!(
-            LocalSocketAddress::decode(&[NAME_TAG_PATH, 5, 0, b'/']),
-            Err(LocalSocketCodecError::Truncated)
+            UnixSocketAddress::decode(&[NAME_TAG_PATH, 5, 0, b'/']),
+            Err(UnixSocketCodecError::Truncated)
         );
     }
 }

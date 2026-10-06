@@ -11,16 +11,16 @@ use super::primitive::{Decoder, Encoder};
 use super::socket::{
     decode_shutdown_mode, decode_socket_type, encode_shutdown_mode, encode_socket_type,
 };
-use crate::local_socket::{
-    AcceptLocalSocketRequest, AcceptLocalSocketResponse, BindLocalSocketRequest,
-    ConnectLocalSocketRequest, CreateLocalSocketPairResponse, CreateLocalSocketRequest,
-    CreateLocalSocketResponse, GetLocalSocketNameRequest, GetLocalSocketNameResponse,
-    GetLocalSocketOptionsResponse, ListenLocalSocketRequest, LocalSocketError, LocalSocketOption,
-    LocalSocketOptions, ReceiveLocalSocketRequest, ReceiveLocalSocketResponse,
-    SendLocalSocketRequest, SendLocalSocketResponse, SetLocalSocketOptionRequest,
-    ShutdownLocalSocketRequest,
+use crate::message::{UnixSocketRequest, UnixSocketResponse};
+use crate::unix_socket::{
+    AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
+    ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
+    CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
+    GetUnixSocketOptionsResponse, ListenUnixSocketRequest, ReceiveUnixSocketRequest,
+    ReceiveUnixSocketResponse, SendUnixSocketRequest, SendUnixSocketResponse,
+    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError, UnixSocketOption,
+    UnixSocketOptions,
 };
-use crate::message::{LocalSocketRequest, LocalSocketResponse};
 
 const TAG_CREATE: u8 = 0;
 const TAG_CREATE_PAIR: u8 = 1;
@@ -55,47 +55,47 @@ const ERROR_TAG_BROKEN_PIPE: u8 = 8;
 const ERROR_TAG_FILE: u8 = 9;
 const ERROR_TAG_NOT_PERMITTED: u8 = 10;
 
-pub(super) fn encode_local_socket_request(encoder: &mut Encoder, request: LocalSocketRequest) {
+pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSocketRequest) {
     match request {
-        LocalSocketRequest::Create(request) => {
+        UnixSocketRequest::Create(request) => {
             encoder.u8(TAG_CREATE);
             encode_create_request(encoder, request);
         }
-        LocalSocketRequest::CreatePair(request) => {
+        UnixSocketRequest::CreatePair(request) => {
             encoder.u8(TAG_CREATE_PAIR);
             encode_create_request(encoder, request);
         }
-        LocalSocketRequest::Bind(request) => {
+        UnixSocketRequest::Bind(request) => {
             encoder.u8(TAG_BIND);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.address);
             encode_user(encoder, request.user);
             encoder.u16(request.mode.bits());
         }
-        LocalSocketRequest::Listen(request) => {
+        UnixSocketRequest::Listen(request) => {
             encoder.u8(TAG_LISTEN);
             encoder.handle(request.handle);
             encoder.u32(request.backlog);
         }
-        LocalSocketRequest::Connect(request) => {
+        UnixSocketRequest::Connect(request) => {
             encoder.u8(TAG_CONNECT);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.address);
             encode_user(encoder, request.user);
         }
-        LocalSocketRequest::Accept(request) => {
+        UnixSocketRequest::Accept(request) => {
             encoder.u8(TAG_ACCEPT);
             encoder.handle(request.handle);
             encoder.u16(request.flags.bits());
         }
-        LocalSocketRequest::Send(request) => {
+        UnixSocketRequest::Send(request) => {
             encoder.u8(TAG_SEND);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.address_length);
             encode_user(encoder, request.user);
         }
-        LocalSocketRequest::Receive(request) => {
+        UnixSocketRequest::Receive(request) => {
             encoder.u8(TAG_RECEIVE);
             encoder.handle(request.handle);
             encoder.shared_buffer_sequence(request.buffer);
@@ -103,177 +103,177 @@ pub(super) fn encode_local_socket_request(encoder: &mut Encoder, request: LocalS
             encode_bool(encoder, request.peek);
             encode_bool(encoder, request.nonblocking);
         }
-        LocalSocketRequest::Shutdown(request) => {
+        UnixSocketRequest::Shutdown(request) => {
             encoder.u8(TAG_SHUTDOWN);
             encoder.handle(request.handle);
             encode_shutdown_mode(encoder, request.mode);
         }
-        LocalSocketRequest::GetName(request) => {
+        UnixSocketRequest::GetName(request) => {
             encoder.u8(TAG_GET_NAME);
             encoder.handle(request.handle);
             encode_bool(encoder, request.peer);
             encoder.shared_buffer_sequence(request.buffer);
         }
-        LocalSocketRequest::SetOption(request) => {
+        UnixSocketRequest::SetOption(request) => {
             encoder.u8(TAG_SET_OPTION);
             encoder.handle(request.handle);
             encode_option(encoder, request.option);
         }
-        LocalSocketRequest::GetOptions(handle) => {
+        UnixSocketRequest::GetOptions(handle) => {
             encoder.u8(TAG_GET_OPTIONS);
             encoder.handle(handle);
         }
     }
 }
 
-pub(super) fn decode_local_socket_request(
+pub(super) fn decode_unix_socket_request(
     decoder: &mut Decoder<'_>,
-) -> Result<LocalSocketRequest, WireError> {
+) -> Result<UnixSocketRequest, WireError> {
     Ok(match decoder.u8()? {
-        TAG_CREATE => LocalSocketRequest::Create(decode_create_request(decoder)?),
-        TAG_CREATE_PAIR => LocalSocketRequest::CreatePair(decode_create_request(decoder)?),
-        TAG_BIND => LocalSocketRequest::Bind(BindLocalSocketRequest {
+        TAG_CREATE => UnixSocketRequest::Create(decode_create_request(decoder)?),
+        TAG_CREATE_PAIR => UnixSocketRequest::CreatePair(decode_create_request(decoder)?),
+        TAG_BIND => UnixSocketRequest::Bind(BindUnixSocketRequest {
             handle: decoder.handle()?,
             address: decoder.shared_buffer_sequence()?,
             user: decode_user(decoder)?,
             mode: decode_mode(decoder)?,
         }),
-        TAG_LISTEN => LocalSocketRequest::Listen(ListenLocalSocketRequest {
+        TAG_LISTEN => UnixSocketRequest::Listen(ListenUnixSocketRequest {
             handle: decoder.handle()?,
             backlog: decoder.u32()?,
         }),
-        TAG_CONNECT => LocalSocketRequest::Connect(ConnectLocalSocketRequest {
+        TAG_CONNECT => UnixSocketRequest::Connect(ConnectUnixSocketRequest {
             handle: decoder.handle()?,
             address: decoder.shared_buffer_sequence()?,
             user: decode_user(decoder)?,
         }),
-        TAG_ACCEPT => LocalSocketRequest::Accept(AcceptLocalSocketRequest {
+        TAG_ACCEPT => UnixSocketRequest::Accept(AcceptUnixSocketRequest {
             handle: decoder.handle()?,
             flags: decode_open_flags(decoder)?,
         }),
-        TAG_SEND => LocalSocketRequest::Send(SendLocalSocketRequest {
+        TAG_SEND => UnixSocketRequest::Send(SendUnixSocketRequest {
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
             address_length: decoder.u32()?,
             user: decode_user(decoder)?,
         }),
-        TAG_RECEIVE => LocalSocketRequest::Receive(ReceiveLocalSocketRequest {
+        TAG_RECEIVE => UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
             handle: decoder.handle()?,
             buffer: decoder.shared_buffer_sequence()?,
             capacity: decoder.u32()?,
             peek: decode_bool(decoder)?,
             nonblocking: decode_bool(decoder)?,
         }),
-        TAG_SHUTDOWN => LocalSocketRequest::Shutdown(ShutdownLocalSocketRequest {
+        TAG_SHUTDOWN => UnixSocketRequest::Shutdown(ShutdownUnixSocketRequest {
             handle: decoder.handle()?,
             mode: decode_shutdown_mode(decoder)?,
         }),
-        TAG_GET_NAME => LocalSocketRequest::GetName(GetLocalSocketNameRequest {
+        TAG_GET_NAME => UnixSocketRequest::GetName(GetUnixSocketNameRequest {
             handle: decoder.handle()?,
             peer: decode_bool(decoder)?,
             buffer: decoder.shared_buffer_sequence()?,
         }),
-        TAG_SET_OPTION => LocalSocketRequest::SetOption(SetLocalSocketOptionRequest {
+        TAG_SET_OPTION => UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
             handle: decoder.handle()?,
             option: decode_option(decoder)?,
         }),
-        TAG_GET_OPTIONS => LocalSocketRequest::GetOptions(decoder.handle()?),
+        TAG_GET_OPTIONS => UnixSocketRequest::GetOptions(decoder.handle()?),
         _ => return Err(WireError::InvalidTag),
     })
 }
 
-pub(super) fn encode_local_socket_response(encoder: &mut Encoder, response: LocalSocketResponse) {
+pub(super) fn encode_unix_socket_response(encoder: &mut Encoder, response: UnixSocketResponse) {
     match response {
-        LocalSocketResponse::Create(response) => {
+        UnixSocketResponse::Create(response) => {
             encoder.u8(TAG_CREATE);
             encoder.handle(response.handle);
         }
-        LocalSocketResponse::CreatePair(response) => {
+        UnixSocketResponse::CreatePair(response) => {
             encoder.u8(TAG_CREATE_PAIR);
             encoder.handle(response.first);
             encoder.handle(response.second);
         }
-        LocalSocketResponse::Bind => encoder.u8(TAG_BIND),
-        LocalSocketResponse::Listen => encoder.u8(TAG_LISTEN),
-        LocalSocketResponse::Connect => encoder.u8(TAG_CONNECT),
-        LocalSocketResponse::Accept(response) => {
+        UnixSocketResponse::Bind => encoder.u8(TAG_BIND),
+        UnixSocketResponse::Listen => encoder.u8(TAG_LISTEN),
+        UnixSocketResponse::Connect => encoder.u8(TAG_CONNECT),
+        UnixSocketResponse::Accept(response) => {
             encoder.u8(TAG_ACCEPT);
             encoder.handle(response.handle);
         }
-        LocalSocketResponse::Send(response) => {
+        UnixSocketResponse::Send(response) => {
             encoder.u8(TAG_SEND);
             encoder.u32(response.sent);
         }
-        LocalSocketResponse::Receive(response) => {
+        UnixSocketResponse::Receive(response) => {
             encoder.u8(TAG_RECEIVE);
             encoder.u32(response.received);
             encoder.u32(response.length);
             encoder.u32(response.source_length);
         }
-        LocalSocketResponse::Shutdown => encoder.u8(TAG_SHUTDOWN),
-        LocalSocketResponse::GetName(response) => {
+        UnixSocketResponse::Shutdown => encoder.u8(TAG_SHUTDOWN),
+        UnixSocketResponse::GetName(response) => {
             encoder.u8(TAG_GET_NAME);
             encoder.u32(response.length);
         }
-        LocalSocketResponse::SetOption => encoder.u8(TAG_SET_OPTION),
-        LocalSocketResponse::GetOptions(response) => {
+        UnixSocketResponse::SetOption => encoder.u8(TAG_SET_OPTION),
+        UnixSocketResponse::GetOptions(response) => {
             encoder.u8(TAG_GET_OPTIONS);
             encode_socket_type(encoder, response.socket_type);
             encode_options(encoder, response.options);
         }
-        LocalSocketResponse::Failed(error) => {
+        UnixSocketResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
             encode_error(encoder, error);
         }
     }
 }
 
-pub(super) fn decode_local_socket_response(
+pub(super) fn decode_unix_socket_response(
     decoder: &mut Decoder<'_>,
-) -> Result<LocalSocketResponse, WireError> {
+) -> Result<UnixSocketResponse, WireError> {
     Ok(match decoder.u8()? {
-        TAG_CREATE => LocalSocketResponse::Create(CreateLocalSocketResponse {
+        TAG_CREATE => UnixSocketResponse::Create(CreateUnixSocketResponse {
             handle: decoder.handle()?,
         }),
-        TAG_CREATE_PAIR => LocalSocketResponse::CreatePair(CreateLocalSocketPairResponse {
+        TAG_CREATE_PAIR => UnixSocketResponse::CreatePair(CreateUnixSocketPairResponse {
             first: decoder.handle()?,
             second: decoder.handle()?,
         }),
-        TAG_BIND => LocalSocketResponse::Bind,
-        TAG_LISTEN => LocalSocketResponse::Listen,
-        TAG_CONNECT => LocalSocketResponse::Connect,
-        TAG_ACCEPT => LocalSocketResponse::Accept(AcceptLocalSocketResponse {
+        TAG_BIND => UnixSocketResponse::Bind,
+        TAG_LISTEN => UnixSocketResponse::Listen,
+        TAG_CONNECT => UnixSocketResponse::Connect,
+        TAG_ACCEPT => UnixSocketResponse::Accept(AcceptUnixSocketResponse {
             handle: decoder.handle()?,
         }),
-        TAG_SEND => LocalSocketResponse::Send(SendLocalSocketResponse {
+        TAG_SEND => UnixSocketResponse::Send(SendUnixSocketResponse {
             sent: decoder.u32()?,
         }),
-        TAG_RECEIVE => LocalSocketResponse::Receive(ReceiveLocalSocketResponse {
+        TAG_RECEIVE => UnixSocketResponse::Receive(ReceiveUnixSocketResponse {
             received: decoder.u32()?,
             length: decoder.u32()?,
             source_length: decoder.u32()?,
         }),
-        TAG_SHUTDOWN => LocalSocketResponse::Shutdown,
-        TAG_GET_NAME => LocalSocketResponse::GetName(GetLocalSocketNameResponse {
+        TAG_SHUTDOWN => UnixSocketResponse::Shutdown,
+        TAG_GET_NAME => UnixSocketResponse::GetName(GetUnixSocketNameResponse {
             length: decoder.u32()?,
         }),
-        TAG_SET_OPTION => LocalSocketResponse::SetOption,
-        TAG_GET_OPTIONS => LocalSocketResponse::GetOptions(GetLocalSocketOptionsResponse {
+        TAG_SET_OPTION => UnixSocketResponse::SetOption,
+        TAG_GET_OPTIONS => UnixSocketResponse::GetOptions(GetUnixSocketOptionsResponse {
             socket_type: decode_socket_type(decoder)?,
             options: decode_options(decoder)?,
         }),
-        RESPONSE_TAG_FAILED => LocalSocketResponse::Failed(decode_error(decoder)?),
+        RESPONSE_TAG_FAILED => UnixSocketResponse::Failed(decode_error(decoder)?),
         _ => return Err(WireError::InvalidTag),
     })
 }
 
-fn encode_create_request(encoder: &mut Encoder, request: CreateLocalSocketRequest) {
+fn encode_create_request(encoder: &mut Encoder, request: CreateUnixSocketRequest) {
     encode_socket_type(encoder, request.socket_type);
     encoder.u16(request.flags.bits());
 }
 
-fn decode_create_request(decoder: &mut Decoder<'_>) -> Result<CreateLocalSocketRequest, WireError> {
-    Ok(CreateLocalSocketRequest {
+fn decode_create_request(decoder: &mut Decoder<'_>) -> Result<CreateUnixSocketRequest, WireError> {
+    Ok(CreateUnixSocketRequest {
         socket_type: decode_socket_type(decoder)?,
         flags: decode_open_flags(decoder)?,
     })
@@ -314,48 +314,48 @@ fn decode_duration(decoder: &mut Decoder<'_>) -> Result<Option<Duration>, WireEr
     Ok(Some(Duration::new(seconds, nanoseconds)))
 }
 
-fn encode_option(encoder: &mut Encoder, option: LocalSocketOption) {
+fn encode_option(encoder: &mut Encoder, option: UnixSocketOption) {
     match option {
-        LocalSocketOption::ReceiveTimeout(timeout) => {
+        UnixSocketOption::ReceiveTimeout(timeout) => {
             encoder.u8(OPTION_TAG_RECEIVE_TIMEOUT);
             encode_duration(encoder, timeout);
         }
-        LocalSocketOption::SendTimeout(timeout) => {
+        UnixSocketOption::SendTimeout(timeout) => {
             encoder.u8(OPTION_TAG_SEND_TIMEOUT);
             encode_duration(encoder, timeout);
         }
-        LocalSocketOption::Linger(timeout) => {
+        UnixSocketOption::Linger(timeout) => {
             encoder.u8(OPTION_TAG_LINGER);
             encode_duration(encoder, timeout);
         }
-        LocalSocketOption::ReuseAddress(value) => {
+        UnixSocketOption::ReuseAddress(value) => {
             encoder.u8(OPTION_TAG_REUSE_ADDRESS);
             encode_bool(encoder, value);
         }
-        LocalSocketOption::KeepAlive(value) => {
+        UnixSocketOption::KeepAlive(value) => {
             encoder.u8(OPTION_TAG_KEEP_ALIVE);
             encode_bool(encoder, value);
         }
-        LocalSocketOption::Broadcast(value) => {
+        UnixSocketOption::Broadcast(value) => {
             encoder.u8(OPTION_TAG_BROADCAST);
             encode_bool(encoder, value);
         }
     }
 }
 
-fn decode_option(decoder: &mut Decoder<'_>) -> Result<LocalSocketOption, WireError> {
+fn decode_option(decoder: &mut Decoder<'_>) -> Result<UnixSocketOption, WireError> {
     Ok(match decoder.u8()? {
-        OPTION_TAG_RECEIVE_TIMEOUT => LocalSocketOption::ReceiveTimeout(decode_duration(decoder)?),
-        OPTION_TAG_SEND_TIMEOUT => LocalSocketOption::SendTimeout(decode_duration(decoder)?),
-        OPTION_TAG_LINGER => LocalSocketOption::Linger(decode_duration(decoder)?),
-        OPTION_TAG_REUSE_ADDRESS => LocalSocketOption::ReuseAddress(decode_bool(decoder)?),
-        OPTION_TAG_KEEP_ALIVE => LocalSocketOption::KeepAlive(decode_bool(decoder)?),
-        OPTION_TAG_BROADCAST => LocalSocketOption::Broadcast(decode_bool(decoder)?),
+        OPTION_TAG_RECEIVE_TIMEOUT => UnixSocketOption::ReceiveTimeout(decode_duration(decoder)?),
+        OPTION_TAG_SEND_TIMEOUT => UnixSocketOption::SendTimeout(decode_duration(decoder)?),
+        OPTION_TAG_LINGER => UnixSocketOption::Linger(decode_duration(decoder)?),
+        OPTION_TAG_REUSE_ADDRESS => UnixSocketOption::ReuseAddress(decode_bool(decoder)?),
+        OPTION_TAG_KEEP_ALIVE => UnixSocketOption::KeepAlive(decode_bool(decoder)?),
+        OPTION_TAG_BROADCAST => UnixSocketOption::Broadcast(decode_bool(decoder)?),
         _ => return Err(WireError::InvalidTag),
     })
 }
 
-fn encode_options(encoder: &mut Encoder, options: LocalSocketOptions) {
+fn encode_options(encoder: &mut Encoder, options: UnixSocketOptions) {
     encode_duration(encoder, options.receive_timeout);
     encode_duration(encoder, options.send_timeout);
     encode_duration(encoder, options.linger);
@@ -364,8 +364,8 @@ fn encode_options(encoder: &mut Encoder, options: LocalSocketOptions) {
     encode_bool(encoder, options.broadcast);
 }
 
-fn decode_options(decoder: &mut Decoder<'_>) -> Result<LocalSocketOptions, WireError> {
-    Ok(LocalSocketOptions {
+fn decode_options(decoder: &mut Decoder<'_>) -> Result<UnixSocketOptions, WireError> {
+    Ok(UnixSocketOptions {
         receive_timeout: decode_duration(decoder)?,
         send_timeout: decode_duration(decoder)?,
         linger: decode_duration(decoder)?,
@@ -375,38 +375,38 @@ fn decode_options(decoder: &mut Decoder<'_>) -> Result<LocalSocketOptions, WireE
     })
 }
 
-fn encode_error(encoder: &mut Encoder, error: LocalSocketError) {
+fn encode_error(encoder: &mut Encoder, error: UnixSocketError) {
     match error {
-        LocalSocketError::AddressInUse => encoder.u8(ERROR_TAG_ADDRESS_IN_USE),
-        LocalSocketError::ConnectionRefused => encoder.u8(ERROR_TAG_CONNECTION_REFUSED),
-        LocalSocketError::WrongType => encoder.u8(ERROR_TAG_WRONG_TYPE),
-        LocalSocketError::InvalidArgument => encoder.u8(ERROR_TAG_INVALID_ARGUMENT),
-        LocalSocketError::AlreadyConnected => encoder.u8(ERROR_TAG_ALREADY_CONNECTED),
-        LocalSocketError::NotConnected => encoder.u8(ERROR_TAG_NOT_CONNECTED),
-        LocalSocketError::Unsupported => encoder.u8(ERROR_TAG_UNSUPPORTED),
-        LocalSocketError::MessageTooLarge => encoder.u8(ERROR_TAG_MESSAGE_TOO_LARGE),
-        LocalSocketError::BrokenPipe => encoder.u8(ERROR_TAG_BROKEN_PIPE),
-        LocalSocketError::NotPermitted => encoder.u8(ERROR_TAG_NOT_PERMITTED),
-        LocalSocketError::File(error) => {
+        UnixSocketError::AddressInUse => encoder.u8(ERROR_TAG_ADDRESS_IN_USE),
+        UnixSocketError::ConnectionRefused => encoder.u8(ERROR_TAG_CONNECTION_REFUSED),
+        UnixSocketError::WrongType => encoder.u8(ERROR_TAG_WRONG_TYPE),
+        UnixSocketError::InvalidArgument => encoder.u8(ERROR_TAG_INVALID_ARGUMENT),
+        UnixSocketError::AlreadyConnected => encoder.u8(ERROR_TAG_ALREADY_CONNECTED),
+        UnixSocketError::NotConnected => encoder.u8(ERROR_TAG_NOT_CONNECTED),
+        UnixSocketError::Unsupported => encoder.u8(ERROR_TAG_UNSUPPORTED),
+        UnixSocketError::MessageTooLarge => encoder.u8(ERROR_TAG_MESSAGE_TOO_LARGE),
+        UnixSocketError::BrokenPipe => encoder.u8(ERROR_TAG_BROKEN_PIPE),
+        UnixSocketError::NotPermitted => encoder.u8(ERROR_TAG_NOT_PERMITTED),
+        UnixSocketError::File(error) => {
             encoder.u8(ERROR_TAG_FILE);
             encode_file_error(encoder, error);
         }
     }
 }
 
-fn decode_error(decoder: &mut Decoder<'_>) -> Result<LocalSocketError, WireError> {
+fn decode_error(decoder: &mut Decoder<'_>) -> Result<UnixSocketError, WireError> {
     Ok(match decoder.u8()? {
-        ERROR_TAG_ADDRESS_IN_USE => LocalSocketError::AddressInUse,
-        ERROR_TAG_CONNECTION_REFUSED => LocalSocketError::ConnectionRefused,
-        ERROR_TAG_WRONG_TYPE => LocalSocketError::WrongType,
-        ERROR_TAG_INVALID_ARGUMENT => LocalSocketError::InvalidArgument,
-        ERROR_TAG_ALREADY_CONNECTED => LocalSocketError::AlreadyConnected,
-        ERROR_TAG_NOT_CONNECTED => LocalSocketError::NotConnected,
-        ERROR_TAG_UNSUPPORTED => LocalSocketError::Unsupported,
-        ERROR_TAG_MESSAGE_TOO_LARGE => LocalSocketError::MessageTooLarge,
-        ERROR_TAG_BROKEN_PIPE => LocalSocketError::BrokenPipe,
-        ERROR_TAG_NOT_PERMITTED => LocalSocketError::NotPermitted,
-        ERROR_TAG_FILE => LocalSocketError::File(decode_file_error(decoder)?),
+        ERROR_TAG_ADDRESS_IN_USE => UnixSocketError::AddressInUse,
+        ERROR_TAG_CONNECTION_REFUSED => UnixSocketError::ConnectionRefused,
+        ERROR_TAG_WRONG_TYPE => UnixSocketError::WrongType,
+        ERROR_TAG_INVALID_ARGUMENT => UnixSocketError::InvalidArgument,
+        ERROR_TAG_ALREADY_CONNECTED => UnixSocketError::AlreadyConnected,
+        ERROR_TAG_NOT_CONNECTED => UnixSocketError::NotConnected,
+        ERROR_TAG_UNSUPPORTED => UnixSocketError::Unsupported,
+        ERROR_TAG_MESSAGE_TOO_LARGE => UnixSocketError::MessageTooLarge,
+        ERROR_TAG_BROKEN_PIPE => UnixSocketError::BrokenPipe,
+        ERROR_TAG_NOT_PERMITTED => UnixSocketError::NotPermitted,
+        ERROR_TAG_FILE => UnixSocketError::File(decode_file_error(decoder)?),
         _ => return Err(WireError::InvalidTag),
     })
 }

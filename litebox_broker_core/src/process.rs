@@ -226,8 +226,8 @@ pub struct BrokerProcess {
     threads: Mutex<HashSet<ThreadId>>,
     /// Pipe capacity charged to this process by live pipe objects.
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
-    /// Bytes queued in local sockets created by this process.
-    pub(crate) local_socket_bytes: Arc<AtomicUsize>,
+    /// Bytes queued in Unix sockets created by this process.
+    pub(crate) unix_socket_bytes: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
     /// Signals sent to this process that it has not taken.
@@ -372,7 +372,7 @@ impl BrokerProcess {
             }),
             threads: Mutex::new(HashSet::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
-            local_socket_bytes: Arc::new(AtomicUsize::new(0)),
+            unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),

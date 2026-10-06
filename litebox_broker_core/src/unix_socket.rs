@@ -1,9 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker-owned local sockets.
+//! Broker-owned Unix sockets.
 //!
-//! Every local socket lives in one broker-wide table behind a single lock,
+//! Every Unix socket lives in one broker-wide table behind a single lock,
 //! since connecting, sending, and closing change the sockets at both ends of
 //! a connection. A socket stays in the table while any reference to it
 //! exists, or while it waits in a listener's backlog. Operations call the
@@ -23,13 +23,12 @@ use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::fs::{
     FileAccessMode, FileError, FileMode, FileOpenFlags, FileStatusFlags, FileUser,
 };
-use litebox_broker_protocol::local_socket::{
-    LOCAL_SOCKET_BUFFER_SIZE, LocalSocketAddress, LocalSocketError, LocalSocketName,
-    LocalSocketOption, LocalSocketOptions, MAX_LOCAL_SOCKET_BACKLOG,
-    MAX_LOCAL_SOCKET_TRANSFER_SIZE,
-};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{ShutdownMode, SocketType};
+use litebox_broker_protocol::unix_socket::{
+    MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_TRANSFER_SIZE, UNIX_SOCKET_BUFFER_SIZE,
+    UnixSocketAddress, UnixSocketError, UnixSocketName, UnixSocketOption, UnixSocketOptions,
+};
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
 
 use crate::fs::File;
@@ -37,11 +36,11 @@ use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
-/// Guest-visible result of a local socket operation.
-pub type LocalSocketResult<T> = core::result::Result<T, LocalSocketError>;
+/// Guest-visible result of a Unix socket operation.
+pub type UnixSocketResult<T> = core::result::Result<T, UnixSocketError>;
 
 /// Bytes a socket queues before senders to it wait.
-const CAPACITY: usize = LOCAL_SOCKET_BUFFER_SIZE as usize;
+const CAPACITY: usize = UNIX_SOCKET_BUFFER_SIZE as usize;
 
 /// Bytes charged for each queued datagram beyond its data, so empty
 /// datagrams still consume queue space and quota.
@@ -51,7 +50,7 @@ const DATAGRAM_OVERHEAD: usize = 256;
 /// which holds no reference until accepted.
 const CONNECTION_OVERHEAD: usize = 256;
 
-/// Data received from a local socket.
+/// Data received from a Unix socket.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Received {
     /// Received bytes.
@@ -59,10 +58,10 @@ pub struct Received {
     /// Length of the whole datagram, or of `data` for a stream socket.
     pub length: usize,
     /// Name of the sending socket.
-    pub source: LocalSocketName,
+    pub source: UnixSocketName,
 }
 
-/// Creates an unconnected local socket.
+/// Creates an unconnected Unix socket.
 ///
 /// The socket starts with the status flags `flags`, which must be within
 /// [`FileOpenFlags::STATUS`]. Its reference publishes readiness through
@@ -78,10 +77,10 @@ pub fn create(
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
     let object = new_object(process, socket_type, flags)?;
     object.watch(&registration)?;
-    reference.commit_with_readiness(ObjectEntry::LocalSocket(object), Some(registration))
+    reference.commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
 }
 
-/// Creates a pair of local sockets connected to each other.
+/// Creates a pair of Unix sockets connected to each other.
 ///
 /// Both sockets start with the status flags `flags`, which must be within
 /// [`FileOpenFlags::STATUS`]. Their references publish readiness through
@@ -102,20 +101,20 @@ pub fn create_pair(
     let first = new_object(process, socket_type, flags)?;
     let second = new_object(process, socket_type, flags)?;
     {
-        let mut table = process.core.local_sockets.lock();
+        let mut table = process.core.unix_sockets.lock();
         for (id, peer) in [(first.id, second.id), (second.id, first.id)] {
             table.socket_mut(id)?.connection = Connection::Connected {
                 peer: Some(peer),
-                peer_name: LocalSocketName::Unnamed,
+                peer_name: UnixSocketName::Unnamed,
             };
         }
     }
     first.watch(&first_registration)?;
     second.watch(&second_registration)?;
     let first = first_reference
-        .commit_with_readiness(ObjectEntry::LocalSocket(first), Some(first_registration))?;
+        .commit_with_readiness(ObjectEntry::UnixSocket(first), Some(first_registration))?;
     match second_reference
-        .commit_with_readiness(ObjectEntry::LocalSocket(second), Some(second_registration))
+        .commit_with_readiness(ObjectEntry::UnixSocket(second), Some(second_registration))
     {
         Ok(second) => Ok((first, second)),
         Err(error) => {
@@ -125,26 +124,26 @@ pub fn create_pair(
     }
 }
 
-/// Binds a local socket to `address`.
+/// Binds a Unix socket to `address`.
 ///
 /// Binding to a path creates a file there with `mode` as `user`, which fails
-/// with [`LocalSocketError::AddressInUse`] if the path already exists.
+/// with [`UnixSocketError::AddressInUse`] if the path already exists.
 pub fn bind(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    address: &LocalSocketAddress,
+    address: &UnixSocketAddress,
     user: FileUser,
     mode: FileMode,
-) -> Result<LocalSocketResult<()>> {
+) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     let path = {
         let mut table = lease.lock();
         let socket = table.socket_mut(lease.id)?;
-        if socket.binding || socket.name != LocalSocketName::Unnamed {
-            return Ok(Err(LocalSocketError::InvalidArgument));
+        if socket.binding || socket.name != UnixSocketName::Unnamed {
+            return Ok(Err(UnixSocketError::InvalidArgument));
         }
         match address {
-            LocalSocketAddress::Abstract(_) => {
+            UnixSocketAddress::Abstract(_) => {
                 return table.register_name(
                     lease.id,
                     NameKey::of(address, lease.socket_type),
@@ -152,7 +151,7 @@ pub fn bind(
                     &mut None,
                 );
             }
-            LocalSocketAddress::Path { path, .. } => {
+            UnixSocketAddress::Path { path, .. } => {
                 socket.binding = true;
                 path
             }
@@ -180,8 +179,8 @@ pub fn bind(
                 ino: status.node_info.ino,
             }
         }
-        Err(FileError::AlreadyExists) => return Ok(Err(LocalSocketError::AddressInUse)),
-        Err(error) => return Ok(Err(LocalSocketError::File(error))),
+        Err(FileError::AlreadyExists) => return Ok(Err(UnixSocketError::AddressInUse)),
+        Err(error) => return Ok(Err(UnixSocketError::File(error))),
     };
     table.register_name(lease.id, key, address.name(), &mut marker)
 }
@@ -192,16 +191,16 @@ pub fn listen(
     process: &BrokerProcess,
     handle: ObjectHandle,
     backlog: u32,
-) -> Result<LocalSocketResult<()>> {
+) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     if lease.socket_type != SocketType::Stream {
-        return Ok(Err(LocalSocketError::Unsupported));
+        return Ok(Err(UnixSocketError::Unsupported));
     }
-    let limit = backlog.min(MAX_LOCAL_SOCKET_BACKLOG) as usize;
+    let limit = backlog.min(MAX_UNIX_SOCKET_BACKLOG) as usize;
     let mut table = lease.lock();
     let socket = table.socket_mut(lease.id)?;
-    if socket.name == LocalSocketName::Unnamed {
-        return Ok(Err(LocalSocketError::InvalidArgument));
+    if socket.name == UnixSocketName::Unnamed {
+        return Ok(Err(UnixSocketError::InvalidArgument));
     }
     match &mut socket.connection {
         Connection::None => {
@@ -211,14 +210,14 @@ pub fn listen(
             };
         }
         Connection::Listening { limit: current, .. } => *current = limit,
-        Connection::Connected { .. } => return Ok(Err(LocalSocketError::InvalidArgument)),
+        Connection::Connected { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
     }
     table.wake_waiters(lease.id);
     table.publish(lease.id);
     Ok(Ok(()))
 }
 
-/// Connects a local socket to the socket bound to `address`.
+/// Connects a Unix socket to the socket bound to `address`.
 ///
 /// A stream socket queues a new connection on the listening socket there,
 /// failing with [`BrokerError::WouldBlock`] while its backlog is full. A
@@ -226,9 +225,9 @@ pub fn listen(
 pub fn connect(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    address: &LocalSocketAddress,
+    address: &UnixSocketAddress,
     user: FileUser,
-) -> Result<LocalSocketResult<()>> {
+) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     // The node stays open until after the table guard drops, so its identity
     // cannot be reused while the operation runs.
@@ -245,7 +244,7 @@ pub fn connect(
         SocketType::Stream => table.connect_stream(lease.id, target, lease.nonblocking),
         SocketType::Datagram => {
             if !table.accepts_datagrams_from(target, lease.id)? {
-                return Ok(Err(LocalSocketError::NotPermitted));
+                return Ok(Err(UnixSocketError::NotPermitted));
             }
             let peer_name = table.socket(target)?.name.clone();
             let socket = table.socket_mut(lease.id)?;
@@ -282,11 +281,11 @@ pub fn accept(
     handle: ObjectHandle,
     flags: FileOpenFlags,
     readiness_sink: &Arc<dyn ReadinessSink>,
-) -> Result<LocalSocketResult<ObjectHandle>> {
+) -> Result<UnixSocketResult<ObjectHandle>> {
     let rights = creation_rights(process, flags)?;
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
     if lease.socket_type != SocketType::Stream {
-        return Ok(Err(LocalSocketError::Unsupported));
+        return Ok(Err(UnixSocketError::Unsupported));
     }
     let reference = process.reserve_object_reference(rights)?;
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
@@ -294,13 +293,13 @@ pub fn accept(
         let mut table = lease.lock();
         let listener = table.socket_mut(lease.id)?;
         let Connection::Listening { backlog, .. } = &mut listener.connection else {
-            return Ok(Err(LocalSocketError::InvalidArgument));
+            return Ok(Err(UnixSocketError::InvalidArgument));
         };
         let Some(accepted) = backlog.pop_front() else {
             // Linux reports a shut-down listener as invalid only to callers
             // that would otherwise wait.
             return if listener.read_shut && !lease.nonblocking {
-                Ok(Err(LocalSocketError::InvalidArgument))
+                Ok(Err(UnixSocketError::InvalidArgument))
             } else {
                 Err(BrokerError::would_block(lease.nonblocking))
             };
@@ -309,7 +308,7 @@ pub fn accept(
         table.wake_waiters(lease.id);
         accepted
     };
-    let object = LocalSocketObject::new(
+    let object = UnixSocketObject::new(
         Arc::clone(&lease.sockets),
         accepted,
         SocketType::Stream,
@@ -317,11 +316,11 @@ pub fn accept(
     );
     object.watch(&registration)?;
     reference
-        .commit_with_readiness(ObjectEntry::LocalSocket(object), Some(registration))
+        .commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
         .map(Ok)
 }
 
-/// Sends bytes from a local socket, to `address` if given or otherwise to
+/// Sends bytes from a Unix socket, to `address` if given or otherwise to
 /// its connected peer, and returns how many were sent.
 ///
 /// A stream socket sends as many bytes as its peer has room for. A datagram
@@ -330,11 +329,11 @@ pub fn accept(
 pub fn send(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    address: Option<&LocalSocketAddress>,
+    address: Option<&UnixSocketAddress>,
     data: &[u8],
     user: FileUser,
-) -> Result<LocalSocketResult<usize>> {
-    if data.len() > MAX_LOCAL_SOCKET_TRANSFER_SIZE as usize {
+) -> Result<UnixSocketResult<usize>> {
+    if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize {
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
@@ -362,7 +361,7 @@ pub fn send(
     }
 }
 
-/// Receives up to `capacity` bytes from a local socket, leaving them queued
+/// Receives up to `capacity` bytes from a Unix socket, leaving them queued
 /// if `peek` is set.
 ///
 /// A stream socket receives queued bytes. A datagram socket receives one
@@ -380,8 +379,8 @@ pub fn receive(
     capacity: u32,
     peek: bool,
     nonblocking: bool,
-) -> Result<LocalSocketResult<Received>> {
-    if capacity > MAX_LOCAL_SOCKET_TRANSFER_SIZE {
+) -> Result<UnixSocketResult<Received>> {
+    if capacity > MAX_UNIX_SOCKET_TRANSFER_SIZE {
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
@@ -396,7 +395,7 @@ pub fn receive(
     }
 }
 
-/// Shuts down one or both directions of a local socket.
+/// Shuts down one or both directions of a Unix socket.
 ///
 /// Shutting down a direction of a connected stream socket also shuts down
 /// the opposite direction of its peer.
@@ -404,7 +403,7 @@ pub fn shutdown(
     process: &BrokerProcess,
     handle: ObjectHandle,
     mode: ShutdownMode,
-) -> Result<LocalSocketResult<()>> {
+) -> Result<UnixSocketResult<()>> {
     let (read, write) = match mode {
         ShutdownMode::Read => (true, false),
         ShutdownMode::Write => (false, true),
@@ -438,13 +437,13 @@ pub fn shutdown(
     Ok(Ok(()))
 }
 
-/// Returns the name of a local socket, or of its connected peer if `peer`
+/// Returns the name of a Unix socket, or of its connected peer if `peer`
 /// is set.
 pub fn name(
     process: &BrokerProcess,
     handle: ObjectHandle,
     peer: bool,
-) -> Result<LocalSocketResult<LocalSocketName>> {
+) -> Result<UnixSocketResult<UnixSocketName>> {
     let lease = Lease::new(
         process
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
@@ -456,26 +455,26 @@ pub fn name(
     }
     match &socket.connection {
         Connection::Connected { peer_name, .. } => Ok(Ok(peer_name.clone())),
-        Connection::None | Connection::Listening { .. } => Ok(Err(LocalSocketError::NotConnected)),
+        Connection::None | Connection::Listening { .. } => Ok(Err(UnixSocketError::NotConnected)),
     }
 }
 
-/// Stores one option of a local socket.
+/// Stores one option of a Unix socket.
 pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    option: LocalSocketOption,
+    option: UnixSocketOption,
 ) -> Result<()> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
     lease.lock().socket_mut(lease.id)?.options.set(option);
     Ok(())
 }
 
-/// Returns the type and stored options of a local socket.
+/// Returns the type and stored options of a Unix socket.
 pub fn options(
     process: &BrokerProcess,
     handle: ObjectHandle,
-) -> Result<(SocketType, LocalSocketOptions)> {
+) -> Result<(SocketType, UnixSocketOptions)> {
     let lease = Lease::new(
         process
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
@@ -498,17 +497,17 @@ fn new_object(
     process: &BrokerProcess,
     socket_type: SocketType,
     flags: FileOpenFlags,
-) -> Result<LocalSocketObject> {
+) -> Result<UnixSocketObject> {
     if !matches!(socket_type, SocketType::Stream | SocketType::Datagram) {
         return Err(BrokerError::UnsupportedOperation);
     }
-    let sockets = &process.core.local_sockets;
+    let sockets = &process.core.unix_sockets;
     let id = sockets.lock().insert(Socket::new(
         socket_type,
-        LocalSocketName::Unnamed,
-        Arc::clone(&process.local_socket_bytes),
+        UnixSocketName::Unnamed,
+        Arc::clone(&process.unix_socket_bytes),
     ))?;
-    Ok(LocalSocketObject::new(
+    Ok(UnixSocketObject::new(
         Arc::clone(sockets),
         id,
         socket_type,
@@ -524,11 +523,11 @@ fn new_object(
 /// node while they use it.
 fn lookup(
     process: &BrokerProcess,
-    address: &LocalSocketAddress,
+    address: &UnixSocketAddress,
     user: FileUser,
     socket_type: SocketType,
-) -> Result<LocalSocketResult<(NameKey, Option<File>)>> {
-    let LocalSocketAddress::Path { path, .. } = address else {
+) -> Result<UnixSocketResult<(NameKey, Option<File>)>> {
+    let UnixSocketAddress::Path { path, .. } = address else {
         return Ok(Ok((NameKey::of(address, socket_type), None)));
     };
     // A path-only open does not copy the node up an overlay, so write
@@ -542,7 +541,7 @@ fn lookup(
         FileMode::empty(),
     )? {
         Ok(opened) => opened,
-        Err(error) => return Ok(Err(LocalSocketError::File(error))),
+        Err(error) => return Ok(Err(UnixSocketError::File(error))),
     };
     let write = if user.user == status.owner.user {
         FileMode::WUSR
@@ -552,7 +551,7 @@ fn lookup(
         FileMode::WOTH
     };
     if !status.mode.contains(write) {
-        return Ok(Err(LocalSocketError::File(FileError::AccessNotAllowed)));
+        return Ok(Err(UnixSocketError::File(FileError::AccessNotAllowed)));
     }
     let key = NameKey::Node {
         dev: status.node_info.dev,
@@ -562,17 +561,17 @@ fn lookup(
 }
 
 impl ObjectEntry {
-    fn as_local_socket(&self) -> Result<&LocalSocketObject> {
+    fn as_unix_socket(&self) -> Result<&UnixSocketObject> {
         match self {
-            Self::LocalSocket(socket) => Ok(socket),
+            Self::UnixSocket(socket) => Ok(socket),
             _ => Err(BrokerError::InvalidRights),
         }
     }
 }
 
-/// One local socket's open state, which its references share.
-pub(crate) struct LocalSocketObject {
-    sockets: Arc<LocalSockets>,
+/// One Unix socket's open state, which its references share.
+pub(crate) struct UnixSocketObject {
+    sockets: Arc<UnixSockets>,
     id: SocketId,
     socket_type: SocketType,
     /// Whether operations that would block fail instead of waiting.
@@ -581,9 +580,9 @@ pub(crate) struct LocalSocketObject {
     append: bool,
 }
 
-impl LocalSocketObject {
+impl UnixSocketObject {
     fn new(
-        sockets: Arc<LocalSockets>,
+        sockets: Arc<UnixSockets>,
         id: SocketId,
         socket_type: SocketType,
         flags: FileOpenFlags,
@@ -639,7 +638,7 @@ impl LocalSocketObject {
     }
 }
 
-impl Drop for LocalSocketObject {
+impl Drop for UnixSocketObject {
     fn drop(&mut self) {
         let marker = self.sockets.lock().remove(self.id);
         drop(marker);
@@ -652,7 +651,7 @@ impl Drop for LocalSocketObject {
 /// reference to the object removes the socket from the table.
 struct Lease {
     _object: Arc<RwLock<ObjectEntry>>,
-    sockets: Arc<LocalSockets>,
+    sockets: Arc<UnixSockets>,
     id: SocketId,
     socket_type: SocketType,
     nonblocking: bool,
@@ -662,7 +661,7 @@ impl Lease {
     fn new(object: Arc<RwLock<ObjectEntry>>) -> Result<Self> {
         let (sockets, id, socket_type, nonblocking) = {
             let entry = object.read();
-            let socket = entry.as_local_socket()?;
+            let socket = entry.as_unix_socket()?;
             (
                 Arc::clone(&socket.sockets),
                 socket.id,
@@ -684,18 +683,18 @@ impl Lease {
     }
 }
 
-/// Every local socket of a broker.
-pub(crate) struct LocalSockets(Mutex<Table>);
+/// Every Unix socket of a broker.
+pub(crate) struct UnixSockets(Mutex<Table>);
 
-impl LocalSockets {
+impl UnixSockets {
     pub(crate) fn new(limits: &BrokerCoreLimits) -> Self {
         Self(Mutex::new(Table {
             sockets: HashMap::new(),
             names: HashMap::new(),
             next_id: 0,
             queued: 0,
-            max_queued: limits.max_total_local_socket_bytes,
-            max_queued_per_process: limits.max_local_socket_bytes_per_process,
+            max_queued: limits.max_total_unix_socket_bytes,
+            max_queued_per_process: limits.max_unix_socket_bytes_per_process,
         }))
     }
 
@@ -719,24 +718,24 @@ enum NameKey {
 
 impl NameKey {
     /// Returns the key of an abstract address held by a `socket_type` socket.
-    fn of(address: &LocalSocketAddress, socket_type: SocketType) -> Self {
+    fn of(address: &UnixSocketAddress, socket_type: SocketType) -> Self {
         match address {
-            LocalSocketAddress::Abstract(bytes) => Self::Abstract(socket_type, bytes.clone()),
-            LocalSocketAddress::Path { .. } => unreachable!("path names are keyed by their node"),
+            UnixSocketAddress::Abstract(bytes) => Self::Abstract(socket_type, bytes.clone()),
+            UnixSocketAddress::Path { .. } => unreachable!("path names are keyed by their node"),
         }
     }
 }
 
 struct Socket {
     kind: SocketType,
-    name: LocalSocketName,
+    name: UnixSocketName,
     /// Whether a bind is creating the socket's path outside the table lock.
     binding: bool,
     name_key: Option<NameKey>,
     /// File created by binding to a path, held open so the node that
     /// identifies the name stays allocated.
     marker: Option<File>,
-    options: LocalSocketOptions,
+    options: UnixSocketOptions,
     read_shut: bool,
     write_shut: bool,
     connection: Connection,
@@ -755,14 +754,14 @@ struct Socket {
 }
 
 impl Socket {
-    fn new(kind: SocketType, name: LocalSocketName, quota: Arc<AtomicUsize>) -> Self {
+    fn new(kind: SocketType, name: UnixSocketName, quota: Arc<AtomicUsize>) -> Self {
         Self {
             kind,
             name,
             binding: false,
             name_key: None,
             marker: None,
-            options: LocalSocketOptions::default(),
+            options: UnixSocketOptions::default(),
             read_shut: false,
             write_shut: false,
             connection: Connection::None,
@@ -792,13 +791,13 @@ enum Connection {
         /// The peer, or `None` once a stream peer closes.
         peer: Option<SocketId>,
         /// Name the peer had when the connection formed.
-        peer_name: LocalSocketName,
+        peer_name: UnixSocketName,
     },
 }
 
 struct Datagram {
     data: Vec<u8>,
-    source: LocalSocketName,
+    source: UnixSocketName,
 }
 
 impl Datagram {
@@ -845,11 +844,11 @@ impl Table {
         &mut self,
         id: SocketId,
         key: NameKey,
-        name: LocalSocketName,
+        name: UnixSocketName,
         marker: &mut Option<File>,
-    ) -> Result<LocalSocketResult<()>> {
+    ) -> Result<UnixSocketResult<()>> {
         if self.names.contains_key(&key) {
-            return Ok(Err(LocalSocketError::AddressInUse));
+            return Ok(Err(UnixSocketError::AddressInUse));
         }
         self.names
             .try_reserve(1)
@@ -864,16 +863,12 @@ impl Table {
 
     /// Returns the socket holding the name `key`, which must have type
     /// `socket_type`.
-    fn target(
-        &self,
-        key: &NameKey,
-        socket_type: SocketType,
-    ) -> Result<LocalSocketResult<SocketId>> {
+    fn target(&self, key: &NameKey, socket_type: SocketType) -> Result<UnixSocketResult<SocketId>> {
         let Some(&target) = self.names.get(key) else {
-            return Ok(Err(LocalSocketError::ConnectionRefused));
+            return Ok(Err(UnixSocketError::ConnectionRefused));
         };
         if self.socket(target)?.kind != socket_type {
-            return Ok(Err(LocalSocketError::WrongType));
+            return Ok(Err(UnixSocketError::WrongType));
         }
         Ok(Ok(target))
     }
@@ -894,20 +889,20 @@ impl Table {
         id: SocketId,
         target: SocketId,
         nonblocking: bool,
-    ) -> Result<LocalSocketResult<()>> {
+    ) -> Result<UnixSocketResult<()>> {
         let client = self.socket(id)?;
         match client.connection {
             Connection::None => {}
-            Connection::Connected { .. } => return Ok(Err(LocalSocketError::AlreadyConnected)),
-            Connection::Listening { .. } => return Ok(Err(LocalSocketError::InvalidArgument)),
+            Connection::Connected { .. } => return Ok(Err(UnixSocketError::AlreadyConnected)),
+            Connection::Listening { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
         }
         let client_name = client.name.clone();
         let listener = self.socket(target)?;
         let Connection::Listening { backlog, limit } = &listener.connection else {
-            return Ok(Err(LocalSocketError::ConnectionRefused));
+            return Ok(Err(UnixSocketError::ConnectionRefused));
         };
         if listener.read_shut {
-            return Ok(Err(LocalSocketError::ConnectionRefused));
+            return Ok(Err(UnixSocketError::ConnectionRefused));
         }
         if backlog.len() > *limit {
             self.add_waiter(target, id)?;
@@ -956,27 +951,27 @@ impl Table {
         addressed: bool,
         data: &[u8],
         nonblocking: bool,
-    ) -> Result<LocalSocketResult<usize>> {
+    ) -> Result<UnixSocketResult<usize>> {
         let socket = self.socket(id)?;
         let Connection::Connected { peer, .. } = socket.connection else {
             return Ok(Err(if addressed {
-                LocalSocketError::Unsupported
+                UnixSocketError::Unsupported
             } else {
-                LocalSocketError::NotConnected
+                UnixSocketError::NotConnected
             }));
         };
         if addressed {
-            return Ok(Err(LocalSocketError::AlreadyConnected));
+            return Ok(Err(UnixSocketError::AlreadyConnected));
         }
         if socket.write_shut {
-            return Ok(Err(LocalSocketError::BrokenPipe));
+            return Ok(Err(UnixSocketError::BrokenPipe));
         }
         if data.is_empty() {
             return Ok(Ok(0));
         }
         let Some(peer) = peer.filter(|peer| self.sockets.get(peer).is_some_and(|p| !p.read_shut))
         else {
-            return Ok(Err(LocalSocketError::BrokenPipe));
+            return Ok(Err(UnixSocketError::BrokenPipe));
         };
         let available = CAPACITY.saturating_sub(self.socket(peer)?.queued);
         if available == 0 {
@@ -1001,7 +996,7 @@ impl Table {
         key: Option<&NameKey>,
         data: &[u8],
         nonblocking: bool,
-    ) -> Result<LocalSocketResult<usize>> {
+    ) -> Result<UnixSocketResult<usize>> {
         let target = match key {
             Some(key) => match self.target(key, SocketType::Datagram)? {
                 Ok(target) => target,
@@ -1018,27 +1013,27 @@ impl Table {
                         self.purge_datagrams(id)?;
                         self.wake_waiters(id);
                         self.publish(id);
-                        return Ok(Err(LocalSocketError::ConnectionRefused));
+                        return Ok(Err(UnixSocketError::ConnectionRefused));
                     }
                     peer
                 }
-                _ => return Ok(Err(LocalSocketError::NotConnected)),
+                _ => return Ok(Err(UnixSocketError::NotConnected)),
             },
         };
         if data.len() > CAPACITY {
-            return Ok(Err(LocalSocketError::MessageTooLarge));
+            return Ok(Err(UnixSocketError::MessageTooLarge));
         }
         let socket = self.socket(id)?;
         if socket.write_shut {
-            return Ok(Err(LocalSocketError::BrokenPipe));
+            return Ok(Err(UnixSocketError::BrokenPipe));
         }
         let source = socket.name.clone();
         if !self.accepts_datagrams_from(target, id)? {
-            return Ok(Err(LocalSocketError::NotPermitted));
+            return Ok(Err(UnixSocketError::NotPermitted));
         }
         let receiver = self.socket(target)?;
         if receiver.read_shut {
-            return Ok(Err(LocalSocketError::BrokenPipe));
+            return Ok(Err(UnixSocketError::BrokenPipe));
         }
         // A datagram may overrun the capacity, so a socket that is not full
         // accepts any datagram, as its readiness reports.
@@ -1068,10 +1063,10 @@ impl Table {
         capacity: usize,
         peek: bool,
         nonblocking: bool,
-    ) -> Result<LocalSocketResult<Received>> {
+    ) -> Result<UnixSocketResult<Received>> {
         let socket = self.socket_mut(id)?;
         let Connection::Connected { peer_name, .. } = &socket.connection else {
-            return Ok(Err(LocalSocketError::InvalidArgument));
+            return Ok(Err(UnixSocketError::InvalidArgument));
         };
         let source = peer_name.clone();
         if capacity == 0 {
@@ -1117,7 +1112,7 @@ impl Table {
         capacity: usize,
         peek: bool,
         nonblocking: bool,
-    ) -> Result<LocalSocketResult<Received>> {
+    ) -> Result<UnixSocketResult<Received>> {
         let socket = self.socket_mut(id)?;
         let Some(datagram) = socket.datagrams.front() else {
             return if socket.read_shut && !nonblocking {
@@ -1189,13 +1184,13 @@ impl Table {
             .expect("a socket's charge must cover its queued data");
         *total = total
             .checked_sub(bytes)
-            .expect("the broker's local socket charge must cover every socket's");
+            .expect("the broker's Unix socket charge must cover every socket's");
         socket
             .quota
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
                 charged.checked_sub(bytes)
             })
-            .expect("a process's local socket charge must cover its sockets'");
+            .expect("a process's Unix socket charge must cover its sockets'");
     }
 
     /// Wakes the sockets that may send to socket `id` after its queue shrank.

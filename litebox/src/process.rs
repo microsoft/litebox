@@ -21,9 +21,9 @@ use crate::broker::{
 };
 use crate::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use crate::fs::FileFd;
-use crate::local_sockets::LocalSocket;
 use crate::pipes::PipeFd;
 use crate::sync::RawSyncPrimitivesProvider;
+use crate::unix_sockets::BrokerUnixSocket;
 
 /// Error returned by the broker-backed process service.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
@@ -116,8 +116,8 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     File(Arc<FileFd>),
     /// A pipe end, adopted with [`LiteBox::adopt_inherited_pipe`].
     Pipe(Arc<PipeFd<Platform>>),
-    /// A local socket, adopted with [`LiteBox::adopt_inherited_local_socket`].
-    LocalSocket(Arc<LocalSocket<Platform>>),
+    /// A Unix socket, adopted with [`LiteBox::adopt_inherited_unix_socket`].
+    UnixSocket(Arc<BrokerUnixSocket<Platform>>),
 }
 
 /// Termination state of a child process.
@@ -217,7 +217,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
                     held_pipes.push(pipe);
                     handle
                 }
-                InheritableFd::LocalSocket(socket) => {
+                InheritableFd::UnixSocket(socket) => {
                     held_sockets.push(Arc::clone(socket));
                     socket.handle()
                 }

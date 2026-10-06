@@ -19,7 +19,6 @@ extern crate alloc;
 pub mod event;
 pub mod fd;
 pub mod fs;
-pub mod local_sockets;
 pub mod mm;
 pub mod net;
 pub mod path;
@@ -31,6 +30,7 @@ pub mod shim;
 pub mod sync;
 pub mod thread;
 pub mod tls;
+pub mod unix_sockets;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.

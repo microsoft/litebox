@@ -1325,7 +1325,7 @@ fn test_broker_with_policy(
                 .with_socket_policy(*socket_policy),
         ),
         limits: crate::BrokerCoreLimits::new_with_all_limits(16, 4, 8, 8),
-        local_sockets: Arc::new(crate::local_socket::LocalSockets::new(
+        unix_sockets: Arc::new(crate::unix_socket::UnixSockets::new(
             &crate::BrokerCoreLimits::DEFAULT,
         )),
         ids: Arc::new(spin::Mutex::new(

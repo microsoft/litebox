@@ -12,13 +12,13 @@ use spin::rwlock::RwLock;
 
 use crate::event::EventObject;
 use crate::fs::File;
-use crate::local_socket::LocalSocketObject;
 use crate::pipe::PipeObject;
 use crate::process::ProcessObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
 use crate::signal::SignalsObject;
 use crate::socket::SocketObject;
 use crate::timer::TimerObject;
+use crate::unix_socket::UnixSocketObject;
 use crate::{BrokerError, BrokerProcess, Result};
 
 bitflags::bitflags! {
@@ -49,7 +49,7 @@ pub(crate) struct ObjectReference {
 pub(crate) enum ObjectEntry {
     Event(EventObject),
     File(File),
-    LocalSocket(LocalSocketObject),
+    UnixSocket(UnixSocketObject),
     Pipe(PipeObject),
     Socket(SocketObject),
     Process(ProcessObject),
@@ -68,7 +68,7 @@ impl ObjectEntry {
     /// other processes must also implement [`Self::watch`].
     pub(crate) fn is_duplicable(&self) -> bool {
         match self {
-            Self::Event(_) | Self::File(_) | Self::LocalSocket(_) | Self::Pipe(_) => true,
+            Self::Event(_) | Self::File(_) | Self::UnixSocket(_) | Self::Pipe(_) => true,
             Self::Socket(_) | Self::Process(_) | Self::Signals(_) | Self::Timer(_) => false,
         }
     }
@@ -83,7 +83,7 @@ impl ObjectEntry {
     ) -> Result<Option<ReadinessRegistration>> {
         match self {
             Self::File(file) => file.watch(handle, readiness_sink),
-            Self::LocalSocket(socket) => {
+            Self::UnixSocket(socket) => {
                 let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
                 socket.watch(&registration)?;
                 Ok(Some(registration))
@@ -111,7 +111,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
         match &*object {
             ObjectEntry::Event(event) => return Ok(event.readiness()),
             ObjectEntry::File(file) => return file.readiness(),
-            ObjectEntry::LocalSocket(socket) => return Ok(socket.readiness()),
+            ObjectEntry::UnixSocket(socket) => return Ok(socket.readiness()),
             ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
             ObjectEntry::Process(process) => return Ok(process.readiness()),
             ObjectEntry::Signals(signals) => return Ok(signals.readiness()),
@@ -129,7 +129,7 @@ pub(crate) fn get_status_flags(
 ) -> Result<FileStatusFlags> {
     let file = match &*object.read() {
         ObjectEntry::File(file) => file.clone(),
-        ObjectEntry::LocalSocket(socket) => return Ok(socket.get_status_flags()),
+        ObjectEntry::UnixSocket(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::Pipe(pipe) => return Ok(pipe.get_status_flags()),
         ObjectEntry::Event(_)
         | ObjectEntry::Socket(_)
@@ -149,7 +149,7 @@ pub(crate) fn set_status_flags(
 ) -> Result<()> {
     let file = match &mut *object.write() {
         ObjectEntry::File(file) => file.clone(),
-        ObjectEntry::LocalSocket(socket) => {
+        ObjectEntry::UnixSocket(socket) => {
             socket.set_status_flags(mask, flags);
             return Ok(());
         }

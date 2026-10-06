@@ -3,9 +3,9 @@
 
 //! Unix domain sockets for the Linux shim layer.
 //!
-//! Each socket is a broker-owned [`LocalSocket`], so processes that share a socket through
+//! Each socket is a broker-owned [`BrokerUnixSocket`], so processes that share a socket through
 //! inheritance see one socket. This module translates between Linux socket calls and the
-//! broker's guest-neutral local socket operations.
+//! broker's guest-neutral Unix socket operations.
 
 use alloc::{
     string::{String, ToString as _},
@@ -15,16 +15,14 @@ use alloc::{
 use litebox::{
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
-    local_sockets::LocalSocket,
     process::ProcessError,
+    unix_sockets::BrokerUnixSocket,
 };
 use litebox_broker_protocol::{
     ObjectHandle,
     fs::{FileMode as Mode, FileOpenFlags, FileUser},
-    local_socket::{
-        LOCAL_SOCKET_BUFFER_SIZE, LocalSocketAddress, LocalSocketName, LocalSocketOption,
-    },
     socket::{ShutdownMode, SocketType},
+    unix_socket::{UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName, UnixSocketOption},
 };
 use litebox_common_linux::{
     IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
@@ -75,13 +73,13 @@ impl UnixSocketAddr {
     fn to_local<Platform: ShimPlatform>(
         &self,
         task: &Task<Platform>,
-    ) -> Result<LocalSocketAddress, Errno> {
+    ) -> Result<UnixSocketAddress, Errno> {
         match self {
             UnixSocketAddr::Unnamed => Err(Errno::EINVAL),
-            UnixSocketAddr::Abstract(name) => Ok(LocalSocketAddress::Abstract(name.clone())),
+            UnixSocketAddr::Abstract(name) => Ok(UnixSocketAddress::Abstract(name.clone())),
             UnixSocketAddr::Path(path) => {
                 let resolved = task.fs.borrow().context.read().resolve(path.as_str())?;
-                Ok(LocalSocketAddress::Path {
+                Ok(UnixSocketAddress::Path {
                     path: resolved.to_string(),
                     name: path.as_bytes().to_vec(),
                 })
@@ -90,25 +88,25 @@ impl UnixSocketAddr {
     }
 }
 
-impl From<LocalSocketName> for UnixSocketAddr {
-    fn from(name: LocalSocketName) -> Self {
+impl From<UnixSocketName> for UnixSocketAddr {
+    fn from(name: UnixSocketName) -> Self {
         match name {
-            LocalSocketName::Unnamed => UnixSocketAddr::Unnamed,
-            LocalSocketName::Path(name) => {
+            UnixSocketName::Unnamed => UnixSocketAddr::Unnamed,
+            UnixSocketName::Path(name) => {
                 UnixSocketAddr::Path(String::from_utf8_lossy(&name).into_owned())
             }
-            LocalSocketName::Abstract(name) => UnixSocketAddr::Abstract(name),
+            UnixSocketName::Abstract(name) => UnixSocketAddr::Abstract(name),
         }
     }
 }
 
 /// A Unix domain socket descriptor's open file description.
 pub(crate) struct UnixSocket<Platform: ShimPlatform> {
-    socket: Arc<LocalSocket<Platform>>,
+    socket: Arc<BrokerUnixSocket<Platform>>,
 }
 
-impl<Platform: ShimPlatform> From<LocalSocket<Platform>> for UnixSocket<Platform> {
-    fn from(socket: LocalSocket<Platform>) -> Self {
+impl<Platform: ShimPlatform> From<BrokerUnixSocket<Platform>> for UnixSocket<Platform> {
+    fn from(socket: BrokerUnixSocket<Platform>) -> Self {
         Self {
             socket: Arc::new(socket),
         }
@@ -121,7 +119,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         sock_type: SockType,
         flags: SockFlags,
     ) -> Result<Self, Errno> {
-        let socket = litebox.create_local_socket(socket_type(sock_type)?, open_flags(flags))?;
+        let socket = litebox.create_unix_socket(socket_type(sock_type)?, open_flags(flags))?;
         Ok(socket.into())
     }
 
@@ -131,12 +129,12 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         flags: SockFlags,
     ) -> Result<(Self, Self), Errno> {
         let (first, second) =
-            litebox.create_local_socket_pair(socket_type(sock_type)?, open_flags(flags))?;
+            litebox.create_unix_socket_pair(socket_type(sock_type)?, open_flags(flags))?;
         Ok((first.into(), second.into()))
     }
 
     /// The broker-owned socket, which a child process inherits.
-    pub(crate) fn local_socket(&self) -> &Arc<LocalSocket<Platform>> {
+    pub(crate) fn broker_socket(&self) -> &Arc<BrokerUnixSocket<Platform>> {
         &self.socket
     }
 
@@ -251,22 +249,22 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         match global.setsockopt_common(optname, optval, optlen, |so, value| {
             let option = match (so, value) {
                 (SocketOption::RCVTIMEO, SocketOptionValue::Timeout(timeout)) => {
-                    LocalSocketOption::ReceiveTimeout(timeout)
+                    UnixSocketOption::ReceiveTimeout(timeout)
                 }
                 (SocketOption::SNDTIMEO, SocketOptionValue::Timeout(timeout)) => {
-                    LocalSocketOption::SendTimeout(timeout)
+                    UnixSocketOption::SendTimeout(timeout)
                 }
                 (SocketOption::LINGER, SocketOptionValue::Timeout(timeout)) => {
-                    LocalSocketOption::Linger(timeout)
+                    UnixSocketOption::Linger(timeout)
                 }
                 (SocketOption::REUSEADDR, SocketOptionValue::U32(val)) => {
-                    LocalSocketOption::ReuseAddress(val != 0)
+                    UnixSocketOption::ReuseAddress(val != 0)
                 }
                 (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
-                    LocalSocketOption::KeepAlive(val != 0)
+                    UnixSocketOption::KeepAlive(val != 0)
                 }
                 (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
-                    LocalSocketOption::Broadcast(val != 0)
+                    UnixSocketOption::Broadcast(val != 0)
                 }
                 _ => unreachable!(),
             };
@@ -359,7 +357,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
                         SockType::Datagram as u32
                     }
                 }
-                SocketOption::RCVBUF | SocketOption::SNDBUF => LOCAL_SOCKET_BUFFER_SIZE,
+                SocketOption::RCVBUF | SocketOption::SNDBUF => UNIX_SOCKET_BUFFER_SIZE,
                 SocketOption::PEERCRED => {
                     if !self.is_stream() {
                         log_unsupported!("get PEERCRED for unix datagram socket");
@@ -426,7 +424,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         &self,
         handle: ObjectHandle,
     ) -> Result<TypedFd<UnixSocketSubsystem<Platform>>, ProcessError> {
-        let socket = self.litebox.adopt_inherited_local_socket(handle)?;
+        let socket = self.litebox.adopt_inherited_unix_socket(handle)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

@@ -19,7 +19,6 @@ extern crate std;
 pub mod error;
 pub mod event;
 pub mod fs;
-pub mod local_socket;
 pub mod message;
 pub mod pipe;
 pub mod process;
@@ -29,6 +28,7 @@ pub mod shared_buffer;
 pub mod signal;
 pub mod socket;
 pub mod timer;
+pub mod unix_socket;
 pub mod wire;
 
 /// Guest process ID carried by broker protocol messages.
