@@ -120,7 +120,7 @@ jobs:
       #    incompatibility when SSE-using dependencies are linked against a soft-float stdlib
       #
       # Version alignment: The nightly version should match the stable version (e.g., stable
-      # 1.91.x -> nightly 1.91.x). Use `rustc +nightly-YYYY-MM-DD --version` to find a date.
+      # 1.99.x -> nightly 1.99.x). Use `rustc +nightly-YYYY-MM-DD --version` to find a date.
       - name: Set up Rust
         run: |
           RUST_CHANNEL=$(awk -F'"' '/channel/{print $2}' litebox_runner_lvbs/rust-toolchain.toml)
@@ -146,10 +146,10 @@ jobs:
       - run: |
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features
           # Run clippy for lvbs with custom target (requires build-std)
-          ./.github/tools/github_actions_run_cargo clippy -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json --all-features
+          ./.github/tools/github_actions_run_cargo clippy -Z json-target-spec -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json --all-features
       - run: |
           ./.github/tools/github_actions_run_cargo build
-          ./.github/tools/github_actions_run_cargo build -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+          ./.github/tools/github_actions_run_cargo build -Z json-target-spec -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
       - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_platform_lvbs
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
@@ -205,9 +205,9 @@ jobs:
           rustup override set ${RUST_CHANNEL}
           rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: ./.github/tools/github_actions_run_cargo clippy --all-features --target litebox_runner_snp/target.json --manifest-path=litebox_runner_snp/Cargo.toml -Zbuild-std=core,compiler_builtins,alloc
+      - run: ./.github/tools/github_actions_run_cargo clippy -Zjson-target-spec --all-features --target litebox_runner_snp/target.json --manifest-path=litebox_runner_snp/Cargo.toml -Zbuild-std=core,compiler_builtins,alloc
       - run: |
-          ./.github/tools/github_actions_run_cargo build -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
+          ./.github/tools/github_actions_run_cargo build -Zjson-target-spec -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem --manifest-path=litebox_runner_snp/Cargo.toml --target litebox_runner_snp/target.json
       - name: Build documentation (fail on warnings)
         run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items
 
