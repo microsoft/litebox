@@ -10,10 +10,11 @@
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::IsTerminal as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
@@ -26,6 +27,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
+use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveLayout};
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
 
 use zerocopy::{FromBytes, IntoBytes};
@@ -534,11 +536,40 @@ struct ThreadContext<'a> {
     ctx: &'a mut litebox_common_linux::PtRegs,
 }
 
+fn xsave_layout() -> &'static XsaveLayout {
+    static LAYOUT: OnceLock<XsaveLayout> = OnceLock::new();
+    LAYOUT.get_or_init(XsaveLayout::detect)
+}
+
+thread_local! {
+    static GUEST_XSTATE: RefCell<XsaveArea> = RefCell::new(XsaveArea::initial(xsave_layout()));
+}
+
+fn activate_xstate(reenter: bool) {
+    GUEST_XSTATE.with_borrow_mut(|guest| {
+        if !reenter {
+            *guest = XsaveArea::initial(xsave_layout());
+        }
+        // SAFETY: The buffer remains owned by this thread's TLS until thread exit.
+        // No guest is running while these assembly TLS slots are initialized.
+        unsafe {
+            core::arch::asm!(
+                "mov fs:guest_xsave@tpoff, {guest}",
+                "mov fs:xsave_mask@tpoff, {mask}",
+                guest = in(reg) guest.as_mut_ptr(),
+                mask = in(reg) xsave_layout().mask,
+                options(nostack, preserves_flags),
+            );
+        }
+    });
+}
+
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
     reenter: bool,
 ) {
+    activate_xstate(reenter);
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     ThreadHandle::run_with_handle(|| {
@@ -559,6 +590,17 @@ host_sp:
     .quad 0
 host_bp:
     .quad 0
+.globl guest_xsave
+guest_xsave:
+    .quad 0
+.globl xsave_mask
+xsave_mask:
+    .quad 0
+host_x87_control_word:
+    .word 0
+    .align 4
+host_mxcsr:
+    .long 0
 guest_context_top:
     .quad 0
 .globl guest_fsbase
@@ -646,6 +688,11 @@ unsafe extern "C-unwind" fn run_thread_arch(
     rdfsbase r8
     wrgsbase r8
 
+    // Preserve the host FP controls required by the SysV AMD64 ABI. FP data
+    // registers are caller-saved, so they do not require a host XSAVE area.
+    fnstcw WORD PTR fs:host_x87_control_word@tpoff
+    stmxcsr DWORD PTR fs:host_mxcsr@tpoff
+
     // Call init_handler or reenter_handler based on reenter flag (in dl).
     test dl, dl
     jnz 1f
@@ -677,7 +724,6 @@ syscall_callback:
     mov     r11, rsp
     mov     rsp, fs:guest_context_top@tpoff
 
-    // TODO: save float and vector registers (xsave or fxsave)
     // Save caller-saved registers
     push    0x2b       // pt_regs->ss = __USER_DS
     push    r11        // pt_regs->sp
@@ -702,6 +748,15 @@ syscall_callback:
     push    r14         // pt_regs->r14
     push    r15         // pt_regs->r15
 
+    mov     r10, fs:guest_xsave@tpoff
+    mov     eax, DWORD PTR fs:xsave_mask@tpoff
+    mov     edx, DWORD PTR fs:xsave_mask@tpoff+4
+    xsave64 [r10]
+    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
+    fnclex
+    fldcw   WORD PTR fs:host_x87_control_word@tpoff
+    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
+
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -714,6 +769,18 @@ syscall_callback:
     jmp .Ldone
 
 exception_callback:
+    // rt_sigreturn restored the guest FP state. Save it before entering host code.
+    mov     r8, rdx
+    mov     r10, fs:guest_xsave@tpoff
+    mov     eax, DWORD PTR fs:xsave_mask@tpoff
+    mov     edx, DWORD PTR fs:xsave_mask@tpoff+4
+    xsave64 [r10]
+    mov     rdx, r8
+    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
+    fnclex
+    fldcw   WORD PTR fs:host_x87_control_word@tpoff
+    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
+
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -723,6 +790,18 @@ exception_callback:
     jmp .Ldone
 
 interrupt_callback:
+    // rt_sigreturn restored the guest FP state. Save it before entering host code.
+    mov     r10, fs:guest_xsave@tpoff
+    mov     eax, DWORD PTR fs:xsave_mask@tpoff
+    mov     edx, DWORD PTR fs:xsave_mask@tpoff+4
+    xsave64 [r10]
+.globl interrupt_callback_no_xsave
+interrupt_callback_no_xsave:
+    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
+    fnclex
+    fldcw   WORD PTR fs:host_x87_control_word@tpoff
+    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
+
     // Restore the stack and frame pointer.
     mov     rsp, fs:host_sp@tpoff
     mov     rbp, fs:host_bp@tpoff
@@ -732,6 +811,10 @@ interrupt_callback:
 
 .Ldone:
 
+    // Clear the x87 exception flags and restore the x87 FPU and SSE control words.
+    fnclex
+    fldcw   WORD PTR fs:host_x87_control_word@tpoff
+    ldmxcsr DWORD PTR fs:host_mxcsr@tpoff
     lea  rsp, [rbp - 5*8]
     pop  r15
     pop  r14
@@ -770,10 +853,10 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // interrupt arrives while `in_guest` is set, the signal handler will
         // see that the IP is between `switch_to_guest_start` and
         // `switch_to_guest_end` and will set `interrupt` and jump to
-        // `interrupt_callback`.
+        // `interrupt_callback_no_xsave`.
         //
         // If an interrupt is already pending, clear `in_guest` and jump to
-        // `interrupt_callback` without entering the guest. `interrupt_callback`
+        // `interrupt_callback_no_xsave` without entering the guest. The callback
         // runs host code, and a signal arriving there with `in_guest` still set
         // would be taken for a guest interrupt and overwrite the saved guest
         // context with host registers.
@@ -781,8 +864,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         "cmp BYTE PTR fs:interrupt@tpoff, 0",
         "je 2f",
         "mov BYTE PTR fs:in_guest@tpoff, 0",
-        "jmp interrupt_callback",
+        "jmp interrupt_callback_no_xsave",
         "2:",
+        "mov r10, fs:guest_xsave@tpoff",
+        "mov eax, DWORD PTR fs:xsave_mask@tpoff",
+        "mov edx, DWORD PTR fs:xsave_mask@tpoff+4",
+        "xrstor64 [r10]",
         // Restore guest context from ctx.
         "mov rsp, rdi",
         // Switch to the guest fsbase
@@ -1444,6 +1531,7 @@ unsafe extern "C" {
     fn syscall_callback() -> isize;
     fn exception_callback();
     fn interrupt_callback();
+    fn interrupt_callback_no_xsave();
     fn switch_to_guest_start();
     fn switch_to_guest_end();
 }
@@ -2098,7 +2186,18 @@ unsafe fn interrupt_signal_handler(
         copy_signal_context(unsafe { &mut *regs }, context);
     }
     // Cases 3 and 4: jump to interrupt handler.
-    set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
+    set_signal_return(
+        context,
+        if in_switch_to_guest {
+            interrupt_callback_no_xsave
+        } else {
+            interrupt_callback
+        },
+        0,
+        0,
+        0,
+        0,
+    );
 }
 
 impl litebox::platform::CrngProvider for LinuxUserland {
@@ -2187,6 +2286,299 @@ mod tests {
     use crate::LinuxUserland;
 
     extern crate std;
+
+    #[test]
+    fn xsave_preserves_state_across_guest_transitions() {
+        use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
+        use litebox_common_linux::PtRegs;
+        use std::cell::Cell;
+        use zerocopy::IntoBytes as _;
+
+        const TEST_CW: u16 = 0x077e;
+        const TEST_MXCSR: u32 = 0x3f80;
+        const HOST_CW: u16 = 0x0b7f;
+        const HOST_MXCSR: u32 = 0x5f80;
+        const SNAPSHOT_SIZE: usize = 576;
+
+        #[unsafe(naked)]
+        unsafe extern "C" fn guest_entry() {
+            core::arch::naked_asm!(
+                // Preserve the snapshot buffer, AVX flag, interrupt signal,
+                // process ID, and thread ID in callee-saved registers.
+                "mov r12, rsi",
+                "mov r13, rdi",
+                "mov ebx, edx",
+                "mov r14, r8",
+                "mov r15, r9",
+                // Record the host controls observed before installing guest
+                // state. The assertions below verify their exact restoration.
+                "stmxcsr [r12 + 5*{snapshot_size}]",
+                "fnstcw [r12 + 5*{snapshot_size} + 4]",
+                // Install distinctive x87, SSE, and optional AVX guest state.
+                "sub rsp, 40",
+                "mov WORD PTR [rsp + 32], {control_word}",
+                "mov DWORD PTR [rsp + 36], {mxcsr}",
+                "mov rax, 0x5a5a5a5a5a5a5a5a",
+                "mov [rsp], rax",
+                "mov [rsp + 8], rax",
+                "mov [rsp + 16], rax",
+                "mov [rsp + 24], rax",
+                "fldcw [rsp + 32]",
+                "ldmxcsr [rsp + 36]",
+                "movdqu xmm0, [rsp]",
+                "test r13, r13",  // Whether support for AVX is enabled
+                "jz 2f",
+                "vmovdqu ymm0, [rsp]",
+                "2:",
+                "fldz",
+                "fldz",
+                "fdivp st(1), st(0)",
+                "add rsp, 40",
+                // Syscall transition: the shim clobbers host FP state before
+                // resuming at label 3. Capture snapshot 0 after restoration.
+                "lea rcx, [rip + 3f]",
+                "jmp {syscall_callback}",
+                "3:",
+                "fxsave64 [r12]",
+                "test r13, r13",
+                "jz 4f",
+                "vmovdqu [r12 + 512], ymm0",
+                "4:",
+                // Exception transition: UD2 enters the exception callback,
+                // which advances RIP. Capture snapshot 1 after resumption.
+                "ud2",
+                "fxsave64 [r12 + {snapshot_size}]",
+                "test r13, r13",
+                "jz 5f",
+                "vmovdqu [r12 + {snapshot_size} + 512], ymm0",
+                "5:",
+                // Interrupt transition: signal this guest thread directly and
+                // capture snapshot 2 after the interrupt callback resumes it.
+                "mov rdi, r14",
+                "mov rsi, r15",
+                "mov edx, ebx",
+                "mov eax, {tgkill}",
+                "syscall",
+                "fxsave64 [r12 + 2*{snapshot_size}]",
+                "test r13, r13",  // Whether support for AVX is enabled
+                "jz 6f",
+                "vmovdqu [r12 + 2*{snapshot_size} + 512], ymm0",
+                "6:",
+                // The shim terminates on this second syscall. reenter_thread
+                // resumes at label 7; snapshot 3 verifies persisted XSTATE.
+                "lea rcx, [rip + 7f]",
+                "jmp {syscall_callback}",
+                "7:",
+                "fxsave64 [r12 + 3*{snapshot_size}]",
+                "test r13, r13",
+                "jz 8f",
+                "vmovdqu [r12 + 3*{snapshot_size} + 512], ymm0",
+                "8:",
+                // Replace the guest state, cross another syscall, and capture
+                // snapshot 4 to prove the newly saved state supersedes it.
+                "fninit",
+                "pxor xmm0, xmm0",
+                "test r13, r13",
+                "jz 9f",
+                "vzeroall",
+                "9:",
+                "lea rcx, [rip + 10f]",
+                "jmp {syscall_callback}",
+                "10:",
+                "fxsave64 [r12 + 4*{snapshot_size}]",
+                "test r13, r13",
+                "jz 11f",
+                "vmovdqu [r12 + 4*{snapshot_size} + 512], ymm0",
+                "11:",
+                // The fourth syscall terminates the test. UD2 is unreachable
+                // and prevents accidental fallthrough if it unexpectedly resumes.
+                "lea rcx, [rip + 12f]",
+                "jmp {syscall_callback}",
+                "12:",
+                "ud2",
+                snapshot_size = const SNAPSHOT_SIZE,
+                control_word = const TEST_CW,
+                mxcsr = const TEST_MXCSR,
+                tgkill = const libc::SYS_tgkill,
+                syscall_callback = sym super::syscall_callback,
+            );
+        }
+
+        struct StateShim {
+            calls: Cell<usize>,
+            exceptions: Cell<usize>,
+            interrupts: Cell<usize>,
+            avx: bool,
+        }
+
+        impl StateShim {
+            fn clobber_host_state(&self) {
+                let mut control = 0_u16;
+                let status: u16;
+                let mut mxcsr = 0_u32;
+                // SAFETY: These instructions access only the current thread's FP
+                // registers and valid local outputs; AVX is checked before use.
+                unsafe {
+                    core::arch::asm!(
+                        "fnstcw [{control}]",
+                        "fnstsw ax",
+                        "stmxcsr [{mxcsr}]",
+                        control = in(reg) &raw mut control,
+                        mxcsr = in(reg) &raw mut mxcsr,
+                        lateout("ax") status,
+                        options(nostack, preserves_flags),
+                    );
+                }
+                assert_eq!(control, HOST_CW);
+                assert_eq!(status & 0x81, 0);
+                assert_eq!(mxcsr & !0x3f, HOST_MXCSR);
+                // SAFETY: The clobbers are declared and AVX support was detected.
+                unsafe {
+                    core::arch::asm!(
+                        "fninit",
+                        "pxor xmm0, xmm0",
+                        out("xmm0") _,
+                        options(nostack),
+                    );
+                    if self.avx {
+                        core::arch::asm!(
+                            "vpxor ymm0, ymm0, ymm0",
+                            out("ymm0") _,
+                            options(nostack),
+                        );
+                    }
+                }
+            }
+        }
+
+        impl EnterShim for StateShim {
+            type ExecutionContext = PtRegs;
+
+            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.clobber_host_state();
+                ContinueOperation::Resume
+            }
+
+            fn reenter(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.clobber_host_state();
+                ContinueOperation::Resume
+            }
+
+            fn syscall(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.clobber_host_state();
+                let call = self.calls.get() + 1;
+                self.calls.set(call);
+                if call == 2 || call == 4 {
+                    ContinueOperation::Terminate
+                } else {
+                    ContinueOperation::Resume
+                }
+            }
+
+            fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
+                self.clobber_host_state();
+                assert_eq!(info.exception, litebox::shim::Exception(6));
+                self.exceptions.set(self.exceptions.get() + 1);
+                ctx.rip += 2;
+                ContinueOperation::Resume
+            }
+
+            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
+                self.clobber_host_state();
+                self.interrupts.set(self.interrupts.get() + 1);
+                ContinueOperation::Resume
+            }
+        }
+
+        let mut original_control = 0_u16;
+        let mut original_mxcsr = 0_u32;
+        let host_control = HOST_CW;
+        let host_mxcsr = HOST_MXCSR;
+        // SAFETY: Save the test thread's controls and install masked,
+        // non-default rounding modes to verify exact host restoration.
+        unsafe {
+            core::arch::asm!(
+                "fnstcw [{original_control}]",
+                "stmxcsr [{original_mxcsr}]",
+                "fldcw [{host_control}]",
+                "ldmxcsr [{host_mxcsr}]",
+                original_control = in(reg) &raw mut original_control,
+                original_mxcsr = in(reg) &raw mut original_mxcsr,
+                host_control = in(reg) &raw const host_control,
+                host_mxcsr = in(reg) &raw const host_mxcsr,
+                options(nostack, preserves_flags),
+            );
+        }
+        let _restore_controls = litebox::utils::defer(|| unsafe {
+            core::arch::asm!(
+                "fnclex",
+                "fldcw [{original_control}]",
+                "ldmxcsr [{original_mxcsr}]",
+                original_control = in(reg) &raw const original_control,
+                original_mxcsr = in(reg) &raw const original_mxcsr,
+                options(nostack, preserves_flags),
+            );
+        });
+
+        let _platform = LinuxUserland::new(None);
+        let shim = StateShim {
+            calls: Cell::new(0),
+            exceptions: Cell::new(0),
+            interrupts: Cell::new(0),
+            avx: std::is_x86_feature_detected!("avx"),
+        };
+        let mut stack = [0_u128; 256];
+        let mut snapshots = [0_u128; (5 * SNAPSHOT_SIZE + 16) / 16];
+        let mut ctx = PtRegs {
+            rip: guest_entry as *const () as usize,
+            rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
+            rsi: snapshots.as_mut_ptr().addr(),
+            rdi: usize::from(shim.avx),
+            rdx: usize::try_from(super::INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed)).unwrap(),
+            // SAFETY: These calls only query the current process and thread IDs.
+            r8: usize::try_from(unsafe { libc::getpid() }).unwrap(),
+            r9: usize::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap(),
+            eflags: 0x202,
+            ..Default::default()
+        };
+        // SAFETY: The assembly guest uses a valid stack and output buffer and the
+        // shim terminates at known points, preserving a valid reentry context.
+        unsafe {
+            super::run_thread_ref(&shim, &mut ctx);
+            assert_eq!(shim.calls.get(), 2);
+            super::reenter_thread(&shim, &mut ctx);
+        }
+        assert_eq!(shim.calls.get(), 4);
+        assert_eq!(shim.exceptions.get(), 1);
+        assert_eq!(shim.interrupts.get(), 1);
+        let bytes = snapshots.as_bytes();
+        for index in 0..5 {
+            let snapshot = &bytes[index * SNAPSHOT_SIZE..][..SNAPSHOT_SIZE];
+            let expected_control = if index == 4 { 0x037f } else { TEST_CW };
+            let expected_status = if index == 4 { 0 } else { 0x81 };
+            let expected_vector = if index == 4 { 0 } else { 0x5a };
+            assert_eq!(
+                u16::from_le_bytes(snapshot[..2].try_into().unwrap()),
+                expected_control
+            );
+            assert_eq!(
+                u16::from_le_bytes(snapshot[2..4].try_into().unwrap()) & 0x81,
+                expected_status
+            );
+            assert_eq!(
+                u32::from_le_bytes(snapshot[24..28].try_into().unwrap()),
+                TEST_MXCSR
+            );
+            assert_eq!(&snapshot[160..176], &[expected_vector; 16]);
+            if shim.avx {
+                assert_eq!(&snapshot[512..544], &[expected_vector; 32]);
+            }
+        }
+        assert_eq!(
+            &bytes[5 * SNAPSHOT_SIZE..][..6],
+            &[0x80, 0x1f, 0, 0, 0x7f, 3]
+        );
+    }
 
     /// An interrupt pending at guest entry diverts to the interrupt handler
     /// without entering the guest, so a further interrupt taken while that

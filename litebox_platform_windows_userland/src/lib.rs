@@ -26,6 +26,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
+use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -444,175 +445,54 @@ fn debug_assert_host_fx_control_state() {
     }
 }
 
-const XSAVE_LEGACY_SIZE: usize =
-    size_of::<windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT>();
-const XSAVE_HEADER_OFFSET: usize = XSAVE_LEGACY_SIZE;
+const _: () = assert!(
+    size_of::<windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT>()
+        == size_of::<XsaveLegacyArea>()
+);
 
-#[repr(C, align(64))]
-#[derive(Clone)]
-struct XsaveChunk([u8; 64]);
-
-struct XsaveLayout {
-    size: usize,
-    mask: u64,
-    components: Vec<XsaveComponent>,
+fn xsave_layout() -> &'static XsaveLayout {
+    static LAYOUT: OnceLock<XsaveLayout> = OnceLock::new();
+    LAYOUT.get_or_init(XsaveLayout::detect)
 }
 
-struct XsaveComponent {
-    id: u32,
-    offset: usize,
-    size: usize,
-}
+fn restore_xsave_to_context(
+    xsave: &XsaveArea,
+    context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
+) {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CONTEXT_XSTATE_AMD64, LocateXStateFeature, SetXStateFeaturesMask,
+    };
 
-impl XsaveLayout {
-    fn get() -> &'static Self {
-        static LAYOUT: OnceLock<XsaveLayout> = OnceLock::new();
-        LAYOUT.get_or_init(|| {
-            const CPUID_XSAVE: u32 = 1 << 26;
-            const CPUID_OSXSAVE: u32 = 1 << 27;
-
-            assert!(core::arch::x86_64::__cpuid(0).eax >= 0x0d);
-            let feature_info = core::arch::x86_64::__cpuid(1);
-            assert_eq!(
-                feature_info.ecx & (CPUID_XSAVE | CPUID_OSXSAVE),
-                CPUID_XSAVE | CPUID_OSXSAVE,
-                "XSAVE must be supported and enabled by Windows",
-            );
-            let features = core::arch::x86_64::__cpuid_count(0x0d, 0);
-            let mask = unsafe { core::arch::x86_64::_xgetbv(0) };
-            assert_eq!(mask & 3, 3, "x87 and SSE state must be enabled");
-            assert!(features.ebx as usize >= XSAVE_HEADER_OFFSET + 64);
-            let components = (2..64)
-                .filter(|id| mask & (1 << id) != 0)
-                .map(|id| {
-                    let component = core::arch::x86_64::__cpuid_count(0x0d, id);
-                    let component = XsaveComponent {
-                        id,
-                        offset: component.ebx as usize,
-                        size: component.eax as usize,
-                    };
-                    assert!(component.offset + component.size <= features.ebx as usize);
-                    component
-                })
-                .collect();
-            XsaveLayout {
-                size: features.ebx as usize,
-                mask,
-                components,
-            }
-        })
+    let legacy_state = xsave.materialized_legacy_area();
+    context.MxCsr = legacy_state.mxcsr;
+    // SAFETY: XSAVE_FORMAT is Windows' representation of the architectural
+    // legacy area, and its size is checked above.
+    context.Anonymous.FltSave = unsafe { core::mem::transmute(legacy_state) };
+    if context.ContextFlags & CONTEXT_XSTATE_AMD64 != CONTEXT_XSTATE_AMD64 {
+        return;
     }
-}
 
-/// Represents the standard-layout XSAVE area for a guest context.
-struct XsaveArea {
-    storage: Box<[XsaveChunk]>,
-}
-
-impl XsaveArea {
-    const GUEST_INITIAL_X87_CONTROL_WORD: u16 = 0x037f;
-    const GUEST_INITIAL_MXCSR: u32 = core::arch::x86_64::_MM_MASK_MASK;
-
-    fn initial_guest() -> Self {
-        let chunk_count = XsaveLayout::get().size.div_ceil(size_of::<XsaveChunk>());
-        let mut area = Self {
-            storage: vec![XsaveChunk([0; 64]); chunk_count].into_boxed_slice(),
-        };
-        // SAFETY: The buffer owns aligned, initialized storage for the legacy area.
-        // Standard XRSTOR loads MXCSR even when XSTATE_BV marks SSE as initial.
+    let layout = xsave_layout();
+    let xstate_bv = xsave.xstate_bv();
+    for component in &layout.components {
+        if xstate_bv & (1 << component.id) == 0 {
+            continue;
+        }
+        let mut length = 0;
+        // SAFETY: The context has initialized XSTATE storage, checked above.
+        let destination =
+            unsafe { LocateXStateFeature(context, component.id, &raw mut length).cast::<u8>() };
+        assert!(!destination.is_null());
+        assert_eq!(length as usize, component.size);
+        // SAFETY: The component fits both disjoint buffers and is marked valid.
         unsafe {
-            (*area
-                .as_mut_ptr()
-                .cast::<windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT>())
-            .MxCsr = Self::GUEST_INITIAL_MXCSR;
-        }
-        area
-    }
-
-    fn as_ptr(&self) -> *const u8 {
-        self.storage.as_ptr().cast()
-    }
-
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.storage.as_mut_ptr().cast()
-    }
-
-    fn xstate_bv(&self) -> u64 {
-        unsafe {
-            self.as_ptr()
-                .add(XSAVE_HEADER_OFFSET)
-                .cast::<u64>()
-                .read_unaligned()
+            destination
+                .copy_from_nonoverlapping(xsave.as_ptr().add(component.offset), component.size);
         }
     }
-
-    fn restore_to_context(
-        &self,
-        context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
-    ) {
-        use windows_sys::Win32::System::Diagnostics::Debug::{
-            CONTEXT_XSTATE_AMD64, LocateXStateFeature, SetXStateFeaturesMask,
-        };
-
-        let legacy_state = self.legacy_state_for_context();
-        context.Anonymous.FltSave = legacy_state;
-        context.MxCsr = legacy_state.MxCsr;
-        if context.ContextFlags & CONTEXT_XSTATE_AMD64 != CONTEXT_XSTATE_AMD64 {
-            return;
-        }
-
-        let layout = XsaveLayout::get();
-        let xstate_bv = self.xstate_bv();
-        for component in &layout.components {
-            if xstate_bv & (1 << component.id) == 0 {
-                continue;
-            }
-            let mut length = 0;
-            // SAFETY: The context has initialized XSTATE storage, checked above.
-            let destination =
-                unsafe { LocateXStateFeature(context, component.id, &raw mut length).cast::<u8>() };
-            assert!(!destination.is_null());
-            assert_eq!(length as usize, component.size);
-            // SAFETY: The component fits both disjoint buffers and is marked valid.
-            unsafe {
-                destination
-                    .copy_from_nonoverlapping(self.as_ptr().add(component.offset), component.size);
-            }
-        }
-        // SAFETY: The context owns initialized XSTATE storage for the enabled features.
-        let ok = unsafe { SetXStateFeaturesMask(context, xstate_bv & layout.mask) };
-        assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
-    }
-
-    fn legacy_state_for_context(
-        &self,
-    ) -> windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT {
-        use windows_sys::Win32::System::Diagnostics::Debug::XSAVE_FORMAT;
-
-        let saved = unsafe { self.as_ptr().cast::<XSAVE_FORMAT>().read() };
-        let mut state = XSAVE_FORMAT {
-            ControlWord: Self::GUEST_INITIAL_X87_CONTROL_WORD,
-            MxCsr: saved.MxCsr,
-            MxCsr_Mask: saved.MxCsr_Mask,
-            ..Default::default()
-        };
-        let xstate_bv = self.xstate_bv();
-        if xstate_bv & 1 != 0 {
-            state.ControlWord = saved.ControlWord;
-            state.StatusWord = saved.StatusWord;
-            state.TagWord = saved.TagWord;
-            state.ErrorOpcode = saved.ErrorOpcode;
-            state.ErrorOffset = saved.ErrorOffset;
-            state.ErrorSelector = saved.ErrorSelector;
-            state.DataOffset = saved.DataOffset;
-            state.DataSelector = saved.DataSelector;
-            state.FloatRegisters = saved.FloatRegisters;
-        }
-        if xstate_bv & 2 != 0 {
-            state.XmmRegisters = saved.XmmRegisters;
-        }
-        state
-    }
+    // SAFETY: The context owns initialized XSTATE storage for the enabled features.
+    let ok = unsafe { SetXStateFeaturesMask(context, xstate_bv & layout.mask) };
+    assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
 }
 
 /// Represents an extended CPU context, including the XSAVE area.
@@ -660,7 +540,7 @@ impl ExtendedContext {
             )
         };
         assert_ne!(ok, 0, "InitializeContext failed");
-        let ok = unsafe { SetXStateFeaturesMask(context, XsaveLayout::get().mask) };
+        let ok = unsafe { SetXStateFeaturesMask(context, xsave_layout().mask) };
         assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
         Self {
             _storage: storage,
@@ -686,7 +566,7 @@ impl ExtendedContext {
         let context = self.context_mut();
         context.ContextFlags = CONTEXT_ALL_AMD64 | CONTEXT_XSTATE_AMD64;
         // SAFETY: The context retains its initialized extended storage across captures.
-        let ok = unsafe { SetXStateFeaturesMask(context, XsaveLayout::get().mask) };
+        let ok = unsafe { SetXStateFeaturesMask(context, xsave_layout().mask) };
         assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
         context
     }
@@ -725,7 +605,7 @@ struct TlsState {
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
     fn new() -> Self {
-        let mut guest_xsave_area = XsaveArea::initial_guest();
+        let mut guest_xsave_area = XsaveArea::initial(xsave_layout());
         let guest_xsave_ptr = guest_xsave_area.as_mut_ptr();
         Self {
             host_sp: Cell::new(core::ptr::null_mut()),
@@ -738,7 +618,7 @@ impl TlsState {
             interrupt_context: UnsafeCell::new(ExtendedContext::new()),
             guest_xsave_ptr: Cell::new(guest_xsave_ptr),
             guest_xsave_area: UnsafeCell::new(guest_xsave_area),
-            guest_xsave_mask: XsaveLayout::get().mask,
+            guest_xsave_mask: xsave_layout().mask,
             guest_xstate_format: Cell::new(GuestXstateFormat::Native),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
@@ -1083,7 +963,7 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
             win_ctx.R15 = ctx.r15 as u64;
             win_ctx.Rip = ctx.rip as u64;
             if native_xstate {
-                (*tls.guest_xsave_area.get()).restore_to_context(win_ctx);
+                restore_xsave_to_context(&*tls.guest_xsave_area.get(), win_ctx);
             }
         }
         tls.guest_xstate_format.set(GuestXstateFormat::Windows);
@@ -2096,7 +1976,7 @@ mod tests {
     use core::sync::atomic::AtomicU32;
     use std::thread::sleep;
 
-    use crate::{PAGE_SIZE, XsaveArea, XsaveLayout};
+    use crate::{PAGE_SIZE, WindowsXsaveArea as _, XsaveArea, xsave_layout};
     use litebox::platform::RawMutex;
 
     #[test]
@@ -2466,7 +2346,7 @@ mod tests {
                     u64::from_le_bytes([expected; 8])
                 );
                 if self.avx {
-                    let component = XsaveLayout::get()
+                    let component = xsave_layout()
                         .components
                         .iter()
                         .find(|component| component.id == 2)
