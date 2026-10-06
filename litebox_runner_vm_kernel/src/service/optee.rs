@@ -1,24 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! OP-TEE TAs in runner processes. From the payload: `runner.elf`,
-//! `ldelf.elf`, and `ta.elf` (rewritten or not).
-//!
-//! One TA instance at a time, in its own process: a new process once the
-//! instance ends. That is when its first open fails, when the TA panics, or
-//! when its last session closes (unless the TA is single-instance and
-//! keep-alive); the runner serves exactly one instance. Only the TA header is
-//! checked, not its signature, so a TA can claim any UUID and its derived
-//! keys.
+//! OP-TEE TAs in runner processes, one per TA instance, under [`TaManager`].
+//! From the payload: `runner.elf`, `ldelf.elf`, and TAs as `tas/<name>.elf`
+//! (rewritten or not). Only TA headers are checked, not signatures, so a TA
+//! can claim any UUID and its derived keys.
 
 use super::Service;
 use crate::payload::Payload;
-use litebox_broker_core::BrokerCore;
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use litebox_common_optee::TeeUuid;
 use litebox_common_optee::envelope::{LDELF_IMAGE, TA_IMAGE};
-use litebox_common_optee::{TeeOrigin, TeeResult, TeeUuid};
 use litebox_common_vm_abi::IDENTITY_LEN;
 use litebox_platform_vm_kernel::VmKernel;
-use litebox_shim_vm_kernel::optee::{self, Completion, EntryFunc, Invocation};
+use litebox_shim_vm_kernel::optee::Completion;
+use litebox_shim_vm_kernel::optee::Invocation;
+use litebox_shim_vm_kernel::optee::ta_manager::{InstancePolicy, TaManager};
 use litebox_shim_vm_kernel::{Process, ProcessConfig};
 use zerocopy::IntoBytes as _;
 
@@ -28,22 +26,10 @@ pub struct Request {
     pub invocation: Invocation,
 }
 
-pub struct Optee {
-    platform: &'static VmKernel,
-    broker_core: BrokerCore,
-    runner: &'static [u8],
-    images: [&'static [u8]; 2],
-    uuid: TeeUuid,
-    tsc_khz: u64,
-    keep_alive: bool,
-    instance: Option<Instance>,
-}
+type Spawn = Box<dyn FnMut(&TeeUuid) -> Result<Process, ()>>;
 
-struct Instance {
-    process: Process,
-    sessions: usize,
-    /// Whether an open has succeeded.
-    opened: bool,
+pub struct Optee {
+    manager: TaManager<Process, Spawn>,
 }
 
 impl Optee {
@@ -56,49 +42,69 @@ impl Optee {
                 .file(name)
                 .unwrap_or_else(|| panic!("payload has no {name}"))
         };
-        let ta = file("ta.elf");
-        let head = litebox_common_optee::parse_ta_head(ta).expect("malformed TA header");
-        let mut images = [&[][..]; 2];
-        images[LDELF_IMAGE] = file("ldelf.elf");
-        images[TA_IMAGE] = ta;
-        Self {
-            platform,
-            broker_core: crate::broker::core(),
-            runner: file("runner.elf"),
-            images,
-            uuid: head.uuid,
-            tsc_khz,
-            keep_alive: head.flags.is_single_instance() && head.flags.is_keep_alive(),
-            instance: None,
+        let (runner, ldelf) = (file("runner.elf"), file("ldelf.elf"));
+        let mut tas = BTreeMap::new();
+        let mut policies = alloc::vec::Vec::new();
+        for (name, image) in payload.files_under("tas/") {
+            let Some(name) = name.strip_suffix(".elf") else {
+                continue;
+            };
+            // Only the header is checked; signatures are not verified.
+            let head = litebox_common_optee::parse_ta_head(image)
+                .unwrap_or_else(|| panic!("malformed TA header: {name}"));
+            let uuid = head.uuid;
+            let policy = InstancePolicy {
+                single_instance: head.flags.is_single_instance(),
+                multi_session: head.flags.is_multi_session(),
+                keep_alive: head.flags.is_keep_alive(),
+            };
+            litebox_util_log::info!(name:% = name, policy:? = policy; "TA");
+            assert!(
+                tas.insert(uuid, image).is_none(),
+                "two TAs with UUID {uuid:?}"
+            );
+            policies.push((uuid, policy));
         }
+        assert!(!tas.is_empty(), "payload has no tas/<name>.elf");
+        let broker_core = crate::broker::core();
+        let spawn: Spawn = Box::new(move |uuid: &TeeUuid| {
+            let Some(ta) = tas.get(uuid) else {
+                litebox_util_log::error!(uuid:? = uuid; "no such TA");
+                return Err(());
+            };
+            let mut images = [&[][..]; 2];
+            images[LDELF_IMAGE] = ldelf;
+            images[TA_IMAGE] = ta;
+            let mut identity = [0u8; IDENTITY_LEN];
+            identity[..size_of::<TeeUuid>()].copy_from_slice(uuid.as_bytes());
+            let mut process = Process::spawn(
+                platform,
+                broker_core.clone(),
+                &ProcessConfig {
+                    runner,
+                    images: &images,
+                    identity,
+                    tsc_khz,
+                },
+            )
+            .map_err(|error| {
+                litebox_util_log::error!(error:? = error; "failed to spawn a TA instance");
+            })?;
+            process.start().map_err(|dead| {
+                litebox_util_log::error!(dead:? = dead; "TA instance died starting");
+            })?;
+            Ok(process)
+        });
+        let mut manager = TaManager::new(spawn);
+        for (uuid, policy) in policies {
+            manager.register(uuid, policy);
+        }
+        Self { manager }
     }
 
-    fn spawn(&self) -> Option<Process> {
-        let mut identity = [0u8; IDENTITY_LEN];
-        identity[..size_of::<TeeUuid>()].copy_from_slice(self.uuid.as_bytes());
-        let config = ProcessConfig {
-            runner: self.runner,
-            images: &self.images,
-            identity,
-            tsc_khz: self.tsc_khz,
-        };
-        let mut process = Process::spawn(self.platform, self.broker_core.clone(), &config)
-            .inspect_err(|e| litebox_util_log::warn!(error:% = e; "spawn"))
-            .ok()?;
-        process
-            .start()
-            .inspect_err(|dead| litebox_util_log::warn!(dead:? = dead; "the runner died starting"))
-            .ok()?;
-        Some(process)
-    }
-}
-
-fn tee_error(result: TeeResult) -> Completion {
-    Completion {
-        result: result.into(),
-        origin: *TeeOrigin::Tee.value(),
-        session: 0,
-        params: Default::default(),
+    /// Live TA instances, for tests.
+    pub fn instance_count(&self) -> usize {
+        self.manager.instance_count()
     }
 }
 
@@ -107,51 +113,6 @@ impl Service for Optee {
     type Reply = Completion;
 
     fn call(&mut self, request: Request) -> Completion {
-        let func = request.invocation.func;
-        if func == EntryFunc::OpenSession {
-            if request.ta != self.uuid {
-                return tee_error(TeeResult::ItemNotFound);
-            }
-            if self.instance.is_none() {
-                let Some(process) = self.spawn() else {
-                    return tee_error(TeeResult::GenericError);
-                };
-                self.instance = Some(Instance {
-                    process,
-                    sessions: 0,
-                    opened: false,
-                });
-            }
-        }
-        // Without an instance, every session is unknown.
-        let Some(instance) = self.instance.as_mut() else {
-            return tee_error(TeeResult::BadParameters);
-        };
-        let completion = match optee::call(&mut instance.process, request.invocation) {
-            Ok(completion) => completion,
-            Err(dead) => {
-                litebox_util_log::warn!(dead:? = dead; "the TA instance died");
-                self.instance = None;
-                return tee_error(TeeResult::TargetDead);
-            }
-        };
-        if completion.result == u32::from(TeeResult::TargetDead) {
-            self.instance = None;
-            return completion;
-        }
-        if completion.result == u32::from(TeeResult::Success) {
-            match func {
-                EntryFunc::OpenSession => {
-                    instance.sessions += 1;
-                    instance.opened = true;
-                }
-                EntryFunc::CloseSession => instance.sessions = instance.sessions.saturating_sub(1),
-                EntryFunc::InvokeCommand => {}
-            }
-        }
-        if instance.sessions == 0 && !(self.keep_alive && instance.opened) {
-            self.instance = None;
-        }
-        completion
+        self.manager.call(&request.ta, request.invocation)
     }
 }

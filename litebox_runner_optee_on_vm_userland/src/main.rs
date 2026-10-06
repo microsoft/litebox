@@ -3,7 +3,8 @@
 
 //! Serves one OP-TEE TA instance in ring 3 on the LiteBox VM kernel.
 //!
-//! - One instance per process; a second is refused.
+//! - The kernel runs one instance per process and ends the process when the
+//!   instance ends.
 //! - The TA and `ldelf` may be syscall-rewritten (syscalls are calls into the
 //!   shim) or unmodified (each `syscall` costs one kernel round trip).
 //! - Static PIE linked at 0 (`x86_64_vm_userland.ld`): the kernel loads it at

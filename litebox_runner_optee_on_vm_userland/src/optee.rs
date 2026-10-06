@@ -425,6 +425,7 @@ impl Runner {
             );
             token.disarm();
         }
+        // On failure, the kernel ends this process.
         reply
     }
 
@@ -549,12 +550,13 @@ impl Runner {
                     session_manager.evict_cached_instance(instance);
                 }
             }
-            // Closing always succeeds (GlobalPlatform).
-            reply = Some(error_reply(
-                TeeResult::Success,
-                TeeOrigin::TrustedApp,
-                session,
-            ));
+            // Closing always succeeds for the client (GlobalPlatform), but the
+            // kernel must learn of a death to end the instance.
+            reply = Some(if r.result == u32::from(TeeResult::TargetDead) {
+                r
+            } else {
+                error_reply(TeeResult::Success, TeeOrigin::TrustedApp, session)
+            });
             Ok(())
         });
         match (result, reply) {
@@ -641,6 +643,8 @@ impl Runner {
         // Safety: no other guest thread runs.
         unsafe { litebox_platform_vm_userland::thread::reenter_thread_ref(entrypoints, &mut ctx) };
         let result: u32 = ctx.rax.trunc();
+        // The shim reports a panic only as `TARGET_DEAD`, so one the TA returns
+        // itself is taken for a panic, as in the LVBS runner.
         let origin = if result == u32::from(TeeResult::TargetDead) {
             TeeOrigin::Tee
         } else {

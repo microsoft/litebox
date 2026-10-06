@@ -44,4 +44,14 @@ impl Payload {
     pub fn file(&self, name: &str) -> Option<&'static [u8]> {
         self.files.get(name).copied()
     }
+
+    /// Files whose names start with `prefix`, as (the rest of the name, data).
+    pub fn files_under<'a>(
+        &'a self,
+        prefix: &'a str,
+    ) -> impl Iterator<Item = (&'static str, &'static [u8])> + 'a {
+        self.files
+            .iter()
+            .filter_map(move |(name, data)| Some((name.strip_prefix(prefix)?, *data)))
+    }
 }
