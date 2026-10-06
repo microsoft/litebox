@@ -4296,11 +4296,12 @@ mod unix_tests {
         use litebox_common_linux::{IoReadVec, IoWriteVec};
 
         let task = init_platform();
+        // Non-blocking, so a split `readv` fails rather than waiting for another datagram.
         let (sender, receiver) = task
             .do_socketpair(
                 AddressFamily::UNIX,
                 SockType::Datagram,
-                SockFlags::empty(),
+                SockFlags::NONBLOCK,
                 0,
             )
             .unwrap();
