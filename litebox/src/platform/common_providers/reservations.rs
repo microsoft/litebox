@@ -159,15 +159,8 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
             })
     }
 
-    /// Round and reserve one currently unowned gap, or place one addressless hint.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a zero-address request does not use [`FixedAddressBehavior::Hint`].
-    ///
-    /// # Safety
-    ///
-    /// A nonzero `requested` range must be unowned. `placement` must not permit replacement.
+    /// Round and reserve one currently unowned gap, or allow platform to pick a suitable address
+    /// to reserve if the requested start address is zero.
     pub unsafe fn reserve_gap<Platform, const ALIGN: usize>(
         platform: &Platform,
         requested: Range<usize>,
@@ -184,16 +177,13 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
             .checked_next_multiple_of(alignment)
             .ok_or(AllocationError::OutOfMemory)?;
         let placement = if requested.start == 0 {
-            assert!(
-                matches!(placement, FixedAddressBehavior::Hint(_)),
-                "a zero-address reservation must be an addressless hint"
-            );
+            if !matches!(placement, FixedAddressBehavior::Hint(_)) {
+                return Err(AllocationError::UnsupportedByPlatform);
+            }
             placement
         } else {
             FixedAddressBehavior::NoReplace
         };
-        // SAFETY: Stored reservations use the same native rounding, so this rounded gap remains
-        // unowned. A zero-address hint permits relocation without replacement.
         unsafe { platform.reserve_pages(core::iter::empty, start..end, can_grow_down, placement) }
     }
 
@@ -207,10 +197,6 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
     ///
     /// Panics if `requested` starts at zero.
     /// Panics if the platform returns a reservation whose base is already tracked.
-    ///
-    /// # Safety
-    ///
-    /// `placement` must not permit replacement of existing reservations.
     pub unsafe fn reserve_gaps<Platform, const ALIGN: usize>(
         &mut self,
         platform: &Platform,
