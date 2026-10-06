@@ -889,6 +889,11 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
     }
 
+    /// Whether `fd` is a datagram (UDP) socket.
+    pub(super) fn is_datagram(&self, fd: &SocketFd<Platform>) -> Result<bool, Errno> {
+        Ok(matches!(*self.get_proxy(fd)?, NetworkProxy::Datagram(_)))
+    }
+
     pub(crate) fn get_proxy(
         &self,
         fd: &SocketFd<Platform>,
@@ -1394,25 +1399,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         )
     }
 
-    /// Whether `fd` is a datagram socket. Like Linux, sends on datagram sockets report `EPIPE`
-    /// without raising `SIGPIPE`.
-    pub(super) fn is_datagram_socket(&self, fd: &AnyTypedFd<Platform>) -> bool {
-        self.files
-            .borrow()
-            .with_typed_socket(
-                &self.global,
-                fd,
-                |fd| {
-                    Ok(!matches!(
-                        self.global.get_socket_type(fd)?,
-                        SockType::Stream
-                    ))
-                },
-                |file| Ok(!file.is_stream()),
-            )
-            .unwrap_or(false)
-    }
-
     /// Handle syscall `sendto`
     pub(crate) fn sys_sendto(
         &self,
@@ -1437,6 +1423,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
+        // Classify the socket while sending: a concurrent `close` would fail a later lookup.
+        let is_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1445,6 +1433,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                is_datagram.set(self.global.is_datagram(fd)?);
                 self.global
                     .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
             },
@@ -1453,13 +1442,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                is_datagram.set(!file.is_stream());
                 file.sendto(self, buf, flags, addr)
             },
         );
         // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !self.is_datagram_socket(socket)
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -1509,6 +1499,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EFAULT)?,
             )
         };
+        // Classify the socket while sending: a concurrent `close` would fail a later lookup.
+        let is_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1518,6 +1510,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
+                is_datagram.set(self.global.is_datagram(fd)?);
                 self.global
                     .sendto(&self.wait_cx(), fd, &data, flags, sock_addr)
             },
@@ -1527,13 +1520,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
+                is_datagram.set(!file.is_stream());
                 file.sendto(self, &data, flags, unix_addr)
             },
         );
         // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !self.is_datagram_socket(socket)
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -3056,7 +3050,13 @@ mod tests {
         );
         shutdown(&task, raw_udp, ShutdownHow::Write);
         assert_eq!(send_each_way(&task, raw_udp), [Err(Errno::EPIPE); 3]);
+        // The socket type is not per-descriptor state, so a duplicate is a datagram socket too.
+        let raw_dup = task
+            .sys_dup(i32::try_from(raw_udp).unwrap(), None, None)
+            .unwrap();
+        assert_eq!(send_each_way(&task, raw_dup), [Err(Errno::EPIPE); 3]);
         assert!(!task.pending_signal_set().contains(Signal::SIGPIPE));
+        close_socket(&task, raw_dup);
         close_socket(&task, raw_udp);
     }
 

@@ -446,9 +446,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         flags: super::ReceiveFlags,
         source_addr: Option<&mut Option<SocketAddr>>,
     ) -> Result<usize, ChannelReadError> {
-        // Load the flag before reading: the worker sets it only after queuing all data
-        // received before the peer's FIN.
+        // Load the flag and state before reading: the worker updates them only after queuing
+        // all data received before the connection was shut down or closed.
         let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
+        let state = self.inner.state();
 
         let mut rx_cons = self.inner.rx_cons.lock();
         let n = if flags.contains(super::ReceiveFlags::DISCARD) {
@@ -475,7 +476,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         if read_shutdown {
             return Err(ChannelReadError::ReadShutdown);
         }
-        match self.inner.state() {
+        match state {
             SocketState::Connected => Ok(0),
             SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
             _ => Err(ChannelReadError::NotConnected),

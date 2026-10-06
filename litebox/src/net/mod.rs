@@ -272,6 +272,15 @@ impl TcpServerSpecific {
     }
 }
 
+/// Whether a pending connection on a listening socket has completed its handshake and can be
+/// accepted. Like Linux, this includes connections that the peer has already half-closed.
+fn is_acceptable(socket: &tcp::Socket) -> bool {
+    matches!(
+        socket.state(),
+        tcp::State::Established | tcp::State::CloseWait
+    )
+}
+
 /// Socket-specific data for UDP sockets
 pub(crate) struct UdpSpecific {
     /// Remote endpoint
@@ -581,6 +590,13 @@ where
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
 
+                // Observe the handshake before sending a FIN below, which leaves `Established`.
+                // The peer may also have already sent its FIN.
+                if let tcp::State::Established | tcp::State::CloseWait = tcp_socket.state() {
+                    proxy.set_state(socket_channel::SocketState::Connected);
+                    proxy.clear_async_error();
+                }
+
                 // Drain TX buffer: from ring buffer directly to smoltcp
                 while tcp_socket.can_send() {
                     let sent = proxy
@@ -610,11 +626,6 @@ where
                     proxy.shutdown_read();
                 }
 
-                // The peer may have already sent its FIN by the time the handshake is observed.
-                if let tcp::State::Established | tcp::State::CloseWait = tcp_socket.state() {
-                    proxy.set_state(socket_channel::SocketState::Connected);
-                    proxy.clear_async_error();
-                }
                 let tcp_specific = socket_handle.specific.tcp();
                 // Update socket state in the channel
                 // server socket that is listening also has closed state
@@ -635,6 +646,10 @@ where
                         socket_channel::SocketState::Connected if tcp_socket.can_recv() => {
                             // smoltcp still holds data that did not fit in the channel. Fail
                             // writes now, but report the close only after that data is read.
+                            //
+                            // Known limitation: smoltcp discards this data when `TimeWait`
+                            // expires, so data still left unread then is lost and the
+                            // connection is reported as reset.
                             proxy.shutdown_write();
                         }
                         socket_channel::SocketState::Connected => {
@@ -656,10 +671,7 @@ where
                     server_socket
                         .socket_set_handles
                         .iter()
-                        .any(|&h| {
-                            let socket: &tcp::Socket = socket_set.get(h);
-                            socket.state() == tcp::State::Established
-                        })
+                        .any(|&h| is_acceptable(socket_set.get(h)))
                         .then(|| {
                             proxy.set_readable(true);
                             proxy.notify_io_event(Events::IN);
@@ -999,8 +1011,13 @@ where
             Protocol::Tcp => {
                 let check_state = |state: tcp::State| -> Result<(), ConnectError> {
                     match state {
-                        tcp::State::Established | tcp::State::CloseWait => {
-                            // already connected (the peer may have already sent its FIN)
+                        tcp::State::Established
+                        | tcp::State::CloseWait
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::LastAck => {
+                            // already connected (either side may have since shut down writes)
                             Ok(())
                         }
                         tcp::State::Closed | tcp::State::TimeWait => {
@@ -1353,12 +1370,12 @@ where
                     let socket: &tcp::Socket = self.socket_set.get(h);
                     socket.is_open()
                 });
-                // Find a socket that has progressed further in its TCP state machine, by finding a
-                // socket in an established state
-                let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
-                    let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() == tcp::State::Established
-                }) else {
+                // Find a socket that has completed its handshake
+                let Some(position) = server_socket
+                    .socket_set_handles
+                    .iter()
+                    .position(|&h| is_acceptable(self.socket_set.get(h)))
+                else {
                     if let Some(proxy) = &socket_handle.proxy {
                         // No connections are ready; make sure the readable flag is cleared
                         proxy.set_readable(false);
