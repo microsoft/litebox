@@ -59,7 +59,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         #[cfg(feature = "alarm_fallback")]
         self.check_alarm_deadline();
         self.check_for_child_terminations();
-        self.take_signals();
+        self.take_signals(false);
     }
 }
 

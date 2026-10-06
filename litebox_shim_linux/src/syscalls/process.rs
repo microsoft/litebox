@@ -679,25 +679,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
         );
     }
 
-    /// Queues the signals other processes sent, without waiting to be notified of them.
-    ///
-    /// Like Linux, a process that signals its own process group thus handles the signal before
-    /// `kill` returns.
-    pub(crate) fn take_signals_now(&self) {
-        self.take_signals_inner(true);
-    }
-
     /// Queues the signals other processes sent since signals were last taken.
+    ///
+    /// Unless `force` is set, this only takes signals after being notified of them. A forced take
+    /// does not wait for the notification, so, like Linux, a process that signals its own process
+    /// group handles the signal before `kill` returns.
     ///
     /// During a `vfork` window the signal state is the child's, so the parent takes the signals
     /// once it resumes.
-    pub(crate) fn take_signals(&self) {
-        self.take_signals_inner(false);
-    }
-
-    /// Queues the signals other processes sent, if notified of any since signals were last taken
-    /// or if `force` is set.
-    fn take_signals_inner(&self, force: bool) {
+    pub(crate) fn take_signals(&self, force: bool) {
         let process = &self.thread.process;
         if self.vfork.borrow().is_some() {
             return;
