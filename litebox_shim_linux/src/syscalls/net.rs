@@ -1599,44 +1599,27 @@ pub(crate) fn write_sockaddr_to_user<Platform: ShimPlatform>(
             size_of::<CSockInetAddr>()
         }
         SocketAddress::Unix(v) => {
-            let family_ptr = UserPtrMut::<u16>::from_usize(addr.as_usize());
-            family_ptr
-                .write_at_offset::<Platform>(0, AddressFamily::UNIX as u16)
-                .ok_or(Errno::EFAULT)?;
+            // Like Linux, copy the full address truncated to the caller's buffer, which may be
+            // too small even for the family.
+            let mut bytes = alloc::vec::Vec::new();
+            bytes.extend_from_slice(&(AddressFamily::UNIX as u16).to_ne_bytes());
             match v {
-                UnixSocketAddr::Unnamed => {
-                    // only write family
-                    size_of::<u16>()
-                }
+                UnixSocketAddr::Unnamed => {}
                 UnixSocketAddr::Abstract(name) => {
-                    let offset = offset_of!(CSockUnixAddr, path);
-                    if addrlen_val as usize > offset {
-                        addr.write_at_offset::<Platform>(isize::try_from(offset).unwrap(), 0)
-                            .ok_or(Errno::EFAULT)?;
-                        let max_len = addrlen_val as usize - offset - 1;
-                        addr.write_slice_at_offset::<Platform>(
-                            isize::try_from(offset + 1).unwrap(),
-                            &name[..name.len().min(max_len)],
-                        )
-                        .ok_or(Errno::EFAULT)?;
-                    }
-                    offset + 1 + name.len()
+                    bytes.push(0);
+                    bytes.extend_from_slice(&name);
                 }
                 UnixSocketAddr::Path(path) => {
-                    let offset = offset_of!(CSockUnixAddr, path);
-                    let max_len = addrlen_val as usize - offset;
-                    let name = &path.as_bytes()[..path.len().min(max_len)];
-                    addr.write_slice_at_offset::<Platform>(isize::try_from(offset).unwrap(), name)
-                        .ok_or(Errno::EFAULT)?;
-                    let null_offset = offset + name.len();
-                    // write null terminator if there is space
-                    if addrlen_val as usize > null_offset {
-                        addr.write_at_offset::<Platform>(isize::try_from(null_offset).unwrap(), 0)
-                            .ok_or(Errno::EFAULT)?;
-                    }
-                    offset + path.len() + 1
+                    bytes.extend_from_slice(path.as_bytes());
+                    bytes.push(0);
                 }
             }
+            let copied = bytes.len().min(addrlen_val as usize);
+            if copied != 0 {
+                addr.write_slice_at_offset::<Platform>(0, &bytes[..copied])
+                    .ok_or(Errno::EFAULT)?;
+            }
+            bytes.len()
         }
         SocketAddress::Inet(SocketAddr::V6(_)) => todo!("copy_sockaddr_to_user for IPv6"),
     }
@@ -4458,6 +4441,39 @@ mod unix_tests {
             close_socket(&task, sender);
             close_socket(&task, receiver);
         }
+    }
+
+    #[test]
+    fn unix_addresses_are_truncated_to_the_callers_buffer() {
+        let task = init_platform();
+        let path = "/unix_truncated_name.sock";
+        let raw_fd = create_unix_server_socket(
+            &task,
+            UnixSocketAddr::Path(path.to_string()),
+            SockFlags::empty(),
+        )
+        .unwrap();
+        let fd = i32::try_from(raw_fd).unwrap();
+        let mut expected = (AddressFamily::UNIX as u16).to_ne_bytes().to_vec();
+        expected.extend_from_slice(path.as_bytes());
+        expected.push(0);
+        let full_length = u32::try_from(expected.len()).unwrap();
+        for capacity in [0, 1, 3, full_length] {
+            let mut buffer = [0xff_u8; 64];
+            let mut length = capacity;
+            task.sys_getsockname(
+                fd,
+                UserPtrMut::from_ptr(buffer.as_mut_ptr()),
+                UserPtrMut::from_ptr(&raw mut length),
+            )
+            .unwrap();
+            assert_eq!(length, full_length);
+            let copied = capacity as usize;
+            assert_eq!(&buffer[..copied], &expected[..copied]);
+            assert!(buffer[copied..].iter().all(|&byte| byte == 0xff));
+        }
+        close_socket(&task, raw_fd);
+        task.sys_unlinkat(-1, path, AtFlags::empty()).unwrap();
     }
 
     #[test]
