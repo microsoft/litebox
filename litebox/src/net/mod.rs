@@ -1413,6 +1413,7 @@ where
     /// the write side is shut down is still sent, followed by a FIN for TCP. Shutting down the
     /// read side of a listening socket stops listening (pending connections are reset), and
     /// shutting down a TCP socket that is still connecting aborts the connection attempt.
+    /// An unconnected UDP socket is shut down too, even though `NotConnected` is returned.
     pub fn shutdown(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1452,10 +1453,12 @@ where
                 }
             }
             ProtocolSpecific::Udp(udp_specific) => {
+                // Like Linux, shut down even an unconnected socket (waking blocked receivers)
+                // before reporting that it is not connected.
+                proxy.shutdown(how);
                 if udp_specific.remote_endpoint.is_none() {
                     return Err(ShutdownError::NotConnected);
                 }
-                proxy.shutdown(how);
             }
             ProtocolSpecific::Icmp(_) | ProtocolSpecific::Raw(_) => unimplemented!(),
         }

@@ -2998,6 +2998,39 @@ mod tests {
         );
         close_socket(&task, raw_listener);
 
+        // Like Linux, an unconnected UDP socket is shut down even though `ENOTCONN` is reported,
+        // so receivers see end-of-file and sends fail.
+        let raw_udp = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .unwrap();
+        let udp = typed_socket(&task, raw_udp);
+        task.do_bind(&udp, inet_addr(TUN_IP_ADDR, SERVER_PORT))
+            .unwrap();
+        assert_eq!(
+            task.sys_shutdown(i32::try_from(raw_udp).unwrap(), ShutdownHow::Both as i32),
+            Err(Errno::ENOTCONN)
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            task.do_recvfrom(&udp, &mut buf, ReceiveFlags::empty(), None),
+            Ok(0)
+        );
+        assert_eq!(
+            task.do_sendto(
+                &udp,
+                b"x",
+                SendFlags::empty(),
+                Some(inet_addr([10, 0, 0, 1], SERVER_PORT))
+            ),
+            Err(Errno::EPIPE)
+        );
+        close_socket(&task, raw_udp);
+
         // A connected UDP socket reports end-of-file only to blocking receives, and fails sends
         // with `EPIPE` without raising `SIGPIPE`.
         let raw_udp = task
