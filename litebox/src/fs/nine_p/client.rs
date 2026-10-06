@@ -228,16 +228,12 @@ impl<Platform: RawSyncPrimitivesProvider, T: Read + Write> Client<Platform, T> {
         }
     }
 
-    #[allow(
-        deprecated,
-        reason = "use fetch_update rather than try_update until the LVBS and SNP toolchains are updated"
-    )]
     fn next_tag(&self) -> u16 {
         // NOTAG is reserved for Tversion/Rversion, so cycle through 1..NOTAG.
-        // `fetch_update` returns the value before the update, which is the tag
+        // `try_update` returns the value before the update, which is the tag
         // we want to use for this fcall.
         self.next_tag
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 debug_assert!(current != fcall::NOTAG);
                 Some(if current == fcall::NOTAG - 1 {
                     1
