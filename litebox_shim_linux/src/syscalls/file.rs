@@ -941,15 +941,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .entry_handle(fd)
                     .ok_or(Errno::EBADF)?;
                 handle.with_entry(|file| {
-                    let buf = &mut buf.borrow_mut();
-                    // A datagram longer than `buf` reports its full length.
                     file.recvfrom(
                         &self.wait_cx(),
-                        buf,
+                        &mut buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
                         None,
                     )
-                    .map(|size| size.min(buf.len()))
                 })
             },
             |fd| {
