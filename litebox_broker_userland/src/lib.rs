@@ -15,6 +15,8 @@
 //! mode.
 
 pub mod builder;
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+pub mod fs;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
 pub mod mapped_file;
 #[cfg(any(target_os = "linux", all(windows, target_arch = "x86_64")))]
