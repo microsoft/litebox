@@ -28,6 +28,11 @@ struct CliArgs {
     /// AArch64 ELF only: virtualize guest x18 on Linux (development/testing)
     #[arg(long)]
     virtualize_x18: bool,
+    /// x86-64 ELF only: keep syscalls that cannot be redirected instead of
+    /// failing. Only for kernels that reflect stray syscalls to the shim (the
+    /// LiteBox VM kernel); elsewhere they would reach the host kernel.
+    #[arg(long)]
+    keep_unpatchable: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -69,11 +74,30 @@ fn main() -> anyhow::Result<()> {
             litebox_syscall_rewriter::RewriteOptions::for_binary(&input_binary_bytes).target_host()
         }
     };
-    let output_binary = litebox_syscall_rewriter::rewrite_binary_with_options(
+    let unpatchable = if cli_args.keep_unpatchable {
+        litebox_syscall_rewriter::UnpatchableSyscalls::Keep
+    } else {
+        litebox_syscall_rewriter::UnpatchableSyscalls::Trap
+    };
+    let rewrite = litebox_syscall_rewriter::rewrite_binary_reporting(
         &input_binary_bytes,
         cli_args.trampoline_addr,
-        litebox_syscall_rewriter::RewriteOptions::new(host, cli_args.virtualize_x18),
+        litebox_syscall_rewriter::RewriteOptions::new(host, cli_args.virtualize_x18)
+            .with_unpatchable_syscalls(unpatchable),
     )?;
+    if !rewrite.kept_syscalls.is_empty() {
+        let addrs: Vec<String> = rewrite
+            .kept_syscalls
+            .iter()
+            .map(|addr| format!("{addr:#x}"))
+            .collect();
+        eprintln!(
+            "warning: kept {} unpatchable syscall(s) at [{}]",
+            addrs.len(),
+            addrs.join(", ")
+        );
+    }
+    let output_binary = rewrite.binary;
     let output_path = cli_args.output_binary.unwrap_or_else(|| {
         cli_args.input_binary.with_file_name(
             cli_args
@@ -105,6 +129,7 @@ mod tests {
         let help = error.to_string();
         assert!(help.contains("--target-host"));
         assert!(help.contains("--virtualize-x18"));
+        assert!(help.contains("--keep-unpatchable"));
         assert!(help.contains("development/testing"));
     }
 }
