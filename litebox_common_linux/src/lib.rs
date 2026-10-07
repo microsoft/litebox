@@ -1908,28 +1908,21 @@ pub enum SocketcallType {
     Sendmmsg = 20,
 }
 
-/// `how` argument to the `shutdown(2)` syscall.
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, IntEnum)]
-pub enum ShutdownHow {
-    /// `SHUT_RD`.
-    Read = 0,
-    /// `SHUT_WR`.
-    Write = 1,
-    /// `SHUT_RDWR`.
-    Both = 2,
-}
+/// `how` argument to the `shutdown(2)` syscall: disallow further receptions.
+pub const SHUT_RD: i32 = 0;
+/// `how` argument to the `shutdown(2)` syscall: disallow further transmissions.
+pub const SHUT_WR: i32 = 1;
+/// `how` argument to the `shutdown(2)` syscall: disallow further receptions and transmissions.
+pub const SHUT_RDWR: i32 = 2;
 
-impl ShutdownHow {
-    /// Returns `true` when this `how` disables the receive side (`SHUT_RD` or `SHUT_RDWR`).
-    #[must_use]
-    pub fn is_shutdown_read(self) -> bool {
-        matches!(self, Self::Read | Self::Both)
-    }
-    /// Returns `true` when this `how` disables the send side (`SHUT_WR` or `SHUT_RDWR`).
-    #[must_use]
-    pub fn is_shutdown_write(self) -> bool {
-        matches!(self, Self::Write | Self::Both)
+/// Decodes the `how` argument to the `shutdown(2)` syscall, returning `None` if it is invalid.
+#[must_use]
+pub fn shutdown_from_how(how: i32) -> Option<litebox::net::Shutdown> {
+    match how {
+        SHUT_RD => Some(litebox::net::Shutdown::Read),
+        SHUT_WR => Some(litebox::net::Shutdown::Write),
+        SHUT_RDWR => Some(litebox::net::Shutdown::Both),
+        _ => None,
     }
 }
 
