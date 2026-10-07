@@ -232,11 +232,6 @@ pub(crate) struct TcpSpecific {
     server_socket: Option<TcpServerSpecific>,
     /// Whether to immediately close the socket when closed (i.e., no graceful FIN handshake)
     immediate_close: AtomicBool,
-    /// Whether the peer's close, either its FIN or a reported reset, has been seen.
-    ///
-    /// smoltcp does not say whether a closed connection received the peer's FIN, so the
-    /// worker records it to tell a reset from a graceful close.
-    peer_closed: AtomicBool,
     /// Timestamp when `connect` was initiated
     connect_initiated_at_us: Option<smoltcp::time::Instant>,
 }
@@ -632,6 +627,9 @@ where
                 }
 
                 let tcp_specific = socket_handle.specific.tcp();
+                // Record the peer's FIN as soon as it is seen, so that poll reports it at once.
+                // This also tells a reset from a graceful close below, since smoltcp does not say
+                // whether a closed connection received the FIN.
                 if fin_received
                     || matches!(
                         tcp_socket.state(),
@@ -641,7 +639,7 @@ where
                             | tcp::State::TimeWait
                     )
                 {
-                    tcp_specific.peer_closed.store(true, Ordering::Relaxed);
+                    proxy.set_peer_closed();
                 }
 
                 // Update socket state in the channel
@@ -663,9 +661,8 @@ where
                         socket_channel::SocketState::Connected => {
                             // Without the peer's FIN, the connection was reset. Like Linux,
                             // report the reset at once, even if received data is still unread.
-                            if !tcp_specific.peer_closed.swap(true, Ordering::Relaxed) {
+                            if !proxy.is_peer_closed() {
                                 proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
-                                proxy.notify_io_event(Events::ERR);
                             }
                             if tcp_socket.can_recv() {
                                 // smoltcp still holds data that did not fit in the channel.
@@ -678,6 +675,7 @@ where
                             } else {
                                 proxy.set_state(socket_channel::SocketState::Closed);
                             }
+                            proxy.set_peer_closed();
                         }
                         _ => {
                             proxy.set_state(socket_channel::SocketState::Closed);
@@ -835,7 +833,6 @@ where
                     local_port: None,
                     server_socket: None,
                     immediate_close: AtomicBool::new(false),
-                    peer_closed: AtomicBool::new(false),
                     connect_initiated_at_us: None,
                 }),
                 Protocol::Udp => ProtocolSpecific::Udp(UdpSpecific {
@@ -1427,7 +1424,6 @@ where
                         local_port,
                         server_socket: None,
                         immediate_close: AtomicBool::new(false),
-                        peer_closed: AtomicBool::new(false),
                         connect_initiated_at_us: None,
                     }),
                     proxy: None,

@@ -356,6 +356,11 @@ struct StreamChannelInner<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     read_shutdown: AtomicBool,
     /// Whether the write side is shut down (`SHUT_WR`)
     write_shutdown: AtomicBool,
+    /// Whether the peer has closed the connection, by FIN or reset.
+    ///
+    /// Unlike `read_shutdown`, this is set as soon as the network worker sees the close, even
+    /// while data received before it is still waiting to be moved into the channel.
+    peer_closed: AtomicBool,
     /// Bytes available in RX buffer (for quick poll checks)
     rx_available: AtomicUsize,
     /// Space available in TX buffer (for quick poll checks)
@@ -386,6 +391,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamChannelInner<Plat
             state: AtomicU32::new(SocketState::Initial as u32),
             read_shutdown: AtomicBool::new(false),
             write_shutdown: AtomicBool::new(false),
+            peer_closed: AtomicBool::new(false),
             rx_available: AtomicUsize::new(0),
             tx_available: AtomicUsize::new(tx_capacity),
 
@@ -565,12 +571,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
         let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
         let write_shutdown = self.inner.write_shutdown.load(Ordering::Acquire);
         if read_shutdown {
-            events |= Events::IN | Events::RDHUP;
+            events |= Events::IN;
         }
         if write_shutdown {
             events |= Events::OUT;
         }
-        if read_shutdown && write_shutdown {
+        // The peer's close is reported even while data received before it is unread.
+        let read_closed = read_shutdown || self.inner.peer_closed.load(Ordering::Acquire);
+        if read_closed {
+            events |= Events::RDHUP;
+        }
+        if read_closed && write_shutdown {
             events |= Events::HUP;
         }
         // Like Linux, a pending socket error is reported until it is consumed.
@@ -717,6 +728,21 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Check if the write side has been shut down.
     pub(super) fn is_write_shutdown(&self) -> bool {
         self.inner.write_shutdown.load(Ordering::Acquire)
+    }
+
+    /// Check if the peer has closed the connection; see [`Self::set_peer_closed`].
+    pub(super) fn is_peer_closed(&self) -> bool {
+        self.inner.peer_closed.load(Ordering::Acquire)
+    }
+
+    /// Record that the peer has closed the connection, by FIN or reset.
+    ///
+    /// Like Linux, this is reported to poll at once, but reads still return the data received
+    /// before the close; see [`Self::shutdown_read`].
+    pub(super) fn set_peer_closed(&self) {
+        if !self.inner.peer_closed.swap(true, Ordering::AcqRel) {
+            self.inner.pollee.notify_observers(self.check_io_events());
+        }
     }
 
     /// Get the available space in the RX buffer.
