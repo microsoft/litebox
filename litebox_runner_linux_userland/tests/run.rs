@@ -1522,10 +1522,16 @@ fn run_test_broker_connection(
         litebox_broker_host::ConnectionTermination::PeerClosed
     );
     readiness.close();
-    publisher
+    // A readiness update queued after the runner closed fails with `BrokenPipe`;
+    // that is a clean close.
+    match publisher
         .join()
         .expect("broker readiness publisher panicked")
-        .expect("broker readiness publication failed");
+    {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("broker readiness publication failed: {error:?}"),
+    }
     association.finish();
     close_object_count_tx
         .send(close_object_count)
