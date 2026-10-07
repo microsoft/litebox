@@ -209,7 +209,7 @@ impl LinuxUserland {
         }
     }
 
-    fn guest_tls_mode(&self) -> GuestTlsMode {
+    fn guest_tls_mode() -> GuestTlsMode {
         match GUEST_TLS_MODE.load(Ordering::Relaxed) {
             mode if mode == GuestTlsMode::Linux as u8 => GuestTlsMode::Linux,
             mode if mode == GuestTlsMode::Windows as u8 => GuestTlsMode::Windows,
@@ -1539,7 +1539,7 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase
-                if self.guest_tls_mode() == GuestTlsMode::Linux =>
+                if Self::guest_tls_mode() == GuestTlsMode::Linux =>
             {
                 if litebox_common_linux::arch::is_valid_user_fs_base(val) {
                     // We swap gs and fs before and after a syscall, so while handling a guest
@@ -1557,7 +1557,7 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
                 Err(litebox::platform::ArchSpecificError::RegisterReserved)
             }
             litebox::platform::ArchSpecificRegister::GsBase => {
-                match self.guest_tls_mode() {
+                match Self::guest_tls_mode() {
                     GuestTlsMode::Windows => {
                         if litebox_common_linux::arch::is_valid_user_fs_base(val) {
                             // SAFETY: this platform requires FSGSBASE support.
@@ -1582,7 +1582,7 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
     ) -> Result<usize, litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase
-                if self.guest_tls_mode() == GuestTlsMode::Linux =>
+                if Self::guest_tls_mode() == GuestTlsMode::Linux =>
             {
                 Ok(get_guest_fsbase())
             }
@@ -1590,7 +1590,7 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
                 Err(litebox::platform::ArchSpecificError::RegisterReserved)
             }
             litebox::platform::ArchSpecificRegister::GsBase => {
-                match self.guest_tls_mode() {
+                match Self::guest_tls_mode() {
                     GuestTlsMode::Windows => {
                         // SAFETY: this platform requires FSGSBASE support.
                         Ok(unsafe { litebox_common_linux::rdgsbase() })
@@ -1899,7 +1899,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        match self.guest_tls_mode() {
+        match Self::guest_tls_mode() {
             GuestTlsMode::Windows => syscall_callback_guest_gs as *const () as usize,
             GuestTlsMode::Linux => syscall_callback as *const () as usize,
         }
