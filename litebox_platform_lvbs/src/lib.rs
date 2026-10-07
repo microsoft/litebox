@@ -86,6 +86,7 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //                         │ VA = PA + KERNEL_OFFSET         │
 //  0xFFFF_E200_0000_0000  ├─────────────────────────────────┤ ← KERNEL_OFFSET
 //                         │ guard gap (1 TiB)               │
+//  0xFFFF_E100_0000_0000  │  vault pages (vault PT only)    │ ← VAULT_BASE
 //  0xFFFF_E0FF_FFFF_F000  ├─────────────────────────────────┤ ← VMAP_END
 //                         │ vmap region (32 TiB)            │
 //                         │ non-contiguous PA→VA mappings   │
@@ -118,7 +119,8 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 //
 // The VTL1 kernel region at the top of the address space maps the
 // entire VTL1 kernel via PA + KERNEL_OFFSET. A 1 TiB guard gap
-// separates it from the vmap region.
+// separates it from the vmap region. A few vault pages sit in the gap, mapped
+// only in the vault page table (see `vault`).
 
 /// Offset added to any physical address to obtain the corresponding kernel
 /// virtual address in the high-canonical direct map.
@@ -1577,6 +1579,9 @@ macro_rules! CLEAR_CPU_BUFFERS_ASM {
         )
     };
 }
+
+// Declared after the asm macros above so that it can use them.
+pub(crate) mod vault;
 
 /// Save user context right after `syscall`-driven mode transition to the memory area
 /// pointed by the current stack pointer (`rsp`).

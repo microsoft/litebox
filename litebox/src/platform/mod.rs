@@ -636,6 +636,10 @@ pub trait DerivedKeyProvider {
     ///
     /// The `shim_kdf` is a `fn` not a `Fn`/`FnMut`/`FnOnce` in order to incentivize usage of pure
     /// functions.
+    ///
+    /// Platforms may run `shim_kdf` in a restricted context (e.g., a separate address space with
+    /// interrupts disabled), so it must be a pure computation over its arguments: no locks, no
+    /// allocation, and no access to other memory.
     fn derive_key<E>(
         &self,
         shim_kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,

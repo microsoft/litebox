@@ -111,9 +111,9 @@ impl litebox::platform::CrngProvider for LvbsLinuxKernel {
         let mut random = RANDOM.lock();
         random
             .get_or_insert_with(|| {
-                LvbsCrng::new(
-                    PRK_ONCE.get().expect("Platform root key not initialized"),
-                    rdrand_seed().expect("RDRAND unavailable during CRNG initialization"),
+                let rdrand = rdrand_seed().expect("RDRAND unavailable during CRNG initialization");
+                LvbsCrng::from_seed(
+                    crng_seed_in_vault(rdrand).expect("Platform root key not initialized"),
                 )
             })
             .fill_bytes(buf, rdrand_seed);
@@ -134,12 +134,9 @@ struct LvbsCrng {
 }
 
 impl LvbsCrng {
-    fn new(prk: &[u8; PRK_LEN], rdrand_seed: CrngSeed) -> Self {
+    fn from_seed(seed: CrngSeed) -> Self {
         Self {
-            random: rand_chacha::ChaCha20Rng::from_seed(crng_seed_from_prk_and_rdrand(
-                prk,
-                rdrand_seed,
-            )),
+            random: rand_chacha::ChaCha20Rng::from_seed(seed),
             bytes_until_reseed: CRNG_RESEED_INTERVAL_BYTES,
             reseed_counter: 0,
         }
@@ -175,23 +172,8 @@ impl LvbsCrng {
     }
 }
 
-static PRK_ONCE: spin::Once<[u8; PRK_LEN]> = spin::Once::new();
-
-// Do not expose a raw PRK getter (i.e., no `get_platform_root_key`).
-// Consumers should provide key derivation function and context
-// through `DerivedKeyProvider` so PRK access stays in this module.
-
-/// Sets the Platform Root Key (PRK) for this platform.
-///
-/// This should be called once during platform initialization with a key derived
-/// from hardware or a boot nonce.
-pub(crate) fn set_platform_root_key(key: &[u8; PRK_LEN]) {
-    PRK_ONCE.call_once(|| {
-        let mut prk = Zeroizing::new([0u8; PRK_LEN]);
-        prk.copy_from_slice(key);
-        *prk
-    });
-}
+// The PRK lives only in `crate::vault`. Never expose a raw PRK getter; use
+// `DerivedKeyProvider`.
 
 impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
     fn derive_key<E>(
@@ -199,14 +181,67 @@ impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
         kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
         params: litebox::platform::KDFParams,
     ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
-        let Some(prk) = PRK_ONCE.get() else {
-            return Err(litebox::platform::DerivedKeyError::UnsupportedRebootPersistentKey);
-        };
-        match kdf {
-            None => Err(litebox::platform::DerivedKeyError::ShimKDFRequired),
-            Some(kdf) => Ok(kdf(prk, params)?),
+        use litebox::platform::{DerivedKeyError, KDFParams};
+
+        struct Ctx<'a, E> {
+            kdf: fn(&[u8], KDFParams) -> Result<(), E>,
+            params: Option<KDFParams<'a>>,
+            result: Option<Result<(), E>>,
         }
+
+        if !crate::vault::is_installed() {
+            return Err(DerivedKeyError::UnsupportedRebootPersistentKey);
+        }
+        let Some(kdf) = kdf else {
+            return Err(DerivedKeyError::ShimKDFRequired);
+        };
+
+        // Bounce buffers the vault cannot reach through kernel heap memory.
+        let KDFParams { context, output } = params;
+        let context_copy;
+        let context = if crate::vault::is_accessible(context) {
+            context
+        } else {
+            context_copy = Zeroizing::new(context.to_vec());
+            context_copy.as_slice()
+        };
+        let mut output_copy = (!crate::vault::is_accessible(output))
+            .then(|| Zeroizing::new(::alloc::vec![0u8; output.len()]));
+
+        let mut ctx = Ctx {
+            kdf,
+            params: Some(KDFParams {
+                context,
+                output: match output_copy.as_mut() {
+                    Some(copy) => copy.as_mut_slice(),
+                    None => &mut *output,
+                },
+            }),
+            result: None,
+        };
+        crate::vault::with_prk(&mut ctx, |prk, ctx| {
+            if let Some(params) = ctx.params.take() {
+                // Safety: this callback runs inside the serialized vault window.
+                ctx.result = Some(unsafe { crate::vault::invoke_kdf(ctx.kdf, prk, params) });
+            }
+        })
+        .map_err(|_| DerivedKeyError::UnsupportedRebootPersistentKey)?;
+        ctx.result.expect("vault did not run the KDF")?;
+        if let Some(copy) = &output_copy {
+            output.copy_from_slice(copy);
+        }
+        Ok(())
     }
+}
+
+/// Derive the initial CRNG seed inside the vault.
+fn crng_seed_in_vault(rdrand: CrngSeed) -> Option<CrngSeed> {
+    let mut ctx = (rdrand, CrngSeed::default());
+    crate::vault::with_prk(&mut ctx, |prk, ctx| {
+        ctx.1 = crng_seed_from_prk_and_rdrand(prk, ctx.0);
+    })
+    .ok()?;
+    Some(ctx.1)
 }
 
 fn rdrand_seed() -> Option<CrngSeed> {
@@ -316,7 +351,7 @@ mod tests {
 
     #[test]
     fn crosses_reseed_boundary_twice_with_accurate_budget() {
-        let mut crng = LvbsCrng::new(&TEST_PRK, INIT_SEED);
+        let mut crng = LvbsCrng::from_seed(crng_seed_from_prk_and_rdrand(&TEST_PRK, INIT_SEED));
         let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES * 2 + 7];
         crng.fill_bytes(&mut buf, || Some(RESEED_SEED));
         assert_eq!(crng.reseed_counter, 2);
@@ -325,7 +360,7 @@ mod tests {
 
     #[test]
     fn rdrand_failure_engages_backoff_without_reseed() {
-        let mut crng = LvbsCrng::new(&TEST_PRK, INIT_SEED);
+        let mut crng = LvbsCrng::from_seed(crng_seed_from_prk_and_rdrand(&TEST_PRK, INIT_SEED));
         let mut buf = vec![0u8; CRNG_RESEED_INTERVAL_BYTES];
         crng.fill_bytes(&mut buf, || None);
         assert_eq!(crng.reseed_counter, 0);

@@ -32,7 +32,7 @@ raw-cpuid = "11.6.0"
 rand_chacha = { version = "0.3.1", default-features = false }
 rand_core = { version = "0.6.4", default-features = false }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
-zeroize = { version = "1.8", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = { version = "0.15.2", default-features = false, features = ["instructions"] }
