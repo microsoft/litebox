@@ -700,11 +700,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         0
                     };
                     let addr = relocation_offset.wrapping_add(layout.vaddr);
-                    if layout
-                        .size
-                        .checked_next_multiple_of(PAGE_SIZE)
-                        .and_then(|len| addr.checked_add(len))
-                        .is_none_or(|end| end > Platform::TASK_ADDR_MAX)
+                    if layout.vaddr >= Platform::TASK_ADDR_MAX
+                        || layout
+                            .size
+                            .checked_next_multiple_of(PAGE_SIZE)
+                            .and_then(|len| addr.checked_add(len))
+                            .is_none_or(|end| end > Platform::TASK_ADDR_MAX)
                     {
                         litebox_util_log::debug!(
                             relocation_offset:? = relocation_offset, layout:? = layout;
