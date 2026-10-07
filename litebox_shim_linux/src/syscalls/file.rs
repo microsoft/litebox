@@ -2701,9 +2701,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             unimplemented!("no sigmask support yet");
         }
         let timeout = timeout.read::<Platform>()?;
+        if nfds
+            > self
+                .process()
+                .limits
+                .get_rlimit_cur(litebox_common_linux::RlimitResource::NOFILE)
+        {
+            return Err(Errno::EINVAL);
+        }
         let nfds_signed = isize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
 
-        let mut set = super::epoll::PollSet::with_capacity(nfds);
+        let mut set = super::epoll::PollSet::with_capacity(nfds).ok_or(Errno::ENOMEM)?;
         for i in 0..nfds_signed {
             let fd = fds.read_at_offset::<Platform>(i).ok_or(Errno::EFAULT)?;
 
@@ -2763,7 +2771,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // `self.files.borrow().file_descriptors.read().len()` before `file_descriptors` was
         // removed to clean up the table handling.
         let file_table_len = usize::MAX;
-        let mut set = super::epoll::PollSet::with_capacity(nfds as usize);
+        let mut set = super::epoll::PollSet::with_capacity(nfds as usize).ok_or(Errno::ENOMEM)?;
         for i in 0..nfds {
             let mut events = litebox::event::Events::empty();
             if readfds.as_ref().is_some_and(|set| set[i as usize]) {

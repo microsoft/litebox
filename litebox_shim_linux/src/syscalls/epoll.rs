@@ -527,10 +527,10 @@ impl<Platform: ShimPlatform> Clone for PollEntryObserver<Platform> {
 
 impl<Platform: ShimPlatform> PollSet<Platform> {
     /// Returns a new empty `PollSet` with the given interest capacity.
-    pub fn with_capacity(capacity: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(capacity),
-        }
+    pub fn with_capacity(capacity: usize) -> Option<Self> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(capacity).ok()?;
+        Some(Self { entries })
     }
 
     /// Adds an fd to the poll set with the given event mask.
@@ -708,7 +708,7 @@ mod test {
     fn test_poll() {
         let task = crate::syscalls::tests::init_platform();
 
-        let mut set = super::PollSet::with_capacity(0);
+        let mut set = super::PollSet::with_capacity(0).unwrap();
         let (rfd_u, wfd_u) = task
             .sys_pipe2(litebox_common_linux::OFlags::empty())
             .expect("pipe2 failed");
