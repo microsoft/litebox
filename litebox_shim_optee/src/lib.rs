@@ -38,6 +38,8 @@ pub mod msg_handler;
 
 pub mod idk;
 
+pub(crate) mod keystack;
+
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 
@@ -1726,11 +1728,20 @@ mod test_utils {
     impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
         /// Make a new task with default values for testing.
         pub(crate) fn new_test_task(self: Arc<Self>) -> Task<Platform> {
+            self.new_test_task_with_uuid_and_svn(TeeUuid::default(), 0)
+        }
+
+        /// Make a new task with the provided TA UUID and SVN for testing.
+        pub(crate) fn new_test_task_with_uuid_and_svn(
+            self: Arc<Self>,
+            ta_app_id: TeeUuid,
+            ta_svn: u32,
+        ) -> Task<Platform> {
             Task {
                 global: self.clone(),
                 thread: ThreadState::new(),
-                ta_app_id: TeeUuid::default(),
-                ta_svn: 0,
+                ta_app_id,
+                ta_svn,
                 ta_digest: [0; TA_DIGEST_LEN],
                 ta_dynamic: false,
                 tee_cryp_state_map: TeeCrypStateMap::new(),
