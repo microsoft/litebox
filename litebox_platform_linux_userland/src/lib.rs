@@ -2479,6 +2479,10 @@ mod tests {
         const HOST_CW: u16 = 0x0b7f;
         const HOST_MXCSR: u32 = 0x5f80;
         const SNAPSHOT_COUNT: usize = 5;
+        const X87_STATUS_INVALID_OPERATION: u16 = 1 << 0;
+        const X87_STATUS_EXCEPTION_SUMMARY: u16 = 1 << 7;
+        const X87_INVALID_OPERATION_STATUS: u16 =
+            X87_STATUS_INVALID_OPERATION | X87_STATUS_EXCEPTION_SUMMARY;
 
         #[repr(C, align(64))]
         #[derive(Clone, Copy)]
@@ -2549,6 +2553,20 @@ mod tests {
                 "jz 4f",
                 "vmovdqu [r12 + 512], ymm0",
                 "4:",
+                // Install a state distinct from the preceding syscall so this
+                // snapshot proves the exception callback saved it.
+                "sub rsp, 32",
+                "mov rax, 0x6b6b6b6b6b6b6b6b",
+                "mov [rsp], rax",
+                "mov [rsp + 8], rax",
+                "mov [rsp + 16], rax",
+                "mov [rsp + 24], rax",
+                "movdqu xmm0, [rsp]",
+                "test r13, r13",
+                "jz 13f",
+                "vmovdqu ymm0, [rsp]",
+                "13:",
+                "add rsp, 32",
                 // Exception transition: UD2 enters the exception callback,
                 // which advances RIP. Capture snapshot 1 after resumption.
                 "ud2",
@@ -2557,6 +2575,20 @@ mod tests {
                 "jz 5f",
                 "vmovdqu [r12 + {snapshot_size} + 512], ymm0",
                 "5:",
+                // Install another distinct state so this snapshot proves the
+                // interrupt callback saved it rather than restoring snapshot 1.
+                "sub rsp, 32",
+                "mov rax, 0x7c7c7c7c7c7c7c7c",
+                "mov [rsp], rax",
+                "mov [rsp + 8], rax",
+                "mov [rsp + 16], rax",
+                "mov [rsp + 24], rax",
+                "movdqu xmm0, [rsp]",
+                "test r13, r13",
+                "jz 14f",
+                "vmovdqu ymm0, [rsp]",
+                "14:",
+                "add rsp, 32",
                 // Interrupt transition: signal this guest thread directly and
                 // capture snapshot 2 after the interrupt callback resumes it.
                 "mov rdi, r14",
@@ -2632,12 +2664,12 @@ mod tests {
                         "stmxcsr [{mxcsr}]",
                         control = in(reg) &raw mut control,
                         mxcsr = in(reg) &raw mut mxcsr,
-                        lateout("ax") status,
+                        out("ax") status,
                         options(nostack, preserves_flags),
                     );
                 }
                 assert_eq!(control, HOST_CW);
-                assert_eq!(status & 0x81, 0);
+                assert_eq!(status & X87_INVALID_OPERATION_STATUS, 0);
                 assert_eq!(mxcsr & !0x3f, HOST_MXCSR);
                 // SAFETY: The clobbers are declared and AVX support was detected.
                 unsafe {
@@ -2763,11 +2795,19 @@ mod tests {
         assert_eq!(shim.exceptions.get(), 1);
         assert_eq!(shim.interrupts.get(), 1);
         for (index, snapshot) in captures.snapshots.iter().enumerate() {
+            let (expected_status, expected_vector) = match index {
+                0 => (X87_INVALID_OPERATION_STATUS, 0x5a),
+                1 => (X87_INVALID_OPERATION_STATUS, 0x6b),
+                2 | 3 => (X87_INVALID_OPERATION_STATUS, 0x7c),
+                4 => (0, 0),
+                _ => unreachable!(),
+            };
             let expected_control = if index == 4 { 0x037f } else { TEST_CW };
-            let expected_status = if index == 4 { 0 } else { 0x81 };
-            let expected_vector = if index == 4 { 0 } else { 0x5a };
             assert_eq!(snapshot.legacy.control_word, expected_control);
-            assert_eq!(snapshot.legacy.status_word & 0x81, expected_status);
+            assert_eq!(
+                snapshot.legacy.status_word & X87_INVALID_OPERATION_STATUS,
+                expected_status
+            );
             assert_eq!(snapshot.legacy.mxcsr, TEST_MXCSR);
             assert_eq!(snapshot.legacy.xmm_registers[0], [expected_vector; 16]);
             if shim.avx {
