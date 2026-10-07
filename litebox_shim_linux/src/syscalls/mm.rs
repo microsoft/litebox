@@ -195,7 +195,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 // .text already contains JMPs to the trampoline address.
                 // Continuing would guarantee a SIGSEGV on the first
                 // rewritten syscall, so fail the mmap instead.
-                let _ = self.sys_munmap(result, len);
+                self.sys_munmap(result, len)?;
                 return Err(Errno::ENOMEM);
             }
         } else {
@@ -204,7 +204,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if self.try_init_elf_patch_state(&patch_key, result.as_usize(), offset)
                 == ElfPatchInit::Malformed
             {
-                let _ = self.sys_munmap(result, len);
+                self.sys_munmap(result, len)?;
                 return Err(Errno::ENOMEM);
             }
             // Track non-exec file mappings so we can patch them if they later
