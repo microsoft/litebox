@@ -1044,7 +1044,6 @@ impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<A
             dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
-        ensure_tls_index();
         let ctx = ctx.clone();
         // TODO: Inherit the calling guest's saved extended CPU state.
         // TODO: do we need to wait for the handle in the main thread?
