@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/microsoft/litebox"
+description = "Shared VSM/HEKI wire types and constants for the LiteBox LVBS platform, service, and runner"
 
 [dependencies]
 bitflags = "2.9.0"

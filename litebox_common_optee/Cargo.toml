@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/microsoft/litebox"
+description = "Common OP-TEE-related definitions shared across LiteBox shims, platforms, and runners"
 
 [dependencies]
 bitflags = "2.9.0"

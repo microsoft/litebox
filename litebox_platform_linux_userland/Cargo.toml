@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/microsoft/litebox"
+description = "A LiteBox platform for running LiteBox on userland Linux"
 
 [dependencies]
 arrayvec = { version = "0.7.6", default-features = false }

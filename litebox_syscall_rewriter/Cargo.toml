@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/microsoft/litebox"
+description = "Rewrite ELF files to hook syscalls for LiteBox"
 
 [features]
 default = ["std", "anyhow", "clap"]
