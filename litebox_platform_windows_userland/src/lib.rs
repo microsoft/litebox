@@ -397,7 +397,6 @@ fn ensure_tls_index() {
 /// Runs a guest thread using the provided shim and the given initial context.
 ///
 /// This will run until the thread terminates.
-/// Floating-point and extended CPU state start in architectural initial state.
 ///
 /// # Safety
 /// The context must be valid guest context.
@@ -510,62 +509,6 @@ fn restore_xsave_to_context(
     // SAFETY: The context owns initialized XSTATE storage for the enabled features.
     let ok = unsafe { SetXStateFeaturesMask(context, xstate_bv & layout.mask) };
     assert_ne!(ok, 0, "SetXStateFeaturesMask failed");
-}
-
-fn xsave_from_context(
-    context: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT,
-) -> XsaveArea {
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        CONTEXT_FLOATING_POINT_AMD64, CONTEXT_XSTATE_AMD64, GetXStateFeaturesMask,
-        LocateXStateFeature,
-    };
-
-    assert_eq!(
-        context.ContextFlags & CONTEXT_FLOATING_POINT_AMD64,
-        CONTEXT_FLOATING_POINT_AMD64,
-        "guest context must contain floating-point state",
-    );
-    let layout = XsaveLayout::get();
-    let mut xsave = XsaveArea::initial(layout);
-    // SAFETY: The context contains initialized floating-point state.
-    // XSAVE_FORMAT and XsaveLegacyArea represent the same architectural layout.
-    *xsave.legacy_area_mut() = unsafe {
-        core::ptr::from_ref(&context.Anonymous.FltSave)
-            .cast::<XsaveLegacyArea>()
-            .read_unaligned()
-    };
-    xsave.legacy_area_mut().mxcsr = context.MxCsr;
-    // Windows materializes the legacy state even when these components are initial.
-    xsave.header_mut().xstate_bv = 3;
-    if context.ContextFlags & CONTEXT_XSTATE_AMD64 != CONTEXT_XSTATE_AMD64 {
-        return xsave;
-    }
-
-    let mut mask = 0;
-    // SAFETY: The context retains its initialized extended storage.
-    let ok = unsafe { GetXStateFeaturesMask(context, &raw mut mask) };
-    assert_ne!(ok, 0, "GetXStateFeaturesMask failed");
-    let mask = mask & layout.mask & !3;
-    for component in &layout.components {
-        if mask & (1 << component.id) == 0 {
-            continue;
-        }
-        let mut length = 0;
-        // SAFETY: The context has initialized storage for the saved component.
-        let source =
-            unsafe { LocateXStateFeature(context, component.id, &raw mut length).cast::<u8>() };
-        assert!(!source.is_null());
-        assert_eq!(length as usize, component.size);
-        // SAFETY: The component fits both disjoint buffers and is marked valid.
-        unsafe {
-            xsave
-                .as_mut_ptr()
-                .add(component.offset)
-                .copy_from_nonoverlapping(source, component.size);
-        }
-    }
-    xsave.header_mut().xstate_bv |= mask;
-    xsave
 }
 
 /// Represents an extended CPU context, including the XSAVE area.
@@ -698,26 +641,6 @@ impl TlsState {
             guest_xstate_format: Cell::new(GuestXstateFormat::Native),
             pending_host_signals: AtomicU32::new(0),
             waiting_waker: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-        }
-    }
-
-    fn snapshot_guest_xstate(&self) -> XsaveArea {
-        assert!(
-            !self.is_in_guest.get(),
-            "guest state must be captured before cloning",
-        );
-        match self.guest_xstate_format.get() {
-            GuestXstateFormat::Native => {
-                // SAFETY: The current thread is in the shim, so capture has
-                // finished and no other code can modify the native guest area.
-                unsafe { (&*self.guest_xsave_area.get()).clone() }
-            }
-            GuestXstateFormat::Windows => {
-                // SAFETY: The current thread is in the shim, so its saved
-                // extended context is initialized and not concurrently accessed.
-                let context = unsafe { &*(*self.continue_context.get()).as_ptr() };
-                xsave_from_context(context)
-            }
         }
     }
 }
@@ -1129,8 +1052,6 @@ impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<A
     type ThreadSpawnError = std::io::Error;
     type ThreadHandle = ThreadHandle;
 
-    /// Inherits the calling guest's saved extended CPU state. Without a saved
-    /// guest context, the new thread starts in architectural initial state.
     unsafe fn spawn_thread(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1140,14 +1061,8 @@ impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<A
     ) -> Result<(), Self::ThreadSpawnError> {
         ensure_tls_index();
         let ctx = ctx.clone();
-        let guest_xstate = get_tls_ptr().map_or_else(
-            || XsaveArea::initial(XsaveLayout::get()),
-            |tls| {
-                // SAFETY: This is the calling thread's installed TLS, whose
-                // lifetime spans the active shim invocation.
-                unsafe { (&*tls).snapshot_guest_xstate() }
-            },
-        );
+        // TODO: Inherit the calling guest's saved extended CPU state.
+        let guest_xstate = XsaveArea::initial(XsaveLayout::get());
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = std::thread::Builder::new()
             .spawn(move || thread_start(init_thread, ctx, guest_xstate))?;
@@ -2087,266 +2002,6 @@ mod tests {
 
     use crate::{PAGE_SIZE, XsaveArea, XsaveLayout};
     use litebox::platform::RawMutex;
-
-    #[test]
-    fn guest_xstate_snapshots_cover_both_formats_and_initial_components() {
-        use crate::{GuestXstateFormat, TlsState, restore_xsave_to_context};
-
-        for initial in [false, true] {
-            let tls = TlsState::new();
-            // SAFETY: This test exclusively owns TLS and never runs guest code.
-            let native = unsafe { &mut *tls.guest_xsave_area.get() };
-            if !initial {
-                native.header_mut().xstate_bv = 3;
-                native.legacy_area_mut().control_word = 0x0b7f;
-                native.legacy_area_mut().mxcsr = 0x5f80;
-                native.legacy_area_mut().status_word = 0x3800;
-                native.legacy_area_mut().tag_word = 0x80;
-                native.legacy_area_mut().float_registers[0][..10]
-                    .copy_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f]);
-                native.legacy_area_mut().xmm_registers[0] = [0x5a; 16];
-                if let Some(avx) = XsaveLayout::get()
-                    .components
-                    .iter()
-                    .find(|component| component.id == 2)
-                {
-                    native.header_mut().xstate_bv |= 4;
-                    // SAFETY: The detected AVX component fits the owned save area.
-                    unsafe {
-                        native
-                            .as_mut_ptr()
-                            .add(avx.offset)
-                            .write_bytes(0x5a, avx.size);
-                    }
-                }
-            }
-            let native_address = native.as_ptr();
-            let saved = tls.snapshot_guest_xstate();
-            assert_ne!(saved.as_ptr(), native_address);
-
-            // SAFETY: The test exclusively owns both saved-state representations.
-            unsafe {
-                restore_xsave_to_context(&saved, (*tls.continue_context.get()).context_mut());
-                (*tls.guest_xsave_area.get()).reset_to_initial();
-            }
-            tls.guest_xstate_format.set(GuestXstateFormat::Windows);
-            let converted = tls.snapshot_guest_xstate();
-            let expected = saved.materialized_legacy_area();
-            let actual = converted.materialized_legacy_area();
-            assert_eq!(actual.control_word, expected.control_word);
-            assert_eq!(actual.mxcsr, expected.mxcsr);
-            assert_eq!(actual.status_word, expected.status_word);
-            assert_eq!(actual.tag_word, expected.tag_word);
-            assert_eq!(actual.float_registers, expected.float_registers);
-            assert_eq!(actual.xmm_registers, expected.xmm_registers);
-            assert_eq!(converted.xstate_bv() & !3, saved.xstate_bv() & !3);
-            for component in &XsaveLayout::get().components {
-                if saved.xstate_bv() & (1 << component.id) == 0 {
-                    continue;
-                }
-                // SAFETY: The active component fits both owned save areas.
-                let (actual, expected) = unsafe {
-                    (
-                        core::slice::from_raw_parts(
-                            converted.as_ptr().add(component.offset),
-                            component.size,
-                        ),
-                        core::slice::from_raw_parts(
-                            saved.as_ptr().add(component.offset),
-                            component.size,
-                        ),
-                    )
-                };
-                assert_eq!(actual, expected);
-            }
-        }
-    }
-
-    #[test]
-    fn spawned_guest_inherits_xstate_from_syscalls_and_exceptions() {
-        use litebox::platform::ThreadProvider as _;
-        use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo, InitThread};
-        use litebox_common_linux::PtRegs;
-        use std::sync::mpsc::{Sender, channel};
-        use zerocopy::IntoBytes as _;
-
-        const TEST_CW: u16 = 0x0b7f;
-        const TEST_MXCSR: u32 = 0x5f80;
-        const SNAPSHOT_SIZE: usize = 576;
-
-        #[unsafe(naked)]
-        unsafe extern "C" fn guest_entry() {
-            core::arch::naked_asm!(
-                "test rdi, rdi",
-                "jnz 4f",
-                "sub rsp, 40",
-                "mov WORD PTR [rsp + 32], {control_word}",
-                "mov DWORD PTR [rsp + 36], {mxcsr}",
-                "mov rax, 0x5a5a5a5a5a5a5a5a",
-                "mov [rsp], rax",
-                "mov [rsp + 8], rax",
-                "mov [rsp + 16], rax",
-                "mov [rsp + 24], rax",
-                "fldcw [rsp + 32]",
-                "ldmxcsr [rsp + 36]",
-                "fld1",
-                "movdqu xmm0, [rsp]",
-                "test r8, r8",
-                "jz 2f",
-                "vmovdqu ymm0, [rsp]",
-                "2:",
-                "add rsp, 40",
-                "test rdx, rdx",
-                "jz 3f",
-                "ud2",
-                "3:",
-                "lea rcx, [rip + 6f]",
-                "jmp {syscall_callback}",
-                "4:",
-                "fxsave64 [rsi]",
-                "test r8, r8",
-                "jz 5f",
-                "vmovdqu [rsi + 512], ymm0",
-                "5:",
-                "lea rcx, [rip + 6f]",
-                "jmp {syscall_callback}",
-                "6:",
-                "ud2",
-                control_word = const TEST_CW,
-                mxcsr = const TEST_MXCSR,
-                syscall_callback = sym crate::syscall_callback,
-            );
-        }
-
-        struct ChildStorage {
-            _stack: Box<[u128; 256]>,
-            snapshot: Box<[u128; SNAPSHOT_SIZE / 16]>,
-        }
-
-        struct Shim {
-            platform: &'static crate::WindowsUserland<PAGE_SIZE>,
-            sender: Sender<[u8; SNAPSHOT_SIZE]>,
-            child: Option<ChildStorage>,
-            exception_path: bool,
-            fast_entry: bool,
-        }
-
-        impl Shim {
-            fn spawn_child(&self, ctx: &PtRegs) {
-                // SAFETY: XMM0 is caller-saved and guest state is already captured.
-                unsafe {
-                    core::arch::asm!(
-                        "pxor xmm0, xmm0",
-                        out("xmm0") _,
-                        options(nostack),
-                    );
-                }
-                let mut stack = Box::new([0_u128; 256]);
-                let mut snapshot = Box::new([0_u128; SNAPSHOT_SIZE / 16]);
-                let mut child_ctx = ctx.clone();
-                child_ctx.rip = guest_entry as *const () as usize;
-                child_ctx.rcx = if self.fast_entry { child_ctx.rip } else { 0 };
-                child_ctx.rsp = stack.as_mut_ptr().wrapping_add(stack.len()).addr();
-                child_ctx.rdi = 1;
-                child_ctx.rsi = snapshot.as_mut_ptr().addr();
-                let child = Box::new(Shim {
-                    platform: self.platform,
-                    sender: self.sender.clone(),
-                    child: Some(ChildStorage {
-                        _stack: stack,
-                        snapshot,
-                    }),
-                    exception_path: false,
-                    fast_entry: self.fast_entry,
-                });
-                // SAFETY: The child owns its stack and aligned snapshot buffer,
-                // and terminates after capturing its inherited state.
-                unsafe { self.platform.spawn_thread(&child_ctx, child).unwrap() };
-            }
-        }
-
-        impl InitThread for Shim {
-            type ExecutionContext = PtRegs;
-
-            fn init(self: Box<Self>) -> Box<dyn EnterShim<ExecutionContext = PtRegs>> {
-                self
-            }
-        }
-
-        impl EnterShim for Shim {
-            type ExecutionContext = PtRegs;
-
-            fn init(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                ContinueOperation::Resume
-            }
-
-            fn syscall(&self, ctx: &mut PtRegs) -> ContinueOperation {
-                if let Some(child) = &self.child {
-                    self.sender
-                        .send(child.snapshot.as_bytes().try_into().unwrap())
-                        .unwrap();
-                } else {
-                    assert!(!self.exception_path);
-                    self.spawn_child(ctx);
-                }
-                ContinueOperation::Terminate
-            }
-
-            fn exception(&self, ctx: &mut PtRegs, info: &ExceptionInfo) -> ContinueOperation {
-                assert!(self.exception_path && self.child.is_none());
-                assert_eq!(info.exception, Exception::INVALID_OPCODE);
-                self.spawn_child(ctx);
-                ContinueOperation::Terminate
-            }
-
-            fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-                ContinueOperation::Resume
-            }
-        }
-
-        let platform = crate::WindowsUserland::<PAGE_SIZE>::new();
-        let avx = std::is_x86_feature_detected!("avx");
-        for exception_path in [false, true] {
-            for fast_entry in [false, true] {
-                let (sender, receiver) = channel();
-                let shim = Shim {
-                    platform,
-                    sender,
-                    child: None,
-                    exception_path,
-                    fast_entry,
-                };
-                let mut stack = [0_u128; 256];
-                let mut ctx = PtRegs {
-                    rip: guest_entry as *const () as usize,
-                    rsp: stack.as_mut_ptr().wrapping_add(stack.len()).addr(),
-                    rdx: usize::from(exception_path),
-                    r8: usize::from(avx),
-                    eflags: 0x202,
-                    ..Default::default()
-                };
-                // SAFETY: The parent has a valid stack and terminates after
-                // spawning the child, which owns all its guest buffers.
-                unsafe { crate::run_thread(shim, &mut ctx) };
-                let snapshot = receiver
-                    .recv_timeout(std::time::Duration::from_secs(5))
-                    .unwrap();
-                assert_eq!(
-                    u16::from_le_bytes(snapshot[..2].try_into().unwrap()),
-                    TEST_CW
-                );
-                assert_eq!(
-                    u32::from_le_bytes(snapshot[24..28].try_into().unwrap()),
-                    TEST_MXCSR
-                );
-                assert_eq!(&snapshot[32..42], &[0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0x3f]);
-                assert_eq!(&snapshot[160..176], &[0x5a; 16]);
-                if avx {
-                    assert_eq!(&snapshot[512..544], &[0x5a; 32]);
-                }
-            }
-        }
-    }
 
     #[test]
     fn interrupt_capture_preserves_xstate_on_reuse() {
