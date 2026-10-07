@@ -36,6 +36,7 @@ pub(super) fn run(
         .with_process_duplication_enabled(args.allow_process_duplication);
     let fs = super::create_file_service::<WindowsSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
+        &args.mounts,
         stdio,
     )?;
     let broker = BrokerCoreBuilder::new(policy)

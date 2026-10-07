@@ -55,6 +55,7 @@ pub(super) fn run(
         .with_process_duplication_enabled(args.allow_process_duplication);
     let fs = super::create_file_service::<LinuxSyncPrimitivesProvider>(
         args.fs_initial_files.as_deref(),
+        &args.mounts,
         stdio,
     )?;
     let build_broker = || BrokerCoreBuilder::new(policy).with_file_service(fs).build();
