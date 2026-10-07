@@ -13,7 +13,7 @@
 
 use std::cell::Cell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::time::Duration;
 use std::unimplemented;
 
@@ -151,11 +151,13 @@ pub enum GuestTlsMode {
     Windows = 2,
 }
 
+#[cfg(target_arch = "x86_64")]
 const GUEST_TLS_MODE_UNCONFIGURED: u8 = 0;
 
 #[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
-static GUEST_TLS_MODE: AtomicU8 = AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);
+static GUEST_TLS_MODE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(GUEST_TLS_MODE_UNCONFIGURED);
 
 impl core::fmt::Debug for LinuxUserland {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -194,6 +196,7 @@ impl LinuxUserland {
     /// # Panics
     ///
     /// Panics if a different mode has already been configured.
+    #[cfg(target_arch = "x86_64")]
     pub fn set_guest_tls_mode(&self, mode: GuestTlsMode) {
         let mode = mode as u8;
         if let Err(configured_mode) = GUEST_TLS_MODE.compare_exchange(
@@ -209,6 +212,7 @@ impl LinuxUserland {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn guest_tls_mode() -> GuestTlsMode {
         match GUEST_TLS_MODE.load(Ordering::Relaxed) {
             mode if mode == GuestTlsMode::Linux as u8 => GuestTlsMode::Linux,
@@ -1899,9 +1903,16 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        match Self::guest_tls_mode() {
-            GuestTlsMode::Windows => syscall_callback_guest_gs as *const () as usize,
-            GuestTlsMode::Linux => syscall_callback as *const () as usize,
+        #[cfg(target_arch = "x86_64")]
+        {
+            match Self::guest_tls_mode() {
+                GuestTlsMode::Windows => syscall_callback_guest_gs as *const () as usize,
+                GuestTlsMode::Linux => syscall_callback as *const () as usize,
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            syscall_callback as *const () as usize
         }
     }
 
