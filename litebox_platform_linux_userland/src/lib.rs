@@ -852,6 +852,30 @@ unsafe extern "C-unwind" fn run_thread_arch(
 ) {
     core::arch::naked_asm!(
     "
+    .macro restore_guest_context scratch
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rax
+    pop rcx
+    pop rdx
+    pop rsi
+    pop rdi
+    add rsp, 8       // skip orig_rax
+    pop \\scratch    // read rip into scratch
+    add rsp, 8       // skip cs
+    popfq
+    pop rsp
+    jmp \\scratch    // jump to the guest
+    .endm
+
     .cfi_startproc
     // Push all non-volatiles.
     push rbp
@@ -895,16 +919,19 @@ unsafe extern "C-unwind" fn run_thread_arch(
     // contain rflags if the syscall instruction had actually been issued).
     .globl syscall_callback
 syscall_callback:
-    // Restore host FS and save the Linux guest's FS.
+    // Clear in_guest flag. This must be the first instruction to match the
+    // expectations of `interrupt_signal_handler`.
     mov      BYTE PTR gs:in_guest@tpoff, 0
+
+    // Restore host fs base.
     rdfsbase r11
     mov      gs:guest_fsbase@tpoff, r11
     rdgsbase r11
     wrfsbase r11
     jmp .Lhost_tls_restored
 
-    .globl windows_syscall_callback
-windows_syscall_callback:
+    .globl syscall_callback_guest_gs
+syscall_callback_guest_gs:
     // Windows guests use GS, different from Linux hosts which use FS.
     // Thus no need to swap FS and GS like we do for Linux guests.
     mov      BYTE PTR fs:in_guest@tpoff, 0
@@ -1029,51 +1056,12 @@ unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
         // Linux guest: switch FS and use saved host FS through GS.
         "mov rdx, fs:guest_fsbase@tpoff",
         "wrfsbase rdx",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rax",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "add rsp, 8",           // skip orig_rax
-        "pop gs:scratch@tpoff", // read rip into scratch
-        "add rsp, 8",           // skip cs
-        "popfq",
-        "pop rsp",
-        "jmp gs:scratch@tpoff", // jump to the guest
+        "restore_guest_context gs:scratch@tpoff",
         "2:",
         // Windows guest: host FS and guest GS are already active.
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rax",
-        "pop rcx",
-        "pop rdx",
-        "pop rsi",
-        "pop rdi",
-        "add rsp, 8",
-        "pop fs:scratch@tpoff",
-        "add rsp, 8",
-        "popfq",
-        "pop rsp",
-        "jmp fs:scratch@tpoff",
+        "restore_guest_context fs:scratch@tpoff",
         "switch_to_guest_end:",
+        ".purgem restore_guest_context",
         WINDOWS_TLS_MODE = const GuestTlsMode::Windows as u8,
     );
 }
@@ -1550,13 +1538,23 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
         val: usize,
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
-            litebox::platform::ArchSpecificRegister::FsBase => {
+            litebox::platform::ArchSpecificRegister::FsBase
+                if self.guest_tls_mode() == GuestTlsMode::Linux =>
+            {
                 if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                    // We swap gs and fs before and after a syscall, so while handling a guest
+                    // syscall the guest's fs base is stored in the gs base register; the
+                    // per-thread `guest_fsbase` slot holds the value that will be programmed
+                    // into fs base on guest re-entry.
                     set_guest_fsbase(val);
                     Ok(())
                 } else {
                     Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
                 }
+            }
+            litebox::platform::ArchSpecificRegister::FsBase => {
+                // Windows guests leave host TLS active in FS.
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
             }
             litebox::platform::ArchSpecificRegister::GsBase => {
                 match self.guest_tls_mode() {
@@ -1583,7 +1581,14 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
         reg: &litebox::platform::ArchSpecificRegister,
     ) -> Result<usize, litebox::platform::ArchSpecificError> {
         match reg {
-            litebox::platform::ArchSpecificRegister::FsBase => Ok(get_guest_fsbase()),
+            litebox::platform::ArchSpecificRegister::FsBase
+                if self.guest_tls_mode() == GuestTlsMode::Linux =>
+            {
+                Ok(get_guest_fsbase())
+            }
+            litebox::platform::ArchSpecificRegister::FsBase => {
+                Err(litebox::platform::ArchSpecificError::RegisterReserved)
+            }
             litebox::platform::ArchSpecificRegister::GsBase => {
                 match self.guest_tls_mode() {
                     GuestTlsMode::Windows => {
@@ -1694,7 +1699,7 @@ fn futex_val2(
 unsafe extern "C" {
     fn syscall_callback() -> isize;
     #[cfg(target_arch = "x86_64")]
-    fn windows_syscall_callback() -> isize;
+    fn syscall_callback_guest_gs() -> isize;
     #[cfg(target_arch = "aarch64")]
     fn syscall_callback_in_guest_cleared();
     fn exception_callback();
@@ -1766,7 +1771,7 @@ fn in_syscall_callback_prologue(ip: usize) -> bool {
     {
         let start = match GUEST_TLS_MODE.load(Ordering::Relaxed) {
             mode if mode == GuestTlsMode::Windows as u8 => {
-                windows_syscall_callback as *const () as usize
+                syscall_callback_guest_gs as *const () as usize
             }
             _ => syscall_callback as *const () as usize,
         };
@@ -1895,7 +1900,7 @@ impl ThreadContext<'_> {
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
         match self.guest_tls_mode() {
-            GuestTlsMode::Windows => windows_syscall_callback as *const () as usize,
+            GuestTlsMode::Windows => syscall_callback_guest_gs as *const () as usize,
             GuestTlsMode::Linux => syscall_callback as *const () as usize,
         }
     }
