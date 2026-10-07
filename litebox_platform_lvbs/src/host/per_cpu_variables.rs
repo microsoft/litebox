@@ -250,6 +250,13 @@ impl PerCpuVariables {
         self.gdt.get().map(gdt::GdtWrapper::get_segment_selectors)
     }
 
+    /// Return the kernel data segment selector
+    pub(crate) fn get_kernel_data_selector(&self) -> Option<u16> {
+        self.gdt
+            .get()
+            .map(gdt::GdtWrapper::get_kernel_data_selector)
+    }
+
     /// Allocate XSAVE areas for saving/restoring the extended states of each core.
     /// These buffers are allocated once and never deallocated.
     ///
@@ -396,6 +403,9 @@ pub struct PerCpuVariablesAsm {
     /// handling its syscalls/exceptions. Analogous to
     /// `is_in_guest` on the userland platforms.
     is_in_user: Cell<u8>,
+    /// Selector used as the `verw` operand to clear CPU buffers right before
+    /// returning to user mode (see `arch::spec_ctrl`). 0 disables the clearing.
+    verw_sel: Cell<u16>,
 }
 
 impl PerCpuVariablesAsm {
@@ -436,6 +446,14 @@ impl PerCpuVariablesAsm {
     }
     pub fn set_vtl1_user_xsave_area_addr(&self, addr: usize) {
         self.vtl1_user_xsave_area_addr.set(addr);
+    }
+    /// Enable CPU buffer clearing on return to user mode with `sel` as the
+    /// `verw` operand (a writable data segment selector).
+    pub fn set_verw_sel(&self, sel: u16) {
+        self.verw_sel.set(sel);
+    }
+    pub const fn verw_sel_offset() -> usize {
+        offset_of!(PerCpuVariablesAsm, verw_sel)
     }
     pub fn set_vtl1_xsave_mask(&self, mask: u64) {
         self.vtl1_xsave_mask_lo.set((mask & 0xffff_ffff) as u32);

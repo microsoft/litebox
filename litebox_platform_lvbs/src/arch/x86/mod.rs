@@ -7,6 +7,7 @@ pub mod interrupts;
 pub mod ioport;
 pub mod mm;
 pub mod msr;
+pub mod spec_ctrl;
 pub mod timer;
 
 pub(crate) use x86_64::{
