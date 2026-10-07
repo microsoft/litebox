@@ -8,7 +8,7 @@
 use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_platform_lvbs::{
-    arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap},
+    arch::{enable_extended_states, enable_fsgsbase, enable_smep_smap, enable_umip},
     host::{
         bootparam::save_boot_info,
         per_cpu_variables::{
@@ -454,6 +454,7 @@ unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
     let platform = litebox_runner_lvbs::init(is_bsp);
 
     enable_smep_smap();
+    enable_umip(is_bsp);
 
     litebox_runner_lvbs::run(platform)
 }
