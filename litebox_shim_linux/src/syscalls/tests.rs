@@ -35,6 +35,8 @@ pub(crate) fn test_platform() -> &'static TestPlatform {
     static PLATFORM: std::sync::OnceLock<&'static TestPlatform> = std::sync::OnceLock::new();
     PLATFORM.get_or_init(|| {
         let platform = TestPlatform::new();
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        platform.set_guest_tls_mode(litebox_platform_linux_userland::GuestTlsMode::Linux);
         #[cfg(target_os = "windows")]
         TestPlatform::set_guest_tls_mode(litebox_platform_windows_userland::GuestTlsMode::Linux);
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

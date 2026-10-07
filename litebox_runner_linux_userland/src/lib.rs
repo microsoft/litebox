@@ -135,6 +135,8 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         })?;
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
+    #[cfg(target_arch = "x86_64")]
+    platform.set_guest_tls_mode(litebox_platform_linux_userland::GuestTlsMode::Linux);
 
     let mut broker_positional_io_fds = Vec::new();
     let mut broker_shutdown_fds = Vec::new();

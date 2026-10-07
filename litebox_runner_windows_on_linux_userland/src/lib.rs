@@ -10,7 +10,7 @@ extern crate alloc;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 use litebox_broker_local_userland as broker;
-use litebox_platform_linux_userland::LinuxUserland;
+use litebox_platform_linux_userland::{GuestTlsMode, LinuxUserland};
 use std::path::PathBuf;
 
 /// Run Windows PE programs with LiteBox on unmodified Linux.
@@ -76,6 +76,7 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
     }
 
     let platform = LinuxUserland::new();
+    platform.set_guest_tls_mode(GuestTlsMode::Windows);
     let control_socket = cli_args
         .broker_control_channel
         .as_deref()
