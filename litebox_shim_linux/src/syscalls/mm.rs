@@ -310,9 +310,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
+    ) -> Result<UserPtrMut<u8>, Errno> {
         let op = |_| Ok(0);
         self.do_mmap(suggested_addr, len, prot, flags, false, op)
+            .map_err(Errno::from)
     }
 
     fn do_mmap_file(
@@ -323,11 +324,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MapFlags,
         fd: i32,
         offset: usize,
-    ) -> Result<UserPtrMut<u8>, MappingError> {
+    ) -> Result<UserPtrMut<u8>, Errno> {
         let is_exec = prot.contains(ProtFlags::PROT_EXEC);
-        let typed_fd = self.typed_fd(fd).map_err(|_| MappingError::BadFD(fd))?;
+        let typed_fd = self.typed_fd(fd)?;
         let AnyTypedFd::Fs(file_fd) = &typed_fd else {
-            return Err(MappingError::BadFD(fd));
+            return Err(Errno::ENODEV);
         };
 
         let result =
@@ -353,8 +354,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             {
                 // Runtime patching, trampoline setup, or restoration of the
                 // requested permissions failed, so fail the mmap.
-                let _ = self.sys_munmap(result, len);
-                return Err(MappingError::OutOfMemory);
+                self.sys_munmap(result, len)?;
+                return Err(Errno::ENOMEM);
             }
         } else {
             // Ensure patch state is initialized for this fd (no-op if already done).
@@ -362,8 +363,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             if self.try_init_elf_patch_state(&patch_key, result.as_usize(), offset)
                 == ElfPatchInit::Malformed
             {
-                let _ = self.sys_munmap(result, len);
-                return Err(MappingError::OutOfMemory);
+                self.sys_munmap(result, len)?;
+                return Err(Errno::ENOMEM);
             }
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
@@ -501,7 +502,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
-        .map_err(Errno::from)
     }
 
     /// Handle syscall `munmap`
@@ -2360,6 +2360,29 @@ mod tests {
         );
         task.sys_munmap(addr, 0x1000).unwrap();
         task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn mmap_rejects_non_file_descriptor() {
+        let task = init_platform();
+        let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
+        let read_fd = i32::try_from(read_fd).unwrap();
+
+        assert_eq!(
+            task.sys_mmap(
+                0,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE,
+                read_fd,
+                0,
+            )
+            .unwrap_err(),
+            Errno::ENODEV
+        );
+
+        task.sys_close(read_fd).unwrap();
+        task.sys_close(i32::try_from(write_fd).unwrap()).unwrap();
     }
 
     #[test]
