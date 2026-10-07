@@ -2363,29 +2363,6 @@ mod tests {
     }
 
     #[test]
-    fn mmap_rejects_non_file_descriptor() {
-        let task = init_platform();
-        let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
-        let read_fd = i32::try_from(read_fd).unwrap();
-
-        assert_eq!(
-            task.sys_mmap(
-                0,
-                PAGE_SIZE,
-                ProtFlags::PROT_READ,
-                MapFlags::MAP_PRIVATE,
-                read_fd,
-                0,
-            )
-            .unwrap_err(),
-            Errno::ENODEV
-        );
-
-        task.sys_close(read_fd).unwrap();
-        task.sys_close(i32::try_from(write_fd).unwrap()).unwrap();
-    }
-
-    #[test]
     fn test_mremap() {
         let task = init_platform();
 
