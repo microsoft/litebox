@@ -798,7 +798,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         file_offset: usize,
     ) -> ElfPatchInit {
         // Quick check: skip if already initialized.
-        if self.global.elf_patch_cache.lock().contains_key(fd) {
+        let mut cache = self.global.elf_patch_cache.lock();
+        if cache.contains_key(fd) {
             return ElfPatchInit::Ready;
         }
 
@@ -856,7 +857,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let mut max_load_end: u64 = 0;
         let mut min_load_start: u64 = u64::MAX;
         let mut max_load_align: u64 = 0;
-        let mut base_addr: Option<usize> = None;
+        let mut relocation_offset: Option<usize> = None;
         for i in 0..e_phnum {
             let ph_bytes = &phdrs_buf[i * e_phentsize..][..e_phentsize];
             let Ok((ph, _)) = object::from_bytes::<ProgramHeader64<LittleEndian>>(ph_bytes) else {
@@ -882,27 +883,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             max_load_align = max_load_align.max(ph.p_align.get(ENDIAN));
             // Match segment by page-aligned file offset to derive the ET_DYN load base.
             if e_type == ET_DYN
-                && base_addr.is_none()
+                && relocation_offset.is_none()
                 && align_down(p_offset, PAGE_SIZE) == align_down(file_offset, PAGE_SIZE)
             {
-                #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-                {
-                    let Some(base) =
-                        mapped_addr.checked_sub(align_down(p_vaddr.trunc(), PAGE_SIZE))
-                    else {
-                        litebox_util_log::warn!(
-                            mapped_addr:? = mapped_addr, p_vaddr:? = p_vaddr;
-                            "mapped ELF address is below its page-aligned virtual address"
-                        );
-                        return ElfPatchInit::Untracked;
-                    };
-                    base_addr = Some(base);
-                }
-                #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-                {
-                    base_addr =
-                        Some(mapped_addr.wrapping_sub(align_down(p_vaddr.trunc(), PAGE_SIZE)));
-                }
+                relocation_offset =
+                    Some(mapped_addr.wrapping_sub(align_down(p_vaddr.trunc(), PAGE_SIZE)));
             }
         }
 
@@ -920,11 +905,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             Ok(layout) => layout,
         };
-        #[cfg(target_arch = "aarch64")]
-        let pre_patched = trampoline_layout.is_some();
 
         #[cfg(target_arch = "aarch64")]
-        let (code_metadata, trampoline_capacity) = if pre_patched {
+        let (code_metadata, trampoline_capacity) = if trampoline_layout.is_some() {
             (None, 0)
         } else {
             let scanned = self
@@ -992,7 +975,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Some(layout) if layout.size == 0 => (true, layout.file_offset, 0, 0),
                 Some(layout) => {
                     let base = if e_type == ET_DYN {
-                        let Some(base) = base_addr else {
+                        let Some(base) = relocation_offset else {
                             litebox_util_log::debug!(
                                 file_offset:? = file_offset, mapped_addr:? = mapped_addr;
                                 "pre-patched ET_DYN load base is unknown for this mapping"
@@ -1021,7 +1004,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 None => {
                     let base = if e_type == ET_DYN {
-                        base_addr.unwrap_or(mapped_addr)
+                        relocation_offset.unwrap_or(mapped_addr)
                     } else {
                         0
                     };
@@ -1051,11 +1034,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let max_load_end: usize = max_load_end.trunc();
         #[cfg(target_arch = "aarch64")]
         let load_span = if e_type == ET_DYN {
-            base_addr.and_then(|load_base| {
-                let start = load_base.checked_add(min_load_start)?;
+            relocation_offset.and_then(|relocation_offset| {
+                let start = relocation_offset.wrapping_add(min_load_start);
                 let end = max_load_end
                     .checked_next_multiple_of(PAGE_SIZE)
-                    .and_then(|end| load_base.checked_add(end))?;
+                    .map(|end| relocation_offset.wrapping_add(end))?;
                 Some(start..end)
             })
         } else {
@@ -1064,28 +1047,29 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .map(|end| min_load_start..end)
         };
 
-        // Insert under lock (re-check for races).
-        let mut cache = self.global.elf_patch_cache.lock();
-        cache.entry(fd.clone()).or_insert(ElfPatchState {
-            pre_patched,
-            trampoline_file_offset,
-            trampoline_file_size,
-            trampoline_addr,
-            #[cfg(target_arch = "aarch64")]
-            load_span,
-            trampoline_cursor: 0,
-            trampoline_mapped: false,
-            trampoline_mapped_len: 0,
-            runtime_patches_committed: false,
-            #[cfg(target_arch = "aarch64")]
-            trampoline_invalidated: false,
-            #[cfg(target_arch = "aarch64")]
-            code_metadata,
-            #[cfg(target_arch = "aarch64")]
-            trampoline_capacity,
-            file_mappings: BTreeSet::new(),
-            patched_ranges: BTreeSet::new(),
-        });
+        cache.insert(
+            fd.clone(),
+            ElfPatchState {
+                pre_patched,
+                trampoline_file_offset,
+                trampoline_file_size,
+                trampoline_addr,
+                #[cfg(target_arch = "aarch64")]
+                load_span,
+                trampoline_cursor: 0,
+                trampoline_mapped: false,
+                trampoline_mapped_len: 0,
+                runtime_patches_committed: false,
+                #[cfg(target_arch = "aarch64")]
+                trampoline_invalidated: false,
+                #[cfg(target_arch = "aarch64")]
+                code_metadata,
+                #[cfg(target_arch = "aarch64")]
+                trampoline_capacity,
+                file_mappings: BTreeSet::new(),
+                patched_ranges: BTreeSet::new(),
+            },
+        );
         ElfPatchInit::Ready
     }
 
