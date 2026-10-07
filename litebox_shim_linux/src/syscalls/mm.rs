@@ -684,6 +684,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     );
                     return ElfPatchInit::Malformed;
                 }
+                // Zero-sized trampoline
+                Ok(Some(layout)) if layout.size == 0 => (true, layout.file_offset, 0, 0),
                 Ok(Some(layout)) => {
                     let relocation_offset = if e_type == ET_DYN {
                         let Some(relocation_offset) = relocation_offset else {
@@ -698,18 +700,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         0
                     };
                     let addr = relocation_offset.wrapping_add(layout.vaddr);
-                    if !layout
+                    if layout
                         .size
                         .checked_next_multiple_of(PAGE_SIZE)
                         .and_then(|len| addr.checked_add(len))
-                        .is_some_and(|end| end <= Platform::TASK_ADDR_MAX)
+                        .is_none_or(|end| end > Platform::TASK_ADDR_MAX)
                     {
                         litebox_util_log::debug!(
                             relocation_offset:? = relocation_offset, layout:? = layout;
                             "pre-patched trampoline range is invalid"
                         );
                         return ElfPatchInit::Malformed;
-                    };
+                    }
                     (true, layout.file_offset, layout.size, addr)
                 }
                 Ok(None) => {
