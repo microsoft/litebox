@@ -3,8 +3,8 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox_platform_linux_userland::{GuestTlsMode, LinuxUserland as Platform};
 use litebox_platform_linux_userland::SeccompScope;
+use litebox_platform_linux_userland::{GuestTlsMode, LinuxUserland as Platform};
 use std::path::PathBuf;
 
 use litebox_broker_local_userland as broker;
