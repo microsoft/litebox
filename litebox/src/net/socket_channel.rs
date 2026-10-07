@@ -264,11 +264,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
 
     /// Shut down the read and/or write side of the socket.
     pub(super) fn shutdown(&self, how: super::Shutdown) {
-        let (read, write) = match how {
-            super::Shutdown::Read => (true, false),
-            super::Shutdown::Write => (false, true),
-            super::Shutdown::Both => (true, true),
-        };
+        let (read, write) = (how.is_shutdown_read(), how.is_shutdown_write());
         match self {
             NetworkProxy::Stream(channel) => {
                 if read {

@@ -1467,7 +1467,7 @@ where
                 server_socket: Some(server_socket),
                 ..
             }) if server_socket.backlog.is_some() => {
-                if how != Shutdown::Write {
+                if how.is_shutdown_read() {
                     for handle in server_socket.socket_set_handles.drain(..) {
                         self.socket_set.get_mut::<tcp::Socket>(handle).abort();
                         self.closing_in_background.push(handle);
@@ -1810,6 +1810,19 @@ pub enum Shutdown {
     Write,
     /// Further receptions and transmissions are disallowed (`SHUT_RDWR`).
     Both,
+}
+
+impl Shutdown {
+    /// Returns `true` when this disables the receive side (`Read` or `Both`).
+    #[must_use]
+    pub fn is_shutdown_read(self) -> bool {
+        matches!(self, Self::Read | Self::Both)
+    }
+    /// Returns `true` when this disables the send side (`Write` or `Both`).
+    #[must_use]
+    pub fn is_shutdown_write(self) -> bool {
+        matches!(self, Self::Write | Self::Both)
+    }
 }
 
 /// Socket options for TCP

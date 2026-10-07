@@ -18,7 +18,7 @@ use litebox::{
     },
     fs::OFlags,
     net::{
-        CloseBehavior, TcpOptionData,
+        CloseBehavior, Shutdown, TcpOptionData,
         errors::AcceptError,
         socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
@@ -26,9 +26,9 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, ShutdownHow,
-    SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr,
-    UserMsgHdr, errno::Errno, signal::Signal,
+    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
+    SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr, UserMsgHdr, errno::Errno,
+    shutdown_from_how, signal::Signal,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -709,12 +709,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
-    fn shutdown(&self, fd: &SocketFd<Platform>, how: ShutdownHow) -> Result<(), Errno> {
-        let how = match how {
-            ShutdownHow::Read => litebox::net::Shutdown::Read,
-            ShutdownHow::Write => litebox::net::Shutdown::Write,
-            ShutdownHow::Both => litebox::net::Shutdown::Both,
-        };
+    fn shutdown(&self, fd: &SocketFd<Platform>, how: Shutdown) -> Result<(), Errno> {
         self.net.lock().shutdown(fd, how).map_err(Errno::from)
     }
 
@@ -2069,11 +2064,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             &self.global,
             socket,
             |fd| {
-                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                let how = shutdown_from_how(how).ok_or(Errno::EINVAL)?;
                 self.global.shutdown(fd, how)
             },
             |file| {
-                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                let how = shutdown_from_how(how).ok_or(Errno::EINVAL)?;
                 file.shutdown(how);
                 Ok(())
             },
@@ -2939,8 +2934,8 @@ mod tests {
         ]
     }
 
-    fn shutdown(task: &TestTask, raw_fd: u32, how: litebox_common_linux::ShutdownHow) {
-        task.sys_shutdown(i32::try_from(raw_fd).unwrap(), how as i32)
+    fn shutdown(task: &TestTask, raw_fd: u32, how: i32) {
+        task.sys_shutdown(i32::try_from(raw_fd).unwrap(), how)
             .expect("shutdown failed");
     }
 
@@ -2953,7 +2948,7 @@ mod tests {
 
     #[test]
     fn test_inet_shutdown() {
-        use litebox_common_linux::{ShutdownHow, signal::Signal};
+        use litebox_common_linux::{SHUT_RD, SHUT_RDWR, SHUT_WR, signal::Signal};
 
         let task = init_platform(None);
 
@@ -2963,10 +2958,7 @@ mod tests {
                 .unwrap();
             let fd = i32::try_from(raw_fd).unwrap();
             assert_eq!(task.sys_shutdown(fd, 3), Err(Errno::EINVAL));
-            assert_eq!(
-                task.sys_shutdown(fd, ShutdownHow::Both as i32),
-                Err(Errno::ENOTCONN)
-            );
+            assert_eq!(task.sys_shutdown(fd, SHUT_RDWR), Err(Errno::ENOTCONN));
             close_socket(&task, raw_fd);
         }
 
@@ -2985,12 +2977,12 @@ mod tests {
         task.do_listen(&listener, 1).unwrap();
         let listener_fd = i32::try_from(raw_listener).unwrap();
         let accept = || task.sys_accept(listener_fd, None, None, SockFlags::empty());
-        shutdown(&task, raw_listener, ShutdownHow::Write);
+        shutdown(&task, raw_listener, SHUT_WR);
         assert_eq!(accept(), Err(Errno::EAGAIN));
-        shutdown(&task, raw_listener, ShutdownHow::Read);
+        shutdown(&task, raw_listener, SHUT_RD);
         assert_eq!(accept(), Err(Errno::EINVAL));
         assert_eq!(
-            task.sys_shutdown(listener_fd, ShutdownHow::Read as i32),
+            task.sys_shutdown(listener_fd, SHUT_RD),
             Err(Errno::ENOTCONN)
         );
         close_socket(&task, raw_listener);
@@ -3009,7 +3001,7 @@ mod tests {
         task.do_bind(&udp, inet_addr(TUN_IP_ADDR, SERVER_PORT))
             .unwrap();
         assert_eq!(
-            task.sys_shutdown(i32::try_from(raw_udp).unwrap(), ShutdownHow::Both as i32),
+            task.sys_shutdown(i32::try_from(raw_udp).unwrap(), SHUT_RDWR),
             Err(Errno::ENOTCONN)
         );
         let mut buf = [0u8; 8];
@@ -3041,7 +3033,7 @@ mod tests {
         let udp = typed_socket(&task, raw_udp);
         task.do_connect(&udp, inet_addr([10, 0, 0, 1], SERVER_PORT))
             .unwrap();
-        shutdown(&task, raw_udp, ShutdownHow::Read);
+        shutdown(&task, raw_udp, SHUT_RD);
         let mut buf = [0u8; 8];
         assert_eq!(
             task.do_recvfrom(&udp, &mut buf, ReceiveFlags::DONTWAIT, None),
@@ -3051,7 +3043,7 @@ mod tests {
             task.do_recvfrom(&udp, &mut buf, ReceiveFlags::empty(), None),
             Ok(0)
         );
-        shutdown(&task, raw_udp, ShutdownHow::Write);
+        shutdown(&task, raw_udp, SHUT_WR);
         assert_eq!(send_each_way(&task, raw_udp), [Err(Errno::EPIPE); 3]);
         // The socket type is not per-descriptor state, so a duplicate is a datagram socket too.
         let raw_dup = task
@@ -3065,7 +3057,7 @@ mod tests {
 
     #[test]
     fn test_tun_tcp_shutdown() {
-        use litebox_common_linux::{ShutdownHow, signal::Signal};
+        use litebox_common_linux::{SHUT_WR, signal::Signal};
         use std::io::BufRead as _;
 
         let task = init_platform(Some(TUN_DEVICE_NAME));
@@ -3141,7 +3133,7 @@ c.close()
         let (raw_fd1, fd1) = connect();
         task.do_sendto(&fd1, b"ping", SendFlags::empty(), None)
             .unwrap();
-        shutdown(&task, raw_fd1, ShutdownHow::Write);
+        shutdown(&task, raw_fd1, SHUT_WR);
         assert_eq!(recv_to_eof(&fd1), b"echo:ping");
         assert_eq!(get_so_error(&task, &fd1), 0);
 
@@ -3150,7 +3142,7 @@ c.close()
         assert_eq!(recv_to_eof(&fd2), b"hello");
         task.do_sendto(&fd2, b"world", SendFlags::empty(), None)
             .unwrap();
-        shutdown(&task, raw_fd2, ShutdownHow::Write);
+        shutdown(&task, raw_fd2, SHUT_WR);
         assert_eq!(recv_to_eof(&fd2), b"");
         let mut line = alloc::string::String::new();
         stdout.read_line(&mut line).unwrap();
@@ -3791,7 +3783,7 @@ mod unix_tests {
                 .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
                 .unwrap();
             let sender_fd = i32::try_from(sender).unwrap();
-            task.sys_shutdown(sender_fd, litebox_common_linux::ShutdownHow::Write as i32)
+            task.sys_shutdown(sender_fd, litebox_common_linux::SHUT_WR)
                 .unwrap();
             assert_eq!(task.sys_write(sender_fd, b"x", None), Err(Errno::EPIPE));
             let data = b"y";
