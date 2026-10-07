@@ -116,10 +116,10 @@ pub(super) fn restart_syscall(ctx: &mut PtRegs, syscall_instruction_len: usize) 
     ctx.pc = ctx.pc.wrapping_sub(syscall_instruction_len);
 }
 
-pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
-    let frame_addr = sp.wrapping_sub(core::mem::size_of::<SignalFrame>());
+pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> Option<usize> {
+    let frame_addr = sp.checked_sub(core::mem::size_of::<SignalFrame>())?;
     // Linux AArch64 signal entry requires a 16-byte-aligned stack pointer.
-    frame_addr & !15
+    Some(frame_addr & !15)
 }
 
 fn requested_restorer(action: &SigAction) -> Option<usize> {

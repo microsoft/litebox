@@ -884,7 +884,11 @@ where
         let aligned_len = len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
-        if addr.as_usize().checked_add(aligned_len).is_none() {
+        if addr
+            .as_usize()
+            .checked_add(aligned_len)
+            .is_none_or(|end| end > Platform::TASK_ADDR_MAX)
+        {
             return Err(Errno::EINVAL);
         }
 
@@ -912,6 +916,13 @@ where
         }
         if len == 0 {
             return Ok(());
+        }
+        if addr
+            .as_usize()
+            .checked_add(len)
+            .is_none_or(|end| end > Platform::TASK_ADDR_MAX)
+        {
+            return Err(Errno::ENOMEM);
         }
 
         let addr = addr.to_platform_ptr::<Platform>();
@@ -1001,9 +1012,13 @@ where
         let aligned_len = len
             .checked_next_multiple_of(PAGE_SIZE)
             .ok_or(Errno::EINVAL)?;
-        let Some(_end) = addr.as_usize().checked_add(aligned_len) else {
-            return Err(Errno::EINVAL);
-        };
+        let end = addr
+            .as_usize()
+            .checked_add(aligned_len)
+            .ok_or(Errno::EINVAL)?;
+        if end > Platform::TASK_ADDR_MAX {
+            return Err(Errno::ENOMEM);
+        }
 
         let addr = addr.to_platform_ptr::<Platform>();
         match advice {
