@@ -1468,28 +1468,30 @@ mod tests {
             );
             count += 1;
             let addr = {
-                use litebox::platform::{
-                    RawConstPointer as _,
-                    page_mgmt::{
-                        AllocationDirection, FixedAddressBehavior, MemoryRegionPermissions,
-                    },
+                use litebox::platform::page_mgmt::{
+                    AllocationDirection, FixedAddressBehavior, MemoryRegionPermissions,
+                    PageReservation as _,
                 };
 
                 let task_addr_min = <Platform as PageManagementProvider<4096>>::TASK_ADDR_MIN;
                 let reservation_alignment =
                     <Platform as PageManagementProvider<4096>>::RESERVATION_ALIGNMENT;
                 let suggested_start = task_addr_min + count * reservation_alignment;
-                let allocation = <Platform as PageManagementProvider<4096>>::allocate_pages(
-                    external_platform,
-                    suggested_start..suggested_start + 0x1000,
-                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                    false,
-                    false,
-                    FixedAddressBehavior::Hint(AllocationDirection::TopDown),
-                )
-                .unwrap()
-                .as_usize();
-                data.push(allocation);
+                // SAFETY: The hint is aligned and within task bounds; no mappings are replaced.
+                let reservation = unsafe {
+                    <Platform as PageManagementProvider<4096>>::reserve_and_commit_pages(
+                        external_platform,
+                        core::iter::empty,
+                        suggested_start..suggested_start + 0x1000,
+                        MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                        false,
+                        false,
+                        FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+                    )
+                }
+                .unwrap();
+                let allocation = reservation.range().start;
+                data.push(reservation);
                 allocation
             };
 
@@ -1540,16 +1542,6 @@ mod tests {
         task.sys_munmap(res, 0x1000).unwrap();
         task.sys_munmap(UserPtrMut::from_usize(addr - 0x1000), 0x1000)
             .unwrap();
-        for allocation in data {
-            // SAFETY: The page belongs to the external provider and has no outstanding references.
-            unsafe {
-                <Platform as PageManagementProvider<4096>>::release_pages(
-                    external_platform,
-                    allocation..allocation + 0x1000,
-                )
-                .unwrap();
-            }
-        }
     }
 
     #[test]

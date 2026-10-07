@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
-use core::ops::{Deref, Range};
+use core::ops::Deref;
 use litebox::{
     LiteBox,
     net::Network,
@@ -36,10 +36,7 @@ use litebox_common_linux::{
     errno::Errno,
     mm::VmemManager,
     user_pointers::{UserPtr, UserPtrMut},
-    vmem::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmFlags,
-        VmemUnmapError,
-    },
+    vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE},
 };
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
@@ -64,8 +61,6 @@ pub(crate) type LinuxFS<Platform> =
 
 pub(crate) type FileFd<Platform> = litebox::fd::TypedFd<LinuxFS<Platform>>;
 
-pub use litebox_common_linux::vmem::ShimReservations;
-
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written
@@ -75,8 +70,9 @@ pub trait ShimPlatform:
     + litebox::platform::TimeProvider
     + litebox::platform::PageManagementProvider<
         { PAGE_SIZE },
-        Reservations = ShimReservations<Self::Reservation>,
-    > + litebox_common_linux::vmem::VmemPageFaultHandler
+        Reservations = <Self as ShimPlatform>::VmemReservations,
+    >
+    + litebox_common_linux::vmem::VmemPageFaultHandler
     + litebox::platform::RawMutexProvider
     + litebox::sync::RawSyncPrimitivesProvider
     + litebox::platform::CrngProvider
@@ -88,19 +84,17 @@ pub trait ShimPlatform:
     + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
     + litebox::platform::IPInterfaceProvider
     + 'static
+    + Sized
 {
-    /// Opaque page-reservation ownership type supplied by the platform.
-    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
+    type VmemReservations: litebox_common_linux::vmem::LinuxReservationStore<Self, PAGE_SIZE>;
 }
 
-impl<T, Reservation> ShimPlatform for T
+impl<T> ShimPlatform for T
 where
     T: litebox::platform::RawPointerProvider
         + litebox::platform::TimeProvider
-        + litebox::platform::PageManagementProvider<
-            { PAGE_SIZE },
-            Reservations = ShimReservations<Reservation>,
-        > + litebox_common_linux::vmem::VmemPageFaultHandler
+        + litebox::platform::PageManagementProvider<{ PAGE_SIZE }>
+        + litebox_common_linux::vmem::VmemPageFaultHandler
         + litebox::platform::RawMutexProvider
         + litebox::sync::RawSyncPrimitivesProvider
         + litebox::platform::CrngProvider
@@ -111,10 +105,11 @@ where
         + litebox::platform::TimerProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::SignalProvider<Signal = litebox_common_linux::signal::Signal>
         + litebox::platform::IPInterfaceProvider
-        + 'static,
-    Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
+        + 'static
+        + Sized,
+    T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
 {
-    type Reservation = Reservation;
+    type VmemReservations = T::Reservations;
 }
 
 // Linux-specific memory manager state and behavior.
@@ -217,20 +212,16 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
         Ok(requested)
     }
 
-    /// Releases matching mappings and resets Linux program-break state.
+    /// Releases all mappings and resets Linux program-break state.
     ///
     /// # Safety
     ///
     /// The caller must ensure that the released regions are no longer used.
-    pub unsafe fn release_memory(
-        &self,
-        releasable: fn(Range<usize>, VmFlags) -> bool,
-    ) -> Result<(), VmemUnmapError> {
+    pub unsafe fn release_memory(&self) {
         let mut state = self.brk.lock();
-        unsafe { self.vmem.release_memory(releasable) }?;
+        unsafe { self.vmem.release_memory() };
         state.initial = 0;
         state.current = 0;
-        Ok(())
     }
 }
 

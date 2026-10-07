@@ -3,11 +3,14 @@
 
 //! Common virtual-address reservation stores.
 
-use core::ops::Range;
+use core::{marker::PhantomData, ops::Range};
 
 use alloc::{collections::BTreeMap, vec::Vec};
 
-use crate::platform::page_mgmt::{PageReservation, ReservationStore};
+use crate::platform::{
+    PageManagementProvider,
+    page_mgmt::{AllocationError, FixedAddressBehavior, PageReservation, ReservationStore},
+};
 
 /// Define an opaque page-reservation handle with a private constructor.
 #[macro_export]
@@ -29,6 +32,25 @@ macro_rules! define_page_reservation {
         impl<const ALIGN: usize> $crate::platform::page_mgmt::PageReservation for $name<ALIGN> {
             fn range(&self) -> ::core::ops::Range<usize> {
                 self.range.clone()
+            }
+
+            fn split(self, range: ::core::ops::Range<usize>) -> (Option<Self>, Self, Option<Self>) {
+                let extent = self.range;
+                assert!(
+                    extent.start <= range.start && range.end <= extent.end && !range.is_empty()
+                );
+                assert!(range.start.is_multiple_of(ALIGN) && range.end.is_multiple_of(ALIGN));
+                (
+                    (extent.start < range.start).then_some(Self {
+                        range: extent.start..range.start,
+                    }),
+                    Self {
+                        range: range.clone(),
+                    },
+                    (range.end < extent.end).then_some(Self {
+                        range: range.end..extent.end,
+                    }),
+                )
             }
         }
 
@@ -56,13 +78,11 @@ macro_rules! define_page_reservation {
 }
 
 /// Reservation store for page managers that do not retain reservation handles.
-pub struct NoTrackedReservations<const ALIGN: usize, Reservation>(
-    core::marker::PhantomData<Reservation>,
-);
+pub struct NoTrackedReservations<const ALIGN: usize, Reservation>(PhantomData<Reservation>);
 
 impl<const ALIGN: usize, Reservation> Default for NoTrackedReservations<ALIGN, Reservation> {
     fn default() -> Self {
-        Self(core::marker::PhantomData)
+        Self(PhantomData)
     }
 }
 
@@ -77,15 +97,13 @@ where
         &mut self,
         vmas: &rangemap::RangeMap<usize, V>,
         platform: &Platform,
-    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
-    where
+    ) where
         Platform: crate::platform::PageManagementProvider<PAGE_ALIGN, Reservations = Self>,
     {
         for (range, _) in vmas.iter() {
             // SAFETY: The caller relinquishes this provider-owned range without remaining users.
             let _ = unsafe { platform.release_pages(range.clone()) };
         }
-        Ok(())
     }
 
     fn insert(
@@ -103,11 +121,15 @@ where
     fn overlapping(
         &self,
         _range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Self::Reservation)> {
+    ) -> impl DoubleEndedIterator<Item = &Self::Reservation> {
         core::iter::empty()
     }
 
     fn take_overlapping(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
+        Vec::new()
+    }
+
+    fn take_replaced(&mut self, _range: Range<usize>) -> Vec<Self::Reservation> {
         Vec::new()
     }
 }
@@ -122,27 +144,89 @@ impl<Reservation> Default for TrackedReservations<Reservation> {
 }
 
 impl<Reservation: PageReservation> TrackedReservations<Reservation> {
-    /// Snapshot a range by reservation boundaries; `None` denotes an unreserved gap.
-    pub fn segments(&self, range: Range<usize>) -> Vec<(Range<usize>, Option<usize>)> {
-        let mut segments = Vec::new();
-        if range.is_empty() {
-            return segments;
-        }
+    fn gaps(&self, range: Range<usize>) -> impl Iterator<Item = Range<usize>> {
         let mut cursor = range.start;
-        for (base, reservation) in self.overlapping(range.clone()) {
-            let extent = reservation.range();
-            if cursor < extent.start {
-                segments.push((cursor..extent.start, None));
-                cursor = extent.start;
+        self.overlapping(range.clone())
+            .map(PageReservation::range)
+            .chain(core::iter::once(range.end..range.end))
+            .filter_map(move |extent| {
+                let start = cursor;
+                let end = extent.start.min(range.end);
+                cursor = cursor.max(extent.end.min(range.end));
+                (start < end).then_some(start..end)
+            })
+    }
+
+    /// Round and reserve one currently unowned gap, or allow platform to pick a suitable address
+    /// to reserve if the requested start address is zero.
+    pub fn reserve_gap<Platform, const ALIGN: usize>(
+        platform: &Platform,
+        requested: Range<usize>,
+        can_grow_down: bool,
+        placement: FixedAddressBehavior,
+    ) -> Result<Reservation, AllocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    {
+        let alignment = Platform::RESERVATION_ALIGNMENT;
+        let start = requested.start & !(alignment - 1);
+        let end = requested
+            .end
+            .checked_next_multiple_of(alignment)
+            .ok_or(AllocationError::OutOfMemory)?;
+        let placement = if requested.start == 0 {
+            if !matches!(placement, FixedAddressBehavior::Hint(_)) {
+                return Err(AllocationError::UnsupportedByPlatform);
             }
-            let end = extent.end.min(range.end);
-            segments.push((cursor..end, Some(base)));
-            cursor = end;
+            placement
+        } else {
+            FixedAddressBehavior::NoReplace
+        };
+        // SAFETY: only pass `Hint` and `NoReplace` to the platform.
+        unsafe { platform.reserve_pages(core::iter::empty, start..end, can_grow_down, placement) }
+    }
+
+    /// Reserve and track each unreserved gap within `requested`.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok` with a vector of starting addresses if all gaps were successfully reserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `requested` starts at zero.
+    /// Panics if the platform returns a reservation whose base is already tracked.
+    pub fn reserve_gaps<Platform, const ALIGN: usize>(
+        &mut self,
+        platform: &Platform,
+        requested: Range<usize>,
+        can_grow_down: bool,
+        placement: FixedAddressBehavior,
+    ) -> Result<Vec<usize>, AllocationError>
+    where
+        Platform: PageManagementProvider<ALIGN, Reservations = Self>,
+    {
+        assert_ne!(requested.start, 0, "reserve_gaps requires a concrete range");
+        let mut acquired = Vec::new();
+        for gap in self.gaps(requested) {
+            match Self::reserve_gap(platform, gap, can_grow_down, placement) {
+                Ok(reservation) => acquired.push(reservation),
+                Err(error) => {
+                    for reservation in acquired {
+                        // SAFETY: These unpublished reservations have no users.
+                        let _ = unsafe { platform.release_pages(reservation) };
+                    }
+                    return Err(error);
+                }
+            }
         }
-        if cursor < range.end {
-            segments.push((cursor..range.end, None));
+        let mut bases = Vec::new();
+        for reservation in acquired {
+            let base = reservation.range().start;
+            bases.push(base);
+            assert!(self.insert(base, reservation).is_none());
         }
-        segments
+        Ok(bases)
     }
 }
 
@@ -154,15 +238,13 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
         &mut self,
         _vmas: &rangemap::RangeMap<usize, V>,
         platform: &Platform,
-    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
-    where
+    ) where
         Platform: crate::platform::PageManagementProvider<ALIGN, Reservations = Self>,
     {
         for (_, reservation) in core::mem::take(&mut self.0) {
             // SAFETY: The caller relinquishes this reservation without remaining users.
             let _ = unsafe { platform.release_pages(reservation) };
         }
-        Ok(())
     }
 
     fn insert(&mut self, base: usize, reservation: Reservation) -> Option<Reservation> {
@@ -178,10 +260,7 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
         self.0.iter()
     }
 
-    fn overlapping(
-        &self,
-        range: Range<usize>,
-    ) -> impl DoubleEndedIterator<Item = (usize, &Reservation)> {
+    fn overlapping(&self, range: Range<usize>) -> impl DoubleEndedIterator<Item = &Reservation> {
         let first = self
             .0
             .range(..=range.start)
@@ -193,7 +272,7 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
             .filter(move |(_, reservation)| {
                 !range.is_empty() && reservation.range().end > range.start
             })
-            .map(|(&base, reservation)| (base, reservation))
+            .map(|(_, reservation)| reservation)
     }
 
     fn take_overlapping(&mut self, range: Range<usize>) -> Vec<Reservation> {
@@ -210,6 +289,22 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
             .map(|(_, reservation)| reservation)
             .collect()
     }
+
+    fn take_replaced(&mut self, range: Range<usize>) -> Vec<Reservation> {
+        self.take_overlapping(range.clone())
+            .into_iter()
+            .map(|reservation| {
+                let extent = reservation.range();
+                let clipped = extent.start.max(range.start)..extent.end.min(range.end);
+                let (prefix, middle, suffix) = reservation.split(clipped);
+                for remainder in prefix.into_iter().chain(suffix) {
+                    let base = remainder.range().start;
+                    assert!(self.insert(base, remainder).is_none());
+                }
+                middle
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -222,7 +317,7 @@ mod tests {
     crate::define_page_reservation!(TestReservation);
 
     #[test]
-    fn reservation_segments_and_take_overlapping_in_order() {
+    fn reservation_overlap_and_removal_preserve_order() {
         let mut reservations = TrackedReservations::default();
         for range in [0x1000..0x3000, 0x3000..0x4000, 0x5000..0x6000] {
             // SAFETY: Each test range is nonempty, aligned, disjoint, and uniquely represented.
@@ -231,19 +326,13 @@ mod tests {
         }
 
         assert_eq!(
-            reservations.segments(0x800..0x5800),
-            [
-                (0x800..0x1000, None),
-                (0x1000..0x3000, Some(0x1000)),
-                (0x3000..0x4000, Some(0x3000)),
-                (0x4000..0x5000, None),
-                (0x5000..0x5800, Some(0x5000)),
-            ]
+            reservations.gaps(0x800..0x5800).collect::<Vec<_>>(),
+            [0x800..0x1000, 0x4000..0x5000]
         );
         assert_eq!(
             reservations
                 .overlapping(0x2000..0x3800)
-                .map(|(_, reservation)| reservation.range())
+                .map(PageReservation::range)
                 .collect::<Vec<_>>(),
             [0x1000..0x3000, 0x3000..0x4000]
         );
@@ -260,5 +349,40 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0], 0x5000..0x6000);
+    }
+
+    #[test]
+    fn take_replaced_splits_and_preserves_outside_ownership() {
+        let mut reservations = TrackedReservations::default();
+        for range in [0x1000..0x3000, 0x3000..0x5000] {
+            // SAFETY: The test ranges are disjoint, aligned, and uniquely represented.
+            let reservation = unsafe { TestReservation::<0x1000>::new(range.clone()) };
+            assert!(reservations.insert(range.start, reservation).is_none());
+        }
+
+        let replaced = reservations.take_replaced(0x2000..0x4000);
+        assert_eq!(
+            replaced
+                .iter()
+                .map(PageReservation::range)
+                .collect::<Vec<_>>(),
+            [0x2000..0x3000, 0x3000..0x4000]
+        );
+        assert_eq!(
+            reservations
+                .iter()
+                .map(|(_, reservation)| reservation.range())
+                .collect::<Vec<_>>(),
+            [0x1000..0x2000, 0x4000..0x5000]
+        );
+        let replaced = reservations.take_replaced(0x1000..0x6000);
+        assert_eq!(
+            replaced
+                .iter()
+                .map(PageReservation::range)
+                .collect::<Vec<_>>(),
+            [0x1000..0x2000, 0x4000..0x5000]
+        );
+        assert_eq!(reservations.iter().count(), 0);
     }
 }
