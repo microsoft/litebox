@@ -412,14 +412,7 @@ fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
-    run_thread_with_tls(shim, ctx, TlsState::new());
-}
-
-fn run_thread_with_tls(
-    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: &mut litebox_common_linux::PtRegs,
-    tls_state: TlsState,
-) {
+    let tls_state = TlsState::new();
     tls_state
         .guest_context_top
         .set(std::ptr::from_mut(ctx).wrapping_add(1));
@@ -621,10 +614,7 @@ struct TlsState {
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
     fn new() -> Self {
-        Self::with_guest_xstate(XsaveArea::initial(XsaveLayout::get()))
-    }
-
-    fn with_guest_xstate(mut guest_xsave_area: XsaveArea) -> Self {
+        let mut guest_xsave_area = XsaveArea::initial(XsaveLayout::get());
         let guest_xsave_ptr = guest_xsave_area.as_mut_ptr();
         Self {
             host_sp: Cell::new(core::ptr::null_mut()),
@@ -1035,16 +1025,11 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
-    guest_xstate: XsaveArea,
 ) {
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
-    run_thread_with_tls(
-        shim.as_ref(),
-        &mut ctx,
-        TlsState::with_guest_xstate(guest_xstate),
-    );
+    run_thread_inner(shim.as_ref(), &mut ctx);
 }
 
 impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<ALIGN> {
@@ -1062,10 +1047,8 @@ impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<A
         ensure_tls_index();
         let ctx = ctx.clone();
         // TODO: Inherit the calling guest's saved extended CPU state.
-        let guest_xstate = XsaveArea::initial(XsaveLayout::get());
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, guest_xstate))?;
+        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
 
         Ok(())
     }
