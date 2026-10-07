@@ -1600,6 +1600,7 @@ dependencies = [
  "litebox_platform_linux_userland",
  "litebox_runner_linux_userland",
  "litebox_runner_windows_userland",
+ "litebox_util_log",
  "tempfile",
  "windows-sys 0.60.2",
 ]
