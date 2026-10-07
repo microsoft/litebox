@@ -128,6 +128,7 @@ struct Inner {
     state: RefCell<State>,
     /// Statistics for the current request.
     entries: Cell<u64>,
+    reflected: Cell<u64>,
 }
 
 pub struct Process {
@@ -215,6 +216,7 @@ impl Process {
                 broker: broker::Broker::new(broker_core, layout::BROKER_SHARED_MEMORY),
                 state: RefCell::new(State::New),
                 entries: Cell::new(0),
+                reflected: Cell::new(0),
             },
             ctx: PtRegs::default(),
             fs_base: 0,
@@ -311,14 +313,16 @@ impl Process {
             request: request.into(),
         };
         self.inner.entries.set(0);
+        self.inner.reflected.set(0);
         self.activate();
         // Safety: as in `start`.
         unsafe { litebox_platform_vm_kernel::reenter_thread_ref(&self.inner, &mut self.ctx) };
         self.deactivate();
         let reply = self.settle()?;
         log::debug!(
-            "request served with {} kernel entries",
-            self.inner.entries.get()
+            "request served with {} kernel entries ({} reflected syscalls)",
+            self.inner.entries.get(),
+            self.inner.reflected.get()
         );
         Ok(reply.expect("a waiting process has completed its request"))
     }
@@ -679,7 +683,10 @@ impl Inner {
             _ => None,
         };
         let Some(entry) = entry else {
-            return self.kill_and_stop("unhandled exception");
+            return self.kill_and_stop(match kind {
+                UpcallKind::Exception => "unhandled exception",
+                UpcallKind::Syscall => "syscall outside the gate without an upcall entry",
+            });
         };
         let stack = layout::UPCALL_STACK;
         if stack.contains(ctx.rsp as u64) {
@@ -752,7 +759,9 @@ impl EnterShim for Inner {
         self.entries.set(self.entries.get() + 1);
         let syscall_at = (ctx.rip as u64).wrapping_sub(2);
         if !(self.gate.start <= syscall_at && ctx.rip as u64 <= self.gate.end) {
-            return self.kill_and_stop("syscall outside the gate");
+            // A guest syscall: reflect it.
+            self.reflected.set(self.reflected.get() + 1);
+            return self.upcall(ctx, UpcallKind::Syscall, 0, 0, 0);
         }
         match self.dispatch(ctx) {
             Flow::Return(result) => {

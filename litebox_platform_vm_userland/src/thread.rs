@@ -6,14 +6,15 @@
 //!
 //! Entries from the guest, all producing the same `PtRegs`:
 //! - `vmu_syscall_callback`: rewritten syscalls; return address in `rcx`.
-//! - `upcall_entry`: from the kernel, for unresolved exceptions.
+//! - `upcall_entry`: from the kernel, for unmodified syscalls and unresolved
+//!   exceptions.
 //!
 //! Assumes a single thread: the switch state is global.
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox_common_linux::PtRegs;
-use litebox_common_vm_abi::{Registers, UpcallFrame};
+use litebox_common_vm_abi::{Registers, UpcallFrame, UpcallKind};
 use zerocopy::TryFromBytes as _;
 
 /// Accessed from assembly by field offset.
@@ -180,8 +181,16 @@ unsafe extern "C" fn run_thread_arch(
         "call {syscall_handler}",
         "jmp vmu_thread_done",
 
-        // From `upcall_dispatch`, guest state already in the guest context;
-        // rdi = vector, rsi = error code, rdx = fault address.
+        // From `upcall_dispatch`, guest state already in the guest context.
+        ".globl vmu_guest_syscall_upcall",
+        "vmu_guest_syscall_upcall:",
+        "mov rsp, [rip + {state} + {host_sp}]",
+        "mov rbp, [rip + {state} + {host_bp}]",
+        "mov rdi, [rsp]",
+        "call {syscall_handler}",
+        "jmp vmu_thread_done",
+
+        // As above; rdi = vector, rsi = error code, rdx = fault address.
         ".globl vmu_guest_exception_callback",
         "vmu_guest_exception_callback:",
         "mov rcx, rdx",
@@ -216,6 +225,7 @@ unsafe extern "C" fn run_thread_arch(
 
 unsafe extern "C" {
     fn vmu_syscall_callback();
+    fn vmu_guest_syscall_upcall() -> !;
     fn vmu_guest_exception_callback(vector: u64, error_code: u64, fault_address: u64) -> !;
 }
 
@@ -315,11 +325,19 @@ extern "C" fn upcall_dispatch(frame: *const UpcallFrame) -> ! {
         // Safety: `run_thread_arch` is active (the guest was running), so
         // `ctx` is its guest context.
         unsafe { ctx.write(frame.regs) };
-        // Safety: as above; this abandons the upcall stack.
-        unsafe { vmu_guest_exception_callback(frame.vector, frame.error_code, frame.fault_address) }
+        match frame.kind {
+            // Safety: as above; this abandons the upcall stack.
+            UpcallKind::Syscall => unsafe { vmu_guest_syscall_upcall() },
+            // Safety: as above.
+            UpcallKind::Exception => unsafe {
+                vmu_guest_exception_callback(frame.vector, frame.error_code, frame.fault_address)
+            },
+        }
     }
     let rip = usize::try_from(frame.regs.rip).unwrap_or(usize::MAX);
-    if let Some(fixup) = litebox::mm::exception_table::search_exception_tables(rip) {
+    if frame.kind == UpcallKind::Exception
+        && let Some(fixup) = litebox::mm::exception_table::search_exception_tables(rip)
+    {
         let mut regs = frame.regs;
         regs.rip = fixup as u64;
         // Safety: the runner's own state at the fault, redirected to its

@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! OP-TEE TAs in runner processes. From the payload: `runner.elf`,
-//! `ldelf.elf`, and `ta.elf` (syscall-rewritten).
+//! `ldelf.elf`, and `ta.elf` (rewritten or not).
 //!
 //! One TA instance at a time, in its own process: a new process once the
 //! instance ends. That is when its first open fails, when the TA panics, or
