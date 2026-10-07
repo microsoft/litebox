@@ -322,7 +322,11 @@ fn test_tcp_reset_reported_before_unread_data() {
     pump(&mut network);
 
     // Like Linux, the reset is reported at once, but data received before it is still read.
-    assert!(server.check_io_events().contains(Events::ERR));
+    assert!(
+        server
+            .check_io_events()
+            .contains(Events::ERR | Events::HUP | Events::RDHUP)
+    );
     assert!(matches!(
         write(&server, b"x"),
         Err(ChannelWriteError::WriteShutdown)
@@ -362,11 +366,17 @@ fn test_tcp_graceful_close_with_unread_data() {
     assert_eq!(write(&client, b"hello world").unwrap(), 11);
     network.shutdown(&client_fd, Shutdown::Write).unwrap();
     pump(&mut network);
+    // Like Linux, the peer's FIN is reported at once, but reads still return the data first.
+    assert!(server.check_io_events().contains(Events::RDHUP));
+    assert!(!server.check_io_events().contains(Events::HUP));
+    assert_eq!(read(&server).unwrap(), b"hell");
+    assert_eq!(read(&server).unwrap(), b"");
     network.shutdown(&server_fd, Shutdown::Write).unwrap();
     pump(&mut network);
     assert_eq!(tcp_state(&network, &server_fd), tcp::State::Closed);
+    assert!(server.check_io_events().contains(Events::HUP));
 
-    let mut received = alloc::vec::Vec::new();
+    let mut received = b"hell".to_vec();
     while let Ok(data) = read(&server) {
         received.extend_from_slice(&data);
         pump(&mut network);
