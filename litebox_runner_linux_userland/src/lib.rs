@@ -3,7 +3,7 @@
 
 use anyhow::{Context as _, Result, anyhow};
 use clap::Parser;
-use litebox_platform_linux_userland::LinuxUserland as Platform;
+use litebox_platform_linux_userland::{GuestTlsMode, LinuxUserland as Platform};
 use litebox_platform_linux_userland::SeccompScope;
 use std::path::PathBuf;
 
@@ -135,6 +135,7 @@ fn run_with_seccomp(cli_args: CliArgs, seccomp_scope: SeccompScope) -> Result<i3
         })?;
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
+    platform.set_guest_tls_mode(GuestTlsMode::Linux);
 
     let mut broker_positional_io_fds = Vec::new();
     let mut broker_shutdown_fds = Vec::new();
