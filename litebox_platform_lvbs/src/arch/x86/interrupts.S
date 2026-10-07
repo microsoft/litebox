@@ -28,6 +28,10 @@
  *   stack space before performing operations that might fault; otherwise
  *   the fault handler may overwrite live data or trigger a double fault.
  *
+ * SWAPGS speculation (CVE-2019-1125): `lfence` on both sides of the CS check
+ * (here and after `swapgs` in exception_callback) so a mispredicted branch
+ * never runs with the wrong GS.
+ *
  * SMAP: interrupt/exception delivery does not clear RFLAGS.AC, so stubs that
  * run handlers `clac` on entry to keep them from bypassing SMAP. `iretq`
  * restores AC.
@@ -104,6 +108,7 @@
     push    0                   /* Push dummy error code */
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     jnz     .Luser_\name
+    lfence                      /* Kernel entry: no speculative use of a user GS */
     push_regs
     mov     rbp, rsp            /* Save stack pointer */
     and     rsp, -16            /* Align stack to 16 bytes for call */
@@ -126,6 +131,7 @@
     clac
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     jnz     .Luser_\name
+    lfence                      /* Kernel entry: no speculative use of a user GS */
     push_regs
     mov     rbp, rsp            /* Save stack pointer */
     and     rsp, -16            /* Align stack to 16 bytes for call */
@@ -186,6 +192,7 @@ isr_page_fault:
     test    qword ptr [rsp + 16], 0x3  /* Check CS RPL bits */
     push    14                  /* Pass vector number (push does not affect flags) */
     jnz     .Luser_isr_page_fault
+    lfence                      /* Kernel entry: no speculative use of a user GS */
     jmp     kernel_exception_callback
 .Luser_isr_page_fault:
     jmp     exception_callback

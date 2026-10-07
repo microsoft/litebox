@@ -1559,6 +1559,25 @@ macro_rules! XRSTOR_VTL1_ASM {
     };
 }
 
+/// Clear CPU buffers (Intel MDS/TAA/RFDS, AMD TSA) if enabled for this core
+/// (see `arch::spec_ctrl`). Only the memory operand form of `VERW` clears them.
+/// Must come after the last secret memory access. Clobbers: RFLAGS
+#[cfg(target_arch = "x86_64")]
+macro_rules! CLEAR_CPU_BUFFERS_ASM {
+    ($verw_sel_off:tt) => {
+        concat!(
+            "cmp word ptr gs:[",
+            stringify!($verw_sel_off),
+            "], 0\n",
+            "je 7f\n",
+            "verw word ptr gs:[",
+            stringify!($verw_sel_off),
+            "]\n",
+            "7:\n",
+        )
+    };
+}
+
 /// Save user context right after `syscall`-driven mode transition to the memory area
 /// pointed by the current stack pointer (`rsp`).
 ///
@@ -1752,6 +1771,7 @@ unsafe extern "C" fn run_thread_arch(
         ".globl exception_callback",
         "exception_callback:",
         "swapgs",
+        "lfence", // SWAPGS speculation (CVE-2019-1125)
         "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
         "mov al, [rsp]",
         "mov gs:[{exception_trapno_off}], al", // vector number from ISR stack
@@ -2042,6 +2062,8 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         // Restore user context from ctx.
         "mov rsp, rdi",
         RESTORE_CPU_CONTEXT_ASM!(),
+        // So the TA cannot sample kernel data; iretq reloads RFLAGS.
+        CLEAR_CPU_BUFFERS_ASM!({verw_sel_off}),
         // clear the GS base register (as the `KernelGsBase` MSR contains 0)
         // while writing the current GS base value to `KernelGsBase`.
         "swapgs",
@@ -2051,5 +2073,6 @@ unsafe extern "C" fn switch_to_user(_ctx: &litebox_common_linux::PtRegs) -> ! {
         vtl1_xsave_mask_lo_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_lo_offset() },
         vtl1_xsave_mask_hi_off = const { PerCpuVariablesAsm::vtl1_xsave_mask_hi_offset() },
         vtl1_user_xsaved_off = const { PerCpuVariablesAsm::vtl1_user_xsaved_offset() },
+        verw_sel_off = const { PerCpuVariablesAsm::verw_sel_offset() },
     );
 }
