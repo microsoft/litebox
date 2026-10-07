@@ -261,6 +261,10 @@ pub enum VsmError {
     #[error("failed to copy data from/to VTL0")]
     Vtl0CopyFailed,
 
+    // Resource Errors
+    #[error("out of memory")]
+    OutOfMemory,
+
     // Hypercall Errors
     #[error("hypercall failed: {0:?}")]
     HypercallFailed(HypervCallError),
@@ -344,6 +348,8 @@ impl From<VsmError> for Errno {
 
             // Init/hardware failures - I/O error
             VsmError::ApInitFailed(_) | VsmError::HypercallFailed(_) => Errno::EIO,
+
+            VsmError::OutOfMemory => Errno::ENOMEM,
 
             // True format/validation errors - invalid argument
             VsmError::AddressNotPageAligned
