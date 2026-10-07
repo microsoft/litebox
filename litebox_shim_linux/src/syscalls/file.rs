@@ -1087,6 +1087,8 @@ fn read_datagram_from_iovec<Platform: ShimPlatform>(
     if capacity == 0 {
         return Ok(0);
     }
+    // Like `read`, bound the staging buffer rather than trusting the iovec capacity.
+    let capacity = capacity.min(crate::MAX_KERNEL_BUF_SIZE);
     let mut buffer = alloc::vec::Vec::new();
     buffer
         .try_reserve_exact(capacity)

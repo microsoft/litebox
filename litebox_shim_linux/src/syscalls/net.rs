@@ -3617,6 +3617,16 @@ mod unix_tests {
         assert_eq!(&head, b"a");
         assert_eq!(&tail[..5], b"bcdef");
 
+        // A huge advertised capacity must not size the staging buffer.
+        assert_eq!(task.sys_writev(sender_fd, write_iovs_ptr, 2), Ok(6));
+        let huge_iov = [IoReadVec {
+            iov_base: UserPtrMut::from_usize(tail.as_mut_ptr().expose_provenance()),
+            iov_len: usize::try_from(isize::MAX).unwrap(),
+        }];
+        let huge_iov_ptr = UserPtr::from_usize(huge_iov.as_ptr().expose_provenance());
+        assert_eq!(task.sys_readv(receiver_fd, huge_iov_ptr, 1), Ok(6));
+        assert_eq!(&tail[..6], b"abcdef");
+
         let receiver_typed = typed_socket(&task, receiver);
         assert_eq!(
             task.do_recvfrom(&receiver_typed, &mut short, ReceiveFlags::DONTWAIT, None),
