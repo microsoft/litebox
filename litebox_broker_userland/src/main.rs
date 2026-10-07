@@ -27,6 +27,7 @@ use litebox_broker_core::{
 };
 use litebox_broker_protocol::fs::{FileMode as Mode, FileUser as UserInfo};
 use litebox_broker_protocol::socket::{Ipv4Address, Port};
+use litebox_broker_userland::fs::LocalFs;
 use litebox_broker_userland::mapped_file;
 use litebox_broker_userland::random::UserlandRandomProvider;
 use litebox_broker_userland::stdio::UserlandStdioProvider;
@@ -83,6 +84,48 @@ impl FromStr for AllowedDestination {
     }
 }
 
+/// A host directory exposed to the guest via `--mount HOST:GUEST`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MountSpec {
+    host: PathBuf,
+    guest: String,
+}
+
+impl FromStr for MountSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        // Paths may themselves contain colons (e.g. `C:\dir`), so a lone `:` is only accepted
+        // when unambiguous; otherwise `::` must separate the two paths.
+        let (host, guest) = if let Some((host, guest)) = value.split_once("::") {
+            if guest.contains("::") {
+                return Err("`::` separator must appear exactly once".to_owned());
+            }
+            (host, guest)
+        } else {
+            match value.matches(':').count() {
+                0 => return Err("expected HOST_PATH:GUEST_PATH".to_owned()),
+                1 => value.split_once(':').unwrap(),
+                _ => {
+                    return Err(
+                        "ambiguous mount with multiple `:`; use HOST_PATH::GUEST_PATH".to_owned(),
+                    );
+                }
+            }
+        };
+        if host.is_empty() {
+            return Err("host path must not be empty".to_owned());
+        }
+        if !guest.starts_with('/') {
+            return Err("guest path must be absolute".to_owned());
+        }
+        Ok(Self {
+            host: PathBuf::from(host),
+            guest: guest.to_owned(),
+        })
+    }
+}
+
 #[derive(Parser, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct CliArgs {
@@ -135,6 +178,13 @@ struct CliArgs {
     /// broker runs.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     fs_initial_files: Option<PathBuf>,
+    /// Mount a host directory at a guest path, with read/write access governed by host
+    /// permissions.
+    ///
+    /// May be repeated. The guest path must be absolute and normalized. If either path contains
+    /// `:`, separate them with `::` instead (e.g. `C:\data::/data`).
+    #[arg(long = "mount", value_name = "HOST_PATH:GUEST_PATH")]
+    mounts: Vec<MountSpec>,
     /// Opaque arguments to pass to the local runner without interpretation.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true, value_hint = clap::ValueHint::CommandWithArguments)]
     runner_arguments: Vec<OsString>,
@@ -142,6 +192,7 @@ struct CliArgs {
 
 fn create_file_service<Platform>(
     initial_files: Option<&Path>,
+    mounts: &[MountSpec],
     stdio: Arc<UserlandStdioProvider>,
 ) -> IoResult<Arc<dyn FileService>>
 where
@@ -171,7 +222,7 @@ where
         None => Cow::Borrowed(EMPTY_TAR_FILE),
     };
     let in_mem = InMem::<Platform>::new_initialized(entries);
-    let backend = Composer::builder()
+    let mut builder = Composer::builder()
         .mount_nestable("/", |allocators| {
             Overlay::<Platform>::new(
                 in_mem,
@@ -185,9 +236,25 @@ where
                 stdio,
                 Arc::new(UserlandRandomProvider),
             )
-        })
-        .build()
-        .map_err(|_| IoError::other("failed to construct broker file service"))?;
+        });
+    for mount in mounts {
+        builder = builder
+            .try_mount(&mount.guest, |allocator| {
+                LocalFs::new(&mount.host, allocator)
+            })
+            .map_err(|error| {
+                IoError::new(
+                    error.kind(),
+                    format!("failed to mount {}: {error}", mount.host.display()),
+                )
+            })?;
+    }
+    let backend = builder.build().map_err(|error| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!("failed to construct broker file service: {error}"),
+        )
+    })?;
     Ok(Arc::new(Resolver::<Platform, _>::new(backend)))
 }
 
