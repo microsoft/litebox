@@ -448,9 +448,7 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// The caller must ensure that no references to the released memory regions
     /// are held after this call.
     pub unsafe fn release_user_mappings(&self) {
-        unsafe {
-            let _ = self.memory_manager().release_memory();
-        }
+        unsafe { self.memory_manager().release_memory() };
     }
 }
 

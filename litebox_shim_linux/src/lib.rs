@@ -36,9 +36,7 @@ use litebox_common_linux::{
     errno::Errno,
     mm::VmemManager,
     user_pointers::{UserPtr, UserPtrMut},
-    vmem::{
-        CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, VmemUnmapError,
-    },
+    vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE},
 };
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.
@@ -216,12 +214,11 @@ impl<Platform: ShimPlatform> MemoryManager<Platform> {
     /// # Safety
     ///
     /// The caller must ensure that the released regions are no longer used.
-    pub unsafe fn release_memory(&self) -> Result<(), VmemUnmapError> {
+    pub unsafe fn release_memory(&self) {
         let mut state = self.brk.lock();
-        unsafe { self.vmem.release_memory() }?;
+        unsafe { self.vmem.release_memory() };
         state.initial = 0;
         state.current = 0;
-        Ok(())
     }
 }
 

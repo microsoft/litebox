@@ -76,8 +76,7 @@ pub trait ReservationStore {
         &mut self,
         vmas: &rangemap::RangeMap<usize, V>,
         platform: &Platform,
-    ) -> Result<(), DeallocationError>
-    where
+    ) where
         Platform: PageManagementProvider<ALIGN, Reservations = Self>;
 
     /// Insert a reservation at `base`.

@@ -320,8 +320,8 @@ where
     /// # Safety
     ///
     /// The caller must ensure that the released memory regions are no longer used.
-    pub unsafe fn release_memory(&self) -> Result<(), VmemUnmapError> {
-        unsafe { self.vmem.write().release_all() }.map_err(VmemUnmapError::UnmapError)
+    pub unsafe fn release_memory(&self) {
+        unsafe { self.vmem.write().release_all() }
     }
 
     /// Expands (or shrinks) an existing memory mapping

@@ -757,14 +757,13 @@ where
     /// # Safety
     ///
     /// The caller must ensure that no mapped memory remains in use.
-    pub(super) unsafe fn release_all(&mut self) -> Result<(), DeallocationError> {
+    pub(super) unsafe fn release_all(&mut self) {
         // SAFETY: The caller relinquishes every owned extent without remaining users.
         unsafe {
             self.reservations
-                .release_all::<Platform, ALIGN, _>(&self.vmas, self.platform)
-        }?;
+                .release_all::<Platform, ALIGN, _>(&self.vmas, self.platform);
+        };
         self.vmas.clear();
-        Ok(())
     }
 
     /// Reset pages without removing its mapping (similar to Linux `madvise` with
@@ -2166,7 +2165,7 @@ mod tests {
         unsafe { vmm.remove_mapping(PageRange::new(page(8), page(9)).unwrap()) }.unwrap();
         assert_eq!(*vmm.platform.releases.lock(), vec![page(8)..page(9)]);
 
-        unsafe { vmm.release_all() }.unwrap();
+        unsafe { vmm.release_all() };
         assert_eq!(
             *vmm.platform.releases.lock(),
             [page(8)..page(9), page(0)..page(4)]

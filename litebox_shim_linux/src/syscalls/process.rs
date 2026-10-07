@@ -1508,7 +1508,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         self.signals.reset_for_exec();
 
-        unsafe { self.global.mm.release_memory() }.expect("failed to release memory mappings");
+        unsafe { self.global.mm.release_memory() };
 
         self.global
             .platform

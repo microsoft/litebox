@@ -97,15 +97,13 @@ where
         &mut self,
         vmas: &rangemap::RangeMap<usize, V>,
         platform: &Platform,
-    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
-    where
+    ) where
         Platform: crate::platform::PageManagementProvider<PAGE_ALIGN, Reservations = Self>,
     {
         for (range, _) in vmas.iter() {
             // SAFETY: The caller relinquishes this provider-owned range without remaining users.
             let _ = unsafe { platform.release_pages(range.clone()) };
         }
-        Ok(())
     }
 
     fn insert(
@@ -240,15 +238,13 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
         &mut self,
         _vmas: &rangemap::RangeMap<usize, V>,
         platform: &Platform,
-    ) -> Result<(), crate::platform::page_mgmt::DeallocationError>
-    where
+    ) where
         Platform: crate::platform::PageManagementProvider<ALIGN, Reservations = Self>,
     {
         for (_, reservation) in core::mem::take(&mut self.0) {
             // SAFETY: The caller relinquishes this reservation without remaining users.
             let _ = unsafe { platform.release_pages(reservation) };
         }
-        Ok(())
     }
 
     fn insert(&mut self, base: usize, reservation: Reservation) -> Option<Reservation> {
