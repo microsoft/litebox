@@ -2,6 +2,9 @@
 name = "litebox_runner_snp"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "A LiteBox runner for running programs on top of AMD SEV-SNP"
 
 [features]
 debug = []

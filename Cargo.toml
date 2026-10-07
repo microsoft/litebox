@@ -50,6 +50,7 @@ members = [
     "litebox_shim_macos",
     "litebox_shim_windows",
     "litebox_shim_vm_kernel",
+    "litebox_shim_optee",
     "litebox_service_heki",
     "litebox_syscall_rewriter",
     "litebox_packager",

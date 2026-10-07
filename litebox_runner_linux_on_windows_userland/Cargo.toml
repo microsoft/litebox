@@ -2,6 +2,9 @@
 name = "litebox_runner_linux_on_windows_userland"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "Run Linux programs with LiteBox on unmodified Windows"
 
 [dependencies]
 anyhow = "1.0.97"
