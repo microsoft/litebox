@@ -262,9 +262,7 @@ fn is_on_stack(stack: &SigAltStack, sp: usize) -> bool {
     if stack.flags.contains(SsFlags::DISABLE) {
         return false;
     }
-    let stack_start = stack.sp;
-    let stack_end = stack.sp + stack.size;
-    sp >= stack_start && sp < stack_end
+    sp > stack.sp && sp.wrapping_sub(stack.sp) <= stack.size
 }
 
 /// Creates a `Siginfo` for an exception signal.
@@ -316,8 +314,6 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         } else if ss.flags.contains(SsFlags::DISABLE) {
             self.clear_sigaltstack();
             Ok(())
-        } else if ss.sp.checked_add(ss.size).is_none() {
-            Err(Errno::EINVAL)
         } else if ss.size < MINSIGSTKSZ {
             Err(Errno::ENOMEM)
         } else {
@@ -357,12 +353,12 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
             && !on_alt_stack
             && !altstack.flags.contains(SsFlags::DISABLE);
         let sp = if switch_stacks {
-            altstack.sp + altstack.size
+            altstack.sp.wrapping_add(altstack.size)
         } else {
             sp
         };
 
-        let frame_addr = arch::get_signal_frame(sp, action);
+        let frame_addr = arch::get_signal_frame(sp, action).ok_or(DeliverFault)?;
 
         if (switch_stacks || on_alt_stack) && !is_on_stack(&altstack, frame_addr) {
             return Err(DeliverFault);

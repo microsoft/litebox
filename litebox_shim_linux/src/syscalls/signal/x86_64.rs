@@ -32,20 +32,18 @@ pub(super) fn pc(ctx: &PtRegs) -> usize {
     ctx.rip
 }
 
-pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> usize {
+pub(super) fn get_signal_frame(sp: usize, _action: &SigAction) -> Option<usize> {
     let mut frame_addr = sp;
 
     // Skip the redzone.
-    frame_addr = frame_addr.wrapping_sub(128);
+    frame_addr = frame_addr.checked_sub(128)?;
 
     // Space for the signal frame.
-    frame_addr = frame_addr.wrapping_sub(core::mem::size_of::<SignalFrame>());
+    frame_addr = frame_addr.checked_sub(core::mem::size_of::<SignalFrame>())?;
 
     // Align the frame (offset by 8 bytes for return address)
     frame_addr &= !15;
-    frame_addr = frame_addr.wrapping_sub(8);
-
-    frame_addr
+    frame_addr.checked_sub(8)
 }
 
 impl<Platform: ShimPlatform> SignalState<Platform> {

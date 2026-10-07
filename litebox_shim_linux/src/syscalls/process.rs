@@ -458,7 +458,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
             .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
-                UserPtr::from_usize(entry.as_usize() + futex_offset),
+                UserPtr::from_usize(entry.as_usize().wrapping_add(futex_offset)),
                 pi,
                 false,
             )?;
@@ -474,7 +474,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
 
     if pending.as_usize() != 0 {
         let _ = handle_futex_death(
-            UserPtr::from_usize(pending.as_usize() + futex_offset),
+            UserPtr::from_usize(pending.as_usize().wrapping_add(futex_offset)),
             ppi,
             true,
         );
@@ -649,6 +649,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
+        let sp = if stack == 0 {
+            None
+        } else if clone3 {
+            // Like Linux's `clone3_stack_valid`, require the whole stack to be user-addressable.
+            let stack = usize::try_from(stack).map_err(|_| Errno::EINVAL)?;
+            let size = usize::try_from(stack_size).map_err(|_| Errno::EINVAL)?;
+            Some(
+                stack
+                    .checked_add(size)
+                    .filter(|&end| end <= Platform::TASK_ADDR_MAX)
+                    .ok_or(Errno::EINVAL)?,
+            )
+        } else {
+            // Legacy `clone` already passes the stack top.
+            Some(stack.trunc())
+        };
+
         let tls = if flags.contains(CloneFlags::SETTLS) {
             let addr = tls.trunc();
             #[cfg(target_arch = "x86_64")]
@@ -696,13 +713,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if let Some(parent_tid_ptr) = set_parent_tid {
             let _ = parent_tid_ptr.write_at_offset::<Platform>(0, child_tid);
         }
-
-        let sp = if stack != 0 {
-            let stack: usize = stack.trunc();
-            Some(stack.wrapping_add(stack_size.trunc()))
-        } else {
-            None
-        };
 
         let thread = self.thread.new_thread(child_tid).ok_or(Errno::EBUSY)?;
         thread.init_state.set(ThreadInitState::NewThread {
@@ -1254,9 +1264,6 @@ pub(crate) struct CpuSet {
 }
 
 impl CpuSet {
-    pub(crate) fn len(&self) -> usize {
-        self.bits.len()
-    }
     pub(crate) fn as_bytes(&self) -> &[u8] {
         self.bits.as_raw_slice()
     }
