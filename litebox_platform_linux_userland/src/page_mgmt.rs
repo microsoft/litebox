@@ -76,14 +76,68 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
-    fn allocate_pages(
+    unsafe fn commit_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+        populate_pages_immediately: bool,
+    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
+        LinuxUserlandReservation<ALIGN>: 'reservation,
+    {
+        // SAFETY: The caller owns the mapping and excludes conflicting access to these pages.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::mprotect,
+                range.start,
+                range.len(),
+                prot_flags(permissions).bits().reinterpret_as_unsigned() as usize,
+            )
+        }
+        .expect("mprotect failed while committing pages");
+        if populate_pages_immediately {
+            // TODO: MADV_WILLNEED only reads ahead file or swap pages; anonymous pages still fault lazily.
+            // SAFETY: This advice covers the live owned mapping and does not change its contents.
+            let _ = unsafe {
+                syscalls::syscall3(
+                    syscalls::Sysno::madvise,
+                    range.start,
+                    range.len(),
+                    libc::MADV_WILLNEED as usize,
+                )
+            };
+        }
+        Ok(UserMutPtr::from_ptr(range.start as *mut u8))
+    }
+
+    unsafe fn reserve_and_commit_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::AllocationError> {
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::AllocationError,
+    >
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
+        debug_assert!(!suggested_range.is_empty());
+        debug_assert!(
+            suggested_range.start
+                >= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MIN
+                || (suggested_range.start == 0
+                    && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_)))
+        );
+        debug_assert!(
+            suggested_range.end
+                <= <Self as litebox::platform::PageManagementProvider<ALIGN>>::TASK_ADDR_MAX
+        );
         debug_assert!(!matches!(
             fixed_address_behavior,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp)
@@ -129,7 +183,45 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             }
             _ => panic!("unhandled mmap error {err}"),
         })?;
-        Ok(UserMutPtr::from_usize(ptr))
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            replaced_reservations().for_each(drop);
+        }
+        // SAFETY: mmap returned exclusive ownership of this exact aligned extent.
+        Ok(unsafe { LinuxUserlandReservation::new(ptr..ptr + suggested_range.len()) })
+    }
+
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), litebox::platform::page_mgmt::DeallocationError>
+    where
+        Reservations: Iterator<Item = &'reservation LinuxUserlandReservation<ALIGN>>,
+        LinuxUserlandReservation<ALIGN>: 'reservation,
+    {
+        // SAFETY: The caller owns these pages and excludes all users of the decommitted range.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::mprotect,
+                range.start,
+                range.len(),
+                ProtFlags::PROT_NONE.bits().reinterpret_as_unsigned() as usize,
+            )
+        }
+        .expect("mprotect failed while decommitting pages");
+        // TODO: MADV_DONTNEED restores file contents for private file mappings instead of zeroing;
+        // decommit is currently only used by the Windows shim, which lacks native file mappings.
+        // SAFETY: The range is owned and inaccessible; discard its backing.
+        unsafe {
+            syscalls::syscall3(
+                syscalls::Sysno::madvise,
+                range.start,
+                range.len(),
+                libc::MADV_DONTNEED as usize,
+            )
+        }
+        .expect("madvise failed while decommitting pages");
+        Ok(())
     }
 
     unsafe fn release_pages(
@@ -141,12 +233,20 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
-    unsafe fn remap_pages(
+    unsafe fn try_remap_pages<Reservations>(
         &self,
+        source_reservations: impl FnOnce() -> Reservations,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
+        #[cfg_attr(target_arch = "aarch64", expect(unused_variables))]
         permissions: MemoryRegionPermissions,
-    ) -> Result<Self::RawMutPointer<u8>, litebox::platform::page_mgmt::RemapError> {
+    ) -> Result<
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
+        litebox::platform::page_mgmt::RemapError,
+    >
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
         // Without `MREMAP_FIXED` the kernel ignores `new_range` and may move the pages into the
         // host's mmap area. `MREMAP_FIXED` replaces whatever is mapped at the destination, and the
         // host may hold mappings vmem does not know about, so claim the destination first.
@@ -154,16 +254,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         // The claim also provides the grown tail, so only the old pages move: growing them would
         // extend pages that a fork restore mapped from its process image into the image's
         // following bytes instead of fresh zeroed pages.
-        let (flags, moved_len) = {
-            <Self as litebox::platform::PageManagementProvider<ALIGN>>::allocate_pages(
-                self,
-                new_range.clone(),
-                // Shared anonymous memory is private on the host, as in `allocate_pages`.
-                permissions - MemoryRegionPermissions::SHARED,
-                false,
-                false,
-                FixedAddressBehavior::NoReplace,
-            )
+        #[cfg(target_arch = "x86_64")]
+        let (flags, moved_len, destination_reservation) = {
+            // SAFETY: The destination is nonempty, aligned, and reserved by the caller for remap.
+            let destination_reservation = unsafe {
+                <Self as litebox::platform::PageManagementProvider<ALIGN>>::reserve_and_commit_pages(
+                    self,
+                    core::iter::empty,
+                    new_range.clone(),
+                    // Shared anonymous memory is private on the host, as in `allocate_pages`.
+                    permissions - MemoryRegionPermissions::SHARED,
+                    false,
+                    false,
+                    FixedAddressBehavior::NoReplace,
+                )
+            }
             .map_err(|error| match error {
                 // A host mapping vmem does not know about holds the destination; the caller's
                 // copy places the pages elsewhere instead.
@@ -180,8 +285,12 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             (
                 MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_FIXED,
                 old_range.len(),
+                destination_reservation,
             )
         };
+        // Only a fork restore, which is x86_64-only, maps guest pages from a file.
+        #[cfg(target_arch = "aarch64")]
+        let (flags, moved_len) = (MRemapFlags::MREMAP_MAYMOVE, new_range.len());
         let res = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::mremap,
@@ -198,7 +307,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         // move several mappings but may stop partway when the host runs out of memory or
         // mappings; the moved pages are then released with the claim, and the caller's copy
         // panics on the missing source.
-        let res = res.map_err(|_| {
+        #[cfg(target_arch = "x86_64")]
+        res.map_err(|_| {
             // SAFETY: vmem reserved `new_range` for this move, so only the claim made above and
             // any source pages a partial move placed in it can be unmapped.
             let _ = unsafe {
@@ -207,14 +317,29 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             .expect("munmap failed");
             litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
         })?;
-        Ok(UserMutPtr::from_usize(res))
+        #[cfg(target_arch = "aarch64")]
+        let res = res.expect("mremap failed");
+        source_reservations().for_each(drop);
+        #[cfg(target_arch = "x86_64")]
+        return Ok(destination_reservation);
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: Successful mremap transferred ownership to this destination extent.
+            Ok(unsafe { LinuxUserlandReservation::new(res..res + new_range.len()) })
+        }
     }
 
-    unsafe fn update_permissions(
+    unsafe fn protect_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError> {
+    ) -> Result<(), litebox::platform::page_mgmt::PermissionUpdateError>
+    where
+        Reservations:
+            Iterator<Item = &'reservation litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+        litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>: 'reservation,
+    {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             syscalls::syscall3(
@@ -271,7 +396,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     }
 
     fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        self.reserved_pages.iter()
+        core::iter::empty()
     }
 
     /// Asks the host to back `range` with transparent huge pages, each of which takes one
@@ -289,13 +414,17 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         };
     }
 
-    fn try_allocate_cow_pages(
+    unsafe fn try_allocate_cow_pages<Reservations>(
         &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_start: usize,
         source_data: &'static [u8],
         permissions: MemoryRegionPermissions,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, CowAllocationError> {
+    ) -> Result<litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>, CowAllocationError>
+    where
+        Reservations: Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>>,
+    {
         let Some((file_path, file_offset)) = self.lookup_cow_region(source_data) else {
             return Err(CowAllocationError::UnsupportedSourceRegion);
         };
@@ -349,7 +478,13 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         let _ = unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) };
 
         match result {
-            Ok(ptr) => Ok(UserMutPtr::from_usize(ptr)),
+            Ok(address) => {
+                if fixed_address_behavior == FixedAddressBehavior::Replace {
+                    replaced_reservations().for_each(drop);
+                }
+                // SAFETY: mmap returned exclusive ownership of this CoW mapping.
+                Ok(unsafe { LinuxUserlandReservation::new(address..address + source_data.len()) })
+            }
             Err(_) => Err(CowAllocationError::InternalFailure),
         }
     }
@@ -358,7 +493,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
 #[cfg(test)]
 mod tests {
     use super::*;
-    use litebox::platform::PageManagementProvider;
 
     #[cfg(target_arch = "aarch64")]
     #[test]
@@ -370,22 +504,6 @@ mod tests {
         assert!(!sync_permissions.contains(MemoryRegionPermissions::EXEC));
         assert!(final_permissions.contains(MemoryRegionPermissions::EXEC));
     }
-
-    #[test]
-    fn test_reserved_pages() {
-        let platform = LinuxUserland::new();
-        let reserved_pages: Vec<_> =
-            <LinuxUserland as PageManagementProvider<4096>>::reserved_pages(platform).collect();
-
-        // Check that the reserved pages are in order and non-overlapping
-        let mut prev = 0;
-        for page in reserved_pages {
-            assert!(page.start >= prev);
-            assert!(page.end > page.start);
-            prev = page.end;
-        }
-    }
-
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn moving_growth_of_file_pages_adds_zeroed_pages() {
@@ -430,8 +548,9 @@ mod tests {
 
         // SAFETY: Nothing else uses the old page, and the destination is free.
         let moved = unsafe {
-            <LinuxUserland as PageManagementProvider<PAGE>>::remap_pages(
+            <LinuxUserland as litebox::platform::PageManagementProvider<PAGE>>::try_remap_pages(
                 platform,
+                core::iter::empty,
                 old..old + PAGE,
                 new..new + 2 * PAGE,
                 MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
@@ -439,7 +558,8 @@ mod tests {
         }
         .unwrap();
 
-        assert_eq!(moved.as_usize(), new);
+        let moved: core::ops::Range<usize> = moved.into();
+        assert_eq!(moved.start, new);
         // SAFETY: The remap left both pages mapped readable and writable.
         let pages = unsafe { core::slice::from_raw_parts_mut(new as *mut u8, 2 * PAGE) };
         assert!(pages[..PAGE].iter().all(|&byte| byte == 0xa5));

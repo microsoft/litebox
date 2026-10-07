@@ -26,7 +26,7 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::{mm::VmemManager, vmem::ShimReservations};
+use litebox_common_linux::{mm::VmemManager, vmem::LinuxReservationStore};
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::{NtSysno, Win32Sysno};
 use litebox_platform::time::TimeProvider;
@@ -74,30 +74,31 @@ const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 pub trait ShimPlatform:
     RawSyncPrimitivesProvider
     + RawPointerProvider
-    + PageManagementProvider<PAGE_SIZE, Reservations = ShimReservations<Self::Reservation>>
+    + PageManagementProvider<PAGE_SIZE, Reservations = <Self as ShimPlatform>::VmemReservations>
     + ArchSpecificProvider
     + SystemInfoProvider
     + TimeProvider
     + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
     + 'static
+    + Sized
 {
-    /// Opaque page-reservation ownership type supplied by the platform.
-    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
+    /// Platform-selected reservation storage used by the virtual memory manager.
+    type VmemReservations: LinuxReservationStore<Self, PAGE_SIZE>;
 }
 
-impl<T, Reservation> ShimPlatform for T
+impl<T> ShimPlatform for T
 where
     T: RawSyncPrimitivesProvider
         + RawPointerProvider
-        + PageManagementProvider<PAGE_SIZE, Reservations = ShimReservations<Reservation>>
+        + PageManagementProvider<PAGE_SIZE>
         + ArchSpecificProvider
         + SystemInfoProvider
         + TimeProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + 'static,
-    Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
+    T::Reservations: LinuxReservationStore<T, PAGE_SIZE>,
 {
-    type Reservation = Reservation;
+    type VmemReservations = T::Reservations;
 }
 
 pub(crate) type ConstPtr<Platform, T> =
