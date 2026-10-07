@@ -92,6 +92,9 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
 
     // TODO(jb): Clean up platform initialization once we have https://github.com/MSRSSP/litebox/issues/24
     let platform = Platform::new();
+    #[cfg(target_arch = "x86_64")]
+    platform.set_guest_tls_mode(litebox_platform_linux_userland::GuestTlsMode::Linux);
+
     // Leaked because the shim requires a `'static` session manager.
     let session_manager: &'static SessionManager<Platform> =
         Box::leak(Box::new(SessionManager::new()));
