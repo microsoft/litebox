@@ -2,6 +2,8 @@
 name = "dev_tests"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
 
 # All dependencies here are dev dependencies, because this is just purely tests.
 [dev-dependencies]

@@ -2,6 +2,10 @@
 name = "litebox_runner_optee_on_linux_userland"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+# Keep the crate MIT-only: tests/ needs BSD-2-Clause TA fixtures.
+exclude = ["tests/"]
 
 [dependencies]
 anyhow = "1.0.97"

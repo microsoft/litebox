@@ -2,6 +2,8 @@
 name = "litebox_shim_optee"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
 
 [dependencies]
 aes = { version = "0.7", default-features = false }
