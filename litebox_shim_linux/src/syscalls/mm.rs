@@ -1483,23 +1483,6 @@ mod tests {
         task.sys_munmap(res, 0x1000).unwrap();
         task.sys_munmap(UserPtrMut::from_usize(addr - 0x1000), 0x1000)
             .unwrap();
-        #[cfg_attr(
-            target_os = "windows",
-            expect(
-                clippy::useless_conversion,
-                reason = "tracked Windows reservations are their own release target"
-            )
-        )]
-        for reservation in data {
-            // SAFETY: The page belongs to the external provider and has no outstanding references.
-            unsafe {
-                <Platform as PageManagementProvider<4096>>::release_pages(
-                    external_platform,
-                    reservation.into(),
-                )
-                .unwrap();
-            }
-        }
     }
 
     #[test]
