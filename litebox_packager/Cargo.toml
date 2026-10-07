@@ -2,6 +2,9 @@
 name = "litebox_packager"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/microsoft/litebox"
+description = "Package Linux ELF programs and their shared libraries for execution under LiteBox"
 
 [dependencies]
 anyhow = "1.0.97"
