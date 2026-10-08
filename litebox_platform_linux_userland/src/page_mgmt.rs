@@ -66,13 +66,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     /// this limit has no effect.
     #[cfg(target_arch = "aarch64")]
     const PLACEMENT_ADDR_MAX: usize = 0x4000_0000_0000;
-    /// The kernel may place a rejected hint anywhere, including inside the
-    /// host's mmap area, so vmem must pick exact addresses itself.
-    #[cfg(target_arch = "x86_64")]
-    const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
-    /// Exact `MAP_FIXED_NOREPLACE` placement would fail on hosts with fewer
-    /// than 48 VA bits; see the `TASK_ADDR_MAX` note above.
-    #[cfg(target_arch = "aarch64")]
+    /// The host relocates rejected hints top-down, but vmem uses exact placement on both
+    /// architectures when enforcing their lower `PLACEMENT_ADDR_MAX` bounds.
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
