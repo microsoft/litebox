@@ -478,6 +478,7 @@ impl Backend for Composer {
                                         current = last;
                                     }
                                     WalkStopReason::StoppedAtNonDirectory
+                                    | WalkStopReason::Symlink(_)
                                     | WalkStopReason::Continue => {
                                         return Ok(WalkOutcome {
                                             components: walked_components,
@@ -522,7 +523,9 @@ impl Backend for Composer {
                                 index += walked_len;
                                 current = last;
                             }
-                            WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Continue => {
+                            WalkStopReason::StoppedAtNonDirectory
+                            | WalkStopReason::Symlink(_)
+                            | WalkStopReason::Continue => {
                                 return Ok(WalkOutcome {
                                     components: walked_components,
                                     last: WalkingDirHandle::from_typed::<Self>(last),

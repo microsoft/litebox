@@ -119,6 +119,7 @@ impl From<litebox::fs::errors::PathError> for Errno {
             litebox::fs::errors::PathError::InvalidPathname => Errno::EINVAL,
             litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
             litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,
+            litebox::fs::errors::PathError::TooManySymlinks => Errno::ELOOP,
         }
     }
 }
@@ -344,6 +345,7 @@ impl From<litebox::fs::errors::FileStatusError> for Errno {
     fn from(value: litebox::fs::errors::FileStatusError) -> Self {
         match value {
             litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
+            litebox::fs::errors::FileStatusError::Io => Errno::EIO,
             litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
             _ => unimplemented!(),
         }

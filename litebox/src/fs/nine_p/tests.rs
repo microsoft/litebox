@@ -540,13 +540,15 @@ fn test_nine_p_broken_read() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file via normal connection
+    // A nested path also verifies that the resolution pass batches ordinary components.
     {
         let fs = connect_9p(&litebox, &server);
+        fs.mkdir(&ctx, "/parent", Mode::RWXU).unwrap();
+        fs.mkdir(&ctx, "/parent/nested", Mode::RWXU).unwrap();
         let fd = fs
             .open(
                 &ctx,
-                "/read_me.txt",
+                "/parent/nested/read_me.txt",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
             )
@@ -555,10 +557,16 @@ fn test_nine_p_broken_read() {
         fs.close(&fd).unwrap();
     }
 
-    // 4 writes: version + attach + walk + lopen. Then read will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then read will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
-        .open(&ctx, "/read_me.txt", OFlags::RDONLY, Mode::empty())
+        .open(
+            &ctx,
+            "/parent/nested/read_me.txt",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; 64];
@@ -573,9 +581,9 @@ fn test_nine_p_broken_write() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // 5 writes: version + attach + walk (which reports the file as missing) + the clone of the
-    // parent directory's fid + create. Then write will fail.
-    let fs = connect_9p_broken(&litebox, &server, 5);
+    // 6 writes: version + attach + resolution walk + open walk (both report the missing file)
+    // + the clone of the parent directory's fid + create. Then write will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
         .open(
             &ctx,
@@ -696,8 +704,9 @@ fn test_nine_p_broken_truncate() {
         fs.close(&fd).unwrap();
     }
 
-    // 4 writes: version + attach + walk + lopen. Then truncate will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then truncate will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
         .open(&ctx, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
@@ -728,8 +737,9 @@ fn test_nine_p_broken_seek() {
         fs.close(&fd).unwrap();
     }
 
-    // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then the getattr for seek will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
         .open(&ctx, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");

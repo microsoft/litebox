@@ -53,7 +53,8 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     ///
     /// This function explicitly does not walk into files. If the next component exists but is not a
     /// directory, the backend should stop at its parent and return
-    /// `WalkStopReason::StoppedAtNonDirectory`.
+    /// `WalkStopReason::StoppedAtNonDirectory`, or `WalkStopReason::Symlink` with the
+    /// link's target. Symlinks are expanded by the resolver in the filesystem namespace.
     fn walk_directories<'a>(
         &'a self,
         from: WalkingDirHandle<'a>,
@@ -327,13 +328,15 @@ pub struct WalkOutcome<Walking> {
 }
 
 /// Why a backend directory walk stopped.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
 pub(super) enum WalkStopReason {
     /// All requested components were walked, and `last` is the requested directory.
     CompleteDirectory,
     /// The next requested component exists but is not a directory; `last` is its parent directory.
     StoppedAtNonDirectory,
+    /// The next component is a symlink; `last` is its parent, and the target is unexpanded.
+    Symlink(alloc::string::String),
     /// The backend stopped early; the resolver should continue walking from `last`.
     #[expect(dead_code, reason = "no backend currently returns partial walks")]
     Continue,

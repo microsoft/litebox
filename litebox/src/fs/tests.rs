@@ -78,6 +78,562 @@ fn overlay_fs(
     )
 }
 
+mod symlinks {
+    use crate::LiteBox;
+    use crate::fs::backend::{Backend, HandleRef, WalkStopReason};
+    use crate::fs::composer::Composer;
+    use crate::fs::errors::{
+        FileStatusError, OpenError, PathError, ReadError, RmdirError, TruncateError, WalkError,
+        WriteError,
+    };
+    use crate::fs::in_mem::{InMem, InitialNode};
+    use crate::fs::inode_allocator::InodeAllocator;
+    use crate::fs::overlay::Overlay;
+    use crate::fs::resolver::{Context, Resolver};
+    use crate::fs::{FileType, Mode, OFlags, UserInfo};
+    use crate::platform::mock::MockPlatform;
+    use alloc::format;
+    use alloc::string::{String, ToString};
+    use alloc::vec::Vec;
+
+    const ALL_PERMS: Mode = Mode::RWXU.union(Mode::RWXG).union(Mode::RWXO);
+    const OWNER: UserInfo = UserInfo {
+        user: 1000,
+        group: 1000,
+    };
+
+    fn directory() -> InitialNode {
+        InitialNode::Directory {
+            mode: ALL_PERMS,
+            owner: OWNER,
+        }
+    }
+
+    fn file(data: &'static [u8]) -> InitialNode {
+        InitialNode::File {
+            mode: Mode::RUSR | Mode::WUSR,
+            owner: OWNER,
+            data: data.into(),
+        }
+    }
+
+    fn link(target: &str) -> InitialNode {
+        InitialNode::Symlink {
+            owner: OWNER,
+            target: target.into(),
+        }
+    }
+
+    fn initialized<Path: AsRef<str>>(
+        entries: impl IntoIterator<Item = (Path, InitialNode)>,
+    ) -> InMem<MockPlatform> {
+        InMem::new_initialized(
+            [(String::from("/"), directory())].into_iter().chain(
+                entries
+                    .into_iter()
+                    .map(|(path, node)| (path.as_ref().into(), node)),
+            ),
+        )
+    }
+
+    fn fixture(litebox: &LiteBox<MockPlatform>) -> super::InMemFs {
+        Resolver::new(
+            litebox,
+            initialized([
+                ("/real", directory()),
+                ("/real/nested", directory()),
+                ("/real/file", file(b"physical target")),
+                ("/file", file(b"lexical decoy")),
+                ("/relative", link("real/file")),
+                ("/absolute", link("/real/file")),
+                ("/chain", link("relative")),
+                ("/directory", link("/real/nested")),
+                ("/real/nested/up", link(".././file")),
+                ("/dangling", link("/created")),
+                ("/empty-dir", directory()),
+                ("/empty-link", link("empty-dir")),
+                ("/self", link("self")),
+                ("/cycle-a", link("cycle-b")),
+                ("/cycle-b", link("cycle-a")),
+                (
+                    "/protected",
+                    InitialNode::File {
+                        mode: Mode::RUSR | Mode::WUSR,
+                        owner: UserInfo::ROOT,
+                        data: b"private".as_slice().into(),
+                    },
+                ),
+                (
+                    "/private",
+                    InitialNode::Directory {
+                        mode: Mode::RWXU,
+                        owner: UserInfo::ROOT,
+                    },
+                ),
+                ("/private/file", file(b"hidden by parent")),
+                ("/denied-file", link("/protected")),
+                ("/denied-dir", link("/private/file")),
+                (
+                    "/no-search",
+                    InitialNode::Directory {
+                        mode: Mode::RUSR,
+                        owner: OWNER,
+                    },
+                ),
+                ("/no-search-link", link("no-search")),
+            ]),
+        )
+    }
+
+    fn assert_contents<B: Backend>(
+        fs: &Resolver<MockPlatform, B>,
+        ctx: &Context,
+        path: &str,
+        expected: &[u8],
+    ) {
+        let fd = fs.open(ctx, path, OFlags::RDONLY, Mode::empty()).unwrap();
+        let mut buffer = [0; 64];
+        let read = fs.read(&fd, &mut buffer, None).unwrap();
+        assert_eq!(&buffer[..read], expected, "contents at {path}");
+        fs.close(&fd).unwrap();
+    }
+
+    #[test]
+    fn follows_targets_and_resolves_dot_dot_physically() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = fixture(&litebox);
+        let mut ctx = Context::new();
+        let target = fs.file_status(&ctx, "/real/file").unwrap();
+        for path in [
+            "/relative",
+            "/absolute",
+            "/chain",
+            "/directory/up",
+            "/directory/../file",
+        ] {
+            assert_contents(&fs, &ctx, path, b"physical target");
+            assert_eq!(
+                fs.file_status(&ctx, path).unwrap().node_info,
+                target.node_info
+            );
+            assert_eq!(fs.resolve(&ctx, path).unwrap().to_string(), "/real/file");
+        }
+        assert_contents(&fs, &ctx, "/file", b"lexical decoy");
+        assert_eq!(fs.read_link(&ctx, "/directory/up").unwrap(), ".././file");
+        assert_eq!(fs.read_link(&ctx, "/absolute").unwrap(), "/real/file");
+        assert!(fs.read_link(&ctx, "/real/file").is_err());
+        assert_eq!(
+            fs.file_status_no_follow(&ctx, "/directory/up")
+                .unwrap()
+                .file_type,
+            FileType::SymbolicLink
+        );
+        let fd = fs
+            .open(&ctx, "/directory", OFlags::DIRECTORY, Mode::empty())
+            .unwrap();
+        assert_eq!(
+            fs.fd_file_status(&fd).unwrap().file_type,
+            FileType::Directory
+        );
+        fs.close(&fd).unwrap();
+        ctx.set_cwd(fs.resolve(&ctx, "/directory").unwrap());
+        assert_contents(&fs, &ctx, "../file", b"physical target");
+        assert_contents(&fs, &ctx, "up", b"physical target");
+    }
+
+    #[test]
+    fn target_permissions_and_search_permissions_are_not_bypassed() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = fixture(&litebox);
+        let ctx = Context::new();
+        for flags in [OFlags::RDONLY, OFlags::WRONLY, OFlags::RDWR] {
+            assert!(matches!(
+                fs.open(&ctx, "/denied-file", flags, Mode::empty()),
+                Err(OpenError::AccessNotAllowed)
+            ));
+        }
+        assert_eq!(
+            fs.file_status(&ctx, "/denied-file").unwrap().file_type,
+            FileType::RegularFile
+        );
+        assert!(matches!(
+            fs.open(&ctx, "/denied-dir", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::NoSearchPerms))
+        ));
+        assert!(matches!(
+            fs.file_status(&ctx, "/denied-dir"),
+            Err(FileStatusError::PathError(PathError::NoSearchPerms))
+        ));
+        for path in ["/denied-file", "/denied-dir"] {
+            let status = fs.file_status_no_follow(&ctx, path).unwrap();
+            assert_eq!(status.file_type, FileType::SymbolicLink);
+            assert_eq!(status.mode, ALL_PERMS);
+        }
+        for path in ["/no-search/", "/no-search-link/"] {
+            let fd = fs
+                .open(&ctx, path, OFlags::DIRECTORY, Mode::empty())
+                .unwrap();
+            assert_eq!(
+                fs.fd_file_status(&fd).unwrap().file_type,
+                FileType::Directory
+            );
+            fs.close(&fd).unwrap();
+        }
+        for path in ["/no-search/.", "/no-search-link/."] {
+            assert!(matches!(
+                fs.file_status(&ctx, path),
+                Err(FileStatusError::PathError(PathError::NoSearchPerms))
+            ));
+        }
+        let mut root = ctx.clone();
+        root.set_acting_user(UserInfo::ROOT);
+        assert_contents(&fs, &root, "/denied-file", b"private");
+    }
+
+    #[test]
+    fn nofollow_descriptors_expose_link_metadata_but_cannot_mutate_links() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = fixture(&litebox);
+        let ctx = Context::new();
+        for path in ["/absolute", "/dangling"] {
+            assert!(matches!(
+                fs.open(&ctx, path, OFlags::NOFOLLOW, Mode::empty()),
+                Err(OpenError::PathError(PathError::TooManySymlinks))
+            ));
+            assert!(matches!(
+                fs.open(
+                    &ctx,
+                    path,
+                    OFlags::PATH | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+                    Mode::empty(),
+                ),
+                Err(OpenError::PathError(PathError::ComponentNotADirectory))
+            ));
+            let lstat = fs.file_status_no_follow(&ctx, path).unwrap();
+            let fd = fs
+                .open(&ctx, path, OFlags::PATH | OFlags::NOFOLLOW, Mode::empty())
+                .unwrap();
+            let status = fs.fd_file_status(&fd).unwrap();
+            assert_eq!(status.file_type, FileType::SymbolicLink);
+            assert_eq!(status.mode, ALL_PERMS);
+            assert_eq!(status.owner.user, OWNER.user);
+            assert_eq!(status.owner.group, OWNER.group);
+            assert_eq!(status.node_info, lstat.node_info);
+            assert_eq!(status.size, lstat.size);
+            assert!(matches!(
+                fs.read(&fd, &mut [0; 32], None),
+                Err(ReadError::NotForReading)
+            ));
+            assert!(matches!(
+                fs.write(&fd, b"rewritten", None),
+                Err(WriteError::NotForWriting)
+            ));
+            assert!(matches!(
+                fs.truncate(&fd, 0, false),
+                Err(TruncateError::NotOpenForWriting)
+            ));
+            assert!(fs.get_static_backing_data(&fd).is_none());
+            fs.close(&fd).unwrap();
+        }
+        assert_contents(&fs, &ctx, "/absolute", b"physical target");
+
+        let backend = initialized([("/link", link("/original-target"))]);
+        let handle = backend
+            .open_file_at(backend.root(), "link", OFlags::PATH | OFlags::NOFOLLOW)
+            .unwrap()
+            .item;
+        assert!(backend.read(&handle, &mut [0; 32], 0).is_err());
+        assert!(
+            backend
+                .chown(HandleRef::File(&handle), Some(0), None)
+                .is_err()
+        );
+        assert!(backend.write(&handle, b"/new-target", 0).is_err());
+        assert!(backend.truncate(&handle, 0).is_err());
+        assert!(
+            backend
+                .chmod(HandleRef::File(&handle), Mode::empty())
+                .is_err()
+        );
+        assert_eq!(
+            backend.status(HandleRef::File(&handle)).unwrap().mode,
+            ALL_PERMS
+        );
+        assert_eq!(
+            backend
+                .walk_directories(backend.root(), &["link"])
+                .unwrap()
+                .stop_reason,
+            WalkStopReason::Symlink("/original-target".into())
+        );
+    }
+
+    #[test]
+    fn dangling_links_distinguish_stat_exclusive_create_and_target_creation() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = fixture(&litebox);
+        let ctx = Context::new();
+        for path in ["/relative/", "/dangling/", "/real/file/"] {
+            assert!(matches!(
+                fs.mkdir(&ctx, path, ALL_PERMS),
+                Err(crate::fs::errors::MkdirError::AlreadyExists)
+            ));
+        }
+        let before = fs.file_status_no_follow(&ctx, "/dangling").unwrap();
+        assert_eq!(before.file_type, FileType::SymbolicLink);
+        assert_eq!(before.size, "/created".len());
+        assert!(matches!(
+            fs.file_status(&ctx, "/dangling"),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert!(matches!(
+            fs.open(
+                &ctx,
+                "/dangling",
+                OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            ),
+            Err(OpenError::AlreadyExists)
+        ));
+        assert!(matches!(
+            fs.file_status(&ctx, "/created"),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        let fd = fs
+            .open(
+                &ctx,
+                "/dangling",
+                OFlags::CREAT | OFlags::WRONLY,
+                Mode::RUSR | Mode::WUSR,
+            )
+            .unwrap();
+        fs.write(&fd, b"created through link", None).unwrap();
+        fs.close(&fd).unwrap();
+        assert_contents(&fs, &ctx, "/created", b"created through link");
+        assert_contents(&fs, &ctx, "/dangling", b"created through link");
+        let target = fs.file_status(&ctx, "/created").unwrap();
+        assert_eq!(target.file_type, FileType::RegularFile);
+        assert_eq!(
+            fs.file_status(&ctx, "/dangling").unwrap().node_info,
+            target.node_info
+        );
+        let after = fs.file_status_no_follow(&ctx, "/dangling").unwrap();
+        assert_eq!(after.file_type, FileType::SymbolicLink);
+        assert_eq!(after.node_info, before.node_info);
+        assert_eq!(after.size, before.size);
+    }
+
+    #[test]
+    fn cycles_fail_and_acyclic_chains_obey_the_hop_limit() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = fixture(&litebox);
+        let ctx = Context::new();
+        for path in ["/self", "/cycle-a", "/cycle-b"] {
+            assert!(matches!(
+                fs.open(&ctx, path, OFlags::RDONLY, Mode::empty()),
+                Err(OpenError::PathError(PathError::TooManySymlinks))
+            ));
+            assert!(matches!(
+                fs.resolve(&ctx, path),
+                Err(WalkError::PathError(PathError::TooManySymlinks))
+            ));
+            assert_eq!(
+                fs.file_status_no_follow(&ctx, path).unwrap().file_type,
+                FileType::SymbolicLink
+            );
+        }
+        let mut entries = Vec::new();
+        entries.push((String::from("/target"), file(b"end of chain")));
+        for index in 0..41 {
+            let target = if index == 40 {
+                String::from("target")
+            } else {
+                format!("hop{}", index + 1)
+            };
+            entries.push((format!("/hop{index}"), link(&target)));
+        }
+        let fs = Resolver::new(&litebox, initialized(entries));
+        assert_contents(&fs, &ctx, "/hop1", b"end of chain");
+        assert_eq!(fs.resolve(&ctx, "/hop1").unwrap().to_string(), "/target");
+        assert!(matches!(
+            fs.open(&ctx, "/hop0", OFlags::RDONLY, Mode::empty()),
+            Err(OpenError::PathError(PathError::TooManySymlinks))
+        ));
+    }
+
+    #[test]
+    fn unlink_and_rmdir_operate_on_the_link_not_its_target() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let fs = fixture(&litebox);
+        let ctx = Context::new();
+        let target = fs.file_status(&ctx, "/real/file").unwrap().node_info;
+        fs.unlink(&ctx, "/relative").unwrap();
+        assert!(matches!(
+            fs.file_status_no_follow(&ctx, "/relative"),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+        assert_contents(&fs, &ctx, "/real/file", b"physical target");
+        assert_eq!(
+            fs.file_status(&ctx, "/real/file").unwrap().node_info,
+            target
+        );
+        assert!(matches!(
+            fs.rmdir(&ctx, "/empty-link"),
+            Err(RmdirError::NotADirectory)
+        ));
+        assert!(matches!(
+            fs.unlink(&ctx, "/empty-link/"),
+            Err(crate::fs::errors::UnlinkError::PathError(
+                PathError::ComponentNotADirectory
+            ))
+        ));
+        assert!(matches!(
+            fs.rmdir(&ctx, "/empty-link/"),
+            Err(RmdirError::PathError(PathError::ComponentNotADirectory))
+        ));
+        assert_eq!(
+            fs.file_status_no_follow(&ctx, "/empty-link")
+                .unwrap()
+                .file_type,
+            FileType::SymbolicLink
+        );
+        assert_eq!(
+            fs.file_status(&ctx, "/empty-dir").unwrap().file_type,
+            FileType::Directory
+        );
+        fs.unlink(&ctx, "/empty-link").unwrap();
+        assert_eq!(
+            fs.file_status(&ctx, "/empty-dir").unwrap().file_type,
+            FileType::Directory
+        );
+        fs.rmdir(&ctx, "/empty-dir").unwrap();
+        fs.mkdir(&ctx, "/new/", ALL_PERMS).unwrap();
+        assert_eq!(
+            fs.file_status(&ctx, "/new").unwrap().file_type,
+            FileType::Directory
+        );
+        fs.unlink(&ctx, "/dangling").unwrap();
+        assert!(matches!(
+            fs.file_status_no_follow(&ctx, "/dangling"),
+            Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+    }
+
+    #[test]
+    fn composer_links_cross_mounts_in_the_full_namespace() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let ctx = Context::new();
+        let fs = Resolver::new(
+            &litebox,
+            Composer::builder()
+                .mount("/", |_| {
+                    initialized([
+                        ("/root-file", file(b"root target")),
+                        ("/to-mounted", link("/mnt/file")),
+                        ("/to-directory", link("/mnt/nested")),
+                    ])
+                })
+                .mount("/mnt", |_| {
+                    initialized([
+                        ("/file", file(b"mounted target")),
+                        ("/nested", directory()),
+                        ("/back-to-root", link("../root-file")),
+                        ("/absolute-root", link("/root-file")),
+                        ("/nested/back", link("../../root-file")),
+                    ])
+                })
+                .build()
+                .unwrap(),
+        );
+        assert_contents(&fs, &ctx, "/to-mounted", b"mounted target");
+        for path in [
+            "/mnt/back-to-root",
+            "/mnt/absolute-root",
+            "/mnt/nested/back",
+            "/to-directory/../../root-file",
+        ] {
+            assert_contents(&fs, &ctx, path, b"root target");
+            assert_eq!(fs.resolve(&ctx, path).unwrap().to_string(), "/root-file");
+        }
+        assert_eq!(
+            fs.resolve(&ctx, "/to-mounted").unwrap().to_string(),
+            "/mnt/file"
+        );
+        assert_eq!(
+            fs.file_status_no_follow(&ctx, "/mnt/back-to-root")
+                .unwrap()
+                .file_type,
+            FileType::SymbolicLink
+        );
+    }
+
+    #[test]
+    fn overlay_links_follow_merged_namespace_and_keep_their_own_identity() {
+        let litebox = LiteBox::new(MockPlatform::new());
+        let ctx = Context::new();
+        let fs = Resolver::new(
+            &litebox,
+            Overlay::new(
+                &litebox,
+                initialized([
+                    ("/shared", file(b"upper wins")),
+                    ("/upper-link", link("/lower-only")),
+                ]),
+                initialized([
+                    ("/shared", file(b"lower hidden")),
+                    ("/lower-only", file(b"lower target")),
+                    ("/lower-link", link("shared")),
+                    ("/copy-link", link("/lower-only")),
+                ]),
+                InodeAllocator::standalone(),
+            ),
+        );
+        assert_contents(&fs, &ctx, "/lower-link", b"upper wins");
+        assert_contents(&fs, &ctx, "/upper-link", b"lower target");
+        assert_contents(&fs, &ctx, "/copy-link", b"lower target");
+        let root = fs.open(&ctx, "/", OFlags::RDONLY, Mode::empty()).unwrap();
+        let entries = fs.read_dir(&root).unwrap();
+        fs.close(&root).unwrap();
+        let mut identities = Vec::new();
+        for name in ["upper-link", "lower-link", "copy-link"] {
+            let path = format!("/{name}");
+            let status = fs.file_status_no_follow(&ctx, &path).unwrap();
+            let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+            assert_eq!(entry.file_type, FileType::SymbolicLink);
+            assert_eq!(status.file_type, FileType::SymbolicLink);
+            assert_eq!(status.mode, ALL_PERMS);
+            assert_eq!(entry.ino_info.as_ref(), Some(&status.node_info));
+            assert_ne!(
+                status.node_info,
+                fs.file_status(&ctx, &path).unwrap().node_info
+            );
+            let fd = fs
+                .open(&ctx, &path, OFlags::PATH | OFlags::NOFOLLOW, Mode::empty())
+                .unwrap();
+            assert_eq!(fs.fd_file_status(&fd).unwrap().node_info, status.node_info);
+            fs.close(&fd).unwrap();
+            identities.push((path, status.node_info));
+        }
+        let target = fs.file_status(&ctx, "/lower-only").unwrap().node_info;
+        let fd = fs
+            .open(&ctx, "/copy-link", OFlags::WRONLY, Mode::empty())
+            .unwrap();
+        fs.write(&fd, b"copied upper", None).unwrap();
+        fs.close(&fd).unwrap();
+        assert_contents(&fs, &ctx, "/lower-only", b"copied upper");
+        assert_contents(&fs, &ctx, "/upper-link", b"copied upper");
+        assert_eq!(
+            fs.file_status(&ctx, "/copy-link").unwrap().node_info,
+            target
+        );
+        for (path, identity) in identities {
+            let status = fs.file_status_no_follow(&ctx, &path).unwrap();
+            assert_eq!(status.file_type, FileType::SymbolicLink);
+            assert_eq!(status.node_info, identity);
+        }
+    }
+}
+
 mod in_mem {
     use crate::LiteBox;
     use crate::fs::{Mode, OFlags};

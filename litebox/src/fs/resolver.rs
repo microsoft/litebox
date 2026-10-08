@@ -3,6 +3,7 @@
 
 //! The path-management/permissions/... layer, that sits above [`super::backend`].
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -159,7 +160,7 @@ impl Default for Context {
     }
 }
 
-/// Absolute normalized path, must only be created from [`Context::resolve`].
+/// Absolute normalized path, created by [`Context::resolve`] or [`Resolver::resolve`].
 ///
 /// Note that a resolved path does not imply that it exists within the file system, merely that it
 /// is an absolute normalized path.
@@ -211,24 +212,235 @@ enum SearchScope {
 impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend + 'static>
     Resolver<Platform, Backend>
 {
-    fn parent_dir_and_name<'a>(
+    /// Resolve a path to its physical location, following symbolic links.
+    ///
+    /// Unlike [`Context::resolve`], this consults the backend before processing `..`.
+    pub fn resolve(&self, context: &Context, path: impl Arg) -> Result<ResolvedPath, WalkError> {
+        self.resolve_path(context, path, true, false)
+    }
+
+    /// Resolve an existing directory, checking search permission on the target as well.
+    pub fn resolve_directory(
         &self,
         context: &Context,
-        path: &'a ResolvedPath,
-    ) -> Result<Option<(WalkedDir<'_>, &'a str)>, WalkError> {
-        // Return the walking handle rather than an owned directory handle so backends can keep any
-        // locks acquired during path resolution held across the final operation. This lets e.g.
-        // "walk parent + mutate child" stay atomic.
-        let Some((parent_components, name)) = path.parent_and_name() else {
-            return Ok(None);
+        path: impl Arg,
+    ) -> Result<ResolvedPath, WalkError> {
+        let path = self.resolve(context, path)?;
+        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
+        if !components.is_empty() {
+            let (outcome, _) = self.walk_path(
+                context,
+                self.backend.root(),
+                &components,
+                &components,
+                if context.acting_user().user == UserInfo::ROOT.user {
+                    SearchScope::ParentsOnly
+                } else {
+                    SearchScope::AllComponents
+                },
+            )?;
+            if outcome.stop_reason != WalkStopReason::CompleteDirectory {
+                return Err(PathError::ComponentNotADirectory.into());
+            }
+        }
+        Ok(path)
+    }
+
+    // Operations rewalk the expanded path; this is not an atomic namespace snapshot.
+    fn resolve_path(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        follow_final: bool,
+        allow_missing: bool,
+    ) -> Result<ResolvedPath, WalkError> {
+        let raw = path.as_rust_str().map_err(PathError::from)?;
+        let mut pending: VecDeque<String> = if raw.starts_with('/') {
+            VecDeque::new()
+        } else {
+            context.cwd.components.iter().cloned().collect()
         };
-        let parent = self.walk_to_directory(
-            context,
-            self.backend.root(),
-            &parent_components,
-            &parent_components,
-        )?;
-        Ok(Some((parent, name)))
+        pending.extend(
+            raw.split('/')
+                .filter(|part| !part.is_empty())
+                .map(String::from),
+        );
+        let mut require_directory = raw.ends_with('/');
+        let mut resolved = Vec::new();
+        let mut from = self.backend.root();
+        let mut links = 0;
+        while let Some(name) = pending.front() {
+            match name.as_str() {
+                "." => {
+                    pending.pop_front();
+                    continue;
+                }
+                ".." => {
+                    pending.pop_front();
+                    resolved.pop();
+                    let components: Vec<_> = resolved.iter().map(String::as_str).collect();
+                    from = self
+                        .walk_to_directory(context, self.backend.root(), &components, &components)?
+                        .handle;
+                    continue;
+                }
+                _ => {}
+            }
+            let components: Vec<_> = pending
+                .iter()
+                .take_while(|part| !matches!(part.as_str(), "." | ".."))
+                .map(String::as_str)
+                .collect();
+            let run_len = components.len();
+            let outcome = match self.backend.walk_directories(from, &components) {
+                Ok(outcome) => outcome,
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                    if allow_missing && !require_directory && run_len == pending.len() {
+                        // A failed batch does not identify the missing component. Validate its
+                        // parent before allowing creation of only the final name.
+                        let parent: Vec<_> = resolved
+                            .iter()
+                            .map(String::as_str)
+                            .chain(components[..run_len - 1].iter().copied())
+                            .collect();
+                        self.walk_to_directory(context, self.backend.root(), &parent, &parent)?;
+                        resolved.extend(pending);
+                        return Ok(ResolvedPath {
+                            components: resolved,
+                        });
+                    }
+                    return Err(if run_len == pending.len() {
+                        PathError::NoSuchFileOrDirectory
+                    } else {
+                        PathError::MissingComponent
+                    }
+                    .into());
+                }
+                Err(error) => return Err(error),
+            };
+            let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
+            Self::check_walk_permissions(
+                context,
+                &components,
+                &outcome,
+                if run_len == pending.len() && !continuing {
+                    SearchScope::ParentsOnly
+                } else {
+                    SearchScope::AllComponents
+                },
+            )?;
+            let walked = outcome.components.len();
+            assert!(walked <= run_len);
+            resolved.extend(pending.drain(..walked));
+            match outcome.stop_reason {
+                WalkStopReason::CompleteDirectory => {
+                    assert_eq!(walked, run_len);
+                    from = outcome.last;
+                }
+                WalkStopReason::Symlink(target) => {
+                    let name = pending.pop_front().expect("symlink is the next component");
+                    let final_component = pending.is_empty();
+                    if final_component && !follow_final && !require_directory {
+                        resolved.push(name);
+                        return Ok(ResolvedPath {
+                            components: resolved,
+                        });
+                    }
+                    links += 1;
+                    if links > 40 {
+                        return Err(PathError::TooManySymlinks.into());
+                    }
+                    if target.starts_with('/') {
+                        resolved.clear();
+                        from = self.backend.root();
+                    } else {
+                        from = outcome.last;
+                    }
+                    if final_component && target.ends_with('/') {
+                        require_directory = true;
+                    }
+                    for part in target.split('/').filter(|part| !part.is_empty()).rev() {
+                        pending.push_front(String::from(part));
+                    }
+                }
+                WalkStopReason::StoppedAtNonDirectory => {
+                    let name = pending
+                        .pop_front()
+                        .expect("non-directory is the next component");
+                    if !pending.is_empty() || require_directory {
+                        return Err(PathError::ComponentNotADirectory.into());
+                    }
+                    resolved.push(name);
+                    return Ok(ResolvedPath {
+                        components: resolved,
+                    });
+                }
+                WalkStopReason::Continue => {
+                    assert!(walked > 0 && walked < run_len);
+                    from = outcome.last;
+                }
+            }
+        }
+        Ok(ResolvedPath {
+            components: resolved,
+        })
+    }
+
+    fn parent_dir_and_name(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        check_trailing_slash: bool,
+    ) -> Result<Option<(WalkedDir<'_>, String)>, WalkError> {
+        let raw = path.as_rust_str().map_err(PathError::from)?;
+        let trimmed = raw.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let (parent_path, name) = match trimmed.rsplit_once('/') {
+            Some(("", name)) => ("/", name),
+            Some(parts) => parts,
+            None => ("", trimmed),
+        };
+        // Entry mutations resolve the parent but retain the final name, so neither a link nor
+        // a final `.`/`..` can redirect a removal to an ordinary target directory.
+        let parent_path = self.resolve(context, parent_path)?;
+        let parent_components: Vec<_> = parent_path.components.iter().map(String::as_str).collect();
+        let walk_parent = || {
+            self.walk_to_directory(
+                context,
+                self.backend.root(),
+                &parent_components,
+                &parent_components,
+            )
+        };
+        let mut parent = walk_parent()?;
+        if check_trailing_slash && raw.ends_with('/') && !matches!(name, "." | "..") {
+            match self.backend.walk_directories(parent.handle, &[name]) {
+                Ok(outcome) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {}
+                Ok(_) => return Err(PathError::ComponentNotADirectory.into()),
+                // `mkdir` may create this missing final directory. Removal reports ENOENT below.
+                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {}
+                Err(error) => return Err(error),
+            }
+            parent = walk_parent()?;
+        }
+        Ok(Some((parent, String::from(name))))
+    }
+
+    /// Read a symbolic link's stored target, without following the final link.
+    pub fn read_link(&self, context: &Context, path: impl Arg) -> Result<String, WalkError> {
+        let path = self.resolve_path(context, path, false, false)?;
+        let Some((components, name)) = path.parent_and_name() else {
+            return Err(PathError::InvalidPathname.into());
+        };
+        let parent =
+            self.walk_to_directory(context, self.backend.root(), &components, &components)?;
+        let outcome = self.backend.walk_directories(parent.handle, &[name])?;
+        match outcome.stop_reason {
+            WalkStopReason::Symlink(target) => Ok(target),
+            _ => Err(PathError::InvalidPathname.into()),
+        }
     }
 
     /// Whether `context` may add or remove entries in `dir`.
@@ -309,7 +521,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     permissions,
                 })
             }
-            WalkStopReason::StoppedAtNonDirectory => {
+            WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_) => {
                 let file = self
                     .backend
                     .open_file_at(outcome.last, components[walked], OFlags::PATH)
@@ -375,7 +587,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         permissions,
                     });
                 }
-                WalkStopReason::StoppedAtNonDirectory => {
+                WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_) => {
                     return Err(WalkError::PathError(PathError::ComponentNotADirectory));
                 }
                 WalkStopReason::Continue => {
@@ -418,10 +630,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     assert_eq!(walked, components.len() - (offset - walked));
                     return Ok((outcome, offset));
                 }
-                WalkStopReason::StoppedAtNonDirectory if offset == components.len() - 1 => {
+                WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_)
+                    if offset == components.len() - 1 =>
+                {
                     return Ok((outcome, offset));
                 }
-                WalkStopReason::StoppedAtNonDirectory => {
+                WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_) => {
                     return Err(WalkError::PathError(PathError::ComponentNotADirectory));
                 }
                 WalkStopReason::Continue => {
@@ -501,7 +715,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let path = context.resolve(path)?;
+        let path = self
+            .resolve_path(
+                context,
+                path,
+                !flags.contains(OFlags::NOFOLLOW) && !flags.contains(OFlags::CREAT | OFlags::EXCL),
+                flags.contains(OFlags::CREAT),
+            )
+            .map_err(|error| match error {
+                WalkError::Io => OpenError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
@@ -552,7 +776,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 ))
             }
             Ok((outcome, walked))
-                if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
+                if matches!(
+                    outcome.stop_reason,
+                    WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_)
+                ) =>
             {
                 let name = components[walked];
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
@@ -827,7 +1054,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Change the permissions of a file
     pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let path = context.resolve(path)?;
+        let path = self.resolve(context, path).map_err(|error| match error {
+            WalkError::Io => ChmodError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
         let handle = self
             .path_handle(context, &path)
             .map_err(|error| match error {
@@ -848,7 +1078,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = context.resolve(path)?;
+        let path = self.resolve(context, path).map_err(|error| match error {
+            WalkError::Io => ChownError::Io,
+            WalkError::PathError(error) => error.into(),
+        })?;
         let handle = self
             .path_handle(context, &path)
             .map_err(|error| match error {
@@ -863,9 +1096,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Unlink a file
     pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
-        let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
+            self.parent_dir_and_name(context, path, true)
                 .map_err(|error| match error {
                     WalkError::Io => UnlinkError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -873,6 +1105,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(UnlinkError::IsADirectory);
         };
+        if matches!(name.as_str(), "." | "..") {
+            return Err(UnlinkError::IsADirectory);
+        }
         if !Self::can_change_entries_in_dir(context, &parent) {
             return Err(UnlinkError::NoWritePerms);
         }
@@ -882,14 +1117,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => UnlinkError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.unlink_at(parent, name)
+        self.backend.unlink_at(parent, &name)
     }
 
     /// Create a new directory
     pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
+            self.parent_dir_and_name(context, path, false)
                 .map_err(|error| match error {
                     WalkError::Io => MkdirError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -897,6 +1131,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(MkdirError::AlreadyExists);
         };
+        if matches!(name.as_str(), "." | "..") {
+            return Err(MkdirError::AlreadyExists);
+        }
         if !Self::can_change_entries_in_dir(context, &parent) {
             return Err(MkdirError::NoWritePerms);
         }
@@ -909,7 +1146,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.backend
             .mkdir_at(
                 parent,
-                name,
+                &name,
                 CreationMetadata {
                     mode,
                     owner: context.acting_user(),
@@ -920,9 +1157,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Remove a directory
     pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
-        let path = context.resolve(path)?;
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
+            self.parent_dir_and_name(context, path, true)
                 .map_err(|error| match error {
                     WalkError::Io => RmdirError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -930,6 +1166,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         else {
             return Err(RmdirError::Busy);
         };
+        match name.as_str() {
+            "." => return Err(PathError::InvalidPathname.into()),
+            ".." => return Err(RmdirError::NotEmpty),
+            _ => {}
+        }
         if !Self::can_change_entries_in_dir(context, &parent) {
             return Err(RmdirError::NoWritePerms);
         }
@@ -939,7 +1180,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 WalkError::Io => RmdirError::Io,
                 WalkError::PathError(error) => error.into(),
             })?;
-        self.backend.rmdir_at(parent, name)
+        self.backend.rmdir_at(parent, &name)
     }
 
     /// Read directory entries from a directory file descriptor.
@@ -976,18 +1217,32 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(entries)
     }
 
-    /// Obtain the status of a file/directory/... on the file-system.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "`CloseError` is uninhabited, so the internal close cannot fail"
-    )]
+    /// Obtain the status of a file/directory/... on the file-system, following symbolic links.
     pub fn file_status(
         &self,
         context: &Context,
         path: impl Arg,
     ) -> Result<super::FileStatus, FileStatusError> {
+        self.file_status_with_flags(context, path, OFlags::PATH)
+    }
+
+    /// Obtain status without following a final symbolic link.
+    pub fn file_status_no_follow(
+        &self,
+        context: &Context,
+        path: impl Arg,
+    ) -> Result<super::FileStatus, FileStatusError> {
+        self.file_status_with_flags(context, path, OFlags::PATH | OFlags::NOFOLLOW)
+    }
+
+    fn file_status_with_flags(
+        &self,
+        context: &Context,
+        path: impl Arg,
+        flags: OFlags,
+    ) -> Result<super::FileStatus, FileStatusError> {
         let fd = self
-            .open(context, path, OFlags::PATH, Mode::empty())
+            .open(context, path, flags, Mode::empty())
             .map_err(|error| match error {
                 OpenError::PathError(error) => error.into(),
                 OpenError::Io

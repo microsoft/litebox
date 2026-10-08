@@ -264,6 +264,26 @@ enum FsPath {
 /// Maximum size of a file path
 pub const PATH_MAX: usize = 4096;
 
+fn stdio_fd_target(path: &str) -> Option<&'static str> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut components = path.split('/').filter(|part| !matches!(*part, "" | "."));
+    if components.next() != Some("proc")
+        || components.next() != Some("self")
+        || components.next() != Some("fd")
+    {
+        return None;
+    }
+    let target = match components.next()? {
+        "0" => "/dev/stdin",
+        "1" => "/dev/stdout",
+        "2" => "/dev/stderr",
+        _ => return None,
+    };
+    components.next().is_none().then_some(target)
+}
+
 impl FsPath {
     /// Create a new `FsPath` from a dirfd and path.
     ///
@@ -1347,12 +1367,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         mode: AccessFlags,
         caller: AccessUserInfo,
+        follow_symlink: bool,
     ) -> Result<(), Errno> {
         let status = {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.file_status(&context, pathname)?
+            if follow_symlink {
+                files.fs.file_status(&context, pathname)?
+            } else {
+                files.fs.file_status_no_follow(&context, pathname)?
+            }
         };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1368,21 +1393,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let supported_flags =
             AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
-        // TODO: `AT_SYMLINK_NOFOLLOW` is accepted for Linux compatibility, but LiteBox file
-        // status lookups do not currently follow symlinks in any backend.
         if flags.intersects(supported_flags.complement()) {
             return Err(Errno::EINVAL);
         }
 
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
+        let follow_symlink = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
         let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
-            FsPath::Absolute { path } => self.do_access(path, mode, caller),
+            FsPath::Absolute { path } => self.do_access(path, mode, caller, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let cwd = get_cwd();
-                self.do_access(cwd, mode, caller)
+                self.do_access(cwd, mode, caller, follow_symlink)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let stat: FileStat = self.with_typed_fd(fd, |fd| self.do_stat(fd))?;
@@ -1408,22 +1432,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Read the target of a symbolic link
     ///
     /// The caller must pass an absolute path.
-    ///
-    /// Note that this function only handles the following cases that we hardcoded:
-    /// - `/proc/self/fd/<fd>`
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
-        if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
-            let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
-            match fd {
-                0 => return Ok("/dev/stdin".to_string()),
-                1 => return Ok("/dev/stdout".to_string()),
-                2 => return Ok("/dev/stderr".to_string()),
-                _ => unimplemented!(),
-            }
+        use litebox::fs::errors::WalkError;
+
+        if let Some(target) = stdio_fd_target(fullpath) {
+            return Ok(target.to_string());
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        let files = self.files.borrow();
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        files
+            .fs
+            .read_link(&context, fullpath)
+            .map_err(|error| match error {
+                WalkError::PathError(error) => Errno::from(error),
+                _ => Errno::EIO,
+            })
     }
 
     /// Handle syscall `readlink`
@@ -1438,6 +1463,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         buf: &mut [u8],
     ) -> Result<usize, Errno> {
+        if buf.is_empty() {
+            return Err(Errno::EINVAL);
+        }
         let pathname = self.resolve_path_at(dirfd, pathname)?;
         let path = self.do_readlink(pathname.to_str().map_err(|_| Errno::EINVAL)?)?;
         let bytes = path.as_bytes();
@@ -1525,18 +1553,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         follow_symlink: bool,
     ) -> Result<T, Errno> {
-        let normalized_path = pathname.normalized()?;
+        let path = pathname.as_rust_str()?;
         let path = if follow_symlink {
-            self.do_readlink(normalized_path.as_str())
-                .unwrap_or(normalized_path)
+            stdio_fd_target(path).unwrap_or(path)
         } else {
-            normalized_path
+            path
         };
         let status = {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.file_status(&context, path)?
+            if follow_symlink {
+                files.fs.file_status(&context, path)?
+            } else {
+                files.fs.file_status_no_follow(&context, path)?
+            }
         };
         Ok(T::from(status))
     }
@@ -1551,7 +1582,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// `lstat` is identical to `stat`, except that if `pathname` is a symbolic link,
     /// then it returns information about the link itself, not the file that the link refers to.
-    /// TODO: we do not support symbolic links yet.
     pub fn sys_lstat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
         let pathname = self.resolve_path(pathname)?;
         self.do_path_stat(pathname, false)
@@ -1604,7 +1634,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
+        let current_support_flags = AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW;
         if flags.intersects(current_support_flags.complement()) {
             log_unsupported!("unsupported flags: {flags:?}");
             return Err(Errno::EINVAL);
@@ -1854,8 +1884,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
-        use litebox::fs::FileType;
-        use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::fs::errors::WalkError;
 
         let fs = self.fs.borrow();
         if pathname
@@ -1866,34 +1895,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENOENT);
         }
 
-        // Resolve relative paths against the CWD, and normalize (handle `.` / `..`).
-        let target = fs
-            .context
-            .read()
-            .resolve(pathname)
-            .map_err(|_| Errno::EINVAL)?;
-
-        // Verify the path exists and is a directory.
-        {
+        let target = {
             let files = self.files.borrow();
             let context = fs.context.read();
-            match files.fs.file_status(&context, target.to_string()) {
-                Ok(status) => {
-                    if status.file_type != FileType::Directory {
-                        return Err(Errno::ENOTDIR);
-                    }
-                }
-                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
-                    return Err(Errno::ENOENT);
-                }
-                Err(FileStatusError::PathError(_)) => {
-                    return Err(Errno::EACCES);
-                }
-                Err(_) => {
-                    return Err(Errno::ENOENT);
-                }
-            }
-        }
+            files
+                .fs
+                .resolve_directory(&context, pathname)
+                .map_err(|error| match error {
+                    WalkError::PathError(error) => Errno::from(error),
+                    _ => Errno::EIO,
+                })?
+        };
 
         fs.context.write().set_cwd(target);
         Ok(())
@@ -2736,6 +2748,198 @@ mod tests {
     use litebox::fs::{Mode, OFlags};
 
     extern crate std;
+
+    #[test]
+    fn initialized_symlinks_stat_access_and_cwd() {
+        use litebox::fs::UserInfo;
+        use litebox::fs::in_mem::{InMem, InitialNode};
+        use litebox_common_linux::AT_FDCWD;
+
+        let directory = || InitialNode::Directory {
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+            owner: UserInfo::ROOT,
+        };
+        let symlink = |target: &str| InitialNode::Symlink {
+            owner: UserInfo::ROOT,
+            target: target.into(),
+        };
+        let in_mem = InMem::new_initialized([
+            ("/", directory()),
+            ("/real", directory()),
+            ("/real/child", directory()),
+            (
+                "/real/file",
+                InitialNode::File {
+                    mode: Mode::RUSR | Mode::RGRP | Mode::ROTH,
+                    owner: UserInfo::ROOT,
+                    data: b"contents".as_slice().into(),
+                },
+            ),
+            ("/real/relative_link", symlink("file")),
+            ("/real/chain", symlink("relative_link")),
+            ("/real/raw_link", symlink("./child/../file")),
+            (
+                "/real/unsearchable",
+                InitialNode::Directory {
+                    mode: Mode::RUSR,
+                    owner: UserInfo {
+                        user: 1000,
+                        group: 1000,
+                    },
+                },
+            ),
+            ("/denied_link", symlink("real/unsearchable")),
+            ("/file_link", symlink("real/file")),
+            ("/dir_link", symlink("real/child")),
+            ("/dangling", symlink("missing")),
+            ("/loop", symlink("loop")),
+        ]);
+        let builder = crate::LinuxShimBuilder::new(crate::syscalls::tests::test_platform(None));
+        let fs = alloc::sync::Arc::new(
+            builder.default_fs(
+                in_mem,
+                include_bytes!("../../../litebox/src/fs/test.tar")
+                    .as_slice()
+                    .into(),
+            ),
+        );
+        let task = builder.build().0.new_test_task(fs);
+
+        let file_type = InodeType::File as u32;
+        let symlink_type = InodeType::SymLink as u32;
+        let stat = task.sys_stat("/file_link").unwrap();
+        let lstat = task.sys_lstat("/file_link").unwrap();
+        assert_eq!(stat.st_mode & 0o170000, file_type);
+        assert_eq!(lstat.st_mode & 0o170000, symlink_type);
+        assert_eq!({ stat.st_size }, b"contents".len());
+        assert_eq!({ lstat.st_size }, "real/file".len());
+        assert_ne!({ stat.st_ino }, { lstat.st_ino });
+        task.sys_stat("/real/relative_link").unwrap();
+        task.sys_stat("/real/chain").unwrap();
+        task.sys_stat("/real/raw_link").unwrap();
+
+        for (flags, expected_type) in [
+            (AtFlags::empty(), file_type),
+            (AtFlags::AT_SYMLINK_NOFOLLOW, symlink_type),
+        ] {
+            let stat = task.sys_newfstatat(AT_FDCWD, "/file_link", flags).unwrap();
+            assert_eq!(stat.st_mode & 0o170000, expected_type);
+        }
+        for (flags, expected_type) in [
+            (AtFlags::empty(), file_type),
+            (AtFlags::AT_SYMLINK_NOFOLLOW, symlink_type),
+        ] {
+            let stat = task
+                .sys_statx(AT_FDCWD, "/file_link", flags, StatxMask::STATX_BASIC_STATS)
+                .unwrap();
+            assert_eq!(u32::from(stat.stx_mode) & 0o170000, expected_type);
+        }
+
+        for path in ["/dangling", "/loop"] {
+            let expected_error = if path == "/loop" {
+                Errno::ELOOP
+            } else {
+                Errno::ENOENT
+            };
+            assert_eq!(task.sys_stat(path).unwrap_err(), expected_error);
+            assert_eq!(
+                task.sys_lstat(path).unwrap().st_mode & 0o170000,
+                symlink_type
+            );
+            assert_eq!(
+                task.sys_faccessat(AT_FDCWD, path, AccessFlags::F_OK, AtFlags::empty()),
+                Err(expected_error),
+            );
+            task.sys_faccessat(
+                AT_FDCWD,
+                path,
+                AccessFlags::R_OK,
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+            assert_eq!(task.sys_chdir(path), Err(expected_error));
+        }
+
+        for (path, target) in [
+            ("/file_link", "real/file"),
+            ("/real/relative_link", "file"),
+            ("/real/chain", "relative_link"),
+            ("/real/raw_link", "./child/../file"),
+            ("/dangling", "missing"),
+            ("/loop", "loop"),
+        ] {
+            let mut buf = [0xa5u8; 64];
+            let len = task.sys_readlink(path, &mut buf).unwrap();
+            assert_eq!(&buf[..len], target.as_bytes());
+            assert_eq!(buf[len], 0xa5);
+            let mut truncated = [0xa5u8; 3];
+            assert_eq!(task.sys_readlink(path, &mut truncated), Ok(3));
+            assert_eq!(&truncated, &target.as_bytes()[..3]);
+        }
+        for path in ["/real", "/real/file"] {
+            assert_eq!(task.sys_readlink(path, &mut [0u8; 32]), Err(Errno::EINVAL));
+        }
+        assert_eq!(
+            task.sys_readlink("/loop/child", &mut [0u8; 32]),
+            Err(Errno::ELOOP),
+        );
+        assert_eq!(
+            task.sys_readlink("/does_not_exist", &mut [0u8; 32]),
+            Err(Errno::ENOENT),
+        );
+
+        // Lexical normalization would incorrectly look for `/file` instead.
+        assert_eq!(
+            task.sys_stat("/dir_link/../file").unwrap().st_mode & 0o170000,
+            file_type
+        );
+        assert_eq!(
+            task.sys_lstat("/dir_link/../file").unwrap().st_mode & 0o170000,
+            file_type
+        );
+        task.sys_chdir("/dir_link").unwrap();
+        let mut buf = [0u8; 128];
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"/real/child\0");
+        task.sys_stat("../file").unwrap();
+        task.sys_chdir("..").unwrap();
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"/real\0");
+        task.sys_stat("/file_link").unwrap();
+        task.sys_stat("relative_link").unwrap();
+        let len = task
+            .sys_readlinkat(AT_FDCWD, "relative_link", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..len], b"file");
+        let len = task
+            .sys_readlink("/dir_link/../relative_link", &mut buf)
+            .unwrap();
+        assert_eq!(&buf[..len], b"file");
+
+        let fs = task.fs.borrow();
+        fs.context.write().set_acting_user(UserInfo {
+            user: 1000,
+            group: 1000,
+        });
+        task.sys_stat("/denied_link").unwrap();
+        assert_eq!(task.sys_chdir("/denied_link"), Err(Errno::EACCES));
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"/real\0");
+        fs.context.write().set_acting_user(UserInfo::ROOT);
+        task.sys_chdir("/denied_link").unwrap();
+        let len = task.sys_getcwd(&mut buf).unwrap();
+        assert_eq!(&buf[..len], b"/real/unsearchable\0");
+
+        for path in ["/proc/self/fd/0", "/proc//self/./fd/0"] {
+            assert_eq!(
+                task.sys_stat(path).unwrap().st_mode & 0o170000,
+                InodeType::CharDevice as u32,
+            );
+            let len = task.sys_readlink(path, &mut buf).unwrap();
+            assert_eq!(&buf[..len], b"/dev/stdin");
+        }
+        assert_eq!(task.sys_readlink("/file_link", &mut []), Err(Errno::EINVAL));
+    }
 
     #[test]
     fn write_to_iovec_returns_partial_after_later_error() {
