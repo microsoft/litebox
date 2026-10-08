@@ -491,9 +491,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         offset: usize,
     ) -> Result<usize, ReadError> {
         let file = h.get_typed::<Self>().file.read();
-        if file.file_type == FileType::SymbolicLink {
-            return Err(ReadError::Io);
-        }
         let start = offset.min(file.data.len());
         let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
         debug_assert!(start <= end);
@@ -509,9 +506,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         offset: usize,
     ) -> Result<usize, WriteError> {
         let mut file = h.get_typed::<Self>().file.write();
-        if file.file_type == FileType::SymbolicLink {
-            return Err(WriteError::Io);
-        }
         let overwritten_len = match offset.cmp(&file.data.len()) {
             core::cmp::Ordering::Less => {
                 let end = offset.checked_add(buf.len()).unwrap().min(file.data.len());
@@ -532,9 +526,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
 
     fn truncate(&self, h: &super::backend::FileHandle, length: usize) -> Result<(), TruncateError> {
         let mut file = h.get_typed::<Self>().file.write();
-        if file.file_type == FileType::SymbolicLink {
-            return Err(TruncateError::Io);
-        }
         match length.cmp(&file.data.len()) {
             core::cmp::Ordering::Less => match &mut file.data {
                 alloc::borrow::Cow::Borrowed(d) => *d = &d[..length],
@@ -697,11 +688,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        if let super::backend::HandleRef::File(h) = h
-            && h.get_typed::<Self>().file.read().file_type == FileType::SymbolicLink
-        {
-            return Err(ChownError::Io);
-        }
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().file.write(), |f| &mut f.perms)

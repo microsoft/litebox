@@ -343,23 +343,17 @@ mod symlinks {
             .open_file_at(backend.root(), "link", OFlags::PATH | OFlags::NOFOLLOW)
             .unwrap()
             .item;
-        assert!(backend.read(&handle, &mut [0; 32], 0).is_err());
-        assert!(
-            backend
-                .chown(HandleRef::File(&handle), Some(0), None)
-                .is_err()
-        );
-        assert!(backend.write(&handle, b"/new-target", 0).is_err());
-        assert!(backend.truncate(&handle, 0).is_err());
+        backend
+            .chown(HandleRef::File(&handle), Some(0), None)
+            .unwrap();
         assert!(
             backend
                 .chmod(HandleRef::File(&handle), Mode::empty())
                 .is_err()
         );
-        assert_eq!(
-            backend.status(HandleRef::File(&handle)).unwrap().mode,
-            ALL_PERMS
-        );
+        let status = backend.status(HandleRef::File(&handle)).unwrap();
+        assert_eq!(status.owner.user, 0);
+        assert_eq!(status.mode, ALL_PERMS);
         assert_eq!(
             backend
                 .walk_directories(backend.root(), &["link"])
