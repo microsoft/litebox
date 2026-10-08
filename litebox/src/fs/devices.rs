@@ -213,7 +213,6 @@ where
     }
 
     fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
-        // Device files are never symlinks.
         Err(PathError::InvalidPathname.into())
     }
 

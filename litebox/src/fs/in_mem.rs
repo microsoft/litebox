@@ -60,7 +60,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     ///
     /// Panics if an entry's parent does not exist or is not a directory, if an entry changes the
     /// type of an existing path, if the root is given as a non-directory, or if a symlink target
-    /// is empty or contains a NUL byte.
+    /// is malformed.
     #[must_use]
     pub fn new_initialized<Path: AsRef<str>>(
         entries: impl IntoIterator<Item = (Path, InitialNode)>,
@@ -241,7 +241,7 @@ pub enum InitialNode {
     Symlink {
         /// Owning user and group.
         owner: UserInfo,
-        /// A nonempty target without NUL bytes; it need not exist or be normalized.
+        /// The link's target; it need not exist or be normalized.
         target: String,
     },
 }

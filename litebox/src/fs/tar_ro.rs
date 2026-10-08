@@ -127,7 +127,6 @@ impl super::backend::Backend for TarRo {
     }
 
     fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
-        // Tar symlink entries are not indexed, so no walk reports one.
         Err(PathError::InvalidPathname.into())
     }
 

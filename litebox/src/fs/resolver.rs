@@ -395,6 +395,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         path: impl Arg,
         check_trailing_slash: bool,
     ) -> Result<Option<(WalkedDir<'_>, String)>, WalkError> {
+        // Return the walking handle rather than an owned directory handle so backends can keep any
+        // locks acquired during path resolution held across the final operation. This lets e.g.
+        // "walk parent + mutate child" stay atomic.
         let raw = path.as_rust_str().map_err(PathError::from)?;
         let trimmed = raw.trim_end_matches('/');
         if trimmed.is_empty() {
