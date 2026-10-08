@@ -1839,6 +1839,7 @@ dependencies = [
  "litebox_platform",
  "litebox_util_log",
  "log",
+ "spin 0.9.8",
  "zerocopy",
  "zeroize",
 ]

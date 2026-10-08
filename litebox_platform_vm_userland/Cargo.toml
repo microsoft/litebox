@@ -15,6 +15,7 @@ litebox_common_vm_abi = { path = "../litebox_common_vm_abi", version = "0.1.0" }
 litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 zeroize = { version = "1.8", default-features = false }
 

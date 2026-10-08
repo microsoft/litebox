@@ -495,6 +495,91 @@ impl VmKernel {
             unsafe { self.page_table_manager.load_task(pt_id) }
         }
     }
+
+    /// Pins `range` of `address_space`, whose pages must be present and
+    /// writable, for access through the kernel mapping: from any context,
+    /// whichever address space is current, without SMAP or faults, as
+    /// `io_uring` reaches its rings.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may unmap or remap a page of `range` while the result lives.
+    /// The address space keeps owning the frames; the result keeps only its
+    /// page table, and so the frames, alive, even once it is unregistered.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for an empty, unaligned, or non-user range or for
+    /// [`AddressSpaceId::KERNEL`], `ENOENT` for an unknown ID, and `EFAULT`
+    /// if a page is not present and writable.
+    pub unsafe fn pin_user_pages(
+        &self,
+        address_space: AddressSpaceId,
+        range: core::ops::Range<usize>,
+    ) -> Result<PinnedUserPages, Errno> {
+        let range = PageRange::<PAGE_SIZE>::new(range.start, range.end).ok_or(Errno::EINVAL)?;
+        if range.is_empty() || range.start < USER_ADDR_MIN || range.end > USER_ADDR_MAX {
+            return Err(Errno::EINVAL);
+        }
+        if address_space == AddressSpaceId::KERNEL {
+            return Err(Errno::EINVAL);
+        }
+        let page_table = Arc::clone(
+            self.page_table_manager
+                .task_page_tables
+                .read()
+                .get(&address_space)
+                .ok_or(Errno::ENOENT)?,
+        );
+        let pages = range
+            .into_iter()
+            .map(|addr| {
+                let frame = page_table
+                    .user_writable_frame(VirtAddr::new(addr as u64))
+                    .ok_or(Errno::EFAULT)?;
+                Ok(Self::pa_to_va(frame.start_address()).as_u64().trunc())
+            })
+            .collect::<Result<_, Errno>>()?;
+        Ok(PinnedUserPages {
+            _page_table: page_table,
+            pages,
+        })
+    }
+}
+
+/// User pages the kernel reaches through its own mapping; see
+/// [`VmKernel::pin_user_pages`].
+///
+/// The process can write them at any time, including (with more CPUs)
+/// concurrently, so the kernel must never form Rust references into them: it
+/// accesses them only through raw, peer-safe operations, and validates what
+/// it reads.
+pub struct PinnedUserPages {
+    /// Keeps the frames, which its address space owns, from being freed.
+    _page_table: Arc<mm::PageTable<PAGE_SIZE>>,
+    /// The kernel address of each page, in order.
+    pages: alloc::boxed::Box<[usize]>,
+}
+
+impl PinnedUserPages {
+    /// In bytes.
+    pub fn len(&self) -> usize {
+        self.pages.len() * PAGE_SIZE
+    }
+
+    /// Never: [`VmKernel::pin_user_pages`] rejects empty ranges.
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// The kernel address of byte `offset`, valid for as many bytes as the
+    /// second value (to the end of its page) while `self` lives; `None` past
+    /// the end.
+    pub fn kernel_address(&self, offset: usize) -> Option<(*mut u8, usize)> {
+        let page = *self.pages.get(offset / PAGE_SIZE)?;
+        let within = offset % PAGE_SIZE;
+        Some(((page + within) as *mut u8, PAGE_SIZE - within))
+    }
 }
 
 impl RawMutexProvider for VmKernel {

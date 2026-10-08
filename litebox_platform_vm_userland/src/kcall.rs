@@ -6,8 +6,8 @@
 //! [`GATE_SECTION`](litebox_common_vm_abi::GATE_SECTION).
 
 use litebox_common_vm_abi::{
-    BrokerOpSet, CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel,
-    LogRequest, MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest,
+    BrokerEnterRequest, CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall,
+    LogLevel, LogRequest, MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest,
     ReadyRequest, RestrictRequest, Status, UnmapRequest, UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
@@ -139,8 +139,18 @@ pub fn protect(addr: usize, len: usize, prot: Prot) -> Result<(), Status> {
 /// # Errors
 ///
 /// See [`call`].
-pub fn restrict(calls: CallSet, broker_ops: BrokerOpSet, prots: ProtSet) -> Result<(), Status> {
-    call(&RestrictRequest::new(calls, broker_ops, prots))
+pub fn restrict(calls: CallSet, prots: ProtSet) -> Result<(), Status> {
+    call(&RestrictRequest::new(calls, prots))
+}
+
+/// The broker's doorbell, like `io_uring_enter`: the kernel serves every
+/// request published in the control ring before returning.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn broker_enter() -> Result<(), Status> {
+    call(&BrokerEnterRequest::new())
 }
 
 /// # Errors

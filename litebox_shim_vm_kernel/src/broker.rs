@@ -1,29 +1,54 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! A process's broker association: control frames in kernel calls, payloads
-//! in the process's broker shared memory.
+//! A process's broker association, served like `io_uring` (see
+//! `litebox_common_vm_abi`, Broker): the handshake in a kernel call, then
+//! requests and responses in the shared control ring of
+//! `litebox_broker_transport`, the one the userland broker uses, and payloads
+//! in the broker shared memory. [`CallId::BrokerEnter`] is the doorbell.
+//!
+//! The two planes live differently:
+//! - The control ring (control plane: every call, small, hostile metadata) is
+//!   pinned and reached through the kernel's own mapping
+//!   ([`PinnedControlRing`]), like `io_uring`'s rings: from any context, with
+//!   atomic word operations, and without SMAP windows or faults.
+//! - The shared buffers (data plane: bulk, large) stay in the process's
+//!   lazily populated mapping ([`UserSharedMemory`]), touched only while
+//!   executing a request that names them, during the process's own
+//!   `BrokerEnter`, when its address space is current.
+//!
+//! [`CallId::BrokerEnter`]: litebox_common_vm_abi::CallId::BrokerEnter
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
-use core::cell::{Cell, RefCell};
+use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::convert::Infallible;
+use core::ops::Range;
 use litebox_broker_core::BrokerCore;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_host::BrokerHostAssociation;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation,
-};
+use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
-use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError};
-use litebox_common_vm_abi::{BrokerOp, Status, UserRange, WireFrame};
+use litebox_broker_transport::control_ring::{
+    BrokerControlRingEndpoints, CONTROL_RING_MEMORY_SIZE, ControlRing, ControlRingConsumer,
+    ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus, MemoryAccessPolicy,
+};
+use litebox_broker_transport::peer_memory;
+use litebox_broker_transport::shared_memory::{
+    ControlRingMemory, SharedBufferPool, SharedMemory, SharedMemoryError,
+};
+use litebox_common_vm_abi::{Status, UserRange, WireFrame};
+use litebox_platform_vm_kernel::PinnedUserPages;
 
-/// Accessed through the process's user mapping: valid only while that
-/// process's address space is current, which holds because the broker host
-/// touches it only during that process's kernel calls.
+use crate::memory::{copy_from_user, copy_to_user};
+
+/// The shared buffers, in the process's user mapping: valid only while its
+/// address space is current.
 pub(crate) struct UserSharedMemory {
     region: UserRange,
 }
@@ -47,15 +72,143 @@ impl SharedMemory for UserSharedMemory {
 
     fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
         let addr = self.checked(offset, destination.len())?;
-        let bytes = crate::memory::copy_from_user(addr, destination.len())
-            .map_err(|_| SharedMemoryError::AccessFailed)?;
+        let bytes =
+            copy_from_user(addr, destination.len()).map_err(|_| SharedMemoryError::AccessFailed)?;
         destination.copy_from_slice(&bytes);
         Ok(())
     }
 
     fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
         let addr = self.checked(offset, source.len())?;
-        crate::memory::copy_to_user(addr, source).map_err(|_| SharedMemoryError::AccessFailed)
+        copy_to_user(addr, source).map_err(|_| SharedMemoryError::AccessFailed)
+    }
+}
+
+/// The control ring at the start of pinned pages, reached through the
+/// kernel's own mapping: independent of the current address space, and with
+/// the same peer-safe operations the userland transport uses, so its words
+/// are atomic to the process even on more CPUs. Byte and word accesses keep
+/// to the ring ABI's disjoint regions ([`MemoryAccessPolicy::ControlRing`]).
+pub(crate) struct PinnedControlRing(PinnedUserPages);
+
+impl PinnedControlRing {
+    /// `None` if `pages` cannot hold the ring.
+    pub(crate) fn new(pages: PinnedUserPages) -> Option<Self> {
+        (pages.len() >= CONTROL_RING_MEMORY_SIZE).then_some(Self(pages))
+    }
+
+    fn word<T>(&self, offset: usize, permitted: bool) -> Result<*mut T, SharedMemoryError> {
+        if !permitted {
+            return Err(SharedMemoryError::InvalidRange);
+        }
+        if !offset.is_multiple_of(size_of::<T>()) {
+            return Err(SharedMemoryError::UnalignedWord);
+        }
+        // An aligned word never crosses a page.
+        let (address, _) = self
+            .0
+            .kernel_address(offset)
+            .ok_or(SharedMemoryError::InvalidRange)?;
+        Ok(address.cast())
+    }
+
+    fn u32_at(&self, offset: usize) -> Result<*mut u32, SharedMemoryError> {
+        self.word(offset, MemoryAccessPolicy::ControlRing.permits_u32(offset))
+    }
+
+    fn u64_at(&self, offset: usize) -> Result<*mut u64, SharedMemoryError> {
+        self.word(offset, MemoryAccessPolicy::ControlRing.permits_u64(offset))
+    }
+
+    /// Calls `copy` with the kernel address of each page's part of
+    /// `offset..offset + len` and that part's range within `0..len`.
+    fn for_each_part(
+        &self,
+        offset: usize,
+        len: usize,
+        mut copy: impl FnMut(*mut u8, Range<usize>),
+    ) -> Result<(), SharedMemoryError> {
+        if !MemoryAccessPolicy::ControlRing.permits_byte_range(offset, len) {
+            return Err(SharedMemoryError::InvalidRange);
+        }
+        let mut done = 0;
+        while done < len {
+            let (address, available) = self
+                .0
+                .kernel_address(offset + done)
+                .ok_or(SharedMemoryError::InvalidRange)?;
+            let part = available.min(len - done);
+            copy(address, done..done + part);
+            done += part;
+        }
+        Ok(())
+    }
+}
+
+// Safety (for every access below): pinned for `self`'s lifetime, in bounds
+// (checked), and naturally aligned for words; private buffers never overlap
+// them.
+impl SharedMemory for PinnedControlRing {
+    fn len(&self) -> usize {
+        CONTROL_RING_MEMORY_SIZE
+    }
+
+    fn read(&self, offset: usize, destination: &mut [u8]) -> Result<(), SharedMemoryError> {
+        self.for_each_part(offset, destination.len(), |source, part| {
+            // Safety: see above.
+            unsafe { peer_memory::copy_from_peer(source, &mut destination[part]) };
+        })
+    }
+
+    fn write(&self, offset: usize, source: &[u8]) -> Result<(), SharedMemoryError> {
+        self.for_each_part(offset, source.len(), |destination, part| {
+            // Safety: see above.
+            unsafe { peer_memory::copy_to_peer(&source[part], destination) };
+        })
+    }
+}
+
+impl ControlRingMemory for PinnedControlRing {
+    fn load_u32_acquire(&self, offset: usize) -> Result<u32, SharedMemoryError> {
+        let address = self.u32_at(offset)?;
+        // Safety: see above.
+        Ok(unsafe { peer_memory::load_u32_acquire(address) })
+    }
+
+    fn increment_u32_release(&self, offset: usize) -> Result<(), SharedMemoryError> {
+        let address = self.u32_at(offset)?;
+        // Safety: see above.
+        unsafe { peer_memory::increment_u32_release(address) };
+        Ok(())
+    }
+
+    fn load_u64_acquire(&self, offset: usize) -> Result<u64, SharedMemoryError> {
+        let address = self.u64_at(offset)?;
+        // Safety: see above.
+        Ok(unsafe { peer_memory::load_u64_acquire(address) })
+    }
+
+    fn store_u64_release(&self, offset: usize, value: u64) -> Result<(), SharedMemoryError> {
+        let address = self.u64_at(offset)?;
+        // Safety: see above.
+        unsafe { peer_memory::store_u64_release(address, value) };
+        Ok(())
+    }
+
+    fn store_u64_and_increment_u32_release(
+        &self,
+        store_offset: usize,
+        value: u64,
+        increment_offset: usize,
+    ) -> Result<(), SharedMemoryError> {
+        let store = self.u64_at(store_offset)?;
+        let increment = self.u32_at(increment_offset)?;
+        // Safety: see above.
+        unsafe {
+            peer_memory::store_u64_release(store, value);
+            peer_memory::increment_u32_release(increment);
+        }
+        Ok(())
     }
 }
 
@@ -118,11 +271,29 @@ impl HostSetupChannel for KernelHostSetup {
     }
 }
 
+enum Association {
+    /// Before the handshake, with the ring it would activate.
+    New(ControlRing<PinnedControlRing>),
+    Active(Box<Active>),
+    /// The handshake did not activate one, or it failed.
+    Ended,
+}
+
+/// The broker's ends of an active association's rings: it consumes requests
+/// and produces responses; it has no notifications.
+struct Active {
+    association: BrokerHostAssociation<UserSharedMemory>,
+    requests: ControlRingConsumer<PinnedControlRing>,
+    responses: ControlRingProducer<PinnedControlRing>,
+    /// A response the full response ring could not take, like `io_uring`'s
+    /// completion overflow; no request is consumed while it waits.
+    overflow: Option<Vec<u8>>,
+}
+
 pub(crate) struct Broker {
     core: BrokerCore,
     shared_memory: UserRange,
-    association: RefCell<Option<BrokerHostAssociation<UserSharedMemory>>>,
-    handshake_attempted: Cell<bool>,
+    association: RefCell<Association>,
 }
 
 /// [`Status::Unsupported`] if the response does not fit a [`WireFrame`].
@@ -131,20 +302,26 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 }
 
 impl Broker {
-    pub(crate) fn new(core: BrokerCore, shared_memory: UserRange) -> Self {
+    pub(crate) fn new(
+        core: BrokerCore,
+        shared_memory: UserRange,
+        control_ring: ControlRing<PinnedControlRing>,
+    ) -> Self {
         Self {
             core,
             shared_memory,
-            association: RefCell::new(None),
-            handshake_attempted: Cell::new(false),
+            association: RefCell::new(Association::New(control_ring)),
         }
     }
 
-    /// One attempt, successful or not.
+    /// One attempt, successful or not. On success, the association is active
+    /// on the control ring.
     pub(crate) fn handshake(&self, request: &WireFrame) -> Result<WireFrame, Status> {
-        if self.handshake_attempted.replace(true) {
+        let mut association = self.association.borrow_mut();
+        let Association::New(ring) = core::mem::replace(&mut *association, Association::Ended)
+        else {
             return Err(Status::Denied);
-        }
+        };
         let request =
             wire::decode_handshake_request(request.as_slice().ok_or(Status::InvalidArgument)?)
                 .map_err(|_| Status::InvalidArgument)?;
@@ -170,89 +347,108 @@ impl Broker {
             |_| false,
             |_| Ok(()),
         );
-        if let Ok(Ok(association)) = result {
-            if association.activate_process().is_err() {
+        if let Ok(Ok(host)) = result {
+            if host.activate_process().is_err() {
                 // Releases its broker process ID.
-                association.finish();
+                host.finish();
                 return Err(Status::Denied);
             }
-            *self.association.borrow_mut() = Some(association);
+            let BrokerControlRingEndpoints {
+                request_consumer,
+                response_producer,
+                notification_producer: _,
+            } = ring.into_broker();
+            *association = Association::Active(Box::new(Active {
+                association: host,
+                requests: request_consumer,
+                responses: response_producer,
+                overflow: None,
+            }));
         }
         let response = setup.response.ok_or(Status::Denied)?;
         frame(&wire::encode_handshake_response(response))
     }
 
+    /// Consumes and serves every published request, unless the response ring
+    /// fills up. The broker applies its own policy to each request; refusals
+    /// are responses.
+    ///
     /// # Errors
     ///
-    /// [`CallError::NotPermitted`] before execution if `permits` rejects the
-    /// operation.
-    pub(crate) fn call(
-        &self,
-        request: &WireFrame,
-        permits: impl FnOnce(BrokerOp) -> bool,
-    ) -> Result<WireFrame, CallError> {
-        let association = self.association.borrow();
-        let association = association.as_ref().ok_or(Status::Denied)?;
-        let request = wire::decode_request(request.as_slice().ok_or(Status::InvalidArgument)?)
-            .map_err(|_| Status::InvalidArgument)?;
-        let op = op_kind(&request.operation);
-        if !permits(op) {
-            return Err(CallError::NotPermitted(op));
+    /// [`Status::Denied`] without an active association. Otherwise, any
+    /// failure fails the association.
+    pub(crate) fn enter(&self) -> Result<(), Status> {
+        let mut association = self.association.borrow_mut();
+        let Association::Active(active) = &mut *association else {
+            return Err(Status::Denied);
+        };
+        let result = active.serve();
+        if let Err(status) = result {
+            log::warn!("broker association failed: {status:?}");
+            if let Association::Active(active) =
+                core::mem::replace(&mut *association, Association::Ended)
+            {
+                active.association.finish();
+            }
         }
-        let mut response = None;
-        association
-            .execute_request(request, |r| {
-                response = Some(r.clone());
-                Ok::<(), Infallible>(())
-            })
-            .map_err(|_| Status::Denied)?;
-        Ok(frame(&wire::encode_response(
-            response.ok_or(Status::Denied)?,
-        ))?)
+        result
     }
 }
 
-pub(crate) enum CallError {
-    Status(Status),
-    NotPermitted(BrokerOp),
-}
-
-impl From<Status> for CallError {
-    fn from(status: Status) -> Self {
-        Self::Status(status)
+impl Active {
+    fn serve(&mut self) -> Result<(), Status> {
+        if let Some(response) = self.overflow.take()
+            && !self.publish(response)?
+        {
+            return Ok(());
+        }
+        let mut served = 0u64;
+        while let ControlRingReadStatus::Message(request) = self
+            .requests
+            .try_read(wire::decode_request)
+            .map_err(|_| Status::InvalidArgument)?
+        {
+            let mut response = None;
+            self.association
+                .execute_request(request, |r| {
+                    response = Some(wire::encode_response(r.clone()));
+                    Ok::<(), Infallible>(())
+                })
+                .map_err(|_| Status::InvalidArgument)?;
+            served += 1;
+            if !self.publish(response.ok_or(Status::InvalidArgument)?)? {
+                break;
+            }
+        }
+        self.requests
+            .publish_head()
+            .map_err(|_| Status::InvalidArgument)?;
+        log::trace!("broker served {served} requests");
+        Ok(())
     }
-}
 
-/// Exhaustive: a new broker operation must be classified.
-fn op_kind(operation: &BrokerOperation) -> BrokerOp {
-    match operation {
-        BrokerOperation::CreateThread(_) => BrokerOp::CreateThread,
-        BrokerOperation::ExitThread(_) => BrokerOp::ExitThread,
-        BrokerOperation::CloseObject(_) => BrokerOp::CloseObject,
-        BrokerOperation::CheckReadiness(_) => BrokerOp::CheckReadiness,
-        BrokerOperation::GetStatusFlags(_) => BrokerOp::GetStatusFlags,
-        BrokerOperation::SetStatusFlags(_) => BrokerOp::SetStatusFlags,
-        BrokerOperation::Event(_) => BrokerOp::Event,
-        BrokerOperation::Pipe(_) => BrokerOp::Pipe,
-        BrokerOperation::Socket(_) => BrokerOp::Socket,
-        BrokerOperation::FillRandom(_) => BrokerOp::FillRandom,
-        BrokerOperation::File(_) => BrokerOp::File,
-        BrokerOperation::StartChildProcess(_) => BrokerOp::StartChildProcess,
-        BrokerOperation::GetProcessExitStatus(_) => BrokerOp::GetProcessExitStatus,
-        BrokerOperation::ExitChildProcess(_) => BrokerOp::ExitChildProcess,
-        BrokerOperation::ReportExitStatus(_) => BrokerOp::ReportExitStatus,
-        BrokerOperation::SetChildReaping(_) => BrokerOp::SetChildReaping,
-        BrokerOperation::DuplicateObjectsToChild(_) => BrokerOp::DuplicateObjectsToChild,
-        BrokerOperation::WriteChildMemory(_) => BrokerOp::WriteChildMemory,
-        BrokerOperation::Timer(_) => BrokerOp::Timer,
-        BrokerOperation::Signal(_) => BrokerOp::Signal,
+    /// Whether the response ring took `response`; if not, it overflows.
+    fn publish(&mut self, response: Vec<u8>) -> Result<bool, Status> {
+        match self
+            .responses
+            .try_write(&response)
+            .map_err(|_| Status::InvalidArgument)?
+        {
+            ControlRingWriteStatus::Written => Ok(true),
+            ControlRingWriteStatus::Full { .. } => {
+                self.overflow = Some(response);
+                Ok(false)
+            }
+        }
     }
 }
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        if let Some(association) = self.association.get_mut().take() {
-            association.finish();
+        if let Association::Active(active) =
+            core::mem::replace(self.association.get_mut(), Association::Ended)
+        {
+            active.association.finish();
         }
     }
 }
