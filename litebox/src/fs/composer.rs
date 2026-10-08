@@ -477,8 +477,7 @@ impl Backend for Composer {
                                         index += walked_len;
                                         current = last;
                                     }
-                                    WalkStopReason::StoppedAtNonDirectory
-                                    | WalkStopReason::Symlink(_)
+                                    WalkStopReason::StoppedAtNonDirectory { .. }
                                     | WalkStopReason::Continue => {
                                         return Ok(WalkOutcome {
                                             components: walked_components,
@@ -523,8 +522,7 @@ impl Backend for Composer {
                                 index += walked_len;
                                 current = last;
                             }
-                            WalkStopReason::StoppedAtNonDirectory
-                            | WalkStopReason::Symlink(_)
+                            WalkStopReason::StoppedAtNonDirectory { .. }
                             | WalkStopReason::Continue => {
                                 return Ok(WalkOutcome {
                                     components: walked_components,
@@ -593,6 +591,19 @@ impl Backend for Composer {
                         .into(),
                     )
                 }),
+        }
+    }
+
+    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
+        match &dir.as_typed::<Self>().inner {
+            ComposerWalkingDirHandleInner::Virtual { .. } => {
+                Err(PathError::NoSuchFileOrDirectory.into())
+            }
+            ComposerWalkingDirHandleInner::Mounted {
+                mount_index,
+                handle,
+                ..
+            } => self.mounts[*mount_index].backend.read_link_at(handle, name),
         }
     }
 

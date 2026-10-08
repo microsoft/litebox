@@ -314,20 +314,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             let child = match child {
                 Node::Dir(child) => child,
                 Node::File(file) => {
-                    let file = file.read();
-                    let stop_reason = if file.file_type == FileType::SymbolicLink {
-                        super::backend::WalkStopReason::Symlink(
-                            core::str::from_utf8(&file.data)
-                                .expect("symlink targets are initialized from strings")
-                                .into(),
-                        )
-                    } else {
-                        super::backend::WalkStopReason::StoppedAtNonDirectory
-                    };
                     return Ok(super::backend::WalkOutcome {
                         components: walked_components,
                         last: super::backend::WalkingDirHandle::from_typed::<Self>(current),
-                        stop_reason,
+                        stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory {
+                            file_type: file.read().file_type,
+                        },
                     });
                 }
             };
@@ -350,6 +342,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             last: super::backend::WalkingDirHandle::from_typed::<Self>(current),
             stop_reason: super::backend::WalkStopReason::CompleteDirectory,
         })
+    }
+
+    fn read_link_at(
+        &self,
+        dir: &super::backend::WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<String, super::errors::WalkError> {
+        let dir = dir.as_typed::<Self>().dir.read();
+        let Some(Node::File(file)) = dir.children.get(name) else {
+            return Err(PathError::InvalidPathname.into());
+        };
+        let file = file.read();
+        if file.file_type != FileType::SymbolicLink {
+            return Err(PathError::InvalidPathname.into());
+        }
+        Ok(core::str::from_utf8(&file.data)
+            .expect("symlink targets are initialized from strings")
+            .into())
     }
 
     fn owned_dir_at(
@@ -444,7 +454,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 let (file_type, node_info) = match child {
                     Node::File(file) => {
                         let file = file.read();
-                        (file.file_type.clone(), file.node_info.clone())
+                        (file.file_type, file.node_info.clone())
                     }
                     Node::Dir(dir) => (FileType::Directory, dir.read().node_info.clone()),
                 };
@@ -528,7 +538,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.read();
                 Ok(FileStatus {
-                    file_type: file.file_type.clone(),
+                    file_type: file.file_type,
                     mode: file.perms.mode,
                     size: file.data.len(),
                     owner: file.perms.userinfo,

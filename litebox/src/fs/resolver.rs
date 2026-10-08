@@ -337,7 +337,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     assert_eq!(walked, run_len);
                     from = outcome.last;
                 }
-                WalkStopReason::Symlink(target) => {
+                WalkStopReason::StoppedAtNonDirectory {
+                    file_type: FileType::SymbolicLink,
+                } => {
                     let name = pending.pop_front().expect("symlink is the next component");
                     let final_component = pending.is_empty();
                     if final_component && !follow_final && !require_directory {
@@ -350,6 +352,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     if links > 40 {
                         return Err(PathError::TooManySymlinks.into());
                     }
+                    let target = self.backend.read_link_at(&outcome.last, &name)?;
                     if target.starts_with('/') {
                         resolved.clear();
                         from = self.backend.root();
@@ -363,7 +366,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         pending.push_front(String::from(part));
                     }
                 }
-                WalkStopReason::StoppedAtNonDirectory => {
+                WalkStopReason::StoppedAtNonDirectory { .. } => {
                     let name = pending
                         .pop_front()
                         .expect("non-directory is the next component");
@@ -438,7 +441,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             self.walk_to_directory(context, self.backend.root(), &components, &components)?;
         let outcome = self.backend.walk_directories(parent.handle, &[name])?;
         match outcome.stop_reason {
-            WalkStopReason::Symlink(target) => Ok(target),
+            WalkStopReason::StoppedAtNonDirectory {
+                file_type: FileType::SymbolicLink,
+            } => self.backend.read_link_at(&outcome.last, name),
             _ => Err(PathError::InvalidPathname.into()),
         }
     }
@@ -521,7 +526,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     permissions,
                 })
             }
-            WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_) => {
+            WalkStopReason::StoppedAtNonDirectory { .. } => {
                 let file = self
                     .backend
                     .open_file_at(outcome.last, components[walked], OFlags::PATH)
@@ -587,7 +592,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         permissions,
                     });
                 }
-                WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_) => {
+                WalkStopReason::StoppedAtNonDirectory { .. } => {
                     return Err(WalkError::PathError(PathError::ComponentNotADirectory));
                 }
                 WalkStopReason::Continue => {
@@ -630,12 +635,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     assert_eq!(walked, components.len() - (offset - walked));
                     return Ok((outcome, offset));
                 }
-                WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_)
-                    if offset == components.len() - 1 =>
-                {
+                WalkStopReason::StoppedAtNonDirectory { .. } if offset == components.len() - 1 => {
                     return Ok((outcome, offset));
                 }
-                WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_) => {
+                WalkStopReason::StoppedAtNonDirectory { .. } => {
                     return Err(WalkError::PathError(PathError::ComponentNotADirectory));
                 }
                 WalkStopReason::Continue => {
@@ -778,7 +781,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             Ok((outcome, walked))
                 if matches!(
                     outcome.stop_reason,
-                    WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Symlink(_)
+                    WalkStopReason::StoppedAtNonDirectory { .. }
                 ) =>
             {
                 let name = components[walked];

@@ -70,7 +70,7 @@ bitflags! {
 /// Types of files on a file-system.
 ///
 /// See [`resolver::Resolver::file_status`].
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
 pub enum FileType {
     RegularFile,

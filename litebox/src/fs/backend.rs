@@ -4,6 +4,7 @@
 //! [`Backend`] for filesystems supported by [`super::resolver`]
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::any::{Any, TypeId};
 use core::marker::PhantomData;
@@ -14,7 +15,7 @@ use super::errors::{
     ChmodError, ChownError, FileStatusError, MkdirError, OpenError, ReadDirError, ReadError,
     RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
-use super::{DirEntry, FileStatus, Mode, OFlags, UserInfo};
+use super::{DirEntry, FileStatus, FileType, Mode, OFlags, UserInfo};
 
 /// How a backend file handle participates in seek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,13 +54,18 @@ pub trait Backend: private::Sealed + Send + Sync + Any {
     ///
     /// This function explicitly does not walk into files. If the next component exists but is not a
     /// directory, the backend should stop at its parent and return
-    /// `WalkStopReason::StoppedAtNonDirectory`, or `WalkStopReason::Symlink` with the
-    /// link's target. Symlinks are expanded by the resolver in the filesystem namespace.
+    /// `WalkStopReason::StoppedAtNonDirectory` with the component's type. Symlinks are expanded by
+    /// the resolver in the filesystem namespace, via [`Self::read_link_at`].
     fn walk_directories<'a>(
         &'a self,
         from: WalkingDirHandle<'a>,
         components: &[&str],
     ) -> Result<WalkOutcome<WalkingDirHandle<'a>>, WalkError>;
+
+    /// Read the unexpanded target of the symlink `name` in `dir`.
+    ///
+    /// Only called for components that a walk reported as [`FileType::SymbolicLink`].
+    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError>;
 
     /// Take an owned handle to a `dir` found via a walk, validating any open `flags`.
     fn owned_dir_at(
@@ -263,6 +269,19 @@ impl<'a> WalkingDirHandle<'a> {
         // that the allocation has the expected concrete type.
         unsafe { *Box::from_raw(self.raw.into_raw().cast::<B::WalkingDirHandle<'a>>()) }
     }
+
+    /// Borrowing version of [`Self::into_typed`].
+    pub(super) fn as_typed<B: BackendHandles + 'static>(&self) -> &B::WalkingDirHandle<'a> {
+        assert_eq!(
+            self.backend_type,
+            TypeId::of::<B>(),
+            "backend walking directory handle type mismatch"
+        );
+        // SAFETY: as in `into_typed`, the boxed value is a `B::WalkingDirHandle<'a>`; casting the
+        // trait-object pointer to a thin pointer keeps its data address, and the borrow is tied
+        // to `self`, which owns the allocation.
+        unsafe { &*core::ptr::from_ref(&*self.raw).cast::<B::WalkingDirHandle<'a>>() }
+    }
 }
 
 impl FileHandle {
@@ -328,15 +347,14 @@ pub struct WalkOutcome<Walking> {
 }
 
 /// Why a backend directory walk stopped.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[must_use]
 pub(super) enum WalkStopReason {
     /// All requested components were walked, and `last` is the requested directory.
     CompleteDirectory,
     /// The next requested component exists but is not a directory; `last` is its parent directory.
-    StoppedAtNonDirectory,
-    /// The next component is a symlink; `last` is its parent, and the target is unexpanded.
-    Symlink(alloc::string::String),
+    /// `file_type` is that component's type, and is never [`FileType::Directory`].
+    StoppedAtNonDirectory { file_type: FileType },
     /// The backend stopped early; the resolver should continue walking from `last`.
     #[expect(dead_code, reason = "no backend currently returns partial walks")]
     Continue,

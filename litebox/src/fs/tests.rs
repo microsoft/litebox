@@ -364,7 +364,13 @@ mod symlinks {
                 .walk_directories(backend.root(), &["link"])
                 .unwrap()
                 .stop_reason,
-            WalkStopReason::Symlink("/original-target".into())
+            WalkStopReason::StoppedAtNonDirectory {
+                file_type: FileType::SymbolicLink
+            }
+        );
+        assert_eq!(
+            backend.read_link_at(&backend.root(), "link").unwrap(),
+            "/original-target"
         );
     }
 
