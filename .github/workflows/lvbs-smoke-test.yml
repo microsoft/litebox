@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Azure login
-        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
         with:
           client-id: ${{ secrets.ADO_SP_ClientID }}
           tenant-id: ${{ secrets.ADO_SP_TenantID }}
