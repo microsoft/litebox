@@ -28,21 +28,29 @@ pub fn check_user_memory_protection(platform: &VmKernel) {
     unsafe { platform.switch_address_space(id) }.unwrap();
     let range = 0x1_0000..0x1_0000 + PAGE_SIZE;
     let writable = Permissions::READ | Permissions::WRITE;
-    let ptr = PageManagementProvider::<PAGE_SIZE>::allocate_pages(
-        platform,
-        range.clone(),
-        writable,
-        false,
-        true,
-        FixedAddressBehavior::NoReplace,
-    )
+    // Safety: this aligned user range is unused in the private address space.
+    let reservation = unsafe {
+        <VmKernel as PageManagementProvider<PAGE_SIZE>>::reserve_and_commit_pages(
+            platform,
+            core::iter::empty,
+            range.clone(),
+            writable,
+            false,
+            true,
+            FixedAddressBehavior::NoReplace,
+        )
+    }
     .unwrap();
+    let ptr = <VmKernel as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+        range.start,
+    );
     assert_eq!(ptr.write_at_offset(0, 0x5a), Some(()));
     for _ in 0..2 {
         // Safety: no borrowed user references; only fallible copies access the range.
         unsafe {
-            PageManagementProvider::<PAGE_SIZE>::update_permissions(
+            <VmKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
                 platform,
+                || core::iter::once(&reservation),
                 range.clone(),
                 Permissions::empty(),
             )
@@ -52,8 +60,9 @@ pub fn check_user_memory_protection(platform: &VmKernel) {
         assert_eq!(ptr.write_at_offset(0, 0xa5), None);
         // Safety: as above; restore access to the same owned frame.
         unsafe {
-            PageManagementProvider::<PAGE_SIZE>::update_permissions(
+            <VmKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
                 platform,
+                || core::iter::once(&reservation),
                 range.clone(),
                 writable,
             )
@@ -63,8 +72,9 @@ pub fn check_user_memory_protection(platform: &VmKernel) {
     }
     // Safety: no user references remain and the pointer is not used afterward.
     unsafe {
-        PageManagementProvider::<PAGE_SIZE>::update_permissions(
+        <VmKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
             platform,
+            || core::iter::once(&reservation),
             range,
             Permissions::empty(),
         )
