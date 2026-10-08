@@ -367,6 +367,30 @@ mod symlinks {
             backend.read_link_at(&backend.root(), "link").unwrap(),
             "/original-target"
         );
+        assert!(matches!(
+            backend.read_link_at(&backend.root(), "missing"),
+            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
+        ));
+
+        // A lower-layer link is rejected like an upper one, rather than refused copy-up.
+        let overlay = Overlay::new(
+            &litebox,
+            initialized::<&str>([]),
+            initialized([("/link", link("/original-target"))]),
+            InodeAllocator::standalone(),
+        );
+        let handle = overlay
+            .open_file_at(overlay.root(), "link", OFlags::PATH | OFlags::NOFOLLOW)
+            .unwrap()
+            .item;
+        assert!(matches!(
+            overlay.chown(HandleRef::File(&handle), Some(0), None),
+            Err(ChownError::IsSymlink)
+        ));
+        assert!(matches!(
+            overlay.chmod(HandleRef::File(&handle), Mode::empty()),
+            Err(ChmodError::IsSymlink)
+        ));
     }
 
     #[test]

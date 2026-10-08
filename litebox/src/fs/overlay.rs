@@ -1171,6 +1171,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
     }
 
     fn chmod(&self, h: HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
+        if let HandleRef::File(_) = h
+            && self.status(h).map_err(|_| ChmodError::Io)?.file_type == FileType::SymbolicLink
+        {
+            return Err(ChmodError::IsSymlink);
+        }
         let locked = self.namespace.lock();
         let handle = self.ensure_upper(locked, h).map_err(|error| match error {
             OpenError::PathError(error) => ChmodError::PathError(error),
@@ -1186,6 +1191,11 @@ impl<Platform: RawSyncPrimitivesProvider> Backend for Overlay<Platform> {
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
+        if let HandleRef::File(_) = h
+            && self.status(h).map_err(|_| ChownError::Io)?.file_type == FileType::SymbolicLink
+        {
+            return Err(ChownError::IsSymlink);
+        }
         let locked = self.namespace.lock();
         let handle = self.ensure_upper(locked, h).map_err(|error| match error {
             OpenError::PathError(error) => ChownError::PathError(error),

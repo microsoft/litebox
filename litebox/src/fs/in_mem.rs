@@ -375,10 +375,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         name: &str,
     ) -> Result<String, super::errors::WalkError> {
         let dir = dir.as_typed::<Self>().dir.read();
-        let Some(Node::File(file)) = dir.children.get(name) else {
-            return Err(PathError::InvalidPathname.into());
+        let file = match dir.children.get(name) {
+            Some(Node::File(file)) => file.read(),
+            Some(Node::Dir(_)) => return Err(PathError::InvalidPathname.into()),
+            None => return Err(PathError::NoSuchFileOrDirectory.into()),
         };
-        let file = file.read();
         if file.file_type != FileType::SymbolicLink {
             return Err(PathError::InvalidPathname.into());
         }
