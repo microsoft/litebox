@@ -160,7 +160,7 @@ impl Default for Context {
     }
 }
 
-/// Absolute normalized path, created by [`Context::resolve`] or [`Resolver::resolve`].
+/// Absolute normalized path, created by [`Context::resolve`] or [`Resolver::resolve_following_symlinks`].
 ///
 /// Note that a resolved path does not imply that it exists within the file system, merely that it
 /// is an absolute normalized path.
@@ -215,7 +215,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// Resolve a path to its physical location, following symbolic links.
     ///
     /// Unlike [`Context::resolve`], this consults the backend before processing `..`.
-    pub fn resolve(&self, context: &Context, path: impl Arg) -> Result<ResolvedPath, WalkError> {
+    pub fn resolve_following_symlinks(
+        &self,
+        context: &Context,
+        path: impl Arg,
+    ) -> Result<ResolvedPath, WalkError> {
         self.resolve_path(context, path, true, false)
     }
 
@@ -225,7 +229,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         context: &Context,
         path: impl Arg,
     ) -> Result<ResolvedPath, WalkError> {
-        let path = self.resolve(context, path)?;
+        let path = self.resolve_following_symlinks(context, path)?;
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         if !components.is_empty() {
             let (outcome, _) = self.walk_path(
@@ -410,7 +414,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         };
         // Entry mutations resolve the parent but retain the final name, so neither a link nor
         // a final `.`/`..` can redirect a removal to an ordinary target directory.
-        let parent_path = self.resolve(context, parent_path)?;
+        let parent_path = self.resolve_following_symlinks(context, parent_path)?;
         let parent_components: Vec<_> = parent_path.components.iter().map(String::as_str).collect();
         let walk_parent = || {
             self.walk_to_directory(
@@ -1068,10 +1072,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Change the permissions of a file
     pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let path = self.resolve(context, path).map_err(|error| match error {
-            WalkError::Io => ChmodError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
+        let path = self
+            .resolve_following_symlinks(context, path)
+            .map_err(|error| match error {
+                WalkError::Io => ChmodError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
         let handle = self
             .path_handle(context, &path)
             .map_err(|error| match error {
@@ -1092,10 +1098,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = self.resolve(context, path).map_err(|error| match error {
-            WalkError::Io => ChownError::Io,
-            WalkError::PathError(error) => error.into(),
-        })?;
+        let path = self
+            .resolve_following_symlinks(context, path)
+            .map_err(|error| match error {
+                WalkError::Io => ChownError::Io,
+                WalkError::PathError(error) => error.into(),
+            })?;
         let handle = self
             .path_handle(context, &path)
             .map_err(|error| match error {

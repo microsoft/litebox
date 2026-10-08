@@ -217,7 +217,12 @@ mod symlinks {
                 fs.file_status(&ctx, path).unwrap().node_info,
                 target.node_info
             );
-            assert_eq!(fs.resolve(&ctx, path).unwrap().to_string(), "/real/file");
+            assert_eq!(
+                fs.resolve_following_symlinks(&ctx, path)
+                    .unwrap()
+                    .to_string(),
+                "/real/file"
+            );
         }
         assert_contents(&fs, &ctx, "/file", b"lexical decoy");
         assert_eq!(fs.read_link(&ctx, "/directory/up").unwrap(), ".././file");
@@ -237,7 +242,7 @@ mod symlinks {
             FileType::Directory
         );
         fs.close(&fd).unwrap();
-        ctx.set_cwd(fs.resolve(&ctx, "/directory").unwrap());
+        ctx.set_cwd(fs.resolve_following_symlinks(&ctx, "/directory").unwrap());
         assert_contents(&fs, &ctx, "../file", b"physical target");
         assert_contents(&fs, &ctx, "up", b"physical target");
     }
@@ -459,7 +464,7 @@ mod symlinks {
                 Err(OpenError::PathError(PathError::TooManySymlinks))
             ));
             assert!(matches!(
-                fs.resolve(&ctx, path),
+                fs.resolve_following_symlinks(&ctx, path),
                 Err(WalkError::PathError(PathError::TooManySymlinks))
             ));
             assert_eq!(
@@ -479,7 +484,12 @@ mod symlinks {
         }
         let fs = Resolver::new(&litebox, initialized(entries));
         assert_contents(&fs, &ctx, "/hop1", b"end of chain");
-        assert_eq!(fs.resolve(&ctx, "/hop1").unwrap().to_string(), "/target");
+        assert_eq!(
+            fs.resolve_following_symlinks(&ctx, "/hop1")
+                .unwrap()
+                .to_string(),
+            "/target"
+        );
         assert!(matches!(
             fs.open(&ctx, "/hop0", OFlags::RDONLY, Mode::empty()),
             Err(OpenError::PathError(PathError::TooManySymlinks))
@@ -578,10 +588,17 @@ mod symlinks {
             "/to-directory/../../root-file",
         ] {
             assert_contents(&fs, &ctx, path, b"root target");
-            assert_eq!(fs.resolve(&ctx, path).unwrap().to_string(), "/root-file");
+            assert_eq!(
+                fs.resolve_following_symlinks(&ctx, path)
+                    .unwrap()
+                    .to_string(),
+                "/root-file"
+            );
         }
         assert_eq!(
-            fs.resolve(&ctx, "/to-mounted").unwrap().to_string(),
+            fs.resolve_following_symlinks(&ctx, "/to-mounted")
+                .unwrap()
+                .to_string(),
             "/mnt/file"
         );
         assert_eq!(
