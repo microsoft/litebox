@@ -3,7 +3,8 @@
 
 //! QEMU guest kernel: a [service](service::Service) in ring-3 runner
 //! processes, and a [client](client) for it. Today: OP-TEE TAs in
-//! `litebox_runner_optee_on_vm_userland` processes ([`service::optee`]),
+//! `litebox_runner_optee_on_vm_userland` processes, one per TA instance
+//! ([`service::optee`]),
 //! driven by a test client ([`client::script`]). QEMU exits with 33 if all
 //! tests pass, 65 otherwise.
 

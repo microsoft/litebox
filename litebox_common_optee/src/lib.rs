@@ -636,7 +636,20 @@ open_enum! {
 
 /// `TEE_UUID` from `optee_os/lib/libutee/include/tee_api_types.h`. It uniquely identifies
 /// TAs, cryptographic keys, and more.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, Debug, FromBytes, Immutable, IntoBytes)]
+#[derive(
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    Debug,
+    FromBytes,
+    Immutable,
+    IntoBytes,
+)]
 #[repr(C)]
 pub struct TeeUuid {
     pub time_low: u32,
