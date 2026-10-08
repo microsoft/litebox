@@ -111,7 +111,11 @@ pub const HV_X64_MSR_SIEFP: u32 = 0x_4000_0082;
 pub const HV_X64_MSR_SIEFP_ENABLE: u32 = 0x_0000_0001;
 pub const HV_X64_MSR_SIMP: u32 = 0x_4000_0083;
 pub const HV_X64_MSR_SIMP_ENABLE: u32 = 0x_0000_0001;
+pub const HV_X64_MSR_EOM: u32 = 0x_4000_0084;
 pub const HV_X64_MSR_SINT0: u32 = 0x_4000_0090;
+
+/// `HvMessageHeader::message_flags`: a message is queued; write EOM after freeing.
+pub const HV_MESSAGE_FLAG_PENDING: u8 = 1 << 0;
 
 // Partition reference counter and synthetic timer 0 (STIMER0).
 pub const HV_X64_MSR_TIME_REF_COUNT: u32 = 0x_4000_0020;
@@ -122,6 +126,7 @@ pub const HV_X64_MSR_STIMER0_COUNT: u32 = 0x_4000_00b1;
 pub const HV_STIMER_CONFIG_ENABLE: u64 = 1 << 0;
 pub const HV_STIMER_CONFIG_DIRECT_MODE: u64 = 1 << 12;
 pub const HV_STIMER_CONFIG_VECTOR_SHIFT: u32 = 4; // ApicVector occupies bits 4..=11
+pub const HV_STIMER_CONFIG_SINTX_SHIFT: u32 = 16; // SINTx occupies bits 16..=19
 
 pub const HYPERVISOR_CALLBACK_VECTOR: u8 = 0xf3;
 
@@ -133,6 +138,7 @@ pub const HYPERV_HYPERVISOR_PRESENT_BIT: u32 = 0x_8000_0000;
 
 // `HYPERV_CPUID_FEATURES` partition privilege / feature bits.
 pub const HV_FEATURE_REFERENCE_COUNTER: u32 = 1 << 1; // EAX[1]
+pub const HV_FEATURE_SYNIC: u32 = 1 << 2; // EAX[2]
 pub const HV_FEATURE_SYNTHETIC_TIMER: u32 = 1 << 3; // EAX[3]
 pub const HV_FEATURE_STIMER_DIRECT: u32 = 1 << 19; // EDX[19]
 
