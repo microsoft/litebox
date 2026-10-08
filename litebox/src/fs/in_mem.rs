@@ -434,15 +434,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         if flags.contains(super::OFlags::DIRECTORY) {
             return Err(PathError::ComponentNotADirectory.into());
         }
-        let perms = {
-            let file = file.read();
-            if file.file_type == FileType::SymbolicLink
-                && !flags.contains(super::OFlags::PATH | super::OFlags::NOFOLLOW)
-            {
-                return Err(PathError::TooManySymlinks.into());
-            }
-            file.perms.clone()
-        };
+        let perms = file.read().perms.clone();
         let handle = super::backend::FileHandle::from_typed::<Self>(InMemFileHandle { file });
         if flags.contains(super::OFlags::TRUNC) && !flags.contains(super::OFlags::PATH) {
             // Linux truncates whenever the open succeeds, regardless of the access mode (an

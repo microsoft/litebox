@@ -791,6 +791,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
+                if outcome.stop_reason
+                    == (WalkStopReason::StoppedAtNonDirectory {
+                        file_type: FileType::SymbolicLink,
+                    })
+                    && !flags.contains(OFlags::PATH | OFlags::NOFOLLOW)
+                {
+                    return Err(PathError::TooManySymlinks.into());
+                }
                 let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if !path_only
                     && let PermissionCheck::ByResolver(permissions) = &file.permissions
