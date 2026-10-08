@@ -516,6 +516,8 @@ pub enum RemapError {
     Overlapping,
     #[error("provided new range is already allocated")]
     AlreadyAllocated,
+    #[error("provided new range is in use by the platform")]
+    AddressInUseByPlatform,
     #[error("requested page permissions are denied")]
     PermissionDenied,
     #[error("out of memory")]

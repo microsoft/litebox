@@ -18,6 +18,7 @@ use litebox::platform::page_mgmt::AllocationDirection;
 use litebox::platform::page_mgmt::AllocationError;
 use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
+use litebox::platform::page_mgmt::HintPlacementBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::page_mgmt::RemapError;
 use litebox::platform::{
@@ -1166,31 +1167,44 @@ where
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
         }
-        let new_addr = self
-            .get_unmmaped_area(
-                suggested_new_address,
-                new_size,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
-            )
-            .map_err(|_| VmemMoveError::OutOfMemory)?
-            .ok_or(VmemMoveError::OutOfMemory)?;
-        let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
-        // SAFETY: The caller excludes source users, and `get_unmmaped_area` found a disjoint gap.
-        let new_addr = match unsafe {
-            self.reservations.remap(
-                self.platform,
-                old_range.into(),
-                new_range.into(),
-                vma.flags.into(),
-            )
-        } {
-            Ok(new_addr) => new_addr,
-            Err(RemapError::UnsupportedByPlatform) => {
-                // SAFETY: The caller excludes source users, and the copy only places pages with
-                // hints, which never replace existing mappings.
-                return unsafe { self.remap_fallback_with_copy(old_range, new_range, vma) };
+        let mut request = Self::build_unmapped_area_request(
+            suggested_new_address,
+            new_size,
+            FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+        );
+        let new_addr = loop {
+            let new_addr = self
+                .find_area(&request)
+                .map_err(|_| VmemMoveError::OutOfMemory)?
+                .ok_or(VmemMoveError::OutOfMemory)?;
+            let new_range =
+                PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
+            // SAFETY: The caller excludes source users, and find_area found a disjoint guest gap.
+            match unsafe {
+                self.reservations.remap(
+                    self.platform,
+                    old_range.into(),
+                    new_range.into(),
+                    vma.flags.into(),
+                )
+            } {
+                Ok(new_addr) => break new_addr,
+                Err(RemapError::AddressInUseByPlatform) => {
+                    request.suggested_address = None;
+                    request.address_range.end = new_range.start;
+                }
+                Err(RemapError::AlreadyAllocated)
+                    if Platform::HINT_PLACEMENT_BEHAVIOR == HintPlacementBehavior::Exact =>
+                {
+                    unreachable!("exact-placement platform rejected a free remap destination")
+                }
+                Err(RemapError::UnsupportedByPlatform) => {
+                    // SAFETY: The caller excludes source users, and the copy only places pages
+                    // with hints, which never replace existing mappings.
+                    return unsafe { self.remap_fallback_with_copy(old_range, new_range, vma) };
+                }
+                Err(error) => return Err(VmemMoveError::RemapError(error)),
             }
-            Err(error) => return Err(VmemMoveError::RemapError(error)),
         };
 
         let new_start = new_addr.as_usize();
@@ -1502,25 +1516,6 @@ where
 
     /*================================Internal Functions================================ */
 
-    /// Get an unmapped area in the virtual address space.
-    /// `suggested_address` and `behavior` are the hint address and placement policy respectively,
-    /// similar to how `mmap` works.
-    ///
-    /// Returns `None` if no area was found. Otherwise, returns the start address of an
-    /// `ALIGN`-aligned area.
-    pub(super) fn get_unmmaped_area(
-        &self,
-        suggested_address: Option<NonZeroAddress<ALIGN>>,
-        length: NonZeroPageSize<ALIGN>,
-        behavior: FixedAddressBehavior,
-    ) -> Result<Option<usize>, AllocationError> {
-        self.find_area(&Self::build_unmapped_area_request(
-            suggested_address,
-            length,
-            behavior,
-        ))
-    }
-
     fn build_unmapped_area_request(
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -1806,7 +1801,9 @@ mod tests {
     /// A configurable dummy page-management backend.
     struct DummyVmemBackend<const TOP_DOWN: bool = false, Store = UntrackedDummyReservations> {
         rejected_address: Option<usize>,
+        rejected_remap_address: Mutex<Option<usize>>,
         remap_unsupported: bool,
+        remap_calls: Mutex<Vec<Range<usize>>>,
         rejected_commit: Option<usize>,
         calls: Mutex<Vec<AllocationCall>>,
         decommits: Mutex<Vec<Range<usize>>>,
@@ -1934,6 +1931,10 @@ mod tests {
             Reservations:
                 Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
         {
+            self.remap_calls.lock().push(new_range.clone());
+            if *self.rejected_remap_address.lock() == Some(new_range.start) {
+                return Err(litebox::platform::page_mgmt::RemapError::AddressInUseByPlatform);
+            }
             if self.remap_unsupported {
                 return Err(litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform);
             }
@@ -1979,7 +1980,9 @@ mod tests {
     ) -> &'static DummyVmemBackend<TOP_DOWN, Store> {
         Box::leak(Box::new(DummyVmemBackend {
             rejected_address,
+            rejected_remap_address: Mutex::new(None),
             remap_unsupported: false,
+            remap_calls: Mutex::new(Vec::new()),
             rejected_commit,
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
@@ -1987,6 +1990,43 @@ mod tests {
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,
         }))
+    }
+
+    #[test]
+    fn remap_retries_below_a_platform_collision() {
+        let backend = dummy_backend::<true>(None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let source = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(source),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+        let rejected = DummyVmemBackend::<true>::TASK_ADDR_MAX - PAGE_SIZE;
+        *backend.rejected_remap_address.lock() = Some(rejected);
+
+        let destination = unsafe {
+            vmem.move_mappings(
+                PageRange::new(source, source + PAGE_SIZE).unwrap(),
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(destination, rejected - PAGE_SIZE);
+        assert_eq!(
+            *backend.remap_calls.lock(),
+            [
+                rejected..rejected + PAGE_SIZE,
+                destination..destination + PAGE_SIZE,
+            ]
+        );
     }
 
     #[test]
@@ -2664,7 +2704,9 @@ mod tests {
     fn copying_remap_of_shared_mapping_passes_only_access_permissions() {
         let backend: &'static DummyVmemBackend = Box::leak(Box::new(DummyVmemBackend {
             rejected_address: None,
+            rejected_remap_address: Mutex::new(None),
             remap_unsupported: true,
+            remap_calls: Mutex::new(Vec::new()),
             rejected_commit: None,
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),

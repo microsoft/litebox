@@ -273,7 +273,7 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 // A host mapping vmem does not know about holds the destination; the caller's
                 // copy places the pages elsewhere instead.
                 litebox::platform::page_mgmt::AllocationError::AddressInUse => {
-                    litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
+                    litebox::platform::page_mgmt::RemapError::AddressInUseByPlatform
                 }
                 // Hosts with fewer than 48 VA bits may refuse vmem's destination; copy instead.
                 #[cfg(target_arch = "aarch64")]
