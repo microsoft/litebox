@@ -963,9 +963,12 @@ where
             FixedAddressBehavior::Hint(direction) => Some(direction),
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => None,
         };
+        // A relocated hint may escape the range vmem searched even when the platform preserves
+        // its direction, so enforce an exact address when vmem has a stricter upper bound.
         let platform_behavior = match behavior {
             FixedAddressBehavior::Hint(direction)
-                if !Platform::HINT_PLACEMENT_BEHAVIOR.supports(direction) =>
+                if Platform::PLACEMENT_ADDR_MAX < Platform::TASK_ADDR_MAX
+                    || !Platform::HINT_PLACEMENT_BEHAVIOR.supports(direction) =>
             {
                 FixedAddressBehavior::NoReplace
             }
@@ -991,8 +994,8 @@ where
                     if direction.is_some()
                         && platform_behavior == FixedAddressBehavior::NoReplace =>
                 {
-                    // Retry if the requested behavior is `Hint` but the suggested address is already
-                    // in use and the platform does not support the required search direction.
+                    // Retry if the requested hint must be placed exactly to preserve its search
+                    // direction or vmem's stricter placement bound.
                     let rejected_hint = request
                         .suggested_address
                         .is_some_and(|address| address.as_usize() == new_addr);
@@ -1799,7 +1802,11 @@ mod tests {
     type TrackedDummyReservations = TrackedReservations<DummyReservation<PAGE_SIZE>>;
 
     /// A configurable dummy page-management backend.
-    struct DummyVmemBackend<const TOP_DOWN: bool = false, Store = UntrackedDummyReservations> {
+    struct DummyVmemBackend<
+        const TOP_DOWN: bool = false,
+        Store = UntrackedDummyReservations,
+        const LIMITED_PLACEMENT: bool = false,
+    > {
         rejected_address: Option<usize>,
         rejected_remap_address: Mutex<Option<usize>>,
         remap_unsupported: bool,
@@ -1812,16 +1819,17 @@ mod tests {
         store: core::marker::PhantomData<fn() -> Store>,
     }
 
-    impl<const TOP_DOWN: bool, Store> litebox::platform::RawPointerProvider
-        for DummyVmemBackend<TOP_DOWN, Store>
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool>
+        litebox::platform::RawPointerProvider
+        for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT>
     {
         type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
         type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
     }
 
     #[expect(unused_variables, reason = "dummy/mock backend")]
-    impl<const TOP_DOWN: bool, Store> PageManagementProvider<PAGE_SIZE>
-        for DummyVmemBackend<TOP_DOWN, Store>
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool>
+        PageManagementProvider<PAGE_SIZE> for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT>
     where
         Store: ReservationStore<Reservation = DummyReservation<PAGE_SIZE>> + Default,
         Store::ReleaseTarget: Into<Range<usize>>,
@@ -1840,6 +1848,11 @@ mod tests {
         const TASK_ADDR_MIN: usize = 0x1_0000; // Vmem unit-test bound
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000; // MACH_VM_MAX_ADDRESS
+        const PLACEMENT_ADDR_MAX: usize = if LIMITED_PLACEMENT {
+            Self::TASK_ADDR_MAX - PAGE_SIZE
+        } else {
+            Self::TASK_ADDR_MAX
+        };
         const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
             HintPlacementBehavior::Directional(if TOP_DOWN {
                 AllocationDirection::TopDown
@@ -1965,19 +1978,19 @@ mod tests {
     fn dummy_backend<const TOP_DOWN: bool>(
         rejected_address: Option<usize>,
     ) -> &'static DummyVmemBackend<TOP_DOWN> {
-        new_dummy_backend(rejected_address, None)
+        new_dummy_backend::<TOP_DOWN, UntrackedDummyReservations, false>(rejected_address, None)
     }
 
     fn tracked_dummy_backend(
         rejected_commit: Option<usize>,
     ) -> &'static DummyVmemBackend<false, TrackedDummyReservations> {
-        new_dummy_backend(None, rejected_commit)
+        new_dummy_backend::<false, TrackedDummyReservations, false>(None, rejected_commit)
     }
 
-    fn new_dummy_backend<const TOP_DOWN: bool, Store: 'static>(
+    fn new_dummy_backend<const TOP_DOWN: bool, Store: 'static, const LIMITED_PLACEMENT: bool>(
         rejected_address: Option<usize>,
         rejected_commit: Option<usize>,
-    ) -> &'static DummyVmemBackend<TOP_DOWN, Store> {
+    ) -> &'static DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT> {
         Box::leak(Box::new(DummyVmemBackend {
             rejected_address,
             rejected_remap_address: Mutex::new(None),
@@ -2093,6 +2106,33 @@ mod tests {
             [(
                 address..address + PAGE_SIZE,
                 FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )]
+        );
+    }
+
+    #[test]
+    fn limited_placement_range_uses_no_replace() {
+        type Backend = DummyVmemBackend<true, UntrackedDummyReservations, true>;
+        let backend = new_dummy_backend::<true, UntrackedDummyReservations, true>(None, None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+
+        let address = unsafe {
+            vmem.create_mapping(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::TOP_DOWN,
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(address, Backend::PLACEMENT_ADDR_MAX - PAGE_SIZE);
+        assert_eq!(
+            *backend.calls.lock(),
+            [(
+                address..address + PAGE_SIZE,
+                FixedAddressBehavior::NoReplace,
             )]
         );
     }
