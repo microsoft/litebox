@@ -258,7 +258,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
 
     // Configure this CPU's STIMER preemption timer (VTL1 self-preemption).
     // Per-CPU; safe to call on BSP and APs.
-    timer::init();
+    timer::init(is_bsp);
 
     if is_bsp {
         let shim = litebox_shim_optee::OpteeShimBuilder::new(platform, session_manager())
