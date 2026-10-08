@@ -11,13 +11,15 @@ use litebox_broker_core::BrokerCore;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_host::BrokerHostAssociation;
 use litebox_broker_protocol::ObjectHandle;
-use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
+use litebox_broker_protocol::message::{
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerOperation,
+};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::shared_memory::{SharedBufferPool, SharedMemory, SharedMemoryError};
-use litebox_common_vm_abi::{Status, UserRange, WireFrame};
+use litebox_common_vm_abi::{BrokerOp, Status, UserRange, WireFrame};
 
 /// Accessed through the process's user mapping: valid only while that
 /// process's address space is current, which holds because the broker host
@@ -180,11 +182,23 @@ impl Broker {
         frame(&wire::encode_handshake_response(response))
     }
 
-    pub(crate) fn call(&self, request: &WireFrame) -> Result<WireFrame, Status> {
+    /// # Errors
+    ///
+    /// [`CallError::NotPermitted`] before execution if `permits` rejects the
+    /// operation.
+    pub(crate) fn call(
+        &self,
+        request: &WireFrame,
+        permits: impl FnOnce(BrokerOp) -> bool,
+    ) -> Result<WireFrame, CallError> {
         let association = self.association.borrow();
         let association = association.as_ref().ok_or(Status::Denied)?;
         let request = wire::decode_request(request.as_slice().ok_or(Status::InvalidArgument)?)
             .map_err(|_| Status::InvalidArgument)?;
+        let op = op_kind(&request.operation);
+        if !permits(op) {
+            return Err(CallError::NotPermitted(op));
+        }
         let mut response = None;
         association
             .execute_request(request, |r| {
@@ -192,7 +206,46 @@ impl Broker {
                 Ok::<(), Infallible>(())
             })
             .map_err(|_| Status::Denied)?;
-        frame(&wire::encode_response(response.ok_or(Status::Denied)?))
+        Ok(frame(&wire::encode_response(
+            response.ok_or(Status::Denied)?,
+        ))?)
+    }
+}
+
+pub(crate) enum CallError {
+    Status(Status),
+    NotPermitted(BrokerOp),
+}
+
+impl From<Status> for CallError {
+    fn from(status: Status) -> Self {
+        Self::Status(status)
+    }
+}
+
+/// Exhaustive: a new broker operation must be classified.
+fn op_kind(operation: &BrokerOperation) -> BrokerOp {
+    match operation {
+        BrokerOperation::CreateThread(_) => BrokerOp::CreateThread,
+        BrokerOperation::ExitThread(_) => BrokerOp::ExitThread,
+        BrokerOperation::CloseObject(_) => BrokerOp::CloseObject,
+        BrokerOperation::CheckReadiness(_) => BrokerOp::CheckReadiness,
+        BrokerOperation::GetStatusFlags(_) => BrokerOp::GetStatusFlags,
+        BrokerOperation::SetStatusFlags(_) => BrokerOp::SetStatusFlags,
+        BrokerOperation::Event(_) => BrokerOp::Event,
+        BrokerOperation::Pipe(_) => BrokerOp::Pipe,
+        BrokerOperation::Socket(_) => BrokerOp::Socket,
+        BrokerOperation::FillRandom(_) => BrokerOp::FillRandom,
+        BrokerOperation::File(_) => BrokerOp::File,
+        BrokerOperation::StartChildProcess(_) => BrokerOp::StartChildProcess,
+        BrokerOperation::GetProcessExitStatus(_) => BrokerOp::GetProcessExitStatus,
+        BrokerOperation::ExitChildProcess(_) => BrokerOp::ExitChildProcess,
+        BrokerOperation::ReportExitStatus(_) => BrokerOp::ReportExitStatus,
+        BrokerOperation::SetChildReaping(_) => BrokerOp::SetChildReaping,
+        BrokerOperation::DuplicateObjectsToChild(_) => BrokerOp::DuplicateObjectsToChild,
+        BrokerOperation::WriteChildMemory(_) => BrokerOp::WriteChildMemory,
+        BrokerOperation::Timer(_) => BrokerOp::Timer,
+        BrokerOperation::Signal(_) => BrokerOp::Signal,
     }
 }
 

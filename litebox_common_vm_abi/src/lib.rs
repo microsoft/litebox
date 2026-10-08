@@ -63,6 +63,12 @@
 //!   ([`StartupInfo`]), including the runner image; kernel-placed objects go
 //!   only here.
 //!
+//! # Lockdown
+//!
+//! [`CallId::Restrict`] irrevocably narrows the allowed calls, broker
+//! operations, and page permissions. A violation kills the process.
+//! [`CallId::Exit`] is always allowed.
+//!
 //! # Trust
 //!
 //! The runner is untrusted: the guest shares its address space and can make
@@ -179,6 +185,10 @@ macro_rules! kernel_calls {
             $( $(#[$meta])* $name = $id, )*
         }
 
+        impl CallSet {
+            pub const ALL: Self = Self(0 $( | 1 << $id )*);
+        }
+
         impl CallId {
             pub fn from_raw(raw: u64) -> Option<Self> {
                 match raw {
@@ -259,6 +269,193 @@ kernel_calls! {
     9 => Log(LogRequest) -> ();
     /// Does not return.
     10 => Exit(ExitRequest) -> ();
+    /// See [Lockdown](crate#lockdown).
+    11 => Restrict(RestrictRequest) -> ();
+}
+
+/// One bit per [`CallId`] value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(transparent)]
+pub struct CallSet(u64);
+
+impl CallSet {
+    pub const EMPTY: Self = Self(0);
+
+    /// `None` for unknown bits.
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn with(self, id: CallId) -> Self {
+        Self(self.0 | 1 << id as u32)
+    }
+
+    #[must_use]
+    pub const fn without(self, id: CallId) -> Self {
+        Self(self.0 & !(1 << id as u32))
+    }
+
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn contains(self, id: CallId) -> bool {
+        self.0 & 1 << id as u32 != 0
+    }
+}
+
+/// One bit per [`Prot`] value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(transparent)]
+pub struct ProtSet(u32);
+
+impl ProtSet {
+    pub const EMPTY: Self = Self(0);
+    pub const NO_EXEC: Self = Self::EMPTY
+        .with(Prot::None)
+        .with(Prot::Read)
+        .with(Prot::Write)
+        .with(Prot::ReadWrite);
+    pub const ALL: Self = Self::NO_EXEC
+        .with(Prot::Exec)
+        .with(Prot::ReadExec)
+        .with(Prot::WriteExec)
+        .with(Prot::ReadWriteExec);
+
+    /// `None` for unknown bits.
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn with(self, prot: Prot) -> Self {
+        Self(self.0 | 1 << prot as u32)
+    }
+
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn contains(self, prot: Prot) -> bool {
+        self.0 & 1 << prot as u32 != 0
+    }
+}
+
+macro_rules! broker_ops {
+    ($( $name:ident = $id:literal, )*) => {
+        /// `litebox_broker_protocol::message::BrokerOperation` variants. The
+        /// numbers are this ABI's ([`BrokerOpSet`] bits), not the protocol's.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum BrokerOp {
+            $( $name = $id, )*
+        }
+
+        impl BrokerOpSet {
+            pub const ALL: Self = Self(0 $( | 1 << $id )*);
+        }
+    };
+}
+
+broker_ops! {
+    CreateThread = 0,
+    ExitThread = 1,
+    CloseObject = 2,
+    CheckReadiness = 3,
+    GetStatusFlags = 4,
+    SetStatusFlags = 5,
+    Event = 6,
+    Pipe = 7,
+    Socket = 8,
+    FillRandom = 9,
+    File = 10,
+    StartChildProcess = 11,
+    GetProcessExitStatus = 12,
+    ExitChildProcess = 13,
+    ReportExitStatus = 14,
+    SetChildReaping = 15,
+    DuplicateObjectsToChild = 16,
+    Timer = 17,
+    Signal = 18,
+    WriteChildMemory = 19,
+}
+
+/// One bit per [`BrokerOp`] value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(transparent)]
+pub struct BrokerOpSet(u64);
+
+impl BrokerOpSet {
+    pub const EMPTY: Self = Self(0);
+
+    /// `None` for unknown bits.
+    pub const fn from_bits(bits: u64) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn with(self, op: BrokerOp) -> Self {
+        Self(self.0 | 1 << op as u32)
+    }
+
+    #[must_use]
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn contains(self, op: BrokerOp) -> bool {
+        self.0 & 1 << op as u32 != 0
+    }
+}
+
+/// Each set is intersected with the process's current one. Unknown bits are
+/// [`Status::InvalidArgument`]. Dropping [`CallId::Restrict`] from `calls`
+/// makes the lockdown final.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct RestrictRequest {
+    pub calls: CallSet,
+    pub broker_ops: BrokerOpSet,
+    /// For [`CallId::Map`] and [`CallId::Protect`].
+    pub prots: ProtSet,
+    reserved: Reserved,
+}
+
+impl RestrictRequest {
+    pub const fn new(calls: CallSet, broker_ops: BrokerOpSet, prots: ProtSet) -> Self {
+        Self {
+            calls,
+            broker_ops,
+            prots,
+            reserved: Reserved::Zero,
+        }
+    }
 }
 
 /// Addresses `start..start + len` in the runner process. Page-aligned where
@@ -748,6 +945,29 @@ mod tests {
         assert_eq!(UpcallFrame::try_read_from_bytes(&bytes).unwrap(), frame);
         bytes[0] = 2;
         assert!(UpcallFrame::try_read_from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn call_sets() {
+        assert!(CallSet::ALL.contains(CallId::Ready) && CallSet::ALL.contains(CallId::Restrict));
+        assert_eq!(CallSet::ALL.bits() & 1, 0);
+        let set = CallSet::EMPTY.with(CallId::Map).with(CallId::Log);
+        assert!(set.contains(CallId::Map) && !set.contains(CallId::Unmap));
+        assert_eq!(
+            set.intersection(CallSet::ALL.without(CallId::Log)),
+            CallSet::EMPTY.with(CallId::Map)
+        );
+        assert_eq!(CallSet::from_bits(CallSet::ALL.bits()), Some(CallSet::ALL));
+        assert_eq!(CallSet::from_bits(1), None);
+        let next_free_id = (CallSet::ALL.bits() + 1).next_power_of_two();
+        assert_eq!(CallSet::from_bits(next_free_id), None);
+        assert!(ProtSet::NO_EXEC.contains(Prot::ReadWrite));
+        assert!(!ProtSet::NO_EXEC.contains(Prot::ReadExec));
+        assert_eq!(ProtSet::from_bits(0x100), None);
+        assert!(BrokerOpSet::ALL.contains(BrokerOp::WriteChildMemory));
+        assert_eq!(BrokerOpSet::from_bits(BrokerOpSet::ALL.bits() + 1), None);
+        let random = BrokerOpSet::EMPTY.with(BrokerOp::FillRandom);
+        assert!(random.contains(BrokerOp::FillRandom) && !random.contains(BrokerOp::File));
     }
 
     #[test]
