@@ -17,6 +17,9 @@
 //! - Vault entries are serialized with each other, with interrupts disabled.
 //!   Other cores keep running.
 //!
+//! Retpolines protect explicit vault dispatches, not indirect branches inside
+//! the KDF. Those rely on available IBPB and eIBRS/AutoIBRS controls.
+//!
 //! SMT: the sibling hyperthread may run userspace of this VM. eIBRS/AutoIBRS
 //! plus STIBP block branch injection from it; concurrent data sampling is
 //! an accepted risk limited to older CPUs.
@@ -183,14 +186,15 @@ fn build_vault<E>(
     for frame in [prk_frame, dispatch_frame].into_iter().chain(stack_frames) {
         let start: usize = kernel_va(frame).as_u64().trunc();
         // Safety: nothing accesses vault memory through its kernel alias.
-        let _ = unsafe {
+        unsafe {
             manager.base_page_table.unmap_pages(
                 PageRange::new(start, start + PAGE_SIZE).unwrap(),
                 false,
                 true,
                 false,
             )
-        };
+        }
+        .expect("failed to unmap vault kernel alias");
     }
     evict_l1d(eviction.as_deref());
     spec.flush_l1d();
@@ -336,6 +340,8 @@ unsafe fn set_dispatch(target: usize) {
 // Assembly-only Rust-ABI tail entry, used through each target's exact signature.
 // Arguments, stack and return layout are unchanged; r11 is scratch on x86_64.
 // Host ABI tests exercise register arguments and hidden generic return pointers.
+//
+// TODO: Consider to use rustc's retpoline when it becomes stable.
 unsafe extern "Rust" {
     #[link_name = "litebox_vault_dispatch_retpoline"]
     fn dispatch_retpoline();
