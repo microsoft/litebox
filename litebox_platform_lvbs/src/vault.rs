@@ -6,9 +6,8 @@
 //! Threat model: VTL1 userspace using speculative side channels. VTL0
 //! is out of scope as it provides the PRK.
 //!
-//! - The PRK page and the KDF stack are mapped only in the vault page table.
-//!   Their `PA + KERNEL_OFFSET` aliases are unmapped (zeroed PTEs) from the
-//!   shared kernel tables.
+//! - Boot reserves the PRK, dispatch and stack pages outside the normal kernel
+//!   mapping and allocator. Only the vault page table maps them.
 //! - The KDF runs on the vault stack, which is wiped on exit. Caller-saved
 //!   GPRs and VTL1 extended state (x87/SSE) are overwritten too.
 //! - Entry: IBPB, STIBP, SSBD, RSB stuffing; vault dispatch uses retpolines.
@@ -32,17 +31,20 @@
 
 use crate::arch::spec_ctrl::VaultControls;
 use crate::host::per_cpu_variables::PerCpuVariablesAsm;
-use crate::mm::{MemoryProvider, pgtable::PageTableAllocator};
+use crate::mm::MemoryProvider;
+use crate::mshv::vtl1_mem_layout::{
+    VTL1_VAULT_STACK_PAGES, get_memory_base_address, vault_frame_range,
+};
 use crate::{PageTableManager, mm};
 use alloc::boxed::Box;
-use arrayvec::ArrayVec;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmem::{PAGE_SIZE, PageRange};
+use litebox_common_linux::vmem::{PAGE_SIZE, PageRange, VmFlags};
 use litebox_common_lvbs::PRK_LEN;
 use x86_64::{
     VirtAddr,
-    structures::paging::{FrameDeallocator, PageTableFlags, PhysFrame, Size4KiB},
+    structures::paging::{PageTableFlags, PhysFrame, Size4KiB},
 };
+use zeroize::Zeroizing;
 
 /// Vault pages, in the guard gap below `KERNEL_OFFSET`. Its top-level entry
 /// is not shared, so only the vault page table maps them.
@@ -56,7 +58,7 @@ const _: () = assert!(
 
 const VAULT_PRK_VA: u64 = VAULT_BASE;
 
-const VAULT_STACK_PAGES: usize = 8; // 32 KiB
+const VAULT_STACK_PAGES: usize = VTL1_VAULT_STACK_PAGES; // 32 KiB debug, 8 KiB release
 const VAULT_STACK_SIZE: usize = VAULT_STACK_PAGES * PAGE_SIZE;
 /// Unmapped guard pages surround the stack.
 const VAULT_STACK_BOTTOM: u64 = VAULT_BASE + 2 * PAGE_SIZE as u64;
@@ -88,9 +90,9 @@ pub(crate) fn is_accessible(buf: &[u8]) -> bool {
 }
 
 struct Vault {
-    /// Never dropped; maps the leaked PRK/stack frames.
-    _page_table: mm::PageTable<PAGE_SIZE>,
-    /// Physical address of `_page_table`'s top-level table.
+    /// Never dropped; maps the boot-reserved vault frames.
+    page_table: mm::PageTable<PAGE_SIZE>,
+    /// Physical address of `page_table`'s top-level table.
     p4: u64,
     spec: VaultControls,
     eviction: Option<Box<[u8]>>,
@@ -100,25 +102,8 @@ struct Vault {
 
 static VAULT: spin::Once<Vault> = spin::Once::new();
 
-type FrameAlloc = PageTableAllocator<crate::host::LvbsLinuxKernel>;
-
-fn kernel_va(frame: PhysFrame<Size4KiB>) -> VirtAddr {
-    <crate::host::LvbsLinuxKernel as MemoryProvider>::pa_to_va(frame.start_address())
-}
-
-/// Zero and free `frames` (installation failure only).
-fn free_frames(frames: &[PhysFrame<Size4KiB>]) {
-    for &frame in frames {
-        // Safety: frames come from `FrameAlloc` and are still mapped.
-        unsafe {
-            core::ptr::write_bytes(kernel_va(frame).as_mut_ptr::<u8>(), 0, PAGE_SIZE);
-            FrameAlloc::new().deallocate_frame(frame);
-        }
-    }
-}
-
-/// Create the vault. `fill` writes the PRK directly into its page, leaving no
-/// copy elsewhere, before the page's kernel alias is unmapped.
+/// Create the vault. `fill` reads the PRK into a zeroized boot buffer, which is
+/// copied into its reserved page through the vault mapping.
 ///
 /// `VAULT` admits a single installer, and `with_prk` ignores the vault until
 /// it is published.
@@ -142,6 +127,10 @@ fn build_vault<E>(
     manager: &PageTableManager,
     fill: impl FnOnce(&mut [u8; PRK_LEN]) -> Result<(), E>,
 ) -> Result<Vault, InstallError<E>> {
+    unsafe extern "C" fn copy_key(key: *mut u8, prk: *const u8) {
+        // Safety: unpublished writable PRK page; `key` is the live boot buffer.
+        unsafe { core::ptr::copy_nonoverlapping(key, prk.cast_mut(), PRK_LEN) };
+    }
     let spec = VaultControls::detect();
     let eviction = if spec.has_l1d_flush() {
         None
@@ -157,55 +146,42 @@ fn build_vault<E>(
         Some(buffer.into_boxed_slice())
     };
 
-    // PRK page, dispatch page, then stack pages.
-    let mut frames = ArrayVec::<PhysFrame<Size4KiB>, { 2 + VAULT_STACK_PAGES }>::new();
-    while !frames.is_full() {
-        let Some(frame) = FrameAlloc::allocate_frame(true) else {
-            free_frames(&frames);
-            return Err(InstallError::OutOfMemory);
-        };
-        frames.push(frame);
-    }
-    let [prk_frame, dispatch_frame, stack_frames @ ..] = frames.into_inner().unwrap();
-
-    // Safety: exclusively owned, zeroed page.
-    let prk = unsafe { &mut *kernel_va(prk_frame).as_mut_ptr::<[u8; PRK_LEN]>() };
-    let page_table = match fill(prk) {
-        Err(e) => Err(InstallError::Fill(e)),
-        Ok(()) => build_page_table(manager, prk_frame, dispatch_frame, &stack_frames)
-            .ok_or(InstallError::OutOfMemory),
-    };
-    let page_table = page_table.inspect_err(|_| {
-        free_frames(&[prk_frame, dispatch_frame]);
-        free_frames(&stack_frames);
-    })?;
-
-    // Hide the kernel aliases. They are in the shared kernel region, so this
-    // removes them from every page table and flushes all CPUs. The frames are
-    // intentionally leaked.
-    for frame in [prk_frame, dispatch_frame].into_iter().chain(stack_frames) {
-        let start: usize = kernel_va(frame).as_u64().trunc();
-        // Safety: nothing accesses vault memory through its kernel alias.
-        unsafe {
-            manager.base_page_table.unmap_pages(
-                PageRange::new(start, start + PAGE_SIZE).unwrap(),
-                false,
-                true,
-                false,
-            )
-        }
-        .expect("failed to unmap vault kernel alias");
-    }
-    evict_l1d(eviction.as_deref());
-    spec.flush_l1d();
-
-    Ok(Vault {
+    let mut key = Zeroizing::new([0u8; PRK_LEN]);
+    fill(&mut key).map_err(InstallError::Fill)?;
+    let memory_start = <crate::host::LvbsLinuxKernel as MemoryProvider>::va_to_pa(VirtAddr::new(
+        get_memory_base_address(),
+    ));
+    let frames = vault_frame_range(memory_start);
+    let prk_frame = frames.start;
+    let dispatch_frame = prk_frame + 1;
+    let stack_frames = core::array::from_fn::<_, VAULT_STACK_PAGES, _>(|i| {
+        prk_frame + 2 + u64::try_from(i).unwrap()
+    });
+    let page_table = build_page_table(manager, prk_frame, dispatch_frame, &stack_frames)
+        .ok_or(InstallError::OutOfMemory)?;
+    let vault = Vault {
         p4: page_table.get_physical_frame().start_address().as_u64(),
-        _page_table: page_table,
+        page_table,
         spec,
         eviction,
         lock: spin::Mutex::new(()),
-    })
+    };
+    // Safety: only this installer can access the unpublished vault.
+    unsafe { vault.run(copy_key, key.as_mut_ptr()) };
+    // Empty VmFlags leave this present page supervisor-only, read-only and NX.
+    // Safety: no vault window is active; the table has not been published.
+    unsafe {
+        vault.page_table.mprotect_pages(
+            PageRange::new(
+                VAULT_PRK_VA.trunc(),
+                (VAULT_PRK_VA + PAGE_SIZE as u64).trunc(),
+            )
+            .unwrap(),
+            VmFlags::empty(),
+        )
+    }
+    .expect("failed to make vault PRK read-only");
+    Ok(vault)
 }
 
 /// Shared kernel slots plus private PRK and stack mappings.
@@ -221,20 +197,21 @@ fn build_page_table(
 
     let ro = PageTableFlags::PRESENT | PageTableFlags::NO_EXECUTE;
     let rw = ro | PageTableFlags::WRITABLE;
-    pt.map_non_contiguous_phys_frames(&[prk_frame], VirtAddr::new(VAULT_PRK_VA), ro)
+    // Writable only for installation; changed to read-only before publication.
+    pt.map_non_contiguous_phys_frames(&[prk_frame], VirtAddr::new(VAULT_PRK_VA), rw)
         .ok()?;
     pt.map_non_contiguous_phys_frames(&[dispatch_frame], VirtAddr::new(VAULT_DISPATCH_VA), rw)
         .ok()?;
     pt.map_non_contiguous_phys_frames(stack_frames, VirtAddr::new(VAULT_STACK_BOTTOM), rw)
         .ok()?;
-    // On failure, dropping `pt` frees its private tables but not the frames.
+    // On failure, dropping `pt` frees private tables, not the reserved frames.
     Some(pt)
 }
 
 /// Run `f` with the PRK inside the vault.
 ///
-/// `f` must not take locks or touch memory outside the kernel image, heap,
-/// and stacks; `ctx` must live there too.
+/// User/vmap memory is unmapped in the vault. `ctx` must be kernel-resident.
+/// `f` must not take locks or re-enter the vault, to avoid deadlock.
 pub(crate) fn with_prk<C>(ctx: &mut C, f: fn(&[u8; PRK_LEN], &mut C)) -> Result<(), NotInstalled> {
     struct Call<'a, C> {
         ctx: &'a mut C,
@@ -262,25 +239,25 @@ pub(crate) fn with_prk<C>(ctx: &mut C, f: fn(&[u8; PRK_LEN], &mut C)) -> Result<
     }
 
     let vault = VAULT.get().ok_or(NotInstalled)?;
-    let vault_p4 = vault.p4;
     let mut call = Call { ctx, f };
-
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        // Lock with interrupts off so an IRQ cannot re-enter and deadlock.
-        let _guard = vault.lock.lock();
-        let spec = vault.spec.enter();
-        // Safety: interrupts are disabled and the lock is held.
-        unsafe {
-            trampoline(
-                vault_p4,
-                thunk::<C> as unsafe extern "C" fn(*mut u8, *const u8),
-                (&raw mut call).cast(),
-            );
-        }
-        evict_l1d(vault.eviction.as_deref());
-        vault.spec.exit(spec);
-    });
+    // Safety: the thunk matches `Call<C>`, which outlives the window.
+    unsafe { vault.run(thunk::<C>, (&raw mut call).cast()) };
     Ok(())
+}
+
+impl Vault {
+    /// `thunk` must obey the vault restrictions and accept `arg` plus the PRK address.
+    unsafe fn run(&self, thunk: unsafe extern "C" fn(*mut u8, *const u8), arg: *mut u8) {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // Lock with interrupts off so an IRQ cannot re-enter and deadlock.
+            let _guard = self.lock.lock();
+            let spec = self.spec.enter();
+            // Safety: interrupts are disabled, lock held, and caller supplies a valid thunk.
+            unsafe { trampoline(self.p4, thunk, arg) };
+            evict_l1d(self.eviction.as_deref());
+            self.spec.exit(spec);
+        });
+    }
 }
 
 /// Best-effort L1D displacement, not a substitute for microcode or a hardware flush.

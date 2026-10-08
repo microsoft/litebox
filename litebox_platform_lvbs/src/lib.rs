@@ -118,8 +118,8 @@ pub const BASE_PAGE_TABLE_ID: usize = 0;
 // at KERNEL_OFFSET.
 //
 // The VTL1 kernel region at the top of the address space maps the
-// entire VTL1 kernel via PA + KERNEL_OFFSET. A 1 TiB guard gap
-// separates it from the vmap region. A few vault pages sit in the gap, mapped
+// VTL1 kernel via PA + KERNEL_OFFSET, excluding boot-reserved vault frames.
+// A 1 TiB guard gap separates it from the vmap region. Vault pages sit in the gap, mapped
 // only in the vault page table (see `vault`).
 
 /// Offset added to any physical address to obtain the corresponding kernel
@@ -517,7 +517,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// A *new* top-level (PML4) page table is allocated from the heap, populated
     /// with a high-canonical mapping (`VA = PA + KERNEL_OFFSET`) covering the
-    /// entire kernel physical range, and loaded via CR3. Pages inside the kernel
+    /// kernel physical range except the vault reservation, and loaded via CR3. Pages inside the kernel
     /// text section (`text_phys_start..text_phys_end`) and the Hyper-V hypercall
     /// code page are mapped executable; every other page is marked `NO_EXECUTE`.
     /// `.rodata` is mapped read-only and `CR0.WP` is enabled.
@@ -543,16 +543,19 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// 4. **Early page table active**: CR3 must reference an early page
     ///    table that identity-maps (or otherwise maps) at least the kernel
-    ///    code and stack at high-canonical addresses. This function
-    ///    replaces it with the new base page table; it must only be
-    ///    called once.
+    ///    code and stack at high-canonical addresses, and maps the vault
+    ///    reservation writable for zeroing. This function replaces it and
+    ///    must only be called once.
+    ///
+    /// 5. **Boot reservation**: `phys_start` must match relocated `_memory_base`.
+    ///    The vault frames must be unused and excluded from allocator ranges.
     ///
     /// # Post-conditions
     ///
     /// After this function returns:
     ///
-    /// - CR3 points to the new base page table covering the **full** kernel
-    ///   physical range with DEP enforcement.
+    /// - CR3 points to the new base page table with DEP enforcement, excluding
+    ///   the reserved vault pages.
     /// - `CR0.WP` is set on the calling CPU; APs inherit it via their VP context.
     /// - The previous trampoline page table frames (early page table pages and
     ///   any Phase 1 scratch pages) are no longer referenced and may be
@@ -624,18 +627,44 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             exec_ranges.push(hvcall_phys..hvcall_phys + PAGE_SIZE as u64);
         }
 
+        let vault_frames = crate::mshv::vtl1_mem_layout::vault_frame_range(phys_start);
+        assert!(
+            vault_frames.end <= vtl1_range.end,
+            "vault reservation outside VTL1 memory"
+        );
+        #[cfg(not(test))]
+        {
+            use crate::mm::MemoryProvider;
+            use crate::mshv::vtl1_mem_layout::{VTL1_VAULT_PAGES, get_memory_base_address};
+            type Kernel = crate::host::LvbsLinuxKernel;
+            assert_eq!(
+                Kernel::va_to_pa(VirtAddr::new(get_memory_base_address())),
+                phys_start,
+                "boot memory base differs from relocated _memory_base"
+            );
+            let alias = Kernel::pa_to_va(vault_frames.start.start_address());
+            // Safety: unused boot-reserved pages, writable in the early page table.
+            unsafe {
+                core::ptr::write_bytes(alias.as_mut_ptr::<u8>(), 0, VTL1_VAULT_PAGES * PAGE_SIZE);
+            }
+        }
         let base_pt = unsafe { mm::PageTable::new_top_level() }
             .expect("Failed to allocate the base page table frame");
-        if base_pt
-            .map_phys_frame_range(
-                vtl1_range,
-                PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
-                Some(&exec_ranges),
-                Some(core::slice::from_ref(&rodata)),
-            )
-            .is_err()
-        {
-            panic!("Failed to map VTL1 physical memory to base page table with DEP");
+        for range in [
+            PhysFrame::range(vtl1_range.start, vault_frames.start),
+            PhysFrame::range(vault_frames.end, vtl1_range.end),
+        ] {
+            if base_pt
+                .map_phys_frame_range(
+                    range,
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                    Some(&exec_ranges),
+                    Some(core::slice::from_ref(&rodata)),
+                )
+                .is_err()
+            {
+                panic!("Failed to map VTL1 physical memory to base page table with DEP");
+            }
         }
 
         // Enable the NX (No-eXecute) bit in IA32_EFER before loading the new
@@ -645,10 +674,10 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         crate::arch::enable_dep();
 
         // Switch to the new base page table.
-        // Safety: the new page table maps the entire VTL1 memory range at
-        // high-canonical addresses, including the code and stack currently
+        // Safety: the new page table maps VTL1 memory except the unused vault
+        // reservation at high-canonical addresses, including the code and stack currently
         // in use. The Phase 1 trampoline page table (VTL0's PML4) is no
-        // longer needed.
+        // longer needed. Its PTEs are non-global, so CR3 drops both old aliases.
         base_pt.load();
 
         crate::arch::enable_write_protect();

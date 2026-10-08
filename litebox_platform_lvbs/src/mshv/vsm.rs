@@ -791,7 +791,7 @@ impl Vtl1Gate for LvbsVtl1Gate {
         }
 
         let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
-        // Copy straight into the vault's PRK page.
+        // Read into the vault installer's zeroized boot buffer.
         let result = crate::vault::install(self.platform.page_table_manager(), |prk| {
             LvbsVtl0Gate::mint(self.platform)
                 .read_vtl0_contiguous(key_pa.as_u64(), prk)
