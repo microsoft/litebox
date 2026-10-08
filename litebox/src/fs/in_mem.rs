@@ -670,7 +670,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.write();
                 if file.file_type == FileType::SymbolicLink {
-                    return Err(ChmodError::Io);
+                    return Err(ChmodError::IsSymlink);
                 }
                 sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
             }
@@ -690,7 +690,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<(), ChownError> {
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
-                sync::RwLockWriteGuard::map(h.get_typed::<Self>().file.write(), |f| &mut f.perms)
+                let file = h.get_typed::<Self>().file.write();
+                if file.file_type == FileType::SymbolicLink {
+                    return Err(ChownError::IsSymlink);
+                }
+                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
             }
             super::backend::HandleRef::Dir(h) => {
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)

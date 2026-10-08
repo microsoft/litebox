@@ -83,8 +83,8 @@ mod symlinks {
     use crate::fs::backend::{Backend, HandleRef, WalkStopReason};
     use crate::fs::composer::Composer;
     use crate::fs::errors::{
-        FileStatusError, OpenError, PathError, ReadError, RmdirError, TruncateError, WalkError,
-        WriteError,
+        ChmodError, ChownError, FileStatusError, OpenError, PathError, ReadError, RmdirError,
+        TruncateError, WalkError, WriteError,
     };
     use crate::fs::in_mem::{InMem, InitialNode};
     use crate::fs::inode_allocator::InodeAllocator;
@@ -343,16 +343,16 @@ mod symlinks {
             .open_file_at(backend.root(), "link", OFlags::PATH | OFlags::NOFOLLOW)
             .unwrap()
             .item;
-        backend
-            .chown(HandleRef::File(&handle), Some(0), None)
-            .unwrap();
-        assert!(
-            backend
-                .chmod(HandleRef::File(&handle), Mode::empty())
-                .is_err()
-        );
+        assert!(matches!(
+            backend.chown(HandleRef::File(&handle), Some(0), None),
+            Err(ChownError::IsSymlink)
+        ));
+        assert!(matches!(
+            backend.chmod(HandleRef::File(&handle), Mode::empty()),
+            Err(ChmodError::IsSymlink)
+        ));
         let status = backend.status(HandleRef::File(&handle)).unwrap();
-        assert_eq!(status.owner.user, 0);
+        assert_eq!(status.owner.user, OWNER.user);
         assert_eq!(status.mode, ALL_PERMS);
         assert_eq!(
             backend

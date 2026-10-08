@@ -113,6 +113,8 @@ pub enum ChmodError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("the named file is a symbolic link")]
+    IsSymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]
@@ -130,6 +132,8 @@ pub enum ChownError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("the named file is a symbolic link")]
+    IsSymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]
