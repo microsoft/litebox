@@ -364,7 +364,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// - `source_reservations`: Lazily transfers ownership of reservations covering `old_range`.
     /// - `old_range`: The existing address range to remap.
-    /// - `new_range`: The requested address range for the remapped pages.
+    /// - `new_range`: The exact address range for the remapped pages.
     /// - `permissions`: The permissions to apply to the remapped pages.
     ///
     /// # Returns
