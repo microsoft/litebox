@@ -450,21 +450,6 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     pub fn remove_ta_bin(&self, ta_uuid: &TeeUuid) {
         self.0.remove_ta_bin(ta_uuid);
     }
-
-    /// Release all user-space memory mappings owned by this shim instance.
-    ///
-    /// This must be called before switching to the base page table and deleting
-    /// the task page table so that every mapped physical page is properly freed.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that no references to the released memory regions
-    /// are held after this call.
-    pub unsafe fn release_user_mappings(&self) {
-        unsafe {
-            let _ = self.memory_manager().release_memory();
-        }
-    }
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimEntrypoints<Platform> {

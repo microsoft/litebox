@@ -268,7 +268,7 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
                 status => panic!("Protect while committing: unexpected {status:?}"),
             },
         )?;
-        // The VM ABI cannot eagerly populate an existing mapping without replacing its contents.
+        // TODO: The VM ABI cannot eagerly populate an existing mapping without replacing its contents.
         let _ = populate_pages_immediately;
         Ok(UserMutPtr::from_ptr(range.start as *mut u8))
     }

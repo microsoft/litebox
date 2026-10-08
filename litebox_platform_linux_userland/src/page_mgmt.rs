@@ -66,8 +66,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     /// this limit has no effect.
     #[cfg(target_arch = "aarch64")]
     const PLACEMENT_ADDR_MAX: usize = 0x4000_0000_0000;
-    /// The host relocates rejected hints top-down, but vmem uses exact placement on both
-    /// architectures when enforcing their lower `PLACEMENT_ADDR_MAX` bounds.
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
