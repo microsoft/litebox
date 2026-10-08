@@ -74,11 +74,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
 
     /// Insert a single [`InitialNode`], as described on [`Self::new_initialized`].
     fn insert_initial(&self, path: &str, node: InitialNode) {
-        if let InitialNode::Symlink { target, .. } = &node {
+        if let InitialNode::Symlink { mode, target, .. } = &node {
             assert!(
                 !target.is_empty() && !target.as_bytes().contains(&0),
                 "symlink targets must be nonempty and contain no NUL bytes"
             );
+            if *mode != Mode::RWXU | Mode::RWXG | Mode::RWXO {
+                litebox_util_log::debug!(
+                    path:? = path, mode:? = mode;
+                    "symlink modes other than 0777 may not be fully supported"
+                );
+            }
         }
         let mut components = path.split('/').filter(|component| {
             assert!(
@@ -135,14 +141,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                 };
                 existing.data = data;
             }
-            (Some(Node::File(existing)), InitialNode::Symlink { owner, target }) => {
+            (
+                Some(Node::File(existing)),
+                InitialNode::Symlink {
+                    mode,
+                    owner,
+                    target,
+                },
+            ) => {
                 let mut existing = existing.write();
                 assert_eq!(
                     existing.file_type,
                     FileType::SymbolicLink,
                     "{path:?} already exists with a different type"
                 );
-                existing.perms.userinfo = owner;
+                existing.perms = Permissions {
+                    mode,
+                    userinfo: owner,
+                };
                 existing.data = target.into_bytes().into();
             }
             (Some(_), _) => panic!("{path:?} already exists with a different type"),
@@ -169,10 +185,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                 }));
                 dir.children.insert(name.into(), Node::File(child));
             }
-            (None, InitialNode::Symlink { owner, target }) => {
+            (
+                None,
+                InitialNode::Symlink {
+                    mode,
+                    owner,
+                    target,
+                },
+            ) => {
                 let child = Arc::new(sync::RwLock::new(FileData {
                     perms: Permissions {
-                        mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
+                        mode,
                         userinfo: owner,
                     },
                     file_type: FileType::SymbolicLink,
@@ -237,8 +260,10 @@ pub enum InitialNode {
         /// cheap way to set up large read-heavy files (such as executables).
         data: alloc::borrow::Cow<'static, [u8]>,
     },
-    /// A symbolic link with fixed permissions of 0777.
+    /// A symbolic link.
     Symlink {
+        /// Permission bits for the link.
+        mode: Mode,
         /// Owning user and group.
         owner: UserInfo,
         /// The link's target; it need not exist or be normalized.

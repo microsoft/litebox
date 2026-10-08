@@ -2760,6 +2760,7 @@ mod tests {
             owner: UserInfo::ROOT,
         };
         let symlink = |target: &str| InitialNode::Symlink {
+            mode: Mode::RWXU | Mode::RWXG | Mode::RWXO,
             owner: UserInfo::ROOT,
             target: target.into(),
         };

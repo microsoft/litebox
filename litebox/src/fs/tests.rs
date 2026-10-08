@@ -119,6 +119,7 @@ mod symlinks {
 
     fn link(target: &str) -> InitialNode {
         InitialNode::Symlink {
+            mode: ALL_PERMS,
             owner: OWNER,
             target: target.into(),
         }
