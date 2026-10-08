@@ -771,6 +771,7 @@ type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
 struct FileData {
     perms: Permissions,
     file_type: FileType,
+    /// The contents of a regular file, or the target of a symlink.
     data: alloc::borrow::Cow<'static, [u8]>,
     node_info: NodeInfo,
 }
