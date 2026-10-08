@@ -325,6 +325,7 @@ const PAGE_SIZE: u64 = litebox_common_linux::vmem::PAGE_SIZE as u64;
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 
 const NR_SYSCALL_FUTEX: u32 = 202;
+const NR_SYSCALL_GETRANDOM: u32 = 318;
 const NR_SYSCALL_READ: u32 = 0;
 const NR_SYSCALL_WRITE: u32 = 1;
 const NR_SYSCALL_EXIT: u32 = 60;
@@ -590,16 +591,28 @@ impl HostInterface for HostSnpInterface {
 
 impl litebox::platform::CrngProvider for SnpLinuxKernel {
     fn fill_bytes_crng(&self, buf: &mut [u8]) {
-        // FIXME: call into the trusted host to get random bytes.
-        static RANDOM: spin::mutex::SpinMutex<litebox::utils::rng::FastRng> =
-            spin::mutex::SpinMutex::new(litebox::utils::rng::FastRng::new_from_seed(
-                core::num::NonZeroU64::new(0x4d595df4d0f33173).unwrap(),
-            ));
-        let mut random = RANDOM.lock();
-        for b in buf.chunks_mut(8) {
-            b.copy_from_slice(&random.next_u64().to_ne_bytes()[..b.len()]);
+        fill_bytes_from_host(buf, |buf| {
+            HostSnpInterface::syscalls(SyscallN::<3, NR_SYSCALL_GETRANDOM> {
+                args: [buf.as_mut_ptr() as u64, buf.len() as u64, 0],
+            })
+        })
+        .expect("getrandom failed");
+    }
+}
+
+fn fill_bytes_from_host(
+    mut buf: &mut [u8],
+    mut getrandom: impl FnMut(&mut [u8]) -> Result<usize, Errno>,
+) -> Result<(), Errno> {
+    while !buf.is_empty() {
+        match getrandom(buf) {
+            Ok(len) if len <= buf.len() && len != 0 => buf = &mut buf[len..],
+            Ok(_) => return Err(Errno::EIO),
+            Err(Errno::EINTR) => {}
+            Err(err) => return Err(err),
         }
     }
+    Ok(())
 }
 
 impl litebox::platform::SignalProvider for SnpLinuxKernel {
