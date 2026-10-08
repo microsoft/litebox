@@ -235,6 +235,9 @@ impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
 }
 
 /// Derive the initial CRNG seed inside the vault.
+///
+/// TODO: We don't need to use the vault to initialize CRNG seed if
+/// we get an additional nonce from the TPM/VTL0.
 fn crng_seed_in_vault(rdrand: CrngSeed) -> Option<CrngSeed> {
     let mut ctx = (rdrand, CrngSeed::default());
     crate::vault::with_prk(&mut ctx, |prk, ctx| {
