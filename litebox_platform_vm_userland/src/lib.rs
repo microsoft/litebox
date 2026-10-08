@@ -72,7 +72,7 @@ impl VmUserland {
         }
     }
 
-    /// For [`kcall::ready`].
+    /// For [`kcall::ready`] and [`kcall::run`].
     pub fn upcall_entry_address() -> usize {
         thread::upcall_entry as *const () as usize
     }
@@ -466,6 +466,41 @@ impl litebox::platform::DerivedKeyProvider for VmUserland {
         zeroize::Zeroize::zeroize(&mut key);
         Ok(result?)
     }
+}
+
+/// One thread per process: the kernel has no scheduler yet, so nothing could
+/// run a second one.
+impl litebox::platform::ThreadProvider for VmUserland {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    /// The only thread.
+    type ThreadHandle = ();
+
+    unsafe fn spawn_thread(
+        &self,
+        _ctx: &Self::ExecutionContext,
+        _init_thread: alloc::boxed::Box<
+            dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
+        >,
+    ) -> Result<(), Self::ThreadSpawnError> {
+        Err(litebox_common_linux::errno::Errno::EAGAIN)
+    }
+
+    fn current_thread(&self) -> Self::ThreadHandle {}
+
+    /// The only thread is the caller, which is not running guest code.
+    fn interrupt_thread(&self, _thread: &Self::ThreadHandle) {}
+}
+
+/// Unsupported until the kernel has a timer.
+impl litebox::platform::TimerProvider for VmUserland {
+    type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
+    type Signal = litebox_common_linux::signal::Signal;
+}
+
+/// No asynchronous signals: nothing outside the process can raise one.
+impl litebox::platform::SignalProvider for VmUserland {
+    type Signal = litebox_common_linux::signal::Signal;
 }
 
 /// Unsupported: physical memory is not accessible from ring 3.

@@ -62,17 +62,18 @@ jobs:
           key: custom-out-${{ runner.os }}-${{ github.job }}-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/litebox_syscall_rewriter/**/*.rs') }}
       - run: ./.github/tools/github_actions_run_cargo fmt
       - run: |
-          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_linux_on_macos_userland
+          ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_linux_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_optee_on_linux_userland --exclude litebox_runner_linux_on_macos_userland
           ./.github/tools/github_actions_run_cargo clippy --all-targets --all-features -p litebox_runner_optee_on_linux_userland
           (cd litebox_runner_optee_on_qemu && ../.github/tools/github_actions_run_cargo clippy --all-features)
           (cd litebox_runner_vm_kernel && ../.github/tools/github_actions_run_cargo clippy --all-features)
-          # Without RUSTFLAGS, which would replace the runner's codegen flags, as
-          # `dev_tools/run_optee_on_vm_userland.sh` builds it.
+          # Without RUSTFLAGS, which would replace the runners' codegen flags, as
+          # `dev_tools/run_{optee,linux}_on_vm_userland.sh` build them.
           (cd litebox_runner_optee_on_vm_userland && env -u RUSTFLAGS ../.github/tools/github_actions_run_cargo clippy --all-features -- -D warnings)
+          (cd litebox_runner_linux_on_vm_userland && env -u RUSTFLAGS ../.github/tools/github_actions_run_cargo clippy --all-features -- -D warnings)
           # We exclude `litebox_runner_lvbs` because it requires a custom target and nightly
           # features. `build_and_test_lvbs` covers it.
           # `litebox_runner_optee_on_qemu` and `litebox_runner_vm_kernel` are kernels, and
-          # `litebox_runner_optee_on_vm_userland` is a ring-3 program for them, all for
+          # `litebox_runner_{optee,linux}_on_vm_userland` are ring-3 programs for them, all for
           # `x86_64-unknown-none` as set by their `.cargo/config.toml`, so they are linted from
           # their directories and tested in QEMU below.
           # `litebox_runner_optee_on_linux_userland` conflicts with `litebox_runner_linux_userland` due to
@@ -98,13 +99,18 @@ jobs:
         run: |
           QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
             ./dev_tools/run_optee_on_vm_userland.sh -u
+      - name: Run Linux programs in a QEMU VM with stacked runners (TCG)
+        # Also builds the kernel and userland runners.
+        run: |
+          QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
+            ./dev_tools/run_linux_on_vm_userland.sh
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
           # aren't included in nextest at the moment. See relevant discussion at
           # https://github.com/nextest-rs/nextest/issues/16
       - name: Build documentation (fail on warnings)
-        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_linux_on_macos_userland
+        run: ./.github/tools/github_actions_run_cargo doc --no-deps --all-features --document-private-items --workspace --exclude litebox_runner_lvbs --exclude litebox_runner_optee_on_qemu --exclude litebox_runner_optee_on_vm_userland --exclude litebox_runner_linux_on_vm_userland --exclude litebox_runner_vm_kernel --exclude litebox_runner_snp --exclude litebox_runner_linux_on_macos_userland
 
   build_and_test_arm64:
     name: Build and Test (AArch64)

@@ -29,6 +29,7 @@ pub use signal::aarch64::GuestVectorState;
 #[cfg(not(target_arch = "aarch64"))]
 pub type GuestVectorState = ();
 pub mod user_pointers;
+pub mod vm_userland;
 pub mod vmap;
 pub mod vmem;
 

@@ -2,11 +2,14 @@
 // Licensed under the MIT license.
 
 //! QEMU guest kernel: a [service](service::Service) in ring-3 runner
-//! processes, and a [client](client) for it. Today: OP-TEE TAs in
-//! `litebox_runner_optee_on_vm_userland` processes, one per TA instance
-//! ([`service::optee`]),
-//! driven by a test client ([`client::script`]). QEMU exits with 33 if all
-//! tests pass, 65 otherwise.
+//! processes, and a [client](client) for it. The payload picks one:
+//! - OP-TEE TAs in `litebox_runner_optee_on_vm_userland` processes, one per
+//!   TA instance ([`service::optee`]), driven by [`client::script`].
+//! - With a `linux.json`: Linux programs in
+//!   `litebox_runner_linux_on_vm_userland` processes, one per run
+//!   ([`service::linux`]), driven by [`client::linux`].
+//!
+//! QEMU exits with 33 if all tests pass, 65 otherwise.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -30,8 +33,13 @@ fn kernel_main(kernel: Kernel) -> ! {
     set_platform_root_key(&litebox_hal::prk::development());
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
-    let mut service = service::optee::Optee::new(kernel.platform, kernel.tsc_khz, &payload);
-    client::script::run(&payload, &mut service);
+    if payload.file("linux.json").is_some() {
+        let mut service = service::linux::Linux::new(kernel.platform, kernel.tsc_khz, &payload);
+        client::linux::run(&payload, &mut service);
+    } else {
+        let mut service = service::optee::Optee::new(kernel.platform, kernel.tsc_khz, &payload);
+        client::script::run(&payload, &mut service);
+    }
     console_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)
 }

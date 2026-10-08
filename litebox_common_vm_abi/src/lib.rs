@@ -34,7 +34,8 @@
 //!
 //! # Upcalls
 //!
-//! The kernel enters [`ReadyRequest::upcall_entry`] with an [`UpcallFrame`]:
+//! The kernel enters [`ReadyRequest::upcall_entry`] (or
+//! [`RunRequest::upcall_entry`]) with an [`UpcallFrame`]:
 //!
 //! - [`UpcallKind::Syscall`]: registers as `syscall` leaves them (`rcx` =
 //!   return address, `r11` = flags), number in `orig_rax`, `rax` = `-ENOSYS`.
@@ -46,9 +47,10 @@
 //!
 //! # Messages
 //!
-//! The runner serves requests: [`CallId::Ready`] and [`CallId::ReplyAndWait`]
-//! return the next request, and `ReplyAndWait` sends the reply to the current
-//! one. Both are a [`Message`]: an [`envelope`] at the start of
+//! A runner either serves requests or, after [`CallId::Run`], none (it runs
+//! until it exits). A serving runner's [`CallId::Ready`] and
+//! [`CallId::ReplyAndWait`] return the next request, and `ReplyAndWait` sends
+//! the reply to the current one. Both are a [`Message`]: an [`envelope`] at the start of
 //! [`StartupInfo::message_window`] that wraps the service's own ABI. The
 //! kernel checks a reply's framing, not its parts.
 //!
@@ -92,7 +94,8 @@
 //!   kernel serves every published request first.
 //! - The ring's notification direction carries readiness of broker objects
 //!   (e.g., timers) from the kernel. The kernel's broker provides only
-//!   randomness so far, so it produces none yet.
+//!   randomness and, for some services, files and standard streams that are
+//!   always ready, so it produces none yet.
 //! - The kernel pins the control ring and accesses it through its own mapping.
 //!   The shared buffers stay lazily populated and are touched only while
 //!   executing a request that names them.
@@ -300,6 +303,11 @@ kernel_calls! {
     10 => Exit(ExitRequest) -> ();
     /// See [Lockdown](crate#lockdown).
     11 => Restrict(RestrictRequest) -> ();
+    /// Runs without serving requests: registers the upcall entry and returns.
+    /// Allowed once, at startup, instead of [`CallId::Ready`]; the process then
+    /// ends only by [`CallId::Exit`]. `abi_version` must equal
+    /// [`ABI_VERSION`].
+    12 => Run(RunRequest) -> ();
 }
 
 /// One bit per [`CallId`] value.
@@ -698,6 +706,26 @@ impl ReadyRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct RunRequest {
+    pub abi_version: u32,
+    reserved: Reserved,
+    /// As [`ReadyRequest::upcall_entry`].
+    pub upcall_entry: u64,
+}
+
+impl RunRequest {
+    /// For this [`ABI_VERSION`].
+    pub const fn new(upcall_entry: u64) -> Self {
+        Self {
+            abi_version: ABI_VERSION,
+            reserved: Reserved::Zero,
+            upcall_entry,
+        }
+    }
+}
+
 /// An [`envelope`] of `len` bytes at the start of
 /// [`StartupInfo::message_window`], at most its length. A reply must parse
 /// ([`Status::InvalidArgument`]).
@@ -902,6 +930,7 @@ mod tests {
             );
         };
         check(CallId::Ready, ReadyRequest::new(0).as_bytes(), 4);
+        check(CallId::Run, RunRequest::new(0).as_bytes(), 4);
         check(
             CallId::Protect,
             ProtectRequest::new(range, Prot::Read).as_bytes(),

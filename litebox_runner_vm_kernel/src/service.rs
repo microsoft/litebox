@@ -3,6 +3,7 @@
 
 //! Services in runner processes, as clients see them.
 
+pub mod linux;
 pub mod optee;
 
 /// A request/reply service in runner processes; clients reach it only through

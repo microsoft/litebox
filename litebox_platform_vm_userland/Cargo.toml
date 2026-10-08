@@ -2,6 +2,7 @@
 name = "litebox_platform_vm_userland"
 version = "0.1.0"
 edition = "2024"
+links = "litebox_platform_vm_userland"
 description = "LiteBox platform for a ring-3 runner on the LiteBox VM kernel"
 
 [dependencies]

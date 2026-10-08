@@ -1,0 +1,13 @@
+[
+  {
+    "argv": ["/hello"],
+    "expect_stdout": "Hello, world!\nargv[0] = /hello\n",
+    "expect_stderr": "to stderr\n"
+  },
+  {
+    "argv": ["/hello", "fail", "a b"],
+    "envp": ["GREETING=hi"],
+    "expect_exit_code": 3,
+    "expect_stdout": "Hello, world!\nargv[0] = /hello\nargv[1] = fail\nargv[2] = a b\nenvp[0] = GREETING=hi\n"
+  }
+]

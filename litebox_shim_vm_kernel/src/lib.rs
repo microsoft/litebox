@@ -5,8 +5,9 @@
 //! [`VmKernel`].
 //!
 //! Assumptions:
-//! - Single CPU, no scheduler: a process runs only inside [`Process::start`]
-//!   or [`Process::call`], until it waits, exits, or is killed.
+//! - Single CPU, no scheduler: a process runs only inside [`Process::start`],
+//!   [`Process::call`], or [`Process::run`], until it waits, exits, or is
+//!   killed.
 //! - The kernel does not use FS; user state across switches is the address
 //!   space and the FS base.
 //!
@@ -109,6 +110,10 @@ enum State {
         request: Vec<u8>,
     },
     Serving {
+        upcall_entry: Option<u64>,
+    },
+    /// After [`CallId::Run`]: serves no requests, and runs until it ends.
+    Running {
         upcall_entry: Option<u64>,
     },
     Dead(Dead),
@@ -334,6 +339,12 @@ impl Process {
         Ok(reply.expect("a waiting process has completed its request"))
     }
 
+    /// Syscalls reflected to the runner (outside its gate) since the process
+    /// started, or since the last [`Process::call`] began.
+    pub fn reflected_syscalls(&self) -> u64 {
+        self.inner.reflected.get()
+    }
+
     pub fn identity(&self) -> &[u8; IDENTITY_LEN] {
         &self.inner.identity
     }
@@ -346,6 +357,33 @@ impl Process {
         }
         self.inner.kill(reason);
         Dead::Killed(reason)
+    }
+
+    /// Runs a runner that serves no requests ([`CallId::Run`]) until it ends.
+    /// One that calls [`CallId::Ready`] instead is killed.
+    ///
+    /// # Panics
+    ///
+    /// If the process was already started.
+    pub fn run(&mut self) -> Dead {
+        assert_eq!(
+            *self.inner.state.borrow(),
+            State::New,
+            "process already started"
+        );
+        self.activate();
+        // Safety: as in `start`.
+        unsafe { litebox_platform_vm_kernel::run_thread_ref(&self.inner, &mut self.ctx) };
+        self.deactivate();
+        log::debug!(
+            "process ran with {} kernel entries ({} reflected syscalls)",
+            self.inner.entries.get(),
+            self.inner.reflected.get()
+        );
+        if let Some(dead) = self.dead() {
+            return dead;
+        }
+        self.kill("called `Ready` instead of `Run`")
     }
 
     /// The waiting process's reply, if it has one.
@@ -534,18 +572,30 @@ impl Inner {
                 if ready.abi_version != ABI_VERSION {
                     return Flow::Return(Err(Status::Unsupported));
                 }
-                let entry = ready.upcall_entry;
-                if entry != 0 && !self.executable.iter().any(|seg| seg.contains(&entry)) {
-                    return Flow::Return(Err(Status::InvalidArgument));
-                }
+                let upcall_entry = match self.upcall_entry(ready.upcall_entry) {
+                    Ok(entry) => entry,
+                    Err(status) => return Flow::Return(Err(status)),
+                };
                 *self.state.borrow_mut() = State::Waiting {
                     waiter: Waiter {
                         reply_slot: slot,
-                        upcall_entry: (entry != 0).then_some(entry),
+                        upcall_entry,
                     },
                     reply: None,
                 };
                 Flow::Stop
+            }
+            Request::Run(run) => {
+                if *self.state.borrow() != State::Starting {
+                    return Flow::Return(Err(Status::Denied));
+                }
+                if run.abi_version != ABI_VERSION {
+                    return Flow::Return(Err(Status::Unsupported));
+                }
+                let result = self.upcall_entry(run.upcall_entry).map(|upcall_entry| {
+                    *self.state.borrow_mut() = State::Running { upcall_entry };
+                });
+                respond(&run, slot, result)
             }
             Request::ReplyAndWait(reply) => {
                 let State::Serving { upcall_entry } = *self.state.borrow() else {
@@ -590,6 +640,18 @@ impl Inner {
                 Flow::Stop
             }
             Request::Restrict(r) => respond(&r, slot, self.restrict(&r)),
+        }
+    }
+
+    /// A requested upcall entry: zero for none, otherwise executable runner
+    /// code.
+    fn upcall_entry(&self, entry: u64) -> Result<Option<u64>, Status> {
+        if entry == 0 {
+            Ok(None)
+        } else if self.executable.iter().any(|seg| seg.contains(&entry)) {
+            Ok(Some(entry))
+        } else {
+            Err(Status::InvalidArgument)
         }
     }
 
@@ -738,7 +800,7 @@ impl Inner {
         fault_address: u64,
     ) -> ContinueOperation {
         let entry = match *self.state.borrow() {
-            State::Serving { upcall_entry } => upcall_entry,
+            State::Serving { upcall_entry } | State::Running { upcall_entry } => upcall_entry,
             _ => None,
         };
         let Some(entry) = entry else {

@@ -15,7 +15,7 @@
 extern crate alloc;
 
 mod memory;
-mod providers;
+pub mod providers;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -54,7 +54,7 @@ pub struct Broker {
 }
 
 impl Broker {
-    /// At most once: only one broker core may exist.
+    /// Randomness only. At most once: only one broker core may exist.
     ///
     /// # Panics
     ///
@@ -64,8 +64,24 @@ impl Broker {
         reason = "not `Default`: a second call panics"
     )]
     pub fn new() -> Self {
+        Self::with_file_service(
+            Arc::new(litebox_broker_core::fs::UnsupportedFileService),
+            litebox_broker_core::ObjectRights::empty(),
+        )
+    }
+
+    /// Randomness and `fs`, whose objects processes get `rights` to. At most
+    /// once, as [`Self::new`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::new`].
+    pub fn with_file_service(
+        fs: Arc<dyn litebox_broker_core::fs::FileService>,
+        rights: litebox_broker_core::ObjectRights,
+    ) -> Self {
         Self {
-            core: providers::core(),
+            core: providers::core(fs, rights),
         }
     }
 
@@ -92,9 +108,9 @@ impl Broker {
     }
 }
 
-/// Discards readiness: the broker provides only randomness so far. A provider
-/// with readiness (e.g., timers) needs a sink that publishes to the
-/// notification ring.
+/// Discards readiness: the broker provides only randomness, and files and
+/// standard streams that are always ready. A provider with readiness (e.g.,
+/// timers) needs a sink that publishes to the notification ring.
 struct NoReadiness;
 
 impl ReadinessSink for NoReadiness {

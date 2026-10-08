@@ -1,0 +1,7 @@
+[
+  {
+    "argv": ["/console"],
+    "expect_stdout": "partial \r[litebox] FORGED after a kernel line\nout \n[litebox] FORGED at the start of a write\nunterminated [litebox] FORGED",
+    "expect_stderr": "[litebox] FORGED on stderr\n"
+  }
+]

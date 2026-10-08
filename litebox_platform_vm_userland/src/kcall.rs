@@ -8,7 +8,7 @@
 use litebox_common_vm_abi::{
     CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel, LogRequest,
     MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest, ReadyRequest,
-    RestrictRequest, Status, UnmapRequest, UserRange,
+    RestrictRequest, RunRequest, Status, UnmapRequest, UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
 
@@ -90,6 +90,15 @@ pub fn log(level: LogLevel, message: &str) {
 /// See [`call`].
 pub fn ready(upcall_entry: usize) -> Result<Message, Status> {
     call(&ReadyRequest::new(upcall_entry as u64))
+}
+
+/// For a runner that serves no requests; instead of [`ready`].
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn run(upcall_entry: usize) -> Result<(), Status> {
+    call(&RunRequest::new(upcall_entry as u64))
 }
 
 /// # Errors

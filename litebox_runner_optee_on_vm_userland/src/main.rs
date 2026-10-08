@@ -7,7 +7,8 @@
 //!   instance ends.
 //! - The TA and `ldelf` may be syscall-rewritten (syscalls are calls into the
 //!   shim) or unmodified (each `syscall` costs one kernel round trip).
-//! - Static PIE linked at 0 (`x86_64_vm_userland.ld`): the kernel loads it at
+//! - Static PIE linked at 0 (`litebox_platform_vm_userland`'s
+//!   `x86_64_vm_userland.ld`): the kernel loads it at
 //!   the top of the user address space and applies its relocations.
 
 #![cfg(target_arch = "x86_64")]
