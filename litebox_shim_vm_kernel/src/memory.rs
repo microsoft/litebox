@@ -101,14 +101,19 @@ impl Frames for VmKernel {
             Placement::NoReplace => FixedAddressBehavior::NoReplace,
             Placement::Replace => FixedAddressBehavior::Replace,
         };
-        PageManagementProvider::<PAGE_SIZE>::allocate_pages(
-            self,
-            range,
-            permissions(prot),
-            false,
-            populate == Populate::Now,
-            behavior,
-        )
+        // Safety: Mappings supplies an aligned user range, excludes conflicting access during
+        // replacement, and retains ownership through its range map.
+        unsafe {
+            <VmKernel as PageManagementProvider<PAGE_SIZE>>::reserve_and_commit_pages(
+                self,
+                core::iter::empty,
+                range,
+                permissions(prot),
+                false,
+                populate == Populate::Now,
+                behavior,
+            )
+        }
         .map(|_| ())
         .map_err(|e| match e {
             litebox::platform::page_mgmt::AllocationError::OutOfMemory => Status::NoMemory,
@@ -118,14 +123,19 @@ impl Frames for VmKernel {
 
     unsafe fn release(&self, range: Range<usize>) -> Result<(), Status> {
         // Safety: forwarded to the caller.
-        unsafe { PageManagementProvider::<PAGE_SIZE>::release_pages(self, range) }
+        unsafe { <VmKernel as PageManagementProvider<PAGE_SIZE>>::release_pages(self, range) }
             .map_err(|_| Status::InvalidArgument)
     }
 
     unsafe fn protect(&self, range: Range<usize>, prot: Prot) -> Result<(), Status> {
         // Safety: forwarded to the caller.
         unsafe {
-            PageManagementProvider::<PAGE_SIZE>::update_permissions(self, range, permissions(prot))
+            <VmKernel as PageManagementProvider<PAGE_SIZE>>::protect_pages(
+                self,
+                core::iter::empty,
+                range,
+                permissions(prot),
+            )
         }
         .map_err(|_| Status::InvalidArgument)
     }

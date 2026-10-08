@@ -40,38 +40,32 @@ pub mod syscalls;
 #[cfg(all(test, target_os = "macos"))]
 mod tests;
 
-/// Reservation store used by the Darwin shim's virtual memory manager.
-pub type ShimReservations<Reservation> =
-    litebox::platform::common_providers::reservations::NoTrackedReservations<
-        PAGE_SIZE,
-        Reservation,
-    >;
-
 /// Platform capabilities required for descriptor, page, gate, and wait management.
 pub trait ShimPlatform:
-    PageManagementProvider<PAGE_SIZE, Reservations = ShimReservations<Self::Reservation>>
+    PageManagementProvider<PAGE_SIZE, Reservations = <Self as ShimPlatform>::VmemReservations>
     + RawSyncPrimitivesProvider
     + TimeProvider
     + litebox::platform::SignalProvider
     + litebox::platform::SystemInfoProvider
     + litebox_common_macos::MachClock
     + 'static
+    + Sized
 {
-    /// Opaque page-reservation ownership type supplied by the platform.
-    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
+    type VmemReservations: litebox_common_linux::vmem::LinuxReservationStore<Self, PAGE_SIZE>;
 }
-impl<P, Reservation> ShimPlatform for P
+impl<P> ShimPlatform for P
 where
-    P: PageManagementProvider<PAGE_SIZE, Reservations = ShimReservations<Reservation>>
+    P: PageManagementProvider<PAGE_SIZE>
         + RawSyncPrimitivesProvider
         + TimeProvider
         + litebox::platform::SignalProvider
         + litebox::platform::SystemInfoProvider
         + litebox_common_macos::MachClock
-        + 'static,
-    Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync,
+        + 'static
+        + Sized,
+    P::Reservations: litebox_common_linux::vmem::LinuxReservationStore<P, PAGE_SIZE>,
 {
-    type Reservation = Reservation;
+    type VmemReservations = P::Reservations;
 }
 
 pub struct MacosShimBuilder<P: ShimPlatform> {

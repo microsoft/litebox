@@ -249,14 +249,47 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
     const TASK_ADDR_MAX: usize = MANAGED_MAX;
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Exact;
 
-    fn allocate_pages(
+    unsafe fn commit_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+        populate_pages_immediately: bool,
+    ) -> Result<UserMutPtr<u8>, AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation VmUserlandReservation<ALIGN>>,
+        VmUserlandReservation<ALIGN>: 'reservation,
+    {
+        kcall::protect(range.start, range.len(), prot(permissions)).map_err(
+            |status| match status {
+                Status::NoMemory => AllocationError::OutOfMemory,
+                Status::Denied => AllocationError::PermissionDenied,
+                Status::InvalidArgument => AllocationError::Unaligned,
+                status => panic!("Protect while committing: unexpected {status:?}"),
+            },
+        )?;
+        // TODO: The VM ABI cannot eagerly populate an existing mapping without replacing its contents.
+        let _ = populate_pages_immediately;
+        Ok(UserMutPtr::from_ptr(range.start as *mut u8))
+    }
+
+    unsafe fn reserve_and_commit_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<UserMutPtr<u8>, AllocationError> {
+    ) -> Result<VmUserlandReservation<ALIGN>, AllocationError>
+    where
+        Reservations: Iterator<Item = VmUserlandReservation<ALIGN>>,
+    {
+        if suggested_range.start == 0
+            && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_))
+        {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
         // The kernel never grows mappings; growth is the shim's bookkeeping.
         let _ = can_grow_down;
         let placement = match fixed_address_behavior {
@@ -275,14 +308,13 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
             return Err(AllocationError::AboveMaxAddress);
         }
         let len = suggested_range.end.saturating_sub(suggested_range.start);
-        kcall::map(
+        let address = kcall::map(
             suggested_range.start,
             len,
             prot(initial_permissions),
             placement,
             populate,
         )
-        .map(|addr| UserMutPtr::from_ptr(addr as *mut u8))
         .map_err(|status| match status {
             Status::NoMemory => AllocationError::OutOfMemory,
             Status::Exists => AllocationError::AddressInUse,
@@ -290,6 +322,34 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
             // Misaligned or a bad protection: the range was checked above.
             Status::InvalidArgument => AllocationError::Unaligned,
             status => panic!("Map: unexpected {status:?}"),
+        })?;
+        if fixed_address_behavior == FixedAddressBehavior::Replace {
+            replaced_reservations().for_each(drop);
+        }
+        // Safety: Map returned exclusive ownership of this exact extent.
+        Ok(unsafe { VmUserlandReservation::new(address..address + len) })
+    }
+
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), DeallocationError>
+    where
+        Reservations: Iterator<Item = &'reservation VmUserlandReservation<ALIGN>>,
+        VmUserlandReservation<ALIGN>: 'reservation,
+    {
+        kcall::map(
+            range.start,
+            range.len(),
+            Prot::None,
+            Placement::Replace,
+            Populate::Lazy,
+        )
+        .map(|_| ())
+        .map_err(|status| match status {
+            Status::InvalidArgument | Status::Denied => DeallocationError::Unaligned,
+            status => panic!("Map while decommitting: unexpected {status:?}"),
         })
     }
 
@@ -306,11 +366,16 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
         })
     }
 
-    unsafe fn update_permissions(
+    unsafe fn protect_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), PermissionUpdateError> {
+    ) -> Result<(), PermissionUpdateError>
+    where
+        Reservations: Iterator<Item = &'reservation VmUserlandReservation<ALIGN>>,
+        VmUserlandReservation<ALIGN>: 'reservation,
+    {
         kcall::protect(
             range.start,
             range.end.saturating_sub(range.start),
@@ -322,10 +387,6 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmUserland {
             Status::InvalidArgument => PermissionUpdateError::Unaligned,
             _ => PermissionUpdateError::PlatformFailure,
         })
-    }
-
-    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        core::iter::empty()
     }
 }
 

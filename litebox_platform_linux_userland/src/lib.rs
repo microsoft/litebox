@@ -11,13 +11,6 @@
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 
-use std::cell::Cell;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
-use std::time::Duration;
-use std::unimplemented;
-
-use litebox::platform::RawConstPointer as _;
 use litebox::platform::page_mgmt::{
     CowAllocationError, FixedAddressBehavior, MemoryRegionPermissions,
 };
@@ -31,6 +24,10 @@ use litebox_platform::sync::{
 use litebox_platform::time::{
     Instant as InstantTrait, SystemTime as SystemTimeTrait, TimeProvider,
 };
+use std::cell::Cell;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::time::Duration;
 
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -130,8 +127,6 @@ macro_rules! saved_tls {
 /// This implements the main [`litebox::platform::Provider`] trait, i.e., implements all platform
 /// traits.
 pub struct LinuxUserland {
-    /// Reserved pages that are not available for guest programs to use.
-    reserved_pages: Vec<core::ops::Range<usize>>,
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
     /// re-mmap the file.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
@@ -182,9 +177,7 @@ impl LinuxUserland {
 
         register_exception_handlers();
 
-        let reserved_pages = Self::read_maps();
         let platform = Self {
-            reserved_pages,
             cow_regions: std::sync::RwLock::new(std::collections::BTreeMap::new()),
             boot_id: std::sync::OnceLock::new(),
         };
@@ -288,94 +281,6 @@ impl LinuxUserland {
             }
         }
         None
-    }
-
-    fn read_maps() -> alloc::vec::Vec<core::ops::Range<usize>> {
-        // TODO: this function is not guaranteed to return all allocated pages, as it may
-        // allocate more pages after the mapping file is read. Missing allocated pages may
-        // cause the program to crash when calling `mmap` or `mremap` with the `MAP_FIXED` flag later.
-        // We should either fix `mmap` to handle this error, or let global allocator call this function
-        // whenever it get more pages from the host.
-        let path = c"/proc/self/maps";
-        let mut maps = Vec::new();
-        let mut buffer_length = 8192;
-        loop {
-            maps.clear();
-            maps.try_reserve_exact(buffer_length)
-                .expect("failed to allocate maps buffer");
-            maps.resize(buffer_length, 0);
-
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: `path` is a valid C string and `open` receives the
-            // argument count required when no creation flag is present.
-            let fd = unsafe {
-                syscalls::syscall3(
-                    syscalls::Sysno::open,
-                    path.as_ptr() as usize,
-                    OFlags::RDONLY.bits() as usize,
-                    0,
-                )
-            };
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: `path` is a valid C string and the arguments satisfy the
-            // `openat` contract when no creation flag is present.
-            let fd = unsafe {
-                syscalls::syscall4(
-                    syscalls::Sysno::openat,
-                    AT_FDCWD,
-                    path.as_ptr() as usize,
-                    OFlags::RDONLY.bits() as usize,
-                    0,
-                )
-            };
-            let Ok(fd) = fd else {
-                return alloc::vec::Vec::new();
-            };
-
-            let mut total_read = 0;
-            while total_read < maps.len() {
-                // SAFETY: `fd` is open for reading and the remaining `maps`
-                // region is valid for writes of up to its full length.
-                let length = unsafe {
-                    syscalls::syscall3(
-                        syscalls::Sysno::read,
-                        fd,
-                        maps.as_mut_ptr() as usize + total_read,
-                        maps.len() - total_read,
-                    )
-                }
-                .expect("read failed");
-                if length == 0 {
-                    break;
-                }
-                total_read += length;
-            }
-            // SAFETY: `fd` was returned by the successful open above and is
-            // consumed exactly once in this iteration.
-            unsafe { syscalls::syscall1(syscalls::Sysno::close, fd) }.expect("close failed");
-
-            if total_read < maps.len() {
-                maps.truncate(total_read);
-                break;
-            }
-            buffer_length = buffer_length
-                .checked_mul(2)
-                .expect("maps buffer size overflow");
-        }
-
-        let mut reserved_pages = alloc::vec::Vec::new();
-        let s = core::str::from_utf8(&maps).expect("invalid UTF-8");
-        for line in s.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 5 {
-                continue;
-            }
-            let range = parts[0].split('-').collect::<Vec<&str>>();
-            let start = usize::from_str_radix(range[0], 16).expect("invalid start address");
-            let end = usize::from_str_radix(range[1], 16).expect("invalid end address");
-            reserved_pages.push(start..end);
-        }
-        reserved_pages
     }
 
     #[allow(

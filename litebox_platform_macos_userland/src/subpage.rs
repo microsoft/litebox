@@ -330,6 +330,32 @@ impl<const PAGE_SIZE: usize> Pages<PAGE_SIZE> {
         Ok(())
     }
 
+    pub(super) fn decommit(&mut self, range: Range<usize>) -> Result<(), DeallocationError> {
+        if !self.contains_range(range.clone()) {
+            return Err(DeallocationError::AlreadyUnallocated);
+        }
+        let aliases: Vec<_> = host_range(&range)
+            .step_by(HOST_PAGE_SIZE)
+            .map(|base| {
+                Mapping::write_alias(base)
+                    .map(|alias| (base, alias))
+                    .map_err(|_| DeallocationError::AlreadyUnallocated)
+            })
+            .collect::<Result<_, _>>()?;
+        self.update_permissions(range.clone(), Perm::empty())
+            .map_err(|_| DeallocationError::AlreadyUnallocated)?;
+        for (base, alias) in aliases {
+            let start = range.start.max(base);
+            let end = range.end.min(base + HOST_PAGE_SIZE);
+            // SAFETY: the temporary alias is writable, shares this owned guest page, and the
+            // caller excludes users while the decommitted bytes are reset.
+            unsafe {
+                std::ptr::write_bytes((alias.base + start - base) as *mut u8, 0, end - start);
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn deallocate(&mut self, range: Range<usize>) -> Result<(), DeallocationError> {
         // Bound sparse-unmap work by the smaller of the span and table capacity.
         let native = host_range(&range);
@@ -597,7 +623,7 @@ mod tests {
     use super::*;
 
     use crate::{MacosUserland4K as MacosUserland, UserMutPtr, run_thread};
-    use litebox::platform::page_mgmt::AllocationDirection;
+    use litebox::platform::page_mgmt::{AllocationDirection, PageReservation as _};
     use litebox::platform::{
         PageManagementProvider as _, RawConstPointer as _, RawMutPointer as _,
     };
@@ -908,6 +934,24 @@ mod tests {
     }
 
     #[test]
+    fn decommit_zeroes_only_the_requested_subpage() {
+        let mut pages = TestPages::new();
+        let base = pages.allocate(HOST_PAGE_SIZE, RW);
+        let memory = ptr(base);
+        assert_eq!(memory.write_at_offset(0, 0xa5), Some(()));
+        assert_eq!(memory.write_at_offset(PAGE_SIZE as isize, 0x5a), Some(()));
+
+        pages.0.decommit(base..base + PAGE_SIZE).unwrap();
+        pages
+            .0
+            .update_permissions(base..base + PAGE_SIZE, RW)
+            .unwrap();
+
+        assert_eq!(memory.read_at_offset(0), Some(0));
+        assert_eq!(memory.read_at_offset(PAGE_SIZE as isize), Some(0x5a));
+    }
+
+    #[test]
     fn subpage_lifetime_zeroing_and_bounded_fusion() {
         let mut pages = TestPages::new();
         let base = pages.allocate(2 * HOST_PAGE_SIZE, RW);
@@ -1146,15 +1190,21 @@ mod tests {
             host_base(source_range.start),
             host_base(neighbor_range.start)
         );
-        let neighbor = platform
-            .allocate_pages(
+        let neighbor_reservation = unsafe {
+            platform.reserve_and_commit_pages(
+                core::iter::empty,
                 neighbor_range.clone(),
                 RW,
                 false,
                 true,
                 FixedAddressBehavior::NoReplace,
             )
-            .unwrap();
+        }
+        .unwrap();
+        let neighbor =
+            <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+                neighbor_reservation.range().start,
+            );
         assert_eq!(source.write_at_offset(0, 42), Some(()));
         assert_eq!(neighbor.write_at_offset(0, 99), Some(()));
 

@@ -307,16 +307,20 @@ fn teardown_continues_after_unmap_failure_during_unwind() {
     assert!(result.is_err());
     // Cleanup continues with the second VMA after the first unmap fails.
     let second_page = base + PAGE_SIZE..base + 2 * PAGE_SIZE;
-    let probe = platform
-        .allocate_pages(
-            second_page.clone(),
-            Permissions::READ,
-            false,
-            true,
-            FixedAddressBehavior::NoReplace,
-        )
-        .unwrap();
-    assert_eq!(probe.as_usize(), second_page.start);
+    let probe = unsafe {
+        platform
+            .reserve_and_commit_pages(
+                core::iter::empty,
+                second_page.clone(),
+                Permissions::READ,
+                false,
+                true,
+                FixedAddressBehavior::NoReplace,
+            )
+            .unwrap()
+    };
+    let probe: core::ops::Range<usize> = probe.into();
+    assert_eq!(probe.start, second_page.start);
     // SAFETY: the probe has no users and is owned by this test.
     unsafe {
         platform.release_pages(second_page).unwrap();
