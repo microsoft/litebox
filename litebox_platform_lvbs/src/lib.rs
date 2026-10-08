@@ -1977,7 +1977,7 @@ unsafe extern "C" fn exception_handler(
             kernel_mode: false,
         }
     };
-    // A user-mode STIMER_VECTOR fire is the preemption timeout: EOI it and fall
+    // A user-mode STIMER_VECTOR fire is the preemption timeout: acknowledge it and fall
     // through to the shim, which kills the TA with TEE_ERROR_TARGET_DEAD.
     if !kernel_mode && info.exception.0 == crate::arch::timer::STIMER_VECTOR {
         crate::arch::timer::eoi();

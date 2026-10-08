@@ -63,6 +63,9 @@ pub struct PerCpuVariables {
     /// Set once this CPU's preemption timer is configured (see `arch::timer`).
     /// Zero-initialized to `false`.
     pub(crate) preemption_timer_enabled: Cell<bool>,
+    /// True if the preemption timer uses STIMER message mode (see `arch::timer`).
+    /// Zero-initialized to `false`.
+    pub(crate) preemption_timer_message_mode: Cell<bool>,
     /// True while the preemption timer is armed (see `arch::timer`).
     /// Zero-initialized to `false`.
     pub(crate) preemption_armed: Cell<bool>,
