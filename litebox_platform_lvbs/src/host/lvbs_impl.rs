@@ -7,7 +7,6 @@ use crate::{
     Errno, HostInterface, arch::ioport::serial_print_string,
     host::per_cpu_variables::with_per_cpu_variables,
 };
-use litebox_common_lvbs::PRK_LEN;
 use zeroize::Zeroizing;
 
 pub type LvbsLinuxKernel = crate::LinuxKernel<HostLvbsInterface>;

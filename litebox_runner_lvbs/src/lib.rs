@@ -34,9 +34,10 @@ use litebox_platform_lvbs::{
         vtl1_mem_layout::{
             VSM_SK_PTE_PAGES_COUNT, VTL1_INIT_HEAP_SIZE, VTL1_INIT_HEAP_START_PAGE,
             VTL1_PML4E_PAGE, VTL1_PRE_POPULATED_MEMORY_SIZE, VTL1_PTE_0_PAGE, VTL1_REMAP_PDE_PAGE,
-            VTL1_REMAP_PDPT_PAGE, get_heap_start_address, get_memory_base_address,
-            get_rela_end_address, get_rela_start_address, get_rodata_end_address,
-            get_rodata_start_address, get_text_end_address, get_text_start_address,
+            VTL1_REMAP_PDPT_PAGE, VTL1_VAULT_PAGES, VTL1_VAULT_START_PAGE, get_heap_start_address,
+            get_memory_base_address, get_rela_end_address, get_rela_start_address,
+            get_rodata_end_address, get_rodata_start_address, get_text_end_address,
+            get_text_start_address,
         },
     },
 };
@@ -114,7 +115,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
 
     if is_bsp {
         let (start, size) = get_vtl1_memory_info().expect("Failed to get memory info");
-        let min_vtl1_size = ((VTL1_REMAP_PDE_PAGE + 1) * PAGE_SIZE) as u64;
+        let min_vtl1_size = ((VTL1_VAULT_START_PAGE + VTL1_VAULT_PAGES) * PAGE_SIZE) as u64;
         assert!(
             size >= min_vtl1_size,
             "VTL1 memory size is too small for fixed boot layout"
@@ -178,7 +179,7 @@ pub fn init(is_bsp: bool) -> &'static Platform {
         );
 
         // Reclaim Phase 1 / VTL0 page table frames now that Platform::new()
-        // has loaded a fresh base page table covering all VTL1 memory.
+        // has loaded a fresh base page table (excluding the vault reservation).
         // These physical pages are no longer referenced by CR3.
         {
             // Reclaim pages 2–12 (PML4, PDPT, PDE, 8 PTE pages)

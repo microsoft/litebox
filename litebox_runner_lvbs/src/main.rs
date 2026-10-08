@@ -201,8 +201,8 @@ unsafe fn apply_relocations() {
 /// │ Phase 2 – Base page table with DEP (Platform::new, lib.rs)          │
 /// │                                                                     │
 /// │ Heap is now available (seeded from the 16 MiB Phase 1 window).      │
-/// │ Allocate a fresh PML4 from the heap. Map ALL 128 MiB of VTL1        │
-/// │ memory with NX (no-execute) by default; mark only .text and         │
+/// │ Allocate a fresh PML4 from the heap. Map VTL1 memory except the     │
+/// │ vault reservation, with NX by default; mark only .text and          │
 /// │ .hvcall_page executable, and .rodata read-only. Enable EFER.NXE,    │
 /// │ load the new CR3, then enable CR0.WP.                               │
 /// │                                                                     │
@@ -234,12 +234,19 @@ unsafe fn apply_relocations() {
 /// stack page (pages 14–15), preserving all 8 PTE pages for the high-canonical
 /// mapping and covering the full 16 MiB.
 ///
-/// ## Page table pages used
+/// ## Boot pages used
 ///
-/// | page | constant              | purpose                                |
-/// |------|-----------------------|----------------------------------------|
-/// | 14   | `VTL1_REMAP_PDPT_PAGE`| PDPT for the high-canonical PML4 entry |
-/// | 15   | `VTL1_REMAP_PDE_PAGE` | PDE pointing to PTE pages 5–12         |
+/// | Pages           | Constant                | Purpose                               |
+/// |-----------------|-------------------------|---------------------------------------|
+/// | 14              | `VTL1_REMAP_PDPT_PAGE`  | PDPT for the high-canonical PML4 entry|
+/// | 15              | `VTL1_REMAP_PDE_PAGE`   | PDE pointing to PTE pages 5–12        |
+/// | 16              | `VTL1_VAULT_START_PAGE` | Vault PRK                             |
+/// | 17              |                         | Vault dispatch                        |
+/// | 18–25 (debug)   |                         | Vault stack                           |
+/// | 18–19 (release) |                         | Vault stack                           |
+///
+/// Vault pages are cleared during boot and excluded from the Phase 2 mapping
+/// and allocator; only the vault page table maps them.
 ///
 /// ## Algorithm
 ///
