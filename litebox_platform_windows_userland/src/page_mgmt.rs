@@ -366,10 +366,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN>
         }
         Ok(())
     }
-
-    fn reserved_pages(&self) -> impl Iterator<Item = &std::ops::Range<usize>> {
-        core::iter::empty()
-    }
 }
 
 #[cfg(test)]

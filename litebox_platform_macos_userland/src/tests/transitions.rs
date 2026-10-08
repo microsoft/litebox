@@ -8,18 +8,30 @@ use litebox_syscall_rewriter::{
 
 // The first page contains code and gates; remaining pages are RW stack storage.
 // Darwin gates are host-aware so the native-path test can call them directly.
-fn prepare_code(platform: &MacosUserland, words: &[u32], pages: usize, abi: GuestAbi) -> usize {
+fn prepare_code(
+    platform: &MacosUserland,
+    words: &[u32],
+    pages: usize,
+    abi: GuestAbi,
+) -> MacosUserlandReservation<HOST_PAGE_SIZE> {
     assert!(pages > 0);
-    let memory = platform
-        .allocate_pages(
+    // SAFETY: The fixed test range is aligned, free, and retained by the returned reservation.
+    let reservation = unsafe {
+        platform.reserve_and_commit_pages(
+            core::iter::empty,
             TASK_ADDR_MIN..TASK_ADDR_MIN + pages * HOST_PAGE_SIZE,
             RW,
             false,
             true,
             FixedAddressBehavior::Hint(AllocationDirection::BottomUp),
         )
-        .unwrap();
-    let base = memory.as_usize();
+    }
+    .unwrap();
+    let base = reservation.range().start;
+    let memory =
+        <MacosUserland as litebox::platform::RawPointerProvider>::RawMutPointer::<u8>::from_usize(
+            base,
+        );
     let mut code: Vec<_> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
     assert!(code.len() <= HOST_PAGE_SIZE / 2);
     let gate_address = (base + HOST_PAGE_SIZE / 2) as u64;
@@ -56,13 +68,14 @@ fn prepare_code(platform: &MacosUserland, words: &[u32], pages: usize, abi: Gues
     );
     // SAFETY: code and gates are initialized and have no users before RX publication.
     unsafe {
-        platform.update_permissions(
+        platform.protect_pages(
+            || core::iter::once(&reservation),
             base..base + HOST_PAGE_SIZE,
             MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
         )
     }
     .unwrap();
-    base
+    reservation
 }
 
 #[test]
@@ -121,7 +134,7 @@ fn native_syscall_gate_preserves_registers_and_carry() {
         }
     }
     let platform = MacosUserland::new();
-    let base = prepare_code(
+    let reservation = prepare_code(
         platform,
         &[
             0xaa00_03f0, // mov x16, x0
@@ -136,9 +149,10 @@ fn native_syscall_gate_preserves_registers_and_carry() {
         1,
         GuestAbi::Darwin,
     );
+    let base = reservation.range().start;
     let _cleanup = litebox::utils::defer(|| {
         // SAFETY: both callers have finished before this test-owned code is released.
-        unsafe { platform.release_pages(base..base + HOST_PAGE_SIZE) }.unwrap();
+        unsafe { platform.release_pages(reservation.into()) }.unwrap();
     });
     assert_ne!(tls_block_address(), 0);
     assert_eq!(read_tls(tls_offset::IN_GUEST), 0);
@@ -206,7 +220,8 @@ fn child_inherits_vector_state_and_dispatches_on_host_stack() {
 
     set_guest_abi(GuestAbi::Linux);
     let platform = MacosUserland::new();
-    let base = prepare_code(platform, &[0xd400_0001], 3, GuestAbi::Linux); // svc #0
+    let reservation = prepare_code(platform, &[0xd400_0001], 3, GuestAbi::Linux); // svc #0
+    let base = reservation.range().start;
     let original = get_guest_vector_state();
     let _restore = litebox::utils::defer(|| set_guest_vector_state(&original));
     let mut vector_state = GuestVectorState::default();
@@ -235,5 +250,5 @@ fn child_inherits_vector_state_and_dispatches_on_host_stack() {
     }
     assert!(receive.recv_timeout(Duration::from_secs(5)).unwrap());
     // SAFETY: Probe has stopped, so the guest mappings are idle.
-    unsafe { platform.release_pages(base..base + 3 * HOST_PAGE_SIZE) }.unwrap();
+    unsafe { platform.release_pages(reservation.into()) }.unwrap();
 }

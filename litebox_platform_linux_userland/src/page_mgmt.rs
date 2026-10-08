@@ -395,10 +395,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         Ok(())
     }
 
-    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        core::iter::empty()
-    }
-
     /// Asks the host to back `range` with transparent huge pages, each of which takes one
     /// fault and one clear instead of one per base page. This is best-effort: the host may
     /// have them disabled, or another thread may have unmapped the range.

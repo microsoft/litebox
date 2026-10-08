@@ -727,10 +727,6 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
                 .mprotect_pages(range, new_flags)
         }
     }
-
-    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
-        core::iter::empty()
-    }
 }
 
 impl VmemPageFaultHandler for VmKernel {

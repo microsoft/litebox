@@ -1959,10 +1959,6 @@ mod tests {
                 .push((range, new_permissions));
             Ok(())
         }
-
-        fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
-            core::iter::empty()
-        }
     }
 
     fn dummy_backend<const TOP_DOWN: bool>(
