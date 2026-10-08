@@ -260,7 +260,10 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             return Err(TeeResult::ItemNotFound);
         }
         let new_handle = self.ta_handle_map.insert(ta_uuid);
-        let _ = handle.write_at_offset(0, new_handle);
+        if handle.write_at_offset(0, new_handle).is_none() {
+            self.ta_handle_map.remove(new_handle);
+            return Err(TeeResult::AccessDenied);
+        }
 
         Ok(())
     }
@@ -500,7 +503,9 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
             }
         }
 
-        let _ = va.write_at_offset(0, usable_start_addr);
+        if va.write_at_offset(0, usable_start_addr).is_none() {
+            return Err(TeeResult::AccessDenied);
+        }
         guard.disarm();
         // Record the trampoline pages so the padding checks treat them as unmapped.
         if let Some(range) = trampoline_page_range {
