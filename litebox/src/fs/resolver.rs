@@ -98,31 +98,6 @@ impl Context {
         }
     }
 
-    /// Resolve `path` against the current context.
-    // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
-    // outside the chrooted part.
-    // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
-    // `Arg` anymore, so could get rid of it in the future.
-    pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
-        let mut components = if path.as_rust_str()?.starts_with('/') {
-            vec![]
-        } else {
-            self.cwd.components.clone()
-        };
-        for component in path.components()? {
-            match component {
-                "" | "." => {}
-                ".." => {
-                    let _ = components.pop();
-                }
-                _ => {
-                    components.push(component.into());
-                }
-            }
-        }
-        Ok(ResolvedPath { components })
-    }
-
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
         if self.user_info.user == permissions.owner.user {
             permissions.mode.contains(Mode::XUSR)
@@ -160,7 +135,7 @@ impl Default for Context {
     }
 }
 
-/// Absolute normalized path, created by [`Context::resolve`] or [`Resolver::resolve_following_symlinks`].
+/// Absolute normalized path, must only be created by [`Resolver`]'s path resolution.
 ///
 /// Note that a resolved path does not imply that it exists within the file system, merely that it
 /// is an absolute normalized path.
@@ -213,8 +188,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     Resolver<Platform, Backend>
 {
     /// Resolve a path to its physical location, following symbolic links.
-    ///
-    /// Unlike [`Context::resolve`], this consults the backend before processing `..`.
     pub fn resolve_following_symlinks(
         &self,
         context: &Context,
@@ -251,6 +224,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     // Operations rewalk the expanded path; this is not an atomic namespace snapshot.
+    // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
+    // outside the chrooted part.
+    // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
+    // `Arg` anymore, so could get rid of it in the future.
     fn resolve_path(
         &self,
         context: &Context,
