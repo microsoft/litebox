@@ -616,14 +616,43 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
     const TASK_ADDR_MAX: usize = USER_ADDR_MAX;
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Exact;
 
-    fn allocate_pages(
+    unsafe fn commit_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+        permissions: MemoryRegionPermissions,
+        populate_pages_immediately: bool,
+    ) -> Result<Self::RawMutPointer<u8>, AllocationError>
+    where
+        Reservations: Iterator<Item = &'reservation VmReservation<ALIGN>>,
+        VmReservation<ALIGN>: 'reservation,
+    {
+        let range = PageRange::new(range.start, range.end).ok_or(AllocationError::Unaligned)?;
+        let current_pt = self.page_table_manager.current_page_table();
+        // Safety: the caller excludes conflicting accesses to the covered reservation.
+        unsafe { current_pt.mprotect_pages(range, vm_flags(permissions)) }
+            .expect("failed to protect committed pages");
+        // Safety: the supplied reservations cover this user address range.
+        unsafe { current_pt.map_pages(range, vm_flags(permissions), populate_pages_immediately) }
+    }
+
+    unsafe fn reserve_and_commit_pages<Reservations>(
+        &self,
+        replaced_reservations: impl FnOnce() -> Reservations,
         suggested_range: core::ops::Range<usize>,
         initial_permissions: MemoryRegionPermissions,
         can_grow_down: bool,
         populate_pages_immediately: bool,
         fixed_address_behavior: FixedAddressBehavior,
-    ) -> Result<Self::RawMutPointer<u8>, AllocationError> {
+    ) -> Result<VmReservation<ALIGN>, AllocationError>
+    where
+        Reservations: Iterator<Item = VmReservation<ALIGN>>,
+    {
+        if suggested_range.start == 0
+            && matches!(fixed_address_behavior, FixedAddressBehavior::Hint(_))
+        {
+            return Err(AllocationError::UnsupportedByPlatform);
+        }
         let range = PageRange::new(suggested_range.start, suggested_range.end)
             .ok_or(AllocationError::Unaligned)?;
         if range.start < USER_ADDR_MIN {
@@ -640,13 +669,29 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
                 // Unmapping fails only for an unaligned range.
                 unsafe { current_pt.unmap_pages(range, UnmapOptions::RELEASE) }
                     .map_err(|_| AllocationError::Unaligned)?;
+                replaced_reservations().for_each(drop);
             }
         }
         let mut flags = vm_flags(initial_permissions);
         flags.set(VmFlags::VM_GROWSDOWN, can_grow_down);
         // Safety: user address space (checked above) that the page manager
         // tracks as free (`Replace` unmapped it above).
-        unsafe { current_pt.map_pages(range, flags, populate_pages_immediately) }
+        unsafe { current_pt.map_pages(range, flags, populate_pages_immediately) }?;
+        // Safety: the page table now exclusively owns this exact aligned extent.
+        Ok(unsafe { VmReservation::new(suggested_range) })
+    }
+
+    unsafe fn decommit_pages<'reservation, Reservations>(
+        &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
+        range: core::ops::Range<usize>,
+    ) -> Result<(), DeallocationError>
+    where
+        Reservations: Iterator<Item = &'reservation VmReservation<ALIGN>>,
+        VmReservation<ALIGN>: 'reservation,
+    {
+        // Safety: releasing backing preserves the caller's reservation ownership.
+        unsafe { <Self as PageManagementProvider<ALIGN>>::release_pages(self, range) }
     }
 
     unsafe fn release_pages(
@@ -662,11 +707,16 @@ impl<const ALIGN: usize> PageManagementProvider<ALIGN> for VmKernel {
         }
     }
 
-    unsafe fn update_permissions(
+    unsafe fn protect_pages<'reservation, Reservations>(
         &self,
+        _covering_reservations: impl FnOnce() -> Reservations,
         range: core::ops::Range<usize>,
         new_permissions: MemoryRegionPermissions,
-    ) -> Result<(), PermissionUpdateError> {
+    ) -> Result<(), PermissionUpdateError>
+    where
+        Reservations: Iterator<Item = &'reservation VmReservation<ALIGN>>,
+        VmReservation<ALIGN>: 'reservation,
+    {
         let range =
             PageRange::new(range.start, range.end).ok_or(PermissionUpdateError::Unaligned)?;
         let new_flags = vm_flags(new_permissions);
