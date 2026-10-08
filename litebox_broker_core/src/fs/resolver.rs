@@ -491,12 +491,10 @@ impl<Platform, Backend: super::backend::Backend + 'static> Resolver<Platform, Ba
                 if outcome.stop_reason == WalkStopReason::StoppedAtNonDirectory =>
             {
                 let name = components[walked];
-                // TODO(jayb): Reject O_CREAT | O_EXCL before invoking the backend, so open-time
-                // side effects like truncation cannot happen before AlreadyExists is returned.
-                let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
                     return Err(OpenError::AlreadyExists);
                 }
+                let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if !path_only
                     && let PermissionCheck::ByResolver(permissions) = &file.permissions
                     && ((read_allowed && !context.can_read(permissions))
