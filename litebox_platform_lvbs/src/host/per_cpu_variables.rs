@@ -6,8 +6,8 @@
 use crate::{
     arch::{gdt, instrs::rdmsr},
     mshv::{
-        HV_REGISTER_VP_INDEX, HvMessage, HvMessagePage, HvVpAssistPage, vsm::ControlRegMap,
-        vtl_switch::VtlState, vtl1_mem_layout::PAGE_SIZE,
+        HV_REGISTER_VP_INDEX, HvMessage, HvVpAssistPage, vsm::ControlRegMap, vtl_switch::VtlState,
+        vtl1_mem_layout::PAGE_SIZE,
     },
 };
 use aligned_vec::avec;
@@ -161,17 +161,22 @@ impl PerCpuVariables {
     /// to `HvMessageTypeNone`, signaling the hypervisor that the slot is
     /// free for reuse.
     ///
-    /// This is safe because the SynIC protocol guarantees the hypervisor
-    /// will not overwrite a slot whose `message_type` is non-zero. By
-    /// reading first and clearing last, no concurrent write is possible.
+    /// The SynIC protocol guarantees the hypervisor will not overwrite a slot
+    /// whose `message_type` is non-zero; by reading first and clearing last,
+    /// no concurrent write to this slot is possible. Only this slot is
+    /// accessed, so other slots (e.g., the preemption timer's) are untouched.
     pub(crate) fn take_sint_message(&self, sint_index: usize) -> HvMessage {
-        // SAFETY: interior mutability via `UnsafeCell`. The SynIC protocol
-        // ensures the hypervisor does not concurrently write to this slot
-        // while `message_type != HvMessageTypeNone`.
-        let simp_page = unsafe { &mut *self.hv_simp_page.get().cast::<HvMessagePage>() };
-        let msg = simp_page.sint_message[sint_index];
-        simp_page.sint_message[sint_index].header.message_type = 0; // HvMessageTypeNone
-        msg
+        assert!(sint_index < PAGE_SIZE / size_of::<HvMessage>());
+        // SAFETY: the slot is in bounds (asserted) of the page-aligned SIMP
+        // page, so `message_type` is 4-byte aligned. Raw volatile accesses via
+        // the `UnsafeCell` create no reference to the page, which the
+        // hypervisor and the timer (another slot) also write.
+        unsafe {
+            let slot = self.hv_simp_page.get().cast::<HvMessage>().add(sint_index);
+            let msg = slot.read_volatile();
+            (&raw mut (*slot).header.message_type).write_volatile(0); // HvMessageTypeNone
+            msg
+        }
     }
 
     /// Run a closure with a shared reference to the VP assist page.

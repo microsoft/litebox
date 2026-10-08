@@ -7,9 +7,8 @@
 //! VTL1 has no preemptive scheduler and VTL0 cannot interrupt VTL1, so
 //! user-mode code that spins without returning holds the VP forever and freezes
 //! VTL0 too. In lieu of a scheduler, VTL1 arms a VTL1-local Hyper-V synthetic
-//! timer (STIMER0 in direct mode) that user-mode code cannot tamper with; on
-//! expiry it fires `STIMER_VECTOR` and the shim terminates the offending
-//! thread.
+//! timer (STIMER0) that user-mode code cannot tamper with; on expiry it fires
+//! `STIMER_VECTOR` and the shim terminates the offending thread.
 //!
 //! The timer is armed when entering user-mode code (`arm_preemption`) and
 //! disarmed at the VTL0-return boundary (`vtl_switch`). Disarming there is
@@ -20,15 +19,18 @@
 //! bounded). This is what keeps VTL0's RCU from detecting a CPU stall
 //! (`rcu_preempt detected stalls`) on the parked VP. See `QUANTUM_MICROS`.
 //!
-//! Direct mode injects `STIMER_VECTOR` straight into the local APIC, so the
-//! usual fire path is an ordinary user-mode interrupt (ISR -> exception_callback
-//! -> kill) with a rare in-kernel safety net (`interrupts::stimer_handler_impl`,
-//! which re-arms via `rearm_preemption`).
+//! `init` picks one of two delivery modes per CPU:
+//! - Direct mode (needs Hyper-V direct-mode support): STIMER0 injects
+//!   `STIMER_VECTOR` into the local APIC. These interrupts need an explicit
+//!   EOI, which this implementation issues via the x2APIC MSR.
+//! - Message mode (fallback; needs SynIC): expiry posts a message to SINT
+//!   `STIMER_SINT`, which raises `STIMER_VECTOR` with auto-EOI. No EOI write
+//!   is needed, but delivery still relies on the local APIC being enabled.
+//!   `eoi` frees the SIMP slot instead.
 //!
-//! Direct mode needs x2APIC to EOI. Without it (or without direct mode), the
-//! timer falls back to message mode: expiry posts to SINT `STIMER_SINT`
-//! (`STIMER_VECTOR`, auto-EOI), so no APIC access is needed. The fire path is
-//! the same; `eoi` frees the SIMP slot instead.
+//! Either way, the usual fire path is an ordinary user-mode interrupt (ISR ->
+//! exception_callback -> kill) with a rare in-kernel safety net
+//! (`interrupts::stimer_handler_impl`, which re-arms via `rearm_preemption`).
 
 use super::instrs::{rdmsr, wrmsr};
 use crate::host::per_cpu_variables::{PerCpuVariables, with_per_cpu_variables};
@@ -44,8 +46,8 @@ use core::arch::x86_64::{__cpuid_count as cpuid_count, CpuidResult};
 use core::mem::{offset_of, size_of};
 use core::sync::atomic::{Ordering, fence};
 
-/// Vector the preemption timer fires on. Above the 0..31 exception range and
-/// clear of the Hyper-V SINT vector (0xf3).
+/// Vector the preemption timer fires on in either mode. Above the 0..31
+/// exception range and clear of the SINT0 intercept vector (0xf3).
 pub(crate) const STIMER_VECTOR: u8 = 0x40;
 
 /// Vector the local APIC delivers for a *spurious* interrupt (programmed
@@ -62,7 +64,7 @@ const STIMER_SLOT_TYPE_OFFSET: usize =
     STIMER_SLOT_OFFSET + offset_of!(HvMessage, header) + offset_of!(HvMessageHeader, message_type);
 const STIMER_SLOT_FLAGS_OFFSET: usize =
     STIMER_SLOT_OFFSET + offset_of!(HvMessage, header) + offset_of!(HvMessageHeader, message_flags);
-// SIMP is page-aligned: keep the volatile accesses aligned and in bounds.
+// With the page-aligned SIMP page, keep the volatile accesses aligned and in bounds.
 const _: () = assert!(STIMER_SLOT_TYPE_OFFSET.is_multiple_of(align_of::<u32>()));
 const _: () = assert!(STIMER_SLOT_OFFSET + size_of::<HvMessage>() <= 4096);
 
@@ -112,7 +114,7 @@ pub(crate) fn reference_time_100ns() -> u64 {
     rdmsr(HV_X64_MSR_TIME_REF_COUNT)
 }
 
-// TODO: This backend is Hyper-V specific (STIMER direct mode). For non-Hyper-V
+// TODO: This backend is Hyper-V specific (STIMER). For non-Hyper-V
 // platforms, add alternative one-shot timer sources behind the same
 // arm/disarm/eoi interface and have `init` pick one per platform:
 // - x86: the LAPIC TSC-deadline timer (deadline via the IA32_TSC_DEADLINE MSR,
@@ -121,9 +123,10 @@ pub(crate) fn reference_time_100ns() -> u64 {
 // - Arm: the architected generic timer (a CNTV/CNTP compare delivering a PPI
 //   via the GIC).
 
-/// Configure the preemption timer on the current CPU: STIMER direct mode if
-/// x2APIC is usable, else message mode. Leaves the timer disabled if neither
-/// works. Idempotent; only the BSP logs.
+/// Configure the preemption timer on the current CPU. Needs the Hyper-V
+/// reference counter and STIMERs; then uses direct mode if Hyper-V offers it
+/// and x2APIC can be enabled, else message mode if SynIC is available, else
+/// leaves the timer disabled. Idempotent; only the BSP logs.
 ///
 /// Call once per CPU after the IDT is loaded and `hvcall::init` (SynIC).
 pub fn init(is_bsp: bool) {
@@ -143,7 +146,7 @@ pub fn init(is_bsp: bool) {
     // Start disabled; arm_preemption writes the full config.
     wrmsr(HV_X64_MSR_STIMER0_CONFIG, 0);
 
-    // Direct mode needs x2APIC to EOI.
+    // This implementation EOIs direct-mode interrupts via x2APIC.
     let direct = hv_features.edx & HV_FEATURE_STIMER_DIRECT != 0
         && cpuid_count(CPUID_FEATURE_INFO, 0x0).ecx & CPUID_FEATURE_INFO_ECX_X2APIC != 0
         && enable_x2apic();
@@ -156,7 +159,8 @@ pub fn init(is_bsp: bool) {
             crate::debug_serial_println!("STIMER direct-mode (quantum {QUANTUM_MICROS} us)");
         }
     } else if hv_features.eax & HV_FEATURE_SYNIC != 0 {
-        // Leaves the APIC as-is: delivery relies on it being enabled already
+        // No further APIC setup (a failed `enable_x2apic` may have set
+        // APIC_BASE.EN). Delivery relies on the APIC being enabled already
         // (APIC_BASE.EN, SVR), as verified on Azure Hyper-V.
         init_stimer_sint();
         with_per_cpu_variables(|pcv| {
@@ -200,7 +204,8 @@ fn enable_x2apic() -> bool {
     true
 }
 
-/// Hyper-V feature leaf, or `None` without the reference counter or STIMERs.
+/// Hyper-V feature leaf, or `None` if not on Hyper-V, the leaf is absent, or
+/// the reference counter or STIMERs are missing.
 fn stimer_features() -> Option<CpuidResult> {
     if cpuid_count(CPUID_FEATURE_INFO, 0x0).ecx & HYPERV_HYPERVISOR_PRESENT_BIT == 0
         || cpuid_count(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS, 0x0).eax < HYPERV_CPUID_FEATURES
@@ -232,8 +237,11 @@ fn ack_stimer_message(pcv: &PerCpuVariables) {
     let simp = pcv.hv_simp_page_as_u64();
     let type_ptr = (simp + STIMER_SLOT_TYPE_OFFSET as u64) as *mut u32;
     let flags_ptr = (simp + STIMER_SLOT_FLAGS_OFFSET as u64) as *const u8;
-    // SAFETY: live per-CPU SIMP page; offsets aligned and in bounds (asserted
-    // above). Volatile, since the hypervisor writes this memory.
+    // SAFETY: the SIMP page is page-aligned (asserted in `per_cpu_variables`)
+    // and the slot offsets are aligned and in bounds (asserted above). The
+    // page is an `UnsafeCell`, so writing through `&PerCpuVariables` is
+    // allowed; raw pointers create no references, and `take_sint_message`
+    // touches only its own slot. Volatile, since the hypervisor writes here.
     let pending = unsafe {
         type_ptr.write_volatile(0); // HvMessageTypeNone
         fence(Ordering::SeqCst);
@@ -329,8 +337,8 @@ pub(crate) fn disarm_preemption() {
 }
 
 /// Acknowledge every delivered preemption timer interrupt: x2APIC EOI in direct
-/// mode, free the SIMP slot in message mode. Not a general APIC EOI: no-op
-/// while the timer is disabled.
+/// mode, free the SIMP slot in message mode. Not a general APIC EOI: no-op if
+/// `init` did not set up the timer on this CPU (armed or not is irrelevant).
 #[inline]
 pub(crate) fn eoi() {
     with_per_cpu_variables(|pcv| {
