@@ -233,7 +233,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         source_reservations: impl FnOnce() -> Reservations,
         old_range: core::ops::Range<usize>,
         new_range: core::ops::Range<usize>,
-        #[cfg_attr(target_arch = "aarch64", expect(unused_variables))]
         permissions: MemoryRegionPermissions,
     ) -> Result<
         litebox::platform::page_mgmt::ReservationOf<Self, ALIGN>,
@@ -246,10 +245,9 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         // host's mmap area. `MREMAP_FIXED` replaces whatever is mapped at the destination, and the
         // host may hold mappings vmem does not know about, so claim the destination first.
         //
-        // The claim also provides the grown tail, so only the old pages move: growing them would
-        // extend pages that a fork restore mapped from its process image into the image's
-        // following bytes instead of fresh zeroed pages.
-        #[cfg(target_arch = "x86_64")]
+        // The claim also provides the grown tail, so only the old pages move: growing pages that
+        // a fork restore mapped from its process image would expose the image's following bytes
+        // instead of fresh zeros.
         let (flags, moved_len, destination_reservation) = {
             // SAFETY: The destination is nonempty, aligned, and reserved by the caller for remap.
             let destination_reservation = unsafe {
@@ -270,22 +268,18 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
                 litebox::platform::page_mgmt::AllocationError::AddressInUse => {
                     litebox::platform::page_mgmt::RemapError::AddressInUseByPlatform
                 }
-                // Hosts with fewer than 48 VA bits may refuse vmem's destination; copy instead.
-                #[cfg(target_arch = "aarch64")]
-                litebox::platform::page_mgmt::AllocationError::OutOfMemory => {
-                    litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
-                }
                 _ => litebox::platform::page_mgmt::RemapError::OutOfMemory,
             })?;
+            // Move only the existing extent: a fork-restored anonymous guest mapping may be
+            // host-file-backed, and growing it could expose following process-image bytes.
+            // The untouched anonymous destination claim supplies the required zero-filled tail.
+            let moved_len = old_range.len();
             (
                 MRemapFlags::MREMAP_MAYMOVE | MRemapFlags::MREMAP_FIXED,
-                old_range.len(),
+                moved_len,
                 destination_reservation,
             )
         };
-        // Only a fork restore, which is x86_64-only, maps guest pages from a file.
-        #[cfg(target_arch = "aarch64")]
-        let (flags, moved_len) = (MRemapFlags::MREMAP_MAYMOVE, new_range.len());
         let res = unsafe {
             syscalls::syscall5(
                 syscalls::Sysno::mremap,
@@ -302,7 +296,6 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
         // move several mappings but may stop partway when the host runs out of memory or
         // mappings; the moved pages are then released with the claim, and the caller's copy
         // panics on the missing source.
-        #[cfg(target_arch = "x86_64")]
         res.map_err(|_| {
             // SAFETY: vmem reserved `new_range` for this move, so only the claim made above and
             // any source pages a partial move placed in it can be unmapped.
@@ -312,16 +305,8 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
             .expect("munmap failed");
             litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform
         })?;
-        #[cfg(target_arch = "aarch64")]
-        let res = res.expect("mremap failed");
         source_reservations().for_each(drop);
-        #[cfg(target_arch = "x86_64")]
-        return Ok(destination_reservation);
-        #[cfg(target_arch = "aarch64")]
-        {
-            // SAFETY: Successful mremap transferred ownership to this destination extent.
-            Ok(unsafe { LinuxUserlandReservation::new(res..res + new_range.len()) })
-        }
+        Ok(destination_reservation)
     }
 
     unsafe fn protect_pages<'reservation, Reservations>(
@@ -495,7 +480,6 @@ mod tests {
         assert!(!sync_permissions.contains(MemoryRegionPermissions::EXEC));
         assert!(final_permissions.contains(MemoryRegionPermissions::EXEC));
     }
-    #[cfg(target_arch = "x86_64")]
     #[test]
     fn moving_growth_of_file_pages_adds_zeroed_pages() {
         const PAGE: usize = 4096;
