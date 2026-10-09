@@ -8,9 +8,12 @@
 //!
 //! - Serves no requests ([`kcall::run`]): the process runs the program to its
 //!   end, then exits.
-//! - Single-threaded, no timers or signals: the kernel has no scheduler yet.
-//!   Blocking panics, as does reading the real-time clock (`time`,
-//!   `gettimeofday`, `CLOCK_REALTIME`): `VmUserland` has no wall clock.
+//! - Single-threaded, with no timers or signals. The kernel time-slices it
+//!   with other processes, and its waits with a timeout (e.g., `nanosleep`)
+//!   block in the kernel; one without a timeout is a deadlock, as no other
+//!   thread could end it, and the runner fails. Reading the real-time clock
+//!   (`time`, `gettimeofday`, `CLOCK_REALTIME`) panics: `VmUserland` has no
+//!   wall clock.
 //! - The program may be syscall-rewritten, or patched by the shim as it loads;
 //!   any `syscall` left costs one kernel round trip (an upcall).
 //! - Static PIE linked at 0 (`litebox_platform_vm_userland`'s
@@ -51,7 +54,9 @@ const RUNNING_CALLS: CallSet = CallSet::EMPTY
     .with(CallId::Unmap)
     .with(CallId::Protect)
     .with(CallId::BrokerEnter)
-    .with(CallId::Log);
+    .with(CallId::Log)
+    .with(CallId::Wait)
+    .with(CallId::Wake);
 
 /// `rdi`: the [`StartupInfo`] page; `rsp`: the top of the stack.
 ///

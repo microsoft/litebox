@@ -28,15 +28,24 @@ unsafe extern "C" {
     fn isr_simd_floating_point();
     fn isr_ignore();
     fn isr_unexpected_stubs();
+    fn isr_interrupt_stubs();
 }
 
 /// Stride of the per-vector stubs in `isr_unexpected_stubs`.
 const UNEXPECTED_STUB_SIZE: usize = 8;
 
+/// Stride of the per-vector stubs in `isr_interrupt_stubs`.
+const INTERRUPT_STUB_SIZE: usize = 16;
+
+/// The deadline timer, if any; fixed at [`init_idt`].
+pub(crate) fn timer() -> Option<&'static dyn crate::clock::DeadlineTimer> {
+    crate::per_cpu::with_per_cpu_variables(|pcv| pcv.timer.get())
+}
+
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 const NMI_IST_INDEX: u16 = 1;
 
-fn idt(ignored_vectors: &[u8]) -> &'static InterruptDescriptorTable {
+fn idt(ignored_vectors: &[u8], handled_vectors: &[u8]) -> &'static InterruptDescriptorTable {
     static IDT_ONCE: Once<InterruptDescriptorTable> = Once::new();
     IDT_ONCE.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
@@ -85,23 +94,47 @@ fn idt(ignored_vectors: &[u8]) -> &'static InterruptDescriptorTable {
             for &vector in ignored_vectors {
                 idt[vector].set_handler_addr(VirtAddr::from_ptr(isr_ignore as *const ()));
             }
+            for &vector in handled_vectors {
+                let stub = isr_interrupt_stubs as *const () as usize
+                    + usize::from(vector - 32) * INTERRUPT_STUB_SIZE;
+                idt[vector].set_handler_addr(VirtAddr::new(stub as u64));
+            }
         }
         idt
     })
 }
 
-/// Requires [`super::gdt::init`]. The first call fixes `ignored_vectors`;
-/// these handlers return without acknowledging the interrupt controller.
+/// Requires [`super::gdt::init`]. The first call fixes `ignored_vectors`,
+/// whose handlers return without acknowledging the interrupt controller, and
+/// the `timer`.
 ///
 /// # Panics
 ///
-/// Panics if a vector in `ignored_vectors` is a CPU exception vector (< 32).
-pub fn init_idt(ignored_vectors: &[u8]) {
+/// Panics if a vector in `ignored_vectors` or the timer's is a CPU exception
+/// vector (< 32), or the timer's is ignored.
+pub fn init_idt(ignored_vectors: &[u8], timer: Option<&'static dyn crate::clock::DeadlineTimer>) {
+    let handled = timer.map(|timer| [timer.vector()]);
+    let handled: &[u8] = handled.as_ref().map_or(&[], |vector| vector);
     assert!(
-        ignored_vectors.iter().all(|&v| v >= 32),
+        ignored_vectors.iter().chain(handled).all(|&v| v >= 32),
         "vectors below 32 are CPU exceptions"
     );
-    idt(ignored_vectors).load();
+    assert!(
+        !handled.iter().any(|v| ignored_vectors.contains(v)),
+        "the timer's vector is ignored"
+    );
+    crate::per_cpu::with_per_cpu_variables(|pcv| pcv.timer.set(timer));
+    idt(ignored_vectors, handled).load();
+}
+
+/// A handled interrupt in kernel mode, i.e., in `VmKernel::idle`, which only
+/// waits for one.
+#[unsafe(no_mangle)]
+extern "C" fn interrupt_handler_impl(vector: u64) {
+    match timer() {
+        Some(timer) if u64::from(timer.vector()) == vector => timer.end_of_interrupt(),
+        _ => panic!("unexpected interrupt {vector:#x} in kernel mode"),
+    }
 }
 
 #[unsafe(no_mangle)]

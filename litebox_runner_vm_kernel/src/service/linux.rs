@@ -3,16 +3,18 @@
 
 //! Linux programs, each run to its end in a fresh
 //! `litebox_runner_linux_on_vm_userland` process, as
-//! `litebox_common_linux::vm_userland` describes. From the payload:
-//! `runner.elf`, and `rootfs.tar`, the broker's read-only file system at `/`.
-//! `/dev` has the standard streams: stdin is empty, and stdout and stderr go
-//! to the console and to the [`Reply`].
+//! `litebox_common_linux::vm_userland` describes; a [`Request`]'s programs run
+//! concurrently, time-sliced ([`litebox_shim_vm_kernel::scheduler`]). From the
+//! payload: `runner.elf`, and `rootfs.tar`, the broker's read-only file system
+//! at `/`. `/dev` has the standard streams, which all processes share: stdin
+//! is empty, and stdout and stderr go to the console and to the [`Reply`].
 //!
-//! No scheduler: a process runs on the calling thread, single-threaded, with
-//! no timers or signals, and a program that blocks kills its runner. No wall
-//! clock either: a program that reads the real-time clock (`time`,
-//! `gettimeofday`, `clock_gettime(CLOCK_REALTIME)`, or a futex wait on it)
-//! kills its runner too. Monotonic clocks work (the TSC).
+//! Each process has one thread, and no timers or signals. A wait with a
+//! timeout (e.g., `nanosleep`) blocks; one without (e.g., `pause`) is a
+//! deadlock, as nothing could end it, and the runner fails. No wall clock either: a program
+//! that reads the real-time clock (`time`, `gettimeofday`,
+//! `clock_gettime(CLOCK_REALTIME)`, or a futex wait on it) kills its runner.
+//! Monotonic clocks work (the TSC).
 
 use super::Service;
 use crate::payload::Payload;
@@ -36,19 +38,34 @@ use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::{Dead, Process, ProcessConfig};
 use spin::Mutex;
 
+/// Programs to run concurrently.
 pub struct Request {
+    pub programs: Vec<Program>,
+}
+
+pub struct Program {
     /// `argv[0]` is the program's absolute path in `rootfs.tar`.
     pub argv: Vec<String>,
     pub envp: Vec<String>,
+    /// Killed this long after it first runs.
+    pub time_limit: Option<core::time::Duration>,
 }
 
 pub struct Reply {
-    /// `Err` with the cause if the runner failed, rather than the program.
-    pub status: Result<ProcessExitStatus, Failure>,
+    /// By program, in the [`Request`]'s order.
+    pub outcomes: Vec<Outcome>,
+    /// All the programs' output, interleaved.
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+pub struct Outcome {
+    /// `Err` with the cause if the runner failed, rather than the program.
+    pub status: Result<ProcessExitStatus, Failure>,
     /// Syscalls the shim did not patch, which the kernel reflected to it.
     pub reflected_syscalls: u64,
+    /// Times the timer took the CPU from the process.
+    pub preemptions: u64,
 }
 
 #[derive(Debug)]
@@ -113,16 +130,15 @@ impl Linux {
         }
     }
 
-    /// Also returns the reflected syscalls.
-    fn run(&self, request: &Request) -> (Result<ProcessExitStatus, Failure>, u64) {
+    fn spawn(&self, program: &Program) -> Result<Process, Failure> {
         let strings = |strings: &[String]| {
             encode_strings(strings.iter().map(String::as_str)).expect("no NULs in arguments")
         };
         let mut images = [&[][..]; 2];
-        let (argv, envp) = (strings(&request.argv), strings(&request.envp));
+        let (argv, envp) = (strings(&program.argv), strings(&program.envp));
         images[ARGV_IMAGE] = &argv;
         images[ENVP_IMAGE] = &envp;
-        let process = Process::spawn(
+        let mut process = Process::spawn(
             self.platform,
             &self.broker,
             &ProcessConfig {
@@ -131,16 +147,49 @@ impl Linux {
                 identity: [0; IDENTITY_LEN],
                 tsc_khz: self.tsc_khz,
             },
-        );
-        let mut process = match process {
-            Ok(process) => process,
-            Err(error) => return (Err(Failure::Spawn(error)), 0),
-        };
-        let status = match process.run() {
-            Dead::Exited(code) => exit_status(code).ok_or(Failure::Runner(Dead::Exited(code))),
-            dead @ Dead::Killed(_) => Err(Failure::Runner(dead)),
-        };
-        (status, process.reflected_syscalls())
+        )
+        .map_err(Failure::Spawn)?;
+        if let Some(limit) = program.time_limit {
+            process.set_time_limit(limit);
+        }
+        Ok(process)
+    }
+
+    fn run(&self, request: &Request) -> Vec<Outcome> {
+        let mut spawned: Vec<Result<Process, Failure>> = request
+            .programs
+            .iter()
+            .map(|program| self.spawn(program))
+            .collect();
+        let mut running: Vec<&mut Process> =
+            spawned.iter_mut().filter_map(|p| p.as_mut().ok()).collect();
+        litebox_shim_vm_kernel::scheduler::run(self.platform, &mut running);
+        spawned
+            .into_iter()
+            .map(|process| {
+                let mut process = match process {
+                    Ok(process) => process,
+                    Err(failure) => {
+                        return Outcome {
+                            status: Err(failure),
+                            reflected_syscalls: 0,
+                            preemptions: 0,
+                        };
+                    }
+                };
+                let status = match process.finish() {
+                    Dead::Exited(code) => {
+                        exit_status(code).ok_or(Failure::Runner(Dead::Exited(code)))
+                    }
+                    dead @ Dead::Killed(_) => Err(Failure::Runner(dead)),
+                };
+                Outcome {
+                    status,
+                    reflected_syscalls: process.reflected_syscalls(),
+                    preemptions: process.preemptions(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -150,13 +199,12 @@ impl Service for Linux {
 
     fn call(&mut self, request: Request) -> Reply {
         self.stdio.reset();
-        let (status, reflected_syscalls) = self.run(&request);
+        let outcomes = self.run(&request);
         let (stdout, stderr) = self.stdio.reset();
         Reply {
-            status,
+            outcomes,
             stdout,
             stderr,
-            reflected_syscalls,
         }
     }
 }

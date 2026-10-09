@@ -7,8 +7,9 @@
 
 use litebox_common_vm_abi::{
     CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel, LogRequest,
-    MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest, ReadyRequest,
-    RestrictRequest, RunRequest, Status, UnmapRequest, UserRange,
+    MapRequest, Message, NO_TIMEOUT, Placement, Populate, Prot, ProtSet, ProtectRequest,
+    ReadyRequest, RestrictRequest, RunRequest, Status, UnmapRequest, UserRange, WaitRequest,
+    WakeRequest,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
 
@@ -141,6 +142,37 @@ pub fn unmap(addr: usize, len: usize) -> Result<(), Status> {
 /// See [`call`].
 pub fn protect(addr: usize, len: usize, prot: Prot) -> Result<(), Status> {
     call(&ProtectRequest::new(range(addr, len), prot))
+}
+
+/// Blocks while `word` holds `expected`, until a [`wake`] on it or the
+/// `timeout`. Success: woken, or `word` did not hold `expected`.
+///
+/// # Errors
+///
+/// [`Status::TimedOut`], [`Status::Stalled`] if nothing could end the wait,
+/// or see [`call`].
+pub fn wait(
+    word: &core::sync::atomic::AtomicU32,
+    expected: u32,
+    timeout: Option<core::time::Duration>,
+) -> Result<(), Status> {
+    let timeout_ns = timeout.map_or(NO_TIMEOUT, |timeout| {
+        u64::try_from(timeout.as_nanos()).map_or(NO_TIMEOUT - 1, |ns| ns.min(NO_TIMEOUT - 1))
+    });
+    call(&WaitRequest::new(
+        word.as_ptr() as u64,
+        expected,
+        timeout_ns,
+    ))
+}
+
+/// Wakes up to `count` threads waiting on `word`; returns how many.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn wake(word: &core::sync::atomic::AtomicU32, count: u32) -> Result<u32, Status> {
+    call(&WakeRequest::new(word.as_ptr() as u64, count)).map(|reply| reply.woken)
 }
 
 /// Irrevocable.

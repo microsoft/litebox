@@ -65,6 +65,15 @@
 //!   ([`StartupInfo`]), including the runner image; kernel-placed objects go
 //!   only here.
 //!
+//! # Scheduling
+//!
+//! The kernel may preempt a runner at any instruction; preemption preserves
+//! its registers, extended state, and FS and GS bases. [`CallId::Wait`] and
+//! [`CallId::Wake`] are futex-like: per process, keyed by address. Like
+//! [`BrokerEnterOp::Wait`], a wait ends with success once woken or if the
+//! word differs, [`Status::TimedOut`], or [`Status::Stalled`] if nothing could
+//! end it (no timeout, and no thread to wake it).
+//!
 //! # Lockdown
 //!
 //! [`CallId::Restrict`] irrevocably narrows the allowed calls and page
@@ -308,6 +317,12 @@ kernel_calls! {
     /// ends only by [`CallId::Exit`]. `abi_version` must equal
     /// [`ABI_VERSION`].
     12 => Run(RunRequest) -> ();
+    /// Blocks the calling thread while the `u32` at `addr` (4-aligned) equals
+    /// `expected`, until a [`CallId::Wake`] on `addr` or the timeout. See
+    /// [Scheduling](crate#scheduling).
+    13 => Wait(WaitRequest) -> ();
+    /// Wakes up to `count` of the process's threads waiting on `addr`.
+    14 => Wake(WakeRequest) -> WakeReply;
 }
 
 /// One bit per [`CallId`] value.
@@ -726,6 +741,56 @@ impl RunRequest {
     }
 }
 
+/// No timeout for [`WaitRequest::timeout_ns`].
+pub const NO_TIMEOUT: u64 = u64::MAX;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct WaitRequest {
+    pub addr: u64,
+    pub expected: u32,
+    reserved: Reserved,
+    /// Relative, in nanoseconds; [`NO_TIMEOUT`] for none. Unlike
+    /// [`BrokerEnterRequest::deadline`], relative: callers have durations
+    /// (e.g., `RawMutex::block_or_timeout`), not the TSC rate.
+    pub timeout_ns: u64,
+}
+
+impl WaitRequest {
+    pub const fn new(addr: u64, expected: u32, timeout_ns: u64) -> Self {
+        Self {
+            addr,
+            expected,
+            reserved: Reserved::Zero,
+            timeout_ns,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct WakeRequest {
+    pub addr: u64,
+    pub count: u32,
+    reserved: Reserved,
+}
+
+impl WakeRequest {
+    pub const fn new(addr: u64, count: u32) -> Self {
+        Self {
+            addr,
+            count,
+            reserved: Reserved::Zero,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct WakeReply {
+    pub woken: u32,
+}
+
 /// An [`envelope`] of `len` bytes at the start of
 /// [`StartupInfo::message_window`], at most its length. A reply must parse
 /// ([`Status::InvalidArgument`]).
@@ -931,6 +996,8 @@ mod tests {
         };
         check(CallId::Ready, ReadyRequest::new(0).as_bytes(), 4);
         check(CallId::Run, RunRequest::new(0).as_bytes(), 4);
+        check(CallId::Wait, WaitRequest::new(0x1000, 0, 0).as_bytes(), 12);
+        check(CallId::Wake, WakeRequest::new(0x1000, 1).as_bytes(), 12);
         check(
             CallId::Protect,
             ProtectRequest::new(range, Prot::Read).as_bytes(),

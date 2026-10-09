@@ -10,10 +10,14 @@
 //! initialized platform; key provisioning remains separate and must precede
 //! execution that needs derived keys.
 //!
-//! Assumptions: a single CPU, no scheduler, and not a confidential VM (no
-//! #VE/#VC/#HV).
-//! There is no timer, so user code that never enters the kernel is never
-//! preempted.
+//! Assumptions: a single CPU, and not a confidential VM (no #VE/#VC/#HV).
+//! The kernel runs with interrupts disabled, except in [`VmKernel::idle`].
+//!
+//! Scheduling is the shim's: the platform runs one user thread at a time
+//! ([`run_thread_with_state`]) and offers the runner's one-shot
+//! [`clock::DeadlineTimer`] ([`VmKernel::set_timer`]), which interrupts user
+//! mode through [`EnterShim::interrupt`]. Without one, user code that never
+//! enters the kernel is never preempted.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -78,6 +82,8 @@ mod syscall_entry;
 pub struct BootConfig<'a> {
     pub page_allocator: &'static dyn mm::PageAllocator,
     pub clock: &'static dyn clock::ClockSource,
+    /// For [`VmKernel::set_timer`]; its vector must not be ignored.
+    pub timer: Option<&'static dyn clock::DeadlineTimer>,
     /// Physical RAM to map; ranges are rounded inward to whole pages.
     pub ram: &'a [core::ops::Range<PhysAddr>],
     /// Page-aligned physical kernel code range, mapped RX.
@@ -574,6 +580,37 @@ impl PinnedUserPages {
     }
 }
 
+/// The deadline timer and idling, for a scheduler.
+impl VmKernel {
+    /// Whether [`Self::set_timer`] can interrupt.
+    pub fn has_timer(&self) -> bool {
+        arch::interrupts::timer().is_some()
+    }
+
+    /// Arms the one-shot timer for `deadline` (at once if it has passed),
+    /// replacing any armed deadline; `None` disarms. A fire in user mode
+    /// calls the running shim's [`EnterShim::interrupt`]; one in
+    /// [`Self::idle`] ends it. It may fire early (see
+    /// [`clock::DeadlineTimer::arm`]). No-op without a timer.
+    pub fn set_timer(&self, deadline: Option<Instant>) {
+        if let Some(timer) = arch::interrupts::timer() {
+            match deadline {
+                Some(deadline) => timer.arm(deadline.0),
+                None => timer.disarm(),
+            }
+        }
+    }
+
+    /// Waits, with interrupts enabled, until one arrives. Without an armed
+    /// timer, it may wait forever.
+    pub fn idle(&self) {
+        // Safety: `sti` takes effect after `hlt`, so no interrupt is missed
+        // between them; handlers of the interrupts that can arrive (the timer,
+        // spurious, NMI) return.
+        unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+    }
+}
+
 impl RawMutexProvider for VmKernel {
     type RawMutex = RawMutex;
 }
@@ -636,7 +673,7 @@ impl RawMutex {
 }
 
 /// Nanoseconds from the installed [`clock::ClockSource`].
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
 
 pub struct SystemTime;
@@ -855,6 +892,64 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for VmKernel {
     }
 }
 
+/// A user thread's state besides its registers: its extended (x87/SSE) state
+/// and GS base. [`run_thread_with_state`] preserves both across kernel
+/// entries, so that a scheduler can interleave threads.
+pub struct UserState {
+    xsave: alloc::boxed::Box<per_cpu::XsaveArea>,
+    xsaved: per_cpu::XsaveState,
+    gs_base: VirtAddr,
+}
+
+impl Default for UserState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UserState {
+    /// The initial extended state and a zero GS base.
+    pub fn new() -> Self {
+        Self {
+            xsave: per_cpu::XsaveArea::new(),
+            xsaved: per_cpu::XsaveState::NeverSaved,
+            gs_base: VirtAddr::zero(),
+        }
+    }
+
+    /// Back to [`Self::new`]'s state.
+    pub fn reset(&mut self) {
+        self.xsave.reset();
+        self.xsaved = per_cpu::XsaveState::NeverSaved;
+        self.gs_base = VirtAddr::zero();
+    }
+}
+
+/// Like [`run_thread_ref`] (`reenter` false) or [`reenter_thread_ref`]
+/// (true), but the thread's extended state and GS base come from, and go back
+/// to, `state` instead of being reset.
+///
+/// # Safety
+///
+/// As for [`run_thread_ref`].
+pub unsafe fn run_thread_with_state<T>(
+    shim: &T,
+    ctx: &mut PtRegs,
+    state: &mut UserState,
+    reenter: bool,
+) where
+    T: EnterShim<ExecutionContext = PtRegs>,
+{
+    crate::arch::write_kernel_gsbase_msr(state.gs_base);
+    let previous =
+        with_per_cpu_variables(|pcv| pcv.asm.swap_user_xsave(state.xsave.addr(), state.xsaved));
+    enter_thread(shim, ctx, reenter);
+    let (_, xsaved) = with_per_cpu_variables(|pcv| pcv.asm.swap_user_xsave(previous.0, previous.1));
+    state.xsaved = xsaved;
+    // `swapgs` at kernel entry left the user's GS base there.
+    state.gs_base = crate::arch::read_kernel_gsbase_msr();
+}
+
 /// Run a user thread until it terminates or returns to the kernel. The shim's
 /// `init` fills `ctx`, which is sanitized before user mode.
 ///
@@ -897,6 +992,10 @@ fn run_thread_inner(
     // SWAPGS exposes KernelGsBase to user code.
     crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
     with_per_cpu_variables(|pcv| pcv.asm.reset_user_xsave());
+    enter_thread(shim, ctx, reenter);
+}
+
+fn enter_thread(shim: &dyn EnterShim<ExecutionContext = PtRegs>, ctx: &mut PtRegs, reenter: bool) {
     let ctx = core::ptr::from_mut(ctx);
     let thread_ctx = ThreadContext { shim, ctx };
     // `ctx` is passed again so the assembly need not know `ThreadContext`'s layout.
@@ -1269,11 +1368,22 @@ unsafe extern "C" fn syscall_handler(thread_ctx: &ThreadContext) {
     }
 }
 
+/// User-mode exceptions, and the timer's interrupts.
 unsafe extern "C" fn exception_handler(thread_ctx: &ThreadContext, cr2: usize) {
     // Safety: entered from user mode; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };
+    let exception = with_per_cpu_variables(|pcv| pcv.asm.exception());
+    if let Some(timer) = arch::interrupts::timer()
+        && exception.0 == timer.vector()
+    {
+        timer.end_of_interrupt();
+        if let ContinueOperation::Resume = thread_ctx.shim.interrupt(ctx) {
+            resume_user(ctx);
+        }
+        return;
+    }
     let info = ExceptionInfo {
-        exception: with_per_cpu_variables(|pcv| pcv.asm.exception()),
+        exception,
         error_code: ctx.orig_rax.trunc(),
         cr2,
         kernel_mode: false,

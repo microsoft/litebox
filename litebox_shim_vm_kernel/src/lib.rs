@@ -5,9 +5,11 @@
 //! [`VmKernel`].
 //!
 //! Assumptions:
-//! - Single CPU, no scheduler: a process runs only inside [`Process::start`],
-//!   [`Process::call`], or [`Process::run`], until it waits, exits, or is
-//!   killed.
+//! - Single CPU. Processes run only inside [`scheduler::run`], which
+//!   [`Process::start`], [`Process::call`], and [`Process::run`] use for one
+//!   process, until they wait for a request, exit, or are killed. It
+//!   time-slices them with the platform's deadline timer.
+//! - One thread per process.
 //! - The kernel does not use FS; user state across switches is the address
 //!   space and the FS base.
 //!
@@ -33,6 +35,7 @@ mod lockdown;
 mod memory;
 #[cfg(feature = "optee")]
 pub mod optee;
+pub mod scheduler;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -46,11 +49,11 @@ use litebox_common_vm_abi::envelope::Envelope;
 use litebox_common_vm_abi::{
     ABI_VERSION, CallId, DERIVED_KEY_LEN, DeriveKeyReply, DeriveKeyRequest, IDENTITY_LEN, Image,
     KernelCall, LogLevel, LogRequest, MAX_IMAGES, MAX_KDF_CONTEXT_LEN, MAX_LOG_LEN, MapReply,
-    MapRequest, Message, PAGE_SIZE, Placement, Populate, Prot, ProtectRequest, RUNNER_MANAGED_MAX,
-    RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest, StartupInfo, Status, UnmapRequest,
-    UpcallFrame, UpcallKind, UserRange,
+    MapRequest, Message, NO_TIMEOUT, PAGE_SIZE, Placement, Populate, Prot, ProtectRequest,
+    RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest, StartupInfo,
+    Status, UnmapRequest, UpcallFrame, UpcallKind, UserRange, WaitRequest, WakeReply, WakeRequest,
 };
-use litebox_platform_vm_kernel::{AddressSpaceId, PinnedUserPages, VmKernel};
+use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, UserState, VmKernel};
 use zerocopy::IntoBytes;
 
 use memory::{Mappings, checked_range, copy_from_user, copy_to_user};
@@ -119,6 +122,17 @@ enum State {
     Dead(Dead),
 }
 
+/// Why a live process's thread is off the CPU, besides waiting for a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Suspension {
+    /// By the timer; resumes where it was.
+    Preempted,
+    /// In [`CallId::Wait`] until `deadline`.
+    Blocked { deadline: Instant },
+    /// Its wait is over; resumes with `result`.
+    Woken { result: Result<(), Status> },
+}
+
 /// Separate from [`Process`] so that the platform can borrow it alongside the
 /// register context.
 struct Inner {
@@ -134,9 +148,11 @@ struct Inner {
     /// Borrowed briefly: killing the process replaces it.
     state: RefCell<State>,
     lockdown: Cell<lockdown::Lockdown>,
+    suspension: Cell<Option<Suspension>>,
     /// Statistics for the current request.
     entries: Cell<u64>,
     reflected: Cell<u64>,
+    preemptions: Cell<u64>,
 }
 
 pub struct Process {
@@ -144,6 +160,12 @@ pub struct Process {
     ctx: PtRegs,
     /// Saved while another process runs.
     fs_base: usize,
+    /// Extended state and GS base, saved while another process runs.
+    user: UserState,
+    /// From its first run; see [`Self::set_time_limit`].
+    time_limit: Option<core::time::Duration>,
+    /// When it is killed: its first run plus `time_limit`.
+    deadline: Option<Instant>,
 }
 
 impl Process {
@@ -227,11 +249,16 @@ impl Process {
                 broker,
                 state: RefCell::new(State::New),
                 lockdown: Cell::new(lockdown::Lockdown::OPEN),
+                suspension: Cell::new(None),
                 entries: Cell::new(0),
                 reflected: Cell::new(0),
+                preemptions: Cell::new(0),
             },
             ctx: PtRegs::default(),
             fs_base: 0,
+            user: UserState::new(),
+            time_limit: None,
+            deadline: None,
         })
     }
 
@@ -289,11 +316,7 @@ impl Process {
             State::New,
             "process already started"
         );
-        self.activate();
-        // Safety: single CPU, and no other thread runs; `ctx` is this
-        // process's context.
-        unsafe { litebox_platform_vm_kernel::run_thread_ref(&self.inner, &mut self.ctx) };
-        self.deactivate();
+        self.run_alone();
         self.settle()?;
         Ok(())
     }
@@ -326,15 +349,16 @@ impl Process {
         };
         self.inner.entries.set(0);
         self.inner.reflected.set(0);
-        self.activate();
-        // Safety: as in `start`.
-        unsafe { litebox_platform_vm_kernel::reenter_thread_ref(&self.inner, &mut self.ctx) };
-        self.deactivate();
+        self.inner.preemptions.set(0);
+        // See `CallId::ReplyAndWait`.
+        self.user.reset();
+        self.run_alone();
         let reply = self.settle()?;
         log::debug!(
-            "request served with {} kernel entries ({} reflected syscalls)",
+            "request served with {} kernel entries ({} reflected syscalls), {} preemptions",
             self.inner.entries.get(),
-            self.inner.reflected.get()
+            self.inner.reflected.get(),
+            self.inner.preemptions.get()
         );
         Ok(reply.expect("a waiting process has completed its request"))
     }
@@ -343,6 +367,12 @@ impl Process {
     /// started, or since the last [`Process::call`] began.
     pub fn reflected_syscalls(&self) -> u64 {
         self.inner.reflected.get()
+    }
+
+    /// Times the timer took the CPU from it, counted as
+    /// [`Self::reflected_syscalls`] is.
+    pub fn preemptions(&self) -> u64 {
+        self.inner.preemptions.get()
     }
 
     pub fn identity(&self) -> &[u8; IDENTITY_LEN] {
@@ -360,7 +390,8 @@ impl Process {
     }
 
     /// Runs a runner that serves no requests ([`CallId::Run`]) until it ends.
-    /// One that calls [`CallId::Ready`] instead is killed.
+    /// One that calls [`CallId::Ready`] instead is killed. To run several at
+    /// once, use [`scheduler::run`] and [`Self::finish`].
     ///
     /// # Panics
     ///
@@ -371,19 +402,108 @@ impl Process {
             State::New,
             "process already started"
         );
-        self.activate();
-        // Safety: as in `start`.
-        unsafe { litebox_platform_vm_kernel::run_thread_ref(&self.inner, &mut self.ctx) };
-        self.deactivate();
+        self.run_alone();
+        self.finish()
+    }
+
+    /// After [`scheduler::run`], how a runner that serves no requests ended;
+    /// one that called [`CallId::Ready`] instead is killed.
+    pub fn finish(&mut self) -> Dead {
         log::debug!(
-            "process ran with {} kernel entries ({} reflected syscalls)",
+            "process ran with {} kernel entries ({} reflected syscalls), {} preemptions",
             self.inner.entries.get(),
-            self.inner.reflected.get()
+            self.inner.reflected.get(),
+            self.inner.preemptions.get()
         );
         if let Some(dead) = self.dead() {
             return dead;
         }
         self.kill("called `Ready` instead of `Run`")
+    }
+
+    /// Kills the process `limit` after it first runs, whether it runs or
+    /// waits meanwhile.
+    ///
+    /// # Panics
+    ///
+    /// If the process was already started.
+    pub fn set_time_limit(&mut self, limit: core::time::Duration) {
+        assert_eq!(
+            *self.inner.state.borrow(),
+            State::New,
+            "process already started"
+        );
+        self.time_limit = Some(limit);
+    }
+
+    fn run_alone(&mut self) {
+        let platform = self.inner.platform;
+        scheduler::run(platform, &mut [self]);
+    }
+
+    /// Runs the thread until it stops: preempted, blocked, waiting for a
+    /// request, or dead.
+    fn run_slice(&mut self) {
+        let reenter = *self.inner.state.borrow() != State::New;
+        if !reenter && let Some(limit) = self.time_limit {
+            use litebox_platform::time::{Instant as _, TimeProvider as _};
+            self.deadline = self.inner.platform.now().checked_add(limit);
+        }
+        self.activate();
+        // Safety: single CPU, and no other thread runs; `ctx` and `user` are
+        // this process's.
+        unsafe {
+            litebox_platform_vm_kernel::run_thread_with_state(
+                &self.inner,
+                &mut self.ctx,
+                &mut self.user,
+                reenter,
+            );
+        };
+        self.deactivate();
+    }
+
+    /// Whether [`Self::run_slice`] would run it.
+    fn runnable(&self) -> bool {
+        match *self.inner.state.borrow() {
+            State::Dead(_) => false,
+            State::New | State::Delivering { .. } => true,
+            _ => matches!(
+                self.inner.suspension.get(),
+                Some(Suspension::Preempted | Suspension::Woken { .. })
+            ),
+        }
+    }
+
+    /// When it must next be looked at while not runnable: its wait's
+    /// deadline or its time limit.
+    fn next_event(&self) -> Option<Instant> {
+        if self.dead().is_some() {
+            return None;
+        }
+        let wait = match self.inner.suspension.get() {
+            Some(Suspension::Blocked { deadline, .. }) => Some(deadline),
+            _ => None,
+        };
+        match (wait, self.deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Ends a wait whose deadline is past, and kills a process past its time
+    /// limit.
+    fn expire(&mut self, now: Instant) {
+        if self.deadline.is_some_and(|deadline| deadline <= now) {
+            let _ = self.kill("time limit exceeded");
+        }
+        if let Some(Suspension::Blocked { deadline }) = self.inner.suspension.get()
+            && deadline <= now
+        {
+            self.inner.suspension.set(Some(Suspension::Woken {
+                result: Err(Status::TimedOut),
+            }));
+        }
     }
 
     /// The waiting process's reply, if it has one.
@@ -640,7 +760,50 @@ impl Inner {
                 Flow::Stop
             }
             Request::Restrict(r) => respond(&r, slot, self.restrict(&r)),
+            Request::Wait(r) => self.wait(&r),
+            Request::Wake(r) => respond(&r, slot, Self::wake(&r)),
         }
+    }
+
+    /// Blocks unless the value differs, the timeout is zero, or nothing could
+    /// end the wait.
+    fn wait(&self, r: &WaitRequest) -> Flow {
+        use litebox_platform::time::{Instant as _, TimeProvider as _};
+        if !r.addr.is_multiple_of(4) {
+            return Flow::Return(Err(Status::InvalidArgument));
+        }
+        let value = match copy_from_user(r.addr, size_of::<u32>()) {
+            Ok(bytes) => u32::from_ne_bytes(bytes[..].try_into().expect("four bytes")),
+            Err(status) => return Flow::Return(Err(status)),
+        };
+        if value != r.expected {
+            return Flow::Return(Ok(()));
+        }
+        if r.timeout_ns == 0 {
+            return Flow::Return(Err(Status::TimedOut));
+        }
+        let deadline = (r.timeout_ns != NO_TIMEOUT)
+            .then(|| {
+                self.platform
+                    .now()
+                    .checked_add(core::time::Duration::from_nanos(r.timeout_ns))
+            })
+            .flatten();
+        let Some(deadline) = deadline else {
+            // One thread per process: no other can wake it.
+            return Flow::Return(Err(Status::Stalled));
+        };
+        self.suspension.set(Some(Suspension::Blocked { deadline }));
+        Flow::Stop
+    }
+
+    /// One thread per process: the caller is the only one, and it is not
+    /// waiting.
+    fn wake(r: &WakeRequest) -> Result<WakeReply, Status> {
+        if !r.addr.is_multiple_of(4) {
+            return Err(Status::InvalidArgument);
+        }
+        Ok(WakeReply { woken: 0 })
     }
 
     /// A requested upcall entry: zero for none, otherwise executable runner
@@ -862,6 +1025,18 @@ impl EnterShim for Inner {
     }
 
     fn reenter(&self, ctx: &mut PtRegs) -> ContinueOperation {
+        match self.suspension.take() {
+            None => {}
+            Some(Suspension::Preempted) => return ContinueOperation::Resume,
+            Some(Suspension::Woken { result }) => {
+                ctx.rax = Status::to_raw(result).trunc();
+                return ContinueOperation::Resume;
+            }
+            blocked @ Some(Suspension::Blocked { .. }) => {
+                self.suspension.set(blocked);
+                return ContinueOperation::Terminate;
+            }
+        }
         let (waiter, request) = match &mut *self.state.borrow_mut() {
             State::Delivering { waiter, request } => (*waiter, core::mem::take(request)),
             _ => return ContinueOperation::Terminate,
@@ -914,8 +1089,11 @@ impl EnterShim for Inner {
         self.deliver_exception(ctx, info)
     }
 
+    /// The timer: the slice is over.
     fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-        ContinueOperation::Resume
+        self.suspension.set(Some(Suspension::Preempted));
+        self.preemptions.set(self.preemptions.get() + 1);
+        ContinueOperation::Terminate
     }
 }
 

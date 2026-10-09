@@ -32,6 +32,8 @@ pub(crate) struct PerCpuVariables {
     pub(crate) asm: PerCpuVariablesAsm,
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<*mut ()>,
+    /// The deadline timer, if any; fixed at boot.
+    pub(crate) timer: Cell<Option<&'static dyn crate::clock::DeadlineTimer>>,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
@@ -84,7 +86,46 @@ impl PerCpuStacks {
 
 /// XSAVE requires 64-byte alignment: 512 legacy bytes + a 64-byte header.
 #[repr(C, align(64))]
-struct XsaveArea([u8; PerCpuVariables::XSAVE_AREA_SIZE]);
+pub(crate) struct XsaveArea([u8; PerCpuVariables::XSAVE_AREA_SIZE]);
+
+impl XsaveArea {
+    /// In the reset state (see [`Self::reset`]).
+    pub(crate) fn new() -> Box<Self> {
+        let mut area = Box::new(Self([0; PerCpuVariables::XSAVE_AREA_SIZE]));
+        area.reset();
+        area
+    }
+
+    /// The XRSTOR of a reset area loads the initial state.
+    pub(crate) fn reset(&mut self) {
+        // Safety: an exclusively borrowed 64-byte-aligned area.
+        unsafe { reset_xsave_area(self.0.as_mut_ptr()) };
+    }
+
+    pub(crate) fn addr(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
+}
+
+/// Default MXCSR, and a zero header (XSTATE_BV, XCOMP_BV, reserved bytes).
+///
+/// # Safety
+///
+/// `area` must be an exclusively owned, 64-byte-aligned XSAVE area.
+unsafe fn reset_xsave_area(area: *mut u8) {
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "XSAVE areas are 64-byte aligned and each offset preserves the write alignment"
+    )]
+    // Safety: both writes are aligned and within the area's 576 bytes.
+    unsafe {
+        area.add(PerCpuVariables::XSAVE_MXCSR_OFFSET)
+            .cast::<u32>()
+            .write(PerCpuVariables::MXCSR_DEFAULT);
+        area.add(PerCpuVariables::XSAVE_HEADER_OFFSET)
+            .write_bytes(0, PerCpuVariables::XSAVE_HEADER_SIZE);
+    }
+}
 
 impl PerCpuVariables {
     /// x87 and SSE: the XCR0 components `enable_extended_states` enables.
@@ -158,8 +199,8 @@ impl PerCpuVariables {
 /// Tracks an XSAVE area. XSAVEOPT is only valid after an XRSTOR of the area.
 /// The `XSAVE_ASM`/`XRSTOR_ASM` macros use these values as literals.
 #[repr(u8)]
-#[derive(Clone, Copy, Default)]
-enum XsaveState {
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) enum XsaveState {
     /// XSAVE sets `Saved`; XRSTOR loads init state and leaves `NeverSaved`.
     #[default]
     NeverSaved = 0,
@@ -221,20 +262,18 @@ impl PerCpuVariablesAsm {
         if area.is_null() {
             return;
         }
-        #[expect(
-            clippy::cast_ptr_alignment,
-            reason = "XSAVE areas are 64-byte aligned and each offset preserves the write alignment"
-        )]
-        // Safety: this core owns the 64-byte-aligned XSAVE area; both writes
-        // are aligned and within its 576 bytes.
-        unsafe {
-            area.add(PerCpuVariables::XSAVE_MXCSR_OFFSET)
-                .cast::<u32>()
-                .write(PerCpuVariables::MXCSR_DEFAULT);
-            // Clear XSTATE_BV, XCOMP_BV, and all reserved header bytes.
-            area.add(PerCpuVariables::XSAVE_HEADER_OFFSET)
-                .write_bytes(0, PerCpuVariables::XSAVE_HEADER_SIZE);
-        }
+        // Safety: this core owns the 64-byte-aligned XSAVE area.
+        unsafe { reset_xsave_area(area) };
+    }
+
+    /// Makes `area`, in state `state`, the user XSAVE area; returns the
+    /// previous area and its state. The area must stay allocated until
+    /// swapped out again.
+    pub(crate) fn swap_user_xsave(&self, area: usize, state: XsaveState) -> (usize, XsaveState) {
+        (
+            self.user_xsave_area_addr.replace(area),
+            self.user_xsaved.replace(state),
+        )
     }
     pub(crate) const fn scratch_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, scratch)
@@ -318,6 +357,7 @@ pub(crate) fn allocate_per_cpu_variables() {
         asm: PerCpuVariablesAsm::default(),
         gdt: Cell::new(None),
         tls: Cell::new(core::ptr::null_mut()),
+        timer: Cell::new(None),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),
     }));

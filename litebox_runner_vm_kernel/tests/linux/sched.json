@@ -1,0 +1,13 @@
+[
+  {"argv": ["/sleep", "50"]},
+  [
+    {"argv": ["/spin", "300", "3"], "min_preemptions": 3},
+    {"argv": ["/spin", "300", "3"], "min_preemptions": 3},
+    {"argv": ["/sleep", "100"]}
+  ],
+  [
+    {"argv": ["/loop"], "time_limit_ms": 6000, "expect_killed": "time limit exceeded", "min_preemptions": 50},
+    {"argv": ["/hello"]}
+  ],
+  {"argv": ["/pause"], "expect_runner_failure": true}
+]

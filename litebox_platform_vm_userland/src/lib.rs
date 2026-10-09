@@ -146,7 +146,9 @@ impl RawMutexProvider for VmUserland {
 
 impl WaitWakerProvider for VmUserland {}
 
-/// Blocking panics: with one thread, nothing could wake the waiter.
+/// Futex-like, on the kernel's [`kcall::wait`] and [`kcall::wake`]. With one
+/// thread per process, only a timeout ends a wait; one without panics (the
+/// kernel reports it [`Status::Stalled`]).
 pub struct RawMutex {
     inner: AtomicU32,
 }
@@ -160,29 +162,44 @@ impl RawMutexTrait for RawMutex {
         &self.inner
     }
 
-    fn wake_many(&self, _n: usize) -> usize {
-        0
+    fn wake_many(&self, n: usize) -> usize {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        let woken = kcall::wake(&self.inner, n)
+            .unwrap_or_else(|status| panic!("Wake: unexpected {status:?}"));
+        usize::try_from(woken).unwrap_or(usize::MAX)
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val).map(|_| ())
+        // Without a timeout, the wait cannot time out.
+        let _ = self.block_or_maybe_timeout(val, None);
+        Ok(())
     }
 
     fn block_or_timeout(
         &self,
         val: u32,
-        _time: core::time::Duration,
+        time: core::time::Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val)
+        Ok(self.block_or_maybe_timeout(val, Some(time)))
     }
 }
 
 impl RawMutex {
-    fn block_or_maybe_timeout(&self, val: u32) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        if self.inner.load(core::sync::atomic::Ordering::Relaxed) != val {
-            return Err(ImmediatelyWokenUp);
+    fn block_or_maybe_timeout(
+        &self,
+        val: u32,
+        timeout: Option<core::time::Duration>,
+    ) -> UnblockedOrTimedOut {
+        // Callers recheck the word either way, so a mismatch need not be
+        // told apart from a wake.
+        match kcall::wait(&self.inner, val, timeout) {
+            Ok(()) => UnblockedOrTimedOut::Unblocked,
+            Err(Status::TimedOut) => UnblockedOrTimedOut::TimedOut,
+            Err(Status::Stalled) => {
+                panic!("deadlock: a wait without a timeout that no other thread could end")
+            }
+            Err(status) => panic!("Wait: unexpected {status:?}"),
         }
-        panic!("blocking in the single-threaded VM userland runner would deadlock")
     }
 }
 
@@ -468,8 +485,9 @@ impl litebox::platform::DerivedKeyProvider for VmUserland {
     }
 }
 
-/// One thread per process: the kernel has no scheduler yet, so nothing could
-/// run a second one.
+/// One thread per process: the guest-switch state (`thread`) is global, as
+/// runner code has no thread-local storage, and the kernel runs one thread per
+/// process.
 impl litebox::platform::ThreadProvider for VmUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
@@ -492,7 +510,7 @@ impl litebox::platform::ThreadProvider for VmUserland {
     fn interrupt_thread(&self, _thread: &Self::ThreadHandle) {}
 }
 
-/// Unsupported until the kernel has a timer.
+/// Unsupported: the kernel offers no timer signals.
 impl litebox::platform::TimerProvider for VmUserland {
     type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
     type Signal = litebox_common_linux::signal::Signal;

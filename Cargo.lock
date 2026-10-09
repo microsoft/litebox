@@ -2240,6 +2240,7 @@ dependencies = [
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_common_vm_abi",
+ "litebox_platform",
  "litebox_platform_vm_kernel",
  "litebox_util_log",
  "log",

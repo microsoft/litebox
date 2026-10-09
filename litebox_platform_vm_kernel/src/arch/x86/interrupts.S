@@ -137,6 +137,39 @@ isr_with_err_code isr_alignment_check alignment_check_handler_impl 17
 
 isr_no_err_code isr_simd_floating_point simd_floating_point_handler_impl 19
 
+/*
+ * External interrupts the kernel handles (the deadline timer's), one 16-byte
+ * stub per vector from 32. Each pushes a zero error code and its vector. From
+ * user mode, they take the exception path (`exception_callback`). The kernel
+ * runs with interrupts disabled except in `VmKernel::idle`, where
+ * `interrupt_handler_impl` only acknowledges them.
+ */
+.balign 16
+.global isr_interrupt_stubs
+isr_interrupt_stubs:
+.set vector, 32
+.rept 224
+    .balign 16
+    push    0
+    push    vector
+    jmp     isr_interrupt
+    .set vector, vector + 1
+.endr
+
+isr_interrupt:
+    cld
+    test    qword ptr [rsp + 24], 0x3  /* CS RPL, past vector and error code */
+    jnz     exception_callback
+    push_regs
+    mov     rbp, rsp
+    and     rsp, -16
+    mov     rdi, [rbp + 15 * 8] /* vector */
+    call    interrupt_handler_impl
+    mov     rsp, rbp
+    pop_regs
+    add     rsp, 16             /* vector and error code */
+    iretq
+
 /* NMI entry must not depend on GS or acquire locks. */
 .global isr_ignore
 isr_ignore:

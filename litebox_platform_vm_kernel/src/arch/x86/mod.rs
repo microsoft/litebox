@@ -80,6 +80,11 @@ pub(crate) fn write_kernel_gsbase_msr(addr: VirtAddr) {
     KernelGsBase::write(addr);
 }
 
+#[inline]
+pub(crate) fn read_kernel_gsbase_msr() -> VirtAddr {
+    KernelGsBase::read()
+}
+
 /// Enable `EFER.NXE`. Must run before loading page tables that use
 /// `NO_EXECUTE`, which is otherwise a reserved bit.
 ///

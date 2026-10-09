@@ -2,8 +2,8 @@
 // Licensed under the MIT license.
 
 //! Boots a LiteBox kernel-mode runner: takes the handoff from a boot front
-//! end, brings up a `VmKernel` (heap, interrupts, TSC), and runs the runner's
-//! `entry!` function.
+//! end, brings up a `VmKernel` (heap, interrupts, TSC, and the PIT as its
+//! deadline timer), and runs the runner's `entry!` function.
 //!
 //! Front ends: PVH.
 //!
@@ -33,7 +33,8 @@ use layout::{
     heap_start_address, rodata_end_address, rodata_start_address, text_end_address,
     text_start_address,
 };
-use litebox_platform_vm_kernel::{BootConfig, KERNEL_OFFSET, VmKernel, clock::TscClock};
+use litebox_platform_vm_kernel::clock::{ClockSource as _, DeadlineTimer, TscClock};
+use litebox_platform_vm_kernel::{BootConfig, KERNEL_OFFSET, VmKernel};
 use x86_64::PhysAddr;
 
 const PAGE_SIZE: u64 = 4096;
@@ -104,7 +105,14 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
     let tsc_khz = litebox_hal::clock::calibrate_tsc_khz();
     litebox_util_log::info!(mhz:% = tsc_khz / 1000; "TSC calibrated against the PIT");
     BOOT.call_once(|| (info, tsc_khz));
-    let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(TscClock::new(tsc_khz)));
+    let clock: &'static TscClock =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(TscClock::new(tsc_khz)));
+    let timer: &'static PitDeadline =
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(PitDeadline {
+            // Safety: the only one, after `init_legacy_pics`.
+            pit: unsafe { litebox_hal::timer::PitTimer::init() },
+            clock,
+        }));
     // Safety: the front end established the direct mapping with IRQs off on one
     // CPU. The heap contains only `ram`, text bounds come from the linker, and
     // no live resource needs the boot stack after the handoff.
@@ -113,6 +121,7 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
             BootConfig {
                 page_allocator: &heap::KernelPages,
                 clock,
+                timer: Some(timer),
                 ram: &ram,
                 text: to_pa(text_start_address())..to_pa(text_end_address()),
                 read_only: to_pa(rodata_start_address())..to_pa(rodata_end_address()),
@@ -120,6 +129,31 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
             },
             kernel_main,
         )
+    }
+}
+
+/// The PIT as a deadline timer on the TSC clock.
+struct PitDeadline {
+    pit: litebox_hal::timer::PitTimer,
+    clock: &'static TscClock,
+}
+
+impl DeadlineTimer for PitDeadline {
+    fn vector(&self) -> u8 {
+        litebox_hal::timer::VECTOR
+    }
+
+    fn arm(&self, deadline: u64) {
+        let delay = deadline.saturating_sub(self.clock.monotonic_nanos());
+        self.pit.arm(core::time::Duration::from_nanos(delay));
+    }
+
+    fn disarm(&self) {
+        self.pit.disarm();
+    }
+
+    fn end_of_interrupt(&self) {
+        self.pit.end_of_interrupt();
     }
 }
 
