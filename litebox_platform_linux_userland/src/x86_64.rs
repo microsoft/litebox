@@ -31,52 +31,14 @@ macro_rules! sanitize_host_rflags {
     };
 }
 
-// ---------------------------------------------------------------------------
-// TLS (`.tbss`) access helpers
-//
-// On x86_64, the ELF TLS model uses `@tpoff`; on x86 it uses `@ntpoff`.
-// At guest-host transitions we swap `fs` and `gs`, so after the swap the host TLS base
-// is in the normal segment register. Before the swap (e.g. in a signal
-// handler that fires while the guest is running), the host TLS base is
-// in the *saved* segment register (`gs` on x86_64, `fs` on x86).
-//
-// The macros below produce string literals so they can be used inside
-// `concat!()` within `core::arch::asm!()`.
-// ---------------------------------------------------------------------------
-
-/// TLS relocation suffix: `"@tpoff"` on x86_64, `"@ntpoff"` on x86.
-macro_rules! tls_suffix {
-    () => {
-        "@tpoff"
-    };
-}
-pub(super) use tls_suffix;
-
-/// Segment register used for TLS after the fs/gs swap (normal host context).
-macro_rules! tls_seg {
-    () => {
-        "fs"
-    };
-}
-pub(super) use tls_seg;
-
-/// Segment register where the host TLS base is saved before the swap
-/// (signal handler context while the guest is running).
-macro_rules! saved_tls_seg {
-    () => {
-        "gs"
-    };
-}
-pub(super) use saved_tls_seg;
-
 /// Full TLS memory operand for a `.tbss` variable in normal host context
 /// (after the fs/gs swap).
 ///
 /// Example: `tls!("pending_host_signals")` expands to
-/// `"fs:pending_host_signals@tpoff"` on x86_64.
+/// `"fs:pending_host_signals@tpoff"`.
 macro_rules! tls {
     ($var:literal) => {
-        concat!(tls_seg!(), ":", $var, tls_suffix!())
+        concat!("fs:", $var, "@tpoff")
     };
 }
 pub(super) use tls;
@@ -84,11 +46,10 @@ pub(super) use tls;
 /// Full TLS memory operand for a `.tbss` variable accessed via the *saved*
 /// segment register (before the fs/gs swap, e.g. from a signal handler).
 ///
-/// Example: `saved_tls!("in_guest")` expands to
-/// `"gs:in_guest@tpoff"` on x86_64.
+/// Example: `saved_tls!("in_guest")` expands to `"gs:in_guest@tpoff"`.
 macro_rules! saved_tls {
     ($var:literal) => {
-        concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
+        concat!("gs:", $var, "@tpoff")
     };
 }
 pub(super) use saved_tls;

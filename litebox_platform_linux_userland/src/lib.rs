@@ -6,7 +6,7 @@
 //! The guest shares the host process's address space, so this platform does not isolate host
 //! memory from the guest: guest code or fixed-address mappings can read or overwrite it.
 
-// Restrict this crate to only work on Linux. For now, we are restricting this to only x86/x86-64
+// Restrict this crate to only work on Linux. For now, we are restricting this to only x86-64
 // Linux, but we _may_ allow for more in the future, if we find it useful to do so.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 
@@ -38,8 +38,7 @@ mod x86_64;
 pub use page_mgmt::LinuxUserlandReservation;
 use x86_64::{
     GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, run_thread_arch,
-    saved_tls, saved_tls_seg, set_signal_return, signal_handler_exit_guest, switch_to_guest, tls,
-    tls_seg, tls_suffix,
+    saved_tls, set_signal_return, signal_handler_exit_guest, switch_to_guest, tls,
 };
 
 /// The userland Linux platform.
@@ -638,7 +637,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
-        // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
+        // Sets `gsbase = fsbase` (x86_64) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
