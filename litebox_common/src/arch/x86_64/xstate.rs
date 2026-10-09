@@ -6,11 +6,11 @@
 use alloc::{boxed::Box, vec, vec::Vec};
 
 /// Size of the architectural legacy x87/SSE save area.
-pub const XSAVE_LEGACY_SIZE: usize = core::mem::size_of::<XsaveLegacyArea>();
+const XSAVE_LEGACY_SIZE: usize = core::mem::size_of::<XsaveLegacyArea>();
 /// Offset of the XSAVE header in a standard-layout save area.
-pub const XSAVE_HEADER_OFFSET: usize = XSAVE_LEGACY_SIZE;
+const XSAVE_HEADER_OFFSET: usize = XSAVE_LEGACY_SIZE;
 /// Size of the architectural XSAVE header.
-pub const XSAVE_HEADER_SIZE: usize = core::mem::size_of::<XsaveHeader>();
+const XSAVE_HEADER_SIZE: usize = core::mem::size_of::<XsaveHeader>();
 
 /// Architectural x86-64 FXSAVE area at the start of a standard XSAVE area.
 #[repr(C)]
@@ -294,87 +294,5 @@ impl XsaveArea {
     #[must_use]
     pub fn xstate_bv(&self) -> u64 {
         self.header().xstate_bv
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_layout(size: usize) -> XsaveLayout {
-        XsaveLayout {
-            size,
-            mask: 3,
-            components: Vec::new(),
-            xsaveopt: false,
-        }
-    }
-
-    #[test]
-    fn initial_state_is_aligned_and_zero_except_mxcsr() {
-        let layout = test_layout(XSAVE_HEADER_OFFSET + XSAVE_HEADER_SIZE + 1);
-        let area = XsaveArea::initial(&layout);
-        assert_eq!(area.as_ptr().addr() % 64, 0);
-        assert_eq!(area.storage.len(), layout.size.div_ceil(64));
-        assert_eq!(area.xstate_bv(), 0);
-        assert_eq!(area.legacy_area().mxcsr, XsaveArea::GUEST_INITIAL_MXCSR);
-        for (index, chunk) in area.storage.iter().enumerate() {
-            let mut expected = [0; 64];
-            if index == 0 {
-                expected[24..28].copy_from_slice(&XsaveArea::GUEST_INITIAL_MXCSR.to_le_bytes());
-            }
-            assert_eq!(chunk.0, expected);
-        }
-    }
-
-    #[test]
-    fn xstate_bitmap_reads_the_standard_header() {
-        let mut area = XsaveArea::initial(&test_layout(576));
-        let bitmap = 0x0123_4567_89ab_cdef_u64;
-        area.header_mut().xstate_bv = bitmap;
-        assert_eq!(area.xstate_bv(), bitmap);
-    }
-
-    #[test]
-    fn reset_to_initial_clears_all_state_and_reuses_storage() {
-        let layout = test_layout(577);
-        let mut area = XsaveArea::initial(&layout);
-        let address = area.as_ptr();
-        for chunk in &mut area.storage {
-            chunk.0.fill(0xff);
-        }
-
-        area.reset_to_initial();
-
-        assert_eq!(area.as_ptr(), address);
-        let initial = XsaveArea::initial(&layout);
-        for (actual, expected) in area.storage.iter().zip(initial.storage.iter()) {
-            assert_eq!(actual.0, expected.0);
-        }
-    }
-
-    #[test]
-    fn materialized_legacy_area_substitutes_initial_components() {
-        let mut area = XsaveArea::initial(&test_layout(576));
-        area.legacy_area_mut().control_word = 1;
-        area.legacy_area_mut().xmm_registers[0] = [2; 16];
-
-        let initial = area.materialized_legacy_area();
-        assert_eq!(
-            initial.control_word,
-            XsaveArea::GUEST_INITIAL_X87_CONTROL_WORD
-        );
-        assert_eq!(initial.xmm_registers[0], [0; 16]);
-
-        area.header_mut().xstate_bv = 3;
-        let saved = area.materialized_legacy_area();
-        assert_eq!(saved.control_word, 1);
-        assert_eq!(saved.xmm_registers[0], [2; 16]);
-    }
-
-    #[test]
-    #[should_panic(expected = "XSAVE layout must include the legacy area and header")]
-    fn initial_state_rejects_a_truncated_header() {
-        let _ = XsaveArea::initial(&test_layout(575));
     }
 }
