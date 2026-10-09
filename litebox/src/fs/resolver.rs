@@ -226,7 +226,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             context,
             self.backend.root(),
             &parent_components,
-            #[cfg(debug_assertions)]
             &parent_components,
         )?;
         Ok(Some((parent, name)))
@@ -290,7 +289,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             context,
             self.backend.root(),
             &components,
-            #[cfg(debug_assertions)]
             &components,
             SearchScope::ParentsOnly,
         )?;
@@ -333,7 +331,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         context: &Context,
         from: WalkingDirHandle<'a>,
         components: &[&str],
-        #[cfg(debug_assertions)] absolute_components: &[&str],
+        absolute_components: &[&str],
     ) -> Result<WalkedDir<'a>, WalkError> {
         if components.is_empty() {
             // TODO(jayb): Decide whether empty walks from a non-root handle need permission checks.
@@ -358,7 +356,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
             Self::check_walk_permissions(
                 context,
-                #[cfg(debug_assertions)]
                 &absolute_components[offset..],
                 &outcome,
                 SearchScope::AllComponents,
@@ -394,7 +391,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         context: &Context,
         from: WalkingDirHandle<'a>,
         components: &[&str],
-        #[cfg(debug_assertions)] absolute_components: &[&str],
+        absolute_components: &[&str],
         scope: SearchScope,
     ) -> Result<(WalkOutcome<WalkingDirHandle<'a>>, usize), WalkError> {
         assert_ne!(components, [] as [&str; 0]);
@@ -405,7 +402,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
             Self::check_walk_permissions(
                 context,
-                #[cfg(debug_assertions)]
                 &absolute_components[offset..],
                 &outcome,
                 if continuing {
@@ -438,7 +434,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     fn check_walk_permissions(
         context: &Context,
-        #[cfg(debug_assertions)] absolute_components: &[&str],
+        absolute_components: &[&str],
         outcome: &WalkOutcome<WalkingDirHandle<'_>>,
         scope: SearchScope,
     ) -> Result<(), PathError> {
@@ -456,19 +452,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             if !allowed {
                 // TODO(jayb): a [`SearchScope::AndReadableTarget`] target denying *read* permission
                 // reports `NoSearchPerms` too. Clean up during filesystem errors overhaul.
-                return Err(PathError::NoSearchPerms {
-                    #[cfg(debug_assertions)]
-                    dir: {
-                        let mut path = String::new();
-                        for component in &absolute_components[..=idx] {
-                            path.push('/');
-                            path.push_str(component);
-                        }
-                        path
-                    },
-                    #[cfg(debug_assertions)]
-                    perms: permissions.mode,
-                });
+                litebox_util_log::debug!(
+                    dir:% = alloc::format!("/{}", absolute_components[..=idx].join("/")),
+                    perms:? = permissions.mode;
+                    "no search permission"
+                );
+                return Err(PathError::NoSearchPerms);
             }
         }
         Ok(())
@@ -545,7 +534,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             context,
             self.backend.root(),
             &components,
-            #[cfg(debug_assertions)]
             &components,
             if path_only {
                 SearchScope::ParentsOnly
@@ -596,7 +584,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         context,
                         self.backend.root(),
                         &parent_components,
-                        #[cfg(debug_assertions)]
                         &parent_components,
                     )
                     .map_err(|error| match error {

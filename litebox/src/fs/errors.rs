@@ -232,12 +232,7 @@ pub enum PathError {
     #[error("no such file or directory")]
     NoSuchFileOrDirectory,
     #[error("one of the directories in pathname did not allow search permission")]
-    NoSearchPerms {
-        #[cfg(debug_assertions)]
-        dir: alloc::string::String,
-        #[cfg(debug_assertions)]
-        perms: crate::fs::Mode,
-    },
+    NoSearchPerms,
     #[error("invalid characters, not permitted by underlying file system")]
     InvalidPathname,
     #[error("a directory component in pathname does not exist or is a dangling symbolic link")]

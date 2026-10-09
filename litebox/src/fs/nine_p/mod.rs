@@ -912,12 +912,7 @@ impl From<Error> for FileStatusError {
                 ENOENT => FileStatusError::PathError(PathError::NoSuchFileOrDirectory),
                 ENAMETOOLONG => FileStatusError::PathError(PathError::InvalidPathname),
                 ENOTDIR => FileStatusError::PathError(PathError::ComponentNotADirectory),
-                EPERM | EACCES => FileStatusError::PathError(PathError::NoSearchPerms {
-                    #[cfg(debug_assertions)]
-                    dir: String::new(),
-                    #[cfg(debug_assertions)]
-                    perms: super::Mode::empty(),
-                }),
+                EPERM | EACCES => FileStatusError::PathError(PathError::NoSearchPerms),
                 _ => FileStatusError::Io,
             },
             Error::Io | Error::InvalidResponse => FileStatusError::Io,
@@ -991,12 +986,7 @@ impl From<Error> for WalkError {
                 ENOENT => WalkError::PathError(PathError::NoSuchFileOrDirectory),
                 ENAMETOOLONG => WalkError::PathError(PathError::InvalidPathname),
                 ENOTDIR => WalkError::PathError(PathError::ComponentNotADirectory),
-                EPERM | EACCES => WalkError::PathError(PathError::NoSearchPerms {
-                    #[cfg(debug_assertions)]
-                    dir: String::new(),
-                    #[cfg(debug_assertions)]
-                    perms: super::Mode::empty(),
-                }),
+                EPERM | EACCES => WalkError::PathError(PathError::NoSearchPerms),
                 _ => WalkError::Io,
             },
             Error::Io | Error::InvalidResponse => WalkError::Io,
