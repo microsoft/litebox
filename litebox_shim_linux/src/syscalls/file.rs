@@ -621,11 +621,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         offset: Option<usize>,
     ) -> Result<usize, Errno> {
         let files = self.files.borrow();
-        let mut is_datagram = false;
+        // Classify sockets while writing: a concurrent `close` would fail a later lookup.
+        let is_datagram = core::cell::Cell::new(false);
         let result = fd.dispatch(
             |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
+                is_datagram.set(!self.global.is_stream(fd)?);
                 self.global.sendto(
                     &self.wait_cx(),
                     fd,
@@ -668,14 +670,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .entry_handle(fd)
                     .ok_or(Errno::EBADF)?;
                 handle.with_entry(|file| {
-                    is_datagram = !file.is_stream();
+                    is_datagram.set(!file.is_stream());
                     file.sendto(self, buf, litebox_common_linux::SendFlags::empty(), None)
                 })
             },
         );
-        // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
+        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = result
-            && !is_datagram
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -1062,12 +1064,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// one whole datagram rather than one datagram per iovec.
     fn is_datagram_socket(&self, fd: &AnyTypedFd<Platform>) -> bool {
         match fd {
-            AnyTypedFd::Network(fd) => self.global.get_proxy(fd).is_ok_and(|proxy| {
-                matches!(
-                    *proxy,
-                    litebox::net::socket_channel::NetworkProxy::Datagram(_)
-                )
-            }),
+            AnyTypedFd::Network(fd) => self.global.is_stream(fd).is_ok_and(|is_stream| !is_stream),
             AnyTypedFd::Unix(fd) => {
                 let handle = self.global.litebox.descriptor_table().entry_handle(fd);
                 handle.is_some_and(|handle| handle.with_entry(|socket| !socket.is_stream()))

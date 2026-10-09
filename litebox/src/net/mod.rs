@@ -27,7 +27,7 @@ mod tests;
 
 use errors::{
     AcceptError, BindError, CloseError, ConnectError, ListenError, LocalAddrError, ReceiveError,
-    RemoteAddrError, SendError, SocketError,
+    RemoteAddrError, SendError, ShutdownError, SocketError,
 };
 use local_ports::{LocalPort, LocalPortAllocator};
 
@@ -270,6 +270,15 @@ impl TcpServerSpecific {
                 .push(socket_set.add(listening_socket));
         }
     }
+}
+
+/// Whether a pending connection on a listening socket has completed its handshake and can be
+/// accepted, including a connection the peer has already half-closed.
+fn is_acceptable(socket: &tcp::Socket) -> bool {
+    matches!(
+        socket.state(),
+        tcp::State::Established | tcp::State::CloseWait
+    )
 }
 
 /// Socket-specific data for UDP sockets
@@ -581,6 +590,13 @@ where
             (Protocol::Tcp, NetworkProxy::Stream(proxy)) => {
                 let tcp_socket = socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
 
+                // Observe the handshake before sending a FIN below, which leaves `Established`.
+                // The peer may also have already sent its FIN.
+                if let tcp::State::Established | tcp::State::CloseWait = tcp_socket.state() {
+                    proxy.set_state(socket_channel::SocketState::Connected);
+                    proxy.clear_async_error();
+                }
+
                 // Drain TX buffer: from ring buffer directly to smoltcp
                 while tcp_socket.can_send() {
                     let sent = proxy
@@ -588,6 +604,11 @@ where
                     if sent == 0 {
                         break;
                     }
+                }
+                // Send FIN once all data written before `SHUT_WR` has been handed to smoltcp.
+                // The flag must be checked first; see `StreamSocketChannel::shutdown_write`.
+                if proxy.is_write_shutdown() && !proxy.has_pending_tx() && tcp_socket.may_send() {
+                    tcp_socket.close();
                 }
 
                 // Drain RX buffer: from smoltcp directly to ring buffer
@@ -598,12 +619,29 @@ where
                         break;
                     }
                 }
-
-                if let tcp::State::Established = tcp_socket.state() {
-                    proxy.set_state(socket_channel::SocketState::Connected);
-                    proxy.clear_async_error();
+                // smoltcp reports `Finished` only once the peer's FIN has been received and all
+                // data before it has been moved to the channel.
+                let fin_received = matches!(tcp_socket.peek(0), Err(tcp::RecvError::Finished));
+                if fin_received {
+                    proxy.shutdown_read();
                 }
+
                 let tcp_specific = socket_handle.specific.tcp();
+                // Record the peer's FIN as soon as it is seen, so that poll reports it at once.
+                // This also tells a reset from a graceful close below, since smoltcp does not say
+                // whether a closed connection received the FIN.
+                if fin_received
+                    || matches!(
+                        tcp_socket.state(),
+                        tcp::State::CloseWait
+                            | tcp::State::LastAck
+                            | tcp::State::Closing
+                            | tcp::State::TimeWait
+                    )
+                {
+                    proxy.set_peer_closed();
+                }
+
                 // Update socket state in the channel
                 // server socket that is listening also has closed state
                 if !tcp_socket.is_open() && tcp_specific.server_socket.is_none() {
@@ -621,9 +659,23 @@ where
                             proxy.set_state(socket_channel::SocketState::Error);
                         }
                         socket_channel::SocketState::Connected => {
-                            // Connection was reset by peer
-                            proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
-                            proxy.set_state(socket_channel::SocketState::Closed);
+                            // Without the peer's FIN, the connection was reset. Report the reset
+                            // at once, even if received data is still unread.
+                            if !proxy.is_peer_closed() {
+                                proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
+                            }
+                            if tcp_socket.can_recv() {
+                                // smoltcp still holds data that did not fit in the channel.
+                                // Fail writes now, but close the channel only after that data
+                                // is read.
+                                //
+                                // Known limitation: smoltcp discards this data when `TimeWait`
+                                // expires, so data still left unread then is lost.
+                                proxy.shutdown_write();
+                            } else {
+                                proxy.set_state(socket_channel::SocketState::Closed);
+                            }
+                            proxy.set_peer_closed();
                         }
                         _ => {
                             proxy.set_state(socket_channel::SocketState::Closed);
@@ -637,10 +689,7 @@ where
                     server_socket
                         .socket_set_handles
                         .iter()
-                        .any(|&h| {
-                            let socket: &tcp::Socket = socket_set.get(h);
-                            socket.state() == tcp::State::Established
-                        })
+                        .any(|&h| is_acceptable(socket_set.get(h)))
                         .then(|| {
                             proxy.set_readable(true);
                             proxy.notify_io_event(Events::IN);
@@ -980,8 +1029,13 @@ where
             Protocol::Tcp => {
                 let check_state = |state: tcp::State| -> Result<(), ConnectError> {
                     match state {
-                        tcp::State::Established => {
-                            // already connected
+                        tcp::State::Established
+                        | tcp::State::CloseWait
+                        | tcp::State::FinWait1
+                        | tcp::State::FinWait2
+                        | tcp::State::Closing
+                        | tcp::State::LastAck => {
+                            // already connected (either side may have since shut down writes)
                             Ok(())
                         }
                         tcp::State::Closed | tcp::State::TimeWait => {
@@ -1334,12 +1388,12 @@ where
                     let socket: &tcp::Socket = self.socket_set.get(h);
                     socket.is_open()
                 });
-                // Find a socket that has progressed further in its TCP state machine, by finding a
-                // socket in an established state
-                let Some(position) = server_socket.socket_set_handles.iter().position(|&h| {
-                    let socket: &tcp::Socket = self.socket_set.get(h);
-                    socket.state() == tcp::State::Established
-                }) else {
+                // Find a socket that has completed its handshake
+                let Some(position) = server_socket
+                    .socket_set_handles
+                    .iter()
+                    .position(|&h| is_acceptable(self.socket_set.get(h)))
+                else {
                     if let Some(proxy) = &socket_handle.proxy {
                         // No connections are ready; make sure the readable flag is cleared
                         proxy.set_readable(false);
@@ -1386,6 +1440,68 @@ where
             ProtocolSpecific::Icmp(_) => unimplemented!(),
             ProtocolSpecific::Raw(_) => unimplemented!(),
         }
+    }
+
+    /// Shut down part or all of a connection.
+    ///
+    /// Data received before the read side is shut down can still be read; data written before
+    /// the write side is shut down is still sent, followed by a FIN for TCP. Shutting down the
+    /// read side of a listening socket stops listening (pending connections are reset), and
+    /// shutting down a TCP socket that is still connecting aborts the connection attempt.
+    /// An unconnected UDP socket is shut down too, even though `NotConnected` is returned.
+    pub fn shutdown(
+        &mut self,
+        fd: &SocketFd<Platform>,
+        how: Shutdown,
+    ) -> Result<(), ShutdownError> {
+        let descriptor_table = self.litebox.descriptor_table();
+        let mut table_entry = descriptor_table
+            .get_entry_mut(fd)
+            .ok_or(ShutdownError::InvalidFd)?;
+        let socket_handle = &mut table_entry.entry;
+        let Some(proxy) = socket_handle.proxy.as_deref() else {
+            unimplemented!("shutdown requires a socket proxy")
+        };
+        match &mut socket_handle.specific {
+            ProtocolSpecific::Tcp(TcpSpecific {
+                server_socket: Some(server_socket),
+                ..
+            }) if server_socket.backlog.is_some() => {
+                if how.is_shutdown_read() {
+                    for handle in server_socket.socket_set_handles.drain(..) {
+                        self.socket_set.get_mut::<tcp::Socket>(handle).abort();
+                        self.closing_in_background.push(handle);
+                    }
+                    server_socket.backlog = None;
+                    proxy.set_readable(false);
+                    proxy.set_state(socket_channel::SocketState::Closed);
+                }
+            }
+            ProtocolSpecific::Tcp(_) => {
+                let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
+                match tcp_socket.state() {
+                    tcp::State::SynSent => tcp_socket.abort(),
+                    tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => {
+                        return Err(ShutdownError::NotConnected);
+                    }
+                    _ => proxy.shutdown(how),
+                }
+            }
+            ProtocolSpecific::Udp(udp_specific) => {
+                // Shut down even an unconnected socket (waking blocked receivers) before
+                // reporting that it is not connected.
+                proxy.shutdown(how);
+                if udp_specific.remote_endpoint.is_none() {
+                    return Err(ShutdownError::NotConnected);
+                }
+            }
+            ProtocolSpecific::Icmp(_) | ProtocolSpecific::Raw(_) => unimplemented!(),
+        }
+        drop(table_entry);
+        drop(descriptor_table);
+
+        self.automated_platform_interaction(PollDirection::Both);
+        Ok(())
     }
 
     /// Send data over a socket, optionally specifying the destination address.
@@ -1682,6 +1798,30 @@ bitflags! {
         const NOSIGNAL = 0x4000;
         /// `MSG_OOB`: sends out-of-band data.
         const OOB = 0x1;
+    }
+}
+
+/// Which side(s) of a socket to shut down; see [`Network::shutdown`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shutdown {
+    /// Further receptions are disallowed (`SHUT_RD`).
+    Read,
+    /// Further transmissions are disallowed (`SHUT_WR`).
+    Write,
+    /// Further receptions and transmissions are disallowed (`SHUT_RDWR`).
+    Both,
+}
+
+impl Shutdown {
+    /// Returns `true` when this disables the receive side (`Read` or `Both`).
+    #[must_use]
+    pub fn is_shutdown_read(self) -> bool {
+        matches!(self, Self::Read | Self::Both)
+    }
+    /// Returns `true` when this disables the send side (`Write` or `Both`).
+    #[must_use]
+    pub fn is_shutdown_write(self) -> bool {
+        matches!(self, Self::Write | Self::Both)
     }
 }
 

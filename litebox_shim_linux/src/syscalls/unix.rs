@@ -22,12 +22,13 @@ use litebox::{
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
     fs::{Mode, OFlags, errors::OpenError},
+    net::Shutdown,
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    IpOption, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
-    SocketOptionName, errno::Errno,
+    IpOption, ReceiveFlags, SendFlags, SockFlags, SockType, SocketOption, SocketOptionName,
+    errno::Errno,
 };
 
 use crate::{
@@ -212,7 +213,7 @@ impl<Platform: ShimPlatform> UnixInitStream<Platform> {
         }
     }
 
-    fn shutdown(&self, how: ShutdownHow) {
+    fn shutdown(&self, how: Shutdown) {
         if how.is_shutdown_read() && !self.read_shutdown.swap(true, Ordering::Release) {
             self.pollee.notify_observers(Events::IN);
         }
@@ -579,7 +580,7 @@ impl<Platform: ShimPlatform> UnixConnectedStream<Platform> {
         events
     }
 
-    fn shutdown(&self, how: ShutdownHow) {
+    fn shutdown(&self, how: Shutdown) {
         let mut events = Events::empty();
         if how.is_shutdown_read() && self.recv_channel.shutdown() {
             events |= Events::IN | Events::RDHUP;
@@ -905,7 +906,7 @@ impl<Platform: ShimPlatform> UnixStream<Platform> {
         })
     }
 
-    fn shutdown(&self, how: ShutdownHow) {
+    fn shutdown(&self, how: Shutdown) {
         self.with_state_ref(|state| match state {
             UnixStreamState::Init(init) => init.shutdown(how),
             UnixStreamState::Listen(listen) => {
@@ -1060,7 +1061,7 @@ impl<Platform: ShimPlatform> UnixDatagramInner<Platform> {
         Ok(())
     }
 
-    fn shutdown(&mut self, how: ShutdownHow) {
+    fn shutdown(&mut self, how: Shutdown) {
         let mut events = Events::empty();
         if how.is_shutdown_read() {
             self.read_shutdown = true;
@@ -1292,7 +1293,7 @@ impl<Platform: ShimPlatform> UnixDatagram<Platform> {
         events
     }
 
-    fn shutdown(&self, how: ShutdownHow) {
+    fn shutdown(&self, how: Shutdown) {
         let mut inner = self.inner.write();
         inner.shutdown(how);
     }
@@ -1619,7 +1620,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         super::write_to_user::<_, Platform>(val, optval, len)
     }
 
-    pub(super) fn shutdown(&self, how: ShutdownHow) {
+    pub(super) fn shutdown(&self, how: Shutdown) {
         match &self.inner {
             UnixSocketInner::Stream(stream) => stream.shutdown(how),
             UnixSocketInner::Datagram(datagram) => datagram.shutdown(how),

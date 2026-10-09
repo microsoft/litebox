@@ -19,7 +19,7 @@ use litebox::{
     },
     fs::OFlags,
     net::{
-        CloseBehavior, TcpOptionData,
+        CloseBehavior, Shutdown, TcpOptionData,
         errors::AcceptError,
         socket_channel::{ChannelReadError, ChannelWriteError, NetworkProxy, SocketState},
     },
@@ -27,9 +27,9 @@ use litebox::{
     utils::TruncateExt as _,
 };
 use litebox_common_linux::{
-    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, ShutdownHow,
-    SockFlags, SockType, SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr,
-    UserMsgHdr, errno::Errno, signal::Signal,
+    AddressFamily, FileDescriptorFlags, IPProtocol, ReceiveFlags, SendFlags, SockFlags, SockType,
+    SocketOption, SocketOptionName, TcpOption, UnixProtocol, UserMmsgHdr, UserMsgHdr, errno::Errno,
+    shutdown_from_how, signal::Signal,
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
@@ -200,7 +200,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let old = dt.set_fd_metadata(fd, sock_type);
+        let old = dt.set_entry_metadata(fd, sock_type);
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
@@ -710,6 +710,10 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         self.net.lock().listen(fd, backlog).map_err(Errno::from)
     }
 
+    fn shutdown(&self, fd: &SocketFd<Platform>, how: Shutdown) -> Result<(), Errno> {
+        self.net.lock().shutdown(fd, how).map_err(Errno::from)
+    }
+
     /// Send data via socket channel (lock-free path).
     ///
     /// This uses the channel-based approach where the user writes to a TX ring buffer,
@@ -833,6 +837,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             }
         }
 
+        let is_datagram = !self.is_stream(fd)?;
         let proxy = self.get_proxy(fd)?;
         cx.with_timeout(timeout)
             .wait_on_events(
@@ -845,6 +850,11 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                 || match proxy.try_read(buf, new_flags, source_addr.as_deref_mut()) {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
+                    // Like Linux, a nonblocking receive on a shut-down UDP socket fails with
+                    // `EAGAIN` rather than reporting end-of-file.
+                    Err(ChannelReadError::ReadShutdown) if is_datagram && is_nonblock => {
+                        Err(TryOpError::TryAgain)
+                    }
                     Err(ChannelReadError::ReadShutdown) => Ok(0),
                     Err(ChannelReadError::ConnectionClosed) => match proxy.get_async_error(true) {
                         Some(err) => Err(TryOpError::Other(err.into())),
@@ -872,6 +882,11 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             .with_metadata(fd, |SocketOFlags(flags)| *flags)
             .unwrap()
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
+    }
+
+    /// Whether `fd` is a stream (TCP) socket.
+    pub(super) fn is_stream(&self, fd: &SocketFd<Platform>) -> Result<bool, Errno> {
+        Ok(matches!(self.get_socket_type(fd)?, SockType::Stream))
     }
 
     pub(crate) fn get_proxy(
@@ -1265,7 +1280,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             &self.global,
             socket,
             |fd| {
-                let sock_type = self.global.get_socket_type(fd)?;
+                if !self.global.is_stream(fd)? {
+                    return Err(Errno::EOPNOTSUPP);
+                }
                 let mut socket_addr =
                     want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
                 let accepted_file =
@@ -1275,7 +1292,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
                 let proxy = self
                     .global
-                    .initialize_socket(&accepted_file, sock_type, flags);
+                    .initialize_socket(&accepted_file, SockType::Stream, flags);
                 proxy.set_state(SocketState::Connected);
                 let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
                     unimplemented!()
@@ -1403,7 +1420,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: SendFlags,
         sockaddr: Option<SocketAddress>,
     ) -> Result<usize, Errno> {
-        let mut is_datagram = false;
+        // Classify the socket while sending: a concurrent `close` would fail a later lookup.
+        let is_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1412,6 +1430,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
+                is_datagram.set(!self.global.is_stream(fd)?);
                 self.global
                     .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
             },
@@ -1420,14 +1439,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                is_datagram = !file.is_stream();
+                is_datagram.set(!file.is_stream());
                 file.sendto(self, buf, flags, addr)
             },
         );
-        // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
+        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_datagram
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -1477,7 +1496,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .ok_or(Errno::EFAULT)?,
             )
         };
-        let mut is_datagram = false;
+        // Classify the socket while sending: a concurrent `close` would fail a later lookup.
+        let is_datagram = core::cell::Cell::new(false);
         let res = self.files.borrow().with_typed_socket(
             &self.global,
             socket,
@@ -1487,6 +1507,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
+                is_datagram.set(!self.global.is_stream(fd)?);
                 self.global
                     .sendto(&self.wait_cx(), fd, &data, flags, sock_addr)
             },
@@ -1496,14 +1517,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.unix().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
-                is_datagram = !file.is_stream();
+                is_datagram.set(!file.is_stream());
                 file.sendto(self, &data, flags, unix_addr)
             },
         );
-        // Like Linux, Unix datagram sockets report EPIPE without raising SIGPIPE.
+        // Like Linux, datagram sockets report EPIPE without raising SIGPIPE.
         if let Err(Errno::EPIPE) = res
             && !flags.contains(SendFlags::NOSIGNAL)
-            && !is_datagram
+            && !is_datagram.get()
         {
             self.send_signal(Signal::SIGPIPE, signal::siginfo_kill(Signal::SIGPIPE));
         }
@@ -2041,13 +2062,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         self.files.borrow().with_typed_socket(
             &self.global,
             socket,
-            |_fd| {
-                ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
-                log_unsupported!("shutdown on inet socket");
-                Err(Errno::EOPNOTSUPP)
+            |fd| {
+                let how = shutdown_from_how(how).ok_or(Errno::EINVAL)?;
+                self.global.shutdown(fd, how)
             },
             |file| {
-                let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
+                let how = shutdown_from_how(how).ok_or(Errno::EINVAL)?;
                 file.shutdown(how);
                 Ok(())
             },
@@ -2895,6 +2915,145 @@ mod tests {
         close_socket(&task, raw_sockfd);
     }
 
+    /// Send one byte through `write`, `sendto` and `sendmsg`, returning their results.
+    fn send_each_way(task: &TestTask, raw_fd: u32) -> [Result<usize, Errno>; 3] {
+        let fd = typed_socket(task, raw_fd);
+        let data = b"x";
+        let iovec = [litebox_common_linux::IoVec {
+            iov_base: UserPtrMut::from_usize(data.as_ptr().expose_provenance()),
+            iov_len: data.len(),
+        }];
+        let mut hdr = litebox_common_linux::UserMsgHdr::new_zeroed();
+        hdr.msg_iov = UserPtr::from_usize(iovec.as_ptr() as usize);
+        hdr.msg_iovlen = iovec.len();
+        [
+            task.sys_write(i32::try_from(raw_fd).unwrap(), data, None),
+            task.do_sendto(&fd, data, SendFlags::empty(), None),
+            task.do_sendmsg(&fd, &hdr, SendFlags::empty()),
+        ]
+    }
+
+    fn shutdown(task: &TestTask, raw_fd: u32, how: i32) {
+        task.sys_shutdown(i32::try_from(raw_fd).unwrap(), how)
+            .expect("shutdown failed");
+    }
+
+    fn inet_addr(ip: [u8; 4], port: u16) -> SocketAddress {
+        SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+            core::net::Ipv4Addr::from(ip),
+            port,
+        )))
+    }
+
+    #[test]
+    fn test_inet_shutdown() {
+        use litebox_common_linux::{SHUT_RD, SHUT_RDWR, SHUT_WR, signal::Signal};
+
+        let task = init_platform(None);
+
+        for ty in [SockType::Stream, SockType::Datagram] {
+            let raw_fd = task
+                .do_socket(AddressFamily::INET, ty, SockFlags::empty(), 0)
+                .unwrap();
+            let fd = i32::try_from(raw_fd).unwrap();
+            assert_eq!(task.sys_shutdown(fd, 3), Err(Errno::EINVAL));
+            assert_eq!(task.sys_shutdown(fd, SHUT_RDWR), Err(Errno::ENOTCONN));
+            close_socket(&task, raw_fd);
+        }
+
+        // Like Linux, `SHUT_WR` leaves a listener alone while `SHUT_RD` stops listening.
+        let raw_listener = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let listener = typed_socket(&task, raw_listener);
+        task.do_bind(&listener, inet_addr(TUN_IP_ADDR, SERVER_PORT))
+            .unwrap();
+        task.do_listen(&listener, 1).unwrap();
+        let listener_fd = i32::try_from(raw_listener).unwrap();
+        let accept = || task.sys_accept(listener_fd, None, None, SockFlags::empty());
+        shutdown(&task, raw_listener, SHUT_WR);
+        assert_eq!(accept(), Err(Errno::EAGAIN));
+        shutdown(&task, raw_listener, SHUT_RD);
+        assert_eq!(accept(), Err(Errno::EINVAL));
+        assert_eq!(
+            task.sys_shutdown(listener_fd, SHUT_RD),
+            Err(Errno::ENOTCONN)
+        );
+        close_socket(&task, raw_listener);
+
+        // Like Linux, an unconnected UDP socket is shut down even though `ENOTCONN` is reported,
+        // so receivers see end-of-file and sends fail.
+        let raw_udp = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .unwrap();
+        let udp = typed_socket(&task, raw_udp);
+        task.do_bind(&udp, inet_addr(TUN_IP_ADDR, SERVER_PORT))
+            .unwrap();
+        assert_eq!(
+            task.sys_shutdown(i32::try_from(raw_udp).unwrap(), SHUT_RDWR),
+            Err(Errno::ENOTCONN)
+        );
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            task.do_recvfrom(&udp, &mut buf, ReceiveFlags::empty(), None),
+            Ok(0)
+        );
+        assert_eq!(
+            task.do_sendto(
+                &udp,
+                b"x",
+                SendFlags::empty(),
+                Some(inet_addr([10, 0, 0, 1], SERVER_PORT))
+            ),
+            Err(Errno::EPIPE)
+        );
+        close_socket(&task, raw_udp);
+
+        // A connected UDP socket reports end-of-file only to blocking receives, and fails sends
+        // with `EPIPE` without raising `SIGPIPE`.
+        let raw_udp = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Datagram,
+                SockFlags::empty(),
+                0,
+            )
+            .unwrap();
+        let udp = typed_socket(&task, raw_udp);
+        task.do_connect(&udp, inet_addr([10, 0, 0, 1], SERVER_PORT))
+            .unwrap();
+        shutdown(&task, raw_udp, SHUT_RD);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            task.do_recvfrom(&udp, &mut buf, ReceiveFlags::DONTWAIT, None),
+            Err(Errno::EAGAIN)
+        );
+        assert_eq!(
+            task.do_recvfrom(&udp, &mut buf, ReceiveFlags::empty(), None),
+            Ok(0)
+        );
+        shutdown(&task, raw_udp, SHUT_WR);
+        assert_eq!(send_each_way(&task, raw_udp), [Err(Errno::EPIPE); 3]);
+        // The socket type is not per-descriptor state, so a duplicate is a datagram socket too.
+        let raw_dup = task
+            .sys_dup(i32::try_from(raw_udp).unwrap(), None, None)
+            .unwrap();
+        assert_eq!(send_each_way(&task, raw_dup), [Err(Errno::EPIPE); 3]);
+        assert!(!task.pending_signal_set().contains(Signal::SIGPIPE));
+        close_socket(&task, raw_dup);
+        close_socket(&task, raw_udp);
+    }
+
     #[test]
     fn test_socket_dup_and_close() {
         let task = init_platform(None);
@@ -3512,7 +3671,7 @@ mod unix_tests {
                 .do_socketpair(AddressFamily::UNIX, ty, SockFlags::empty(), 0)
                 .unwrap();
             let sender_fd = i32::try_from(sender).unwrap();
-            task.sys_shutdown(sender_fd, litebox_common_linux::ShutdownHow::Write as i32)
+            task.sys_shutdown(sender_fd, litebox_common_linux::SHUT_WR)
                 .unwrap();
             assert_eq!(task.sys_write(sender_fd, b"x", None), Err(Errno::EPIPE));
             let data = b"y";
