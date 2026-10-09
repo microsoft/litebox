@@ -27,8 +27,8 @@ use core::ops::Range;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
-    FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, PRK_LEN, ReservationStatus,
-    VsmError, Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
+    FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, ReservationStatus, VsmError,
+    Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,
 };
 use rangemap::RangeSet;
 use spin::{Once, rwlock::RwLock as SpinRwLock};
@@ -37,7 +37,6 @@ use x86_64::{
     structures::paging::{PhysFrame, Size4KiB, frame::PhysFrameRange},
 };
 use zerocopy::FromBytes;
-use zeroize::Zeroizing;
 
 use super::{PrivilegedVtl0PhysMutPtr, Vtl0PhysConstPtr};
 
@@ -792,11 +791,17 @@ impl Vtl1Gate for LvbsVtl1Gate {
         }
 
         let key_pa = PhysAddr::try_new(key_pa).map_err(|_| VsmError::InvalidPhysicalAddress)?;
-        let mut keybuf = Zeroizing::new([0u8; PRK_LEN]);
-        LvbsVtl0Gate::mint(self.platform)
-            .read_vtl0_contiguous(key_pa.as_u64(), &mut *keybuf)
-            .map_err(|_| VsmError::Vtl0CopyFailed)?;
-        crate::host::set_platform_root_key(&keybuf);
-        Ok(())
+        // Read into the vault installer's zeroized boot buffer.
+        let result = crate::vault::install(self.platform.page_table_manager(), |prk| {
+            LvbsVtl0Gate::mint(self.platform)
+                .read_vtl0_contiguous(key_pa.as_u64(), prk)
+                .map_err(|_| VsmError::Vtl0CopyFailed)
+        });
+        match result {
+            // Set once: keep the first key.
+            Ok(()) | Err(crate::vault::InstallError::AlreadyInstalled) => Ok(()),
+            Err(crate::vault::InstallError::OutOfMemory) => Err(VsmError::OutOfMemory),
+            Err(crate::vault::InstallError::Fill(e)) => Err(e),
+        }
     }
 }

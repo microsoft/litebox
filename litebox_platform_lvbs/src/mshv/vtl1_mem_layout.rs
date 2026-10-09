@@ -36,6 +36,23 @@ pub const VTL1_REMAP_PDPT_PAGE: usize = VTL1_KERNEL_STACK_PAGE + 1;
 /// covering the full 16 MiB of VTL1 pre-populated memory.
 pub const VTL1_REMAP_PDE_PAGE: usize = VTL1_REMAP_PDPT_PAGE + 1;
 
+/// Vault backing pages in the unused boot gap, excluded from the normal mapping
+/// and allocator. PRK, dispatch page, then the private stack.
+pub const VTL1_VAULT_START_PAGE: usize = VTL1_REMAP_PDE_PAGE + 1;
+// The current KDF needs ~18 KiB in debug and ~1.3 KiB in release.
+pub const VTL1_VAULT_STACK_PAGES: usize = if cfg!(debug_assertions) { 8 } else { 2 };
+pub const VTL1_VAULT_PAGES: usize = 2 + VTL1_VAULT_STACK_PAGES;
+const _: () = assert!(VTL1_VAULT_START_PAGE + VTL1_VAULT_PAGES <= VTL1_INIT_HEAP_START_PAGE);
+
+pub(crate) fn vault_frame_range(
+    memory_start: x86_64::PhysAddr,
+) -> x86_64::structures::paging::frame::PhysFrameRange {
+    use x86_64::structures::paging::PhysFrame;
+    let start =
+        PhysFrame::containing_address(memory_start) + u64::try_from(VTL1_VAULT_START_PAGE).unwrap();
+    PhysFrame::range(start, start + u64::try_from(VTL1_VAULT_PAGES).unwrap())
+}
+
 /// Number of VTL0 PTE pages available for the Phase 1 high-canonical mapping.
 /// All 8 PTE pages are used, covering 8 * 2 MiB = 16 MiB.
 ///
@@ -119,4 +136,24 @@ pub fn get_rela_start_address() -> u64 {
 #[inline]
 pub fn get_rela_end_address() -> u64 {
     &raw const _rela_end as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_reservation_fits_between_boot_tables_and_heap() {
+        let base = x86_64::PhysAddr::new(0x0800_0000);
+        let range = vault_frame_range(base);
+        assert_eq!(
+            range.start.start_address(),
+            base + (VTL1_VAULT_START_PAGE * PAGE_SIZE) as u64
+        );
+        assert_eq!(range.end - range.start, VTL1_VAULT_PAGES as u64);
+        assert!(
+            range.start.start_address() >= base + ((VTL1_REMAP_PDE_PAGE + 1) * PAGE_SIZE) as u64
+        );
+        assert!(range.end.start_address() <= base + (VTL1_INIT_HEAP_START_PAGE * PAGE_SIZE) as u64);
+    }
 }
