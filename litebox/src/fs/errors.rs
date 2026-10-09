@@ -240,9 +240,3 @@ pub enum PathError {
     #[error("a component used as a directory in pathname is not, in fact, a directory")]
     ComponentNotADirectory,
 }
-
-impl From<crate::path::ConversionError> for PathError {
-    fn from(_value: crate::path::ConversionError) -> Self {
-        Self::InvalidPathname
-    }
-}

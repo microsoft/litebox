@@ -3,7 +3,6 @@
 
 //! Implementation of generic TEE related syscalls
 
-use litebox::path::Arg;
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
@@ -162,10 +161,7 @@ impl<Platform: crate::OpteeShimPlatform> Task<Platform> {
     ) -> Result<(), TeeResult> {
         let name_str =
             core::ffi::CStr::from_bytes_with_nul(name).map_err(|_| TeeResult::BadParameters)?;
-        match name_str
-            .as_rust_str()
-            .map_err(|_| TeeResult::BadParameters)?
-        {
+        match name_str.to_str().map_err(|_| TeeResult::BadParameters)? {
             "gpd.client.identity" => {
                 if prop_set == TeePropSet::CurrentClient {
                     index
