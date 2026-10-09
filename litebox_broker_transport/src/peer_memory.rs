@@ -181,12 +181,17 @@ pub unsafe fn copy_to_peer(source: &[u8], destination: *mut u8) {
 /// between page-aligned shared buffers and arbitrarily aligned private ones, so
 /// that case is common.
 ///
+/// Chunks use vector registers on x86-64. Without SSE, as on kernel targets,
+/// there are no chunks and words are copied one at a time; such targets copy
+/// only small control messages and payloads.
+///
 /// # Safety
 ///
 /// `source` must be readable and `destination` writable for `length` bytes,
 /// and the ranges must not overlap.
 unsafe fn copy(source: *const u8, destination: *mut u8, length: usize) {
     let mut offset = 0;
+    #[cfg(any(target_arch = "aarch64", target_feature = "sse2"))]
     while length - offset >= CHUNK_SIZE {
         let (from, to) = (
             source.wrapping_add(offset),
@@ -216,6 +221,7 @@ unsafe fn copy(source: *const u8, destination: *mut u8, length: usize) {
     }
 }
 
+#[cfg(any(target_arch = "aarch64", target_feature = "sse2"))]
 const CHUNK_SIZE: usize = 64;
 
 /// Copies [`CHUNK_SIZE`] bytes.
@@ -223,10 +229,10 @@ const CHUNK_SIZE: usize = 64;
 /// # Safety
 ///
 /// As for [`copy`] with `length` equal to [`CHUNK_SIZE`].
+#[cfg(any(target_arch = "aarch64", target_feature = "sse2"))]
 unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
-    // SAFETY: Guaranteed by the caller. SSE2 is part of the x86-64 baseline,
-    // but kernel targets such as `x86_64-unknown-none` disable it.
-    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    // SAFETY: Guaranteed by the caller. Compiled on x86-64 only with SSE2.
+    #[cfg(target_arch = "x86_64")]
     unsafe {
         asm!(
             "movdqu {a}, xmmword ptr [{source}]",
@@ -243,36 +249,6 @@ unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
             b = out(xmm_reg) _,
             c = out(xmm_reg) _,
             d = out(xmm_reg) _,
-            options(nostack, preserves_flags),
-        );
-    }
-    // SAFETY: Guaranteed by the caller. Without SSE, general-purpose
-    // registers copy each 32-byte half, still loading it before storing it.
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "sse2")))]
-    unsafe {
-        asm!(
-            "mov {a}, qword ptr [{source}]",
-            "mov {b}, qword ptr [{source} + 8]",
-            "mov {c}, qword ptr [{source} + 16]",
-            "mov {d}, qword ptr [{source} + 24]",
-            "mov qword ptr [{destination}], {a}",
-            "mov qword ptr [{destination} + 8], {b}",
-            "mov qword ptr [{destination} + 16], {c}",
-            "mov qword ptr [{destination} + 24], {d}",
-            "mov {a}, qword ptr [{source} + 32]",
-            "mov {b}, qword ptr [{source} + 40]",
-            "mov {c}, qword ptr [{source} + 48]",
-            "mov {d}, qword ptr [{source} + 56]",
-            "mov qword ptr [{destination} + 32], {a}",
-            "mov qword ptr [{destination} + 40], {b}",
-            "mov qword ptr [{destination} + 48], {c}",
-            "mov qword ptr [{destination} + 56], {d}",
-            source = in(reg) source,
-            destination = in(reg) destination,
-            a = out(reg) _,
-            b = out(reg) _,
-            c = out(reg) _,
-            d = out(reg) _,
             options(nostack, preserves_flags),
         );
     }
