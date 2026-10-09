@@ -22,6 +22,7 @@ use super::Error;
 use super::pci::PciTransport;
 use super::queue::{Buffer, VirtQueue};
 use crate::dma::{DmaRegion, Hal};
+use crate::pci::MsiMessage;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -108,15 +109,22 @@ pub struct VirtioConsole {
 }
 
 impl VirtioConsole {
-    /// The first virtio console on bus 0, brought up; `None` if there is
-    /// none.
+    /// The first virtio console on bus 0, brought up, interrupting with
+    /// `interrupt` (if it can; see [`PciTransport::interrupts`]); `None` if
+    /// there is none.
     ///
     /// # Errors
     ///
     /// The device cannot be driven.
-    pub fn probe(hal: &'static dyn Hal) -> Option<Result<Self, Error>> {
+    pub fn probe(
+        hal: &'static dyn Hal,
+        interrupt: Option<MsiMessage>,
+    ) -> Option<Result<Self, Error>> {
         let function = super::find_pci_device(DEVICE_TYPE)?;
-        Some(PciTransport::new(hal, function).and_then(|transport| Self::bring_up(hal, transport)))
+        Some(
+            PciTransport::new(hal, function, interrupt)
+                .and_then(|transport| Self::bring_up(hal, transport)),
+        )
     }
 
     fn bring_up(hal: &'static dyn Hal, transport: PciTransport) -> Result<Self, Error> {

@@ -6,11 +6,11 @@
 //!
 //! - Runner processes' standard streams: a virtio console if there is one,
 //!   else output to the serial console and no input.
-//! - Events: the console's interrupt, and the PIT for deadlines.
+//! - Events: the console's interrupt (MSI-X), and the local APIC's timer
+//!   for deadlines.
 //!
-//! The interrupt handler only masks the IRQ (the platform records the
-//! vector); the kernel services the device and unmasks it when it next polls
-//! or halts.
+//! The interrupt handler only ends the interrupt; the kernel services the
+//! device when it next polls or halts.
 
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -19,8 +19,8 @@ use litebox_broker_core::stdio::{
     StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_hal::interrupt::LocalApic;
 use litebox_hal::virtio::console::VirtioConsole;
-use litebox_hal::{interrupt, timer};
 use litebox_platform_vm_kernel::VmKernel;
 use spin::Mutex;
 
@@ -28,19 +28,13 @@ use spin::Mutex;
 /// the rest is dropped.
 const WRITE_TIMEOUT_NANOS: u64 = 100_000_000;
 
-/// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
-/// per-CPU data. The IRQ stays masked until [`Devices::acknowledge`].
-fn on_interrupt(vector: u8) -> bool {
-    let Some(irq) = interrupt::irq(vector) else {
-        return false;
-    };
-    interrupt::mask_and_acknowledge(irq);
-    true
-}
+const TIMER_VECTOR: u8 = 0x30;
+const CONSOLE_VECTOR: u8 = 0x31;
 
 struct Console {
     device: Mutex<VirtioConsole>,
-    irq: Option<u8>,
+    /// Whether it interrupts; else it is polled.
+    interrupts: bool,
     /// Standard-input files, to wake when input arrives.
     stdin_watchers: Mutex<ReadinessWatchers>,
     /// Whether input was pending when last looked at; watchers are woken
@@ -56,6 +50,7 @@ impl Console {
 
 pub struct Devices {
     platform: &'static VmKernel,
+    apic: LocalApic,
     tsc_khz: u64,
     console: Option<Console>,
 }
@@ -63,10 +58,9 @@ pub struct Devices {
 impl Devices {
     /// Brings up the devices and enables their interrupts. Call once.
     pub fn init(platform: &'static VmKernel, tsc_khz: u64) -> &'static Self {
-        litebox_platform_vm_kernel::set_interrupt_handler(on_interrupt);
-        timer::disarm();
-        interrupt::unmask(timer::IRQ);
-        let console = match VirtioConsole::probe(platform) {
+        let apic = LocalApic::init(platform, TIMER_VECTOR, tsc_khz);
+        let interrupt = apic.msi_message(CONSOLE_VECTOR);
+        let console = match VirtioConsole::probe(platform, Some(interrupt)) {
             None => {
                 litebox_util_log::info!(
                     "no virtio console: standard output goes to the serial console"
@@ -81,60 +75,51 @@ impl Devices {
                 None
             }
             Some(Ok(device)) => {
-                let irq = device.transport().irq();
+                let interrupts = device.transport().interrupts();
                 litebox_util_log::info!(
                     pci:% = device.transport().function(),
-                    irq:? = irq;
+                    interrupts:% = interrupts;
                     "virtio console: standard streams"
                 );
-                if let Some(irq) = irq {
-                    interrupt::unmask(irq);
-                }
                 Some(Console {
                     device: Mutex::new(device),
-                    irq,
+                    interrupts,
                     stdin_watchers: Mutex::new(ReadinessWatchers::default()),
                     stdin_readable: AtomicBool::new(false),
                 })
             }
         };
-        Box::leak(Box::new(Self {
+        let devices: &'static Self = Box::leak(Box::new(Self {
             platform,
+            apic,
             tsc_khz,
             console,
-        }))
+        }));
+        litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
+            devices.on_interrupt(vector)
+        })));
+        devices
     }
 
-    /// Acknowledges recorded interrupts at their devices and unmasks them.
-    fn acknowledge(&self) {
-        let pending = self.platform.take_pending_interrupts();
-        if let Some(console) = &self.console
-            && let Some(irq) = console.irq
-            && pending.contains(interrupt::vector(irq))
-        {
-            // Before unmasking, or the line would still be asserted.
-            console.device.lock().transport().acknowledge_interrupt();
+    /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
+    /// per-CPU data.
+    fn on_interrupt(&self, vector: u8) -> bool {
+        if !matches!(vector, TIMER_VECTOR | CONSOLE_VECTOR) {
+            return false;
         }
-        for irq in pending.iter().filter_map(interrupt::irq) {
-            interrupt::unmask(irq);
-        }
+        self.apic.end_of_interrupt();
+        true
     }
 
     /// Halts until an interrupt, or until `deadline` (TSC).
     fn halt(&self, deadline: Option<u64>) {
         if let Some(deadline) = deadline {
-            let now = rdtsc();
-            if now >= deadline {
-                return;
-            }
-            let nanos = u128::from(deadline - now) * 1_000_000 / u128::from(self.tsc_khz);
-            timer::arm_oneshot(u64::try_from(nanos).unwrap_or(u64::MAX));
+            self.apic.arm_timer(deadline);
         }
         self.platform.halt_until_interrupt();
         if deadline.is_some() {
-            timer::disarm();
+            self.apic.disarm_timer();
         }
-        self.acknowledge();
     }
 }
 
@@ -145,7 +130,6 @@ fn rdtsc() -> u64 {
 
 impl litebox_broker_vm_kernel::Events for Devices {
     fn poll(&self) {
-        self.acknowledge();
         // Wake watchers when input starts to be pending.
         if let Some(console) = &self.console {
             let readable = console.readable();
@@ -161,7 +145,7 @@ impl litebox_broker_vm_kernel::Events for Devices {
         let interrupts = self
             .console
             .as_ref()
-            .is_some_and(|console| console.irq.is_some());
+            .is_some_and(|console| console.interrupts);
         if deadline.is_none() && !interrupts {
             return false;
         }

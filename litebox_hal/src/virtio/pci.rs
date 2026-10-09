@@ -2,12 +2,12 @@
 // Licensed under the MIT license.
 
 //! The modern virtio-PCI transport: structures located by vendor-specific
-//! capabilities, in memory BARs.
+//! capabilities, in memory BARs; interrupts by MSI-X.
 
 use super::Error;
 use super::queue::VirtQueue;
 use crate::dma::{Hal, Mmio};
-use crate::pci::{self, Function, MemoryBar};
+use crate::pci::{self, Function, MemoryBar, MsiMessage};
 
 const CAP_VENDOR_SPECIFIC: u8 = 0x09;
 
@@ -27,7 +27,6 @@ mod cap {
 
     pub const COMMON: u8 = 1;
     pub const NOTIFY: u8 = 2;
-    pub const ISR: u8 = 3;
     pub const DEVICE: u8 = 4;
 }
 
@@ -40,6 +39,7 @@ mod common {
     pub const DEVICE_STATUS: usize = 0x14;
     pub const QUEUE_SELECT: usize = 0x16;
     pub const QUEUE_SIZE: usize = 0x18;
+    pub const QUEUE_MSIX_VECTOR: usize = 0x1a;
     pub const QUEUE_ENABLE: usize = 0x1c;
     pub const QUEUE_NOTIFY_OFF: usize = 0x1e;
     pub const QUEUE_DESC: usize = 0x20;
@@ -72,7 +72,6 @@ struct Location {
 struct Locations {
     common: Option<Location>,
     notify: Option<(Location, u32)>,
-    isr: Option<Location>,
     device: Option<Location>,
 }
 
@@ -97,9 +96,6 @@ impl Locations {
                     let multiplier = function.read_u32(offset + cap::NOTIFY_OFF_MULTIPLIER);
                     found.notify.get_or_insert((location, multiplier));
                 }
-                cap::ISR => {
-                    found.isr.get_or_insert(location);
-                }
                 cap::DEVICE => {
                     found.device.get_or_insert(location);
                 }
@@ -116,19 +112,23 @@ pub struct PciTransport {
     common: Mmio,
     notify: Mmio,
     notify_off_multiplier: u32,
-    isr: Mmio,
     device: Option<Mmio>,
-    irq: Option<u8>,
+    /// Whether the device interrupts (by MSI-X); else it is polled.
+    interrupts: bool,
 }
 
 impl PciTransport {
-    /// Maps `function`'s structures and enables its memory decoding, bus
-    /// mastering, and INTx.
+    /// Maps `function`'s structures, enables its memory decoding and bus
+    /// mastering, and sends its interrupts as `interrupt` if it has MSI-X.
     ///
     /// # Errors
     ///
     /// A missing or malformed structure, or one that cannot be mapped.
-    pub fn new(hal: &dyn Hal, function: Function) -> Result<Self, Error> {
+    pub fn new(
+        hal: &dyn Hal,
+        function: Function,
+        interrupt: Option<MsiMessage>,
+    ) -> Result<Self, Error> {
         let locations = Locations::read(function);
         let mut bars = [None::<MemoryBar>; 6];
         let mut map = |location: Location, what, min_len: usize| -> Result<Mmio, Error> {
@@ -150,34 +150,38 @@ impl PciTransport {
         let common = locations.common.ok_or(Error::MissingStructure("common"))?;
         let (notify, notify_off_multiplier) =
             locations.notify.ok_or(Error::MissingStructure("notify"))?;
-        let isr = locations.isr.ok_or(Error::MissingStructure("ISR"))?;
-        let transport = Self {
-            function,
-            common: map(common, "common", common::LEN)?,
-            notify: map(notify, "notify", 2)?,
-            notify_off_multiplier,
-            isr: map(isr, "ISR", 1)?,
-            device: locations
-                .device
-                .map(|device| map(device, "device", 0))
-                .transpose()?,
-            irq: function.legacy_irq(),
-        };
+        let common = map(common, "common", common::LEN)?;
+        let notify = map(notify, "notify", 2)?;
+        let device = locations
+            .device
+            .map(|device| map(device, "device", 0))
+            .transpose()?;
+        // Safety: the driver does not access the BARs yet; the message is the
+        // caller's interrupt.
+        let interrupts =
+            interrupt.is_some_and(|message| unsafe { function.enable_msix(hal, message) });
         let command = (function.command() | pci::COMMAND_MEMORY_SPACE | pci::COMMAND_BUS_MASTER)
-            & !pci::COMMAND_INTX_DISABLE;
+            | pci::COMMAND_INTX_DISABLE;
         // Safety: decodes the BARs firmware assigned; DMA only goes where the
         // driver points the queues.
         unsafe { function.set_command(command) };
-        Ok(transport)
+        Ok(Self {
+            function,
+            common,
+            notify,
+            notify_off_multiplier,
+            device,
+            interrupts,
+        })
     }
 
     pub fn function(&self) -> Function {
         self.function
     }
 
-    /// The PIC IRQ of the device's INTx, if firmware routed one.
-    pub fn irq(&self) -> Option<u8> {
-        self.irq
+    /// Whether the device interrupts (by MSI-X); else it must be polled.
+    pub fn interrupts(&self) -> bool {
+        self.interrupts
     }
 
     /// The device-specific configuration, if any.
@@ -240,12 +244,13 @@ impl PciTransport {
         Ok(accepted)
     }
 
-    /// Sets up and enables queue `index`, with at most `max_size` entries.
+    /// Sets up and enables queue `index`, with at most `max_size` entries,
+    /// interrupting on MSI-X vector 0 if the device interrupts.
     ///
     /// # Errors
     ///
-    /// The device lacks the queue, its notification address is out of
-    /// range, or memory ran out.
+    /// The device lacks the queue, its notification address or vector is
+    /// unusable, or memory ran out.
     pub fn setup_queue(
         &self,
         hal: &'static dyn Hal,
@@ -264,6 +269,13 @@ impl PciTransport {
             .checked_mul(usize::try_from(self.notify_off_multiplier).unwrap_or(usize::MAX))
             .filter(|&offset| offset.is_multiple_of(2) && offset + 2 <= self.notify.len())
             .ok_or(Error::BadNotifyOffset(index))?;
+        if self.interrupts {
+            self.common.write_u16(common::QUEUE_MSIX_VECTOR, 0);
+            // The device answers `NO_VECTOR` (0xffff) if it cannot.
+            if self.common.read_u16(common::QUEUE_MSIX_VECTOR) != 0 {
+                return Err(Error::QueueUnavailable(index));
+            }
+        }
         let queue = VirtQueue::new(hal, index, size, notify_offset)?;
         let [desc, driver, device] = queue.addresses();
         self.common.write_u16(common::QUEUE_SIZE, size);
@@ -291,12 +303,5 @@ impl PciTransport {
     pub fn notify(&self, queue: &VirtQueue) {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.notify.write_u16(queue.notify_offset(), queue.index());
-    }
-
-    /// Acknowledges the device's interrupt (deasserting INTx); returns the
-    /// ISR status (bit 0: a queue, bit 1: configuration). Process the queues
-    /// afterwards, so nothing that arrived before goes unnoticed.
-    pub fn acknowledge_interrupt(&self) -> u8 {
-        self.isr.read_u8(0)
     }
 }

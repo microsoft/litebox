@@ -97,6 +97,9 @@ pub struct BootConfig<'a> {
     pub ignored_vectors: &'a [u8],
 }
 
+/// See [`set_interrupt_handler`].
+pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
+
 /// Installs the handler for external interrupts (vectors 32 and up, except
 /// [`BootConfig::ignored_vectors`]), which returns whether it handled the
 /// vector; an unhandled one panics. Before this, every external interrupt
@@ -104,28 +107,14 @@ pub struct BootConfig<'a> {
 ///
 /// The handler runs with interrupts disabled, on the interrupted context's GS
 /// (user mode, or [`VmKernel::halt_until_interrupt`]): it must not touch
-/// per-CPU data, block, or take locks, only quiet the source. The kernel acts
-/// on handled vectors later ([`VmKernel::take_pending_interrupts`]).
+/// per-CPU data, block, or take locks; it should only end the interrupt and
+/// leave the work to the kernel after the halt.
 ///
 /// # Panics
 ///
 /// On a second call.
-pub fn set_interrupt_handler(handler: fn(u8) -> bool) {
+pub fn set_interrupt_handler(handler: &'static InterruptHandler) {
     arch::interrupts::set_external_interrupt_handler(handler);
-}
-
-/// A set of interrupt vectors.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct InterruptVectors([u64; 4]);
-
-impl InterruptVectors {
-    pub fn contains(&self, vector: u8) -> bool {
-        self.0[usize::from(vector / 64)] & (1 << (vector % 64)) != 0
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
-        (0..=u8::MAX).filter(|&vector| self.contains(vector))
-    }
 }
 
 /// Valid until unregistered; its representation is private to the platform.
@@ -473,11 +462,6 @@ impl VmKernel {
             ram_frame_ranges,
             mmio_next: spin::Mutex::new(dma::MMIO_WINDOW.start),
         }))
-    }
-
-    /// The vectors the interrupt handler handled since the last call.
-    pub fn take_pending_interrupts(&self) -> InterruptVectors {
-        InterruptVectors(arch::interrupts::take_pending())
     }
 
     /// Halts until an interrupt is handled, with interrupts enabled only for

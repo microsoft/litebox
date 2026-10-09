@@ -26,6 +26,4 @@ pub mod prk;
 #[cfg(target_arch = "x86_64")]
 pub mod rng;
 #[cfg(target_arch = "x86_64")]
-pub mod timer;
-#[cfg(target_arch = "x86_64")]
 pub mod virtio;

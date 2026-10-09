@@ -5,7 +5,7 @@
 //! NMI entry cannot assume kernel GS or a completed syscall stack switch.
 //! CR4.MCE remains off; machine checks shut down the CPU.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use crate::InterruptHandler;
 use litebox_common_linux::PtRegs;
 use spin::Once;
 use x86_64::{VirtAddr, structures::idt::InterruptDescriptorTable};
@@ -42,10 +42,7 @@ const NMI_IST_INDEX: u16 = 1;
 struct Interrupts {
     idt: InterruptDescriptorTable,
     /// See [`crate::set_interrupt_handler`].
-    handler: Once<fn(u8) -> bool>,
-    /// Bit `v % 64` of word `v / 64`: vector `v` was handled since it was
-    /// last taken ([`take_pending`]).
-    pending: [AtomicU64; 4],
+    handler: Once<&'static InterruptHandler>,
 }
 
 static INTERRUPTS: Once<Interrupts> = Once::new();
@@ -55,7 +52,6 @@ fn idt(ignored_vectors: &[u8]) -> &'static InterruptDescriptorTable {
         .call_once(|| Interrupts {
             idt: build_idt(ignored_vectors),
             handler: Once::new(),
-            pending: [const { AtomicU64::new(0) }; 4],
         })
         .idt
 }
@@ -128,7 +124,7 @@ pub fn init_idt(ignored_vectors: &[u8]) {
 /// # Panics
 ///
 /// Before [`init_idt`], or if a handler is already set.
-pub(crate) fn set_external_interrupt_handler(handler: fn(u8) -> bool) {
+pub(crate) fn set_external_interrupt_handler(handler: &'static InterruptHandler) {
     let interrupts = INTERRUPTS.get().expect("the IDT is initialized at boot");
     let mut installed = false;
     interrupts.handler.call_once(|| {
@@ -136,13 +132,6 @@ pub(crate) fn set_external_interrupt_handler(handler: fn(u8) -> bool) {
         handler
     });
     assert!(installed, "an interrupt handler is already set");
-}
-
-/// The vectors handled since the last call, as a 256-bit set.
-pub(crate) fn take_pending() -> [u64; 4] {
-    INTERRUPTS.get().map_or([0; 4], |interrupts| {
-        core::array::from_fn(|word| interrupts.pending[word].swap(0, Ordering::Relaxed))
-    })
 }
 
 /// Runs with interrupts disabled, on whatever stack and GS the interrupted
@@ -155,8 +144,6 @@ extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) {
             .get()
             .is_some_and(|handler| handler(vector))
     {
-        interrupts.pending[usize::from(vector / 64)]
-            .fetch_or(1 << (vector % 64), Ordering::Relaxed);
         return;
     }
     panic!("EXCEPTION: UNEXPECTED INTERRUPT (vector {vector:#x}, RIP {rip:#x}, CS {cs:#x})");

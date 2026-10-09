@@ -2,9 +2,10 @@
 // Licensed under the MIT license.
 
 //! PCI: configuration space through the legacy mechanism #1 ports
-//! (`0xCF8`/`0xCFC`), on bus 0. Firmware (SeaBIOS under QEMU) has already
-//! assigned BARs and routed INTx to a legacy PIC IRQ.
+//! (`0xCF8`/`0xCFC`), on bus 0, and MSI-X. Firmware (SeaBIOS under QEMU) has
+//! already assigned BARs.
 
+use crate::dma::Hal;
 use x86_64::instructions::port::Port;
 
 const CONFIG_ADDRESS: u16 = 0xcf8;
@@ -21,8 +22,11 @@ const STATUS_CAPABILITIES: u16 = 1 << 4;
 /// Capabilities live past the standard header.
 const FIRST_CAPABILITY: u8 = 0x40;
 const BAR0: u8 = 0x10;
-const INTERRUPT_LINE: u8 = 0x3c;
-const INTERRUPT_PIN: u8 = 0x3d;
+
+const CAP_MSIX: u8 = 0x11;
+const MSIX_CONTROL_ENABLE: u16 = 1 << 15;
+const MSIX_CONTROL_FUNCTION_MASK: u16 = 1 << 14;
+const MSIX_ENTRY_SIZE: usize = 16;
 
 /// `COMMAND` bits.
 pub const COMMAND_IO_SPACE: u16 = 1 << 0;
@@ -100,16 +104,25 @@ impl Function {
         self.read_u16(COMMAND)
     }
 
-    /// A 16-bit write, leaving `STATUS` (write-1-to-clear) alone.
+    /// A 16-bit write, leaving the neighboring register (e.g., `STATUS`,
+    /// write-1-to-clear) alone.
     ///
+    /// # Safety
+    ///
+    /// As for [`Self::write_u32`].
+    pub unsafe fn write_u16(self, offset: u8, value: u16) {
+        self.select(offset);
+        // Safety: forwarded to the caller.
+        unsafe { Port::<u16>::new(CONFIG_DATA + u16::from(offset & 2)).write(value) };
+    }
+
     /// # Safety
     ///
     /// Enabling bus mastering lets the device DMA wherever the driver points
     /// it.
     pub unsafe fn set_command(self, command: u16) {
-        self.select(COMMAND);
         // Safety: forwarded to the caller.
-        unsafe { Port::<u16>::new(CONFIG_DATA + u16::from(COMMAND & 2)).write(command) };
+        unsafe { self.write_u16(COMMAND, command) };
     }
 
     /// Memory BAR `index` (with its upper half, if 64-bit), sized; `None` if
@@ -173,13 +186,66 @@ impl Function {
         }
     }
 
-    /// The legacy PIC IRQ that firmware routed INTx to, if any.
-    pub fn legacy_irq(self) -> Option<u8> {
-        if self.read_u8(INTERRUPT_PIN) == 0 {
-            return None;
+    /// Routes every MSI-X vector of the function to `message` and enables
+    /// MSI-X (which disables INTx); `false` if it has no usable MSI-X.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may access the function's BARs meanwhile, and `message` must
+    /// raise an interrupt the kernel handles.
+    pub unsafe fn enable_msix(self, hal: &dyn Hal, message: MsiMessage) -> bool {
+        let mut msix = None;
+        self.for_each_capability(|offset, id| {
+            if id == CAP_MSIX && offset <= 0xf4 {
+                msix.get_or_insert(offset);
+            }
+        });
+        let Some(cap) = msix else {
+            return false;
+        };
+        let control = self.read_u16(cap + 2);
+        let entries = usize::from(control & 0x7ff) + 1;
+        let table = self.read_u32(cap + 4);
+        // Safety: the caller does not access the BARs meanwhile.
+        let Some(bar) = (unsafe { self.memory_bar(table.to_le_bytes()[0] & 7) }) else {
+            return false;
+        };
+        let (offset, len) = (u64::from(table & !7), (entries * MSIX_ENTRY_SIZE) as u64);
+        if offset + len > bar.size {
+            return false;
         }
-        Some(self.read_u8(INTERRUPT_LINE)).filter(|&irq| irq < 16)
+        // Safety: the table is within the BAR, so device registers.
+        let Some(table) =
+            (unsafe { hal.map_mmio(bar.address + offset, entries * MSIX_ENTRY_SIZE) })
+        else {
+            return false;
+        };
+        // Safety: decodes the BAR firmware assigned, so the table writes
+        // below reach the device.
+        unsafe { self.set_command(self.command() | COMMAND_MEMORY_SPACE) };
+        #[expect(clippy::cast_possible_truncation, reason = "split into words")]
+        for entry in (0..entries).map(|entry| entry * MSIX_ENTRY_SIZE) {
+            table.write_u32(entry, message.address as u32);
+            table.write_u32(entry + 4, (message.address >> 32) as u32);
+            table.write_u32(entry + 8, message.data);
+            table.write_u32(entry + 12, 0); // unmasked
+        }
+        // Safety: the vectors raise the caller's interrupt.
+        unsafe {
+            self.write_u16(
+                cap + 2,
+                (control | MSIX_CONTROL_ENABLE) & !MSIX_CONTROL_FUNCTION_MASK,
+            );
+        }
+        true
     }
+}
+
+/// An MSI message: a write of `data` to `address` raises the interrupt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsiMessage {
+    pub address: u64,
+    pub data: u32,
 }
 
 /// A memory BAR's physical range.

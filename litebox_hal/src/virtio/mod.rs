@@ -3,8 +3,8 @@
 
 //! Virtio 1.x devices over PCI ([`pci::PciTransport`]): the modern
 //! interface, with its structures in memory BARs (mapped through
-//! [`crate::dma::Hal`]) and INTx interrupts (routed to a legacy PIC IRQ by
-//! firmware; MSI-X is left disabled). Split virtqueues ([`queue`]).
+//! [`crate::dma::Hal`]) and interrupts by MSI-X. Split virtqueues
+//! ([`queue`]).
 //!
 //! Devices: [`console`]. The transport and queues are device-independent,
 //! for further devices (e.g., file systems and networking for the broker).
@@ -34,7 +34,7 @@ pub fn find_pci_device(device_type: u16) -> Option<crate::pci::Function> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The device lacks a required structure (common, notify, or ISR).
+    /// The device lacks a required structure (common or notify).
     MissingStructure(&'static str),
     /// A structure is outside its BAR, too short, or not in a memory BAR.
     BadStructure(&'static str),
