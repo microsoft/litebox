@@ -273,7 +273,7 @@ impl TcpServerSpecific {
 }
 
 /// Whether a pending connection on a listening socket has completed its handshake and can be
-/// accepted. Like Linux, this includes connections that the peer has already half-closed.
+/// accepted, including a connection the peer has already half-closed.
 fn is_acceptable(socket: &tcp::Socket) -> bool {
     matches!(
         socket.state(),
@@ -659,8 +659,8 @@ where
                             proxy.set_state(socket_channel::SocketState::Error);
                         }
                         socket_channel::SocketState::Connected => {
-                            // Without the peer's FIN, the connection was reset. Like Linux,
-                            // report the reset at once, even if received data is still unread.
+                            // Without the peer's FIN, the connection was reset. Report the reset
+                            // at once, even if received data is still unread.
                             if !proxy.is_peer_closed() {
                                 proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
                             }
@@ -1442,7 +1442,7 @@ where
         }
     }
 
-    /// Shut down part or all of a connection, like Linux's `shutdown(2)`.
+    /// Shut down part or all of a connection.
     ///
     /// Data received before the read side is shut down can still be read; data written before
     /// the write side is shut down is still sent, followed by a FIN for TCP. Shutting down the
@@ -1488,8 +1488,8 @@ where
                 }
             }
             ProtocolSpecific::Udp(udp_specific) => {
-                // Like Linux, shut down even an unconnected socket (waking blocked receivers)
-                // before reporting that it is not connected.
+                // Shut down even an unconnected socket (waking blocked receivers) before
+                // reporting that it is not connected.
                 proxy.shutdown(how);
                 if udp_specific.remote_endpoint.is_none() {
                     return Err(ShutdownError::NotConnected);
