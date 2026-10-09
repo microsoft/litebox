@@ -26,7 +26,6 @@ use litebox::platform::{
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
 use litebox::sync::{Mutex, RawSyncPrimitivesProvider};
 use litebox::utils::TruncateExt as _;
-use litebox_common_linux::{mm::VmemManager, vmem::LinuxReservationStore};
 use litebox_common_windows::loader::PAGE_SIZE;
 use litebox_common_windows::{NtSysno, Win32Sysno};
 use litebox_platform::time::TimeProvider;
@@ -60,6 +59,7 @@ use crate::syscalls::{SyscallRequest, ThreadHandle, mm};
 mod fs;
 mod loader;
 mod nt_types;
+mod page_manager;
 mod syscalls;
 mod wait;
 
@@ -74,7 +74,7 @@ const DEFAULT_PROCESS_EXIT_CODE: i32 = 1;
 pub trait ShimPlatform:
     RawSyncPrimitivesProvider
     + RawPointerProvider
-    + PageManagementProvider<PAGE_SIZE, Reservations = <Self as ShimPlatform>::VmemReservations>
+    + PageManagementProvider<PAGE_SIZE, Reservations = <Self as ShimPlatform>::PlatformReservations>
     + ArchSpecificProvider
     + SystemInfoProvider
     + TimeProvider
@@ -82,8 +82,13 @@ pub trait ShimPlatform:
     + 'static
     + Sized
 {
-    /// Platform-selected reservation storage used by the virtual memory manager.
-    type VmemReservations: LinuxReservationStore<Self, PAGE_SIZE>;
+    /// Opaque reservation handle retained by the Windows page manager.
+    type Reservation: litebox::platform::page_mgmt::PageReservation + Send + Sync;
+    /// Platform-selected storage whose handle type is retained by the Windows manager.
+    type PlatformReservations: litebox::platform::page_mgmt::ReservationStore<
+            Reservation = Self::Reservation,
+            ReleaseTarget: From<Self::Reservation>,
+        > + Default;
 }
 
 impl<T> ShimPlatform for T
@@ -96,16 +101,19 @@ where
         + TimeProvider
         + litebox::platform::ThreadProvider<ExecutionContext = litebox_common_linux::PtRegs>
         + 'static,
-    T::Reservations: LinuxReservationStore<T, PAGE_SIZE>,
+    litebox::platform::page_mgmt::ReservationOf<T, PAGE_SIZE>: Send + Sync,
+    litebox::platform::page_mgmt::ReleaseTargetOf<T, PAGE_SIZE>:
+        From<litebox::platform::page_mgmt::ReservationOf<T, PAGE_SIZE>>,
 {
-    type VmemReservations = T::Reservations;
+    type Reservation = litebox::platform::page_mgmt::ReservationOf<T, PAGE_SIZE>;
+    type PlatformReservations = T::Reservations;
 }
 
 pub(crate) type ConstPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawConstPointer<T>;
 pub(crate) type MutPtr<Platform, T> =
     <Platform as litebox::platform::RawPointerProvider>::RawMutPointer<T>;
-pub(crate) type WindowsPageManager<Platform> = VmemManager<Platform, PAGE_SIZE>;
+pub(crate) type WindowsPageManager<Platform> = page_manager::WindowsPageManager<Platform>;
 pub(crate) type WindowsHandleStore<Platform> =
     litebox::sync::RwLock<Platform, litebox::fd::RawDescriptorStorage>;
 
@@ -202,7 +210,8 @@ pub(crate) struct WindowsVirtualAllocation {
     pub(crate) size: usize,
     pub(crate) allocation_protect: syscalls::mm::PageProtection,
     pub(crate) type_: syscalls::mm::MemoryType,
-    pub(crate) pages: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
+    /// Exact Windows protections; commitment is determined by the page manager.
+    pub(crate) page_protections: rangemap::RangeMap<usize, syscalls::mm::PageProtection>,
 }
 
 pub(crate) struct WindowsSectionView<Platform: ShimPlatform> {
@@ -436,7 +445,7 @@ impl<Platform: ShimPlatform> WindowsShimBuilder<Platform> {
         let fs = Arc::new(fs::Fs::regular(Arc::clone(&litebox)));
         let global = Arc::new(GlobalState {
             platform: self.platform,
-            page_manager: VmemManager::new(self.platform),
+            page_manager: WindowsPageManager::new(self.platform),
             registry: syscalls::registry::RegistryStore::new(fs::Fs::registry(Arc::clone(
                 &litebox,
             ))),
@@ -474,22 +483,21 @@ fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
         NonZeroPageSize::new(size_of::<nt_types::KUserSharedData>().next_multiple_of(PAGE_SIZE))?;
     let shared_data = windows_user_shared_data();
     let shared_data_bytes = shared_data.as_bytes();
-    // SAFETY: `NOREPLACE` makes the fixed mapping fail instead of replacing any
-    // existing host or guest mapping at the shared-data address.
-    unsafe {
-        page_manager.create_readable_pages(
+    page_manager
+        .create_initialized_pages(
             Some(address),
             length,
+            crate::syscalls::mm::ALLOCATION_GRANULARITY,
             CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+            litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
             |ptr| {
                 ptr.copy_from_slice(0, shared_data_bytes)
                     .ok_or(MappingError::OutOfMemory)?;
                 Ok(0)
             },
         )
-    }
-    .map(|ptr| ptr.as_usize())
-    .ok()
+        .map(|ptr| ptr.as_usize())
+        .ok()
 }
 
 // TODO: This is a temporary placeholder for the Windows shared data page.
