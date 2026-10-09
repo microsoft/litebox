@@ -89,8 +89,9 @@
 //! - [`CallId::BrokerHandshake`] negotiates the association (the userland
 //!   broker's setup socket). On success the kernel activates the
 //!   `litebox_broker_transport::control_ring` at the start of
-//!   [`StartupInfo::broker_control_ring`], and the shared buffers in
-//!   [`StartupInfo::broker_shared_memory`].
+//!   [`StartupInfo::broker_control_ring`] and the shared buffers in
+//!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring's
+//!   layout, in place of the userland broker's ring-ready token.
 //! - The runner produces requests in the request ring and consumes responses
 //!   from the response ring, like `io_uring`'s submission and completion
 //!   queues. The kernel produces no notifications.
@@ -100,8 +101,9 @@
 //!   wait for it, the runner enters instead; a wait that one entry does not
 //!   satisfy never will, since nothing else runs.
 //! - Rings are hostile-peer-safe in both directions. A malformed ring or
-//!   request fails the association: that `BrokerEnter` is
-//!   [`Status::InvalidArgument`], and every later one [`Status::Denied`].
+//!   request fails the association and kills the process, as the userland
+//!   broker ends its runner. Before a successful handshake, `BrokerEnter` is
+//!   [`Status::Denied`].
 //! - The two regions are the control and data planes, kept apart:
 //!   - The control ring carries every request and response, so it is
 //!     critical: the kernel populates it at creation and pins it, and reaches
@@ -123,7 +125,8 @@ pub mod envelope;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-/// Must change with any incompatible change to this crate.
+/// Must change with any incompatible change to this crate, or to the layout of
+/// the broker's control ring (see [Broker](crate#broker)).
 pub const ABI_VERSION: u32 = 1;
 
 /// The section holding the runner's only `syscall` instruction.

@@ -585,7 +585,14 @@ impl Inner {
             Request::Unmap(r) => respond(&r, slot, self.unmap(&r)),
             Request::Protect(r) => respond(&r, slot, self.protect(&r)),
             Request::BrokerHandshake(r) => respond(&r, slot, self.broker.handshake(&r.0)),
-            Request::BrokerEnter(r) => respond(&r, slot, self.broker.enter()),
+            Request::BrokerEnter(r) => match self.broker.enter() {
+                Ok(()) => respond(&r, slot, Ok(())),
+                Err(broker::EnterError::NoAssociation) => Flow::Return(Err(Status::Denied)),
+                Err(broker::EnterError::Failed) => {
+                    self.kill("broker association failed");
+                    Flow::Stop
+                }
+            },
             Request::DeriveKey(r) => respond(&r, slot, self.derive_key(&r)),
             Request::Log(r) => respond(&r, slot, Self::log(&r)),
             Request::Exit(r) => {

@@ -375,28 +375,26 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// [`Status::Denied`] without an active association. Otherwise, any
-    /// failure fails the association.
-    pub(crate) fn enter(&self) -> Result<(), Status> {
+    /// [`EnterError::NoAssociation`] without an active association, and
+    /// [`EnterError::Failed`] if serving failed and ended the association.
+    pub(crate) fn enter(&self) -> Result<(), EnterError> {
         let mut association = self.association.borrow_mut();
         let Association::Active(active) = &mut *association else {
-            return Err(Status::Denied);
+            return Err(EnterError::NoAssociation);
         };
-        let result = active.serve();
-        if let Err(status) = result {
-            log::warn!("broker association failed: {status:?}");
+        active.serve().map_err(|Failed| {
             if let Association::Active(active) =
                 core::mem::replace(&mut *association, Association::Ended)
             {
-                active.association.finish();
+                end(active.association);
             }
-        }
-        result
+            EnterError::Failed
+        })
     }
 }
 
 impl Active {
-    fn serve(&mut self) -> Result<(), Status> {
+    fn serve(&mut self) -> Result<(), Failed> {
         if let Some(response) = self.overflow.take()
             && !self.publish(response)?
         {
@@ -406,7 +404,7 @@ impl Active {
         while let ControlRingReadStatus::Message(request) = self
             .requests
             .try_read(wire::decode_request)
-            .map_err(|_| Status::InvalidArgument)?
+            .map_err(failure("request ring"))?
         {
             let mut response = None;
             self.association
@@ -414,25 +412,28 @@ impl Active {
                     response = Some(wire::encode_response(r.clone()));
                     Ok::<(), Infallible>(())
                 })
-                .map_err(|_| Status::InvalidArgument)?;
+                .map_err(failure("request execution"))?;
             served += 1;
-            if !self.publish(response.ok_or(Status::InvalidArgument)?)? {
+            let response = response
+                .ok_or("no response")
+                .map_err(failure("request execution"))?;
+            if !self.publish(response)? {
                 break;
             }
         }
         self.requests
             .publish_head()
-            .map_err(|_| Status::InvalidArgument)?;
+            .map_err(failure("request ring"))?;
         log::trace!("broker served {served} requests");
         Ok(())
     }
 
     /// Whether the response ring took `response`; if not, it overflows.
-    fn publish(&mut self, response: Vec<u8>) -> Result<bool, Status> {
+    fn publish(&mut self, response: Vec<u8>) -> Result<bool, Failed> {
         match self
             .responses
             .try_write(&response)
-            .map_err(|_| Status::InvalidArgument)?
+            .map_err(failure("response ring"))?
         {
             ControlRingWriteStatus::Written => Ok(true),
             ControlRingWriteStatus::Full { .. } => {
@@ -443,12 +444,54 @@ impl Active {
     }
 }
 
+/// Serving failed; the cause is logged where it happened.
+struct Failed;
+
+/// Logs why `what` failed the association.
+fn failure<E: core::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> Failed {
+    move |error| {
+        log::warn!("broker {what} failed: {error:?}");
+        Failed
+    }
+}
+
+pub(crate) enum EnterError {
+    /// Before a successful handshake.
+    NoAssociation,
+    /// Serving failed, which ended the association.
+    Failed,
+}
+
+/// Ends an active association as the userland broker does when its runner
+/// goes away.
+fn end(association: BrokerHostAssociation<UserSharedMemory>) {
+    association.request_cancellation();
+    association.association_ending();
+    association.finish();
+}
+
 impl Drop for Broker {
     fn drop(&mut self) {
         if let Association::Active(active) =
             core::mem::replace(self.association.get_mut(), Association::Ended)
         {
-            active.association.finish();
+            end(active.association);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use litebox_broker_transport::control_ring::CONTROL_RING_READY;
+
+    /// The userland broker exchanges this token so that its endpoints agree on
+    /// the ring layout; here `ABI_VERSION` stands in for it. When this fails,
+    /// change `litebox_common_vm_abi::ABI_VERSION` and then the expectation.
+    #[test]
+    fn ring_layout_change_needs_an_abi_version_change() {
+        assert_eq!(
+            (CONTROL_RING_READY, litebox_common_vm_abi::ABI_VERSION),
+            (&b"litebox-control-ring-ready-v1"[..], 1)
+        );
     }
 }
