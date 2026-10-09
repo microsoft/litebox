@@ -16,8 +16,6 @@
 
 use alloc::vec::Vec;
 
-use litebox_common_linux::OFlags;
-
 /// Width of a syscall argument comparison.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArgWidth {
@@ -105,23 +103,10 @@ const NO_PEER_ADDRESS: &[ArgEq] = &[
 ];
 
 #[allow(
-    clippy::cast_lossless,
-    reason = "`From` is not usable in const context"
-)]
-const O_RDONLY: u64 = OFlags::RDONLY.bits() as u64;
-
-#[allow(
     clippy::cast_sign_loss,
     reason = "SHUT_RDWR is a small non-negative constant"
 )]
 const SHUT_RDWR_VALUE: u64 = libc::SHUT_RDWR as u64;
-
-// A mismatched syscall and flags index would admit arbitrary flags; see `OPEN_FLAGS_ARG`.
-const OPEN_RDONLY: &[ArgEq] = &[ArgEq {
-    index: crate::OPEN_FLAGS_ARG,
-    width: ArgWidth::U32,
-    value: O_RDONLY,
-}];
 
 const SHUT_RDWR: &[ArgEq] = &[ArgEq {
     index: 1,
@@ -199,15 +184,8 @@ pub(crate) const GRANTS: &[Grant] = &[
     // Required by libc allocator
     grant(libc::SYS_brk, "brk", "libc allocator"),
     grant(libc::SYS_getpid, "getpid", "libc allocator"),
-    // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
-    Grant {
-        conditions: OPEN_RDONLY,
-        ..grant(
-            crate::OPEN_SYSNO,
-            crate::OPEN_NAME,
-            "copy-on-write file regions (`try_allocate_cow_pages`)",
-        )
-    },
+    // No host path opens: CoW backing files are opened when they are registered (see
+    // `register_cow_region`).
     // Connected UnixStream I/O may use sendto/recvfrom rather than raw read/write. Limit these
     // rules to connected-socket calls that do not name a peer address.
     Grant {

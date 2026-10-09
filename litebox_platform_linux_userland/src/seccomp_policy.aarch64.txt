@@ -28,7 +28,6 @@ gettid             any arguments                                std thread spawn
 madvise            any arguments                                std thread spawn
 brk                any arguments                                libc allocator
 getpid             any arguments                                libc allocator
-openat             arg2:u32 == 0x0                              copy-on-write file regions (`try_allocate_cow_pages`)
 sendto             arg4:u64 == 0x0 && arg5:u64 == 0x0           connected UnixStream I/O
 recvfrom           arg4:u64 == 0x0 && arg5:u64 == 0x0           connected UnixStream I/O
 close              any arguments                                closing descriptors

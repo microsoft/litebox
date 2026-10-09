@@ -16,7 +16,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MRemapFlags, MapFlags, OFlags, ProtFlags, vmap::VmapManager};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -47,24 +47,10 @@ use aarch64::{
 
 extern crate alloc;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(test)]
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 mod page_mgmt;
 mod seccomp_policy;
-
-/// The admitted open syscall, its name, and its flags index must remain paired.
-#[cfg(target_arch = "x86_64")]
-const OPEN_SYSNO: i64 = libc::SYS_open;
-#[cfg(target_arch = "x86_64")]
-const OPEN_NAME: &str = "open";
-#[cfg(target_arch = "x86_64")]
-const OPEN_FLAGS_ARG: u8 = 1;
-#[cfg(target_arch = "aarch64")]
-const OPEN_SYSNO: i64 = libc::SYS_openat;
-#[cfg(target_arch = "aarch64")]
-const OPEN_NAME: &str = "openat";
-#[cfg(target_arch = "aarch64")]
-const OPEN_FLAGS_ARG: u8 = 2;
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //
@@ -133,7 +119,7 @@ macro_rules! saved_tls {
 /// traits.
 pub struct LinuxUserland {
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
-    /// re-mmap the file.
+    /// map the file again.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
     /// If [`Self::initialize_boot_specific_kdf_support`] has been run, this is set to a value that
     /// is persistent across multiple process executions, however, it is ephemeral across true
@@ -168,8 +154,12 @@ impl core::fmt::Debug for LinuxUserland {
 /// Information about a CoW-eligible memory region backed by a file.
 #[derive(Debug, Clone)]
 struct CowRegionInfo {
-    /// The path to the backing file on the host filesystem.
-    file_path: PathBuf,
+    /// The backing file, opened read-only when the region is registered.
+    ///
+    /// Mapping from this descriptor, rather than opening the path again, keeps host path opens
+    /// out of the seccomp policy, and maps the file that was registered even if the path is
+    /// later replaced on the host.
+    file: std::sync::Arc<std::os::fd::OwnedFd>,
     /// Length of the backing file.
     file_length: usize,
 }
@@ -248,13 +238,24 @@ impl LinuxUserland {
 
     /// Register a CoW-eligible memory region backed by a file.
     ///
+    /// The file is opened here, so regions must be registered before
+    /// [`Self::enable_seccomp_filter`], which does not admit host path opens.
+    ///
     /// # Panics
     ///
-    /// Panics if an overlapping region is already registered.
+    /// Panics if an overlapping region is already registered, or if the file cannot be opened.
     pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<PathBuf>) {
         let start = data.as_ptr() as usize;
+        let file_path = file_path.into();
+        // `File::open` opens read-only and close-on-exec.
+        let file = std::fs::File::open(&file_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to open CoW backing file {}: {error}",
+                file_path.display()
+            )
+        });
         let info = CowRegionInfo {
-            file_path: file_path.into(),
+            file: std::sync::Arc::new(file.into()),
             file_length: data.len(),
         };
 
@@ -269,9 +270,12 @@ impl LinuxUserland {
 
     /// Look up the file backing a static slice for CoW mapping.
     ///
-    /// Returns `Some((file_path, offset_in_file))` if the slice is backed by a registered
-    /// CoW region, `None` otherwise.
-    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(PathBuf, usize)> {
+    /// Returns `Some((file, offset_in_file))` if the slice is backed by a registered CoW region,
+    /// `None` otherwise.
+    fn lookup_cow_region(
+        &self,
+        source_data: &'static [u8],
+    ) -> Option<(std::sync::Arc<std::os::fd::OwnedFd>, usize)> {
         let slice_start = source_data.as_ptr() as usize;
         let slice_len = source_data.len();
 
@@ -282,7 +286,7 @@ impl LinuxUserland {
             let slice_end = slice_start.checked_add(slice_len).unwrap();
 
             if slice_start >= region_start && slice_end <= region_end {
-                return Some((info.file_path.clone(), slice_start - region_start));
+                return Some((info.file.clone(), slice_start - region_start));
             }
         }
         None
@@ -2856,48 +2860,37 @@ mod tests {
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
 
-        // Denying RDWR does not on its own show that the rule reads the flags
-        // argument: were it to read the path pointer instead, that too would
-        // compare unequal to `O_RDONLY` and be denied. Only an allowed RDONLY
-        // open pins the argument index `OPEN_FLAGS_ARG`.
-        #[cfg(target_arch = "aarch64")]
-        {
-            let open_rdonly = unsafe {
+        // No host path may be opened once the filter is installed, not even read-only.
+        for flags in [OFlags::RDONLY, OFlags::RDWR] {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let open_res = unsafe {
+                    syscalls::syscall2(
+                        syscalls::Sysno::open,
+                        pathname.as_ptr() as usize,
+                        flags.bits() as usize,
+                    )
+                };
+                assert_eq!(
+                    open_res.unwrap_err(),
+                    syscalls::Errno::EINVAL,
+                    "open with {flags:?} should be blocked by seccomp filter"
+                );
+            }
+            let openat_res = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::openat,
                     super::AT_FDCWD,
                     pathname.as_ptr() as usize,
-                    OFlags::RDONLY.bits() as usize,
+                    flags.bits() as usize,
                     0,
                 )
             };
-            let fd = open_rdonly.expect("openat with RDONLY should be allowed by seccomp filter");
-            // SAFETY: the open above just returned this as a fresh owned descriptor.
-            drop(unsafe { OwnedFd::from_raw_fd(i32::try_from(fd).unwrap()) });
+            assert_eq!(
+                openat_res.unwrap_err(),
+                syscalls::Errno::EINVAL,
+                "openat with {flags:?} should be blocked by seccomp filter"
+            );
         }
-
-        #[cfg(target_arch = "x86_64")]
-        let open_res = unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::open,
-                pathname.as_ptr() as usize,
-                OFlags::RDWR.bits() as usize,
-            )
-        };
-        #[cfg(target_arch = "aarch64")]
-        let open_res = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::openat,
-                super::AT_FDCWD,
-                pathname.as_ptr() as usize,
-                OFlags::RDWR.bits() as usize,
-                0,
-            )
-        };
-        assert_eq!(
-            open_res.unwrap_err(),
-            syscalls::Errno::EINVAL,
-            "open with RDWR should be blocked by seccomp filter"
-        );
     }
 }
