@@ -86,10 +86,13 @@
 //!   [`StartupInfo::broker_control_ring`] and the shared buffers in
 //!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring
 //!   layout.
-//! - The runner publishes requests and consumes responses; there are no
-//!   notifications. [`CallId::BrokerEnter`] is the doorbell: the kernel serves
-//!   every published request before returning. The runner enters wherever the
-//!   userland transport would wait or wake with a futex.
+//! - The runner publishes requests and consumes responses.
+//!   [`CallId::BrokerEnter`] stands in for the userland transport's futex:
+//!   [`BrokerEnterOp::Wake`] and [`BrokerEnterOp::Wait`] on ring words. The
+//!   kernel serves every published request first.
+//! - The ring's notification direction carries readiness of broker objects
+//!   (e.g., timers) from the kernel. The kernel's broker provides only
+//!   randomness so far, so it produces none yet.
 //! - The kernel pins the control ring and accesses it through its own mapping.
 //!   The shared buffers stay lazily populated and are touched only while
 //!   executing a request that names them.
@@ -157,6 +160,10 @@ pub enum Status {
     /// Not permitted in the process's current state.
     Denied = 7,
     Unsupported = 8,
+    /// A deadline passed.
+    TimedOut = 9,
+    /// A wait that nothing could end.
+    Stalled = 10,
 }
 
 impl Status {
@@ -576,19 +583,46 @@ impl WireFrame {
 #[repr(transparent)]
 pub struct BrokerHandshakeFrame(pub WireFrame);
 
-/// Reserved for flags.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout,
-)]
+/// The futex operations of the userland transport, on control-ring words.
+/// Both serve published requests first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(u32)]
+pub enum BrokerEnterOp {
+    Wake = 0,
+    /// Returns once the `u32` ring word at `offset`, an epoch, differs from
+    /// `expected`. [`Status::TimedOut`] at the deadline; [`Status::Stalled`]
+    /// if nothing could change the word. Deadlines are
+    /// [`Status::Unsupported`] so far.
+    Wait = 1,
+}
+
+/// `offset` is into the control ring and `deadline` a TSC value or zero for
+/// none. The other fields are zero for [`BrokerEnterOp::Wake`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct BrokerEnterRequest {
-    reserved: Reserved,
+    pub op: BrokerEnterOp,
+    pub expected: u32,
+    pub offset: u64,
+    pub deadline: u64,
 }
 
 impl BrokerEnterRequest {
-    pub const fn new() -> Self {
+    pub const fn wake() -> Self {
         Self {
-            reserved: Reserved::Zero,
+            op: BrokerEnterOp::Wake,
+            expected: 0,
+            offset: 0,
+            deadline: 0,
+        }
+    }
+
+    pub const fn wait(offset: u64, expected: u32, deadline: u64) -> Self {
+        Self {
+            op: BrokerEnterOp::Wait,
+            expected,
+            offset,
+            deadline,
         }
     }
 }
@@ -878,11 +912,26 @@ mod tests {
             LogRequest::new(LogLevel::Info, range).as_bytes(),
             4,
         );
-        check(CallId::BrokerEnter, BrokerEnterRequest::new().as_bytes(), 0);
         check(
             CallId::Restrict,
             RestrictRequest::new(CallSet::ALL, ProtSet::ALL).as_bytes(),
             12,
+        );
+    }
+
+    #[test]
+    fn broker_enter_ops_are_validated() {
+        let wait = BrokerEnterRequest::wait(8, 1, 42);
+        assert!(matches!(
+            Request::decode(CallId::BrokerEnter, wait.as_bytes()),
+            Ok(Request::BrokerEnter(r)) if r == wait
+        ));
+        let mut bytes = [0u8; size_of::<BrokerEnterRequest>()];
+        bytes.copy_from_slice(wait.as_bytes());
+        bytes[0] = 2;
+        assert_eq!(
+            Request::decode(CallId::BrokerEnter, &bytes).unwrap_err(),
+            Status::InvalidArgument
         );
     }
 

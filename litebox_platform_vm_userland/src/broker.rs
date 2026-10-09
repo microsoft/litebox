@@ -5,10 +5,10 @@
 //! handshake in a kernel call, then requests and responses in the control
 //! ring and payloads in the shared buffers.
 //!
-//! Where the userland transport waits or wakes with futexes, this one enters
-//! the kernel ([`kcall::broker_enter`]), which serves the ring before
-//! returning; a call takes one entry. Shared memory is accessed only through
-//! `peer_memory`.
+//! Where the userland transport uses futexes, this one uses the kernel's
+//! ([`kcall::broker_wake`], [`kcall::broker_wait`]). The kernel serves the
+//! ring within each, so a call takes one entry. Shared memory is accessed only
+//! through `peer_memory`.
 
 use alloc::sync::Arc;
 use litebox::utils::TruncateExt as _;
@@ -37,8 +37,6 @@ pub enum ChannelError {
     Memory(SharedMemoryError),
     Oversized,
     NoRequest,
-    /// The kernel made no progress on what the call waits for.
-    Stalled,
     /// A response for another request.
     UnexpectedResponse,
     /// A reentrant call.
@@ -56,7 +54,6 @@ impl core::fmt::Display for ChannelError {
             Self::Memory(error) => write!(f, "broker shared memory: {error}"),
             Self::Oversized => f.write_str("broker frame too large"),
             Self::NoRequest => f.write_str("no handshake request was sent"),
-            Self::Stalled => f.write_str("the broker made no progress"),
             Self::UnexpectedResponse => f.write_str("broker response for another request"),
             Self::Busy => f.write_str("reentrant broker call"),
             Self::Failed => f.write_str("the broker association failed"),
@@ -93,7 +90,8 @@ impl LocalSetupChannel for KernelBrokerSetup {
     }
 }
 
-/// The local ends of the rings: requests out, responses in.
+/// The local ends of the request and response rings. The notification
+/// consumer awaits the kernel's first notifying provider (e.g., timers).
 struct Rings {
     requests: ControlRingProducer<KernelControlRing>,
     responses: ControlRingConsumer<KernelControlRing>,
@@ -116,7 +114,6 @@ impl Rings {
                 }
             }
         }
-        // The doorbell.
         self.requests.wake_consumer()?;
         let response = loop {
             match self.responses.try_read(wire::decode_response) {
@@ -308,7 +305,7 @@ impl ControlRingMemory for KernelControlRing {
     }
 }
 
-/// Waits and wakes enter the kernel, which serves the ring synchronously.
+/// The kernel's futex operations on ring words.
 impl WaitableSharedMemory for KernelControlRing {
     type Error = ChannelError;
 
@@ -316,31 +313,14 @@ impl WaitableSharedMemory for KernelControlRing {
         ChannelError::Memory(error)
     }
 
-    /// One entry is all the progress the kernel can make, so an unchanged
-    /// epoch is [`ChannelError::Stalled`].
     fn wait_while_equal(&self, offset: usize, expected: u32) -> Result<(), ChannelError> {
-        if self
-            .load_u32_acquire(offset)
-            .map_err(ChannelError::Memory)?
-            != expected
-        {
-            return Ok(());
-        }
-        kcall::broker_enter().map_err(ChannelError::Kernel)?;
-        if self
-            .load_u32_acquire(offset)
-            .map_err(ChannelError::Memory)?
-            == expected
-        {
-            return Err(ChannelError::Stalled);
-        }
-        Ok(())
+        kcall::broker_wait(offset, expected, 0).map_err(ChannelError::Kernel)
     }
 
-    /// Only the request ring's consumer, the kernel, needs waking.
+    /// The kernel waits on no ring word: only new requests need it.
     fn wake_one(&self, offset: usize) -> Result<(), ChannelError> {
         if offset == ControlRingDirection::Requests.producer_epoch_offset() {
-            kcall::broker_enter().map_err(ChannelError::Kernel)?;
+            kcall::broker_wake().map_err(ChannelError::Kernel)?;
         }
         Ok(())
     }
@@ -360,6 +340,7 @@ pub fn connect(
         let LocalControlRingEndpoints {
             request_producer,
             response_consumer,
+            // Unused until the kernel produces notifications.
             notification_consumer: _,
         } = ControlRing::new(memory)
             .map_err(ChannelError::Ring)?

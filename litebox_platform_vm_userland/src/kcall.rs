@@ -143,14 +143,23 @@ pub fn restrict(calls: CallSet, prots: ProtSet) -> Result<(), Status> {
     call(&RestrictRequest::new(calls, prots))
 }
 
-/// The broker doorbell: the kernel serves every published request before
-/// returning.
+/// Serves published broker requests.
 ///
 /// # Errors
 ///
 /// See [`call`].
-pub fn broker_enter() -> Result<(), Status> {
-    call(&BrokerEnterRequest::new())
+pub fn broker_wake() -> Result<(), Status> {
+    call(&BrokerEnterRequest::wake())
+}
+
+/// Serves published broker requests, then waits while the control-ring word
+/// at `offset` equals `expected`, until `deadline` (TSC; zero for none).
+///
+/// # Errors
+///
+/// See [`call`] and [`litebox_common_vm_abi::BrokerEnterOp::Wait`].
+pub fn broker_wait(offset: usize, expected: u32, deadline: u64) -> Result<(), Status> {
+    call(&BrokerEnterRequest::wait(offset as u64, expected, deadline))
 }
 
 /// # Errors

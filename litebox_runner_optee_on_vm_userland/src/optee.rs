@@ -729,10 +729,21 @@ fn check_guest_memory_access() {
     assert_eq!(read(), None, "read from unmapped guest memory");
 }
 
-/// Self-check (debug builds): entering an idle broker is a no-op.
+/// Self-check (debug builds): the broker's futex operations, on the
+/// notification ring's producer epoch, which stays zero (no notifications).
 fn check_broker_enter() {
-    kcall::broker_enter().expect("entering an idle broker");
-    kcall::broker_enter().expect("entering an idle broker again");
+    use litebox_broker_transport::control_ring::ControlRingDirection;
+    use litebox_common_vm_abi::{BrokerEnterRequest, Status};
+    let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
+    kcall::broker_wake().expect("waking an idle broker");
+    assert_eq!(kcall::broker_wait(epoch, 1, 0), Ok(()), "word differs");
+    assert_eq!(kcall::broker_wait(epoch, 0, 0), Err(Status::Stalled));
+    assert_eq!(kcall::broker_wait(epoch, 0, 1), Err(Status::Unsupported));
+    assert_eq!(kcall::broker_wait(0, 0, 0), Err(Status::InvalidArgument));
+    let mut wake = BrokerEnterRequest::wake();
+    wake.expected = 1;
+    assert_eq!(kcall::call(&wake), Err(Status::InvalidArgument));
+    kcall::broker_wake().expect("the association survives");
 }
 
 /// Self-check (debug builds): unknown lockdown bits are rejected.

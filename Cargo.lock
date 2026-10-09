@@ -2007,6 +2007,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "litebox",
+ "litebox_broker_transport",
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_common_vm_abi",

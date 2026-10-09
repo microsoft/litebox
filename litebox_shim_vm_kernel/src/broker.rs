@@ -30,7 +30,7 @@ use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{
     ControlRingMemory, SharedBufferPool, SharedMemory, SharedMemoryError,
 };
-use litebox_common_vm_abi::{Status, UserRange, WireFrame};
+use litebox_common_vm_abi::{BrokerEnterOp, BrokerEnterRequest, Status, UserRange, WireFrame};
 use litebox_platform_vm_kernel::PinnedUserPages;
 
 use crate::memory::{copy_from_user, copy_to_user};
@@ -74,12 +74,13 @@ impl SharedMemory for UserSharedMemory {
 
 /// The control ring at the start of pinned pages, through the kernel's
 /// mapping. Accesses keep to [`MemoryAccessPolicy::ControlRing`].
-pub(crate) struct PinnedControlRing(PinnedUserPages);
+#[derive(Clone)]
+pub(crate) struct PinnedControlRing(Arc<PinnedUserPages>);
 
 impl PinnedControlRing {
     /// `None` if `pages` cannot hold the ring.
     pub(crate) fn new(pages: PinnedUserPages) -> Option<Self> {
-        (pages.len() >= CONTROL_RING_MEMORY_SIZE).then_some(Self(pages))
+        (pages.len() >= CONTROL_RING_MEMORY_SIZE).then_some(Self(Arc::new(pages)))
     }
 
     fn word<T>(&self, offset: usize, permitted: bool) -> Result<*mut T, SharedMemoryError> {
@@ -196,7 +197,9 @@ impl ControlRingMemory for PinnedControlRing {
     }
 }
 
-/// Assumes no broker object a process can create needs readiness.
+/// Discards readiness: the broker provides only randomness so far. A provider
+/// with readiness (e.g., timers) needs a sink that publishes to the
+/// notification ring.
 struct NoReadiness;
 
 impl ReadinessSink for NoReadiness {
@@ -263,11 +266,14 @@ enum Association {
     Ended,
 }
 
-/// The broker's ends of the rings: requests in, responses out.
+/// The broker's ends of the request and response rings. Its notification
+/// producer awaits a provider with readiness (see [`NoReadiness`]).
 struct Active {
     association: BrokerHostAssociation<UserSharedMemory>,
     requests: ControlRingConsumer<PinnedControlRing>,
     responses: ControlRingProducer<PinnedControlRing>,
+    /// For [`BrokerEnterOp::Wait`].
+    words: PinnedControlRing,
     /// A response the full ring could not take; no request is consumed while
     /// it waits.
     overflow: Option<Vec<u8>>,
@@ -335,15 +341,18 @@ impl Broker {
                 host.finish();
                 return Err(Status::Denied);
             }
+            let words = ring.memory().clone();
             let BrokerControlRingEndpoints {
                 request_consumer,
                 response_producer,
+                // Unused until a provider has readiness.
                 notification_producer: _,
             } = ring.into_broker();
             *association = Association::Active(Box::new(Active {
                 association: host,
                 requests: request_consumer,
                 responses: response_producer,
+                words,
                 overflow: None,
             }));
         }
@@ -351,24 +360,53 @@ impl Broker {
         frame(&wire::encode_handshake_response(response))
     }
 
-    /// Serves every published request, unless the response ring fills up.
+    /// Serves every published request, unless the response ring fills up,
+    /// then performs `request`'s operation. An invalid request has no effect.
+    /// Before the handshake, any request is [`Status::Denied`].
     ///
     /// # Errors
     ///
     /// See [`EnterError`].
-    pub(crate) fn enter(&self) -> Result<(), EnterError> {
+    pub(crate) fn enter(&self, request: &BrokerEnterRequest) -> Result<(), EnterError> {
         let mut association = self.association.borrow_mut();
         let Association::Active(active) = &mut *association else {
-            return Err(EnterError::NoAssociation);
+            return Err(EnterError::Status(Status::Denied));
         };
-        active.serve().map_err(|Failed| {
+        let invalid = || EnterError::Status(Status::InvalidArgument);
+        let wait_offset = match request.op {
+            BrokerEnterOp::Wake => {
+                if (request.expected, request.offset, request.deadline) != (0, 0, 0) {
+                    return Err(invalid());
+                }
+                None
+            }
+            BrokerEnterOp::Wait => {
+                if request.deadline != 0 {
+                    return Err(EnterError::Status(Status::Unsupported));
+                }
+                let offset = usize::try_from(request.offset).map_err(|_| invalid())?;
+                if !MemoryAccessPolicy::ControlRing.permits_u32(offset) {
+                    return Err(invalid());
+                }
+                Some(offset)
+            }
+        };
+        if active.serve().is_err() {
             if let Association::Active(active) =
                 core::mem::replace(&mut *association, Association::Ended)
             {
                 end(active.association);
             }
-            EnterError::Failed
-        })
+            return Err(EnterError::Failed);
+        }
+        // Nothing else changes ring words, so a word unchanged after serving
+        // stays so.
+        match wait_offset.map(|offset| active.words.load_u32_acquire(offset)) {
+            None => Ok(()),
+            Some(Ok(word)) if word != request.expected => Ok(()),
+            Some(Ok(_)) => Err(EnterError::Status(Status::Stalled)),
+            Some(Err(_)) => Err(invalid()),
+        }
     }
 }
 
@@ -435,8 +473,8 @@ fn failure<E: core::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> Failed 
 }
 
 pub(crate) enum EnterError {
-    /// Before a successful handshake.
-    NoAssociation,
+    /// For the runner.
+    Status(Status),
     /// Serving failed, which ended the association.
     Failed,
 }
