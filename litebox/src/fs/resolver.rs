@@ -196,33 +196,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.resolve_path(context, path, true, false)
     }
 
-    /// Resolve an existing directory, checking search permission on the target as well.
-    pub fn resolve_directory(
-        &self,
-        context: &Context,
-        path: impl Arg,
-    ) -> Result<ResolvedPath, WalkError> {
-        let path = self.resolve_following_symlinks(context, path)?;
-        let components: Vec<_> = path.components.iter().map(String::as_str).collect();
-        if !components.is_empty() {
-            let (outcome, _) = self.walk_path(
-                context,
-                self.backend.root(),
-                &components,
-                &components,
-                if context.acting_user().user == UserInfo::ROOT.user {
-                    SearchScope::ParentsOnly
-                } else {
-                    SearchScope::AllComponents
-                },
-            )?;
-            if outcome.stop_reason != WalkStopReason::CompleteDirectory {
-                return Err(PathError::ComponentNotADirectory.into());
-            }
-        }
-        Ok(path)
-    }
-
     // Operations rewalk the expanded path; this is not an atomic namespace snapshot.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
