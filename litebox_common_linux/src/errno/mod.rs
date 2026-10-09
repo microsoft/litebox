@@ -115,7 +115,7 @@ impl From<litebox::fs::errors::PathError> for Errno {
     fn from(value: litebox::fs::errors::PathError) -> Self {
         match value {
             litebox::fs::errors::PathError::NoSuchFileOrDirectory => Errno::ENOENT,
-            litebox::fs::errors::PathError::NoSearchPerms { .. } => Errno::EACCES,
+            litebox::fs::errors::PathError::NoSearchPerms => Errno::EACCES,
             litebox::fs::errors::PathError::InvalidPathname => Errno::EINVAL,
             litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
             litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,

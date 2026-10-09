@@ -456,19 +456,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             if !allowed {
                 // TODO(jayb): a [`SearchScope::AndReadableTarget`] target denying *read* permission
                 // reports `NoSearchPerms` too. Clean up during filesystem errors overhaul.
-                return Err(PathError::NoSearchPerms {
-                    #[cfg(debug_assertions)]
-                    dir: {
-                        let mut path = String::new();
-                        for component in &absolute_components[..=idx] {
-                            path.push('/');
-                            path.push_str(component);
-                        }
-                        path
-                    },
-                    #[cfg(debug_assertions)]
-                    perms: permissions.mode,
-                });
+                #[cfg(debug_assertions)]
+                {
+                    let mut dir = String::new();
+                    for component in &absolute_components[..=idx] {
+                        dir.push('/');
+                        dir.push_str(component);
+                    }
+                    litebox_util_log::debug!(
+                        dir:% = dir, perms:? = permissions.mode;
+                        "no search permission"
+                    );
+                }
+                return Err(PathError::NoSearchPerms);
             }
         }
         Ok(())
