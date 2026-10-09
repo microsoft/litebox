@@ -1,14 +1,21 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker association with the kernel (see `litebox_common_vm_abi`, Broker):
-//! handshake in a kernel call, then requests and responses in the control
-//! ring and payloads in the shared buffers.
+//! The broker's local endpoint for a runner on the LiteBox VM kernel, like
+//! `litebox_broker_local_userland` for hosted runners: handshake in a kernel
+//! call, then requests and responses in the control ring and payloads in the
+//! shared buffers (see `litebox_common_vm_abi`, Broker).
 //!
 //! Where the userland transport uses futexes, this one uses the kernel's
-//! ([`kcall::broker_wake`], [`kcall::broker_wait`]). The kernel serves the
-//! ring within each, so a call takes one entry. Shared memory is accessed only
-//! through `peer_memory`.
+//! (`BrokerEnter`'s Wake and Wait). The kernel serves the ring within each,
+//! so a call takes one entry. Shared memory is accessed only through
+//! `peer_memory`.
+
+#![cfg(target_arch = "x86_64")]
+#![no_std]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+extern crate alloc;
 
 use alloc::sync::Arc;
 use litebox::utils::TruncateExt as _;
@@ -25,9 +32,10 @@ use litebox_broker_transport::control_ring::{
 };
 use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
-use litebox_common_vm_abi::{BrokerHandshakeFrame, StartupInfo, Status, UserRange, WireFrame};
-
-use crate::kcall;
+use litebox_common_vm_abi::{
+    BrokerEnterRequest, BrokerHandshakeFrame, StartupInfo, Status, UserRange, WireFrame,
+};
+use litebox_platform_vm_userland::kcall;
 
 #[derive(Debug)]
 pub enum ChannelError {
@@ -314,13 +322,13 @@ impl WaitableSharedMemory for KernelControlRing {
     }
 
     fn wait_while_equal(&self, offset: usize, expected: u32) -> Result<(), ChannelError> {
-        kcall::broker_wait(offset, expected, 0).map_err(ChannelError::Kernel)
+        broker_wait(offset, expected, 0).map_err(ChannelError::Kernel)
     }
 
     /// The kernel waits on no ring word: only new requests need it.
     fn wake_one(&self, offset: usize) -> Result<(), ChannelError> {
         if offset == ControlRingDirection::Requests.producer_epoch_offset() {
-            kcall::broker_wake().map_err(ChannelError::Kernel)?;
+            broker_wake().map_err(ChannelError::Kernel)?;
         }
         Ok(())
     }
@@ -357,4 +365,34 @@ pub fn connect(
         Ok((channel, shared_memory, ()))
     })?;
     Ok(local)
+}
+
+/// Serves published broker requests.
+fn broker_wake() -> Result<(), Status> {
+    kcall::call(&BrokerEnterRequest::wake())
+}
+
+/// Serves published broker requests, then waits while the control-ring word
+/// at `offset` equals `expected`, until `deadline` (TSC; zero for none).
+fn broker_wait(offset: usize, expected: u32, deadline: u64) -> Result<(), Status> {
+    kcall::call(&BrokerEnterRequest::wait(offset as u64, expected, deadline))
+}
+
+/// Self-check (debug builds): the broker's futex operations, on the
+/// notification ring's producer epoch, which stays zero (no notifications).
+///
+/// # Panics
+///
+/// On a failed check.
+pub fn self_check() {
+    let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
+    broker_wake().expect("waking an idle broker");
+    assert_eq!(broker_wait(epoch, 1, 0), Ok(()), "word differs");
+    assert_eq!(broker_wait(epoch, 0, 0), Err(Status::Stalled));
+    assert_eq!(broker_wait(epoch, 0, 1), Err(Status::Unsupported));
+    assert_eq!(broker_wait(0, 0, 0), Err(Status::InvalidArgument));
+    let mut wake = BrokerEnterRequest::wake();
+    wake.expected = 1;
+    assert_eq!(kcall::call(&wake), Err(Status::InvalidArgument));
+    broker_wake().expect("the association survives");
 }

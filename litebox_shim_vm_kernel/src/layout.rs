@@ -5,8 +5,7 @@
 //! space. Checked at compile time: regions are page-aligned, sorted, disjoint,
 //! and in [`RUNNER_MANAGED_MAX`]..[`USER_END`]. Gaps stay unmapped as guards.
 
-use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
-use litebox_broker_transport::control_ring::CONTROL_RING_MEMORY_SIZE;
+use litebox_broker_vm_kernel::{CONTROL_RING_SIZE, SHARED_MEMORY_SIZE};
 use litebox_common_vm_abi::{PAGE_SIZE, RUNNER_MANAGED_MAX, USER_END, UserRange};
 
 const MIB: u64 = 1 << 20;
@@ -41,13 +40,13 @@ pub const MESSAGE_WINDOW: UserRange = UserRange {
 
 pub const BROKER_SHARED_MEMORY: UserRange = UserRange {
     start: BASE + 0x3000_0000,
-    len: SHARED_BUFFER_POOL_SIZE as u64,
+    len: SHARED_MEMORY_SIZE as u64,
 };
 
 /// The control ring is at its start.
 pub const BROKER_CONTROL_RING: UserRange = UserRange {
     start: BASE + 0x3800_0000,
-    len: (CONTROL_RING_MEMORY_SIZE as u64).next_multiple_of(PAGE_SIZE),
+    len: (CONTROL_RING_SIZE as u64).next_multiple_of(PAGE_SIZE),
 };
 
 /// Bounds the images' total size.
@@ -61,7 +60,7 @@ pub const HEAP: UserRange = UserRange {
     len: 256 * MIB,
 };
 
-const _: () = assert!(BROKER_CONTROL_RING.len >= CONTROL_RING_MEMORY_SIZE as u64);
+const _: () = assert!(BROKER_CONTROL_RING.len >= CONTROL_RING_SIZE as u64);
 
 const _: () = {
     let regions = [

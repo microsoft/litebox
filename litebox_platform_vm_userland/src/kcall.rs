@@ -6,9 +6,9 @@
 //! [`GATE_SECTION`](litebox_common_vm_abi::GATE_SECTION).
 
 use litebox_common_vm_abi::{
-    BrokerEnterRequest, CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall,
-    LogLevel, LogRequest, MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest,
-    ReadyRequest, RestrictRequest, Status, UnmapRequest, UserRange,
+    CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel, LogRequest,
+    MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest, ReadyRequest,
+    RestrictRequest, Status, UnmapRequest, UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
 
@@ -141,25 +141,6 @@ pub fn protect(addr: usize, len: usize, prot: Prot) -> Result<(), Status> {
 /// See [`call`].
 pub fn restrict(calls: CallSet, prots: ProtSet) -> Result<(), Status> {
     call(&RestrictRequest::new(calls, prots))
-}
-
-/// Serves published broker requests.
-///
-/// # Errors
-///
-/// See [`call`].
-pub fn broker_wake() -> Result<(), Status> {
-    call(&BrokerEnterRequest::wake())
-}
-
-/// Serves published broker requests, then waits while the control-ring word
-/// at `offset` equals `expected`, until `deadline` (TSC; zero for none).
-///
-/// # Errors
-///
-/// See [`call`] and [`litebox_common_vm_abi::BrokerEnterOp::Wait`].
-pub fn broker_wait(offset: usize, expected: u32, deadline: u64) -> Result<(), Status> {
-    call(&BrokerEnterRequest::wait(offset as u64, expected, deadline))
 }
 
 /// # Errors

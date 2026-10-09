@@ -1,0 +1,17 @@
+[package]
+name = "litebox_broker_local_vm_userland"
+version = "0.1.0"
+edition = "2024"
+description = "The broker's local endpoint for a ring-3 runner on the LiteBox VM kernel"
+
+[dependencies]
+litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_broker_local = { path = "../litebox_broker_local", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_common_vm_abi = { path = "../litebox_common_vm_abi", version = "0.1.0" }
+litebox_platform_vm_userland = { path = "../litebox_platform_vm_userland", version = "0.1.0" }
+spin = { version = "0.9.8", default-features = false, features = ["spin_mutex"] }
+
+[lints]
+workspace = true

@@ -21,7 +21,6 @@
 
 extern crate alloc;
 
-pub mod broker;
 pub mod kcall;
 pub mod thread;
 
