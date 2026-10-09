@@ -1189,30 +1189,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         Ok(entries)
     }
 
-    /// Obtain the status of a file/directory/... on the file-system, following symbolic links.
+    /// Obtain the status of a file/directory/... on the file-system.
+    ///
+    /// If `follow_symlinks` is false, a final symbolic link is described itself.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "`CloseError` is uninhabited, so the internal close cannot fail"
+    )]
     pub fn file_status(
         &self,
         context: &Context,
         path: impl Arg,
+        follow_symlinks: bool,
     ) -> Result<super::FileStatus, FileStatusError> {
-        self.file_status_with_flags(context, path, OFlags::PATH)
-    }
-
-    /// Obtain status without following a final symbolic link.
-    pub fn file_status_no_follow(
-        &self,
-        context: &Context,
-        path: impl Arg,
-    ) -> Result<super::FileStatus, FileStatusError> {
-        self.file_status_with_flags(context, path, OFlags::PATH | OFlags::NOFOLLOW)
-    }
-
-    fn file_status_with_flags(
-        &self,
-        context: &Context,
-        path: impl Arg,
-        flags: OFlags,
-    ) -> Result<super::FileStatus, FileStatusError> {
+        let flags = if follow_symlinks {
+            OFlags::PATH
+        } else {
+            OFlags::PATH | OFlags::NOFOLLOW
+        };
         let fd = self
             .open(context, path, flags, Mode::empty())
             .map_err(|error| match error {

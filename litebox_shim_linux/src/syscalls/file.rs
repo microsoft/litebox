@@ -1353,11 +1353,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            if follow_symlink {
-                files.fs.file_status(&context, pathname)?
-            } else {
-                files.fs.file_status_no_follow(&context, pathname)?
-            }
+            files.fs.file_status(&context, pathname, follow_symlink)?
         };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1540,11 +1536,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            if follow_symlink {
-                files.fs.file_status(&context, path)?
-            } else {
-                files.fs.file_status_no_follow(&context, path)?
-            }
+            files.fs.file_status(&context, path, follow_symlink)?
         };
         Ok(T::from(status))
     }
@@ -1591,7 +1583,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let files = self.files.borrow();
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
-                Ok(T::from(files.fs.file_status(&context, cwd)?))
+                Ok(T::from(files.fs.file_status(&context, cwd, true)?))
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
@@ -1884,7 +1876,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         {
             let files = self.files.borrow();
             let context = fs.context.read();
-            match files.fs.file_status(&context, target.to_string()) {
+            match files.fs.file_status(&context, target.to_string(), true) {
                 Ok(status) => {
                     if status.file_type != FileType::Directory {
                         return Err(Errno::ENOTDIR);
