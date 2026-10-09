@@ -196,7 +196,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         self.resolve_path(context, path, true, false)
     }
 
-    // Operations rewalk the expanded path; this is not an atomic namespace snapshot.
+    // XXX(jayb): callers rewalk the result, so this is non-atomic and walks twice; returning the
+    // final walking handle alongside the path would fix both.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
     // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
