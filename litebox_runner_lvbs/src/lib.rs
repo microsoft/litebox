@@ -40,13 +40,14 @@ use litebox_platform_lvbs::{
         },
     },
 };
+use litebox_shim_optee::ClientPta;
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
 use litebox_shim_optee::{
     msg_handler::{
-        checked_memref_size, decode_ta_request, handle_optee_msg_args, handle_optee_smc_args,
-        read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm, unregister_rpc_shm,
-        update_optee_msg_args, write_rpc_args_to_regd_shm,
+        checked_memref_size, client_pta_params, decode_ta_request, handle_optee_msg_args,
+        handle_optee_smc_args, read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm,
+        unregister_rpc_shm, update_optee_msg_args, write_rpc_args_to_regd_shm,
     },
     rpc_context::{RpcCompletion, RpcContext, rpc_context_map},
 };
@@ -964,6 +965,11 @@ fn handle_open_session(
 
     let ta_uuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let client_identity = ta_req_info.client_identity;
+
+    if let Some(pta) = ClientPta::from_uuid(&ta_uuid) {
+        return client_pta_open_session(platform, msg_args, msg_args_phys_addr, pta);
+    }
+
     let params = &ta_req_info.params;
 
     session_manager().with_ta(&ta_uuid, |target| match target {
@@ -1444,6 +1450,16 @@ fn handle_invoke_command(
     let params = &ta_req_info.params;
     let session_id = ta_req_info.session;
 
+    if let Some(pta) = session_manager().client_pta_for_session(session_id) {
+        return client_pta_invoke_command(
+            platform,
+            msg_args,
+            msg_args_phys_addr,
+            pta,
+            &ta_req_info,
+        );
+    }
+
     session_manager().with_session(session_id, |instance| {
         let Some(instance) = instance else {
             return finalize_dead_session(
@@ -1561,6 +1577,12 @@ fn handle_close_session(
 
     debug_serial_println!("CloseSession: session_id={}", session_id);
 
+    if session_manager().close_client_pta_session(session_id) {
+        msg_args.ret = TeeResult::Success;
+        msg_args.ret_origin = TeeOrigin::Tee;
+        return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
+    }
+
     session_manager().with_session(session_id, |instance| {
         let Some(instance) = instance else {
             return finalize_dead_session(
@@ -1649,6 +1671,71 @@ fn handle_close_session(
 
         write_result
     })
+}
+
+/// Runs on the base page table.
+fn client_pta_open_session(
+    platform: &'static Platform,
+    msg_args: &mut OpteeMsgArgs,
+    msg_args_phys_addr: u64,
+    pta: ClientPta,
+) -> Result<(), OpteeSmcReturnCode> {
+    let result = session_manager().open_client_pta_session(pta);
+    match result {
+        Ok(session_id) => {
+            msg_args.session = session_id;
+            msg_args.ret = TeeResult::Success;
+            msg_args.ret_origin = TeeOrigin::TrustedApp;
+        }
+        // Resource limits, not PTA errors.
+        Err(error) => {
+            msg_args.ret = error;
+            msg_args.ret_origin = TeeOrigin::Tee;
+        }
+    }
+
+    write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr).inspect_err(
+        |_| {
+            // The client never learns the ID.
+            if let Ok(session_id) = result {
+                session_manager().close_client_pta_session(session_id);
+            }
+        },
+    )?;
+    debug_serial_println!("OpenSession on client PTA {:?}: {:?}", pta, msg_args.ret);
+    Ok(())
+}
+
+/// Runs on the base page table.
+fn client_pta_invoke_command(
+    platform: &'static Platform,
+    msg_args: &mut OpteeMsgArgs,
+    msg_args_phys_addr: u64,
+    pta: ClientPta,
+    ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
+) -> Result<(), OpteeSmcReturnCode> {
+    let mut params = client_pta_params(ta_req_info);
+    let result = pta.invoke_command(
+        platform,
+        ta_req_info.cmd_id,
+        &mut params,
+        &ta_req_info.shm_info,
+    )?;
+    // Outputs are meaningful only on these results; a rejected NULL memref
+    // would otherwise fail the size check.
+    let outputs = matches!(result, TeeResult::Success | TeeResult::ShortBuffer).then_some(&params);
+    // Memref outputs were written in place: no `memref_addresses`.
+    update_optee_msg_args(
+        platform,
+        result,
+        TeeOrigin::TrustedApp,
+        None,
+        outputs,
+        Some(ta_req_info),
+        None,
+        msg_args,
+    )?;
+    write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)
 }
 
 /// Update msg_args with return values and write back to normal world memory.
