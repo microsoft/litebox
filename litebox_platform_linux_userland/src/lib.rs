@@ -16,7 +16,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common_linux::{MRemapFlags, MapFlags, OFlags, ProtFlags, vmap::VmapManager};
+use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags, vmap::VmapManager};
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
     WaitWakerProvider,
@@ -47,19 +47,10 @@ use aarch64::{
 
 extern crate alloc;
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(test)]
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 mod page_mgmt;
-
-/// The admitted open syscall and its flags index must remain paired.
-#[cfg(target_arch = "x86_64")]
-const OPEN_SYSNO: i64 = libc::SYS_open;
-#[cfg(target_arch = "x86_64")]
-const OPEN_FLAGS_ARG: u8 = 1;
-#[cfg(target_arch = "aarch64")]
-const OPEN_SYSNO: i64 = libc::SYS_openat;
-#[cfg(target_arch = "aarch64")]
-const OPEN_FLAGS_ARG: u8 = 2;
+mod seccomp_policy;
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //
@@ -128,7 +119,7 @@ macro_rules! saved_tls {
 /// traits.
 pub struct LinuxUserland {
     /// CoW-eligible memory regions. Maps start address of the static slice, to the info needed to
-    /// re-mmap the file.
+    /// map the file again.
     cow_regions: std::sync::RwLock<std::collections::BTreeMap<usize, CowRegionInfo>>,
     /// If [`Self::initialize_boot_specific_kdf_support`] has been run, this is set to a value that
     /// is persistent across multiple process executions, however, it is ephemeral across true
@@ -163,8 +154,12 @@ impl core::fmt::Debug for LinuxUserland {
 /// Information about a CoW-eligible memory region backed by a file.
 #[derive(Debug, Clone)]
 struct CowRegionInfo {
-    /// The path to the backing file on the host filesystem.
-    file_path: PathBuf,
+    /// The backing file, opened read-only when the region is registered.
+    ///
+    /// Mapping from this descriptor, rather than opening the path again, keeps host path opens
+    /// out of the seccomp policy, and maps the file that was registered even if the path is
+    /// later replaced on the host.
+    file: std::sync::Arc<std::os::fd::OwnedFd>,
     /// Length of the backing file.
     file_length: usize,
 }
@@ -243,13 +238,24 @@ impl LinuxUserland {
 
     /// Register a CoW-eligible memory region backed by a file.
     ///
+    /// The file is opened here, so regions must be registered before
+    /// [`Self::enable_seccomp_filter`], which does not admit host path opens.
+    ///
     /// # Panics
     ///
-    /// Panics if an overlapping region is already registered.
+    /// Panics if an overlapping region is already registered, or if the file cannot be opened.
     pub fn register_cow_region(&self, data: &'static [u8], file_path: impl Into<PathBuf>) {
         let start = data.as_ptr() as usize;
+        let file_path = file_path.into();
+        // `File::open` opens read-only and close-on-exec.
+        let file = std::fs::File::open(&file_path).unwrap_or_else(|error| {
+            panic!(
+                "failed to open CoW backing file {}: {error}",
+                file_path.display()
+            )
+        });
         let info = CowRegionInfo {
-            file_path: file_path.into(),
+            file: std::sync::Arc::new(file.into()),
             file_length: data.len(),
         };
 
@@ -264,9 +270,12 @@ impl LinuxUserland {
 
     /// Look up the file backing a static slice for CoW mapping.
     ///
-    /// Returns `Some((file_path, offset_in_file))` if the slice is backed by a registered
-    /// CoW region, `None` otherwise.
-    fn lookup_cow_region(&self, source_data: &'static [u8]) -> Option<(PathBuf, usize)> {
+    /// Returns `Some((file, offset_in_file))` if the slice is backed by a registered CoW region,
+    /// `None` otherwise.
+    fn lookup_cow_region(
+        &self,
+        source_data: &'static [u8],
+    ) -> Option<(std::sync::Arc<std::os::fd::OwnedFd>, usize)> {
         let slice_start = source_data.as_ptr() as usize;
         let slice_len = source_data.len();
 
@@ -277,7 +286,7 @@ impl LinuxUserland {
             let slice_end = slice_start.checked_add(slice_len).unwrap();
 
             if slice_start >= region_start && slice_end <= region_end {
-                return Some((info.file_path.clone(), slice_start - region_start));
+                return Some((info.file.clone(), slice_start - region_start));
             }
         }
         None
@@ -295,164 +304,10 @@ impl LinuxUserland {
         shutdown_fds: &[std::os::fd::RawFd],
         scope: SeccompScope,
     ) {
-        use seccompiler::{
-            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-            SeccompFilter, SeccompRule,
-        };
+        use seccompiler::{BpfProgram, SeccompAction, SeccompFilter};
 
-        let mut rules = vec![
-            // Terminal and broker I/O
-            (libc::SYS_read, vec![]),
-            (libc::SYS_write, vec![]),
-            // The AArch64 (asm-generic) syscall table has no `poll`; glibc
-            // implements `poll(3)` there via `ppoll`.
-            #[cfg(target_arch = "x86_64")]
-            (libc::SYS_poll, vec![]),
-            #[cfg(target_arch = "aarch64")]
-            (libc::SYS_ppoll, vec![]),
-            // memory management
-            (libc::SYS_mmap, vec![]),
-            (libc::SYS_mprotect, vec![]),
-            (libc::SYS_munmap, vec![]),
-            (libc::SYS_mremap, vec![]),
-            // signal
-            (libc::SYS_rt_sigreturn, vec![]),
-            (libc::SYS_sigaltstack, vec![]),
-            (libc::SYS_tgkill, vec![]),
-            (libc::SYS_timer_create, vec![]),
-            (libc::SYS_timer_settime, vec![]),
-            (libc::SYS_timer_delete, vec![]),
-            // called by [pthread_create](https://codebrowser.dev/glibc/glibc/nptl/pthread_create.c.html#83) to set up signal handler
-            // to support setuid et.al. functions (which we probably don't need, but include them in debug mode to suppress the warnings
-            // about missing seccomp rules for these syscalls).
-            #[cfg(debug_assertions)]
-            (libc::SYS_rt_sigaction, vec![]),
-            // TODO: also called by `next_signal_handler`, but I'm not sure if it's really needed.
-            (libc::SYS_rt_sigprocmask, vec![]),
-            // thread management
-            (libc::SYS_exit, vec![]),
-            (libc::SYS_exit_group, vec![]),
-            (libc::SYS_clone3, vec![]),
-            // sync
-            (libc::SYS_futex, vec![]),
-            // misc
-            (libc::SYS_getrandom, vec![]),
-            // required by std spawn
-            (libc::SYS_rseq, vec![]),
-            (libc::SYS_set_robust_list, vec![]),
-            (libc::SYS_get_robust_list, vec![]),
-            (libc::SYS_sched_getaffinity, vec![]),
-            (libc::SYS_gettid, vec![]),
-            (libc::SYS_madvise, vec![]),
-            // required by libc allocator
-            (libc::SYS_brk, vec![]),
-            (libc::SYS_getpid, vec![]),
-            // TODO: could be removed if we pre-open files (see `try_allocate_cow_pages`)
-            //
-            // A mismatched syscall and flags index would admit arbitrary flags.
-            (
-                OPEN_SYSNO,
-                vec![
-                    SeccompRule::new(vec![
-                        SeccompCondition::new(
-                            OPEN_FLAGS_ARG,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(OFlags::RDONLY.bits()),
-                        )
-                        .unwrap(),
-                    ])
-                    .unwrap(),
-                ],
-            ),
-            // Connected UnixStream I/O may use sendto/recvfrom rather than raw
-            // read/write. Limit these rules to connected-socket calls that do
-            // not name a peer address.
-            (
-                libc::SYS_sendto,
-                vec![
-                    SeccompRule::new(vec![
-                        SeccompCondition::new(4, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
-                            .unwrap(),
-                        SeccompCondition::new(5, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
-                            .unwrap(),
-                    ])
-                    .unwrap(),
-                ],
-            ),
-            (
-                libc::SYS_recvfrom,
-                vec![
-                    SeccompRule::new(vec![
-                        SeccompCondition::new(4, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
-                            .unwrap(),
-                        SeccompCondition::new(5, SeccompCmpArgLen::Qword, SeccompCmpOp::Eq, 0)
-                            .unwrap(),
-                    ])
-                    .unwrap(),
-                ],
-            ),
-            (libc::SYS_close, vec![]),
-        ];
-        if !positional_io_fds.is_empty() {
-            // Broker shared memory uses positional descriptor I/O.
-            let fd_rules = || {
-                positional_io_fds
-                    .iter()
-                    .map(|fd| {
-                        SeccompRule::new(vec![
-                            SeccompCondition::new(
-                                0,
-                                SeccompCmpArgLen::Dword,
-                                SeccompCmpOp::Eq,
-                                u64::from(
-                                    u32::try_from(*fd)
-                                        .expect("positional I/O descriptor must be valid"),
-                                ),
-                            )
-                            .unwrap(),
-                        ])
-                        .unwrap()
-                    })
-                    .collect()
-            };
-            rules.push((libc::SYS_pread64, fd_rules()));
-            rules.push((libc::SYS_pwrite64, fd_rules()));
-        }
-        if !shutdown_fds.is_empty() {
-            // Association failure shuts down the control socket in both
-            // directions to interrupt local and peer liveness waits.
-            let shutdown_rules = shutdown_fds
-                .iter()
-                .map(|fd| {
-                    SeccompRule::new(vec![
-                        SeccompCondition::new(
-                            0,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(*fd).expect("shutdown descriptor must be valid"),
-                            ),
-                        )
-                        .unwrap(),
-                        SeccompCondition::new(
-                            1,
-                            SeccompCmpArgLen::Dword,
-                            SeccompCmpOp::Eq,
-                            u64::from(
-                                u32::try_from(libc::SHUT_RDWR)
-                                    .expect("SHUT_RDWR must be non-negative"),
-                            ),
-                        )
-                        .unwrap(),
-                    ])
-                    .unwrap()
-                })
-                .collect();
-            rules.push((libc::SYS_shutdown, shutdown_rules));
-        }
-        let rule_map: std::collections::BTreeMap<i64, Vec<SeccompRule>> =
-            rules.into_iter().collect();
+        // The admitted syscalls, and why, are listed in `seccomp_policy.rs`.
+        let rule_map = seccomp_policy::rules(positional_io_fds, shutdown_fds);
         let filter = SeccompFilter::new(
             rule_map,
             // In debug builds, log violations instead of silently returning an error so that
@@ -2265,7 +2120,15 @@ unsafe extern "C" fn exception_signal_handler(
             // Log the paths in case we need to allow some of them in the future.
             let _ = writeln!(buf, "INFO: openat with {c_path:?} is not allowed");
         } else {
-            let _ = writeln!(buf, "WARNING: disallowed syscall invoked: {sysno}");
+            // Signal-safe: `Sysno::new` and `Sysno::name` are `const fn` table lookups.
+            let name = usize::try_from(sysno)
+                .ok()
+                .and_then(syscalls::Sysno::new)
+                .map_or("unknown", |sysno| sysno.name());
+            let _ = writeln!(
+                buf,
+                "WARNING: disallowed syscall invoked: {name} ({sysno}); not admitted by seccomp_policy.rs"
+            );
         }
         let _ = unsafe {
             syscalls::syscall3(
@@ -2850,6 +2713,7 @@ mod tests {
         let denied = test_memfd(c"seccomp-denied-positional-io");
         let (allowed_shutdown, _allowed_peer) = UnixStream::pair().unwrap();
         let (denied_shutdown, _denied_peer) = UnixStream::pair().unwrap();
+        let (stream, stream_peer) = UnixStream::pair().unwrap();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let worker_barrier = barrier.clone();
         // Spawned before the filter is installed.
@@ -2909,6 +2773,65 @@ mod tests {
         let error = denied_shutdown.shutdown(Shutdown::Both).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
 
+        // `sendto` and `recvfrom` are admitted only when they name no peer address.
+        let send = |address: *const libc::sockaddr, address_len: libc::socklen_t| {
+            // SAFETY: `written` is valid for its length, and `address` is either null or a valid
+            // `sockaddr_un` of `address_len` bytes.
+            unsafe {
+                libc::sendto(
+                    stream.as_raw_fd(),
+                    written.as_ptr().cast(),
+                    written.len(),
+                    0,
+                    address,
+                    address_len,
+                )
+            }
+        };
+        let receive = |address: *mut libc::sockaddr, address_len: *mut libc::socklen_t| {
+            let mut received = [0_u8];
+            // SAFETY: `received` is valid for its length, and `address` is either null or a
+            // valid `sockaddr_un` whose size `address_len` points to.
+            let n = unsafe {
+                libc::recvfrom(
+                    stream_peer.as_raw_fd(),
+                    received.as_mut_ptr().cast(),
+                    received.len(),
+                    0,
+                    address,
+                    address_len,
+                )
+            };
+            (n, received)
+        };
+        assert_eq!(send(core::ptr::null(), 0), 1);
+        assert_eq!(
+            receive(core::ptr::null_mut(), core::ptr::null_mut()),
+            (1, written)
+        );
+        // SAFETY: an all-zero `sockaddr_un` is a valid value.
+        let mut address: libc::sockaddr_un = unsafe { core::mem::zeroed() };
+        address.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX).unwrap();
+        let address_size = libc::socklen_t::try_from(size_of::<libc::sockaddr_un>()).unwrap();
+        // On a connected socket the kernel itself would reject a peer address with `EISCONN`;
+        // `EINVAL` shows that the filter denied the call first.
+        assert_eq!(send((&raw const address).cast(), address_size), -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        // Queue a byte first so that a wrongly admitted `recvfrom` returns rather than blocks.
+        assert_eq!(send(core::ptr::null(), 0), 1);
+        let mut address_len = address_size;
+        assert_eq!(
+            receive((&raw mut address).cast(), &raw mut address_len).0,
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
+
         assert_seccomp_filter();
         worker.join().unwrap();
     }
@@ -2937,48 +2860,37 @@ mod tests {
         let pathname =
             std::ffi::CString::new(format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"))).unwrap();
 
-        // Denying RDWR does not on its own show that the rule reads the flags
-        // argument: were it to read the path pointer instead, that too would
-        // compare unequal to `O_RDONLY` and be denied. Only an allowed RDONLY
-        // open pins the argument index `OPEN_FLAGS_ARG`.
-        #[cfg(target_arch = "aarch64")]
-        {
-            let open_rdonly = unsafe {
+        // No host path may be opened once the filter is installed, not even read-only.
+        for flags in [OFlags::RDONLY, OFlags::RDWR] {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let open_res = unsafe {
+                    syscalls::syscall2(
+                        syscalls::Sysno::open,
+                        pathname.as_ptr() as usize,
+                        flags.bits() as usize,
+                    )
+                };
+                assert_eq!(
+                    open_res.unwrap_err(),
+                    syscalls::Errno::EINVAL,
+                    "open with {flags:?} should be blocked by seccomp filter"
+                );
+            }
+            let openat_res = unsafe {
                 syscalls::syscall4(
                     syscalls::Sysno::openat,
                     super::AT_FDCWD,
                     pathname.as_ptr() as usize,
-                    OFlags::RDONLY.bits() as usize,
+                    flags.bits() as usize,
                     0,
                 )
             };
-            let fd = open_rdonly.expect("openat with RDONLY should be allowed by seccomp filter");
-            // SAFETY: the open above just returned this as a fresh owned descriptor.
-            drop(unsafe { OwnedFd::from_raw_fd(i32::try_from(fd).unwrap()) });
+            assert_eq!(
+                openat_res.unwrap_err(),
+                syscalls::Errno::EINVAL,
+                "openat with {flags:?} should be blocked by seccomp filter"
+            );
         }
-
-        #[cfg(target_arch = "x86_64")]
-        let open_res = unsafe {
-            syscalls::syscall2(
-                syscalls::Sysno::open,
-                pathname.as_ptr() as usize,
-                OFlags::RDWR.bits() as usize,
-            )
-        };
-        #[cfg(target_arch = "aarch64")]
-        let open_res = unsafe {
-            syscalls::syscall4(
-                syscalls::Sysno::openat,
-                super::AT_FDCWD,
-                pathname.as_ptr() as usize,
-                OFlags::RDWR.bits() as usize,
-                0,
-            )
-        };
-        assert_eq!(
-            open_res.unwrap_err(),
-            syscalls::Errno::EINVAL,
-            "open with RDWR should be blocked by seccomp filter"
-        );
     }
 }
