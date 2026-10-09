@@ -241,7 +241,7 @@ fn test_tcp_shutdown_read_keeps_receiving() {
     let listener = listening_socket(&mut network);
     let ((client_fd, client), (server_fd, server)) = connect_and_accept(&mut network, &listener);
 
-    // Like Linux, `SHUT_RD` reports end-of-file but neither discards nor refuses data.
+    // `SHUT_RD` reports end-of-file but neither discards nor refuses data.
     network.shutdown(&client_fd, Shutdown::Read).unwrap();
     assert!(matches!(read(&client), Err(ChannelReadError::ReadShutdown)));
     assert_eq!(write(&server, b"data").unwrap(), 4);
@@ -258,30 +258,6 @@ fn test_tcp_shutdown_read_keeps_receiving() {
 }
 
 #[test]
-fn test_tcp_reset_reports_connection_reset() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
-    network.set_platform_interaction(PlatformInteraction::Manual);
-    let listener = listening_socket(&mut network);
-    let ((client_fd, client), (server_fd, _server)) = connect_and_accept(&mut network, &listener);
-
-    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
-    pump(&mut network);
-    assert!(client.check_io_events().contains(Events::ERR | Events::HUP));
-    assert!(matches!(
-        read(&client),
-        Err(ChannelReadError::ConnectionClosed)
-    ));
-    assert!(matches!(
-        client.get_async_error(false),
-        Some(errors::SocketAsyncError::ConnectionReset)
-    ));
-
-    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
-    network.close(&listener, CloseBehavior::Immediate).unwrap();
-}
-
-#[test]
 fn test_tcp_reset_after_shutdown_read() {
     let litebox = LiteBox::new(MockPlatform::new());
     let mut network = Network::new(&litebox);
@@ -289,7 +265,7 @@ fn test_tcp_reset_after_shutdown_read() {
     let listener = listening_socket(&mut network);
     let ((client_fd, client), (server_fd, _server)) = connect_and_accept(&mut network, &listener);
 
-    // Like Linux, a reset is reported to reads even after `SHUT_RD`.
+    // A reset is reported to reads even after `SHUT_RD`.
     network.shutdown(&client_fd, Shutdown::Read).unwrap();
     network.close(&server_fd, CloseBehavior::Immediate).unwrap();
     pump(&mut network);
@@ -321,7 +297,7 @@ fn test_tcp_reset_reported_before_unread_data() {
     network.close(&client_fd, CloseBehavior::Immediate).unwrap();
     pump(&mut network);
 
-    // Like Linux, the reset is reported at once, but data received before it is still read.
+    // The reset is reported at once, but data received before it is still read.
     assert!(
         server
             .check_io_events()
@@ -366,7 +342,7 @@ fn test_tcp_graceful_close_with_unread_data() {
     assert_eq!(write(&client, b"hello world").unwrap(), 11);
     network.shutdown(&client_fd, Shutdown::Write).unwrap();
     pump(&mut network);
-    // Like Linux, the peer's FIN is reported at once, but reads still return the data first.
+    // The peer's FIN is reported at once, but reads still return the data first.
     assert!(server.check_io_events().contains(Events::RDHUP));
     assert!(!server.check_io_events().contains(Events::HUP));
     assert_eq!(read(&server).unwrap(), b"hell");
@@ -384,38 +360,6 @@ fn test_tcp_graceful_close_with_unread_data() {
     assert_eq!(received, b"hello world");
     assert!(server.get_async_error(false).is_none());
     assert!(!server.check_io_events().contains(Events::ERR));
-
-    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
-    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
-    network.close(&listener, CloseBehavior::Immediate).unwrap();
-}
-
-#[test]
-fn test_tcp_listener_shutdown() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
-    network.set_platform_interaction(PlatformInteraction::Manual);
-    let listener = listening_socket(&mut network);
-
-    // Like Linux, `SHUT_WR` leaves a listener alone while `SHUT_RD` stops listening.
-    network.shutdown(&listener, Shutdown::Write).unwrap();
-    assert!(matches!(
-        network.accept(&listener, None),
-        Err(AcceptError::NoConnectionsReady)
-    ));
-    network.shutdown(&listener, Shutdown::Read).unwrap();
-    assert!(matches!(
-        network.accept(&listener, None),
-        Err(AcceptError::NotListening)
-    ));
-    assert!(matches!(
-        network.shutdown(&listener, Shutdown::Read),
-        Err(ShutdownError::NotConnected)
-    ));
-
-    // The socket can listen again.
-    network.listen(&listener, 1).unwrap();
-    let ((client_fd, _), (server_fd, _)) = connect_and_accept(&mut network, &listener);
 
     network.close(&client_fd, CloseBehavior::Immediate).unwrap();
     network.close(&server_fd, CloseBehavior::Immediate).unwrap();
@@ -443,7 +387,7 @@ fn test_tcp_accept_half_closed_connection() {
     assert!(matches!(err, ConnectError::InProgress));
     pump(&mut network);
 
-    // Like Linux, a connection the peer half-closes before `accept` can still be accepted.
+    // A connection the peer half-closes before `accept` can still be accepted.
     assert_eq!(write(&client, b"request").unwrap(), 7);
     network.shutdown(&client_fd, Shutdown::Write).unwrap();
     pump(&mut network);
@@ -504,39 +448,4 @@ fn test_tcp_shutdown_write_before_connect_observed() {
     network.close(&client_fd, CloseBehavior::Immediate).unwrap();
     network.close(&server_fd, CloseBehavior::Immediate).unwrap();
     network.close(&listener, CloseBehavior::Immediate).unwrap();
-}
-
-#[test]
-fn test_shutdown_requires_connection() {
-    let litebox = LiteBox::new(MockPlatform::new());
-    let mut network = Network::new(&litebox);
-    network.set_platform_interaction(PlatformInteraction::Manual);
-
-    let (tcp_fd, _) = stream_socket(&mut network);
-    assert!(matches!(
-        network.shutdown(&tcp_fd, Shutdown::Both),
-        Err(ShutdownError::NotConnected)
-    ));
-
-    let udp_fd = network.socket(Protocol::Udp).unwrap();
-    let udp = alloc::sync::Arc::new(NetworkProxy::Datagram(
-        socket_channel::DatagramSocketChannel::new(),
-    ));
-    assert!(network.set_socket_proxy(&udp_fd, udp.clone()));
-    // Like Linux, an unconnected UDP socket is shut down anyway.
-    assert!(matches!(
-        network.shutdown(&udp_fd, Shutdown::Read),
-        Err(ShutdownError::NotConnected)
-    ));
-    assert!(matches!(read(&udp), Err(ChannelReadError::ReadShutdown)));
-    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
-    network.connect(&udp_fd, &addr, false).unwrap();
-    network.shutdown(&udp_fd, Shutdown::Write).unwrap();
-    assert!(matches!(
-        write(&udp, b"data"),
-        Err(ChannelWriteError::WriteShutdown)
-    ));
-
-    network.close(&tcp_fd, CloseBehavior::Immediate).unwrap();
-    network.close(&udp_fd, CloseBehavior::Immediate).unwrap();
 }

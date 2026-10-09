@@ -440,7 +440,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     /// Returns the number of bytes read, or an error if the socket is closed
     /// or not connected.
     ///
-    /// Like Linux, data received before the read side was shut down can still be read;
+    /// Data received before the read side was shut down can still be read;
     /// once it is consumed, this returns [`ChannelReadError::ReadShutdown`], or
     /// [`ChannelReadError::ConnectionClosed`] if the connection has closed.
     pub fn try_read(
@@ -476,7 +476,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         if n > 0 {
             return Ok(n);
         }
-        // Like Linux, a closed connection reports its error even after `SHUT_RD`.
+        // A closed connection reports its error even after `SHUT_RD`.
         match state {
             SocketState::Closed | SocketState::Error => Err(ChannelReadError::ConnectionClosed),
             _ if read_shutdown => Err(ChannelReadError::ReadShutdown),
@@ -523,7 +523,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         self.inner.tx_available.load(Ordering::Acquire) > 0
     }
 
-    /// Shut down the read side of the socket, like Linux's `RCV_SHUTDOWN`.
+    /// Shut down the read side of the socket.
     ///
     /// Data already received can still be read; after that, reads report end-of-file.
     pub fn shutdown_read(&self) {
@@ -532,7 +532,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         }
     }
 
-    /// Shut down the write side of the socket, like Linux's `SEND_SHUTDOWN`.
+    /// Shut down the write side of the socket.
     ///
     /// Further writes fail with [`ChannelWriteError::WriteShutdown`]. The network worker
     /// sends FIN once the data written before this call has been handed to TCP.
@@ -563,7 +563,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
             events |= Events::IN;
         }
 
-        // Like Linux, a shut-down side never blocks: reads return end-of-file and writes fail.
+        // A shut-down side never blocks: reads return end-of-file and writes fail.
         let read_shutdown = self.inner.read_shutdown.load(Ordering::Acquire);
         let write_shutdown = self.inner.write_shutdown.load(Ordering::Acquire);
         if read_shutdown {
@@ -580,7 +580,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
         if read_closed && write_shutdown {
             events |= Events::HUP;
         }
-        // Like Linux, a pending socket error is reported until it is consumed.
+        // A pending socket error is reported until it is consumed.
         if self.get_async_error(false).is_some() {
             events |= Events::ERR;
         }
@@ -733,8 +733,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
 
     /// Record that the peer has closed the connection, by FIN or reset.
     ///
-    /// Like Linux, this is reported to poll at once, but reads still return the data received
-    /// before the close; see [`Self::shutdown_read`].
+    /// This is reported to poll at once, but reads still return the data received before the
+    /// close; see [`Self::shutdown_read`].
     pub(super) fn set_peer_closed(&self) {
         if !self.inner.peer_closed.swap(true, Ordering::AcqRel) {
             self.inner.pollee.notify_observers(self.check_io_events());
@@ -920,7 +920,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
     /// If the datagram is larger than `buf`, behavior depends on `flags`.
     /// Returns the original message size (which may exceed `buf.len()`).
     ///
-    /// Like Linux, datagrams can still be received after the read side is shut down;
+    /// Datagrams can still be received after the read side is shut down;
     /// [`ChannelReadError::ReadShutdown`] is returned only when none is queued.
     pub fn try_read(
         &self,
@@ -1018,14 +1018,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> DatagramSocketChannel<P
         }
     }
 
-    /// Shut down the read side of the socket, like Linux's `RCV_SHUTDOWN`.
+    /// Shut down the read side of the socket.
     pub fn shutdown_read(&self) {
         if !self.inner.read_shutdown.swap(true, Ordering::AcqRel) {
             self.inner.pollee.notify_observers(self.check_io_events());
         }
     }
 
-    /// Shut down the write side of the socket, like Linux's `SEND_SHUTDOWN`.
+    /// Shut down the write side of the socket.
     pub fn shutdown_write(&self) {
         if !self.inner.write_shutdown.swap(true, Ordering::AcqRel) {
             self.inner.pollee.notify_observers(self.check_io_events());
