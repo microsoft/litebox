@@ -102,15 +102,20 @@
 //!   - Encrypting the resume identifier (thread ID, etc.) with authenticated encryption
 //!     (e.g., AES-GCM) to detect tampering and replay attacks from normal world
 
-use crate::{LoadedProgram, OpteeShim, SessionIdPool};
+use crate::{ClientPta, LoadedProgram, OpteeShim, SessionIdPool};
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use hashbrown::{HashMap, HashSet};
-use litebox_common_optee::{OpteeSmcReturnCode, TaFlags, TeeIdentity, TeeLogin, TeeUuid};
+use litebox_common_optee::{
+    OpteeSmcReturnCode, TaFlags, TeeIdentity, TeeLogin, TeeResult, TeeUuid,
+};
 use spin::mutex::SpinMutex;
 
 /// Maximum number of concurrent TA instances to avoid out of memory situations.
 const MAX_TA_INSTANCES: usize = 16;
+
+/// Bounds open client PTA sessions; the normal world is untrusted.
+const MAX_CLIENT_PTA_SESSIONS: usize = 64;
 
 /// The anonymous public client identity. Used as the fallback when no per-session
 /// identity is recorded, matching OP-TEE OS / the Linux driver.
@@ -491,6 +496,8 @@ pub struct SessionManager<Platform: crate::OpteeShimPlatform> {
     /// Populated before the OpenSession entry point runs and removed when
     /// the session is unregistered.
     session_client_identities: SpinMutex<HashMap<u32, TeeIdentity>>,
+    /// Client PTA sessions; not backed by a TA instance.
+    client_pta_sessions: SpinMutex<HashMap<u32, ClientPta>>,
 }
 
 impl<Platform: crate::OpteeShimPlatform> SessionManager<Platform> {
@@ -504,6 +511,7 @@ impl<Platform: crate::OpteeShimPlatform> SessionManager<Platform> {
             ta_load_lock: AtomicBool::new(false),
             active_sessions: SpinMutex::new(HashSet::new()),
             session_client_identities: SpinMutex::new(HashMap::new()),
+            client_pta_sessions: SpinMutex::new(HashMap::new()),
         }
     }
 
@@ -997,6 +1005,36 @@ impl<Platform: crate::OpteeShimPlatform> SessionManager<Platform> {
         }
 
         result
+    }
+
+    /// # Errors
+    ///
+    /// `Busy` (a TEE-origin error) if the session cap or the session ID pool
+    /// is exhausted.
+    pub fn open_client_pta_session(&self, pta: ClientPta) -> Result<u32, TeeResult> {
+        let mut sessions = self.client_pta_sessions.lock();
+        if sessions.len() >= MAX_CLIENT_PTA_SESSIONS {
+            return Err(TeeResult::Busy);
+        }
+        let session_id = SessionIdPool::allocate().ok_or(TeeResult::Busy)?;
+        let prev = sessions.insert(session_id, pta);
+        debug_assert!(prev.is_none(), "session ID reused while still open");
+        Ok(session_id)
+    }
+
+    /// The returned PTA may be invoked after a racing close; this relies on
+    /// client PTAs being stateless.
+    pub fn client_pta_for_session(&self, session_id: u32) -> Option<ClientPta> {
+        self.client_pta_sessions.lock().get(&session_id).copied()
+    }
+
+    /// Returns `false` if `session_id` is not an open client PTA session.
+    pub fn close_client_pta_session(&self, session_id: u32) -> bool {
+        let removed = self.client_pta_sessions.lock().remove(&session_id);
+        if removed.is_some() {
+            SessionIdPool::recycle(session_id);
+        }
+        removed.is_some()
     }
 }
 

@@ -40,6 +40,7 @@ pub mod idk;
 
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
+pub use syscalls::pta::ClientPta;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 pub(crate) const TA_DIGEST_LEN: usize = 32;
