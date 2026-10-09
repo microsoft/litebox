@@ -37,8 +37,10 @@ mod x86_64;
 #[doc(hidden)]
 pub use page_mgmt::LinuxUserlandReservation;
 use x86_64::{
-    GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, run_thread_arch,
-    saved_tls, set_signal_return, signal_handler_exit_guest, switch_to_guest, tls,
+    GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, exception_callback,
+    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls, set_signal_return,
+    signal_handler_exit_guest, switch_to_guest, switch_to_guest_end, switch_to_guest_start,
+    syscall_callback, tls,
 };
 
 /// The userland Linux platform.
@@ -1084,16 +1086,6 @@ impl litebox::platform::StdioProvider for LinuxUserland {
     fn is_a_tty(&self, stream: litebox::platform::StdioStream) -> bool {
         self.stdio_is_tty[stream as usize]
     }
-}
-
-unsafe extern "C" {
-    // Defined in asm blocks above
-    fn syscall_callback() -> isize;
-    fn exception_callback();
-    fn interrupt_callback();
-    fn interrupt_callback_no_xsave();
-    fn switch_to_guest_start();
-    fn switch_to_guest_end();
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {

@@ -438,6 +438,16 @@ pub(super) unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRe
     );
 }
 
+// Defined in the assembly blocks above.
+unsafe extern "C" {
+    pub(super) fn syscall_callback() -> isize;
+    pub(super) fn exception_callback();
+    pub(super) fn interrupt_callback();
+    pub(super) fn interrupt_callback_no_xsave();
+    pub(super) fn switch_to_guest_start();
+    pub(super) fn switch_to_guest_end();
+}
+
 /// Called from signal handlers to fix up thread state after potentially running
 /// in the guest.
 ///
