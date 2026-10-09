@@ -8,8 +8,8 @@
 //! shared semantic DTOs from `litebox_broker_protocol` for values that both the
 //! local core and broker understand, such as handles and readiness state. It
 //! deliberately has no dependency on protocol envelopes, channel traits, wire
-//! codecs, Unix sockets, shared-memory rings, kernel traps, or any other
-//! channel implementation.
+//! codecs, Unix-socket transports, shared-memory rings, kernel traps, or any
+//! other channel implementation.
 
 #![no_std]
 
@@ -32,6 +32,7 @@ pub mod signal;
 pub mod socket;
 pub mod stdio;
 pub mod timer;
+pub mod unix_socket;
 
 #[cfg(test)]
 mod test_platform;
@@ -80,6 +81,10 @@ pub struct BrokerCoreLimits {
     pub max_total_pipe_capacity: usize,
     /// Maximum capacity in bytes reserved by live pipes created by one process.
     pub max_pipe_capacity_per_process: usize,
+    /// Maximum total bytes queued in Unix sockets across all processes.
+    pub max_total_unix_socket_bytes: usize,
+    /// Maximum bytes queued in Unix sockets created by one process.
+    pub max_unix_socket_bytes_per_process: usize,
     /// Maximum live platform socket resources across all processes.
     pub max_sockets: usize,
     /// Maximum live platform socket resources owned by one process.
@@ -102,6 +107,8 @@ impl BrokerCoreLimits {
         max_references_per_process: 1024,
         max_total_pipe_capacity: 64 * 1024 * 1024,
         max_pipe_capacity_per_process: 16 * 1024 * 1024,
+        max_total_unix_socket_bytes: 64 * 1024 * 1024,
+        max_unix_socket_bytes_per_process: 16 * 1024 * 1024,
         max_sockets: 1024,
         max_sockets_per_process: 256,
         max_threads: 4096,
@@ -121,6 +128,8 @@ impl BrokerCoreLimits {
             max_references_per_process: max_references,
             max_total_pipe_capacity,
             max_pipe_capacity_per_process: max_total_pipe_capacity,
+            max_total_unix_socket_bytes: Self::DEFAULT.max_total_unix_socket_bytes,
+            max_unix_socket_bytes_per_process: Self::DEFAULT.max_unix_socket_bytes_per_process,
             max_sockets: Self::DEFAULT.max_sockets,
             max_sockets_per_process: Self::DEFAULT.max_sockets_per_process,
             max_threads: Self::DEFAULT.max_threads,
@@ -146,6 +155,8 @@ impl BrokerCoreLimits {
             max_references_per_process: max_references,
             max_total_pipe_capacity,
             max_pipe_capacity_per_process: max_total_pipe_capacity,
+            max_total_unix_socket_bytes: Self::DEFAULT.max_total_unix_socket_bytes,
+            max_unix_socket_bytes_per_process: Self::DEFAULT.max_unix_socket_bytes_per_process,
             max_sockets,
             max_sockets_per_process,
             max_threads: Self::DEFAULT.max_threads,
@@ -168,6 +179,24 @@ impl BrokerCoreLimits {
         Self {
             max_references_per_process,
             max_pipe_capacity_per_process,
+            ..self
+        }
+    }
+
+    /// Returns these limits with explicit broker-wide and per-process quotas
+    /// for bytes queued in Unix sockets.
+    ///
+    /// A per-process quota above the broker-wide limit is accepted; the
+    /// broker-wide limit still applies.
+    #[must_use]
+    pub const fn with_unix_socket_limits(
+        self,
+        max_total_unix_socket_bytes: usize,
+        max_unix_socket_bytes_per_process: usize,
+    ) -> Self {
+        Self {
+            max_total_unix_socket_bytes,
+            max_unix_socket_bytes_per_process,
             ..self
         }
     }
@@ -241,6 +270,7 @@ pub struct BrokerCore {
     pub(crate) pending_references: Arc<AtomicUsize>,
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    pub(crate) unix_sockets: Arc<unix_socket::UnixSockets>,
     /// Bytes of child memory images held by the broker.
     pub(crate) reserved_child_image_size: Arc<AtomicU64>,
     pub(crate) random_provider: Arc<dyn RandomProvider>,
@@ -303,6 +333,7 @@ impl BrokerCore {
             pending_references: Arc::new(AtomicUsize::new(0)),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            unix_sockets: Arc::new(unix_socket::UnixSockets::new(&limits)),
             reserved_child_image_size: Arc::new(AtomicU64::new(0)),
             random_provider,
             socket_provider,

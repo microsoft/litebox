@@ -171,7 +171,7 @@ fn set_file_status_flags<Platform: ShimPlatform>(
 
 /// Returns the `F_GETFL` flags for the access mode and status flags `status` of an open file
 /// description.
-fn linux_status_flags(status: FileStatusFlags) -> Result<OFlags, Errno> {
+pub(super) fn linux_status_flags(status: FileStatusFlags) -> Result<OFlags, Errno> {
     let mut flags = match status.access {
         FileAccessMode::ReadOnly => OFlags::RDONLY,
         FileAccessMode::WriteOnly => OFlags::WRONLY,
@@ -318,6 +318,13 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                     self.install_inherited_fd(litebox, first_fd, raw_fd, || {
                         global
                             .adopt_inherited_linux_pipe(handle, endpoint)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
+                }
+                InheritedFdKind::UnixSocket => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_unix_socket(handle)
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
@@ -597,7 +604,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// them is:
     ///
     /// - a network socket: the broker does not duplicate socket objects;
-    /// - an eventfd, epoll, or Unix socket descriptor: the object is local to this runner;
+    /// - an eventfd or epoll descriptor: the object is local to this runner;
     /// - a timerfd: the broker does not duplicate timer objects;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
     ///   runner; or
@@ -636,6 +643,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 AnyTypedFd::Pipes(pipe) => (
                     self.global.inherited_linux_pipe_kind(&pipe)?,
                     InheritableFd::Pipe(pipe),
+                ),
+                AnyTypedFd::Unix(socket) => (
+                    InheritedFdKind::UnixSocket,
+                    InheritableFd::UnixSocket(self.global.with_unix_socket(&socket, |socket| {
+                        Ok(alloc::sync::Arc::clone(socket.broker_socket()))
+                    })?),
                 ),
                 _ => return Err(Errno::EAGAIN),
             };
@@ -932,7 +945,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         &self.wait_cx(),
                         &mut buf.borrow_mut(),
                         litebox_common_linux::ReceiveFlags::empty(),
-                        None,
                         None,
                     )
                 })
@@ -2132,7 +2144,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         |fd| linux_status_flags(self.global.pipes.get_status_flags(fd)?),
                         |fd| getfl_from_handle!(fd),
                         |fd| getfl_from_handle!(fd),
-                        |fd| getfl_from_handle!(fd),
+                        |fd| {
+                            self.global
+                                .with_unix_socket(fd, super::unix::UnixSocket::get_status)
+                        },
                         |fd| getfl_from_handle!(fd),
                     )?
                     .bits())
@@ -2213,8 +2228,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     },
                     |_fd| todo!("epoll"),
                     |fd| {
-                        toggle_flags!(fd);
-                        Ok(())
+                        if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
+                        self.global.with_unix_socket(fd, |socket| {
+                            socket.set_status_flags(setfl_mask, flags)
+                        })
                     },
                     |fd| {
                         toggle_flags!(fd);
@@ -2508,7 +2527,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     },
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| set_nonblock_on_entry!(fd),
-                    |fd| set_nonblock_on_entry!(fd),
+                    |fd| {
+                        let flags = if val != 0 {
+                            OFlags::NONBLOCK
+                        } else {
+                            OFlags::empty()
+                        };
+                        self.global.with_unix_socket(fd, |socket| {
+                            socket.set_status_flags(OFlags::NONBLOCK, flags)
+                        })
+                    },
                     |fd| set_nonblock_on_entry!(fd),
                 )?;
                 Ok(0)

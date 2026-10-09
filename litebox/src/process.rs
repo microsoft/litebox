@@ -23,6 +23,7 @@ use crate::event::{Events, IOPollable, observer::Observer, polling::Pollee};
 use crate::fs::FileFd;
 use crate::pipes::PipeFd;
 use crate::sync::RawSyncPrimitivesProvider;
+use crate::unix_sockets::BrokerUnixSocket;
 
 /// Error returned by the broker-backed process service.
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
@@ -115,6 +116,8 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     File(Arc<FileFd>),
     /// A pipe end, adopted with [`LiteBox::adopt_inherited_pipe`].
     Pipe(Arc<PipeFd<Platform>>),
+    /// A Unix socket, adopted with [`LiteBox::adopt_inherited_unix_socket`].
+    UnixSocket(Arc<BrokerUnixSocket<Platform>>),
 }
 
 /// Termination state of a child process.
@@ -194,6 +197,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
         // Holding the objects keeps their handles open until the child has its own.
         let mut held_files = Vec::new();
         let mut held_pipes = Vec::new();
+        let mut held_sockets = Vec::new();
         let mut fd_handles = Vec::new();
         for fd in fds {
             let handle = match fd {
@@ -212,6 +216,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Process<Platform> {
                     let handle = pipe.handle();
                     held_pipes.push(pipe);
                     handle
+                }
+                InheritableFd::UnixSocket(socket) => {
+                    held_sockets.push(Arc::clone(socket));
+                    socket.handle()
                 }
             };
             fd_handles.push(handle);

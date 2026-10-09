@@ -152,7 +152,7 @@ pub(super) fn encode_fs_request(encoder: &mut Encoder, request: FileRequest) {
     }
 }
 
-fn decode_mode(decoder: &mut Decoder<'_>) -> Result<FileMode, WireError> {
+pub(super) fn decode_mode(decoder: &mut Decoder<'_>) -> Result<FileMode, WireError> {
     FileMode::from_bits(decoder.u16()?).ok_or(WireError::InvalidTag)
 }
 
@@ -312,7 +312,7 @@ pub(super) fn decode_fs_response(decoder: &mut Decoder<'_>) -> Result<FileRespon
     }
 }
 
-fn encode_file_error(encoder: &mut Encoder, error: FileError) {
+pub(super) fn encode_file_error(encoder: &mut Encoder, error: FileError) {
     encoder.u8(match error {
         FileError::AccessNotAllowed => 1,
         FileError::NoWritePermissions => 2,
@@ -338,7 +338,7 @@ fn encode_file_error(encoder: &mut Encoder, error: FileError) {
     });
 }
 
-fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, WireError> {
+pub(super) fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, WireError> {
     match decoder.u8()? {
         1 => Ok(FileError::AccessNotAllowed),
         2 => Ok(FileError::NoWritePermissions),
@@ -365,12 +365,12 @@ fn decode_file_error(decoder: &mut Decoder<'_>) -> Result<FileError, WireError> 
     }
 }
 
-fn encode_user(encoder: &mut Encoder, user: FileUser) {
+pub(super) fn encode_user(encoder: &mut Encoder, user: FileUser) {
     encoder.u16(user.user);
     encoder.u16(user.group);
 }
 
-fn decode_user(decoder: &mut Decoder<'_>) -> Result<FileUser, WireError> {
+pub(super) fn decode_user(decoder: &mut Decoder<'_>) -> Result<FileUser, WireError> {
     Ok(FileUser {
         user: decoder.u16()?,
         group: decoder.u16()?,

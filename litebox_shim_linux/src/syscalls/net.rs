@@ -1377,7 +1377,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
-                let socket = UnixSocket::new(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                let socket = UnixSocket::new(&self.global.litebox, ty, flags)?;
                 let typed = self
                     .global
                     .litebox
@@ -1436,7 +1436,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             AddressFamily::UNIX => {
                 let _ = UnixProtocol::try_from(protocol).map_err(|_| Errno::EPROTONOSUPPORT)?;
                 let (sock1, sock2) =
-                    UnixSocket::new_connected_pair(ty, flags).ok_or(Errno::ESOCKTNOSUPPORT)?;
+                    UnixSocket::new_connected_pair(&self.global.litebox, ty, flags)?;
                 let files = self.files.borrow();
                 let mut dt = self.global.litebox.descriptor_table_mut();
                 let typed1 =
@@ -1797,7 +1797,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             &self.global,
             socket,
             |fd| self.global.listen(fd, backlog),
-            |file| file.listen(backlog, &self.global),
+            |file| file.listen(backlog),
         )
     }
 
@@ -2110,19 +2110,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .transpose()?;
                 Ok((chunk_waitall, is_stream, deadline))
             }
-            ReceiveSocket::Unix(handle) => handle.with_entry(|entry| {
-                let deadline = entry
-                    .recv_timeout()
-                    .map(|timeout| {
-                        self.global
-                            .platform
-                            .now()
-                            .checked_add(timeout)
-                            .ok_or(Errno::EINVAL)
-                    })
-                    .transpose()?;
-                Ok((false, entry.is_stream(), deadline))
-            }),
+            // The Unix socket applies its own receive timeout to each receive.
+            ReceiveSocket::Unix(handle) => {
+                Ok((false, handle.with_entry(UnixSocket::is_stream), None))
+            }
         }
     }
 
@@ -2205,16 +2196,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             ReceiveSocket::Unix(handle) => handle.with_entry(|entry| {
                 let mut addr = None;
-                let timeout = deadline.map(|deadline| {
-                    deadline
-                        .checked_duration_since(&self.global.platform.now())
-                        .unwrap_or(core::time::Duration::ZERO)
-                });
                 let size = entry.recvfrom(
                     &self.wait_cx(),
                     buf,
                     flags,
-                    timeout,
                     if want_source { Some(&mut addr) } else { None },
                 )?;
                 let src_addr = addr.map(SocketAddress::Unix);
@@ -2649,7 +2634,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
             },
-            |unix| Ok(SocketAddress::Unix(unix.get_local_addr())),
+            |unix| unix.get_local_addr().map(SocketAddress::Unix),
         )
     }
 
@@ -2676,11 +2661,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(SocketAddress::Inet)
                     .map_err(Errno::from)
             },
-            |file| {
-                file.get_peer_addr()
-                    .ok_or(Errno::ENOTCONN)
-                    .map(SocketAddress::Unix)
-            },
+            |file| file.get_peer_addr().map(SocketAddress::Unix),
         )
     }
 
@@ -2716,8 +2697,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             },
             |file| {
                 let how = ShutdownHow::try_from(how).map_err(|_| Errno::EINVAL)?;
-                file.shutdown(how);
-                Ok(())
+                file.shutdown(how)
             },
         )
     }
@@ -3862,7 +3842,7 @@ mod unix_tests {
             &client_fd,
             SocketAddress::Unix(UnixSocketAddr::Path(addr.to_string())),
         );
-        assert_eq!(result.unwrap_err(), Errno::ECONNREFUSED);
+        assert_eq!(result.unwrap_err(), Errno::ENOENT);
         close_socket(&task, raw_client_fd);
 
         let raw_server_fd = create_unix_server_socket(
@@ -3946,11 +3926,15 @@ mod unix_tests {
                     },
                 );
                 let client_fd = typed_socket(&task, raw_client_fd);
-                if is_nonblocking {
-                    ppoll(&task, raw_server_fd, Events::OUT);
+                // A listener never polls writable, so a non-blocking connect
+                // retries while the backlog is full.
+                loop {
+                    match task.do_connect(&client_fd, SocketAddress::Unix(client_addr.clone())) {
+                        Ok(()) => break,
+                        Err(Errno::EAGAIN) if is_nonblocking => std::thread::yield_now(),
+                        Err(error) => panic!("connect failed: {error:?}"),
+                    }
                 }
-                task.do_connect(&client_fd, SocketAddress::Unix(client_addr.clone()))
-                    .unwrap();
                 client_fds.push((raw_client_fd, client_fd));
             }
 

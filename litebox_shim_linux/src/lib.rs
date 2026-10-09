@@ -61,7 +61,6 @@ macro_rules! log_unsupported {
     };
 }
 
-pub(crate) mod channel;
 pub mod loader;
 pub(crate) mod stdio;
 pub mod syscalls;
@@ -406,7 +405,6 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
             boot_time: self.platform.now(),
             process_id: self.process_id,
             litebox,
-            unix_addr_table: litebox::sync::RwLock::new(syscalls::unix::UnixAddrTable::new()),
             elf_patch_cache: litebox::sync::Mutex::new(alloc::collections::BTreeMap::new()),
         });
         LinuxShim(global)
@@ -1519,8 +1517,6 @@ struct GlobalState<Platform: ShimPlatform> {
     boot_time: <Platform as TimeProvider>::Instant,
     /// Process ID assigned to this shim.
     process_id: i32,
-    /// UNIX domain socket address table
-    unix_addr_table: litebox::sync::RwLock<Platform, syscalls::unix::UnixAddrTable<Platform>>,
     /// Per-process collection of ELF patching state for runtime syscall rewriting.
     elf_patch_cache: litebox::sync::Mutex<Platform, syscalls::mm::ElfPatchCache>,
 }
