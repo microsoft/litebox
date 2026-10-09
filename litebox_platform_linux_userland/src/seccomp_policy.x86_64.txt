@@ -1,0 +1,37 @@
+# Host syscalls admitted after the seccomp filter is installed (x86_64).
+# Generated from seccomp_policy.rs; everything not listed is denied.
+read               any arguments                                terminal and broker I/O
+write              any arguments                                terminal and broker I/O
+poll               any arguments                                terminal and broker I/O
+mmap               any arguments                                memory management
+mprotect           any arguments                                memory management
+munmap             any arguments                                memory management
+mremap             any arguments                                memory management
+rt_sigreturn       any arguments                                signal handling
+sigaltstack        any arguments                                signal handling
+tgkill             any arguments                                signal handling
+timer_create       any arguments                                signal handling
+timer_settime      any arguments                                signal handling
+timer_delete       any arguments                                signal handling
+rt_sigaction       any arguments [debug builds only]            pthread_create setuid support; quiets debug warnings
+rt_sigprocmask     any arguments                                signal handling
+exit               any arguments                                thread management
+exit_group         any arguments                                thread management
+clone3             any arguments                                thread management
+futex              any arguments                                synchronization
+getrandom          any arguments                                randomness
+rseq               any arguments                                std thread spawn
+set_robust_list    any arguments                                std thread spawn
+get_robust_list    any arguments                                std thread spawn
+sched_getaffinity  any arguments                                std thread spawn
+gettid             any arguments                                std thread spawn
+madvise            any arguments                                std thread spawn
+brk                any arguments                                libc allocator
+getpid             any arguments                                libc allocator
+open               arg1:u32 == 0x0                              copy-on-write file regions (`try_allocate_cow_pages`)
+sendto             arg4:u64 == 0x0 && arg5:u64 == 0x0           connected UnixStream I/O
+recvfrom           arg4:u64 == 0x0 && arg5:u64 == 0x0           connected UnixStream I/O
+close              any arguments                                closing descriptors
+pread64            arg0:u32 in positional_io_fds                broker shared memory (positional I/O)
+pwrite64           arg0:u32 in positional_io_fds                broker shared memory (positional I/O)
+shutdown           arg0:u32 in shutdown_fds && arg1:u32 == 0x2  association failure interrupts liveness waits
