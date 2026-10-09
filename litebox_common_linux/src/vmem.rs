@@ -18,6 +18,7 @@ use litebox::platform::page_mgmt::AllocationDirection;
 use litebox::platform::page_mgmt::AllocationError;
 use litebox::platform::page_mgmt::CowAllocationError;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
+use litebox::platform::page_mgmt::HintPlacementBehavior;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox::platform::page_mgmt::RemapError;
 use litebox::platform::{
@@ -962,9 +963,12 @@ where
             FixedAddressBehavior::Hint(direction) => Some(direction),
             FixedAddressBehavior::Replace | FixedAddressBehavior::NoReplace => None,
         };
+        // A relocated hint may escape the range vmem searched even when the platform preserves
+        // its direction, so enforce an exact address when vmem has a stricter upper bound.
         let platform_behavior = match behavior {
             FixedAddressBehavior::Hint(direction)
-                if !Platform::HINT_PLACEMENT_BEHAVIOR.supports(direction) =>
+                if Platform::PLACEMENT_ADDR_MAX < Platform::TASK_ADDR_MAX
+                    || !Platform::HINT_PLACEMENT_BEHAVIOR.supports(direction) =>
             {
                 FixedAddressBehavior::NoReplace
             }
@@ -990,8 +994,8 @@ where
                     if direction.is_some()
                         && platform_behavior == FixedAddressBehavior::NoReplace =>
                 {
-                    // Retry if the requested behavior is `Hint` but the suggested address is already
-                    // in use and the platform does not support the required search direction.
+                    // Retry if the requested hint must be placed exactly to preserve its search
+                    // direction or vmem's stricter placement bound.
                     let rejected_hint = request
                         .suggested_address
                         .is_some_and(|address| address.as_usize() == new_addr);
@@ -1166,31 +1170,44 @@ where
         if vma.is_file_backed() {
             unimplemented!("file-backed mapping move is not supported yet");
         }
-        let new_addr = self
-            .get_unmmaped_area(
-                suggested_new_address,
-                new_size,
-                FixedAddressBehavior::Hint(AllocationDirection::TopDown),
-            )
-            .map_err(|_| VmemMoveError::OutOfMemory)?
-            .ok_or(VmemMoveError::OutOfMemory)?;
-        let new_range = PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
-        // SAFETY: The caller excludes source users, and `get_unmmaped_area` found a disjoint gap.
-        let new_addr = match unsafe {
-            self.reservations.remap(
-                self.platform,
-                old_range.into(),
-                new_range.into(),
-                vma.flags.into(),
-            )
-        } {
-            Ok(new_addr) => new_addr,
-            Err(RemapError::UnsupportedByPlatform) => {
-                // SAFETY: The caller excludes source users, and the copy only places pages with
-                // hints, which never replace existing mappings.
-                return unsafe { self.remap_fallback_with_copy(old_range, new_range, vma) };
+        let mut request = Self::build_unmapped_area_request(
+            suggested_new_address,
+            new_size,
+            FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+        );
+        let new_addr = loop {
+            let new_addr = self
+                .find_area(&request)
+                .map_err(|_| VmemMoveError::OutOfMemory)?
+                .ok_or(VmemMoveError::OutOfMemory)?;
+            let new_range =
+                PageRange::<ALIGN>::new(new_addr, new_addr + new_size.as_usize()).unwrap();
+            // SAFETY: The caller excludes source users, and find_area found a disjoint guest gap.
+            match unsafe {
+                self.reservations.remap(
+                    self.platform,
+                    old_range.into(),
+                    new_range.into(),
+                    vma.flags.into(),
+                )
+            } {
+                Ok(new_addr) => break new_addr,
+                Err(RemapError::AddressInUseByPlatform) => {
+                    request.suggested_address = None;
+                    request.address_range.end = new_range.start;
+                }
+                Err(RemapError::AlreadyAllocated)
+                    if Platform::HINT_PLACEMENT_BEHAVIOR == HintPlacementBehavior::Exact =>
+                {
+                    unreachable!("exact-placement platform rejected a free remap destination")
+                }
+                Err(RemapError::UnsupportedByPlatform) => {
+                    // SAFETY: The caller excludes source users, and the copy only places pages
+                    // with hints, which never replace existing mappings.
+                    return unsafe { self.remap_fallback_with_copy(old_range, new_range, vma) };
+                }
+                Err(error) => return Err(VmemMoveError::RemapError(error)),
             }
-            Err(error) => return Err(VmemMoveError::RemapError(error)),
         };
 
         let new_start = new_addr.as_usize();
@@ -1502,25 +1519,6 @@ where
 
     /*================================Internal Functions================================ */
 
-    /// Get an unmapped area in the virtual address space.
-    /// `suggested_address` and `behavior` are the hint address and placement policy respectively,
-    /// similar to how `mmap` works.
-    ///
-    /// Returns `None` if no area was found. Otherwise, returns the start address of an
-    /// `ALIGN`-aligned area.
-    pub(super) fn get_unmmaped_area(
-        &self,
-        suggested_address: Option<NonZeroAddress<ALIGN>>,
-        length: NonZeroPageSize<ALIGN>,
-        behavior: FixedAddressBehavior,
-    ) -> Result<Option<usize>, AllocationError> {
-        self.find_area(&Self::build_unmapped_area_request(
-            suggested_address,
-            length,
-            behavior,
-        ))
-    }
-
     fn build_unmapped_area_request(
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
@@ -1804,9 +1802,15 @@ mod tests {
     type TrackedDummyReservations = TrackedReservations<DummyReservation<PAGE_SIZE>>;
 
     /// A configurable dummy page-management backend.
-    struct DummyVmemBackend<const TOP_DOWN: bool = false, Store = UntrackedDummyReservations> {
+    struct DummyVmemBackend<
+        const TOP_DOWN: bool = false,
+        Store = UntrackedDummyReservations,
+        const LIMITED_PLACEMENT: bool = false,
+    > {
         rejected_address: Option<usize>,
+        rejected_remap_address: Mutex<Option<usize>>,
         remap_unsupported: bool,
+        remap_calls: Mutex<Vec<Range<usize>>>,
         rejected_commit: Option<usize>,
         calls: Mutex<Vec<AllocationCall>>,
         decommits: Mutex<Vec<Range<usize>>>,
@@ -1815,16 +1819,17 @@ mod tests {
         store: core::marker::PhantomData<fn() -> Store>,
     }
 
-    impl<const TOP_DOWN: bool, Store> litebox::platform::RawPointerProvider
-        for DummyVmemBackend<TOP_DOWN, Store>
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool>
+        litebox::platform::RawPointerProvider
+        for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT>
     {
         type RawConstPointer<T: FromBytes> = TransparentConstPtr<T>;
         type RawMutPointer<T: FromBytes + IntoBytes> = TransparentMutPtr<T>;
     }
 
     #[expect(unused_variables, reason = "dummy/mock backend")]
-    impl<const TOP_DOWN: bool, Store> PageManagementProvider<PAGE_SIZE>
-        for DummyVmemBackend<TOP_DOWN, Store>
+    impl<const TOP_DOWN: bool, Store, const LIMITED_PLACEMENT: bool>
+        PageManagementProvider<PAGE_SIZE> for DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT>
     where
         Store: ReservationStore<Reservation = DummyReservation<PAGE_SIZE>> + Default,
         Store::ReleaseTarget: Into<Range<usize>>,
@@ -1843,6 +1848,11 @@ mod tests {
         const TASK_ADDR_MIN: usize = 0x1_0000; // Vmem unit-test bound
         #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
         const TASK_ADDR_MAX: usize = 0x7FFF_FE00_0000; // MACH_VM_MAX_ADDRESS
+        const PLACEMENT_ADDR_MAX: usize = if LIMITED_PLACEMENT {
+            Self::TASK_ADDR_MAX - PAGE_SIZE
+        } else {
+            Self::TASK_ADDR_MAX
+        };
         const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
             HintPlacementBehavior::Directional(if TOP_DOWN {
                 AllocationDirection::TopDown
@@ -1934,6 +1944,10 @@ mod tests {
             Reservations:
                 Iterator<Item = litebox::platform::page_mgmt::ReservationOf<Self, PAGE_SIZE>>,
         {
+            self.remap_calls.lock().push(new_range.clone());
+            if *self.rejected_remap_address.lock() == Some(new_range.start) {
+                return Err(litebox::platform::page_mgmt::RemapError::AddressInUseByPlatform);
+            }
             if self.remap_unsupported {
                 return Err(litebox::platform::page_mgmt::RemapError::UnsupportedByPlatform);
             }
@@ -1959,31 +1973,29 @@ mod tests {
                 .push((range, new_permissions));
             Ok(())
         }
-
-        fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>> {
-            core::iter::empty()
-        }
     }
 
     fn dummy_backend<const TOP_DOWN: bool>(
         rejected_address: Option<usize>,
     ) -> &'static DummyVmemBackend<TOP_DOWN> {
-        new_dummy_backend(rejected_address, None)
+        new_dummy_backend::<TOP_DOWN, UntrackedDummyReservations, false>(rejected_address, None)
     }
 
     fn tracked_dummy_backend(
         rejected_commit: Option<usize>,
     ) -> &'static DummyVmemBackend<false, TrackedDummyReservations> {
-        new_dummy_backend(None, rejected_commit)
+        new_dummy_backend::<false, TrackedDummyReservations, false>(None, rejected_commit)
     }
 
-    fn new_dummy_backend<const TOP_DOWN: bool, Store: 'static>(
+    fn new_dummy_backend<const TOP_DOWN: bool, Store: 'static, const LIMITED_PLACEMENT: bool>(
         rejected_address: Option<usize>,
         rejected_commit: Option<usize>,
-    ) -> &'static DummyVmemBackend<TOP_DOWN, Store> {
+    ) -> &'static DummyVmemBackend<TOP_DOWN, Store, LIMITED_PLACEMENT> {
         Box::leak(Box::new(DummyVmemBackend {
             rejected_address,
+            rejected_remap_address: Mutex::new(None),
             remap_unsupported: false,
+            remap_calls: Mutex::new(Vec::new()),
             rejected_commit,
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),
@@ -1991,6 +2003,43 @@ mod tests {
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,
         }))
+    }
+
+    #[test]
+    fn remap_retries_below_a_platform_collision() {
+        let backend = dummy_backend::<true>(None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        let source = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        unsafe {
+            vmem.create_mapping(
+                NonZeroAddress::new(source),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::FIXED_ADDR,
+            )
+        }
+        .unwrap();
+        let rejected = DummyVmemBackend::<true>::TASK_ADDR_MAX - PAGE_SIZE;
+        *backend.rejected_remap_address.lock() = Some(rejected);
+
+        let destination = unsafe {
+            vmem.move_mappings(
+                PageRange::new(source, source + PAGE_SIZE).unwrap(),
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(destination, rejected - PAGE_SIZE);
+        assert_eq!(
+            *backend.remap_calls.lock(),
+            [
+                rejected..rejected + PAGE_SIZE,
+                destination..destination + PAGE_SIZE,
+            ]
+        );
     }
 
     #[test]
@@ -2057,6 +2106,33 @@ mod tests {
             [(
                 address..address + PAGE_SIZE,
                 FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            )]
+        );
+    }
+
+    #[test]
+    fn limited_placement_range_uses_no_replace() {
+        type Backend = DummyVmemBackend<true, UntrackedDummyReservations, true>;
+        let backend = new_dummy_backend::<true, UntrackedDummyReservations, true>(None, None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+
+        let address = unsafe {
+            vmem.create_mapping(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::TOP_DOWN,
+            )
+        }
+        .unwrap()
+        .as_usize();
+
+        assert_eq!(address, Backend::PLACEMENT_ADDR_MAX - PAGE_SIZE);
+        assert_eq!(
+            *backend.calls.lock(),
+            [(
+                address..address + PAGE_SIZE,
+                FixedAddressBehavior::NoReplace,
             )]
         );
     }
@@ -2668,7 +2744,9 @@ mod tests {
     fn copying_remap_of_shared_mapping_passes_only_access_permissions() {
         let backend: &'static DummyVmemBackend = Box::leak(Box::new(DummyVmemBackend {
             rejected_address: None,
+            rejected_remap_address: Mutex::new(None),
             remap_unsupported: true,
+            remap_calls: Mutex::new(Vec::new()),
             rejected_commit: None,
             calls: Mutex::new(Vec::new()),
             decommits: Mutex::new(Vec::new()),

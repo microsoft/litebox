@@ -364,7 +364,7 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     ///
     /// - `source_reservations`: Lazily transfers ownership of reservations covering `old_range`.
     /// - `old_range`: The existing address range to remap.
-    /// - `new_range`: The requested address range for the remapped pages.
+    /// - `new_range`: The exact address range for the remapped pages.
     /// - `permissions`: The permissions to apply to the remapped pages.
     ///
     /// # Returns
@@ -394,11 +394,6 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     {
         Err(RemapError::UnsupportedByPlatform)
     }
-
-    /// Return reserved pages that are not available for allocation.
-    ///
-    /// Note that the returned ranges should be `ALIGN`-aligned.
-    fn reserved_pages(&self) -> impl Iterator<Item = &Range<usize>>;
 
     /// Hints that the caller is about to fill the allocated pages in `range` with data from their
     /// start, possibly stopping short of the end (e.g., at the end of a file copied into them).
@@ -521,6 +516,8 @@ pub enum RemapError {
     Overlapping,
     #[error("provided new range is already allocated")]
     AlreadyAllocated,
+    #[error("provided new range is in use by the platform")]
+    AddressInUseByPlatform,
     #[error("requested page permissions are denied")]
     PermissionDenied,
     #[error("out of memory")]
