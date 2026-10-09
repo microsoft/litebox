@@ -1,0 +1,19 @@
+[package]
+name = "litebox_broker_vm_kernel"
+version = "0.1.0"
+edition = "2024"
+description = "The LiteBox VM kernel's broker: serves runner processes' broker associations"
+
+[dependencies]
+litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
+litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
+litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
+litebox_common_vm_abi = { path = "../litebox_common_vm_abi", version = "0.1.0" }
+litebox_hal = { path = "../litebox_hal", version = "0.1.0" }
+litebox_platform_vm_kernel = { path = "../litebox_platform_vm_kernel", version = "0.1.0" }
+log = { version = "0.4", default-features = false }
+
+[lints]
+workspace = true

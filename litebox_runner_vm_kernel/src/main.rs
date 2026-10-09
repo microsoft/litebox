@@ -15,7 +15,6 @@
 
 extern crate alloc;
 
-mod broker;
 mod client;
 mod payload;
 mod service;

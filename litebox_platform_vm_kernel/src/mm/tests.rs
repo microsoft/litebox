@@ -377,3 +377,32 @@ fn task_tables_share_only_kernel_slots() {
     assert_eq!(live_frames(), before_task);
     check_mapped(&base, kernel_va, kernel_flags);
 }
+
+#[test]
+fn user_writable_frames_are_found_only_for_writable_pages() {
+    let pgtable = new_table();
+    let start = 0x1000_0000;
+    let rw = VmFlags::VM_READ | VmFlags::VM_WRITE;
+    // Safety: a fresh table; the range is unmapped user space.
+    unsafe { pgtable.map_pages(range(start, 3), rw, true) }.unwrap();
+    // Safety: nothing uses the page.
+    unsafe { pgtable.mprotect_pages(range(start + PAGE_SIZE, 1), VmFlags::VM_READ) }.unwrap();
+    // Safety: as above.
+    unsafe { pgtable.mprotect_pages(range(start + 2 * PAGE_SIZE, 1), VmFlags::empty()) }.unwrap();
+    assert_eq!(
+        pgtable.user_writable_frame(VirtAddr::new(start as u64 + 5)),
+        Some(mapped_frame(&pgtable, start))
+    );
+    assert_eq!(
+        pgtable.user_writable_frame(VirtAddr::new((start + PAGE_SIZE) as u64)),
+        None
+    );
+    assert_eq!(
+        pgtable.user_writable_frame(VirtAddr::new((start + 2 * PAGE_SIZE) as u64)),
+        None
+    );
+    assert_eq!(
+        pgtable.user_writable_frame(VirtAddr::new((start + 3 * PAGE_SIZE) as u64)),
+        None
+    );
+}

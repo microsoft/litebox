@@ -26,7 +26,6 @@ extern crate alloc;
 /// The longest request [`Process::call`] accepts, and the longest reply.
 pub const MAX_MESSAGE_LEN: u64 = layout::MESSAGE_WINDOW.len;
 
-mod broker;
 mod layout;
 pub mod loader;
 mod lockdown;
@@ -40,7 +39,7 @@ use core::cell::{Cell, RefCell};
 use core::ops::Range;
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::TruncateExt as _;
-use litebox_broker_core::BrokerCore;
+use litebox_broker_vm_kernel::{Association, Broker, EnterError};
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::envelope::Envelope;
 use litebox_common_vm_abi::{
@@ -50,7 +49,7 @@ use litebox_common_vm_abi::{
     RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest, StartupInfo, Status, UnmapRequest,
     UpcallFrame, UpcallKind, UserRange,
 };
-use litebox_platform_vm_kernel::{AddressSpaceId, VmKernel};
+use litebox_platform_vm_kernel::{AddressSpaceId, PinnedUserPages, VmKernel};
 use zerocopy::IntoBytes;
 
 use memory::{Mappings, checked_range, copy_from_user, copy_to_user};
@@ -75,6 +74,8 @@ pub enum SpawnError {
     ImagesTooLarge,
     #[error("mapping failed: {0:?}")]
     Map(Status),
+    #[error("pinning the broker control ring failed: {0:?}")]
+    Pin(litebox_common_linux::errno::Errno),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,7 +125,7 @@ struct Inner {
     /// See [`loader::LoadedRunner::executable`].
     executable: Vec<Range<u64>>,
     mappings: Mappings,
-    broker: broker::Broker,
+    broker: Association,
     /// Borrowed briefly: killing the process replaces it.
     state: RefCell<State>,
     lockdown: Cell<lockdown::Lockdown>,
@@ -152,14 +153,14 @@ impl Process {
     /// If the new address space cannot be activated.
     pub fn spawn(
         platform: &'static VmKernel,
-        broker_core: BrokerCore,
+        broker: &Broker,
         config: &ProcessConfig<'_>,
     ) -> Result<Self, SpawnError> {
         let address_space = platform.create_address_space();
         // Safety: the kernel holds no references into user memory.
         unsafe { platform.switch_address_space(address_space) }
             .expect("a freshly created address space is registered");
-        Self::populate(platform, address_space, broker_core, config).inspect_err(|_| {
+        Self::populate(platform, address_space, broker, config).inspect_err(|_| {
             // Safety: nothing references the half-built process's memory, and
             // it never ran, so its frames are exclusively owned.
             unsafe { release_address_space(platform, address_space) };
@@ -169,7 +170,7 @@ impl Process {
     fn populate(
         platform: &'static VmKernel,
         address_space: AddressSpaceId,
-        broker_core: BrokerCore,
+        broker: &Broker,
         config: &ProcessConfig<'_>,
     ) -> Result<Self, SpawnError> {
         let mappings = Mappings::new(platform);
@@ -190,6 +191,8 @@ impl Process {
         lazy(layout::MESSAGE_WINDOW)?;
         lazy(layout::BROKER_SHARED_MEMORY)?;
         lazy(layout::HEAP)?;
+        let control_ring = pin_control_ring(platform, address_space, &mappings)?;
+        let broker = broker.associate(layout::BROKER_SHARED_MEMORY, control_ring);
         let images = map_images(&mappings, config.images)?;
 
         let info = StartupInfo {
@@ -203,6 +206,7 @@ impl Process {
             upcall_stack: layout::UPCALL_STACK,
             message_window: layout::MESSAGE_WINDOW,
             broker_shared_memory: layout::BROKER_SHARED_MEMORY,
+            broker_control_ring: layout::BROKER_CONTROL_RING,
         };
         map_read_only(&mappings, layout::STARTUP_INFO, info.as_bytes())?;
 
@@ -215,7 +219,7 @@ impl Process {
                 gate: runner.gate,
                 executable: runner.executable,
                 mappings,
-                broker: broker::Broker::new(broker_core, layout::BROKER_SHARED_MEMORY),
+                broker,
                 state: RefCell::new(State::New),
                 lockdown: Cell::new(lockdown::Lockdown::OPEN),
                 entries: Cell::new(0),
@@ -380,6 +384,27 @@ unsafe fn release_address_space(platform: &VmKernel, address_space: AddressSpace
 
 fn region_range(region: UserRange) -> Range<usize> {
     usize::try_from(region.start).unwrap()..usize::try_from(region.end()).unwrap()
+}
+
+/// Populated and pinned at creation. Nothing unmaps or remaps it: the
+/// runner's calls are confined to the runner-managed area.
+fn pin_control_ring(
+    platform: &VmKernel,
+    address_space: AddressSpaceId,
+    mappings: &Mappings,
+) -> Result<PinnedUserPages, SpawnError> {
+    let range = region_range(layout::BROKER_CONTROL_RING);
+    mappings
+        .map(
+            range.clone(),
+            Prot::ReadWrite,
+            Placement::NoReplace,
+            Populate::Now,
+        )
+        .map_err(SpawnError::Map)?;
+    // Safety: see above; unregistering the address space frees nothing while
+    // pinned.
+    unsafe { platform.pin_user_pages(address_space, range) }.map_err(SpawnError::Pin)
 }
 
 /// Read-only, packed in [`layout::IMAGES`] with a guard page after each.
@@ -550,17 +575,14 @@ impl Inner {
             Request::Unmap(r) => respond(&r, slot, self.unmap(&r)),
             Request::Protect(r) => respond(&r, slot, self.protect(&r)),
             Request::BrokerHandshake(r) => respond(&r, slot, self.broker.handshake(&r.0)),
-            Request::BrokerCall(r) => {
-                let lockdown = self.lockdown.get();
-                let result = match self.broker.call(&r.0, |op| lockdown.permits_broker_op(op)) {
-                    Ok(frame) => Ok(frame),
-                    Err(broker::CallError::Status(status)) => Err(status),
-                    Err(broker::CallError::NotPermitted(op)) => {
-                        return self.violation("broker operation not allowed by the lockdown", op);
-                    }
-                };
-                respond(&r, slot, result)
-            }
+            Request::BrokerEnter(r) => match self.broker.enter(&r) {
+                Ok(()) => respond(&r, slot, Ok(())),
+                Err(EnterError::Status(status)) => Flow::Return(Err(status)),
+                Err(EnterError::Failed) => {
+                    self.kill("broker association failed");
+                    Flow::Stop
+                }
+            },
             Request::DeriveKey(r) => respond(&r, slot, self.derive_key(&r)),
             Request::Log(r) => respond(&r, slot, Self::log(&r)),
             Request::Exit(r) => {

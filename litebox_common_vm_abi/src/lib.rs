@@ -65,9 +65,9 @@
 //!
 //! # Lockdown
 //!
-//! [`CallId::Restrict`] irrevocably narrows the allowed calls, broker
-//! operations, and page permissions. A violation kills the process.
-//! [`CallId::Exit`] is always allowed.
+//! [`CallId::Restrict`] irrevocably narrows the allowed calls and page
+//! permissions. A violation kills the process. [`CallId::Exit`] is always
+//! allowed.
 //!
 //! # Trust
 //!
@@ -75,6 +75,31 @@
 //! any call. Every call is scoped to the calling process, and identity-bound
 //! results (derived keys) bind to [`StartupInfo::identity`], fixed at process
 //! creation.
+//!
+//! # Broker
+//!
+//! Active traffic uses the userland broker's shared-memory transport, served
+//! like `io_uring`:
+//!
+//! - [`CallId::BrokerHandshake`] negotiates the association and activates the
+//!   control ring (`litebox_broker_transport::control_ring`) at the start of
+//!   [`StartupInfo::broker_control_ring`] and the shared buffers in
+//!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring
+//!   layout.
+//! - The runner publishes requests and consumes responses.
+//!   [`CallId::BrokerEnter`] stands in for the userland transport's futex:
+//!   [`BrokerEnterOp::Wake`] and [`BrokerEnterOp::Wait`] on ring words. The
+//!   kernel serves every published request first.
+//! - The ring's notification direction carries readiness of broker objects
+//!   (e.g., timers) from the kernel. The kernel's broker provides only
+//!   randomness so far, so it produces none yet.
+//! - The kernel pins the control ring and accesses it through its own mapping.
+//!   The shared buffers stay lazily populated and are touched only while
+//!   executing a request that names them.
+//! - If the response ring is full, the kernel holds one response and consumes
+//!   no further request.
+//! - A malformed ring or request kills the process. Before the handshake,
+//!   `BrokerEnter` is [`Status::Denied`].
 
 #![no_std]
 
@@ -82,7 +107,8 @@ pub mod envelope;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-/// Must change with any incompatible change to this crate.
+/// Must change with any incompatible change to this crate or to the broker's
+/// control-ring layout.
 pub const ABI_VERSION: u32 = 1;
 
 /// The section holding the runner's only `syscall` instruction.
@@ -134,6 +160,10 @@ pub enum Status {
     /// Not permitted in the process's current state.
     Denied = 7,
     Unsupported = 8,
+    /// A deadline passed.
+    TimedOut = 9,
+    /// A wait that nothing could end.
+    Stalled = 10,
 }
 
 impl Status {
@@ -259,11 +289,10 @@ kernel_calls! {
     /// together is [`Status::Denied`].
     5 => Protect(ProtectRequest) -> ();
     /// `litebox_broker_protocol` wire frames. One attempt, successful or not;
-    /// later ones are [`Status::Denied`].
+    /// later ones are [`Status::Denied`]. See [Broker](crate#broker).
     6 => BrokerHandshake(BrokerHandshakeFrame) -> WireFrame;
-    /// `litebox_broker_protocol` wire frames; payloads in
-    /// [`StartupInfo::broker_shared_memory`].
-    7 => BrokerCall(BrokerRequestFrame) -> WireFrame;
+    /// Serves the broker's request ring. See [Broker](crate#broker).
+    7 => BrokerEnter(BrokerEnterRequest) -> ();
     /// The key is bound to [`StartupInfo::identity`] and `context`.
     8 => DeriveKey(DeriveKeyRequest) -> DeriveKeyReply;
     9 => Log(LogRequest) -> ();
@@ -360,80 +389,6 @@ impl ProtSet {
     }
 }
 
-macro_rules! broker_ops {
-    ($( $name:ident = $id:literal, )*) => {
-        /// `litebox_broker_protocol::message::BrokerOperation` variants. The
-        /// numbers are this ABI's ([`BrokerOpSet`] bits), not the protocol's.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub enum BrokerOp {
-            $( $name = $id, )*
-        }
-
-        impl BrokerOpSet {
-            pub const ALL: Self = Self(0 $( | 1 << $id )*);
-        }
-    };
-}
-
-broker_ops! {
-    CreateThread = 0,
-    ExitThread = 1,
-    CloseObject = 2,
-    CheckReadiness = 3,
-    GetStatusFlags = 4,
-    SetStatusFlags = 5,
-    Event = 6,
-    Pipe = 7,
-    Socket = 8,
-    FillRandom = 9,
-    File = 10,
-    StartChildProcess = 11,
-    GetProcessExitStatus = 12,
-    ExitChildProcess = 13,
-    ReportExitStatus = 14,
-    SetChildReaping = 15,
-    DuplicateObjectsToChild = 16,
-    Timer = 17,
-    Signal = 18,
-    WriteChildMemory = 19,
-}
-
-/// One bit per [`BrokerOp`] value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(transparent)]
-pub struct BrokerOpSet(u64);
-
-impl BrokerOpSet {
-    pub const EMPTY: Self = Self(0);
-
-    /// `None` for unknown bits.
-    pub const fn from_bits(bits: u64) -> Option<Self> {
-        if bits & !Self::ALL.0 == 0 {
-            Some(Self(bits))
-        } else {
-            None
-        }
-    }
-
-    pub const fn bits(self) -> u64 {
-        self.0
-    }
-
-    #[must_use]
-    pub const fn with(self, op: BrokerOp) -> Self {
-        Self(self.0 | 1 << op as u32)
-    }
-
-    #[must_use]
-    pub const fn intersection(self, other: Self) -> Self {
-        Self(self.0 & other.0)
-    }
-
-    pub const fn contains(self, op: BrokerOp) -> bool {
-        self.0 & 1 << op as u32 != 0
-    }
-}
-
 /// Each set is intersected with the process's current one. Unknown bits are
 /// [`Status::InvalidArgument`]. Dropping [`CallId::Restrict`] from `calls`
 /// makes the lockdown final.
@@ -441,17 +396,15 @@ impl BrokerOpSet {
 #[repr(C)]
 pub struct RestrictRequest {
     pub calls: CallSet,
-    pub broker_ops: BrokerOpSet,
     /// For [`CallId::Map`] and [`CallId::Protect`].
     pub prots: ProtSet,
     reserved: Reserved,
 }
 
 impl RestrictRequest {
-    pub const fn new(calls: CallSet, broker_ops: BrokerOpSet, prots: ProtSet) -> Self {
+    pub const fn new(calls: CallSet, prots: ProtSet) -> Self {
         Self {
             calls,
-            broker_ops,
             prots,
             reserved: Reserved::Zero,
         }
@@ -600,7 +553,7 @@ impl ProtectRequest {
     }
 }
 
-/// Inline wire frame; holds any broker control message.
+/// Inline wire frame; holds any broker handshake message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct WireFrame {
@@ -630,9 +583,49 @@ impl WireFrame {
 #[repr(transparent)]
 pub struct BrokerHandshakeFrame(pub WireFrame);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(transparent)]
-pub struct BrokerRequestFrame(pub WireFrame);
+/// The futex operations of the userland transport, on control-ring words.
+/// Both serve published requests first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(u32)]
+pub enum BrokerEnterOp {
+    Wake = 0,
+    /// Returns once the `u32` ring word at `offset`, an epoch, differs from
+    /// `expected`. [`Status::TimedOut`] at the deadline; [`Status::Stalled`]
+    /// if nothing could change the word. Deadlines are
+    /// [`Status::Unsupported`] so far.
+    Wait = 1,
+}
+
+/// `offset` is into the control ring and `deadline` a TSC value or zero for
+/// none. The other fields are zero for [`BrokerEnterOp::Wake`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct BrokerEnterRequest {
+    pub op: BrokerEnterOp,
+    pub expected: u32,
+    pub offset: u64,
+    pub deadline: u64,
+}
+
+impl BrokerEnterRequest {
+    pub const fn wake() -> Self {
+        Self {
+            op: BrokerEnterOp::Wake,
+            expected: 0,
+            offset: 0,
+            deadline: 0,
+        }
+    }
+
+    pub const fn wait(offset: u64, expected: u32, deadline: u64) -> Self {
+        Self {
+            op: BrokerEnterOp::Wait,
+            expected,
+            offset,
+            deadline,
+        }
+    }
+}
 
 /// `context.len` ≤ [`MAX_KDF_CONTEXT_LEN`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
@@ -820,8 +813,10 @@ pub struct StartupInfo {
     pub upcall_stack: UserRange,
     /// See [Messages](crate#messages).
     pub message_window: UserRange,
-    /// Accessed by the kernel only during the process's broker calls.
+    /// Broker payloads. See [Broker](crate#broker).
     pub broker_shared_memory: UserRange,
+    /// Broker control ring, at its start. See [Broker](crate#broker).
+    pub broker_control_ring: UserRange,
 }
 
 #[cfg(test)]
@@ -917,6 +912,27 @@ mod tests {
             LogRequest::new(LogLevel::Info, range).as_bytes(),
             4,
         );
+        check(
+            CallId::Restrict,
+            RestrictRequest::new(CallSet::ALL, ProtSet::ALL).as_bytes(),
+            12,
+        );
+    }
+
+    #[test]
+    fn broker_enter_ops_are_validated() {
+        let wait = BrokerEnterRequest::wait(8, 1, 42);
+        assert!(matches!(
+            Request::decode(CallId::BrokerEnter, wait.as_bytes()),
+            Ok(Request::BrokerEnter(r)) if r == wait
+        ));
+        let mut bytes = [0u8; size_of::<BrokerEnterRequest>()];
+        bytes.copy_from_slice(wait.as_bytes());
+        bytes[0] = 2;
+        assert_eq!(
+            Request::decode(CallId::BrokerEnter, &bytes).unwrap_err(),
+            Status::InvalidArgument
+        );
     }
 
     #[test]
@@ -964,10 +980,6 @@ mod tests {
         assert!(ProtSet::NO_EXEC.contains(Prot::ReadWrite));
         assert!(!ProtSet::NO_EXEC.contains(Prot::ReadExec));
         assert_eq!(ProtSet::from_bits(0x100), None);
-        assert!(BrokerOpSet::ALL.contains(BrokerOp::WriteChildMemory));
-        assert_eq!(BrokerOpSet::from_bits(BrokerOpSet::ALL.bits() + 1), None);
-        let random = BrokerOpSet::EMPTY.with(BrokerOp::FillRandom);
-        assert!(random.contains(BrokerOp::FillRandom) && !random.contains(BrokerOp::File));
     }
 
     #[test]

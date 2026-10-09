@@ -495,6 +495,83 @@ impl VmKernel {
             unsafe { self.page_table_manager.load_task(pt_id) }
         }
     }
+
+    /// Pins the present, writable pages of `range` in `address_space` for
+    /// access through the kernel mapping, whichever address space is current.
+    ///
+    /// # Safety
+    ///
+    /// Nothing may unmap or remap `range` while the result lives. The result
+    /// keeps the page table, which owns the frames, alive.
+    ///
+    /// # Errors
+    ///
+    /// `EINVAL` for an invalid range or [`AddressSpaceId::KERNEL`], `ENOENT`
+    /// for an unknown ID, and `EFAULT` for a page that is not present and
+    /// writable.
+    pub unsafe fn pin_user_pages(
+        &self,
+        address_space: AddressSpaceId,
+        range: core::ops::Range<usize>,
+    ) -> Result<PinnedUserPages, Errno> {
+        let range = PageRange::<PAGE_SIZE>::new(range.start, range.end).ok_or(Errno::EINVAL)?;
+        if range.is_empty() || range.start < USER_ADDR_MIN || range.end > USER_ADDR_MAX {
+            return Err(Errno::EINVAL);
+        }
+        if address_space == AddressSpaceId::KERNEL {
+            return Err(Errno::EINVAL);
+        }
+        let page_table = Arc::clone(
+            self.page_table_manager
+                .task_page_tables
+                .read()
+                .get(&address_space)
+                .ok_or(Errno::ENOENT)?,
+        );
+        let pages = range
+            .into_iter()
+            .map(|addr| {
+                let frame = page_table
+                    .user_writable_frame(VirtAddr::new(addr as u64))
+                    .ok_or(Errno::EFAULT)?;
+                Ok(Self::pa_to_va(frame.start_address()).as_u64().trunc())
+            })
+            .collect::<Result<_, Errno>>()?;
+        Ok(PinnedUserPages {
+            _page_table: page_table,
+            pages,
+        })
+    }
+}
+
+/// See [`VmKernel::pin_user_pages`]. The process may write these pages at any
+/// time: access them only with peer-safe operations, never through Rust
+/// references.
+pub struct PinnedUserPages {
+    /// Keeps the frames alive.
+    _page_table: Arc<mm::PageTable<PAGE_SIZE>>,
+    /// Kernel address of each page.
+    pages: alloc::boxed::Box<[usize]>,
+}
+
+impl PinnedUserPages {
+    /// In bytes.
+    pub fn len(&self) -> usize {
+        self.pages.len() * PAGE_SIZE
+    }
+
+    /// Never: [`VmKernel::pin_user_pages`] rejects empty ranges.
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    /// The kernel address of byte `offset` and the bytes left in its page;
+    /// `None` past the end.
+    pub fn kernel_address(&self, offset: usize) -> Option<(*mut u8, usize)> {
+        let page = *self.pages.get(offset / PAGE_SIZE)?;
+        let within = offset % PAGE_SIZE;
+        Some(((page + within) as *mut u8, PAGE_SIZE - within))
+    }
 }
 
 impl RawMutexProvider for VmKernel {

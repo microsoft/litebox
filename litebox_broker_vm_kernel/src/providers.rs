@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The kernel's broker core: hardware randomness only.
+//! The broker core's providers: hardware randomness only.
 
 use alloc::sync::Arc;
 use litebox_broker_core::{
@@ -21,12 +21,10 @@ impl RandomProvider for HardwareRandom {
     }
 }
 
-/// At most once: only one broker core may exist.
-///
 /// # Panics
 ///
 /// Without a hardware CSPRNG, or on a second call.
-pub fn core() -> BrokerCore {
+pub(crate) fn core() -> BrokerCore {
     BrokerCore::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::empty()),
         Arc::new(UnsupportedSocketProvider),

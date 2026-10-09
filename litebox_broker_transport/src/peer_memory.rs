@@ -224,9 +224,8 @@ const CHUNK_SIZE: usize = 64;
 ///
 /// As for [`copy`] with `length` equal to [`CHUNK_SIZE`].
 unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
-    // SAFETY: Guaranteed by the caller. SSE2 is part of the x86-64 baseline
-    // that this module requires.
-    #[cfg(target_arch = "x86_64")]
+    // SAFETY: Guaranteed by the caller.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     unsafe {
         asm!(
             "movdqu {a}, xmmword ptr [{source}]",
@@ -245,6 +244,18 @@ unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
             d = out(xmm_reg) _,
             options(nostack, preserves_flags),
         );
+    }
+    // Without SSE (kernel targets), word by word; those copy only small
+    // messages.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "sse2")))]
+    for offset in (0..CHUNK_SIZE).step_by(size_of::<u64>()) {
+        // SAFETY: Guaranteed by the caller.
+        unsafe {
+            copy_word(
+                source.wrapping_add(offset),
+                destination.wrapping_add(offset),
+            );
+        }
     }
     // SAFETY: Guaranteed by the caller. General-purpose registers keep this
     // usable on targets without floating-point registers.

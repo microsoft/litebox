@@ -4,11 +4,11 @@
 //! Serves entry requests for the process's one TA instance, in the message
 //! format of [`litebox_common_optee::envelope`].
 //!
-//! Lockdown: after the broker connects, no new association and only
-//! [`SERVING_BROKER_OPS`]; once the TA's code is mapped, or the first open
-//! fails before that, and before the TA first runs, only [`SERVING_CALLS`] and
-//! no new executable memory. The TA's code includes its syscall trampoline,
-//! which the first TA context load maps.
+//! Lockdown: after the broker connects, no new association; once the TA's
+//! code is mapped, or the first open fails before that, and before the TA
+//! first runs, only [`SERVING_CALLS`] and no new executable memory. The TA's
+//! code includes its syscall trampoline, which the first TA context load
+//! maps.
 
 use alloc::boxed::Box;
 use core::cell::RefCell;
@@ -25,9 +25,7 @@ use litebox_common_optee::{
     UteeParams,
 };
 use litebox_common_vm_abi::envelope::{Envelope, Protocol};
-use litebox_common_vm_abi::{
-    BrokerOp, BrokerOpSet, CallId, CallSet, Image, Message, ProtSet, StartupInfo, UserRange,
-};
+use litebox_common_vm_abi::{CallId, CallSet, Image, Message, ProtSet, StartupInfo, UserRange};
 use litebox_platform_vm_userland::{VmUserland, kcall};
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 use litebox_shim_optee::{LoadedProgram, OpteeShim, TaMemrefAddresses, UserConstPtr};
@@ -122,12 +120,9 @@ const SERVING_CALLS: CallSet = CallSet::EMPTY
     .with(CallId::Map)
     .with(CallId::Unmap)
     .with(CallId::Protect)
-    .with(CallId::BrokerCall)
+    .with(CallId::BrokerEnter)
     .with(CallId::DeriveKey)
     .with(CallId::Log);
-
-/// All the OP-TEE shim uses.
-const SERVING_BROKER_OPS: BrokerOpSet = BrokerOpSet::EMPTY.with(BrokerOp::FillRandom);
 
 /// The session manager tells instances apart by page-table ID; with one
 /// instance per process, any constant works.
@@ -137,14 +132,10 @@ pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));
     let session_manager: &'static SessionManager<Platform> =
         Box::leak(Box::new(SessionManager::new()));
-    let local = litebox_platform_vm_userland::broker::connect(info.broker_shared_memory)
+    let local = litebox_broker_local_vm_userland::connect(info)
         .unwrap_or_else(|e| panic!("broker association: {e:?}"));
-    kcall::restrict(
-        CallSet::ALL.without(CallId::BrokerHandshake),
-        SERVING_BROKER_OPS,
-        ProtSet::ALL,
-    )
-    .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
+    kcall::restrict(CallSet::ALL.without(CallId::BrokerHandshake), ProtSet::ALL)
+        .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
     let shim =
         litebox_shim_optee::OpteeShimBuilder::new_with_litebox(platform, session_manager, litebox)
@@ -180,6 +171,7 @@ pub fn serve(info: &StartupInfo) -> ! {
         // Requires upcalls, registered by `ready`.
         check_guest_memory_access();
         check_lockdown_validation();
+        litebox_broker_local_vm_userland::self_check();
     }
     loop {
         let reply = runner.serve(request);
@@ -577,7 +569,7 @@ impl Runner {
     /// The final lockdown stage (see the module docs); idempotent.
     fn lock_down(&mut self) {
         if !self.locked_down {
-            kcall::restrict(SERVING_CALLS, SERVING_BROKER_OPS, ProtSet::NO_EXEC)
+            kcall::restrict(SERVING_CALLS, ProtSet::NO_EXEC)
                 .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
             self.locked_down = true;
         }
@@ -740,23 +732,14 @@ fn check_guest_memory_access() {
 /// Self-check (debug builds): unknown lockdown bits are rejected.
 fn check_lockdown_validation() {
     use litebox_common_vm_abi::{RestrictRequest, Status};
-    let raw = |calls: u64, broker_ops: u64, prots: u32| {
+    let raw = |calls: u64, prots: u32| {
         RestrictRequest::new(
             CallSet::read_from_bytes(calls.as_bytes()).unwrap(),
-            BrokerOpSet::read_from_bytes(broker_ops.as_bytes()).unwrap(),
             ProtSet::read_from_bytes(prots.as_bytes()).unwrap(),
         )
     };
-    let (calls, ops, prots) = (
-        CallSet::ALL.bits(),
-        BrokerOpSet::ALL.bits(),
-        ProtSet::ALL.bits(),
-    );
-    for request in [
-        raw(calls | 1, ops, prots),
-        raw(calls, ops + 1, prots),
-        raw(calls, ops, prots + 1),
-    ] {
+    let (calls, prots) = (CallSet::ALL.bits(), ProtSet::ALL.bits());
+    for request in [raw(calls | 1, prots), raw(calls, prots + 1)] {
         assert_eq!(kcall::call(&request), Err(Status::InvalidArgument));
     }
 }

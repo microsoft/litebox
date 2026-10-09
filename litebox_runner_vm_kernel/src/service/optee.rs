@@ -66,7 +66,7 @@ impl Optee {
             policies.push((uuid, policy));
         }
         assert!(!tas.is_empty(), "payload has no tas/<name>.elf");
-        let broker_core = crate::broker::core();
+        let broker = litebox_broker_vm_kernel::Broker::new();
         let spawn: Spawn = Box::new(move |uuid: &TeeUuid| {
             let Some(ta) = tas.get(uuid) else {
                 litebox_util_log::error!(uuid:? = uuid; "no such TA");
@@ -79,7 +79,7 @@ impl Optee {
             identity[..size_of::<TeeUuid>()].copy_from_slice(uuid.as_bytes());
             let mut process = Process::spawn(
                 platform,
-                broker_core.clone(),
+                &broker,
                 &ProcessConfig {
                     runner,
                     images: &images,

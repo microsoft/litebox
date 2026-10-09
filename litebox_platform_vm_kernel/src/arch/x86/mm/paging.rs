@@ -382,6 +382,26 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
+    /// The frame of the present, user-accessible, writable page at `addr`.
+    pub(crate) fn user_writable_frame(&self, addr: VirtAddr) -> Option<PhysFrame<Size4KiB>> {
+        let page = Page::<Size4KiB>::containing_address(addr);
+        match self.inner.lock().translate(page.start_address()) {
+            TranslateResult::Mapped {
+                frame: x86_64::structures::paging::mapper::MappedFrame::Size4KiB(frame),
+                offset: _,
+                flags,
+            } if flags.contains(
+                PageTableFlags::PRESENT
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::WRITABLE,
+            ) =>
+            {
+                Some(frame)
+            }
+            _ => None,
+        }
+    }
+
     /// Requires an inactive table. Kernel mappings must not demand-fault.
     pub(crate) fn map_kernel_ram(
         &self,
