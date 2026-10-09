@@ -8,6 +8,8 @@ description = "LiteBox as the guest kernel of a QEMU VM, hosting ring-3 runner p
 arrayvec = { version = "0.7.6", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 litebox_bootloader = { version = "0.1.0", path = "../litebox_bootloader" }
+litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
+litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
 litebox_broker_vm_kernel = { version = "0.1.0", path = "../litebox_broker_vm_kernel" }
 litebox_hal = { version = "0.1.0", path = "../litebox_hal" }
 litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
@@ -16,6 +18,7 @@ litebox_platform_vm_kernel = { version = "0.1.0", path = "../litebox_platform_vm
 litebox_shim_vm_kernel = { version = "0.1.0", path = "../litebox_shim_vm_kernel" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 serde = { version = "1.0.142", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0.142", default-features = false, features = ["alloc"] }
 tar-no-std = { version = "0.3.3", default-features = false, features = ["alloc"] }

@@ -15,6 +15,7 @@ use core::cell::RefCell;
 use core::ops::Range;
 use litebox::platform::RawConstPointer as _;
 use litebox::utils::TruncateExt as _;
+use litebox_broker_protocol::fs::{FileAccessMode, FileMode, FileOpenFlags};
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::envelope::{
     LDELF_IMAGE, OPEN_SESSION_META_PARAMS, TA_IMAGE, parse_open_session_meta, rmem_buffer,
@@ -132,14 +133,28 @@ pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));
     let session_manager: &'static SessionManager<Platform> =
         Box::leak(Box::new(SessionManager::new()));
-    let local = litebox_broker_local_vm_userland::connect(info)
+    let (local, mut notifications) = litebox_broker_local_vm_userland::connect(info)
         .unwrap_or_else(|e| panic!("broker association: {e:?}"));
     kcall::restrict(CallSet::ALL.without(CallId::BrokerHandshake), ProtSet::ALL)
         .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
     let litebox = litebox::LiteBox::new_with_broker_local(platform, local);
-    let shim =
-        litebox_shim_optee::OpteeShimBuilder::new_with_litebox(platform, session_manager, litebox)
-            .build();
+    let mut builder =
+        litebox_shim_optee::OpteeShimBuilder::new_with_litebox(platform, session_manager, litebox);
+    // TA and ldelf output goes to the broker's standard output.
+    match builder.litebox().open_file(
+        &litebox::fs::Context::new(),
+        "/dev/stdout",
+        FileAccessMode::WriteOnly,
+        FileOpenFlags::NONE,
+        FileMode::empty(),
+    ) {
+        Ok(stdout) => builder = builder.with_log_file(stdout),
+        Err(error) => log::warn!("TA output stays in the log: /dev/stdout: {error:?}"),
+    }
+    if cfg!(debug_assertions) {
+        check_stdin(builder.litebox(), &mut notifications, info.tsc_khz);
+    }
+    let shim = builder.build();
 
     // Safety: mapped read-only for the process's lifetime; nothing writes
     // them.
@@ -171,7 +186,7 @@ pub fn serve(info: &StartupInfo) -> ! {
         // Requires upcalls, registered by `ready`.
         check_guest_memory_access();
         check_lockdown_validation();
-        litebox_broker_local_vm_userland::self_check();
+        litebox_broker_local_vm_userland::self_check(&notifications, info.tsc_khz);
     }
     loop {
         let reply = runner.serve(request);
@@ -727,6 +742,64 @@ fn check_guest_memory_access() {
     assert_eq!(read(), Some(0x5a));
     kcall::unmap(addr, len).unwrap();
     assert_eq!(read(), None, "read from unmapped guest memory");
+}
+
+/// Self-check (debug builds): standard input through the broker, which TAs
+/// never read. Waits briefly for input (on broker notifications), and echoes
+/// what arrived to standard output.
+fn check_stdin(
+    litebox: &litebox::LiteBox<Platform>,
+    notifications: &mut litebox_broker_local_vm_userland::Notifications,
+    tsc_khz: u64,
+) {
+    use litebox::fs::errors::ReadError;
+    const WAIT_MS: u64 = 20;
+
+    let context = litebox::fs::Context::new();
+    let open = |path, access| {
+        litebox
+            .open_file(
+                &context,
+                path,
+                access,
+                FileOpenFlags::NONBLOCKING,
+                FileMode::empty(),
+            )
+            .unwrap_or_else(|error| panic!("opening {path}: {error:?}"))
+    };
+    let stdin = open("/dev/stdin", FileAccessMode::ReadOnly);
+    // Safety: RDTSC has no side effects; the kernel allows it in ring 3.
+    let deadline = unsafe { core::arch::x86_64::_rdtsc() } + WAIT_MS * tsc_khz;
+    let mut input = [0u8; 256];
+    let len = loop {
+        match litebox.read_file(&stdin, &mut input, None, None) {
+            Ok(len) => break len,
+            Err(ReadError::WouldBlock) => {
+                let dispatch = litebox.broker_notification_dispatcher();
+                match notifications.receive(deadline, dispatch) {
+                    Ok(0) => break 0,
+                    Ok(_) => {}
+                    Err(error) => panic!("waiting for standard input: {error}"),
+                }
+            }
+            Err(error) => panic!("reading standard input: {error:?}"),
+        }
+    };
+    litebox.close_file(&stdin).expect("closing standard input");
+    if len == 0 {
+        log::debug!("stdin check: no input within {WAIT_MS} ms");
+        return;
+    }
+    let stdout = open("/dev/stdout", FileAccessMode::WriteOnly);
+    for bytes in [&b"[stdin] "[..], &input[..len]] {
+        litebox
+            .write_file(&stdout, bytes, None, None)
+            .expect("writing standard output");
+    }
+    litebox
+        .close_file(&stdout)
+        .expect("closing standard output");
+    log::info!("stdin check: echoed {len} bytes");
 }
 
 /// Self-check (debug builds): unknown lockdown bits are rejected.

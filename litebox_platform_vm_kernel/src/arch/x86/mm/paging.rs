@@ -436,6 +436,45 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
+    /// Maps device registers `frames` uncacheable at `start`, in the kernel
+    /// tables that task tables share. Pages already mapped to the same frame
+    /// are kept.
+    ///
+    /// # Safety
+    ///
+    /// The frames must be device registers, not RAM, and `start..` kernel
+    /// address space in an existing kernel PML4 slot, used for nothing else.
+    pub(crate) unsafe fn map_kernel_mmio(
+        &self,
+        start: Page<Size4KiB>,
+        frames: PhysFrameRange<Size4KiB>,
+    ) -> Result<(), MapToError<Size4KiB>> {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let table_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::ACCESSED
+            | PageTableFlags::DIRTY;
+        // PCD and PWT select UC with the reset PAT.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::WRITE_THROUGH;
+        let mut inner = self.inner.lock();
+        for (page, frame) in Page::range(start, start + frames.count() as u64).zip(frames) {
+            // Safety: device registers (the caller's contract), mapped only here.
+            match unsafe {
+                inner.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator)
+            } {
+                // A newly present entry needs no flush.
+                Ok(flush) => flush.ignore(),
+                Err(MapToError::PageAlreadyMapped(mapped)) if mapped == frame => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
     /// # Panics
     ///
     /// Panics if the frame allocation fails.

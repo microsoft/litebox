@@ -143,26 +143,57 @@ isr_ignore:
     iretq
 
 /*
- * IDT entries require an 8-byte stride; CALL pushes stub + 5 for vector lookup.
- * Kernel-fatal even from user mode; GS may still belong to user code.
+ * External interrupts (vectors 32..=255), handled by the registered handler
+ * or fatal. IDT entries require an 8-byte stride; CALL pushes stub + 5 for
+ * vector lookup.
+ *
+ * They arrive from user mode, or from the kernel only while it halts with
+ * IF=1. Entry does not depend on GS (which may still be the user's): the
+ * handler must not touch per-CPU data, so no SWAPGS. The kernel runs with
+ * SSE disabled, so only the caller-saved GPRs need saving.
  */
 .balign 8
-.global isr_unexpected_stubs
-isr_unexpected_stubs:
+.global isr_external_stubs
+isr_external_stubs:
 .rept 224
     .balign 8
-    call    isr_unexpected
+    call    isr_external
 .endr
 
-isr_unexpected:
+isr_external:
     cld
-    pop     rdi                 /* stub return address */
-    lea     rax, [rip + isr_unexpected_stubs + 5]
+    clac                        /* SMAP stays enforced; IRETQ restores AC */
+    /* [rsp] stub return address, [rsp+8] RIP, [rsp+16] CS */
+    push    rax
+    push    rcx
+    push    rdx
+    push    rsi
+    push    rdi
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    push    rbp
+    mov     rbp, rsp
+    mov     rdi, [rbp + 80]     /* stub return address */
+    lea     rax, [rip + isr_external_stubs + 5]
     sub     rdi, rax
     shr     rdi, 3
     add     rdi, 32             /* vector */
-    mov     rsi, [rsp]          /* interrupted RIP */
-    mov     rdx, [rsp + 8]      /* interrupted CS */
+    mov     rsi, [rbp + 88]     /* interrupted RIP */
+    mov     rdx, [rbp + 96]     /* interrupted CS */
     and     rsp, -16
-    call    unexpected_interrupt_handler_impl
-    ud2
+    call    external_interrupt_handler_impl
+    mov     rsp, rbp
+    pop     rbp
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdi
+    pop     rsi
+    pop     rdx
+    pop     rcx
+    pop     rax
+    add     rsp, 8              /* stub return address */
+    iretq

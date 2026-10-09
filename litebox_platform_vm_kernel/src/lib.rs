@@ -12,8 +12,15 @@
 //!
 //! Assumptions: a single CPU, no scheduler, and not a confidential VM (no
 //! #VE/#VC/#HV).
-//! There is no timer, so user code that never enters the kernel is never
-//! preempted.
+//!
+//! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
+//!
+//! Interrupts: the kernel runs with interrupts disabled, except while it
+//! halts ([`VmKernel::halt_until_interrupt`]); user code runs with them
+//! enabled. External interrupts go to the handler the runner installs
+//! ([`set_interrupt_handler`]), which returns to the interrupted code: there
+//! is no preemption, so user code that never enters the kernel keeps the
+//! CPU.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -67,6 +74,7 @@ extern crate alloc;
 mod arch;
 mod boot;
 pub mod clock;
+mod dma;
 pub mod mm;
 mod per_cpu;
 pub mod providers;
@@ -87,6 +95,37 @@ pub struct BootConfig<'a> {
     pub read_only: core::ops::Range<PhysAddr>,
     /// External vectors that require neither handling nor acknowledgement.
     pub ignored_vectors: &'a [u8],
+}
+
+/// Installs the handler for external interrupts (vectors 32 and up, except
+/// [`BootConfig::ignored_vectors`]), which returns whether it handled the
+/// vector; an unhandled one panics. Before this, every external interrupt
+/// panics.
+///
+/// The handler runs with interrupts disabled, on the interrupted context's GS
+/// (user mode, or [`VmKernel::halt_until_interrupt`]): it must not touch
+/// per-CPU data, block, or take locks, only quiet the source. The kernel acts
+/// on handled vectors later ([`VmKernel::take_pending_interrupts`]).
+///
+/// # Panics
+///
+/// On a second call.
+pub fn set_interrupt_handler(handler: fn(u8) -> bool) {
+    arch::interrupts::set_external_interrupt_handler(handler);
+}
+
+/// A set of interrupt vectors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InterruptVectors([u64; 4]);
+
+impl InterruptVectors {
+    pub fn contains(&self, vector: u8) -> bool {
+        self.0[usize::from(vector / 64)] & (1 << (vector % 64)) != 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = u8> + '_ {
+        (0..=u8::MAX).filter(|&vector| self.contains(vector))
+    }
 }
 
 /// Valid until unregistered; its representation is private to the platform.
@@ -281,6 +320,8 @@ pub struct VmKernel {
     clock: &'static dyn clock::ClockSource,
     /// Guest RAM owned by this kernel (mapped at `PA + KERNEL_OFFSET`).
     ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>>,
+    /// The next free offset in `dma::MMIO_WINDOW`.
+    mmio_next: spin::Mutex<u64>,
 }
 
 /// Confines user pointers to the user range and opens SMAP around accesses.
@@ -430,7 +471,22 @@ impl VmKernel {
             page_table_manager: PageTableManager::new(base_pt),
             clock,
             ram_frame_ranges,
+            mmio_next: spin::Mutex::new(dma::MMIO_WINDOW.start),
         }))
+    }
+
+    /// The vectors the interrupt handler handled since the last call.
+    pub fn take_pending_interrupts(&self) -> InterruptVectors {
+        InterruptVectors(arch::interrupts::take_pending())
+    }
+
+    /// Halts until an interrupt is handled, with interrupts enabled only for
+    /// the halt. An interrupt that became pending while they were disabled
+    /// ends the halt at once, so check for work first and halt after: none
+    /// is missed.
+    pub fn halt_until_interrupt(&self) {
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
     }
 
     /// Only valid for addresses in the kernel's direct mapping.

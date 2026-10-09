@@ -52,10 +52,13 @@ pass=0
 fail=0
 failed=()
 
-# run_vm NAME KERNEL PAYLOAD: boots KERNEL with PAYLOAD as its initrd and
-# records the outcome; with $verbose set, prints passing logs too.
+# run_vm NAME KERNEL PAYLOAD [QEMU_ARG]...: boots KERNEL with PAYLOAD as its
+# initrd and records the outcome; with $verbose set, prints passing logs too.
+# If $check names a function, a guest pass also needs `$check NAME` to
+# succeed; it prints why not otherwise.
 run_vm() {
     local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why
+    shift 3
     set +e
     # shellcheck disable=SC2086 # QEMU is a command line
     timeout "$TIMEOUT" $QEMU \
@@ -64,16 +67,18 @@ run_vm() {
         -kernel "$kernel" -initrd "$payload" -append "litebox.log=${LITEBOX_LOG:-info}" \
         -serial stdio -display none -no-reboot \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+        "$@" \
         </dev/null >"$log" 2>&1
     status=$?
     set -e
     # isa-debug-exit: QEMU exits with (value << 1) | 1; 33 = pass.
-    if [[ $status -eq 33 ]]; then
+    if [[ $status -eq 33 ]] && { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
         echo "PASS  $name"
         pass=$((pass + 1))
         [[ ${verbose:-0} -eq 0 ]] || cat "$log"
     else
         case $status in
+            33) ;;
             65) why="guest reported failure" ;;
             124) why="timed out after ${TIMEOUT}s" ;;
             *) why="exit status $status" ;;

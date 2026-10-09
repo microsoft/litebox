@@ -77,14 +77,18 @@ impl ComPort {
         }
     }
 
-    fn write_string(&mut self, s: &str) {
+    fn write_bytes(&mut self, bytes: &[u8]) {
         if !self.available {
             return;
         }
 
-        for byte in s.bytes() {
+        for &byte in bytes {
             self.write_byte(byte);
         }
+    }
+
+    fn write_string(&mut self, s: &str) {
+        self.write_bytes(s.as_bytes());
     }
 }
 
@@ -112,6 +116,11 @@ pub fn print(args: core::fmt::Arguments) {
 
 pub fn print_str(s: &str) {
     com().lock().write_string(s);
+}
+
+/// Non-printable bytes show as `0xfe`.
+pub fn print_bytes(bytes: &[u8]) {
+    com().lock().write_bytes(bytes);
 }
 
 /// Panic may interrupt a locked or initializing console. Never wait for it
