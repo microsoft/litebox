@@ -1043,6 +1043,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let iovs: &[IoReadVec] = &iovec
                 .to_owned_slice::<Platform>(iovcnt)
                 .ok_or(Errno::EFAULT)?;
+            if self.is_datagram_socket(fd) {
+                return read_datagram_from_iovec::<Platform>(iovs, |buf| {
+                    self.do_read(fd, buf, None)
+                });
+            }
             let mut kernel_buffer = vec![0u8; PAGE_SIZE];
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with
@@ -1052,6 +1057,83 @@ impl<Platform: ShimPlatform> Task<Platform> {
             })
         })
     }
+
+    /// Whether `fd` is a datagram socket, whose `readv` and `writev` must move
+    /// one whole datagram rather than one datagram per iovec.
+    fn is_datagram_socket(&self, fd: &AnyTypedFd<Platform>) -> bool {
+        match fd {
+            AnyTypedFd::Network(fd) => self.global.get_proxy(fd).is_ok_and(|proxy| {
+                matches!(
+                    *proxy,
+                    litebox::net::socket_channel::NetworkProxy::Datagram(_)
+                )
+            }),
+            AnyTypedFd::Unix(fd) => {
+                let handle = self.global.litebox.descriptor_table().entry_handle(fd);
+                handle.is_some_and(|handle| handle.with_entry(|socket| !socket.is_stream()))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Receives one datagram with `receive` and scatters it across `iovs`.
+fn read_datagram_from_iovec<Platform: ShimPlatform>(
+    iovs: &[IoReadVec],
+    receive: impl FnOnce(&mut [u8]) -> Result<usize, Errno>,
+) -> Result<usize, Errno> {
+    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+    let capacity = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    if capacity == 0 {
+        return Ok(0);
+    }
+    // Like `read`, bound the staging buffer rather than trusting the iovec capacity.
+    let capacity = capacity.min(crate::MAX_KERNEL_BUF_SIZE);
+    let mut buffer = alloc::vec::Vec::new();
+    buffer
+        .try_reserve_exact(capacity)
+        .map_err(|_| Errno::ENOMEM)?;
+    buffer.resize(capacity, 0);
+    let received = receive(&mut buffer)?.min(buffer.len());
+    let mut copied = 0;
+    for iov in iovs {
+        if copied == received {
+            break;
+        }
+        let length = (received - copied).min(iov.iov_len);
+        iov.iov_base
+            .copy_from_slice::<Platform>(0, &buffer[copied..copied + length])
+            .ok_or(Errno::EFAULT)?;
+        copied += length;
+    }
+    Ok(received)
+}
+
+/// Gathers `iovs` into one datagram and sends it with `send`.
+fn write_datagram_to_iovec<Platform: ShimPlatform>(
+    iovs: &[IoWriteVec],
+    send: impl FnOnce(&[u8]) -> Result<usize, Errno>,
+) -> Result<usize, Errno> {
+    check_iov_lens(iovs.iter().map(|iov| iov.iov_len))?;
+    let length = iovs.iter().map(|iov| iov.iov_len).sum::<usize>();
+    if length == 0 {
+        return Ok(0);
+    }
+    let mut buffer = alloc::vec::Vec::new();
+    buffer
+        .try_reserve_exact(length)
+        .map_err(|_| Errno::ENOMEM)?;
+    for iov in iovs {
+        for offset in 0..iov.iov_len {
+            let offset = isize::try_from(offset).map_err(|_| Errno::EFAULT)?;
+            buffer.push(
+                iov.iov_base
+                    .read_at_offset::<Platform>(offset)
+                    .ok_or(Errno::EFAULT)?,
+            );
+        }
+    }
+    send(&buffer)
 }
 
 /// Linux's `IOV_MAX` / `UIO_MAXIOV`: the kernel rejects iovec counts above this
@@ -1188,6 +1270,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let iovs: &[IoWriteVec] = &iovec
                 .to_owned_slice::<Platform>(iovcnt)
                 .ok_or(Errno::EFAULT)?;
+            if self.is_datagram_socket(fd) {
+                return write_datagram_to_iovec::<Platform>(iovs, |buf| {
+                    self.do_write(fd, buf, None)
+                });
+            }
             // TODO: The data transfers performed by readv() and writev() are atomic: the data
             // written by writev() is written as a single block that is not intermingled with
             // output from writes in other processes
