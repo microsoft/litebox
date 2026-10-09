@@ -455,6 +455,7 @@ unsafe extern "C" fn kernel_main(is_bsp: bool) -> ! {
 
     enable_smep_smap();
     enable_umip(is_bsp);
+    litebox_platform_lvbs::arch::spec_ctrl::init(is_bsp);
 
     litebox_runner_lvbs::run(platform)
 }

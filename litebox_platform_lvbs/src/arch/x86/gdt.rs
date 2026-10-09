@@ -71,6 +71,11 @@ impl GdtWrapper {
             self.selectors.user_data.0,
         )
     }
+
+    /// Return the kernel data segment selector
+    pub fn get_kernel_data_selector(&self) -> u16 {
+        self.selectors.kernel_data.0
+    }
 }
 
 impl Default for GdtWrapper {
