@@ -352,7 +352,6 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         &self,
         context: &Context,
         path: impl Arg,
-        check_trailing_slash: bool,
     ) -> Result<Option<(WalkedDir<'_>, String)>, WalkError> {
         // Return the walking handle rather than an owned directory handle so backends can keep any
         // locks acquired during path resolution held across the final operation. This lets e.g.
@@ -371,25 +370,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         // a final `.`/`..` can redirect a removal to an ordinary target directory.
         let parent_path = self.resolve_following_symlinks(context, parent_path)?;
         let parent_components: Vec<_> = parent_path.components.iter().map(String::as_str).collect();
-        let walk_parent = || {
-            self.walk_to_directory(
-                context,
-                self.backend.root(),
-                &parent_components,
-                &parent_components,
-            )
-        };
-        let mut parent = walk_parent()?;
-        if check_trailing_slash && raw.ends_with('/') && !matches!(name, "." | "..") {
-            match self.backend.walk_directories(parent.handle, &[name]) {
-                Ok(outcome) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {}
-                Ok(_) => return Err(PathError::ComponentNotADirectory.into()),
-                // `mkdir` may create this missing final directory. Removal reports ENOENT below.
-                Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {}
-                Err(error) => return Err(error),
-            }
-            parent = walk_parent()?;
-        }
+        let parent = self.walk_to_directory(
+            context,
+            self.backend.root(),
+            &parent_components,
+            &parent_components,
+        )?;
         Ok(Some((parent, String::from(name))))
     }
 
@@ -1073,8 +1059,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Unlink a file
     pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
+        let trailing_slash = path.as_rust_str().map_err(PathError::from)?.ends_with('/');
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, path, true)
+            self.parent_dir_and_name(context, path)
                 .map_err(|error| match error {
                     WalkError::Io => UnlinkError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -1084,6 +1071,19 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         };
         if matches!(name.as_str(), "." | "..") {
             return Err(UnlinkError::IsADirectory);
+        }
+        if trailing_slash {
+            // Only a directory may be named with a trailing slash, and unlink cannot remove one.
+            return Err(
+                match self.backend.walk_directories(parent.handle, &[&name]) {
+                    Ok(outcome) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
+                        UnlinkError::IsADirectory
+                    }
+                    Ok(_) => PathError::ComponentNotADirectory.into(),
+                    Err(WalkError::Io) => UnlinkError::Io,
+                    Err(WalkError::PathError(error)) => error.into(),
+                },
+            );
         }
         if !Self::can_change_entries_in_dir(context, &parent) {
             return Err(UnlinkError::NoWritePerms);
@@ -1100,7 +1100,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// Create a new directory
     pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, path, false)
+            self.parent_dir_and_name(context, path)
                 .map_err(|error| match error {
                     WalkError::Io => MkdirError::Io,
                     WalkError::PathError(error) => error.into(),
@@ -1135,7 +1135,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     /// Remove a directory
     pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
         let Some((parent, name)) =
-            self.parent_dir_and_name(context, path, true)
+            self.parent_dir_and_name(context, path)
                 .map_err(|error| match error {
                     WalkError::Io => RmdirError::Io,
                     WalkError::PathError(error) => error.into(),
