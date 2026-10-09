@@ -1,23 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! A process's broker association, served like `io_uring` (see
-//! `litebox_common_vm_abi`, Broker): the handshake in a kernel call, then
-//! requests and responses in the shared control ring of
-//! `litebox_broker_transport`, the one the userland broker uses, and payloads
-//! in the broker shared memory. [`CallId::BrokerEnter`] is the doorbell.
-//!
-//! The two planes live differently:
-//! - The control ring (control plane: every call, small, hostile metadata) is
-//!   pinned and reached through the kernel's own mapping
-//!   ([`PinnedControlRing`]), like `io_uring`'s rings: from any context, with
-//!   atomic word operations, and without SMAP windows or faults.
-//! - The shared buffers (data plane: bulk, large) stay in the process's
-//!   lazily populated mapping ([`UserSharedMemory`]), touched only while
-//!   executing a request that names them, during the process's own
-//!   `BrokerEnter`, when its address space is current.
-//!
-//! [`CallId::BrokerEnter`]: litebox_common_vm_abi::CallId::BrokerEnter
+//! A process's broker association (see `litebox_common_vm_abi`, Broker):
+//! handshake in a kernel call, then requests and responses in the control
+//! ring, pinned and accessed through the kernel's mapping
+//! ([`PinnedControlRing`]), and payloads in the process's lazily populated
+//! shared buffers ([`UserSharedMemory`]).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -47,7 +35,7 @@ use litebox_platform_vm_kernel::PinnedUserPages;
 
 use crate::memory::{copy_from_user, copy_to_user};
 
-/// The shared buffers, in the process's user mapping: valid only while its
+/// The shared buffers, through the process's mapping: valid only while its
 /// address space is current.
 pub(crate) struct UserSharedMemory {
     region: UserRange,
@@ -84,11 +72,8 @@ impl SharedMemory for UserSharedMemory {
     }
 }
 
-/// The control ring at the start of pinned pages, reached through the
-/// kernel's own mapping: independent of the current address space, and with
-/// the same peer-safe operations the userland transport uses, so its words
-/// are atomic to the process even on more CPUs. Byte and word accesses keep
-/// to the ring ABI's disjoint regions ([`MemoryAccessPolicy::ControlRing`]).
+/// The control ring at the start of pinned pages, through the kernel's
+/// mapping. Accesses keep to [`MemoryAccessPolicy::ControlRing`].
 pub(crate) struct PinnedControlRing(PinnedUserPages);
 
 impl PinnedControlRing {
@@ -120,8 +105,8 @@ impl PinnedControlRing {
         self.word(offset, MemoryAccessPolicy::ControlRing.permits_u64(offset))
     }
 
-    /// Calls `copy` with the kernel address of each page's part of
-    /// `offset..offset + len` and that part's range within `0..len`.
+    /// Calls `copy` for each page's part of `offset..offset + len`, with that
+    /// part's range within `0..len`.
     fn for_each_part(
         &self,
         offset: usize,
@@ -145,9 +130,8 @@ impl PinnedControlRing {
     }
 }
 
-// Safety (for every access below): pinned for `self`'s lifetime, in bounds
-// (checked), and naturally aligned for words; private buffers never overlap
-// them.
+// Safety (below): pinned for `self`'s lifetime, in bounds and aligned
+// (checked), and disjoint from private memory.
 impl SharedMemory for PinnedControlRing {
     fn len(&self) -> usize {
         CONTROL_RING_MEMORY_SIZE
@@ -279,14 +263,13 @@ enum Association {
     Ended,
 }
 
-/// The broker's ends of an active association's rings: it consumes requests
-/// and produces responses; it has no notifications.
+/// The broker's ends of the rings: requests in, responses out.
 struct Active {
     association: BrokerHostAssociation<UserSharedMemory>,
     requests: ControlRingConsumer<PinnedControlRing>,
     responses: ControlRingProducer<PinnedControlRing>,
-    /// A response the full response ring could not take, like `io_uring`'s
-    /// completion overflow; no request is consumed while it waits.
+    /// A response the full ring could not take; no request is consumed while
+    /// it waits.
     overflow: Option<Vec<u8>>,
 }
 
@@ -314,8 +297,7 @@ impl Broker {
         }
     }
 
-    /// One attempt, successful or not. On success, the association is active
-    /// on the control ring.
+    /// One attempt, successful or not; success activates the control ring.
     pub(crate) fn handshake(&self, request: &WireFrame) -> Result<WireFrame, Status> {
         let mut association = self.association.borrow_mut();
         let Association::New(ring) = core::mem::replace(&mut *association, Association::Ended)
@@ -369,14 +351,11 @@ impl Broker {
         frame(&wire::encode_handshake_response(response))
     }
 
-    /// Consumes and serves every published request, unless the response ring
-    /// fills up. The broker applies its own policy to each request; refusals
-    /// are responses.
+    /// Serves every published request, unless the response ring fills up.
     ///
     /// # Errors
     ///
-    /// [`EnterError::NoAssociation`] without an active association, and
-    /// [`EnterError::Failed`] if serving failed and ended the association.
+    /// See [`EnterError`].
     pub(crate) fn enter(&self) -> Result<(), EnterError> {
         let mut association = self.association.borrow_mut();
         let Association::Active(active) = &mut *association else {
@@ -444,7 +423,7 @@ impl Active {
     }
 }
 
-/// Serving failed; the cause is logged where it happened.
+/// Serving failed; the cause is logged.
 struct Failed;
 
 /// Logs why `what` failed the association.
@@ -484,9 +463,8 @@ impl Drop for Broker {
 mod tests {
     use litebox_broker_transport::control_ring::CONTROL_RING_READY;
 
-    /// The userland broker exchanges this token so that its endpoints agree on
-    /// the ring layout; here `ABI_VERSION` stands in for it. When this fails,
-    /// change `litebox_common_vm_abi::ABI_VERSION` and then the expectation.
+    /// `ABI_VERSION` stands in for the userland broker's ring-layout token;
+    /// change both together.
     #[test]
     fn ring_layout_change_needs_an_abi_version_change() {
         assert_eq!(

@@ -143,8 +143,8 @@ pub fn restrict(calls: CallSet, prots: ProtSet) -> Result<(), Status> {
     call(&RestrictRequest::new(calls, prots))
 }
 
-/// The broker's doorbell, like `io_uring_enter`: the kernel serves every
-/// request published in the control ring before returning.
+/// The broker doorbell: the kernel serves every published request before
+/// returning.
 ///
 /// # Errors
 ///

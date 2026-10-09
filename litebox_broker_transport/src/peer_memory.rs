@@ -181,17 +181,12 @@ pub unsafe fn copy_to_peer(source: &[u8], destination: *mut u8) {
 /// between page-aligned shared buffers and arbitrarily aligned private ones, so
 /// that case is common.
 ///
-/// Chunks use vector registers on x86-64. Without SSE, as on kernel targets,
-/// there are no chunks and words are copied one at a time; such targets copy
-/// only small control messages and payloads.
-///
 /// # Safety
 ///
 /// `source` must be readable and `destination` writable for `length` bytes,
 /// and the ranges must not overlap.
 unsafe fn copy(source: *const u8, destination: *mut u8, length: usize) {
     let mut offset = 0;
-    #[cfg(any(target_arch = "aarch64", target_feature = "sse2"))]
     while length - offset >= CHUNK_SIZE {
         let (from, to) = (
             source.wrapping_add(offset),
@@ -221,7 +216,6 @@ unsafe fn copy(source: *const u8, destination: *mut u8, length: usize) {
     }
 }
 
-#[cfg(any(target_arch = "aarch64", target_feature = "sse2"))]
 const CHUNK_SIZE: usize = 64;
 
 /// Copies [`CHUNK_SIZE`] bytes.
@@ -229,10 +223,9 @@ const CHUNK_SIZE: usize = 64;
 /// # Safety
 ///
 /// As for [`copy`] with `length` equal to [`CHUNK_SIZE`].
-#[cfg(any(target_arch = "aarch64", target_feature = "sse2"))]
 unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
-    // SAFETY: Guaranteed by the caller. Compiled on x86-64 only with SSE2.
-    #[cfg(target_arch = "x86_64")]
+    // SAFETY: Guaranteed by the caller.
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
     unsafe {
         asm!(
             "movdqu {a}, xmmword ptr [{source}]",
@@ -251,6 +244,18 @@ unsafe fn copy_chunk(source: *const u8, destination: *mut u8) {
             d = out(xmm_reg) _,
             options(nostack, preserves_flags),
         );
+    }
+    // Without SSE (kernel targets), word by word; those copy only small
+    // messages.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "sse2")))]
+    for offset in (0..CHUNK_SIZE).step_by(size_of::<u64>()) {
+        // SAFETY: Guaranteed by the caller.
+        unsafe {
+            copy_word(
+                source.wrapping_add(offset),
+                destination.wrapping_add(offset),
+            );
+        }
     }
     // SAFETY: Guaranteed by the caller. General-purpose registers keep this
     // usable on targets without floating-point registers.

@@ -391,9 +391,8 @@ fn region_range(region: UserRange) -> Range<usize> {
     usize::try_from(region.start).unwrap()..usize::try_from(region.end()).unwrap()
 }
 
-/// Populated now and pinned for the kernel (see `broker`). Like the rest of
-/// the kernel-laid-out area, nothing unmaps or remaps it while the process
-/// lives: the runner's calls are confined to the runner-managed area.
+/// Populated and pinned at creation. Nothing unmaps or remaps it: the
+/// runner's calls are confined to the runner-managed area.
 fn pin_control_ring(
     platform: &VmKernel,
     address_space: AddressSpaceId,
@@ -408,8 +407,8 @@ fn pin_control_ring(
             Populate::Now,
         )
         .map_err(SpawnError::Map)?;
-    // Safety: see above; afterwards the address space only ever goes away
-    // whole, which the pin outlives.
+    // Safety: see above; unregistering the address space frees nothing while
+    // pinned.
     let pages =
         unsafe { platform.pin_user_pages(address_space, range) }.map_err(SpawnError::Pin)?;
     let memory = broker::PinnedControlRing::new(pages)

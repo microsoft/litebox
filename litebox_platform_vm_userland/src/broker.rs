@@ -1,21 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Broker association with the kernel's broker host, over the userland
-//! broker's transport (see `litebox_common_vm_abi`, Broker): negotiation in a
-//! kernel call, then the shared control ring of `litebox_broker_transport`
-//! for requests and responses, and the startup info's broker shared memory
-//! for payloads.
+//! Broker association with the kernel (see `litebox_common_vm_abi`, Broker):
+//! handshake in a kernel call, then requests and responses in the control
+//! ring and payloads in the shared buffers.
 //!
-//! Where the userland transport waits and wakes with futexes, this one enters
-//! the kernel ([`kcall::broker_enter`], like `io_uring_enter`), which serves
-//! the request ring before returning. A call takes one kernel entry: the
-//! doorbell after publishing its request leaves the response in the ring.
-//!
-//! The kernel touches the shared regions only during this thread's kernel
-//! calls; the guest shares the address space but not the thread. Accesses
-//! still go through `peer_memory`, as the userland transport's do, so no Rust
-//! reference into them is ever formed.
+//! Where the userland transport waits or wakes with futexes, this one enters
+//! the kernel ([`kcall::broker_enter`]), which serves the ring before
+//! returning; a call takes one entry. Shared memory is accessed only through
+//! `peer_memory`.
 
 use alloc::sync::Arc;
 use litebox::utils::TruncateExt as _;
@@ -44,11 +37,11 @@ pub enum ChannelError {
     Memory(SharedMemoryError),
     Oversized,
     NoRequest,
-    /// The kernel served the ring, but what the call waits for did not happen.
+    /// The kernel made no progress on what the call waits for.
     Stalled,
     /// A response for another request.
     UnexpectedResponse,
-    /// A call is already in progress (a reentrant call).
+    /// A reentrant call.
     Busy,
     /// An earlier call failed the association.
     Failed,
@@ -100,16 +93,14 @@ impl LocalSetupChannel for KernelBrokerSetup {
     }
 }
 
-/// The local ends of the association's rings: it produces requests and
-/// consumes responses; the kernel sends no notifications.
+/// The local ends of the rings: requests out, responses in.
 struct Rings {
     requests: ControlRingProducer<KernelControlRing>,
     responses: ControlRingConsumer<KernelControlRing>,
 }
 
 impl Rings {
-    /// One request in flight at a time (one thread), so responses come in
-    /// order and need no pending-call matching.
+    /// One call in flight, so responses arrive in order.
     fn call(&mut self, request: BrokerRequest) -> Result<BrokerResponse, ChannelError> {
         let request_id = request.request_id;
         let frame = wire::encode_request(request);
@@ -125,7 +116,7 @@ impl Rings {
                 }
             }
         }
-        // The doorbell: the kernel serves the request.
+        // The doorbell.
         self.requests.wake_consumer()?;
         let response = loop {
             match self.responses.try_read(wire::decode_response) {
@@ -211,9 +202,8 @@ impl SharedMemory for KernelSharedMemory {
     }
 }
 
-/// The control ring at the start of the startup info's region. Byte and word
-/// accesses keep to the ring ABI's disjoint regions
-/// ([`MemoryAccessPolicy::ControlRing`]).
+/// The control ring at the start of its region. Accesses keep to
+/// [`MemoryAccessPolicy::ControlRing`].
 struct KernelControlRing {
     start: usize,
 }
@@ -252,9 +242,8 @@ impl KernelControlRing {
     }
 }
 
-// Safety (for every access below): checked to be in bounds of, and naturally
-// aligned in, a region mapped for the process's lifetime and disjoint from
-// private memory.
+// Safety (below): in bounds and aligned (checked), in a region mapped for the
+// process's lifetime and disjoint from private memory.
 impl SharedMemory for KernelControlRing {
     fn len(&self) -> usize {
         CONTROL_RING_MEMORY_SIZE
@@ -319,8 +308,7 @@ impl ControlRingMemory for KernelControlRing {
     }
 }
 
-/// Waiting and waking are kernel entries: the kernel serves the ring
-/// synchronously and has no thread to wake or to wait for.
+/// Waits and wakes enter the kernel, which serves the ring synchronously.
 impl WaitableSharedMemory for KernelControlRing {
     type Error = ChannelError;
 
@@ -328,8 +316,8 @@ impl WaitableSharedMemory for KernelControlRing {
         ChannelError::Memory(error)
     }
 
-    /// One entry lets the kernel make all the progress it can, so an epoch
-    /// that is still unchanged would stay so: [`ChannelError::Stalled`].
+    /// One entry is all the progress the kernel can make, so an unchanged
+    /// epoch is [`ChannelError::Stalled`].
     fn wait_while_equal(&self, offset: usize, expected: u32) -> Result<(), ChannelError> {
         if self
             .load_u32_acquire(offset)
@@ -349,7 +337,7 @@ impl WaitableSharedMemory for KernelControlRing {
         Ok(())
     }
 
-    /// Only the kernel's consumption of requests needs a wakeup: the doorbell.
+    /// Only the request ring's consumer, the kernel, needs waking.
     fn wake_one(&self, offset: usize) -> Result<(), ChannelError> {
         if offset == ControlRingDirection::Requests.producer_epoch_offset() {
             kcall::broker_enter().map_err(ChannelError::Kernel)?;

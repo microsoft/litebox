@@ -8,7 +8,7 @@
 //! code is mapped, or the first open fails before that, and before the TA
 //! first runs, only [`SERVING_CALLS`] and no new executable memory. The TA's
 //! code includes its syscall trampoline, which the first TA context load
-//! maps. Which broker operations run is the broker's policy.
+//! maps.
 
 use alloc::boxed::Box;
 use core::cell::RefCell;
@@ -729,8 +729,7 @@ fn check_guest_memory_access() {
     assert_eq!(read(), None, "read from unmapped guest memory");
 }
 
-/// Self-check (debug builds): entering the broker with no request published
-/// is a no-op that leaves the association usable.
+/// Self-check (debug builds): entering an idle broker is a no-op.
 fn check_broker_enter() {
     kcall::broker_enter().expect("entering an idle broker");
     kcall::broker_enter().expect("entering an idle broker again");

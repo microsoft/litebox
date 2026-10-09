@@ -44,7 +44,7 @@ pub const BROKER_SHARED_MEMORY: UserRange = UserRange {
     len: SHARED_BUFFER_POOL_SIZE as u64,
 };
 
-/// The control ring is at its start; the rest of the last page is unused.
+/// The control ring is at its start.
 pub const BROKER_CONTROL_RING: UserRange = UserRange {
     start: BASE + 0x3800_0000,
     len: (CONTROL_RING_MEMORY_SIZE as u64).next_multiple_of(PAGE_SIZE),

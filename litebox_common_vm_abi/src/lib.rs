@@ -66,13 +66,8 @@
 //! # Lockdown
 //!
 //! [`CallId::Restrict`] irrevocably narrows the allowed calls and page
-//! permissions, like seccomp. A violation kills the process.
-//! [`CallId::Exit`] is always allowed.
-//!
-//! Broker operations are not calls, so the lockdown does not cover them: the
-//! broker applies its own policy to each request, whatever carries it. The
-//! lockdown can still take away [`CallId::BrokerEnter`], and with it the
-//! broker.
+//! permissions. A violation kills the process. [`CallId::Exit`] is always
+//! allowed.
 //!
 //! # Trust
 //!
@@ -83,41 +78,25 @@
 //!
 //! # Broker
 //!
-//! As with the userland broker, a call only sets an association up; active
-//! traffic is in memory shared with the kernel, in the same transport:
+//! Active traffic uses the userland broker's shared-memory transport, served
+//! like `io_uring`:
 //!
-//! - [`CallId::BrokerHandshake`] negotiates the association (the userland
-//!   broker's setup socket). On success the kernel activates the
-//!   `litebox_broker_transport::control_ring` at the start of
+//! - [`CallId::BrokerHandshake`] negotiates the association and activates the
+//!   control ring (`litebox_broker_transport::control_ring`) at the start of
 //!   [`StartupInfo::broker_control_ring`] and the shared buffers in
-//!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring's
-//!   layout, in place of the userland broker's ring-ready token.
-//! - The runner produces requests in the request ring and consumes responses
-//!   from the response ring, like `io_uring`'s submission and completion
-//!   queues. The kernel produces no notifications.
-//! - [`CallId::BrokerEnter`] is the doorbell, like `io_uring_enter`: the kernel
-//!   consumes every published request, executes it, and publishes its
-//!   response, then returns. Where a futex would wake the userland broker or
-//!   wait for it, the runner enters instead; a wait that one entry does not
-//!   satisfy never will, since nothing else runs.
-//! - Rings are hostile-peer-safe in both directions. A malformed ring or
-//!   request fails the association and kills the process, as the userland
-//!   broker ends its runner. Before a successful handshake, `BrokerEnter` is
-//!   [`Status::Denied`].
-//! - The two regions are the control and data planes, kept apart:
-//!   - The control ring carries every request and response, so it is
-//!     critical: the kernel populates it at creation and pins it, and reaches
-//!     it through its own mapping, with atomic word operations.
-//!   - The shared buffers carry bulk payloads: they stay lazily populated,
-//!     and the kernel touches them only while executing a request that names
-//!     them.
-//!
-//!   The kernel serves either only during the process's calls, so it needs no
-//!   wakeups of its own.
-//! - A response the full response ring cannot take waits in the kernel (one
-//!   at most) and the kernel consumes no further request until it is
-//!   published, so a runner that does not consume responses stalls only
-//!   itself.
+//!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring
+//!   layout.
+//! - The runner publishes requests and consumes responses; there are no
+//!   notifications. [`CallId::BrokerEnter`] is the doorbell: the kernel serves
+//!   every published request before returning. The runner enters wherever the
+//!   userland transport would wait or wake with a futex.
+//! - The kernel pins the control ring and accesses it through its own mapping.
+//!   The shared buffers stay lazily populated and are touched only while
+//!   executing a request that names them.
+//! - If the response ring is full, the kernel holds one response and consumes
+//!   no further request.
+//! - A malformed ring or request kills the process. Before the handshake,
+//!   `BrokerEnter` is [`Status::Denied`].
 
 #![no_std]
 
@@ -125,8 +104,8 @@ pub mod envelope;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 
-/// Must change with any incompatible change to this crate, or to the layout of
-/// the broker's control ring (see [Broker](crate#broker)).
+/// Must change with any incompatible change to this crate or to the broker's
+/// control-ring layout.
 pub const ABI_VERSION: u32 = 1;
 
 /// The section holding the runner's only `syscall` instruction.
@@ -597,7 +576,7 @@ impl WireFrame {
 #[repr(transparent)]
 pub struct BrokerHandshakeFrame(pub WireFrame);
 
-/// Room for flags, like `io_uring_enter`'s.
+/// Reserved for flags.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout,
 )]
@@ -800,9 +779,9 @@ pub struct StartupInfo {
     pub upcall_stack: UserRange,
     /// See [Messages](crate#messages).
     pub message_window: UserRange,
-    /// Payloads of broker requests and responses. See [Broker](crate#broker).
+    /// Broker payloads. See [Broker](crate#broker).
     pub broker_shared_memory: UserRange,
-    /// The broker's control ring, at its start. See [Broker](crate#broker).
+    /// Broker control ring, at its start. See [Broker](crate#broker).
     pub broker_control_ring: UserRange,
 }
 

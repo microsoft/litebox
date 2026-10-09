@@ -382,8 +382,7 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
-    /// The frame of the present, user-accessible, writable page at `addr`;
-    /// `None` otherwise, including for `PROT_NONE` leaves.
+    /// The frame of the present, user-accessible, writable page at `addr`.
     pub(crate) fn user_writable_frame(&self, addr: VirtAddr) -> Option<PhysFrame<Size4KiB>> {
         let page = Page::<Size4KiB>::containing_address(addr);
         match self.inner.lock().translate(page.start_address()) {

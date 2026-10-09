@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 
 //! A process's lockdown (see `litebox_common_vm_abi`, Lockdown). Invariant:
-//! it only narrows. Broker operations are the broker's policy, not this.
+//! it only narrows.
 
 use litebox_common_vm_abi::{CallId, CallSet, Prot, ProtSet, RestrictRequest, Status};
 
