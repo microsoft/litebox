@@ -627,7 +627,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             |fd| files.fs.write(fd, buf, offset).map_err(Errno::from),
             |fd| {
                 espipe_for_non_seekable_offset(offset)?;
-                is_datagram.set(self.global.is_datagram(fd)?);
+                is_datagram.set(!self.global.is_stream(fd)?);
                 self.global.sendto(
                     &self.wait_cx(),
                     fd,

@@ -200,7 +200,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             let old = dt.set_fd_metadata(fd, litebox_common_linux::FileDescriptorFlags::FD_CLOEXEC);
             assert!(old.is_none());
         }
-        let old = dt.set_fd_metadata(fd, sock_type);
+        let old = dt.set_entry_metadata(fd, sock_type);
         assert!(old.is_none());
         let old = dt.set_entry_metadata(fd, SocketOFlags(status));
         assert!(old.is_none());
@@ -837,8 +837,8 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             }
         }
 
+        let is_datagram = !self.is_stream(fd)?;
         let proxy = self.get_proxy(fd)?;
-        let is_datagram = matches!(proxy.as_ref(), NetworkProxy::Datagram(_));
         cx.with_timeout(timeout)
             .wait_on_events(
                 is_nonblock,
@@ -884,9 +884,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             & litebox::fs::OFlags::STATUS_FLAGS_MASK
     }
 
-    /// Whether `fd` is a datagram (UDP) socket.
-    pub(super) fn is_datagram(&self, fd: &SocketFd<Platform>) -> Result<bool, Errno> {
-        Ok(matches!(*self.get_proxy(fd)?, NetworkProxy::Datagram(_)))
+    /// Whether `fd` is a stream (TCP) socket.
+    pub(super) fn is_stream(&self, fd: &SocketFd<Platform>) -> Result<bool, Errno> {
+        Ok(matches!(self.get_socket_type(fd)?, SockType::Stream))
     }
 
     pub(crate) fn get_proxy(
@@ -1280,8 +1280,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             &self.global,
             socket,
             |fd| {
-                let sock_type = self.global.get_socket_type(fd)?;
-                if !matches!(sock_type, SockType::Stream) {
+                if !self.global.is_stream(fd)? {
                     return Err(Errno::EOPNOTSUPP);
                 }
                 let mut socket_addr =
@@ -1293,7 +1292,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
                 let proxy = self
                     .global
-                    .initialize_socket(&accepted_file, sock_type, flags);
+                    .initialize_socket(&accepted_file, SockType::Stream, flags);
                 proxy.set_state(SocketState::Connected);
                 let Ok(raw_fd) = files.insert_raw_fd(accepted_file) else {
                     unimplemented!()
@@ -1431,7 +1430,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .clone()
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
-                is_datagram.set(self.global.is_datagram(fd)?);
+                is_datagram.set(!self.global.is_stream(fd)?);
                 self.global
                     .sendto(&self.wait_cx(), fd, buf, flags, sockaddr)
             },
@@ -1508,7 +1507,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .map(|addr| addr.inet().ok_or(Errno::EAFNOSUPPORT))
                     .transpose()?;
                 let data = copy_iovs_to_vec::<Platform>(iovs.as_deref().unwrap_or_default())?;
-                is_datagram.set(self.global.is_datagram(fd)?);
+                is_datagram.set(!self.global.is_stream(fd)?);
                 self.global
                     .sendto(&self.wait_cx(), fd, &data, flags, sock_addr)
             },
