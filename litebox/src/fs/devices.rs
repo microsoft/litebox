@@ -17,8 +17,9 @@ use super::backend::{
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkingDirHandle,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, ComponentNotADirectory, FileStatusError, Io, IsTerminalDevice,
+    MkdirError, NoSuchFileOrDirectory, NotForReading, NotForWriting, OpenError, ReadDirError,
+    ReadError, ReadOnlyFileSystem, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
@@ -201,7 +202,7 @@ where
                     stop_reason: WalkStopReason::StoppedAtNonDirectory,
                 });
             }
-            return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+            return NoSuchFileOrDirectory.err();
         }
         Ok(WalkOutcome {
             components: vec![],
@@ -231,11 +232,10 @@ where
         flags: OFlags,
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let _dir = dir.into_typed::<Self>();
-        let device = Device::from_name(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+        let device = Device::from_name(name).ok_or(NoSuchFileOrDirectory.into_set())?;
 
         if flags.contains(OFlags::DIRECTORY) {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+            return ComponentNotADirectory.err();
         }
         if flags.contains(OFlags::NONBLOCK)
             && matches!(
@@ -249,13 +249,13 @@ where
         if flags.contains(OFlags::TRUNC) {
             // Note: matching Linux behavior, this does not actually perform any truncation, and
             // instead, it is silently ignored if you attempt to truncate upon opening stdio.
-            debug_assert!(matches!(
+            debug_assert!(
                 self.truncate(
                     &FileHandle::from_typed::<Self>(DeviceFileHandle { device }),
                     0
-                ),
-                Err(TruncateError::IsTerminalDevice)
-            ));
+                )
+                .is_err_and(|e| e.is(IsTerminalDevice))
+            );
         }
 
         Ok(Permissioned {
@@ -285,9 +285,9 @@ where
                 .platform
                 .read_from_stdin(buf)
                 .map_err(|e| match e {
-                    crate::platform::StdioReadError::Closed => ReadError::Io,
+                    crate::platform::StdioReadError::Closed => Io.into_set(),
                 }),
-            Device::Stdout | Device::Stderr => Err(ReadError::NotForReading),
+            Device::Stdout | Device::Stderr => NotForReading.err(),
             Device::Null => {
                 // /dev/null read returns EOF
                 Ok(0)
@@ -302,7 +302,7 @@ where
     fn write(&self, h: &FileHandle, buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
         let h = h.get_typed::<Self>();
         let stream = match h.device {
-            Device::Stdin => return Err(WriteError::NotForWriting),
+            Device::Stdin => return NotForWriting.err(),
             Device::Stdout => crate::platform::StdioOutStream::Stdout,
             Device::Stderr => crate::platform::StdioOutStream::Stderr,
             Device::Null | Device::URandom => {
@@ -322,12 +322,12 @@ where
             .platform
             .write_to(stream, buf)
             .map_err(|e| match e {
-                crate::platform::StdioWriteError::Closed => WriteError::Io,
+                crate::platform::StdioWriteError::Closed => Io.into_set(),
             })
     }
 
     fn truncate(&self, _h: &FileHandle, _len: usize) -> Result<(), TruncateError> {
-        Err(TruncateError::IsTerminalDevice)
+        IsTerminalDevice.err()
     }
 
     fn seek_behavior(&self, h: &FileHandle) -> SeekBehavior {
@@ -361,7 +361,7 @@ where
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        Err(OpenError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn mkdir_at(
@@ -370,19 +370,19 @@ where
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        Err(MkdirError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn unlink_at(&self, _dir: DirHandle, _name: &str) -> Result<(), UnlinkError> {
-        Err(UnlinkError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn rmdir_at(&self, _dir: DirHandle, _name: &str) -> Result<(), RmdirError> {
-        Err(RmdirError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
-        Err(ChmodError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn chown(
@@ -391,6 +391,6 @@ where
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
-        Err(ChownError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 }

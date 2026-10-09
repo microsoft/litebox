@@ -22,8 +22,11 @@ use crate::fs::backend::{
     WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use crate::fs::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError, WriteError,
+    AccessNotAllowed, AlreadyExists, ChmodError, ChownError, ClosedFd, ComponentNotADirectory,
+    FileStatusError, InvalidOffset, InvalidPathname, Io, IsADirectory, MkdirError, NoSearchPerms,
+    NoSuchFileOrDirectory, NoWritePerms, NonSeekable, NotADirectory, NotAFile, NotEmpty,
+    NotForReading, NotForWriting, NotTheOwner, OpenError, ReadDirError, ReadError, RmdirError,
+    SeekError, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use crate::fs::nine_p::fcall::Rlerror;
 use crate::sync;
@@ -305,7 +308,7 @@ where
             let Some(fid) = result.fid else {
                 // A short walk whose walked components are all directories means the next
                 // component simply does not exist.
-                return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                return NoSuchFileOrDirectory.err();
             };
             debug_assert_eq!(result.wqids.len(), components.len());
             return Ok(WalkOutcome {
@@ -394,7 +397,7 @@ where
         // TODO: we do not support non-blocking, so ignore that flag instead of returning an error.
         let flags = flags - OFlags::NONBLOCK;
         if flags.contains(OFlags::DIRECTORY) {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+            return ComponentNotADirectory.err();
         }
 
         let fid = match dir.into_typed::<Self>().inner {
@@ -452,14 +455,14 @@ where
     }
 
     fn read(&self, h: &FileHandle, buf: &mut [u8], offset: usize) -> Result<usize, ReadError> {
-        let offset = u64::try_from(offset).map_err(|_| ReadError::Io)?;
+        let offset = u64::try_from(offset).map_err(|_| Io.into_set())?;
         Ok(self
             .client
             .read(&h.get_typed::<Self>().fid.fid, offset, buf)?)
     }
 
     fn write(&self, h: &FileHandle, buf: &[u8], offset: usize) -> Result<usize, WriteError> {
-        let offset = u64::try_from(offset).map_err(|_| WriteError::Io)?;
+        let offset = u64::try_from(offset).map_err(|_| Io.into_set())?;
         Ok(self
             .client
             .write(&h.get_typed::<Self>().fid.fid, offset, buf)?)
@@ -467,7 +470,7 @@ where
 
     fn truncate(&self, h: &FileHandle, length: usize) -> Result<(), TruncateError> {
         let stat = fcall::SetAttr {
-            size: u64::try_from(length).map_err(|_| TruncateError::Io)?,
+            size: u64::try_from(length).map_err(|_| Io.into_set())?,
             ..Default::default()
         };
         self.client.setattr(
@@ -801,16 +804,16 @@ pub enum Error {
 impl From<Error> for OpenError {
     fn from(e: Error) -> Self {
         match e {
-            Error::InvalidPathname => OpenError::PathError(PathError::InvalidPathname),
+            Error::InvalidPathname => InvalidPathname.into_set(),
             Error::Remote(errno) => match errno {
-                ENOENT => OpenError::PathError(PathError::NoSuchFileOrDirectory),
-                EEXIST => OpenError::AlreadyExists,
-                EPERM | EACCES => OpenError::AccessNotAllowed,
-                ENOTDIR => OpenError::PathError(PathError::ComponentNotADirectory),
-                ENAMETOOLONG => OpenError::PathError(PathError::InvalidPathname),
-                _ => OpenError::Io,
+                ENOENT => NoSuchFileOrDirectory.into_set(),
+                EEXIST => AlreadyExists.into_set(),
+                EPERM | EACCES => AccessNotAllowed.into_set(),
+                ENOTDIR => ComponentNotADirectory.into_set(),
+                ENAMETOOLONG => InvalidPathname.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse => OpenError::Io,
+            Error::Io | Error::InvalidResponse => Io.into_set(),
         }
     }
 }
@@ -819,11 +822,11 @@ impl From<Error> for ReadError {
     fn from(e: Error) -> Self {
         match e {
             Error::Remote(errno) => match errno {
-                ENOENT | EISDIR => ReadError::NotAFile,
-                EPERM | EACCES => ReadError::NotForReading,
-                _ => ReadError::Io,
+                ENOENT | EISDIR => NotAFile.into_set(),
+                EPERM | EACCES => NotForReading.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => Io.into_set(),
         }
     }
 }
@@ -832,11 +835,11 @@ impl From<Error> for WriteError {
     fn from(e: Error) -> Self {
         match e {
             Error::Remote(errno) => match errno {
-                ENOENT | EISDIR => WriteError::NotAFile,
-                EPERM | EACCES => WriteError::NotForWriting,
-                _ => WriteError::Io,
+                ENOENT | EISDIR => NotAFile.into_set(),
+                EPERM | EACCES => NotForWriting.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => WriteError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => Io.into_set(),
         }
     }
 }
@@ -844,16 +847,16 @@ impl From<Error> for WriteError {
 impl From<Error> for MkdirError {
     fn from(e: Error) -> Self {
         match e {
-            Error::InvalidPathname => MkdirError::PathError(PathError::InvalidPathname),
+            Error::InvalidPathname => InvalidPathname.into_set(),
             Error::Remote(errno) => match errno {
-                ENOENT => MkdirError::PathError(PathError::NoSuchFileOrDirectory),
-                EEXIST => MkdirError::AlreadyExists,
-                EPERM | EACCES => MkdirError::NoWritePerms,
-                ENOTDIR => MkdirError::PathError(PathError::ComponentNotADirectory),
-                ENAMETOOLONG => MkdirError::PathError(PathError::InvalidPathname),
-                _ => MkdirError::Io,
+                ENOENT => NoSuchFileOrDirectory.into_set(),
+                EEXIST => AlreadyExists.into_set(),
+                EPERM | EACCES => NoWritePerms.into_set(),
+                ENOTDIR => ComponentNotADirectory.into_set(),
+                ENAMETOOLONG => InvalidPathname.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse => MkdirError::Io,
+            Error::Io | Error::InvalidResponse => Io.into_set(),
         }
     }
 }
@@ -862,10 +865,10 @@ impl From<Error> for ReadDirError {
     fn from(e: Error) -> Self {
         match e {
             Error::Remote(errno) => match errno {
-                ENOENT | ENOTDIR => ReadDirError::NotADirectory,
-                _ => ReadDirError::Io,
+                ENOENT | ENOTDIR => NotADirectory.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => ReadDirError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => Io.into_set(),
         }
     }
 }
@@ -873,16 +876,16 @@ impl From<Error> for ReadDirError {
 impl From<Error> for UnlinkError {
     fn from(e: Error) -> Self {
         match e {
-            Error::InvalidPathname => UnlinkError::PathError(PathError::InvalidPathname),
+            Error::InvalidPathname => InvalidPathname.into_set(),
             Error::Remote(errno) => match errno {
-                ENOENT => UnlinkError::PathError(PathError::NoSuchFileOrDirectory),
-                EISDIR => UnlinkError::IsADirectory,
-                EPERM | EACCES => UnlinkError::NoWritePerms,
-                ENOTDIR => UnlinkError::PathError(PathError::ComponentNotADirectory),
-                ENAMETOOLONG => UnlinkError::PathError(PathError::InvalidPathname),
-                _ => UnlinkError::Io,
+                ENOENT => NoSuchFileOrDirectory.into_set(),
+                EISDIR => IsADirectory.into_set(),
+                EPERM | EACCES => NoWritePerms.into_set(),
+                ENOTDIR => ComponentNotADirectory.into_set(),
+                ENAMETOOLONG => InvalidPathname.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse => UnlinkError::Io,
+            Error::Io | Error::InvalidResponse => Io.into_set(),
         }
     }
 }
@@ -890,16 +893,16 @@ impl From<Error> for UnlinkError {
 impl From<Error> for RmdirError {
     fn from(e: Error) -> Self {
         match e {
-            Error::InvalidPathname => RmdirError::PathError(PathError::InvalidPathname),
+            Error::InvalidPathname => InvalidPathname.into_set(),
             Error::Remote(errno) => match errno {
-                ENOENT => RmdirError::PathError(PathError::NoSuchFileOrDirectory),
-                ENOTDIR => RmdirError::NotADirectory,
-                EPERM | EACCES => RmdirError::NoWritePerms,
-                ENAMETOOLONG => RmdirError::PathError(PathError::InvalidPathname),
-                ENOTEMPTY => RmdirError::NotEmpty,
-                _ => RmdirError::Io,
+                ENOENT => NoSuchFileOrDirectory.into_set(),
+                ENOTDIR => NotADirectory.into_set(),
+                EPERM | EACCES => NoWritePerms.into_set(),
+                ENAMETOOLONG => InvalidPathname.into_set(),
+                ENOTEMPTY => NotEmpty.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse => RmdirError::Io,
+            Error::Io | Error::InvalidResponse => Io.into_set(),
         }
     }
 }
@@ -907,15 +910,15 @@ impl From<Error> for RmdirError {
 impl From<Error> for FileStatusError {
     fn from(e: Error) -> Self {
         match e {
-            Error::InvalidPathname => FileStatusError::PathError(PathError::InvalidPathname),
+            Error::InvalidPathname => InvalidPathname.into_set(),
             Error::Remote(errno) => match errno {
-                ENOENT => FileStatusError::PathError(PathError::NoSuchFileOrDirectory),
-                ENAMETOOLONG => FileStatusError::PathError(PathError::InvalidPathname),
-                ENOTDIR => FileStatusError::PathError(PathError::ComponentNotADirectory),
-                EPERM | EACCES => FileStatusError::PathError(PathError::NoSearchPerms),
-                _ => FileStatusError::Io,
+                ENOENT => NoSuchFileOrDirectory.into_set(),
+                ENAMETOOLONG => InvalidPathname.into_set(),
+                ENOTDIR => ComponentNotADirectory.into_set(),
+                EPERM | EACCES => NoSearchPerms.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse => FileStatusError::Io,
+            Error::Io | Error::InvalidResponse => Io.into_set(),
         }
     }
 }
@@ -924,12 +927,12 @@ impl From<Error> for SeekError {
     fn from(e: Error) -> Self {
         match e {
             Error::Remote(e) => match e {
-                ENOENT => SeekError::ClosedFd,
-                EINVAL => SeekError::InvalidOffset,
-                ESPIPE => SeekError::NonSeekable,
-                _ => SeekError::Io,
+                ENOENT => ClosedFd.into_set(),
+                EINVAL => InvalidOffset.into_set(),
+                ESPIPE => NonSeekable.into_set(),
+                _ => Io.into_set(),
             },
-            _ => SeekError::Io,
+            _ => Io.into_set(),
         }
     }
 }
@@ -938,12 +941,12 @@ impl From<Error> for TruncateError {
     fn from(e: Error) -> Self {
         match e {
             Error::Remote(errno) => match errno {
-                ENOENT => TruncateError::ClosedFd,
-                EISDIR => TruncateError::IsDirectory,
-                EPERM | EACCES => TruncateError::NotForWriting,
-                _ => TruncateError::Io,
+                ENOENT => ClosedFd.into_set(),
+                EISDIR => IsADirectory.into_set(),
+                EPERM | EACCES => NotForWriting.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse | Error::InvalidPathname => TruncateError::Io,
+            Error::Io | Error::InvalidResponse | Error::InvalidPathname => Io.into_set(),
         }
     }
 }
@@ -951,29 +954,14 @@ impl From<Error> for TruncateError {
 impl From<Error> for ChmodError {
     fn from(e: Error) -> Self {
         match e {
-            Error::InvalidPathname => ChmodError::PathError(PathError::InvalidPathname),
+            Error::InvalidPathname => InvalidPathname.into_set(),
             Error::Remote(errno) => match errno {
-                ENOENT => ChmodError::PathError(PathError::NoSuchFileOrDirectory),
-                ENOTDIR => ChmodError::PathError(PathError::ComponentNotADirectory),
-                EPERM | EACCES => ChmodError::NotTheOwner,
-                _ => ChmodError::Io,
+                ENOENT => NoSuchFileOrDirectory.into_set(),
+                ENOTDIR => ComponentNotADirectory.into_set(),
+                EPERM | EACCES => NotTheOwner.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse => ChmodError::Io,
-        }
-    }
-}
-
-impl From<Error> for ChownError {
-    fn from(e: Error) -> Self {
-        match e {
-            Error::InvalidPathname => ChownError::PathError(PathError::InvalidPathname),
-            Error::Remote(errno) => match errno {
-                ENOENT => ChownError::PathError(PathError::NoSuchFileOrDirectory),
-                ENOTDIR => ChownError::PathError(PathError::ComponentNotADirectory),
-                EPERM | EACCES => ChownError::NotTheOwner,
-                _ => ChownError::Io,
-            },
-            Error::Io | Error::InvalidResponse => ChownError::Io,
+            Error::Io | Error::InvalidResponse => Io.into_set(),
         }
     }
 }
@@ -981,15 +969,15 @@ impl From<Error> for ChownError {
 impl From<Error> for WalkError {
     fn from(e: Error) -> Self {
         match e {
-            Error::InvalidPathname => WalkError::PathError(PathError::InvalidPathname),
+            Error::InvalidPathname => InvalidPathname.into_set(),
             Error::Remote(errno) => match errno {
-                ENOENT => WalkError::PathError(PathError::NoSuchFileOrDirectory),
-                ENAMETOOLONG => WalkError::PathError(PathError::InvalidPathname),
-                ENOTDIR => WalkError::PathError(PathError::ComponentNotADirectory),
-                EPERM | EACCES => WalkError::PathError(PathError::NoSearchPerms),
-                _ => WalkError::Io,
+                ENOENT => NoSuchFileOrDirectory.into_set(),
+                ENAMETOOLONG => InvalidPathname.into_set(),
+                ENOTDIR => ComponentNotADirectory.into_set(),
+                EPERM | EACCES => NoSearchPerms.into_set(),
+                _ => Io.into_set(),
             },
-            Error::Io | Error::InvalidResponse => WalkError::Io,
+            Error::Io | Error::InvalidResponse => Io.into_set(),
         }
     }
 }

@@ -16,6 +16,14 @@
     reason = "in this one module, we want to pull in all the constants, rather than manually list them"
 )]
 
+use litebox::fs::errors::{
+    AccessNotAllowed, AlreadyExists, Busy, ClosedFd, ComponentNotADirectory, InvalidOffset,
+    InvalidPathname, Io, IsADirectory, IsTerminalDevice, MissingComponent, NoSearchPerms,
+    NoSuchFileOrDirectory, NoWritePerms, NonSeekable, NotADirectory, NotAFile, NotEmpty,
+    NotForReading, NotForWriting, NotOpenForReading, NotOpenForSeeking, NotOpenForWriting,
+    PathError, ReadOnlyFileSystem,
+};
+use litebox_util_errset::match_kind;
 use thiserror::Error;
 
 mod generated;
@@ -113,64 +121,63 @@ impl TryFrom<u8> for Errno {
 
 impl From<litebox::fs::errors::PathError> for Errno {
     fn from(value: litebox::fs::errors::PathError) -> Self {
-        match value {
-            litebox::fs::errors::PathError::NoSuchFileOrDirectory => Errno::ENOENT,
-            litebox::fs::errors::PathError::NoSearchPerms => Errno::EACCES,
-            litebox::fs::errors::PathError::InvalidPathname => Errno::EINVAL,
-            litebox::fs::errors::PathError::MissingComponent => Errno::ENOENT,
-            litebox::fs::errors::PathError::ComponentNotADirectory => Errno::ENOTDIR,
-        }
+        match_kind!(value {
+            NoSuchFileOrDirectory | MissingComponent => Errno::ENOENT,
+            NoSearchPerms => Errno::EACCES,
+            InvalidPathname => Errno::EINVAL,
+            ComponentNotADirectory => Errno::ENOTDIR,
+        })
     }
 }
 
 impl From<litebox::fs::errors::OpenError> for Errno {
     fn from(value: litebox::fs::errors::OpenError) -> Self {
-        match value {
-            litebox::fs::errors::OpenError::AccessNotAllowed => Errno::EACCES,
-            litebox::fs::errors::OpenError::NoWritePerms => Errno::EACCES,
-            litebox::fs::errors::OpenError::PathError(path_error) => path_error.into(),
-            litebox::fs::errors::OpenError::ReadOnlyFileSystem => Errno::EROFS,
-            litebox::fs::errors::OpenError::AlreadyExists => Errno::EEXIST,
-            litebox::fs::errors::OpenError::Io => Errno::EIO,
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            PathError::ANY as path_error => path_error.into(),
+            AccessNotAllowed | NoWritePerms => Errno::EACCES,
+            ReadOnlyFileSystem => Errno::EROFS,
+            AlreadyExists => Errno::EEXIST,
+            Io => Errno::EIO,
+            ClosedFd | IsADirectory | NotForWriting | NotOpenForWriting | IsTerminalDevice => {
+                unimplemented!()
+            }
+        })
     }
 }
 
 impl From<litebox::fs::errors::UnlinkError> for Errno {
     fn from(value: litebox::fs::errors::UnlinkError) -> Self {
-        match value {
-            litebox::fs::errors::UnlinkError::NoWritePerms => Errno::EACCES,
-            litebox::fs::errors::UnlinkError::IsADirectory => Errno::EISDIR,
-            litebox::fs::errors::UnlinkError::ReadOnlyFileSystem => Errno::EROFS,
-            litebox::fs::errors::UnlinkError::Io => Errno::EIO,
-            litebox::fs::errors::UnlinkError::PathError(path_error) => path_error.into(),
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            PathError::ANY as path_error => path_error.into(),
+            NoWritePerms => Errno::EACCES,
+            IsADirectory => Errno::EISDIR,
+            ReadOnlyFileSystem => Errno::EROFS,
+            Io => Errno::EIO,
+        })
     }
 }
 
 impl From<litebox::fs::errors::RmdirError> for Errno {
     fn from(value: litebox::fs::errors::RmdirError) -> Self {
-        match value {
-            litebox::fs::errors::RmdirError::NoWritePerms => Errno::EACCES,
-            litebox::fs::errors::RmdirError::Busy => Errno::EBUSY,
-            litebox::fs::errors::RmdirError::NotEmpty => Errno::ENOTEMPTY,
-            litebox::fs::errors::RmdirError::NotADirectory => Errno::ENOTDIR,
-            litebox::fs::errors::RmdirError::ReadOnlyFileSystem => Errno::EROFS,
-            litebox::fs::errors::RmdirError::Io => Errno::EIO,
-            litebox::fs::errors::RmdirError::PathError(path_error) => path_error.into(),
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            PathError::ANY as path_error => path_error.into(),
+            NoWritePerms => Errno::EACCES,
+            Busy => Errno::EBUSY,
+            NotEmpty => Errno::ENOTEMPTY,
+            NotADirectory => Errno::ENOTDIR,
+            ReadOnlyFileSystem => Errno::EROFS,
+            Io => Errno::EIO,
+        })
     }
 }
 
 impl From<litebox::fs::errors::CloseError> for Errno {
+    #[expect(
+        unreachable_code,
+        reason = "`CloseError` has no kinds, so no value of it exists"
+    )]
     fn from(value: litebox::fs::errors::CloseError) -> Self {
-        #[expect(clippy::match_single_binding)]
-        match value {
-            _ => unimplemented!(),
-        }
+        match value.into_enum() {}
     }
 }
 
@@ -185,52 +192,45 @@ impl From<litebox::net::errors::CloseError> for Errno {
 
 impl From<litebox::fs::errors::ReadError> for Errno {
     fn from(value: litebox::fs::errors::ReadError) -> Self {
-        match value {
-            litebox::fs::errors::ReadError::ClosedFd => Errno::EBADF,
-            litebox::fs::errors::ReadError::NotAFile => Errno::EISDIR,
-            litebox::fs::errors::ReadError::NotForReading => Errno::EBADF,
-            litebox::fs::errors::ReadError::Io => Errno::EIO,
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            ClosedFd | NotForReading => Errno::EBADF,
+            NotAFile => Errno::EISDIR,
+            Io => Errno::EIO,
+        })
     }
 }
 
 impl From<litebox::fs::errors::WriteError> for Errno {
     fn from(value: litebox::fs::errors::WriteError) -> Self {
-        match value {
-            litebox::fs::errors::WriteError::NotAFile => Errno::EISDIR,
-            litebox::fs::errors::WriteError::NotForWriting => Errno::EBADF,
-            litebox::fs::errors::WriteError::Io => Errno::EIO,
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            ClosedFd => unimplemented!(),
+            NotAFile => Errno::EISDIR,
+            NotForWriting => Errno::EBADF,
+            Io => Errno::EIO,
+        })
     }
 }
 
 impl From<litebox::fs::errors::SeekError> for Errno {
     fn from(value: litebox::fs::errors::SeekError) -> Self {
-        match value {
-            litebox::fs::errors::SeekError::NotAFile | litebox::fs::errors::SeekError::ClosedFd => {
-                Errno::EBADF
-            }
-            litebox::fs::errors::SeekError::InvalidOffset => Errno::EINVAL,
-            litebox::fs::errors::SeekError::NonSeekable => Errno::ESPIPE,
-            litebox::fs::errors::SeekError::NotOpenForSeeking => Errno::EBADF,
-            litebox::fs::errors::SeekError::Io => Errno::EIO,
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            ClosedFd | NotAFile | NotOpenForSeeking => Errno::EBADF,
+            InvalidOffset => Errno::EINVAL,
+            NonSeekable => Errno::ESPIPE,
+            Io => Errno::EIO,
+        })
     }
 }
 
 impl From<litebox::fs::errors::MkdirError> for Errno {
     fn from(value: litebox::fs::errors::MkdirError) -> Self {
-        match value {
-            litebox::fs::errors::MkdirError::PathError(path_error) => path_error.into(),
-            litebox::fs::errors::MkdirError::AlreadyExists => Errno::EEXIST,
-            litebox::fs::errors::MkdirError::ReadOnlyFileSystem => Errno::EROFS,
-            litebox::fs::errors::MkdirError::NoWritePerms => Errno::EACCES,
-            litebox::fs::errors::MkdirError::Io => Errno::EIO,
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            PathError::ANY as path_error => path_error.into(),
+            NoWritePerms => Errno::EACCES,
+            AlreadyExists => Errno::EEXIST,
+            ReadOnlyFileSystem => Errno::EROFS,
+            Io => Errno::EIO,
+        })
     }
 }
 
@@ -342,11 +342,11 @@ impl From<litebox::path::ConversionError> for Errno {
 
 impl From<litebox::fs::errors::FileStatusError> for Errno {
     fn from(value: litebox::fs::errors::FileStatusError) -> Self {
-        match value {
-            litebox::fs::errors::FileStatusError::ClosedFd => Errno::EBADF,
-            litebox::fs::errors::FileStatusError::PathError(path_error) => path_error.into(),
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            PathError::ANY as path_error => path_error.into(),
+            ClosedFd => Errno::EBADF,
+            Io => unimplemented!(),
+        })
     }
 }
 
@@ -545,11 +545,11 @@ where
 
 impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
-        match value {
-            litebox::fs::errors::ReadDirError::NotADirectory => Errno::ENOTDIR,
-            litebox::fs::errors::ReadDirError::NotOpenForReading => Errno::EBADF,
-            _ => unimplemented!(),
-        }
+        match_kind!(value {
+            ClosedFd | Io => unimplemented!(),
+            NotADirectory => Errno::ENOTDIR,
+            NotOpenForReading => Errno::EBADF,
+        })
     }
 }
 
@@ -606,14 +606,13 @@ impl From<litebox::pipes::errors::ClosedError> for Errno {
 
 impl From<litebox::fs::errors::TruncateError> for Errno {
     fn from(value: litebox::fs::errors::TruncateError) -> Self {
-        match value {
-            litebox::fs::errors::TruncateError::IsDirectory => Errno::EISDIR,
-            litebox::fs::errors::TruncateError::NotForWriting => Errno::EACCES,
-            litebox::fs::errors::TruncateError::NotOpenForWriting => Errno::EBADF,
-            litebox::fs::errors::TruncateError::IsTerminalDevice => Errno::EINVAL,
-            litebox::fs::errors::TruncateError::ClosedFd => Errno::EBADF,
-            litebox::fs::errors::TruncateError::Io => Errno::EIO,
-        }
+        match_kind!(value {
+            ClosedFd | NotOpenForWriting => Errno::EBADF,
+            IsADirectory => Errno::EISDIR,
+            NotForWriting => Errno::EACCES,
+            IsTerminalDevice => Errno::EINVAL,
+            Io => Errno::EIO,
+        })
     }
 }
 

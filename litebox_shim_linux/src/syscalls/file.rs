@@ -830,7 +830,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         match files.fs.seek(fd, offset, whence) {
             Ok(pos) => Ok(pos),
-            Err(litebox::fs::errors::SeekError::NotAFile) => {
+            Err(e) if e.is(litebox::fs::errors::NotAFile) => {
                 let base = match whence {
                     SeekWhence::RelativeToBeginning => 0,
                     SeekWhence::RelativeToCurrentOffset => self
@@ -1768,7 +1768,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         use litebox::fs::FileType;
-        use litebox::fs::errors::{FileStatusError, PathError};
+        use litebox::fs::errors::{NoSuchFileOrDirectory, PathError};
 
         let fs = self.fs.borrow();
         if pathname
@@ -1796,10 +1796,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         return Err(Errno::ENOTDIR);
                     }
                 }
-                Err(FileStatusError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                Err(error) if error.is(NoSuchFileOrDirectory) => {
                     return Err(Errno::ENOENT);
                 }
-                Err(FileStatusError::PathError(_)) => {
+                Err(error) if error.is(PathError::ANY) => {
                     return Err(Errno::EACCES);
                 }
                 Err(_) => {
@@ -1910,7 +1910,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Ok((136..=143).contains(&major)
                     && status.file_type == litebox::fs::FileType::CharacterDevice)
             }
-            Err(litebox::fs::errors::FileStatusError::ClosedFd) => Err(Errno::EBADF),
+            Err(e) if e.is(litebox::fs::errors::ClosedFd) => Err(Errno::EBADF),
             Err(_) => unimplemented!(),
         }
     }

@@ -35,8 +35,9 @@ use super::{
     Mode, NodeInfo, OFlags, UserInfo,
     backend::{CreationMetadata, DirHandle, FileHandle, HandleRef, WalkingDirHandle},
     errors::{
-        ChmodError, ChownError, MkdirError, OpenError, PathError, ReadDirError, ReadError,
-        RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+        ChmodError, ChownError, ComponentNotADirectory, IsADirectory, MkdirError,
+        NoSuchFileOrDirectory, NotADirectory, NotForWriting, OpenError, ReadDirError, ReadError,
+        ReadOnlyFileSystem, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
     },
     inode_allocator::InodeAllocator,
 };
@@ -97,7 +98,7 @@ impl super::backend::Backend for TarRo {
             let child = self.tar_index.dirs[current.idx]
                 .children
                 .get(*component)
-                .ok_or(WalkError::PathError(PathError::NoSuchFileOrDirectory))?;
+                .ok_or(NoSuchFileOrDirectory.into_set())?;
             let IndexedChild::Dir(child_idx) = *child else {
                 return Ok(super::backend::WalkOutcome {
                     components: walked_components,
@@ -130,7 +131,7 @@ impl super::backend::Backend for TarRo {
         flags: OFlags,
     ) -> Result<DirHandle, OpenError> {
         if flags.intersects(OFlags::CREAT | OFlags::TRUNC | OFlags::WRONLY | OFlags::RDWR) {
-            return Err(OpenError::ReadOnlyFileSystem);
+            return ReadOnlyFileSystem.err();
         }
         Ok(DirHandle::from_typed::<Self>(dir.into_typed::<Self>()))
     }
@@ -151,12 +152,12 @@ impl super::backend::Backend for TarRo {
         let child = self.tar_index.dirs[dir.idx]
             .children
             .get(name)
-            .ok_or(OpenError::PathError(PathError::NoSuchFileOrDirectory))?;
+            .ok_or(NoSuchFileOrDirectory.into_set())?;
         let IndexedChild::File(file_idx) = *child else {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+            return ComponentNotADirectory.err();
         };
         if flags.contains(OFlags::DIRECTORY) {
-            return Err(OpenError::PathError(PathError::ComponentNotADirectory));
+            return ComponentNotADirectory.err();
         }
         if !(flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL))
             && (flags.contains(OFlags::CREAT)
@@ -164,7 +165,7 @@ impl super::backend::Backend for TarRo {
                 || flags.contains(OFlags::WRONLY)
                 || flags.contains(OFlags::RDWR))
         {
-            return Err(OpenError::ReadOnlyFileSystem);
+            return ReadOnlyFileSystem.err();
         }
         let file = &self.tar_index.files[file_idx];
         Ok(super::backend::Permissioned {
@@ -214,11 +215,11 @@ impl super::backend::Backend for TarRo {
     }
 
     fn write(&self, _h: &FileHandle, _buf: &[u8], _offset: usize) -> Result<usize, WriteError> {
-        Err(WriteError::NotForWriting)
+        NotForWriting.err()
     }
 
     fn truncate(&self, _h: &FileHandle, _length: usize) -> Result<(), TruncateError> {
-        Err(TruncateError::NotForWriting)
+        NotForWriting.err()
     }
 
     fn seek_behavior(&self, _h: &FileHandle) -> super::backend::SeekBehavior {
@@ -261,7 +262,7 @@ impl super::backend::Backend for TarRo {
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<FileHandle, OpenError> {
-        Err(OpenError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn mkdir_at(
@@ -270,29 +271,29 @@ impl super::backend::Backend for TarRo {
         _name: &str,
         _metadata: CreationMetadata,
     ) -> Result<DirHandle, MkdirError> {
-        Err(MkdirError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
         let dir = dir.into_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
-            Some(IndexedChild::Dir(_)) => Err(UnlinkError::IsADirectory),
-            Some(IndexedChild::File(_)) => Err(UnlinkError::ReadOnlyFileSystem),
-            None => Err(PathError::NoSuchFileOrDirectory.into()),
+            Some(IndexedChild::Dir(_)) => IsADirectory.err(),
+            Some(IndexedChild::File(_)) => ReadOnlyFileSystem.err(),
+            None => NoSuchFileOrDirectory.err(),
         }
     }
 
     fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
         let dir = dir.into_typed::<Self>();
         match self.tar_index.dirs[dir.idx].children.get(name) {
-            Some(IndexedChild::Dir(_)) => Err(RmdirError::ReadOnlyFileSystem),
-            Some(IndexedChild::File(_)) => Err(RmdirError::NotADirectory),
-            None => Err(PathError::NoSuchFileOrDirectory.into()),
+            Some(IndexedChild::Dir(_)) => ReadOnlyFileSystem.err(),
+            Some(IndexedChild::File(_)) => NotADirectory.err(),
+            None => NoSuchFileOrDirectory.err(),
         }
     }
 
     fn chmod(&self, _h: HandleRef<'_>, _mode: Mode) -> Result<(), ChmodError> {
-        Err(ChmodError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 
     fn chown(
@@ -301,7 +302,7 @@ impl super::backend::Backend for TarRo {
         _user: Option<u16>,
         _group: Option<u16>,
     ) -> Result<(), ChownError> {
-        Err(ChownError::ReadOnlyFileSystem)
+        ReadOnlyFileSystem.err()
     }
 }
 

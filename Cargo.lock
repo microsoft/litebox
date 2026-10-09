@@ -1510,6 +1510,7 @@ dependencies = [
  "buddy_system_allocator",
  "either",
  "hashbrown",
+ "litebox_util_errset",
  "litebox_util_log",
  "rangemap",
  "ringbuf",
@@ -1533,6 +1534,7 @@ dependencies = [
  "elf",
  "int-enum",
  "litebox",
+ "litebox_util_errset",
  "litebox_util_log",
  "rangemap",
  "spin 0.9.8",
@@ -1785,6 +1787,7 @@ dependencies = [
  "litebox_platform_linux_userland",
  "litebox_platform_windows_userland",
  "litebox_syscall_rewriter",
+ "litebox_util_errset",
  "litebox_util_log",
  "object",
  "once_cell",
@@ -1835,6 +1838,10 @@ dependencies = [
  "thiserror",
  "zerocopy",
 ]
+
+[[package]]
+name = "litebox_util_errset"
+version = "0.1.0"
 
 [[package]]
 name = "litebox_util_log"

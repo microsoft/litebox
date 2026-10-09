@@ -11,8 +11,9 @@ use hashbrown::HashMap;
 use crate::sync;
 
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WriteError,
+    AlreadyExists, ChmodError, ChownError, ComponentNotADirectory, FileStatusError, IsADirectory,
+    MkdirError, NoSuchFileOrDirectory, NotADirectory, NotEmpty, OpenError, ReadDirError, ReadError,
+    ResultExt, RmdirError, TruncateError, UnlinkError, WriteError,
 };
 use super::inode_allocator::InodeAllocator;
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, UserInfo};
@@ -262,7 +263,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 .read()
                 .children
                 .get(*component)
-                .ok_or(PathError::NoSuchFileOrDirectory)?
+                .ok_or(NoSuchFileOrDirectory.into_set())?
                 .clone();
             let Node::Dir(child) = child else {
                 return Ok(super::backend::WalkOutcome {
@@ -331,13 +332,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .read()
             .children
             .get(name)
-            .ok_or(PathError::NoSuchFileOrDirectory)?
+            .ok_or(NoSuchFileOrDirectory.into_set())?
             .clone();
         let Node::File(file) = child else {
-            return Err(PathError::ComponentNotADirectory.into());
+            return ComponentNotADirectory.err();
         };
         if flags.contains(super::OFlags::DIRECTORY) {
-            return Err(PathError::ComponentNotADirectory.into());
+            return ComponentNotADirectory.err();
         }
         let perms = file.read().perms.clone();
         let handle = super::backend::FileHandle::from_typed::<Self>(InMemFileHandle { file });
@@ -349,7 +350,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             // TODO(jayb): Linux's `may_open` also adds `MAY_WRITE` for `O_TRUNC`, and checks
             // permissions _before_ truncating; the resolver does neither, so a denied
             // `O_RDONLY|O_TRUNC` open still empties the file here.
-            self.truncate(&handle, 0)?;
+            self.truncate(&handle, 0).widen()?;
         }
         Ok(super::backend::Permissioned {
             item: handle,
@@ -481,7 +482,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
         if parent.children.contains_key(name) {
-            return Err(OpenError::AlreadyExists);
+            return AlreadyExists.err();
         }
         let file = Arc::new(sync::RwLock::new(FileData {
             perms: Permissions {
@@ -511,7 +512,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
         if parent.children.contains_key(name) {
-            return Err(MkdirError::AlreadyExists);
+            return AlreadyExists.err();
         }
         let child = Arc::new(sync::RwLock::new(DirData {
             perms: Permissions {
@@ -539,8 +540,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
         match parent.children.get(name) {
-            None => Err(PathError::NoSuchFileOrDirectory.into()),
-            Some(Node::Dir(_)) => Err(UnlinkError::IsADirectory),
+            None => NoSuchFileOrDirectory.err(),
+            Some(Node::Dir(_)) => IsADirectory.err(),
             Some(Node::File(_)) => {
                 parent.children.remove(name);
                 Ok(())
@@ -554,11 +555,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
         let parent = dir.into_typed::<Self>();
         let mut parent = parent.dir.write();
         match parent.children.get(name) {
-            None => Err(PathError::NoSuchFileOrDirectory.into()),
-            Some(Node::File(_)) => Err(RmdirError::NotADirectory),
-            Some(Node::Dir(child)) if !child.read().children.is_empty() => {
-                Err(RmdirError::NotEmpty)
-            }
+            None => NoSuchFileOrDirectory.err(),
+            Some(Node::File(_)) => NotADirectory.err(),
+            Some(Node::Dir(child)) if !child.read().children.is_empty() => NotEmpty.err(),
             Some(Node::Dir(_)) => {
                 parent.children.remove(name);
                 Ok(())

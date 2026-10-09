@@ -243,11 +243,7 @@ pub extern "C" fn sandbox_process_init(
             litebox::fs::devices::Devices::new(litebox, allocator)
         })
         .build()
-        .unwrap_or_else(
-            |(litebox::fs::composer::BuildError::NoMounts
-             | litebox::fs::composer::BuildError::InvalidMountPath
-             | litebox::fs::composer::BuildError::DuplicateMountPath)| unreachable!(),
-        );
+        .unwrap_or_else(|_: litebox::fs::composer::BuildError| unreachable!());
     let fs = alloc::sync::Arc::new(litebox::fs::resolver::Resolver::new(litebox, composer));
 
     // Loading a program may trigger page faults, so we need to set SHIM before this.

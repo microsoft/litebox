@@ -63,7 +63,7 @@ impl TestLauncher {
         for ancestor in ancestors {
             if let Err(e) = self.install_dir(ancestor.to_str().unwrap()) {
                 assert!(
-                    matches!(e, litebox::fs::errors::MkdirError::AlreadyExists),
+                    e.is(litebox::fs::errors::AlreadyExists),
                     "Failed to create directory {}: {e}",
                     ancestor.display()
                 );

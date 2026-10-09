@@ -8,10 +8,7 @@ use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use crate::fs::errors::{
-    FileStatusError, MkdirError, OpenError, ReadDirError, ReadError, RmdirError, SeekError,
-    TruncateError, UnlinkError, WriteError,
-};
+use crate::fs::errors::Io;
 use crate::fs::inode_allocator::InodeAllocator;
 use crate::fs::resolver::Resolver;
 use crate::fs::{Mode, OFlags};
@@ -518,7 +515,7 @@ fn test_nine_p_broken_open() {
     let fs = connect_9p_broken(&litebox, &server, 2);
 
     let result = fs.open(&ctx, "/anything.txt", OFlags::RDONLY, Mode::empty());
-    assert!(matches!(result, Err(OpenError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// Creating a file should fail when the connection is broken.
@@ -530,7 +527,7 @@ fn test_nine_p_broken_create() {
     let fs = connect_9p_broken(&litebox, &server, 2);
 
     let result = fs.open(&ctx, "/new.txt", OFlags::CREAT | OFlags::WRONLY, Mode::RWXU);
-    assert!(matches!(result, Err(OpenError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// Reading from an fd obtained before the break should fail.
@@ -563,7 +560,7 @@ fn test_nine_p_broken_read() {
 
     let mut buf = alloc::vec![0u8; 64];
     let result = fs.read(&fd, &mut buf, None);
-    assert!(matches!(result, Err(ReadError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// Writing to an fd obtained before the break should fail.
@@ -586,7 +583,7 @@ fn test_nine_p_broken_write() {
         .expect("create should succeed before break");
 
     let result = fs.write(&fd, b"data", None);
-    assert!(matches!(result, Err(WriteError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// mkdir should fail when the connection is broken.
@@ -598,7 +595,7 @@ fn test_nine_p_broken_mkdir() {
     let fs = connect_9p_broken(&litebox, &server, 2);
 
     let result = fs.mkdir(&ctx, "/broken_dir", Mode::RWXU);
-    assert!(matches!(result, Err(MkdirError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// readdir should fail when the connection breaks during the directory read.
@@ -615,7 +612,7 @@ fn test_nine_p_broken_readdir() {
         .expect("open dir should succeed before break");
 
     let result = fs.read_dir(&fd);
-    assert!(matches!(result, Err(ReadDirError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// unlink should fail when the connection is broken.
@@ -641,7 +638,7 @@ fn test_nine_p_broken_unlink() {
 
     let fs = connect_9p_broken(&litebox, &server, 2);
     let result = fs.unlink(&ctx, "/to_unlink.txt");
-    assert!(matches!(result, Err(UnlinkError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// rmdir should fail when the connection is broken.
@@ -659,7 +656,7 @@ fn test_nine_p_broken_rmdir() {
 
     let fs = connect_9p_broken(&litebox, &server, 2);
     let result = fs.rmdir(&ctx, "/to_rmdir");
-    assert!(matches!(result, Err(RmdirError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// file_status should fail when the connection is broken.
@@ -671,7 +668,7 @@ fn test_nine_p_broken_file_status() {
     let fs = connect_9p_broken(&litebox, &server, 2);
 
     let result = fs.file_status(&ctx, "/");
-    assert!(matches!(result, Err(FileStatusError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// truncate should fail when the connection breaks after open.
@@ -703,7 +700,7 @@ fn test_nine_p_broken_truncate() {
         .expect("open should succeed before break");
 
     let result = fs.truncate(&fd, 0, true);
-    assert!(matches!(result, Err(TruncateError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 /// seek (RelativeToEnd, which requires a getattr) should fail when broken.
@@ -735,7 +732,7 @@ fn test_nine_p_broken_seek() {
         .expect("open should succeed before break");
 
     let result = fs.seek(&fd, -1, crate::fs::SeekWhence::RelativeToEnd);
-    assert!(matches!(result, Err(SeekError::Io)));
+    assert!(matches!(result, Err(e) if e.is(Io)));
 }
 
 #[test]

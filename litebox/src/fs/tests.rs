@@ -159,13 +159,13 @@ mod in_mem {
         let mut buffer = [0];
         assert!(matches!(
             fs.read(&fd, &mut buffer, None),
-            Err(crate::fs::errors::ReadError::NotForReading)
+            Err(e) if e.is(crate::fs::errors::NotForReading)
         ));
         fs.close(&fd).expect("Failed to close file");
 
         assert!(matches!(
             fs.open(&ctx, path, OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::AccessNotAllowed)
+            Err(e) if e.is(crate::fs::errors::AccessNotAllowed)
         ));
     }
 
@@ -190,7 +190,7 @@ mod in_mem {
         assert_eq!(status.mode, Mode::empty());
         assert!(matches!(
             fs.open(&ctx, path, OFlags::WRONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::AccessNotAllowed)
+            Err(e) if e.is(crate::fs::errors::AccessNotAllowed)
         ));
     }
 
@@ -425,7 +425,7 @@ mod in_mem {
 
             assert!(matches!(
                 result,
-                Err(crate::fs::errors::ReadDirError::NotADirectory)
+                Err(e) if e.is(crate::fs::errors::NotADirectory)
             ));
         });
     }
@@ -469,19 +469,19 @@ mod in_mem {
                     OFlags::CREAT | OFlags::WRONLY,
                     Mode::RWXU
                 ),
-                Err(crate::fs::errors::OpenError::NoWritePerms)
+                Err(e) if e.is(crate::fs::errors::NoWritePerms)
             ));
             assert!(matches!(
                 fs.mkdir(ctx, "/rootdir/newdir", Mode::RWXU),
-                Err(crate::fs::errors::MkdirError::NoWritePerms)
+                Err(e) if e.is(crate::fs::errors::NoWritePerms)
             ));
             assert!(matches!(
                 fs.unlink(ctx, "/rootdir/file"),
-                Err(crate::fs::errors::UnlinkError::NoWritePerms)
+                Err(e) if e.is(crate::fs::errors::NoWritePerms)
             ));
             assert!(matches!(
                 fs.rmdir(ctx, "/rootdir/sub"),
-                Err(crate::fs::errors::RmdirError::NoWritePerms)
+                Err(e) if e.is(crate::fs::errors::NoWritePerms)
             ));
 
             // The same operations succeed in a directory the user may write.
@@ -532,7 +532,7 @@ mod in_mem {
         // Switch to a different user and test that non-owner cannot chown (should fail)
         with_user(&mut fs, &ctx, 500, 500, |fs, ctx| {
             match fs.chown(ctx, path, Some(789), Some(101)) {
-                Err(crate::fs::errors::ChownError::NotTheOwner) => {
+                Err(e) if e.is(crate::fs::errors::NotTheOwner) => {
                     // Expected behavior
                 }
                 Ok(()) => panic!("Non-owner should not be able to chown"),
@@ -542,9 +542,7 @@ mod in_mem {
 
         // Test chown on non-existent file (should fail)
         match fs.chown(&ctx, "/nonexistent", Some(123), Some(456)) {
-            Err(crate::fs::errors::ChownError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory,
-            )) => {
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory) => {
                 // Expected behavior
             }
             Ok(()) => panic!("Should not be able to chown non-existent file"),
@@ -607,9 +605,7 @@ mod in_mem {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::ComponentNotADirectory)
         ));
 
         // Test O_DIRECTORY on non-existent path (should fail)
@@ -620,9 +616,7 @@ mod in_mem {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory)
         ));
 
         // Test O_DIRECTORY with O_CREAT on non-existent path
@@ -682,7 +676,7 @@ mod in_mem {
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(e) if e.is(crate::fs::errors::AlreadyExists)
         ));
 
         // Test O_CREAT | O_EXCL | O_TRUNC on existing file (should fail)
@@ -693,7 +687,7 @@ mod in_mem {
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY | OFlags::TRUNC,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(e) if e.is(crate::fs::errors::AlreadyExists)
         ));
 
         // Test O_EXCL without O_CREAT (should be ignored and succeed)
@@ -730,7 +724,7 @@ mod in_mem {
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(e) if e.is(crate::fs::errors::AlreadyExists)
         ));
     }
 
@@ -1170,9 +1164,7 @@ mod tar_ro {
         let fs = super::tar_ro_fs(&litebox, TEST_TAR_FILE.into());
         assert!(matches!(
             fs.open(&ctx, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory),
         ));
         let fd = fs
             .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
@@ -1205,9 +1197,7 @@ mod tar_ro {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::ComponentNotADirectory)
         ));
 
         // Test O_DIRECTORY on non-existent path (should fail)
@@ -1218,9 +1208,7 @@ mod tar_ro {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory)
         ));
 
         // Test O_DIRECTORY on nested file (should fail)
@@ -1231,9 +1219,7 @@ mod tar_ro {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::ComponentNotADirectory)
         ));
     }
 
@@ -1246,7 +1232,7 @@ mod tar_ro {
         for flags in [OFlags::WRONLY, OFlags::RDWR, OFlags::TRUNC] {
             assert!(matches!(
                 fs.open(&ctx, "bar", flags, Mode::empty()),
-                Err(crate::fs::errors::OpenError::ReadOnlyFileSystem)
+                Err(e) if e.is(crate::fs::errors::ReadOnlyFileSystem)
             ));
         }
     }
@@ -1315,7 +1301,7 @@ mod tar_ro {
 
         assert!(matches!(
             result,
-            Err(crate::fs::errors::ReadDirError::NotADirectory)
+            Err(e) if e.is(crate::fs::errors::NotADirectory)
         ));
     }
 }
@@ -1405,9 +1391,7 @@ mod overlay {
         let fs = overlay_fs(&litebox, upper([]));
         assert!(matches!(
             fs.open(&ctx, "bar/ba", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory),
         ));
         let fd = fs
             .open(&ctx, "bar", OFlags::RDONLY, Mode::empty())
@@ -1513,9 +1497,7 @@ mod overlay {
         fs.close(&fd).expect("Failed to close file");
         assert!(matches!(
             fs.open(&ctx, "foo", OFlags::RDONLY, Mode::empty()),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            )),
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory),
         ));
     }
 
@@ -1574,9 +1556,7 @@ mod overlay {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::ComponentNotADirectory)
         ));
 
         // Test O_DIRECTORY on file from upper layer (should fail)
@@ -1587,9 +1567,7 @@ mod overlay {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::ComponentNotADirectory)
         ));
 
         // Test O_DIRECTORY on nested file from lower layer (should fail)
@@ -1600,9 +1578,7 @@ mod overlay {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::ComponentNotADirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::ComponentNotADirectory)
         ));
 
         // Test O_DIRECTORY on non-existent path (should fail)
@@ -1613,9 +1589,7 @@ mod overlay {
                 OFlags::RDONLY | OFlags::DIRECTORY,
                 Mode::empty()
             ),
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory)
         ));
     }
 
@@ -1748,7 +1722,7 @@ mod overlay {
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(e) if e.is(crate::fs::errors::AlreadyExists)
         ));
 
         // Test O_CREAT | O_EXCL on file that doesn't exist anywhere (should succeed)
@@ -1773,7 +1747,7 @@ mod overlay {
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(e) if e.is(crate::fs::errors::AlreadyExists)
         ));
 
         // Test O_CREAT | O_EXCL on directory that exists in lower layer (should fail)
@@ -1785,7 +1759,7 @@ mod overlay {
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(e) if e.is(crate::fs::errors::AlreadyExists)
         ));
 
         // Test O_CREAT | O_EXCL on file that was deleted (tombstoned) should succeed
@@ -1840,7 +1814,7 @@ mod overlay {
                 OFlags::CREAT | OFlags::EXCL | OFlags::WRONLY,
                 Mode::RWXU,
             ),
-            Err(crate::fs::errors::OpenError::AlreadyExists)
+            Err(e) if e.is(crate::fs::errors::AlreadyExists)
         ));
     }
 
@@ -1986,7 +1960,7 @@ mod overlay {
 
     #[test]
     fn rmdir_upper_only_directory() {
-        use crate::fs::errors::{PathError, RmdirError};
+        use crate::fs::errors::NoSuchFileOrDirectory;
 
         let ctx = crate::fs::resolver::Context::new();
 
@@ -2004,21 +1978,19 @@ mod overlay {
         // Verify it no longer exists
         assert!(matches!(
             fs.file_status(&ctx, "/upper_empty"),
-            Err(crate::fs::errors::FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory
-            ))
+            Err(e) if e.is(NoSuchFileOrDirectory)
         ));
 
         // Second removal should yield NoSuchFileOrDirectory (path error)
         assert!(matches!(
             fs.rmdir(&ctx, "/upper_empty"),
-            Err(RmdirError::PathError(PathError::NoSuchFileOrDirectory))
+            Err(e) if e.is(NoSuchFileOrDirectory)
         ));
     }
 
     #[test]
     fn rmdir_upper_directory_not_empty_then_empty() {
-        use crate::fs::errors::{PathError, RmdirError};
+        use crate::fs::errors::{NoSuchFileOrDirectory, NotEmpty};
 
         let ctx = crate::fs::resolver::Context::new();
 
@@ -2042,7 +2014,7 @@ mod overlay {
         // Attempt to remove while non-empty
         assert!(matches!(
             fs.rmdir(&ctx, "/upper_dir"),
-            Err(RmdirError::NotEmpty)
+            Err(e) if e.is(NotEmpty)
         ));
 
         // Remove inner file
@@ -2056,15 +2028,13 @@ mod overlay {
         // Confirm gone
         assert!(matches!(
             fs.file_status(&ctx, "/upper_dir"),
-            Err(crate::fs::errors::FileStatusError::PathError(
-                PathError::NoSuchFileOrDirectory
-            ))
+            Err(e) if e.is(NoSuchFileOrDirectory)
         ));
     }
 
     #[test]
     fn rmdir_lower_directory_non_empty() {
-        use crate::fs::errors::RmdirError;
+        use crate::fs::errors::NotEmpty;
 
         let ctx = crate::fs::resolver::Context::new();
 
@@ -2072,12 +2042,12 @@ mod overlay {
         let fs = overlay_fs(&litebox, upper([]));
 
         // "bar" exists in lower layer and contains "baz" (non-empty)
-        assert!(matches!(fs.rmdir(&ctx, "bar"), Err(RmdirError::NotEmpty)));
+        assert!(matches!(fs.rmdir(&ctx, "bar"), Err(e) if e.is(NotEmpty)));
     }
 
     #[test]
     fn rmdir_not_a_directory() {
-        use crate::fs::errors::RmdirError;
+        use crate::fs::errors::NotADirectory;
 
         let ctx = crate::fs::resolver::Context::new();
 
@@ -2098,7 +2068,7 @@ mod overlay {
         // rmdir should fail with NotADirectory
         assert!(matches!(
             fs.rmdir(&ctx, "/regular_file"),
-            Err(RmdirError::NotADirectory)
+            Err(e) if e.is(NotADirectory)
         ));
     }
 
@@ -2209,9 +2179,7 @@ mod stdio {
         let result = fs.open(&ctx, "foo", OFlags::RDONLY, Mode::empty());
         assert!(matches!(
             result,
-            Err(crate::fs::errors::OpenError::PathError(
-                crate::fs::errors::PathError::NoSuchFileOrDirectory
-            ))
+            Err(e) if e.is(crate::fs::errors::NoSuchFileOrDirectory)
         ));
     }
 }

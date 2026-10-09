@@ -14,13 +14,13 @@ use super::backend::{
     Permissioned, SeekBehavior, WalkOutcome, WalkStopReason, WalkedComponent, WalkingDirHandle,
 };
 use super::errors::{
-    ChmodError, ChownError, FileStatusError, MkdirError, OpenError, PathError, ReadDirError,
-    ReadError, RmdirError, TruncateError, UnlinkError, WalkError, WriteError,
+    ChmodError, ChownError, FileStatusError, MkdirError, NoSuchFileOrDirectory, OneOf, OpenError,
+    ReadDirError, ReadError, ReadOnlyFileSystem, RmdirError, TruncateError, UnlinkError, WalkError,
+    WriteError,
 };
 use super::inode_allocator::{InodeAllocator, InodeAllocators};
 use super::{DirEntry, FileStatus, FileType, Mode, NodeInfo, OFlags, UserInfo};
 use crate::path::Arg;
-use thiserror::Error;
 
 // XXX(jayb): consider removing this via a runtime reserved device ID?
 const VIRTUAL_DIR_DEVICE_ID: u64 = 0x436f_6d70;
@@ -53,16 +53,14 @@ struct VirtualDir {
     node_info: NodeInfo,
 }
 
-/// Composer construction errors.
-#[derive(Error, Debug, Clone, PartialEq, Eq)]
-pub enum BuildError {
-    #[error("composer must have at least one mount")]
-    NoMounts,
-    #[error("mount paths must be absolute normalized paths")]
-    InvalidMountPath,
-    #[error("two backends were mounted at the same path")]
-    DuplicateMountPath,
+litebox_util_errset::kinds! {
+    pub struct NoMounts => "composer must have at least one mount";
+    pub struct InvalidMountPath => "mount paths must be absolute normalized paths";
+    pub struct DuplicateMountPath => "two backends were mounted at the same path";
 }
+
+/// Composer construction errors.
+pub type BuildError = OneOf<(NoMounts, InvalidMountPath, DuplicateMountPath)>;
 
 impl Composer {
     /// Start building an empty composer.
@@ -103,15 +101,15 @@ impl ComposerBuilder {
     /// Validate mount paths and finalize the composer.
     pub fn build(self) -> Result<Composer, BuildError> {
         if self.mounts.is_empty() {
-            return Err(BuildError::NoMounts);
+            return NoMounts.err();
         }
 
         let mut mounts = vec![];
         let mut paths = vec![];
         for (raw, backend) in self.mounts {
-            let raw = raw.ok_or(BuildError::InvalidMountPath)?;
+            let raw = raw.ok_or(InvalidMountPath.into_set())?;
             if !raw.starts_with('/') {
-                return Err(BuildError::InvalidMountPath);
+                return InvalidMountPath.err();
             }
             let path: Vec<String> = raw
                 .split('/')
@@ -123,11 +121,11 @@ impl ComposerBuilder {
                 .iter()
                 .any(|component| component == "." || component == "..")
             {
-                return Err(BuildError::InvalidMountPath);
+                return InvalidMountPath.err();
             }
             if raw != format!("/{}", path.join("/")) {
                 // Just confirming that it is absolute + canonical
-                return Err(BuildError::InvalidMountPath);
+                return InvalidMountPath.err();
             }
             paths.push(path.clone());
             mounts.push(Mount { path, backend });
@@ -139,7 +137,7 @@ impl ComposerBuilder {
             p
         };
         if sorted_paths.array_windows().any(|[a, b]| a == b) {
-            return Err(BuildError::DuplicateMountPath);
+            return DuplicateMountPath.err();
         }
 
         // TODO(jayb): Decide whether mounting a deep path should implicitly synthesize
@@ -204,18 +202,13 @@ impl Composer {
     /// where the mutation semantics of exact mount points have not been fully figured out. This is
     /// equivalnet to `Ok(path + [name])`, but errors out if anything is either a mount point or an
     /// ancestor of a mount point.
-    fn checked_child_path<E>(
-        &self,
-        path: Vec<String>,
-        name: &str,
-        error: E,
-    ) -> Result<Vec<String>, E> {
+    fn checked_child_path(&self, path: Vec<String>, name: &str) -> Option<Vec<String>> {
         let path = append_components(path, &[name]);
         if self.mount_relation(&path) != MountRelation::Unrelated {
             // TODO(jayb): Define mutation semantics for exact mount points.
-            return Err(error);
+            return None;
         }
-        Ok(path)
+        Some(path)
     }
 
     /// Returns child names from mount paths only; mounted backend contents are not inspected.
@@ -429,7 +422,7 @@ impl Backend for Composer {
                         walked_components.push(BY_BACKEND);
                         current = ComposerWalkingDirHandleInner::Virtual { path }.into();
                     } else {
-                        return Err(WalkError::PathError(PathError::NoSuchFileOrDirectory));
+                        return NoSuchFileOrDirectory.err();
                     }
                     index += 1;
                 }
@@ -487,7 +480,7 @@ impl Backend for Composer {
                                     }
                                 }
                             }
-                            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory)) => {
+                            Err(error) if error.is(NoSuchFileOrDirectory) => {
                                 walked_components.push(BY_BACKEND);
                                 current =
                                     ComposerWalkingDirHandleInner::Virtual { path: child_path }
@@ -601,19 +594,14 @@ impl Backend for Composer {
     ) -> Result<Permissioned<FileHandle>, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerWalkingDirHandleInner::Virtual { .. } => {
-                Err(OpenError::PathError(PathError::NoSuchFileOrDirectory))
-            }
+            ComposerWalkingDirHandleInner::Virtual { .. } => NoSuchFileOrDirectory.err(),
             ComposerWalkingDirHandleInner::Mounted {
                 path,
                 mount_index,
                 handle,
             } => {
-                self.checked_child_path(
-                    path,
-                    name,
-                    OpenError::PathError(PathError::NoSuchFileOrDirectory),
-                )?;
+                self.checked_child_path(path, name)
+                    .ok_or(NoSuchFileOrDirectory.into_set())?;
                 self.mounts[mount_index]
                     .backend
                     .open_file_at(handle, name, flags)
@@ -705,13 +693,14 @@ impl Backend for Composer {
     ) -> Result<FileHandle, OpenError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(OpenError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Virtual { .. } => ReadOnlyFileSystem.err(),
             ComposerDirHandleInner::Mounted {
                 path,
                 mount_index,
                 handle,
             } => {
-                self.checked_child_path(path, name, OpenError::ReadOnlyFileSystem)?;
+                self.checked_child_path(path, name)
+                    .ok_or(ReadOnlyFileSystem.into_set())?;
                 self.mounts[mount_index]
                     .backend
                     .create_file_at(handle, name, metadata)
@@ -733,13 +722,15 @@ impl Backend for Composer {
     ) -> Result<DirHandle, MkdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(MkdirError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Virtual { .. } => ReadOnlyFileSystem.err(),
             ComposerDirHandleInner::Mounted {
                 path,
                 mount_index,
                 handle,
             } => {
-                let path = self.checked_child_path(path, name, MkdirError::ReadOnlyFileSystem)?;
+                let path = self
+                    .checked_child_path(path, name)
+                    .ok_or(ReadOnlyFileSystem.into_set())?;
                 self.mounts[mount_index]
                     .backend
                     .mkdir_at(handle, name, metadata)
@@ -760,13 +751,14 @@ impl Backend for Composer {
     fn unlink_at(&self, dir: DirHandle, name: &str) -> Result<(), UnlinkError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(UnlinkError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Virtual { .. } => ReadOnlyFileSystem.err(),
             ComposerDirHandleInner::Mounted {
                 path,
                 mount_index,
                 handle,
             } => {
-                self.checked_child_path(path, name, UnlinkError::ReadOnlyFileSystem)?;
+                self.checked_child_path(path, name)
+                    .ok_or(ReadOnlyFileSystem.into_set())?;
                 self.mounts[mount_index].backend.unlink_at(handle, name)
             }
         }
@@ -775,13 +767,14 @@ impl Backend for Composer {
     fn rmdir_at(&self, dir: DirHandle, name: &str) -> Result<(), RmdirError> {
         let dir = dir.into_typed::<Self>();
         match dir.inner {
-            ComposerDirHandleInner::Virtual { .. } => Err(RmdirError::ReadOnlyFileSystem),
+            ComposerDirHandleInner::Virtual { .. } => ReadOnlyFileSystem.err(),
             ComposerDirHandleInner::Mounted {
                 path,
                 mount_index,
                 handle,
             } => {
-                self.checked_child_path(path, name, RmdirError::ReadOnlyFileSystem)?;
+                self.checked_child_path(path, name)
+                    .ok_or(ReadOnlyFileSystem.into_set())?;
                 self.mounts[mount_index].backend.rmdir_at(handle, name)
             }
         }
@@ -796,7 +789,7 @@ impl Backend for Composer {
                     .chmod(HandleRef::File(&h.handle), mode)
             }
             HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
-                ComposerDirHandleInner::Virtual { .. } => Err(ChmodError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Virtual { .. } => ReadOnlyFileSystem.err(),
                 ComposerDirHandleInner::Mounted {
                     mount_index,
                     handle,
@@ -822,7 +815,7 @@ impl Backend for Composer {
                     .chown(HandleRef::File(&h.handle), user, group)
             }
             HandleRef::Dir(h) => match &h.get_typed::<Self>().inner {
-                ComposerDirHandleInner::Virtual { .. } => Err(ChownError::ReadOnlyFileSystem),
+                ComposerDirHandleInner::Virtual { .. } => ReadOnlyFileSystem.err(),
                 ComposerDirHandleInner::Mounted {
                     mount_index,
                     handle,

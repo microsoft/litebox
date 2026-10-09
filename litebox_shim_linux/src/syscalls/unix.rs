@@ -21,7 +21,7 @@ use litebox::{
         wait::WaitContext,
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
-    fs::{Mode, OFlags, errors::OpenError},
+    fs::{Mode, OFlags, errors::AlreadyExists},
     sync::{Mutex, RwLock},
     utils::TruncateExt as _,
 };
@@ -129,9 +129,12 @@ impl UnixSocketAddr {
                             flags,
                             Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH,
                         )
-                        .map_err(|err| match err {
-                            OpenError::AlreadyExists => Errno::EADDRINUSE,
-                            other => Errno::from(other),
+                        .map_err(|err| {
+                            if err.is(AlreadyExists) {
+                                Errno::EADDRINUSE
+                            } else {
+                                Errno::from(err)
+                            }
                         })?
                 };
                 Ok(UnixBoundSocketAddr::Path((

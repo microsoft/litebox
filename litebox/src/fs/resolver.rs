@@ -13,9 +13,12 @@ use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
 
 use super::errors::{
-    ChmodError, ChownError, CloseError, FileStatusError, MkdirError, OpenError, PathError,
-    ReadDirError, ReadError, RmdirError, SeekError, TruncateError, UnlinkError, WalkError,
-    WriteError,
+    AccessNotAllowed, AlreadyExists, Busy, ChmodError, ChownError, CloseError, ClosedFd,
+    ComponentNotADirectory, FileStatusError, InvalidOffset, Io, IsADirectory, MissingComponent,
+    MkdirError, NoSearchPerms, NoSuchFileOrDirectory, NoWritePerms, NonSeekable, NotADirectory,
+    NotAFile, NotForReading, NotForWriting, NotOpenForReading, NotOpenForSeeking,
+    NotOpenForWriting, NotTheOwner, OpenError, PathError, ReadDirError, ReadError, ResultExt,
+    RmdirError, SeekError, SubsetExt, TruncateError, UnlinkError, WalkError, WriteError,
 };
 use super::{
     FileType, Mode, OFlags,
@@ -249,12 +252,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     fn owned_parent_dir(&self, dir: WalkingDirHandle<'_>) -> Result<DirHandle, WalkError> {
         self.backend
             .owned_dir_at(dir, OFlags::PATH)
-            .map_err(|error| match error {
-                OpenError::PathError(PathError::NoSuchFileOrDirectory) => {
-                    PathError::MissingComponent.into()
-                }
-                OpenError::PathError(error) => error.into(),
-                _ => WalkError::Io,
+            .map_err(|error| match error.subset(PathError::ANY) {
+                Ok(error) if error.is(NoSuchFileOrDirectory) => MissingComponent.into_set(),
+                Ok(error) => error.widen(),
+                Err(_) => Io.into_set(),
             })
     }
 
@@ -268,10 +269,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         context: &Context,
         path: &ResolvedPath,
     ) -> Result<Permissioned<Handle>, WalkError> {
-        let map_open_error = |error| match error {
-            OpenError::PathError(error) => WalkError::PathError(error),
-            _ => WalkError::Io,
-        };
+        let map_open_error =
+            |error: OpenError| -> WalkError { error.subset(PathError::ANY).widen_or(Io) };
         let components: Vec<_> = path.components.iter().map(String::as_str).collect();
         if components.is_empty() {
             let root = self
@@ -347,11 +346,9 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             let outcome = self
                 .backend
                 .walk_directories(from, &components[offset..])
-                .map_err(|error| match error {
-                    WalkError::PathError(PathError::NoSuchFileOrDirectory) => {
-                        PathError::MissingComponent.into()
-                    }
-                    error => error,
+                .map_err(|error| match error.narrow(NoSuchFileOrDirectory) {
+                    Ok(NoSuchFileOrDirectory) => MissingComponent.into_set(),
+                    Err(error) => error.widen(),
                 })?;
             let continuing = matches!(outcome.stop_reason, WalkStopReason::Continue);
             Self::check_walk_permissions(
@@ -359,7 +356,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 &absolute_components[offset..],
                 &outcome,
                 SearchScope::AllComponents,
-            )?;
+            )
+            .widen()?;
             let walked = outcome.components.len();
             offset += walked;
 
@@ -376,7 +374,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     });
                 }
                 WalkStopReason::StoppedAtNonDirectory => {
-                    return Err(WalkError::PathError(PathError::ComponentNotADirectory));
+                    return ComponentNotADirectory.err();
                 }
                 WalkStopReason::Continue => {
                     assert!(continuing && walked > 0 && offset < components.len());
@@ -409,7 +407,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 } else {
                     scope
                 },
-            )?;
+            )
+            .widen()?;
 
             let walked = outcome.components.len();
             offset += walked;
@@ -422,7 +421,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     return Ok((outcome, offset));
                 }
                 WalkStopReason::StoppedAtNonDirectory => {
-                    return Err(WalkError::PathError(PathError::ComponentNotADirectory));
+                    return ComponentNotADirectory.err();
                 }
                 WalkStopReason::Continue => {
                     assert!(continuing && walked > 0 && offset < components.len());
@@ -457,7 +456,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     perms:? = permissions.mode;
                     "no search permission"
                 );
-                return Err(PathError::NoSearchPerms);
+                return NoSearchPerms.err();
             }
         }
         Ok(())
@@ -501,7 +500,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let path = context.resolve(path)?;
+        let path = context.resolve(path).widen()?;
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
@@ -521,7 +520,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
         if path.components.is_empty() {
             if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                return Err(OpenError::AlreadyExists);
+                return AlreadyExists.err();
             }
             return Ok(insert(
                 Handle::Dir(self.backend.owned_dir_at(self.backend.root(), flags)?),
@@ -544,7 +543,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         match walk {
             Ok((outcome, _)) if outcome.stop_reason == WalkStopReason::CompleteDirectory => {
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
+                    return AlreadyExists.err();
                 }
                 Ok(insert(
                     Handle::Dir(self.backend.owned_dir_at(outcome.last, flags)?),
@@ -556,7 +555,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             {
                 let name = components[walked];
                 if flags.contains(OFlags::CREAT) && flags.contains(OFlags::EXCL) {
-                    return Err(OpenError::AlreadyExists);
+                    return AlreadyExists.err();
                 }
                 let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if !path_only
@@ -564,7 +563,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     && ((read_allowed && !context.can_read(permissions))
                         || (write_allowed && !context.can_write(permissions)))
                 {
-                    return Err(OpenError::AccessNotAllowed);
+                    return AccessNotAllowed.err();
                 }
                 let seek_behavior = self.backend.seek_behavior(&file.item);
                 Ok(insert(Handle::File(file.item), seek_behavior))
@@ -573,9 +572,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 // `walk_path` validates stop reasons before returning.
                 unreachable!()
             }
-            Err(WalkError::PathError(PathError::NoSuchFileOrDirectory))
-                if flags.contains(OFlags::CREAT) =>
-            {
+            Err(error) if error.is(NoSuchFileOrDirectory) && flags.contains(OFlags::CREAT) => {
                 let Some((parent_components, name)) = path.parent_and_name() else {
                     unreachable!("root path was handled above")
                 };
@@ -586,19 +583,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         &parent_components,
                         &parent_components,
                     )
-                    .map_err(|error| match error {
-                        WalkError::Io => OpenError::Io,
-                        WalkError::PathError(error) => error.into(),
-                    })?;
+                    .widen()?;
                 if !Self::can_change_entries_in_dir(context, &parent) {
-                    return Err(OpenError::NoWritePerms);
+                    return NoWritePerms.err();
                 }
-                let parent = self
-                    .owned_parent_dir(parent.handle)
-                    .map_err(|error| match error {
-                        WalkError::Io => OpenError::Io,
-                        WalkError::PathError(error) => error.into(),
-                    })?;
+                let parent = self.owned_parent_dir(parent.handle).widen()?;
                 let file = self.backend.create_file_at(
                     parent,
                     name,
@@ -610,10 +599,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 let seek_behavior = self.backend.seek_behavior(&file);
                 Ok(insert(Handle::File(file), seek_behavior))
             }
-            Err(error) => match error {
-                WalkError::Io => Err(OpenError::Io),
-                WalkError::PathError(error) => Err(error.into()),
-            },
+            Err(error) => Err(error.widen()),
         }
     }
 
@@ -649,21 +635,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .litebox
             .descriptor_table()
             .entry_handle(fd)
-            .ok_or(ReadError::ClosedFd)?;
+            .ok_or(ClosedFd.into_set())?;
         let mut entry = entry.get_entry_mut();
         if entry.entry.path_only {
-            return Err(ReadError::NotForReading);
+            return NotForReading.err();
         }
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
         let file = match &entry.entry.handle {
             Handle::File(file) => file,
-            Handle::Dir(_) => return Err(ReadError::NotAFile),
+            Handle::Dir(_) => return NotAFile.err(),
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.read_allowed {
-            return Err(ReadError::NotForReading);
+            return NotForReading.err();
         }
 
         let read_offset = match seek_behavior {
@@ -696,21 +682,21 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .litebox
             .descriptor_table()
             .entry_handle(fd)
-            .ok_or(WriteError::ClosedFd)?;
+            .ok_or(ClosedFd.into_set())?;
         let mut entry = entry.get_entry_mut();
         if entry.entry.path_only {
-            return Err(WriteError::NotForWriting);
+            return NotForWriting.err();
         }
         // XXX(jayb): This over-holds the descriptor-entry lock across backend I/O. We need a
         // smaller per-open-file-description primitive for position/append serialization, so the
         // descriptor entry can be unlocked before potentially blocking backend calls.
         let file = match &entry.entry.handle {
             Handle::File(file) => file,
-            Handle::Dir(_) => return Err(WriteError::NotAFile),
+            Handle::Dir(_) => return NotAFile.err(),
         };
         let seek_behavior = entry.entry.seek_behavior;
         if !entry.entry.write_allowed {
-            return Err(WriteError::NotForWriting);
+            return NotForWriting.err();
         }
 
         let write_offset = match seek_behavior {
@@ -718,7 +704,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             SeekBehavior::PositionBased if entry.entry.append_mode && offset.is_none() => {
                 self.backend
                     .status(HandleRef::File(file))
-                    .map_err(|_| WriteError::Io)?
+                    .map_err(|_| Io.into_set())?
                     .size
             }
             SeekBehavior::PositionBased => offset.unwrap_or(entry.entry.position),
@@ -743,24 +729,24 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .litebox
             .descriptor_table()
             .entry_handle(fd)
-            .ok_or(SeekError::ClosedFd)?;
+            .ok_or(ClosedFd.into_set())?;
         let mut entry = entry.get_entry_mut();
         let file = match &entry.entry.handle {
             Handle::File(file) => file,
-            Handle::Dir(_) => return Err(SeekError::NotAFile),
+            Handle::Dir(_) => return NotAFile.err(),
         };
         if entry.entry.path_only {
-            return Err(SeekError::NotOpenForSeeking);
+            return NotOpenForSeeking.err();
         }
 
         match entry.entry.seek_behavior {
-            SeekBehavior::NonSeekable => Err(SeekError::NonSeekable),
+            SeekBehavior::NonSeekable => NonSeekable.err(),
             SeekBehavior::ZeroPosition => Ok(0),
             SeekBehavior::PositionBased => {
                 let file_len = self
                     .backend
                     .status(HandleRef::File(file))
-                    .map_err(|_| SeekError::Io)?
+                    .map_err(|_| Io.into_set())?
                     .size;
                 let base = match whence {
                     super::SeekWhence::RelativeToBeginning => 0,
@@ -769,11 +755,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                 };
                 let new_position = base
                     .checked_add_signed(offset)
-                    .ok_or(SeekError::InvalidOffset)?;
+                    .ok_or(InvalidOffset.into_set())?;
                 // TODO(jayb): Linux allows regular files to seek past EOF, while some backends or
                 // file types may not. Model that distinction instead of using one resolver rule.
                 if new_position > file_len {
-                    return Err(SeekError::InvalidOffset);
+                    return InvalidOffset.err();
                 }
                 entry.entry.position = new_position;
                 Ok(new_position)
@@ -797,17 +783,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .litebox
             .descriptor_table()
             .entry_handle(fd)
-            .ok_or(TruncateError::ClosedFd)?;
+            .ok_or(ClosedFd.into_set())?;
         let mut entry = entry.get_entry_mut();
         let file = match &entry.entry.handle {
             Handle::File(file) => file,
-            Handle::Dir(_) => return Err(TruncateError::IsDirectory),
+            Handle::Dir(_) => return IsADirectory.err(),
         };
         if entry.entry.path_only {
-            return Err(TruncateError::NotOpenForWriting);
+            return NotOpenForWriting.err();
         }
         if !entry.entry.write_allowed {
-            return Err(TruncateError::NotForWriting);
+            return NotForWriting.err();
         }
 
         self.backend.truncate(file, length)?;
@@ -827,15 +813,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Change the permissions of a file
     pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let path = context.resolve(path)?;
-        let handle = self
-            .path_handle(context, &path)
-            .map_err(|error| match error {
-                WalkError::Io => ChmodError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+        let path = context.resolve(path).widen()?;
+        let handle = self.path_handle(context, &path).widen()?;
         if !Self::may_change_metadata(context, &handle.permissions) {
-            return Err(ChmodError::NotTheOwner);
+            return NotTheOwner.err();
         }
         self.backend.chmod(handle.item.as_ref(), mode)
     }
@@ -848,64 +829,37 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = context.resolve(path)?;
-        let handle = self
-            .path_handle(context, &path)
-            .map_err(|error| match error {
-                WalkError::Io => ChownError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+        let path = context.resolve(path).widen()?;
+        let handle = self.path_handle(context, &path).widen()?;
         if !Self::may_change_metadata(context, &handle.permissions) {
-            return Err(ChownError::NotTheOwner);
+            return NotTheOwner.err();
         }
         self.backend.chown(handle.item.as_ref(), user, group)
     }
 
     /// Unlink a file
     pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
-        let path = context.resolve(path)?;
-        let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
-                .map_err(|error| match error {
-                    WalkError::Io => UnlinkError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            return Err(UnlinkError::IsADirectory);
+        let path = context.resolve(path).widen()?;
+        let Some((parent, name)) = self.parent_dir_and_name(context, &path).widen()? else {
+            return IsADirectory.err();
         };
         if !Self::can_change_entries_in_dir(context, &parent) {
-            return Err(UnlinkError::NoWritePerms);
+            return NoWritePerms.err();
         }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => UnlinkError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+        let parent = self.owned_parent_dir(parent.handle).widen()?;
         self.backend.unlink_at(parent, name)
     }
 
     /// Create a new directory
     pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let path = context.resolve(path)?;
-        let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
-                .map_err(|error| match error {
-                    WalkError::Io => MkdirError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            return Err(MkdirError::AlreadyExists);
+        let path = context.resolve(path).widen()?;
+        let Some((parent, name)) = self.parent_dir_and_name(context, &path).widen()? else {
+            return AlreadyExists.err();
         };
         if !Self::can_change_entries_in_dir(context, &parent) {
-            return Err(MkdirError::NoWritePerms);
+            return NoWritePerms.err();
         }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => MkdirError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+        let parent = self.owned_parent_dir(parent.handle).widen()?;
         self.backend
             .mkdir_at(
                 parent,
@@ -920,25 +874,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
 
     /// Remove a directory
     pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
-        let path = context.resolve(path)?;
-        let Some((parent, name)) =
-            self.parent_dir_and_name(context, &path)
-                .map_err(|error| match error {
-                    WalkError::Io => RmdirError::Io,
-                    WalkError::PathError(error) => error.into(),
-                })?
-        else {
-            return Err(RmdirError::Busy);
+        let path = context.resolve(path).widen()?;
+        let Some((parent, name)) = self.parent_dir_and_name(context, &path).widen()? else {
+            return Busy.err();
         };
         if !Self::can_change_entries_in_dir(context, &parent) {
-            return Err(RmdirError::NoWritePerms);
+            return NoWritePerms.err();
         }
-        let parent = self
-            .owned_parent_dir(parent.handle)
-            .map_err(|error| match error {
-                WalkError::Io => RmdirError::Io,
-                WalkError::PathError(error) => error.into(),
-            })?;
+        let parent = self.owned_parent_dir(parent.handle).widen()?;
         self.backend.rmdir_at(parent, name)
     }
 
@@ -950,13 +893,13 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .litebox
             .descriptor_table()
             .entry_handle(fd)
-            .ok_or(ReadDirError::ClosedFd)?;
+            .ok_or(ClosedFd.into_set())?;
         let entry = entry.get_entry();
         if entry.entry.path_only {
-            return Err(ReadDirError::NotOpenForReading);
+            return NotOpenForReading.err();
         }
         let dir = match &entry.entry.handle {
-            Handle::File(_) => return Err(ReadDirError::NotADirectory),
+            Handle::File(_) => return NotADirectory.err(),
             Handle::Dir(dir) => dir,
         };
 
@@ -988,15 +931,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     ) -> Result<super::FileStatus, FileStatusError> {
         let fd = self
             .open(context, path, OFlags::PATH, Mode::empty())
-            .map_err(|error| match error {
-                OpenError::PathError(error) => error.into(),
-                OpenError::Io
-                | OpenError::AccessNotAllowed
-                | OpenError::NoWritePerms
-                | OpenError::ReadOnlyFileSystem
-                | OpenError::AlreadyExists
-                | OpenError::TruncateError(_) => FileStatusError::Io,
-            })?;
+            .map_err(|error| error.subset(PathError::ANY).widen_or(Io))?;
         let status = self.fd_file_status(&fd);
         self.close(&fd).unwrap();
         status
@@ -1008,7 +943,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             .litebox
             .descriptor_table()
             .entry_handle(fd)
-            .ok_or(FileStatusError::ClosedFd)?;
+            .ok_or(ClosedFd.into_set())?;
         let entry = entry.get_entry();
         self.backend.status(entry.entry.handle.as_ref())
     }

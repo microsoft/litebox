@@ -6,7 +6,7 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use litebox::fs::errors::ReadError;
+use litebox::fs::errors::{ClosedFd, Io, NotAFile, NotForReading};
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
@@ -16,6 +16,7 @@ use litebox_common_linux::{
     },
     vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError},
 };
+use litebox_util_errset::match_kind;
 
 use crate::FileFd;
 use crate::ShimPlatform;
@@ -294,13 +295,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .borrow()
                     .fs
                     .read(fd, &mut buffer, Some(file_offset))
-                    .map_err(|e| match e {
-                        // The raw fd was resolved once at syscall entry and is intentionally
-                        // not retained; this payload is discarded when converted to EBADF.
-                        ReadError::ClosedFd => MappingError::BadFD(-1),
-                        ReadError::NotAFile => MappingError::NotAFile,
-                        ReadError::NotForReading => MappingError::NotForReading,
-                        _ => unimplemented!(),
+                    .map_err(|e| {
+                        match_kind!(e {
+                            // The raw fd was resolved once at syscall entry and is intentionally
+                            // not retained; this payload is discarded when converted to EBADF.
+                            ClosedFd => MappingError::BadFD(-1),
+                            NotAFile => MappingError::NotAFile,
+                            NotForReading => MappingError::NotForReading,
+                            Io => unimplemented!(),
+                        })
                     })?;
                 if size == 0 {
                     break;
