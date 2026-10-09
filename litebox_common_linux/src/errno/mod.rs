@@ -124,6 +124,16 @@ impl From<litebox::fs::errors::PathError> for Errno {
     }
 }
 
+impl From<litebox::fs::errors::WalkError> for Errno {
+    fn from(value: litebox::fs::errors::WalkError) -> Self {
+        match value {
+            litebox::fs::errors::WalkError::Io => Errno::EIO,
+            litebox::fs::errors::WalkError::PathError(path_error) => path_error.into(),
+            _ => unimplemented!(),
+        }
+    }
+}
+
 impl From<litebox::fs::errors::OpenError> for Errno {
     fn from(value: litebox::fs::errors::OpenError) -> Self {
         match value {

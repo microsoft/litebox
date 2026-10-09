@@ -1414,8 +1414,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// The caller must pass an absolute path.
     // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than hardcoded.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
-        use litebox::fs::errors::WalkError;
-
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
             match fd {
@@ -1429,13 +1427,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let files = self.files.borrow();
         let fs = self.fs.borrow();
         let context = fs.context.read();
-        files
-            .fs
-            .read_link(&context, fullpath)
-            .map_err(|error| match error {
-                WalkError::PathError(error) => Errno::from(error),
-                _ => Errno::EIO,
-            })
+        Ok(files.fs.read_link(&context, fullpath)?)
     }
 
     /// Handle syscall `readlink`
@@ -1870,7 +1862,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `chdir`
     pub fn sys_chdir(&self, pathname: impl path::Arg) -> Result<(), Errno> {
         use litebox::fs::FileType;
-        use litebox::fs::errors::{FileStatusError, PathError, WalkError};
+        use litebox::fs::errors::{FileStatusError, PathError};
 
         let fs = self.fs.borrow();
         if pathname
@@ -1885,13 +1877,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let target = {
             let files = self.files.borrow();
             let context = fs.context.read();
-            files
-                .fs
-                .resolve_following_symlinks(&context, pathname)
-                .map_err(|error| match error {
-                    WalkError::PathError(error) => Errno::from(error),
-                    _ => Errno::EIO,
-                })?
+            files.fs.resolve_following_symlinks(&context, pathname)?
         };
 
         // Verify the path exists and is a directory.
