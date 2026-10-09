@@ -26,6 +26,10 @@ use super::{
     },
 };
 
+/// Maximum number of symbolic links followed while resolving a single path; following more fails
+/// with [`PathError::TooManySymlinks`].
+const MAX_SYMLINKS: usize = 40;
+
 /// The north-facing filesystem entry point, generic over a [`Backend`](super::backend::Backend).
 pub struct Resolver<
     Platform: sync::RawSyncPrimitivesProvider,
@@ -304,7 +308,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                         });
                     }
                     links += 1;
-                    if links > 40 {
+                    if links > MAX_SYMLINKS {
                         return Err(PathError::TooManySymlinks.into());
                     }
                     let target = self.backend.read_link_at(&outcome.last, &name)?;
