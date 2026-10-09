@@ -2186,7 +2186,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             -1 => ChildSelector::Any,
             1.. => ChildSelector::Process(ProcessId(pid.cast_unsigned())),
             i32::MIN => return Err(Errno::ESRCH),
-            0 => match self.membership(self.pid) {
+            0 => match self.membership(0) {
                 Ok(membership) => ChildSelector::ProcessGroup(membership.process_group),
                 // Without a process service, this process has no children.
                 Err(ProcessError::Unavailable) => return Err(Errno::ECHILD),
@@ -2247,23 +2247,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(exit.process_id.0 as usize)
     }
 
-    /// Returns the process group and session of process `pid`.
+    /// Returns the process group and session of process `pid`, or of this process if `pid` is
+    /// zero.
     fn membership(&self, pid: i32) -> Result<ProcessGroupMembership, ProcessError> {
+        let pid = match pid {
+            0 => self.sys_getpid(),
+            1.. => pid,
+            _ => return Err(ProcessError::NoSuchProcess),
+        };
         self.global
             .litebox
             .process_info(ProcessId(pid.cast_unsigned()))
             .map(|info| info.membership)
-    }
-
-    /// Returns the process group and session of process `pid`, or of this process if `pid` is
-    /// zero.
-    fn membership_for_syscall(&self, pid: i32) -> Result<ProcessGroupMembership, Errno> {
-        let pid = match pid {
-            0 => self.sys_getpid(),
-            1.. => pid,
-            _ => return Err(Errno::ESRCH),
-        };
-        Ok(self.membership(pid)?)
     }
 
     /// Handle syscall `setpgid`.
@@ -2293,7 +2288,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `getpgid`.
     pub(crate) fn sys_getpgid(&self, pid: i32) -> Result<usize, Errno> {
-        let membership = self.membership_for_syscall(pid)?;
+        let membership = self.membership(pid)?;
         Ok(membership.process_group.0 as usize)
     }
 
@@ -2313,7 +2308,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `getsid`.
     pub(crate) fn sys_getsid(&self, pid: i32) -> Result<usize, Errno> {
-        let membership = self.membership_for_syscall(pid)?;
+        let membership = self.membership(pid)?;
         Ok(membership.session.0 as usize)
     }
 
