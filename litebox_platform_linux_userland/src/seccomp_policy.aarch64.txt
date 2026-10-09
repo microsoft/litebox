@@ -20,6 +20,7 @@ exit_group         any arguments                                thread managemen
 clone3             any arguments                                thread management
 futex              any arguments                                synchronization
 getrandom          any arguments                                randomness
+clock_gettime      any arguments                                vDSO fallback for reading clocks
 rseq               any arguments                                std thread spawn
 set_robust_list    any arguments                                std thread spawn
 get_robust_list    any arguments                                std thread spawn

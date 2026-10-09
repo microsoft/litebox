@@ -162,6 +162,14 @@ pub(crate) const GRANTS: &[Grant] = &[
     grant(libc::SYS_futex, "futex", "synchronization"),
     // Miscellaneous
     grant(libc::SYS_getrandom, "getrandom", "randomness"),
+    // Normally answered by the vDSO without entering the kernel, but the vDSO falls back to the
+    // syscall when the host's clocksource cannot be read from user space (e.g., `hpet` or
+    // `acpi_pm`, as in some virtual machines).
+    grant(
+        libc::SYS_clock_gettime,
+        "clock_gettime",
+        "vDSO fallback for reading clocks",
+    ),
     // Required by std spawn
     grant(libc::SYS_rseq, "rseq", "std thread spawn"),
     grant(
