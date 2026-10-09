@@ -151,6 +151,7 @@ xsave_mask:
 .globl use_xsaveopt
 use_xsaveopt:
     .byte 0
+    .align 2
 host_x87_control_word:
     .word 0
     .align 4
