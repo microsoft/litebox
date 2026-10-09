@@ -1412,8 +1412,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Read the target of a symbolic link
     ///
     /// The caller must pass an absolute path.
-    ///
-    /// Note that `/proc/self/fd/<fd>` is hardcoded rather than backed by the file system.
+    // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than hardcoded.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         use litebox::fs::errors::WalkError;
 
