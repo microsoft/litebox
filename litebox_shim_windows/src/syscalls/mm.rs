@@ -494,10 +494,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if allocation.type_ != MemoryType::MEM_PRIVATE {
             return NtStatus::INVALID_PARAMETER;
         }
-        if !range_is_committed(
-            &self.global.page_manager.mappings(),
-            aligned_base..aligned_base + aligned_len,
-        ) {
+        let vmem = self.global.page_manager.read_vmem();
+        if !vmem.is_range_mapped(&(aligned_base..aligned_base + aligned_len)) {
             return NtStatus::CONFLICTING_ADDRESSES;
         }
 
@@ -1267,29 +1265,6 @@ enum PageRangeScan {
     ContainsUncommitted,
 }
 
-fn range_is_committed(
-    mappings: &[(core::ops::Range<usize>, VmFlags)],
-    range: core::ops::Range<usize>,
-) -> bool {
-    if range.start >= range.end {
-        return range.start == range.end;
-    }
-    let mut covered_until = range.start;
-    for (mapped, _) in mappings
-        .iter()
-        .skip_while(|(mapped, _)| mapped.end <= range.start)
-    {
-        if mapped.start > covered_until {
-            return false;
-        }
-        covered_until = mapped.end;
-        if covered_until >= range.end {
-            return true;
-        }
-    }
-    false
-}
-
 fn scan_protect_range<Platform: ShimPlatform>(
     page_manager: &WindowsPageManager<Platform>,
     virtual_allocations: &WindowsVirtualAllocations<Platform>,
@@ -1299,7 +1274,8 @@ fn scan_protect_range<Platform: ShimPlatform>(
     let allocation = find_virtual_allocation_containing(virtual_allocations, base)?;
     let end = base.checked_add(size)?;
     let allocation_end = allocation.base.checked_add(allocation.size)?;
-    if end > allocation_end || !range_is_committed(&page_manager.mappings(), base..end) {
+    let vmem = page_manager.read_vmem();
+    if end > allocation_end || !vmem.is_range_mapped(&(base..end)) {
         return Some(PageRangeScan::ContainsUncommitted);
     }
     let first_protect =
@@ -1478,10 +1454,10 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
         return None;
     }
 
-    let mut mappings = page_manager.mappings();
-    mappings.sort_by_key(|(range, _)| range.start);
+    let vmem = page_manager.read_vmem();
+    let mappings = vmem.mappings();
     if let Some(allocation) = find_virtual_allocation_containing(virtual_allocations, query_base) {
-        return query_allocation_basic_information(allocation, query_base, &mappings);
+        return query_allocation_basic_information(allocation, query_base, mappings);
     }
 
     if let Some((range, flags)) = mappings
@@ -1503,9 +1479,8 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
         });
     }
 
-    let reservations = page_manager.reservations();
-    if let Some(range) = reservations
-        .iter()
+    if let Some(range) = vmem
+        .reservation_ranges()
         .find(|range| range.contains(&base_address))
     {
         return Some(MemoryBasicInformation {
@@ -1526,8 +1501,8 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
         .iter()
         .find(|(range, _)| range.start > query_base)
         .map_or(Platform::TASK_ADDR_MAX, |(range, _)| range.start);
-    let next_reservation_start = reservations
-        .iter()
+    let next_reservation_start = vmem
+        .reservation_ranges()
         .filter(|range| range.start > query_base)
         .map(|range| range.start)
         .min()
@@ -1552,7 +1527,7 @@ fn query_memory_basic_information<Platform: ShimPlatform>(
 fn query_allocation_basic_information(
     allocation: WindowsVirtualAllocation,
     query_base: usize,
-    mappings: &[(core::ops::Range<usize>, VmFlags)],
+    mappings: &RangeMap<usize, VmFlags>,
 ) -> Option<MemoryBasicInformation> {
     let allocation_end = allocation.base.checked_add(allocation.size)?;
     let mut mappings = mappings
@@ -1814,52 +1789,6 @@ mod tests {
     }
 
     #[test]
-    fn range_is_committed_checks_state_and_full_coverage() {
-        let base = ALLOCATION_GRANULARITY;
-        assert!(!range_is_committed(&[], base..base + PAGE_SIZE));
-        assert!(range_is_committed(&[], base..base));
-        assert!(!range_is_committed(&[], base + PAGE_SIZE..base));
-
-        let mappings = [
-            (0, VmFlags::VM_READ),
-            (1, VmFlags::empty()),
-            (2, VmFlags::VM_READ | VmFlags::VM_WRITE),
-            (5, VmFlags::VM_READ),
-        ]
-        .map(|(offset, flags)| {
-            (
-                base + offset * PAGE_SIZE..base + (offset + 1) * PAGE_SIZE,
-                flags,
-            )
-        });
-
-        assert!(range_is_committed(&mappings, base..base + 3 * PAGE_SIZE));
-        assert!(range_is_committed(
-            &mappings,
-            base + PAGE_SIZE + 1..base + 2 * PAGE_SIZE - 1,
-        ));
-        assert!(!range_is_committed(&mappings, base..base + 4 * PAGE_SIZE));
-        assert!(!range_is_committed(
-            &mappings,
-            base + 3 * PAGE_SIZE..base + 4 * PAGE_SIZE,
-        ));
-        assert!(!range_is_committed(
-            &mappings,
-            base - PAGE_SIZE..base + PAGE_SIZE,
-        ));
-        assert!(!range_is_committed(
-            &mappings,
-            base + 4 * PAGE_SIZE..base + 6 * PAGE_SIZE,
-        ));
-        assert!(!range_is_committed(
-            &mappings,
-            base + 5 * PAGE_SIZE..base + 7 * PAGE_SIZE,
-        ));
-
-        assert!(!range_is_committed(&mappings, base..base + 6 * PAGE_SIZE));
-    }
-
-    #[test]
     fn query_untracked_mapping_distinguishes_reservation_from_noaccess() {
         run_with_test_platform_pointers(|| {
             let task = crate::tests::test_task();
@@ -1938,14 +1867,17 @@ mod tests {
             type_: MemoryType::MEM_PRIVATE,
             page_protections: pages,
         };
-        let mappings = [
+        let mut mappings = RangeMap::new();
+        for (range, flags) in [
             (base..base + PAGE_SIZE, VmFlags::VM_READ | VmFlags::VM_WRITE),
             (
                 base + PAGE_SIZE..base + 3 * PAGE_SIZE,
                 VmFlags::VM_READ | VmFlags::VM_WRITE | VmFlags::VM_MAYREAD,
             ),
             (base + 5 * PAGE_SIZE..base + 6 * PAGE_SIZE, VmFlags::empty()),
-        ];
+        ] {
+            mappings.insert(range, flags);
+        }
         for (offset, count, state, protect) in [
             (0, 2, MemoryState::MEM_COMMIT, copy_protect.bits()),
             (1, 1, MemoryState::MEM_COMMIT, copy_protect.bits()),

@@ -1737,14 +1737,15 @@ mod tests {
         assert!(
             task.global
                 .page_manager
-                .reservations()
-                .iter()
+                .read_vmem()
+                .reservation_ranges()
                 .any(|range| range.contains(&base))
         );
         assert!(
             !task
                 .global
                 .page_manager
+                .read_vmem()
                 .mappings()
                 .iter()
                 .any(|(range, _)| range.contains(&base))
@@ -1764,8 +1765,9 @@ mod tests {
         assert!(
             task.global
                 .page_manager
+                .read_vmem()
                 .mappings()
-                .into_iter()
+                .iter()
                 .any(|(range, _)| range.contains(&base))
         );
         let mapped = MutPtr::<TestPlatform, u32>::from_usize(base);

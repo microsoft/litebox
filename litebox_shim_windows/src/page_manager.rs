@@ -3,7 +3,6 @@
 
 //! Windows-style explicit reservation, commitment, decommitment, and release.
 
-use alloc::vec::Vec;
 use core::ops::Range;
 
 use litebox::platform::RawConstPointer as _;
@@ -12,7 +11,7 @@ use litebox::platform::page_mgmt::{
     AllocationDirection, AllocationError, FixedAddressBehavior, MemoryRegionPermissions,
     PageReservation as _, ReleaseTargetOf, ReservationStore as _,
 };
-use litebox::sync::RwLock;
+use litebox::sync::{RwLock, RwLockReadGuard};
 use litebox_common_linux::vmem::{
     CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, VmFlags, VmemProtectError,
     VmemUnmapError,
@@ -23,7 +22,7 @@ use crate::PAGE_SIZE;
 
 type Reservations<Platform> = TrackedReservations<<Platform as crate::ShimPlatform>::Reservation>;
 
-struct WindowsVmem<Platform>
+pub(crate) struct WindowsVmem<Platform>
 where
     Platform: crate::ShimPlatform,
 {
@@ -44,18 +43,8 @@ where
         }
     }
 
-    fn is_range_mapped(&self, range: &Range<usize>) -> bool {
-        let mut covered_until = range.start;
-        for (mapped, _) in self.mappings.overlapping(range.clone()) {
-            if mapped.start > covered_until {
-                return false;
-            }
-            covered_until = covered_until.max(mapped.end);
-            if covered_until >= range.end {
-                return true;
-            }
-        }
-        range.is_empty()
+    pub(crate) fn is_range_mapped(&self, range: &Range<usize>) -> bool {
+        range.start <= range.end && self.mappings.gaps(range).next().is_none()
     }
 
     unsafe fn create_private_pages(
@@ -278,11 +267,10 @@ where
         Ok(())
     }
 
-    fn reservations(&self) -> Vec<Range<usize>> {
+    pub(crate) fn reservation_ranges(&self) -> impl Iterator<Item = Range<usize>> + '_ {
         self.reservations
             .iter()
             .map(|(_, reservation)| reservation.range())
-            .collect()
     }
 
     fn get_memory_permissions(
@@ -364,11 +352,8 @@ where
         Ok(())
     }
 
-    fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
-        self.mappings
-            .iter()
-            .map(|(range, flags)| (range.clone(), *flags))
-            .collect()
+    pub(crate) fn mappings(&self) -> &RangeMap<usize, VmFlags> {
+        &self.mappings
     }
 }
 
@@ -518,8 +503,8 @@ where
         unsafe { vmem.decommit_pages(ptr, len) }
     }
 
-    pub(crate) fn reservations(&self) -> Vec<Range<usize>> {
-        self.vmem.read().reservations()
+    pub(crate) fn read_vmem(&self) -> RwLockReadGuard<'_, Platform, WindowsVmem<Platform>> {
+        self.vmem.read()
     }
 
     pub(crate) fn get_memory_permissions(
@@ -614,10 +599,6 @@ where
         let mut vmem = self.vmem.write();
         // SAFETY: The write guard provides exclusive state access and forwards the caller contract.
         unsafe { vmem.remove_pages(ptr, len) }
-    }
-
-    pub(crate) fn mappings(&self) -> Vec<(Range<usize>, VmFlags)> {
-        self.vmem.read().mappings()
     }
 }
 
