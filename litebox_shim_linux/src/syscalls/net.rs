@@ -1281,6 +1281,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
             socket,
             |fd| {
                 let sock_type = self.global.get_socket_type(fd)?;
+                if !matches!(sock_type, SockType::Stream) {
+                    return Err(Errno::EOPNOTSUPP);
+                }
                 let mut socket_addr =
                     want_peer.then(|| SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)));
                 let accepted_file =
