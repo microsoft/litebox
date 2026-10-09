@@ -1525,6 +1525,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "litebox_common"
+version = "0.1.0"
+dependencies = [
+ "spin 0.9.8",
+]
+
+[[package]]
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
@@ -1612,6 +1619,7 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "litebox",
+ "litebox_common",
  "litebox_common_linux",
  "litebox_common_optee",
  "seccompiler",
@@ -1655,6 +1663,7 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "litebox",
+ "litebox_common",
  "litebox_common_linux",
  "windows-sys 0.60.2",
  "zerocopy",
