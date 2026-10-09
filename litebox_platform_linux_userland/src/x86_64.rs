@@ -13,6 +13,24 @@ use super::{
     reenter_handler, syscall_handler,
 };
 
+const RFLAGS_TF: u32 = 1 << 8;
+const RFLAGS_DF: u32 = 1 << 10;
+const RFLAGS_AC: u32 = 1 << 18;
+const HOST_UNSAFE_RFLAGS: u32 = RFLAGS_TF | RFLAGS_DF | RFLAGS_AC;
+const HOST_SAFE_RFLAGS_MASK: u32 = !HOST_UNSAFE_RFLAGS;
+
+// Clear TF, DF, and AC in the live flags before entering host code. Callers
+// must preserve the original guest flags before invoking this macro.
+macro_rules! sanitize_host_rflags {
+    () => {
+        "
+    pushfq
+    and DWORD PTR [rsp], {HOST_SAFE_RFLAGS_MASK}
+    popfq
+"
+    };
+}
+
 // ---------------------------------------------------------------------------
 // TLS (`.tbss`) access helpers
 //
@@ -293,6 +311,9 @@ syscall_callback:
     push    0x2b       // pt_regs->ss = __USER_DS
     push    r11        // pt_regs->sp
     pushfq             // pt_regs->eflags
+",
+    sanitize_host_rflags!(),
+"
     push    0x33       // pt_regs->cs = __USER_CS
     push    rcx        // pt_regs->ip
     push    rax        // pt_regs->orig_ax
@@ -385,6 +406,7 @@ interrupt_callback_no_xsave:
     syscall_handler = sym syscall_handler,
     exception_handler = sym exception_handler,
     interrupt_handler = sym interrupt_handler,
+    HOST_SAFE_RFLAGS_MASK = const HOST_SAFE_RFLAGS_MASK,
     );
 }
 
@@ -575,6 +597,9 @@ pub(super) fn set_signal_return(
     sigctx.gregs[libc::REG_RSI as usize] = p1 as i64;
     sigctx.gregs[libc::REG_RDX as usize] = p2 as i64;
     sigctx.gregs[libc::REG_RCX as usize] = p3 as i64;
+    // `rt_sigreturn` restores RFLAGS before entering the callback, which must
+    // satisfy the host ABI rather than inherit guest-controlled execution flags.
+    sigctx.gregs[libc::REG_EFL as usize] &= !i64::from(HOST_UNSAFE_RFLAGS);
 }
 
 impl litebox::platform::ArchSpecificProvider for LinuxUserland {
