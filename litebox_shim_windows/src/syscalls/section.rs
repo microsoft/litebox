@@ -781,10 +781,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 )
             }
         } else {
-            mm::create_pages(
-                &self.global.page_manager,
+            self.global.page_manager.create_initialized_pages(
                 None,
                 length,
+                super::mm::ALLOCATION_GRANULARITY,
                 CreatePagesFlags::empty(),
                 permissions,
                 |_| Ok(0),

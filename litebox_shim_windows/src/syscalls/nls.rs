@@ -736,10 +736,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
 
         let mut copy_status = None;
-        let mapping = crate::syscalls::mm::create_pages(
-            &self.global.page_manager,
+        let mapping = self.global.page_manager.create_initialized_pages(
             None,
             page_len,
+            crate::syscalls::mm::ALLOCATION_GRANULARITY,
             CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY,
             MemoryRegionPermissions::READ,
             |ptr| match self.copy_nls_section_file(&section_file.fd, section_len, ptr) {

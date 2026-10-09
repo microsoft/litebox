@@ -366,7 +366,7 @@ impl PageTableManager {
     /// The ID of the newly created task page table (its P4 frame start address),
     /// or `Err(Errno::ENOMEM)` if the P4 frame allocation fails.
     pub fn create_task_page_table(&self) -> Result<usize, Errno> {
-        let pt = unsafe { mm::PageTable::new_top_level() }.ok_or(Errno::ENOMEM)?;
+        let pt = unsafe { mm::PageTable::new_top_level() };
 
         // Share the fixed kernel hierarchy; CPU startup only unmaps guard leaves.
         // Lower slots stay private (see `copy_pml4_entries_from`).
@@ -523,7 +523,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// entire kernel physical range, and loaded via CR3. Pages inside the kernel
     /// text section (`text_phys_start..text_phys_end`) and the Hyper-V hypercall
     /// code page are mapped executable; every other page is marked `NO_EXECUTE`.
-    /// `.rodata` is mapped read-only and `CR0.WP` is enabled.
     ///
     /// # Prerequisites
     ///
@@ -556,7 +555,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     ///
     /// - CR3 points to the new base page table covering the **full** kernel
     ///   physical range with DEP enforcement.
-    /// - `CR0.WP` is set on the calling CPU; APs inherit it via their VP context.
     /// - The previous trampoline page table frames (early page table pages and
     ///   any Phase 1 scratch pages) are no longer referenced and may be
     ///   reclaimed by the caller.
@@ -570,44 +568,20 @@ impl<Host: HostInterface> LinuxKernel<Host> {
     /// * `text_phys_start` / `text_phys_end`: Page-aligned physical address
     ///   range of the kernel `.text` section (converted to PA after
     ///   relocation).
-    /// * `rodata_phys_start` / `rodata_phys_end`: Same, for `.rodata`.
     ///
     /// # Panics
     ///
     /// Panics if the heap is not seeded, if any address argument is invalid
-    /// or misaligned, or if the text or rodata section falls outside the VTL1
-    /// range or they overlap.
+    /// or misaligned, or if the text section falls outside the VTL1 range.
     pub fn new(
         phys_start: x86_64::PhysAddr,
         phys_end: x86_64::PhysAddr,
         text_phys_start: x86_64::PhysAddr,
         text_phys_end: x86_64::PhysAddr,
-        rodata_phys_start: x86_64::PhysAddr,
-        rodata_phys_end: x86_64::PhysAddr,
     ) -> &'static Self {
         let physframe_start = PhysFrame::containing_address(phys_start);
         let physframe_end = PhysFrame::containing_address(phys_end.align_up(Size4KiB::SIZE));
         let vtl1_range = PhysFrame::range(physframe_start, physframe_end);
-
-        let text = text_phys_start..text_phys_end;
-        let rodata = rodata_phys_start..rodata_phys_end;
-        let vtl1_phys = physframe_start.start_address()..physframe_end.start_address();
-        for region in [&text, &rodata] {
-            assert!(region.start <= region.end, "reversed kernel image range");
-            assert!(
-                region.start.is_aligned(Size4KiB::SIZE) && region.end.is_aligned(Size4KiB::SIZE),
-                "kernel image range {region:?} must be page-aligned"
-            );
-            assert!(
-                region.is_empty()
-                    || (vtl1_phys.start <= region.start && region.end <= vtl1_phys.end),
-                "kernel image range {region:?} is outside VTL1 memory"
-            );
-        }
-        assert!(
-            rodata.is_empty() || text.end <= rodata.start || rodata.end <= text.start,
-            "kernel text and read-only data overlap"
-        );
 
         // Create the base page table with DEP enforcement.
         //
@@ -616,7 +590,7 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         //   2. The Hyper-V hypercall code page (defined in the linker script;
         //      the hypervisor writes executable code into it at runtime)
         #[allow(unused_mut)]
-        let mut exec_ranges = alloc::vec![text];
+        let mut exec_ranges = alloc::vec![text_phys_start..text_phys_end];
         #[cfg(not(test))]
         {
             use crate::mshv::vtl1_mem_layout::get_hvcall_page_start_address;
@@ -627,14 +601,12 @@ impl<Host: HostInterface> LinuxKernel<Host> {
             exec_ranges.push(hvcall_phys..hvcall_phys + PAGE_SIZE as u64);
         }
 
-        let base_pt = unsafe { mm::PageTable::new_top_level() }
-            .expect("Failed to allocate the base page table frame");
+        let base_pt = unsafe { mm::PageTable::new_top_level() };
         if base_pt
             .map_phys_frame_range(
                 vtl1_range,
                 PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
                 Some(&exec_ranges),
-                Some(core::slice::from_ref(&rodata)),
             )
             .is_err()
         {
@@ -653,8 +625,6 @@ impl<Host: HostInterface> LinuxKernel<Host> {
         // in use. The Phase 1 trampoline page table (VTL0's PML4) is no
         // longer needed.
         base_pt.load();
-
-        crate::arch::enable_write_protect();
 
         // There is only one long-running platform ever expected, thus this leak is perfectly ok in
         // order to simplify usage of the platform.
@@ -1013,7 +983,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         let current_pt = self.page_table_manager.current_page_table();
         unsafe { current_pt.mprotect_pages(range, flags) }
             .expect("failed to protect committed pages");
-        current_pt.map_pages(range, flags, populate_pages_immediately)
+        Ok(current_pt.map_pages(range, flags, populate_pages_immediately))
     }
 
     unsafe fn reserve_and_commit_pages<Reservations>(
@@ -1050,8 +1020,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { current_pt.unmap_pages(range, true, true, false) }
-                    .map_err(|_| litebox::platform::page_mgmt::AllocationError::Unaligned)?;
+                unsafe { current_pt.unmap_pages(range, true, true, false).unwrap() };
                 replaced_reservations().for_each(drop);
             }
         }
@@ -1062,7 +1031,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 0
             };
         let flags = litebox_common_linux::vmem::VmFlags::from_bits(flags).unwrap();
-        current_pt.map_pages(range, flags, populate_pages_immediately)?;
+        current_pt.map_pages(range, flags, populate_pages_immediately);
         // SAFETY: The page table now exclusively owns this exact aligned extent.
         Ok(unsafe { LvbsReservation::new(suggested_range) })
     }
@@ -1140,6 +1109,10 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
                 .current_page_table()
                 .mprotect_pages(range, new_flags)
         }
+    }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
+        core::iter::empty()
     }
 }
 
@@ -1422,12 +1395,9 @@ where
     run_thread_inner(shim, ctx, true);
 }
 
-/// Only accessed via `&`: a kernel-mode #PF can re-enter `exception_handler`
-/// with this same pointer while a shim call is in progress. `ctx` is raw so
-/// only non-nesting user-mode entries create a `&mut PtRegs`.
 struct ThreadContext<'a> {
     shim: &'a dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
-    ctx: *mut litebox_common_linux::PtRegs,
+    ctx: &'a mut litebox_common_linux::PtRegs,
 }
 
 fn run_thread_inner(
@@ -1436,7 +1406,7 @@ fn run_thread_inner(
     reenter: bool,
 ) {
     let ctx_ptr = core::ptr::from_mut(ctx);
-    let thread_ctx = ThreadContext { shim, ctx: ctx_ptr };
+    let mut thread_ctx = ThreadContext { shim, ctx };
     // `thread_ctx` will be passed to `syscall_handler` later.
     // `ctx_ptr` is to let `run_thread_arch` easily access `ctx` (i.e., not to deal with
     // member variable offset calculation in assembly code).
@@ -1447,7 +1417,7 @@ fn run_thread_inner(
     // SAFETY: `thread_ctx` and `ctx_ptr` alias the same valid `PtRegs`/shim for
     // the duration of the call, and `run_thread_arch` returns exactly once.
     unsafe {
-        run_thread_arch(&thread_ctx, ctx_ptr, u8::from(reenter));
+        run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
     }
 }
 
@@ -1720,7 +1690,7 @@ macro_rules! RESTORE_CPU_CONTEXT_ASM {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 unsafe extern "C" fn run_thread_arch(
-    thread_ctx: &ThreadContext,
+    thread_ctx: &mut ThreadContext,
     ctx: *mut litebox_common_linux::PtRegs,
     reenter: u8,
 ) {
@@ -1769,9 +1739,10 @@ unsafe extern "C" fn run_thread_arch(
         // - All GPRs contain user-mode values
         // - Interrupts are disabled (IDT gate clears IF)
         // - GS = user (swapgs has NOT happened yet)
-        // - DF and AC are cleared by the ISR stub (interrupts.S)
         ".globl exception_callback",
         "exception_callback:",
+        "cld",
+        "clac",
         "swapgs",
         "mov gs:[{scratch_off}], rax", // Save `rax` to per-CPU scratch
         "mov al, [rsp]",
@@ -1876,15 +1847,11 @@ unsafe extern "C" fn run_thread_arch(
     );
 }
 
-unsafe extern "C" fn init_handler(thread_ctx: &ThreadContext) {
-    // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
-    // is blocked in `run_thread_arch` and does not touch it, so the pointer is
-    // valid and this is the only reference.
-    let ctx = unsafe { &mut *thread_ctx.ctx };
-    match thread_ctx.shim.init(ctx) {
+unsafe extern "C" fn init_handler(thread_ctx: &mut ThreadContext) {
+    match thread_ctx.call_shim(|shim, ctx| shim.init(ctx)) {
         ContinueOperation::Resume => {
-            if ctx.sanitize_for_user_return() {
-                unsafe { switch_to_user(ctx) }
+            if thread_ctx.ctx.sanitize_for_user_return() {
+                unsafe { switch_to_user(thread_ctx.ctx) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
         }
@@ -1892,15 +1859,11 @@ unsafe extern "C" fn init_handler(thread_ctx: &ThreadContext) {
     }
 }
 
-unsafe extern "C" fn reenter_handler(thread_ctx: &ThreadContext) {
-    // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
-    // is blocked in `run_thread_arch` and does not touch it, so the pointer is
-    // valid and this is the only reference.
-    let ctx = unsafe { &mut *thread_ctx.ctx };
-    match thread_ctx.shim.reenter(ctx) {
+unsafe extern "C" fn reenter_handler(thread_ctx: &mut ThreadContext) {
+    match thread_ctx.call_shim(|shim, ctx| shim.reenter(ctx)) {
         ContinueOperation::Resume => {
-            if ctx.sanitize_for_user_return() {
-                unsafe { switch_to_user(ctx) }
+            if thread_ctx.ctx.sanitize_for_user_return() {
+                unsafe { switch_to_user(thread_ctx.ctx) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
         }
@@ -1908,19 +1871,15 @@ unsafe extern "C" fn reenter_handler(thread_ctx: &ThreadContext) {
     }
 }
 
-unsafe extern "C" fn syscall_handler(thread_ctx: &ThreadContext) {
-    // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
-    // is still blocked in `run_thread_arch`, so the pointer is valid. We entered
-    // from user mode, so no shim call is in progress and no other reference exists.
-    let ctx = unsafe { &mut *thread_ctx.ctx };
-    if !ctx.has_user_return_addresses() {
+unsafe extern "C" fn syscall_handler(thread_ctx: &mut ThreadContext) {
+    if !thread_ctx.ctx.has_user_return_addresses() {
         return;
     }
 
-    match thread_ctx.shim.syscall(ctx) {
+    match thread_ctx.call_shim(|shim, ctx| shim.syscall(ctx)) {
         ContinueOperation::Resume => {
-            if ctx.sanitize_for_user_return() {
-                unsafe { switch_to_user(ctx) }
+            if thread_ctx.ctx.sanitize_for_user_return() {
+                unsafe { switch_to_user(thread_ctx.ctx) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
         }
@@ -1950,7 +1909,7 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
     })
 }
 
-/// Handles exceptions and routes to the shim's exception handler.
+/// Handles exceptions and routes to the shim's exception handler via `call_shim`.
 ///
 /// `cr2` is passed by both kernel- and user-mode assembly callbacks.
 /// For kernel-mode exceptions, `error_code` and `faulting_rip`
@@ -1963,23 +1922,12 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
 /// a fixup address when kernel-mode user-space demand paging fails and
 /// an exception table entry exists. Panics if no fixup is found.
 unsafe extern "C" fn exception_handler(
-    thread_ctx: &ThreadContext,
+    thread_ctx: &mut ThreadContext,
     kernel_mode: bool,
     cr2: usize,
     error_code: usize,
     faulting_rip: usize,
 ) -> usize {
-    let mut scratch = litebox_common_linux::PtRegs::default();
-    // A kernel-mode #PF may interrupt a shim call that is using the user context,
-    // so give the shim a scratch context instead.
-    let ctx = if kernel_mode {
-        &mut scratch
-    } else {
-        // SAFETY: `ctx` points to the `PtRegs` borrowed by `run_thread_inner`, which
-        // is still blocked in `run_thread_arch`, so the pointer is valid. We entered
-        // from user mode, so no shim call is in progress and no other reference exists.
-        unsafe { &mut *thread_ctx.ctx }
-    };
     let info = if kernel_mode {
         use litebox::utils::TruncateExt as _;
         litebox::shim::ExceptionInfo {
@@ -1993,7 +1941,7 @@ unsafe extern "C" fn exception_handler(
         use litebox::utils::TruncateExt as _;
         litebox::shim::ExceptionInfo {
             exception: with_per_cpu_variables(|pcv| pcv.asm.get_exception()),
-            error_code: ctx.orig_rax.trunc(),
+            error_code: thread_ctx.ctx.orig_rax.trunc(),
             cr2,
             kernel_mode: false,
         }
@@ -2004,15 +1952,15 @@ unsafe extern "C" fn exception_handler(
         crate::arch::timer::eoi();
         crate::arch::timer::mark_user_timeout_kill();
     }
-    match thread_ctx.shim.exception(ctx, &info) {
+    match thread_ctx.call_shim(|shim, ctx| shim.exception(ctx, &info)) {
         ContinueOperation::Resume => {
             if kernel_mode {
                 // Kernel-mode exception handled (e.g., demand paging succeeded).
                 0
             } else {
                 // User-mode exception handled; resume user execution.
-                if ctx.sanitize_for_user_return() {
-                    unsafe { switch_to_user(ctx) }
+                if thread_ctx.ctx.sanitize_for_user_return() {
+                    unsafe { switch_to_user(thread_ctx.ctx) }
                 } else {
                     litebox_util_log::warn!("terminating thread with invalid user return context");
                     0
@@ -2038,6 +1986,20 @@ unsafe extern "C" fn exception_handler(
                 0
             }
         }
+    }
+}
+
+/// Calls `f` to invoke a shim entrypoint, returning the shim's
+/// [`ContinueOperation`] for the caller to interpret.
+impl ThreadContext<'_> {
+    fn call_shim(
+        &mut self,
+        f: impl FnOnce(
+            &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+            &mut litebox_common_linux::PtRegs,
+        ) -> ContinueOperation,
+    ) -> ContinueOperation {
+        f(self.shim, self.ctx)
     }
 }
 

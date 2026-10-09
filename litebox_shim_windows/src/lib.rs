@@ -483,20 +483,21 @@ fn map_windows_user_shared_data<Platform: crate::ShimPlatform>(
         NonZeroPageSize::new(size_of::<nt_types::KUserSharedData>().next_multiple_of(PAGE_SIZE))?;
     let shared_data = windows_user_shared_data();
     let shared_data_bytes = shared_data.as_bytes();
-    crate::syscalls::mm::create_pages(
-        page_manager,
-        Some(address),
-        length,
-        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-        litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
-        |ptr| {
-            ptr.copy_from_slice(0, shared_data_bytes)
-                .ok_or(MappingError::OutOfMemory)?;
-            Ok(0)
-        },
-    )
-    .map(|ptr| ptr.as_usize())
-    .ok()
+    page_manager
+        .create_initialized_pages(
+            Some(address),
+            length,
+            crate::syscalls::mm::ALLOCATION_GRANULARITY,
+            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+            litebox::platform::page_mgmt::MemoryRegionPermissions::READ,
+            |ptr| {
+                ptr.copy_from_slice(0, shared_data_bytes)
+                    .ok_or(MappingError::OutOfMemory)?;
+                Ok(0)
+            },
+        )
+        .map(|ptr| ptr.as_usize())
+        .ok()
 }
 
 // TODO: This is a temporary placeholder for the Windows shared data page.

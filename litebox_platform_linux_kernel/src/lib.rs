@@ -365,8 +365,9 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             litebox_common_linux::vmem::VmFlags::from_bits(permissions.bits().into()).unwrap();
         unsafe { self.page_table.mprotect_pages(range, flags) }
             .expect("failed to protect committed pages");
-        self.page_table
-            .map_pages(range, flags, populate_pages_immediately)
+        Ok(self
+            .page_table
+            .map_pages(range, flags, populate_pages_immediately))
     }
 
     unsafe fn reserve_and_commit_pages<Reservations>(
@@ -402,8 +403,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             FixedAddressBehavior::Hint(_) | FixedAddressBehavior::NoReplace => {}
             FixedAddressBehavior::Replace => {
                 // Clear the existing mappings first.
-                unsafe { self.page_table.unmap_pages(range, true) }
-                    .map_err(|_| litebox::platform::page_mgmt::AllocationError::Unaligned)?;
+                unsafe { self.page_table.unmap_pages(range, true).unwrap() };
                 replaced_reservations().for_each(drop);
             }
         }
@@ -415,7 +415,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             };
         let flags = litebox_common_linux::vmem::VmFlags::from_bits(flags).unwrap();
         self.page_table
-            .map_pages(range, flags, populate_pages_immediately)?;
+            .map_pages(range, flags, populate_pages_immediately);
         // SAFETY: The page table now exclusively owns this exact aligned extent.
         Ok(unsafe { LinuxKernelReservation::new(suggested_range) })
     }
@@ -484,6 +484,10 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
         let new_flags =
             litebox_common_linux::vmem::VmFlags::from_bits(new_permissions.bits().into()).unwrap();
         unsafe { self.page_table.mprotect_pages(range, new_flags) }
+    }
+
+    fn reserved_pages(&self) -> impl Iterator<Item = &core::ops::Range<usize>> {
+        core::iter::empty()
     }
 }
 

@@ -19,7 +19,7 @@ use crate::{
     WindowsVirtualAllocations,
 };
 
-pub(super) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
+pub(crate) const ALLOCATION_GRANULARITY: usize = 0x1_0000;
 const MEMORY_WORKING_SET_LIST_MIN_SIZE: usize = 16;
 const MEM_EXTENDED_PARAMETER_TYPE_MASK: u64 = 0xff;
 const READ_VIRTUAL_MEMORY_CHUNK_BYTES: usize = 4 * 1024;
@@ -389,45 +389,40 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let Some(length) = NonZeroPageSize::new(aligned_len) else {
             return NtStatus::INVALID_PARAMETER;
         };
-        let initial_state = if allocation_type.contains(AllocationType::MEM_COMMIT) {
-            PageState::Committed(permissions)
-        } else {
-            PageState::Reserved
-        };
         let top_down = allocation_type.contains(AllocationType::MEM_TOP_DOWN);
-        let allocation = if base == 0 {
+        let (address_bounds, flags) = if base == 0 {
             let upper_bound = zero_bits_address_limit(zero_bits)
                 .unwrap_or(Platform::TASK_ADDR_MAX)
                 .min(Platform::TASK_ADDR_MAX);
-            // SAFETY: The manager chooses fresh aligned address space within the guest's bounds,
-            // and the allocation remains unpublished until output writeback succeeds.
-            unsafe {
-                self.global.page_manager.create_private_pages(
-                    None,
-                    Platform::TASK_ADDR_MIN..upper_bound,
-                    length,
-                    ALLOCATION_GRANULARITY,
-                    if top_down {
-                        CreatePagesFlags::TOP_DOWN
-                    } else {
-                        CreatePagesFlags::empty()
-                    },
-                    allocation_type
-                        .contains(AllocationType::MEM_COMMIT)
-                        .then_some(permissions),
-                )
-            }
-            .map_err(mapping_error_to_nt_status)
-        } else {
-            create_pages_with_state::<Platform>(
-                &self.global.page_manager,
-                NonZeroAddress::new(aligned_base),
-                length,
-                CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-                initial_state,
+            (
+                Platform::TASK_ADDR_MIN..upper_bound,
+                if top_down {
+                    CreatePagesFlags::TOP_DOWN
+                } else {
+                    CreatePagesFlags::empty()
+                },
             )
-            .map_err(mapping_error_to_nt_status)
+        } else {
+            (
+                Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX,
+                CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+            )
         };
+        // SAFETY: The manager acquires fresh aligned address space without replacement, and the
+        // allocation remains unpublished until output writeback succeeds.
+        let allocation = unsafe {
+            self.global.page_manager.create_private_pages(
+                NonZeroAddress::new(aligned_base),
+                address_bounds,
+                length,
+                ALLOCATION_GRANULARITY,
+                flags,
+                allocation_type
+                    .contains(AllocationType::MEM_COMMIT)
+                    .then_some(permissions),
+            )
+        }
+        .map_err(mapping_error_to_nt_status);
         let ptr = match allocation {
             Ok(ptr) => ptr,
             Err(status) => {
@@ -1272,12 +1267,6 @@ enum PageRangeScan {
     ContainsUncommitted,
 }
 
-#[derive(Clone, Copy)]
-enum PageState {
-    Reserved,
-    Committed(MemoryRegionPermissions),
-}
-
 fn range_is_committed(
     mappings: &[(core::ops::Range<usize>, VmFlags)],
     range: core::ops::Range<usize>,
@@ -1406,69 +1395,6 @@ fn permissions_to_page_protect(permissions: MemoryRegionPermissions) -> PageProt
     }
 }
 
-pub(crate) fn create_pages<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
-    length: NonZeroPageSize<PAGE_SIZE>,
-    flags: CreatePagesFlags,
-    permissions: MemoryRegionPermissions,
-    op: impl FnOnce(MutPtr<Platform, u8>) -> Result<usize, MappingError>,
-) -> Result<MutPtr<Platform, u8>, MappingError> {
-    let writable = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-    let fixed = flags.contains(CreatePagesFlags::FIXED_ADDR);
-    let flag_bits = flags.bits();
-    // SAFETY: Each attempt acquires fresh private address space without replacement.
-    let allocate = |suggested_address| unsafe {
-        page_manager.create_reserved_and_committed_pages(
-            suggested_address,
-            length,
-            ALLOCATION_GRANULARITY,
-            CreatePagesFlags::from_bits_retain(flag_bits),
-            writable,
-        )
-    };
-    let ptr = match allocate(suggested_address) {
-        Err(MappingError::MapError(
-            AllocationError::AddressInUse | AllocationError::AddressInUseByPlatform,
-        )) if suggested_address.is_some() && !fixed => allocate(None)?,
-        result => result?,
-    };
-    if let Err(error) = op(ptr) {
-        // SAFETY: Initialization failed before publication, so the mapping has no users.
-        unsafe { page_manager.remove_pages(ptr, length.as_usize()) }
-            .expect("failed to release unpublished mapping");
-        return Err(error);
-    }
-    // SAFETY: The mapping is unpublished and exclusively owned during initialization.
-    let protect = unsafe {
-        match permissions {
-            permissions if permissions == writable => return Ok(ptr),
-            permissions if permissions.is_empty() => {
-                page_manager.make_pages_inaccessible(ptr, length.as_usize())
-            }
-            MemoryRegionPermissions::READ => {
-                page_manager.make_pages_readable(ptr, length.as_usize())
-            }
-            permissions
-                if permissions == MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC =>
-            {
-                page_manager.make_pages_executable(ptr, length.as_usize())
-            }
-            permissions if permissions == writable | MemoryRegionPermissions::EXEC => {
-                page_manager.make_pages_rwx(ptr, length.as_usize())
-            }
-            _ => unreachable!("Windows page protection parser produced unsupported permissions"),
-        }
-    };
-    if protect.is_err() {
-        // SAFETY: Protection failed before publication, so the mapping has no users.
-        unsafe { page_manager.remove_pages(ptr, length.as_usize()) }
-            .expect("failed to release unpublished mapping");
-        return Err(MappingError::OutOfMemory);
-    }
-    Ok(ptr)
-}
-
 fn zero_bits_address_limit(zero_bits: usize) -> Option<usize> {
     if zero_bits > 32 {
         // NtAllocateVirtualMemory treats ZeroBits as a bitmask when > 32.
@@ -1500,33 +1426,6 @@ fn mapping_error_to_nt_status(error: MappingError) -> NtStatus {
         MappingError::OutOfMemory | MappingError::MapError(AllocationError::OutOfMemory) | _ => {
             NtStatus::NO_MEMORY
         }
-    }
-}
-
-fn create_pages_with_state<Platform: ShimPlatform>(
-    page_manager: &WindowsPageManager<Platform>,
-    suggested_address: Option<NonZeroAddress<PAGE_SIZE>>,
-    length: NonZeroPageSize<PAGE_SIZE>,
-    flags: CreatePagesFlags,
-    state: PageState,
-) -> Result<MutPtr<Platform, u8>, MappingError> {
-    match state {
-        PageState::Reserved => unsafe {
-            page_manager.create_reserved_pages(
-                suggested_address,
-                length,
-                ALLOCATION_GRANULARITY,
-                flags,
-            )
-        },
-        PageState::Committed(permissions) => create_pages(
-            page_manager,
-            suggested_address,
-            length,
-            flags,
-            permissions,
-            |_| Ok(0),
-        ),
     }
 }
 
@@ -1788,32 +1687,54 @@ mod tests {
             };
             let host = host.unwrap();
             let guest = guest.unwrap();
-            for state in [
-                PageState::Reserved,
-                PageState::Committed(
-                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                ),
+            for permissions in [
+                None,
+                Some(MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE),
             ] {
+                // SAFETY: Both requests use fixed ranges without replacing existing mappings.
+                let host_result = unsafe {
+                    match permissions {
+                        Some(permissions) => guest_manager.create_reserved_and_committed_pages(
+                            NonZeroAddress::new(host.as_usize()),
+                            length,
+                            ALLOCATION_GRANULARITY,
+                            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                            permissions,
+                        ),
+                        None => guest_manager.create_reserved_pages(
+                            NonZeroAddress::new(host.as_usize()),
+                            length,
+                            ALLOCATION_GRANULARITY,
+                            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                        ),
+                    }
+                };
                 assert!(matches!(
-                    create_pages_with_state(
-                        &guest_manager,
-                        NonZeroAddress::new(host.as_usize()),
-                        length,
-                        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-                        state,
-                    ),
+                    host_result,
                     Err(MappingError::MapError(
                         AllocationError::AddressInUseByPlatform
                     ))
                 ));
+                // SAFETY: Both requests use fixed ranges without replacing existing mappings.
+                let guest_result = unsafe {
+                    match permissions {
+                        Some(permissions) => guest_manager.create_reserved_and_committed_pages(
+                            NonZeroAddress::new(guest.as_usize()),
+                            length,
+                            ALLOCATION_GRANULARITY,
+                            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                            permissions,
+                        ),
+                        None => guest_manager.create_reserved_pages(
+                            NonZeroAddress::new(guest.as_usize()),
+                            length,
+                            ALLOCATION_GRANULARITY,
+                            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
+                        ),
+                    }
+                };
                 assert!(matches!(
-                    create_pages_with_state(
-                        &guest_manager,
-                        NonZeroAddress::new(guest.as_usize()),
-                        length,
-                        CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-                        state,
-                    ),
+                    guest_result,
                     Err(MappingError::MapError(AllocationError::AddressInUse))
                 ));
             }
@@ -1959,6 +1880,16 @@ mod tests {
             assert_eq!(info.region_size, PAGE_SIZE);
             assert_eq!(info.state, MemoryState::MEM_RESERVE.bits());
             assert_eq!(info.protect, 0);
+
+            // SAFETY: The range is reserved and remains inaccessible throughout this failed call.
+            assert!(matches!(
+                unsafe {
+                    task.global
+                        .page_manager
+                        .make_pages_readable(ptr, PAGE_SIZE * 2)
+                },
+                Err(VmemProtectError::InvalidRange(_))
+            ));
 
             // SAFETY: This test owns the reservation and does not access its contents.
             unsafe {

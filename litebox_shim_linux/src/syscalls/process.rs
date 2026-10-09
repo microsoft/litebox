@@ -19,17 +19,22 @@ use litebox::event::polling::{Pollee, TryOpError};
 use litebox::event::wait::WaitError;
 use litebox::event::{Events, IOPollable as _};
 use litebox::platform::ArchSpecificRegister;
+#[cfg(target_arch = "x86_64")]
 use litebox::platform::RawConstPointer as _;
 use litebox::platform::TimerHandle;
 use litebox::process::{ChildStatus, ProcessError};
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
+#[cfg(target_arch = "x86_64")]
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::ProcessExitStatus;
+#[cfg(target_arch = "x86_64")]
 use litebox_common_linux::ProtFlags;
+#[cfg(target_arch = "x86_64")]
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
 use litebox_common_linux::vmem::VmFlags;
+#[cfg(target_arch = "x86_64")]
 use litebox_common_linux::vmem::{
     CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE,
 };
@@ -91,29 +96,20 @@ impl<Platform: ShimPlatform> ThreadState<Platform> {
     }
 
     /// Prepares the initial thread of a process duplicated by `fork` to return zero from the
-    /// `fork` with the rest of `registers`, `vector_state`, and `thread_pointer` as its thread
-    /// pointer (the FS base on x86-64, `TPIDR_EL0` on AArch64), storing its thread ID at
-    /// `set_child_tid` and clearing `clear_child_tid` when it exits, unless they are zero.
+    /// `fork` with the rest of `registers` and `thread_pointer` as its FS base, storing its thread
+    /// ID at `set_child_tid` and clearing `clear_child_tid` when it exits, unless they are zero.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn set_forked_init_state(
         &self,
         mut registers: litebox_common_linux::PtRegs,
-        vector_state: litebox_common_linux::GuestVectorState,
         thread_pointer: usize,
         set_child_tid: usize,
         clear_child_tid: usize,
     ) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            registers.rax = 0;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            registers.regs[0] = 0;
-        }
+        registers.rax = 0;
         let user_ptr = |address: usize| (address != 0).then(|| UserPtrMut::from_usize(address));
         self.init_state.set(ThreadInitState::Forked {
             registers: Box::new(registers),
-            vector_state: Box::new(vector_state),
             thread_pointer,
             set_child_tid: user_ptr(set_child_tid),
         });
@@ -171,10 +167,12 @@ impl<Platform: ShimPlatform> Drop for ThreadDetachGuard<'_, Platform> {
 }
 
 /// Keeps the other threads of a process paused for `fork` until dropped.
+#[cfg(target_arch = "x86_64")]
 struct ForkPause<'a, Platform: ShimPlatform> {
     process: &'a ProcessState<Platform>,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl<Platform: ShimPlatform> Drop for ForkPause<'_, Platform> {
     fn drop(&mut self) {
         let mut inner = self.process.inner.lock();
@@ -406,6 +404,7 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn has_default_alarm_state(&self) -> bool {
         let alarm = self.alarm_timer.lock();
         alarm.handle.is_none() && alarm.deadline.is_none()
@@ -791,6 +790,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Fails with `ERESTARTNOINTR` if a signal or an exit interrupts the wait for them to pause,
     /// so `fork` restarts once the signal is handled, as Linux's does if a signal arrives while
     /// it duplicates the process.
+    #[cfg(target_arch = "x86_64")]
     fn pause_other_threads(&self) -> Result<ForkPause<'_, Platform>, Errno> {
         let process = &self.thread.process;
         loop {
@@ -863,9 +863,9 @@ enum ThreadInitState {
         tls: Option<ThreadLocalDescriptor>,
         set_child_tid: Option<UserPtrMut<i32>>,
     },
+    #[cfg(target_arch = "x86_64")]
     Forked {
         registers: Box<litebox_common_linux::PtRegs>,
-        vector_state: Box<litebox_common_linux::GuestVectorState>,
         thread_pointer: usize,
         set_child_tid: Option<UserPtrMut<i32>>,
     },
@@ -961,12 +961,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
 const ROBUST_LIST_LIMIT: isize = 2048;
 
-/// The register holding a thread's thread pointer, which `fork` copies to the child.
-#[cfg(target_arch = "x86_64")]
-const THREAD_POINTER_REGISTER: ArchSpecificRegister = ArchSpecificRegister::FsBase;
-#[cfg(target_arch = "aarch64")]
-const THREAD_POINTER_REGISTER: ArchSpecificRegister = ArchSpecificRegister::TpidrEl0;
-
 /*
  * Process a futex-list entry, check whether it's owned by the
  * dying task, and do notification if so:
@@ -1002,7 +996,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
             .map(|e| fetch_robust_entry(UserPtr::from_usize(e.next)));
         if entry.as_usize() != pending.as_usize() {
             handle_futex_death(
-                UserPtr::from_usize(entry.as_usize().wrapping_add(futex_offset)),
+                UserPtr::from_usize(entry.as_usize() + futex_offset),
                 pi,
                 false,
             )?;
@@ -1018,7 +1012,7 @@ fn wake_robust_list<Platform: ShimPlatform>(
 
     if pending.as_usize() != 0 {
         let _ = handle_futex_death(
-            UserPtr::from_usize(pending.as_usize().wrapping_add(futex_offset)),
+            UserPtr::from_usize(pending.as_usize() + futex_offset),
             ppi,
             true,
         );
@@ -1097,9 +1091,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Failure means the process service failed, so no termination can be observed.
         let _ = self.observe_child_terminations();
         *ctx = state.parent_context;
-        self.global
-            .platform
-            .set_guest_vector_state(&state.parent_vector_state);
         state.child_pid.cast_unsigned() as usize
     }
 
@@ -1189,11 +1180,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Handles `vfork`; see [`Self::begin_vfork`].
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_vfork(&self, ctx: &mut litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         self.begin_vfork(ctx, None, false)
     }
 
     /// Handle syscall `fork`.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn sys_fork(&self, ctx: &litebox_common_linux::PtRegs) -> Result<usize, Errno> {
         self.fork(ctx, 0, 0)
     }
@@ -1204,21 +1197,21 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// The child stores its thread ID at `set_child_tid` and clears `clear_child_tid` when it
     /// exits, unless they are zero.
     ///
-    /// The child gets a copy of the parent's memory, program break, registers, and thread
-    /// pointer, of its credentials, command name, working directory, and umask, of its
-    /// descriptors, sharing their open file descriptions, and of its signal dispositions, blocked
-    /// mask, and alternate stack, but none of its pending signals, timers, or robust futex list.
-    /// Memory regions formerly backed by files are copied as anonymous memory, and
-    /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
-    /// of the calling one; the parent's other threads pause while the parent is copied.
-    ///
-    /// Floating-point and vector state is copied only on AArch64; x86-64 needs a real
-    /// [`GuestVectorStateProvider`](litebox::platform::GuestVectorStateProvider) and a payload
-    /// encoding first.
+    /// The child gets a copy of the parent's memory, program break, registers, and FS base, of
+    /// its credentials, command name, working directory, and umask, of its descriptors, sharing
+    /// their open file descriptions, and of its signal dispositions, blocked mask, and alternate
+    /// stack, but none of its pending signals, timers, or robust futex list. Memory regions
+    /// formerly backed by files are copied as anonymous memory, and `MADV_DONTFORK` regions are
+    /// copied too. Floating-point and vector state is not copied yet, because x86-64 platforms
+    /// cannot capture a guest thread's vector state until they implement
+    /// [`GuestVectorStateProvider`](litebox::platform::GuestVectorStateProvider) instead of
+    /// using its no-op default. Like Linux, the child has a single thread, a copy of the calling
+    /// one; the parent's other threads pause while the parent is copied.
     ///
     /// Only a process outside a `vfork` window, with default resource-limit and alarm state, no
     /// shared memory mappings, no ELF file mid-load, and only descriptors a fresh runner can
     /// inherit is duplicated; otherwise this fails with `EAGAIN`.
+    #[cfg(target_arch = "x86_64")]
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1267,11 +1260,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             signal_actions,
             alternate_signal_stack,
             registers: ctx.clone(),
-            vector_state: self.global.platform.get_guest_vector_state(),
             thread_pointer: self
                 .global
                 .platform
-                .get_arch_specific_register(&THREAD_POINTER_REGISTER)?,
+                .get_arch_specific_register(&ArchSpecificRegister::FsBase)?,
             syscall_entry_point: self.global.platform.get_syscall_entry_point(),
             set_child_tid,
             clear_child_tid,
@@ -1325,6 +1317,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Writes the contents of each of `regions` that has contents to the pending `child`'s
     /// process image, back to back, skipping zero-filled pages at the ends of each chunk.
+    #[cfg(target_arch = "x86_64")]
     fn write_fork_image(
         &self,
         child: &litebox::process::Process<Platform>,
@@ -1376,6 +1369,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// into a region's pages.
     ///
     /// Restoring fails if any region's address is in use.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn restore_fork_image(
         mm: &crate::MemoryManager<Platform>,
         regions: &[ForkMemoryRegion],
@@ -1454,10 +1448,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// to a fresh runner through `execve`; an `execve` that fails before the transfer returns its
     /// error to the child. The parent's other threads keep running, but they cannot wait for the
     /// child until the parent resumes, and the child ends if one of them ends the process or
-    /// execs.
-    ///
-    /// The parent's registers and vector state are restored when it resumes; the child must not
-    /// change other platform-managed architectural state.
+    /// execs. The child must not change platform-managed architectural state outside
+    /// [`litebox_common_linux::PtRegs`], because the current transfer does not preserve that
+    /// state.
+    #[cfg(target_arch = "x86_64")]
     fn begin_vfork(
         &self,
         ctx: &mut litebox_common_linux::PtRegs,
@@ -1480,14 +1474,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
         let mut parent_context = ctx.clone();
-        #[cfg(target_arch = "x86_64")]
-        {
-            parent_context.rax = child_pid.cast_unsigned() as usize;
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            parent_context.regs[0] = child_pid.cast_unsigned() as usize;
-        }
+        parent_context.rax = child_pid.cast_unsigned() as usize;
         let child_fs = crate::syscalls::file::FsState::clone(&self.fs.borrow());
         let parent_fs = self.fs.replace(Arc::new(child_fs));
         let child_files = self.files.borrow().copy_for_vfork(&self.global);
@@ -1499,21 +1486,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
             child,
             child_pid,
             parent_context,
-            // Callers may keep values in callee-saved vector registers across the call.
-            parent_vector_state: self.global.platform.get_guest_vector_state(),
             parent_fs,
             parent_files,
             parent_signals: self.signals.begin_vfork_child(clear_signal_handlers),
         }));
         if let Some(child_stack) = child_stack {
-            #[cfg(target_arch = "x86_64")]
-            {
-                ctx.rsp = child_stack;
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                ctx.sp = child_stack;
-            }
+            ctx.rsp = child_stack;
         }
         Ok(0)
     }
@@ -1568,21 +1546,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if (stack == 0 && stack_size != 0) || (stack != 0 && clone3 && stack_size == 0) {
             return Err(Errno::EINVAL);
         }
-        let sp = if stack == 0 {
-            None
-        } else if clone3 {
-            let stack = usize::try_from(stack).map_err(|_| Errno::EINVAL)?;
-            let size = usize::try_from(stack_size).map_err(|_| Errno::EINVAL)?;
-            Some(
-                stack
-                    .checked_add(size)
-                    .filter(|&end| end <= Platform::TASK_ADDR_MAX)
-                    .ok_or(Errno::EINVAL)?,
-            )
+        let sp = if stack != 0 {
+            let stack: usize = stack.trunc();
+            Some(stack.wrapping_add(stack_size.trunc()))
         } else {
-            Some(stack.trunc())
+            None
         };
 
+        #[cfg(target_arch = "x86_64")]
         if !flags.intersects(CloneFlags::VM | CloneFlags::THREAD | CloneFlags::VFORK) {
             let supported_fork_flags = CloneFlags::CHILD_SETTID | CloneFlags::CHILD_CLEARTID;
             if flags.intersects(!supported_fork_flags) {
@@ -1607,6 +1578,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             );
         }
 
+        #[cfg(target_arch = "x86_64")]
         if flags.contains(CloneFlags::VFORK) {
             let supported_vfork_flags =
                 CloneFlags::VM | CloneFlags::VFORK | CloneFlags::CLEAR_SIGHAND;
@@ -1835,6 +1807,7 @@ impl<Platform: ShimPlatform> ResourceLimits<Platform> {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn has_default_state(&self) -> bool {
         self.limits
             .read()
@@ -1998,9 +1971,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
         clockid: litebox_common_linux::ClockId,
     ) -> Result<core::time::Duration, Errno> {
         let duration = match clockid {
-            litebox_common_linux::ClockId::RealTime
-            | litebox_common_linux::ClockId::RealTimeCoarse => {
-                // glibc's AArch64 `time` reads CLOCK_REALTIME_COARSE.
+            litebox_common_linux::ClockId::RealTime => {
+                // CLOCK_REALTIME
                 self.real_time_as_duration_since_epoch()
             }
             litebox_common_linux::ClockId::Monotonic => {
@@ -2066,8 +2038,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         // Return the resolution of the clock
         let resolution = match clockid {
-            litebox_common_linux::ClockId::RealTimeCoarse
-            | litebox_common_linux::ClockId::MonotonicCoarse => {
+            litebox_common_linux::ClockId::MonotonicCoarse => {
                 // Coarse clocks typically have lower resolution (e.g., 4 millisecond)
                 Duration::from_millis(4)
             }
@@ -2405,6 +2376,9 @@ pub(crate) struct CpuSet {
 }
 
 impl CpuSet {
+    pub(crate) fn len(&self) -> usize {
+        self.bits.len()
+    }
     pub(crate) fn as_bytes(&self) -> &[u8] {
         self.bits.as_raw_slice()
     }
@@ -2896,18 +2870,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid());
                 }
             }
+            #[cfg(target_arch = "x86_64")]
             ThreadInitState::Forked {
                 registers,
-                vector_state,
                 thread_pointer,
                 set_child_tid,
             } => {
                 *ctx = *registers;
-                self.global.platform.set_guest_vector_state(&vector_state);
-                self.global
-                    .platform
-                    .set_arch_specific_register(&THREAD_POINTER_REGISTER, thread_pointer)
-                    .expect("failed to restore the forked thread's thread pointer");
+                self.sys_arch_prctl(ArchPrctlArg::SetFs(thread_pointer))
+                    .expect("failed to restore the forked thread's FS base");
                 if let Some(child_tid_ptr) = set_child_tid {
                     let _ = child_tid_ptr.write_at_offset::<Platform>(0, self.tid());
                 }
@@ -3107,30 +3078,7 @@ mod tests {
         writer_b.join().unwrap();
     }
 
-    #[test]
-    fn realtime_coarse_clock_reads_wall_clock_time() {
-        use crate::syscalls::tests::init_platform;
-        use litebox_common_linux::{ClockId, TimeParam, Timespec};
-
-        let task = init_platform();
-        let read = |clock_id| {
-            let mut time = Timespec {
-                tv_sec: -1,
-                tv_nsec: 0,
-            };
-            task.sys_clock_gettime(
-                clock_id,
-                TimeParam::Timespec64(UserPtrMut::from_ptr(&raw mut time)),
-            )
-            .expect("clock_gettime failed");
-            time.tv_sec
-        };
-        // glibc's `time` reads CLOCK_REALTIME_COARSE on AArch64.
-        let precise = read(ClockId::RealTime);
-        let coarse = read(ClockId::RealTimeCoarse);
-        assert!(coarse.abs_diff(precise) <= 1, "{coarse} vs {precise}");
-    }
-
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn vfork_rejects_nondefault_resource_limits() {
         use crate::syscalls::tests::init_platform;
