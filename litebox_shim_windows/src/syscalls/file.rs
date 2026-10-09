@@ -2730,7 +2730,7 @@ fn map_open_error(error: OpenError, create_disposition: CreateDisposition) -> Nt
             PathError::MissingComponent => NtStatus::OBJECT_PATH_NOT_FOUND,
             PathError::ComponentNotADirectory => NtStatus::NOT_A_DIRECTORY,
             PathError::InvalidPathname => NtStatus::INVALID_PARAMETER,
-            PathError::NoSearchPerms { .. } => NtStatus::UNSUCCESSFUL,
+            PathError::NoSearchPerms => NtStatus::UNSUCCESSFUL,
         },
         OpenError::AccessNotAllowed | OpenError::NoWritePerms | OpenError::ReadOnlyFileSystem => {
             NtStatus::ACCESS_DENIED

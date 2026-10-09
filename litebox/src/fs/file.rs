@@ -565,12 +565,7 @@ impl From<BrokerControlError> for StatusFlagsError {
 fn path_error(error: FileError) -> Option<PathError> {
     match error {
         FileError::NoSuchFileOrDirectory => Some(PathError::NoSuchFileOrDirectory),
-        FileError::NoSearchPermissions => Some(PathError::NoSearchPerms {
-            #[cfg(debug_assertions)]
-            dir: String::new(),
-            #[cfg(debug_assertions)]
-            perms: Mode::empty(),
-        }),
+        FileError::NoSearchPermissions => Some(PathError::NoSearchPerms),
         FileError::InvalidPathname => Some(PathError::InvalidPathname),
         FileError::MissingComponent => Some(PathError::MissingComponent),
         FileError::ComponentNotDirectory => Some(PathError::ComponentNotADirectory),

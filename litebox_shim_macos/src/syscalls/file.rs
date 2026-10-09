@@ -292,7 +292,7 @@ fn open_error(error: OpenError) -> Errno {
 fn path_error(error: PathError) -> Errno {
     match error {
         PathError::NoSuchFileOrDirectory | PathError::MissingComponent => Errno::ENOENT,
-        PathError::NoSearchPerms { .. } => Errno::EACCES,
+        PathError::NoSearchPerms => Errno::EACCES,
         PathError::InvalidPathname => Errno::EINVAL,
         PathError::ComponentNotADirectory => Errno::ENOTDIR,
     }

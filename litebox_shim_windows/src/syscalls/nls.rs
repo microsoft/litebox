@@ -1003,7 +1003,7 @@ fn map_nls_open_error(error: OpenError) -> NtStatus {
             | PathError::MissingComponent
             | PathError::ComponentNotADirectory,
         ) => NtStatus::OBJECT_NAME_NOT_FOUND,
-        OpenError::PathError(PathError::NoSearchPerms { .. }) | OpenError::AccessNotAllowed => {
+        OpenError::PathError(PathError::NoSearchPerms) | OpenError::AccessNotAllowed => {
             NtStatus::ACCESS_DENIED
         }
         _ => NtStatus::UNSUCCESSFUL,
@@ -1017,7 +1017,7 @@ fn map_nls_file_status_error(error: FileStatusError) -> NtStatus {
             | PathError::MissingComponent
             | PathError::ComponentNotADirectory,
         ) => NtStatus::OBJECT_NAME_NOT_FOUND,
-        FileStatusError::PathError(PathError::NoSearchPerms { .. }) => NtStatus::ACCESS_DENIED,
+        FileStatusError::PathError(PathError::NoSearchPerms) => NtStatus::ACCESS_DENIED,
         _ => NtStatus::UNSUCCESSFUL,
     }
 }

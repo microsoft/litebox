@@ -781,7 +781,7 @@ fn mask_status_mode(status: &mut FileStatus) {
 fn file_path_error(error: PathError) -> FileError {
     match error {
         PathError::NoSuchFileOrDirectory => FileError::NoSuchFileOrDirectory,
-        PathError::NoSearchPerms { .. } => FileError::NoSearchPermissions,
+        PathError::NoSearchPerms => FileError::NoSearchPermissions,
         PathError::InvalidPathname => FileError::InvalidPathname,
         PathError::MissingComponent => FileError::MissingComponent,
         PathError::ComponentNotADirectory => FileError::ComponentNotDirectory,

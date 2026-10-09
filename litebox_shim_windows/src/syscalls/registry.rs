@@ -2477,7 +2477,7 @@ fn map_path_error(error: PathError, not_found_status: NtStatus) -> NtStatus {
         PathError::NoSuchFileOrDirectory | PathError::MissingComponent => not_found_status,
         PathError::ComponentNotADirectory => NtStatus::NOT_A_DIRECTORY,
         PathError::InvalidPathname => NtStatus::INVALID_PARAMETER,
-        PathError::NoSearchPerms { .. } => NtStatus::ACCESS_DENIED,
+        PathError::NoSearchPerms => NtStatus::ACCESS_DENIED,
     }
 }
 

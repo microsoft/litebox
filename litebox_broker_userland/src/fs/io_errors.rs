@@ -5,7 +5,6 @@
 
 // TODO(jayb): Clean this up as part of the error handling cleanups.
 
-use litebox_broker_core::fs::Mode;
 #[cfg(unix)]
 use litebox_broker_core::fs::errors::ChownError;
 use litebox_broker_core::fs::errors::{
@@ -38,12 +37,7 @@ fn path_error(error: &std::io::Error) -> PathError {
     match error.kind() {
         std::io::ErrorKind::NotFound => PathError::NoSuchFileOrDirectory,
         std::io::ErrorKind::NotADirectory => PathError::ComponentNotADirectory,
-        std::io::ErrorKind::PermissionDenied => PathError::NoSearchPerms {
-            #[cfg(debug_assertions)]
-            dir: String::new(),
-            #[cfg(debug_assertions)]
-            perms: Mode::empty(),
-        },
+        std::io::ErrorKind::PermissionDenied => PathError::NoSearchPerms,
         _ => PathError::InvalidPathname,
     }
 }
