@@ -796,11 +796,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_mkdirat(dirfd, path, mode))
                 }),
-            SyscallRequest::Chdir { pathname } => pathname
-                .to_cstring::<Platform>()
-                .map_or(Err(Errno::EINVAL), |path| syscall!(sys_chdir(path))),
+            SyscallRequest::Chdir { pathname } => {
+                pathname
+                    .to_cstring::<Platform>()
+                    .map_or(Err(Errno::EINVAL), |path| {
+                        let path = path.to_str().map_err(|_| Errno::EINVAL)?;
+                        syscall!(sys_chdir(path))
+                    })
+            }
             SyscallRequest::RtSigprocmask {
                 how,
                 set,
@@ -884,6 +890,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_faccessat(dirfd, path, mode, flags))
                 }),
             SyscallRequest::Madvise {
@@ -1024,6 +1031,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
                     let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     self.sys_readlink(path, &mut kernel_buf).and_then(|size| {
                         buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
                             .map(|()| size)
@@ -1054,6 +1062,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
                     let mut kernel_buf = vec![0u8; bufsiz.min(MAX_KERNEL_BUF_SIZE)];
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     self.sys_readlinkat(dirfd, path, &mut kernel_buf)
                         .and_then(|size| {
                             buf.copy_from_slice::<Platform>(0, &kernel_buf[..size])
@@ -1102,6 +1111,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_openat(dirfd, path, flags, mode))
                 }),
             SyscallRequest::Ftruncate { fd, length } => syscall!(sys_ftruncate(fd, length)),
@@ -1113,6 +1123,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_mknodat(dirfd, path, mode_and_type, dev))
                 }),
             SyscallRequest::Unlinkat {
@@ -1122,12 +1133,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     syscall!(sys_unlinkat(dirfd, path, flags))
                 }),
             SyscallRequest::Stat { pathname, buf } => {
                 pathname
                     .to_cstring::<Platform>()
                     .map_or(Err(Errno::EFAULT), |path| {
+                        let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                         self.sys_stat(path).and_then(|stat| {
                             buf.write_at_offset::<Platform>(0, stat)
                                 .ok_or(Errno::EFAULT)
@@ -1139,6 +1152,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 pathname
                     .to_cstring::<Platform>()
                     .map_or(Err(Errno::EFAULT), |path| {
+                        let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                         self.sys_lstat(path).and_then(|stat| {
                             buf.write_at_offset::<Platform>(0, stat)
                                 .ok_or(Errno::EFAULT)
@@ -1160,6 +1174,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             } => pathname
                 .to_cstring::<Platform>()
                 .map_or(Err(Errno::EFAULT), |path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     self.sys_newfstatat(dirfd, path, flags).and_then(|stat| {
                         buf.write_at_offset::<Platform>(0, stat)
                             .ok_or(Errno::EFAULT)
@@ -1182,6 +1197,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     Some(p) => (p.to_cstring::<Platform>().ok_or(Errno::EFAULT), flags),
                 };
                 path.and_then(|path| {
+                    let path = path.to_str().map_err(|_| Errno::EINVAL)?;
                     self.sys_statx(dirfd, path, flags, mask).and_then(|sx| {
                         statxbuf
                             .write_at_offset::<Platform>(0, sx)

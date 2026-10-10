@@ -1398,7 +1398,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         for _ in 0..SHEBANG_MAX_RECURSION {
             let full_path = self.resolve_path(&path)?;
             let file = self.do_open(
-                full_path,
+                &full_path,
                 litebox::fs::OFlags::RDONLY,
                 litebox::fs::Mode::empty(),
             )?;

@@ -332,14 +332,6 @@ impl From<crate::vmem::VmemProtectError> for Errno {
     }
 }
 
-impl From<litebox::path::ConversionError> for Errno {
-    fn from(value: litebox::path::ConversionError) -> Self {
-        match value {
-            litebox::path::ConversionError::FailedToConvertTo(_) => Errno::EINVAL,
-        }
-    }
-}
-
 impl From<litebox::fs::errors::FileStatusError> for Errno {
     fn from(value: litebox::fs::errors::FileStatusError) -> Self {
         match value {

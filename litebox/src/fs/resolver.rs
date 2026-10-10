@@ -9,7 +9,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::fs::UserInfo;
-use crate::path::Arg;
 use crate::{LiteBox, fd::TypedFd, sync};
 
 use super::errors::{
@@ -100,15 +99,13 @@ impl Context {
     /// Resolve `path` against the current context.
     // XXX(jayb): if/when we support chroot, we might need to tweak this to not allow "escaping"
     // outside the chrooted part.
-    // XXX(jayb): since we are migrating all resolution into the resolver, we probably don't need
-    // `Arg` anymore, so could get rid of it in the future.
-    pub fn resolve(&self, path: impl Arg) -> Result<ResolvedPath, PathError> {
-        let mut components = if path.as_rust_str()?.starts_with('/') {
+    pub fn resolve(&self, path: &str) -> ResolvedPath {
+        let mut components = if path.starts_with('/') {
             vec![]
         } else {
             self.cwd.components.clone()
         };
-        for component in path.components()? {
+        for component in path.split('/') {
             match component {
                 "" | "." => {}
                 ".." => {
@@ -119,7 +116,7 @@ impl Context {
                 }
             }
         }
-        Ok(ResolvedPath { components })
+        ResolvedPath { components }
     }
 
     fn can_execute(&self, permissions: &PermissionInfo) -> bool {
@@ -473,7 +470,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     pub fn open(
         &self,
         context: &Context,
-        path: impl Arg,
+        path: &str,
         mut flags: OFlags,
         mode: Mode,
     ) -> Result<TypedFd<Self>, OpenError> {
@@ -501,7 +498,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
             flags &= OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         }
 
-        let path = context.resolve(path)?;
+        let path = context.resolve(path);
         let access_mode = flags & (OFlags::WRONLY | OFlags::RDWR);
         let read_allowed = access_mode == OFlags::RDONLY || access_mode == OFlags::RDWR;
         let write_allowed = access_mode == OFlags::WRONLY || access_mode == OFlags::RDWR;
@@ -826,8 +823,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Change the permissions of a file
-    pub fn chmod(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), ChmodError> {
-        let path = context.resolve(path)?;
+    pub fn chmod(&self, context: &Context, path: &str, mode: Mode) -> Result<(), ChmodError> {
+        let path = context.resolve(path);
         let handle = self
             .path_handle(context, &path)
             .map_err(|error| match error {
@@ -844,11 +841,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     pub fn chown(
         &self,
         context: &Context,
-        path: impl Arg,
+        path: &str,
         user: Option<u16>,
         group: Option<u16>,
     ) -> Result<(), ChownError> {
-        let path = context.resolve(path)?;
+        let path = context.resolve(path);
         let handle = self
             .path_handle(context, &path)
             .map_err(|error| match error {
@@ -862,8 +859,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Unlink a file
-    pub fn unlink(&self, context: &Context, path: impl Arg) -> Result<(), UnlinkError> {
-        let path = context.resolve(path)?;
+    pub fn unlink(&self, context: &Context, path: &str) -> Result<(), UnlinkError> {
+        let path = context.resolve(path);
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
                 .map_err(|error| match error {
@@ -886,8 +883,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Create a new directory
-    pub fn mkdir(&self, context: &Context, path: impl Arg, mode: Mode) -> Result<(), MkdirError> {
-        let path = context.resolve(path)?;
+    pub fn mkdir(&self, context: &Context, path: &str, mode: Mode) -> Result<(), MkdirError> {
+        let path = context.resolve(path);
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
                 .map_err(|error| match error {
@@ -919,8 +916,8 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     }
 
     /// Remove a directory
-    pub fn rmdir(&self, context: &Context, path: impl Arg) -> Result<(), RmdirError> {
-        let path = context.resolve(path)?;
+    pub fn rmdir(&self, context: &Context, path: &str) -> Result<(), RmdirError> {
+        let path = context.resolve(path);
         let Some((parent, name)) =
             self.parent_dir_and_name(context, &path)
                 .map_err(|error| match error {
@@ -984,7 +981,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
     pub fn file_status(
         &self,
         context: &Context,
-        path: impl Arg,
+        path: &str,
     ) -> Result<super::FileStatus, FileStatusError> {
         let fd = self
             .open(context, path, OFlags::PATH, Mode::empty())

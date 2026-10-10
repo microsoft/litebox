@@ -34,7 +34,7 @@ struct ElfFile<'a, Platform: ShimPlatform> {
 }
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
-    fn new(task: &'a Task<Platform>, path: impl litebox::path::Arg) -> Result<Self, Errno> {
+    fn new(task: &'a Task<Platform>, path: &str) -> Result<Self, Errno> {
         let fd = task
             .sys_open(path, OFlags::RDONLY, Mode::empty())?
             .reinterpret_as_signed();
@@ -206,10 +206,7 @@ struct FileAndParsed<'a, Platform: ShimPlatform> {
 }
 
 impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
-    fn new(
-        task: &'a Task<Platform>,
-        path: impl litebox::path::Arg,
-    ) -> Result<Self, ElfLoaderError> {
+    fn new(task: &'a Task<Platform>, path: &str) -> Result<Self, ElfLoaderError> {
         let file = ElfFile::new(task, path).map_err(ElfLoaderError::OpenError)?;
         let mut parsed = litebox_common_linux::loader::ElfParsedFile::parse(&mut &file)
             .map_err(ElfLoaderError::ParseError)?;
@@ -262,7 +259,8 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         // Parse the interpreter ELF file, if any.
         let interp = if let Some(interp_name) = main.parsed.interp(&mut &main.file)? {
             // e.g., /lib64/ld-linux-x86-64.so.2
-            let mut interp = FileAndParsed::new(task, interp_name)?;
+            let mut interp =
+                FileAndParsed::new(task, interp_name.to_str().map_err(|_| Errno::EINVAL)?)?;
             // Linux places the ET_EXEC interpreter high so brk can grow above
             // the fixed-address main image without hitting ld.so.
             interp.file.load_high = true;

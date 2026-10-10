@@ -753,26 +753,21 @@ fn test_nine_p_deep_path_walk() {
     for i in 0..20 {
         path.push('/');
         write!(path, "d{i}").unwrap();
-        fs.mkdir(&ctx, &*path, Mode::RWXU)
+        fs.mkdir(&ctx, &path, Mode::RWXU)
             .expect("failed to mkdir deep path component");
     }
 
     // Create a file at the bottom
     let file_path = path.clone() + "/deep_file.txt";
     let fd = fs
-        .open(
-            &ctx,
-            &*file_path,
-            OFlags::CREAT | OFlags::WRONLY,
-            Mode::RWXU,
-        )
+        .open(&ctx, &file_path, OFlags::CREAT | OFlags::WRONLY, Mode::RWXU)
         .expect("failed to create file in deep path");
     fs.write(&fd, b"deep content", None).unwrap();
     fs.close(&fd).unwrap();
 
     // Read it back
     let fd = fs
-        .open(&ctx, &*file_path, OFlags::RDONLY, Mode::empty())
+        .open(&ctx, &file_path, OFlags::RDONLY, Mode::empty())
         .expect("failed to open file in deep path");
     let mut buf = alloc::vec![0u8; 64];
     let n = fs.read(&fd, &mut buf, None).unwrap();
@@ -781,7 +776,7 @@ fn test_nine_p_deep_path_walk() {
 
     // Verify file_status works through the deep path
     let status = fs
-        .file_status(&ctx, &*file_path)
+        .file_status(&ctx, &file_path)
         .expect("failed to stat deep file");
     assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
     assert_eq!(status.size, 12);
