@@ -9,14 +9,21 @@
 #![no_std]
 #![warn(clippy::undocumented_unsafe_blocks)]
 
+extern crate alloc;
+
 #[cfg(target_arch = "x86_64")]
 pub mod clock;
 #[cfg(target_arch = "x86_64")]
 pub mod console;
+pub mod dma;
 #[cfg(target_arch = "x86_64")]
 pub mod interrupt;
+#[cfg(target_arch = "x86_64")]
+pub mod pci;
 #[cfg(target_arch = "x86_64")]
 pub mod power;
 pub mod prk;
 #[cfg(target_arch = "x86_64")]
 pub mod rng;
+#[cfg(target_arch = "x86_64")]
+pub mod virtio;

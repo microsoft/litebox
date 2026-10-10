@@ -4,16 +4,18 @@
 # Licensed under the MIT license.
 
 # Shared by the dev_tools/run_optee_on_*.sh scripts; source it. Reads QEMU,
-# QEMU_ACCEL, TIMEOUT, LITEBOX_LOG and CARGO_BUILD (see the scripts), makes a
-# relative CARGO_TARGET_DIR absolute, and creates $WORK, removed on exit.
+# QEMU_ACCEL, QEMU_CPU, TIMEOUT, LITEBOX_LOG and CARGO_BUILD (see the scripts),
+# makes a relative CARGO_TARGET_DIR absolute, and creates $WORK, removed on
+# exit.
 
 QEMU=${QEMU:-qemu-system-x86_64}
 if [[ -z ${QEMU_ACCEL:-} ]]; then
     if [[ -r /dev/kvm && -w /dev/kvm ]]; then QEMU_ACCEL=kvm; else QEMU_ACCEL=tcg; fi
 fi
 case $QEMU_ACCEL in
-    kvm) CPU=host ;;
-    tcg) CPU=max ;;
+    # invtsc (not migratable) lets QEMU publish the TSC frequency to the guest.
+    kvm) CPU=${QEMU_CPU:-host,+invtsc} ;;
+    tcg) CPU=${QEMU_CPU:-max} ;;
     *) echo "error: unknown QEMU_ACCEL '$QEMU_ACCEL'" >&2; exit 2 ;;
 esac
 TIMEOUT=${TIMEOUT:-120}
@@ -52,10 +54,13 @@ pass=0
 fail=0
 failed=()
 
-# run_vm NAME KERNEL PAYLOAD: boots KERNEL with PAYLOAD as its initrd and
-# records the outcome; with $verbose set, prints passing logs too.
+# run_vm NAME KERNEL PAYLOAD [QEMU_ARG]...: boots KERNEL with PAYLOAD as its
+# initrd and records the outcome; with $verbose set, prints passing logs too.
+# If $check names a function, a guest pass also needs `$check NAME` to
+# succeed; it prints why not otherwise.
 run_vm() {
     local name=$1 kernel=$2 payload=$3 log="$WORK/$1.log" status why
+    shift 3
     set +e
     # shellcheck disable=SC2086 # QEMU is a command line
     timeout "$TIMEOUT" $QEMU \
@@ -64,16 +69,18 @@ run_vm() {
         -kernel "$kernel" -initrd "$payload" -append "litebox.log=${LITEBOX_LOG:-info}" \
         -serial stdio -display none -no-reboot \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+        "$@" \
         </dev/null >"$log" 2>&1
     status=$?
     set -e
     # isa-debug-exit: QEMU exits with (value << 1) | 1; 33 = pass.
-    if [[ $status -eq 33 ]]; then
+    if [[ $status -eq 33 ]] && { [[ -z ${check:-} ]] || why=$($check "$name"); }; then
         echo "PASS  $name"
         pass=$((pass + 1))
         [[ ${verbose:-0} -eq 0 ]] || cat "$log"
     else
         case $status in
+            33) ;;
             65) why="guest reported failure" ;;
             124) why="timed out after ${TIMEOUT}s" ;;
             *) why="exit status $status" ;;

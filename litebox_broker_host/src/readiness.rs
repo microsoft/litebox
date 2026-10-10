@@ -380,6 +380,24 @@ pub fn publish_readiness<Channel: HostNotificationChannel>(
     }
 }
 
+/// Publishes every pending readiness update, then returns; for deployments
+/// without a publisher thread, which call this whenever updates may be
+/// pending.
+///
+/// The channel must not block: a send that cannot proceed (e.g., a full
+/// notification ring) fails, which leaves its update publishable for the next
+/// call and returns the error.
+pub fn publish_pending_readiness<Channel: HostNotificationChannel>(
+    publisher: &ReadinessPublisher,
+    channel: &mut Channel,
+) -> Result<(), Channel::Error> {
+    while let Some(pending) = publisher.take_pending() {
+        channel.send_notification(&BrokerNotification::Readiness(pending.notification()))?;
+        pending.confirm();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,6 +418,28 @@ mod tests {
             pending.confirm();
         }
         drained
+    }
+
+    #[test]
+    fn pending_readiness_survives_a_failed_nonblocking_send() {
+        struct Full(bool);
+        impl HostNotificationChannel for Full {
+            type Error = ();
+            fn send_notification(&mut self, _: &BrokerNotification) -> Result<(), ()> {
+                if self.0 { Err(()) } else { Ok(()) }
+            }
+        }
+        let publisher = ReadinessPublisher::new();
+        publish(&publisher, HANDLE, ReadinessFlags::READ);
+        assert_eq!(
+            publish_pending_readiness(&publisher, &mut Full(true)),
+            Err(())
+        );
+        assert_eq!(
+            publish_pending_readiness(&publisher, &mut Full(false)),
+            Ok(())
+        );
+        assert!(publisher.take_pending().is_none());
     }
 
     #[test]

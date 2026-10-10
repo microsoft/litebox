@@ -6,6 +6,7 @@ description = "Runs an OP-TEE TA in ring 3 on top of the LiteBox VM kernel"
 
 [dependencies]
 litebox = { version = "0.1.0", path = "../litebox" }
+litebox_broker_protocol = { version = "0.1.0", path = "../litebox_broker_protocol" }
 litebox_common_linux = { version = "0.1.0", path = "../litebox_common_linux" }
 litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
 litebox_broker_local_vm_userland = { version = "0.1.0", path = "../litebox_broker_local_vm_userland" }

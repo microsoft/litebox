@@ -12,8 +12,15 @@
 //!
 //! Assumptions: a single CPU, no scheduler, and not a confidential VM (no
 //! #VE/#VC/#HV).
-//! There is no timer, so user code that never enters the kernel is never
-//! preempted.
+//!
+//! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
+//!
+//! Interrupts: the kernel runs with interrupts disabled, except while it
+//! halts ([`VmKernel::halt_until_interrupt`]); user code runs with them
+//! enabled. External interrupts go to the handler the runner installs
+//! ([`set_interrupt_handler`]), which returns to the interrupted code: there
+//! is no preemption, so user code that never enters the kernel keeps the
+//! CPU.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -67,6 +74,7 @@ extern crate alloc;
 mod arch;
 mod boot;
 pub mod clock;
+mod dma;
 pub mod mm;
 mod per_cpu;
 pub mod providers;
@@ -89,6 +97,26 @@ pub struct BootConfig<'a> {
     pub ignored_vectors: &'a [u8],
 }
 
+/// See [`set_interrupt_handler`].
+pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
+
+/// Installs the handler for external interrupts (vectors 32 and up, except
+/// [`BootConfig::ignored_vectors`]), which returns whether it handled the
+/// vector; an unhandled one panics. Before this, every external interrupt
+/// panics.
+///
+/// The handler runs with interrupts disabled, on the interrupted context's GS
+/// (user mode, or [`VmKernel::halt_until_interrupt`]): it must not touch
+/// per-CPU data, block, or take locks; it should only end the interrupt and
+/// leave the work to the kernel after the halt.
+///
+/// # Panics
+///
+/// On a second call.
+pub fn set_interrupt_handler(handler: &'static InterruptHandler) {
+    arch::interrupts::set_external_interrupt_handler(handler);
+}
+
 /// Valid until unregistered; its representation is private to the platform.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct AddressSpaceId(usize);
@@ -97,13 +125,20 @@ impl AddressSpaceId {
     pub const KERNEL: Self = Self(0);
 }
 
-// Virtual address space:
-//   0xFFFF_E200_0000_0000 ..  kernel: all owned RAM at PA + KERNEL_OFFSET
-//   0x0000_0000_0001_0000 .. 0x0000_7FFF_FFFF_F000  user
+// Virtual address space, one 512 GiB PML4 slot per kernel region, as in
+// Linux's Documentation/arch/x86/x86_64/mm.rst:
+//   0x0000_0000_0001_0000 .. 0x0000_7FFF_FFFF_F000  user, per task
+//   0xFFFF_E200_0000_0000 .. 0xFFFF_E280_0000_0000  direct map of all RAM,
+//                                                   at PA + KERNEL_OFFSET
+//   0xFFFF_E280_0000_0000 .. 0xFFFF_E300_0000_0000  ioremap: device memory
 
 /// `VA = PA + KERNEL_OFFSET` for kernel-owned RAM. Must be 512 GiB aligned
 /// (one PML4 slot).
 pub const KERNEL_OFFSET: u64 = 0xFFFF_E200_0000_0000;
+
+/// Device memory mappings ([`litebox_hal::dma::Hal::map_mmio`]), the slot
+/// after the direct map, which RAM must end below.
+const IOREMAP: core::ops::Range<u64> = KERNEL_OFFSET + (512 << 30)..KERNEL_OFFSET + (1024 << 30);
 
 /// Exclusive; the last page of the low canonical half is a guard page.
 const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
@@ -281,6 +316,8 @@ pub struct VmKernel {
     clock: &'static dyn clock::ClockSource,
     /// Guest RAM owned by this kernel (mapped at `PA + KERNEL_OFFSET`).
     ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>>,
+    /// The next free address in [`IOREMAP`].
+    ioremap_next: spin::Mutex<u64>,
 }
 
 /// Confines user pointers to the user range and opens SMAP around accesses.
@@ -411,7 +448,14 @@ impl VmKernel {
             "kernel text and read-only data overlap"
         );
 
+        assert!(
+            ram_frame_ranges
+                .iter()
+                .all(|r| KERNEL_OFFSET + r.end.start_address().as_u64() <= IOREMAP.start),
+            "guest RAM extends past the direct map"
+        );
         let base_pt = mm::PageTable::new_top_level();
+        base_pt.preallocate_kernel_slot(VirtAddr::new(IOREMAP.start));
         for range in &ram_frame_ranges {
             if let Err(e) = base_pt.map_kernel_ram(*range, text, read_only) {
                 panic!("failed to map guest RAM {range:?}: {e:?}");
@@ -430,7 +474,17 @@ impl VmKernel {
             page_table_manager: PageTableManager::new(base_pt),
             clock,
             ram_frame_ranges,
+            ioremap_next: spin::Mutex::new(IOREMAP.start),
         }))
+    }
+
+    /// Halts until an interrupt is handled, with interrupts enabled only for
+    /// the halt. An interrupt that became pending while they were disabled
+    /// ends the halt at once, so check for work first and halt after: none
+    /// is missed.
+    pub fn halt_until_interrupt(&self) {
+        x86_64::instructions::interrupts::enable_and_hlt();
+        x86_64::instructions::interrupts::disable();
     }
 
     /// Only valid for addresses in the kernel's direct mapping.

@@ -6,7 +6,8 @@
 //! `litebox_runner_optee_on_vm_userland` processes, one per TA instance
 //! ([`service::optee`]),
 //! driven by a test client ([`client::script`]). QEMU exits with 33 if all
-//! tests pass, 65 otherwise.
+//! tests pass, 65 otherwise. Runner processes' standard streams are a virtio
+//! console, if there is one ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -16,6 +17,7 @@
 extern crate alloc;
 
 mod client;
+mod devices;
 mod payload;
 mod service;
 
@@ -30,7 +32,12 @@ fn kernel_main(kernel: Kernel) -> ! {
     set_platform_root_key(&litebox_hal::prk::development());
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
-    let mut service = service::optee::Optee::new(kernel.platform, kernel.tsc_khz, &payload);
+    let devices = devices::Devices::init(kernel.platform, kernel.tsc_khz);
+    let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+        console: devices,
+        events: devices,
+    });
+    let mut service = service::optee::Optee::new(kernel.platform, kernel.tsc_khz, &payload, broker);
     client::script::run(&payload, &mut service);
     console_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)

@@ -7,6 +7,11 @@
 //! responses are in the control ring, pinned and accessed through the
 //! kernel's mapping; payloads are in the process's lazily populated shared
 //! buffers.
+//!
+//! Files are the devices under `/dev`, with standard streams on the
+//! runner's [`stdio::Console`]. Readiness (e.g., of standard input) goes to the
+//! association's notification ring. Waiting ([`BrokerEnterOp::Wait`]) halts
+//! until the runner's [`Events`] report something, e.g., an interrupt.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -16,6 +21,8 @@ extern crate alloc;
 
 mod memory;
 mod providers;
+mod readiness;
+pub mod stdio;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -25,21 +32,22 @@ use core::convert::Infallible;
 use litebox_broker_core::BrokerCore;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_host::BrokerHostAssociation;
-use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
-use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
 use litebox_broker_protocol::wire;
 use litebox_broker_transport::channel::{HostReceive, HostSetupChannel, PeerCredential};
 use litebox_broker_transport::control_ring::{
     BrokerControlRingEndpoints, CONTROL_RING_MEMORY_SIZE, ControlRing, ControlRingConsumer,
-    ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus, MemoryAccessPolicy,
+    ControlRingDirection, ControlRingProducer, ControlRingReadStatus, ControlRingWriteStatus,
+    MemoryAccessPolicy,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
 use litebox_common_vm_abi::{BrokerEnterOp, BrokerEnterRequest, Status, UserRange, WireFrame};
 use litebox_platform_vm_kernel::PinnedUserPages;
 
 use memory::{PinnedControlRing, UserSharedMemory};
+use readiness::KernelReadiness;
+use stdio::ConsoleStdio;
 
 /// Size of a process's broker shared memory.
 pub const SHARED_MEMORY_SIZE: usize = SHARED_BUFFER_POOL_SIZE;
@@ -47,10 +55,28 @@ pub const SHARED_MEMORY_SIZE: usize = SHARED_BUFFER_POOL_SIZE;
 /// Size of a process's broker control ring.
 pub const CONTROL_RING_SIZE: usize = CONTROL_RING_MEMORY_SIZE;
 
+/// What the broker waits for: the runner's event sources (e.g., device
+/// interrupts and a timer).
+pub trait Events: Sync {
+    /// Halts until an event may have happened, or until `deadline` (TSC)
+    /// passes. Without a deadline, false if no event could ever end the halt
+    /// (and it does not halt).
+    fn wait(&self, deadline: Option<u64>) -> bool;
+}
+
+/// The runner's sources for a [`Broker`].
+pub struct Config {
+    /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
+    pub console: &'static dyn stdio::Console,
+    pub events: &'static dyn Events,
+}
+
 /// The kernel's broker; clones share it.
 #[derive(Clone)]
 pub struct Broker {
     core: BrokerCore,
+    events: &'static dyn Events,
+    stdio: Arc<ConsoleStdio>,
 }
 
 impl Broker {
@@ -59,13 +85,12 @@ impl Broker {
     /// # Panics
     ///
     /// Without a hardware CSPRNG, or on a second call.
-    #[expect(
-        clippy::new_without_default,
-        reason = "not `Default`: a second call panics"
-    )]
-    pub fn new() -> Self {
+    pub fn new(config: Config) -> Self {
+        let stdio = Arc::new(ConsoleStdio::new(config.console));
         Self {
-            core: providers::core(),
+            core: providers::core(stdio.clone()),
+            events: config.events,
+            stdio,
         }
     }
 
@@ -87,38 +112,10 @@ impl Broker {
         Association {
             broker: self.clone(),
             shared_memory,
+            readiness: Arc::new(KernelReadiness::default()),
             state: RefCell::new(State::New(ring)),
         }
     }
-}
-
-/// Discards readiness: the broker provides only randomness so far. A provider
-/// with readiness (e.g., timers) needs a sink that publishes to the
-/// notification ring.
-struct NoReadiness;
-
-impl ReadinessSink for NoReadiness {
-    fn max_tracked_objects(&self) -> usize {
-        usize::MAX
-    }
-
-    fn publish(
-        &self,
-        _handle: ObjectHandle,
-        _readiness: ReadinessFlags,
-    ) -> litebox_broker_core::Result<()> {
-        Ok(())
-    }
-
-    fn republish(
-        &self,
-        _handle: ObjectHandle,
-        _readiness: ReadinessFlags,
-    ) -> litebox_broker_core::Result<()> {
-        Ok(())
-    }
-
-    fn retire(&self, _handle: ObjectHandle) {}
 }
 
 /// One handshake request in, one response out.
@@ -161,8 +158,8 @@ enum State {
     Ended,
 }
 
-/// The broker's ends of the request and response rings. Its notification
-/// producer awaits a provider with readiness (see `NoReadiness`).
+/// The broker's ends of the request and response rings; the notification
+/// ring's is in [`Association::readiness`].
 struct Active {
     association: BrokerHostAssociation<UserSharedMemory>,
     requests: ControlRingConsumer<PinnedControlRing>,
@@ -179,6 +176,7 @@ struct Active {
 pub struct Association {
     broker: Broker,
     shared_memory: UserRange,
+    readiness: Arc<KernelReadiness>,
     state: RefCell<State>,
 }
 
@@ -211,7 +209,7 @@ impl Association {
             request: Some(request),
             response: None,
         };
-        let readiness: Arc<dyn ReadinessSink> = Arc::new(NoReadiness);
+        let readiness: Arc<dyn ReadinessSink> = self.readiness.clone();
         let result = litebox_broker_host::setup_connection(
             &self.broker.core,
             None,
@@ -232,9 +230,9 @@ impl Association {
             let BrokerControlRingEndpoints {
                 request_consumer,
                 response_producer,
-                // Unused until a provider has readiness.
-                notification_producer: _,
+                notification_producer,
             } = ring.into_broker();
+            self.readiness.activate(notification_producer);
             *state = State::Active(Box::new(Active {
                 association: host,
                 requests: request_consumer,
@@ -252,6 +250,13 @@ impl Association {
     /// performs `request`'s operation. An invalid request has no effect.
     /// Before the handshake, any request is [`Status::Denied`].
     ///
+    /// Waiting halts the kernel (single CPU, no scheduler) until the word
+    /// changes or the deadline passes. Only notifications change ring words
+    /// asynchronously; a wait on another word without a deadline, or on the
+    /// notification epoch when no event could publish, is
+    /// [`Status::Stalled`]. A corrupted notification ring fails the
+    /// association, as a corrupted request ring does.
+    ///
     /// # Errors
     ///
     /// See [`EnterError`].
@@ -260,6 +265,20 @@ impl Association {
         let State::Active(active) = &mut *state else {
             return Err(EnterError::Status(Status::Denied));
         };
+        let result = self.enter_active(active, request);
+        if result == Err(EnterError::Failed)
+            && let State::Active(active) = core::mem::replace(&mut *state, State::Ended)
+        {
+            end(active.association, &self.readiness);
+        }
+        result
+    }
+
+    fn enter_active(
+        &self,
+        active: &mut Active,
+        request: &BrokerEnterRequest,
+    ) -> Result<(), EnterError> {
         let invalid = || EnterError::Status(Status::InvalidArgument);
         let wait_offset = match request.op {
             BrokerEnterOp::Wake => {
@@ -269,9 +288,6 @@ impl Association {
                 None
             }
             BrokerEnterOp::Wait => {
-                if request.deadline != 0 {
-                    return Err(EnterError::Status(Status::Unsupported));
-                }
                 let offset = usize::try_from(request.offset).map_err(|_| invalid())?;
                 if !MemoryAccessPolicy::ControlRing.permits_u32(offset) {
                     return Err(invalid());
@@ -279,20 +295,44 @@ impl Association {
                 Some(offset)
             }
         };
-        if active.serve().is_err() {
-            if let State::Active(active) = core::mem::replace(&mut *state, State::Ended) {
-                end(active.association);
+        self.broker.stdio.poll();
+        active.serve().map_err(|Failed| EnterError::Failed)?;
+        self.flush_readiness()?;
+        let Some(offset) = wait_offset else {
+            return Ok(());
+        };
+        let deadline = (request.deadline != 0).then_some(request.deadline);
+        let asynchronous = offset == ControlRingDirection::Notifications.producer_epoch_offset();
+        loop {
+            match active.words.load_u32_acquire(offset) {
+                Ok(word) if word != request.expected => return Ok(()),
+                Ok(_) => {}
+                Err(_) => return Err(invalid()),
             }
+            // Safety: RDTSC has no side effects.
+            if deadline.is_some_and(|deadline| unsafe { core::arch::x86_64::_rdtsc() } >= deadline)
+            {
+                return Err(EnterError::Status(Status::TimedOut));
+            }
+            if deadline.is_none() && !asynchronous {
+                return Err(EnterError::Status(Status::Stalled));
+            }
+            if !self.broker.events.wait(deadline) {
+                return Err(EnterError::Status(Status::Stalled));
+            }
+            self.broker.stdio.poll();
+            self.flush_readiness()?;
+        }
+    }
+
+    /// Publishes pending readiness; a corrupted notification ring fails the
+    /// association.
+    fn flush_readiness(&self) -> Result<(), EnterError> {
+        self.readiness.flush();
+        if self.readiness.failed() {
             return Err(EnterError::Failed);
         }
-        // Nothing else changes ring words, so a word unchanged after serving
-        // stays so.
-        match wait_offset.map(|offset| active.words.load_u32_acquire(offset)) {
-            None => Ok(()),
-            Some(Ok(word)) if word != request.expected => Ok(()),
-            Some(Ok(_)) => Err(EnterError::Status(Status::Stalled)),
-            Some(Err(_)) => Err(invalid()),
-        }
+        Ok(())
     }
 }
 
@@ -369,7 +409,8 @@ pub enum EnterError {
 
 /// Ends an active association as the userland broker does when its runner
 /// goes away.
-fn end(association: BrokerHostAssociation<UserSharedMemory>) {
+fn end(association: BrokerHostAssociation<UserSharedMemory>, readiness: &KernelReadiness) {
+    readiness.close();
     association.request_cancellation();
     association.association_ending();
     association.finish();
@@ -378,7 +419,7 @@ fn end(association: BrokerHostAssociation<UserSharedMemory>) {
 impl Drop for Association {
     fn drop(&mut self) {
         if let State::Active(active) = core::mem::replace(self.state.get_mut(), State::Ended) {
-            end(active.association);
+            end(active.association, &self.readiness);
         }
     }
 }

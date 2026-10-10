@@ -36,7 +36,12 @@ impl Optee {
     /// # Panics
     ///
     /// On a missing or malformed payload file.
-    pub fn new(platform: &'static VmKernel, tsc_khz: u64, payload: &Payload) -> Self {
+    pub fn new(
+        platform: &'static VmKernel,
+        tsc_khz: u64,
+        payload: &Payload,
+        broker: litebox_broker_vm_kernel::Broker,
+    ) -> Self {
         let file = |name| {
             payload
                 .file(name)
@@ -66,7 +71,6 @@ impl Optee {
             policies.push((uuid, policy));
         }
         assert!(!tas.is_empty(), "payload has no tas/<name>.elf");
-        let broker = litebox_broker_vm_kernel::Broker::new();
         let spawn: Spawn = Box::new(move |uuid: &TeeUuid| {
             let Some(ta) = tas.get(uuid) else {
                 litebox_util_log::error!(uuid:? = uuid; "no such TA");

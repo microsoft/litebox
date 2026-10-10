@@ -14,6 +14,7 @@ litebox_common_vm_abi = { path = "../litebox_common_vm_abi", version = "0.1.0" }
 litebox_hal = { path = "../litebox_hal", version = "0.1.0" }
 litebox_platform_vm_kernel = { path = "../litebox_platform_vm_kernel", version = "0.1.0" }
 log = { version = "0.4", default-features = false }
+spin = { version = "0.10.0", default-features = false, features = ["spin_mutex"] }
 
 [lints]
 workspace = true

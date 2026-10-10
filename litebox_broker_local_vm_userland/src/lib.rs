@@ -10,6 +10,10 @@
 //! (`BrokerEnter`'s Wake and Wait). The kernel serves the ring within each,
 //! so a call takes one entry. Shared memory is accessed only through
 //! `peer_memory`.
+//!
+//! Notifications (readiness of broker objects, e.g., standard input) have no
+//! receiver thread: the runner receives them with [`Notifications::receive`],
+//! which also waits for them.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -21,7 +25,8 @@ use alloc::sync::Arc;
 use litebox::utils::TruncateExt as _;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::message::{
-    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerRequest, BrokerResponse,
+    BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerRequest,
+    BrokerResponse,
 };
 use litebox_broker_protocol::wire::{self, WireError};
 use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
@@ -98,8 +103,7 @@ impl LocalSetupChannel for KernelBrokerSetup {
     }
 }
 
-/// The local ends of the request and response rings. The notification
-/// consumer awaits the kernel's first notifying provider (e.g., timers).
+/// The local ends of the request and response rings.
 struct Rings {
     requests: ControlRingProducer<KernelControlRing>,
     responses: ControlRingConsumer<KernelControlRing>,
@@ -334,6 +338,13 @@ impl WaitableSharedMemory for KernelControlRing {
     }
 }
 
+/// The notification ring's local end.
+pub struct Notifications {
+    consumer: ControlRingConsumer<KernelControlRing>,
+    /// For [`self_check`].
+    words: KernelControlRing,
+}
+
 /// Call at most once per process.
 ///
 /// # Errors
@@ -341,30 +352,81 @@ impl WaitableSharedMemory for KernelControlRing {
 /// The kernel rejects the association or negotiation fails.
 pub fn connect(
     info: &StartupInfo,
-) -> litebox_broker_local::Result<BrokerLocal<KernelBrokerChannel>, ChannelError> {
-    let (local, _startup, ()) = BrokerLocal::negotiate(KernelBrokerSetup::default(), |_setup| {
-        let memory = KernelControlRing::new(info.broker_control_ring)
-            .ok_or(ChannelError::Memory(SharedMemoryError::InvalidRange))?;
-        let LocalControlRingEndpoints {
-            request_producer,
-            response_consumer,
-            // Unused until the kernel produces notifications.
-            notification_consumer: _,
-        } = ControlRing::new(memory)
-            .map_err(ChannelError::Ring)?
-            .into_local();
-        let channel = KernelBrokerChannel {
-            rings: spin::Mutex::new(Some(Rings {
-                requests: request_producer,
-                responses: response_consumer,
-            })),
-        };
-        let shared_memory: Arc<dyn SharedMemory> = Arc::new(KernelSharedMemory {
-            region: info.broker_shared_memory,
-        });
-        Ok((channel, shared_memory, ()))
-    })?;
-    Ok(local)
+) -> litebox_broker_local::Result<(BrokerLocal<KernelBrokerChannel>, Notifications), ChannelError> {
+    let (local, _startup, notifications) =
+        BrokerLocal::negotiate(KernelBrokerSetup::default(), |_setup| {
+            let ring = || {
+                KernelControlRing::new(info.broker_control_ring)
+                    .ok_or(ChannelError::Memory(SharedMemoryError::InvalidRange))
+            };
+            let LocalControlRingEndpoints {
+                request_producer,
+                response_consumer,
+                notification_consumer,
+            } = ControlRing::new(ring()?)
+                .map_err(ChannelError::Ring)?
+                .into_local();
+            let notifications = Notifications {
+                consumer: notification_consumer,
+                words: ring()?,
+            };
+            let channel = KernelBrokerChannel {
+                rings: spin::Mutex::new(Some(Rings {
+                    requests: request_producer,
+                    responses: response_consumer,
+                })),
+            };
+            let shared_memory: Arc<dyn SharedMemory> = Arc::new(KernelSharedMemory {
+                region: info.broker_shared_memory,
+            });
+            Ok((channel, shared_memory, notifications))
+        })?;
+    Ok((local, notifications))
+}
+
+impl Notifications {
+    /// Passes every published notification to `dispatch` (e.g.,
+    /// `LiteBox::broker_notification_dispatcher`); if there is none, first
+    /// waits for one until `deadline` (TSC; zero for none). Returns how many
+    /// it passed: zero at the deadline.
+    ///
+    /// # Errors
+    ///
+    /// A malformed ring, or a wait the kernel rejects ([`Status::Stalled`]
+    /// if nothing could publish).
+    pub fn receive(
+        &mut self,
+        deadline: u64,
+        mut dispatch: impl FnMut(BrokerNotification),
+    ) -> Result<usize, ChannelError> {
+        let mut received = 0;
+        loop {
+            match self.consumer.try_read(wire::decode_notification) {
+                Ok(ControlRingReadStatus::Message(notification)) => {
+                    dispatch(notification);
+                    received += 1;
+                }
+                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
+                    if received != 0 {
+                        break;
+                    }
+                    let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
+                    match broker_wait(epoch, wait_epoch, deadline) {
+                        Ok(()) => {}
+                        Err(Status::TimedOut) => return Ok(0),
+                        Err(status) => return Err(ChannelError::Kernel(status)),
+                    }
+                }
+                Err(ControlRingReadError::Ring(error)) => return Err(ChannelError::Ring(error)),
+                Err(ControlRingReadError::Decode(error)) => {
+                    return Err(ChannelError::Wire(error));
+                }
+            }
+        }
+        // The kernel sees the freed slots when it next publishes.
+        self.consumer.publish_head().map_err(ChannelError::Ring)?;
+        Ok(received)
+    }
 }
 
 /// Serves published broker requests.
@@ -379,17 +441,40 @@ fn broker_wait(offset: usize, expected: u32, deadline: u64) -> Result<(), Status
 }
 
 /// Self-check (debug builds): the broker's futex operations, on the
-/// notification ring's producer epoch, which stays zero (no notifications).
+/// notification ring's producer epoch and on the request ring's consumer
+/// epoch, which only the kernel's serving changes.
 ///
 /// # Panics
 ///
 /// On a failed check.
-pub fn self_check() {
+pub fn self_check(notifications: &Notifications, tsc_khz: u64) {
     let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
+    let served = ControlRingDirection::Requests.consumer_epoch_offset();
+    // Safety: RDTSC has no side effects.
+    let now = || unsafe { core::arch::x86_64::_rdtsc() };
+    let current = |offset| {
+        notifications
+            .words
+            .load_u32_acquire(offset)
+            .expect("a ring word")
+    };
     broker_wake().expect("waking an idle broker");
-    assert_eq!(broker_wait(epoch, 1, 0), Ok(()), "word differs");
-    assert_eq!(broker_wait(epoch, 0, 0), Err(Status::Stalled));
-    assert_eq!(broker_wait(epoch, 0, 1), Err(Status::Unsupported));
+    let notified = current(epoch);
+    assert_eq!(
+        broker_wait(epoch, notified.wrapping_add(1), 0),
+        Ok(()),
+        "word differs"
+    );
+    let soon = now() + tsc_khz; // 1 ms
+    assert_eq!(
+        broker_wait(served, current(served), 0),
+        Err(Status::Stalled)
+    );
+    assert_eq!(
+        broker_wait(served, current(served), soon),
+        Err(Status::TimedOut)
+    );
+    assert!(now() >= soon, "a timed wait returned early");
     assert_eq!(broker_wait(0, 0, 0), Err(Status::InvalidArgument));
     let mut wake = BrokerEnterRequest::wake();
     wake.expected = 1;

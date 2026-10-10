@@ -14,17 +14,22 @@
 # open_session commands name the TAs it needs in their "ta" fields, or a TA
 # with a *-cmds.json of its own.
 #
+# Runner processes' standard streams are a virtio console, backed by files:
+# TA output must reach it, and in debug builds, whose runners echo standard
+# input, so must the line fed to it.
+#
 # Usage: dev_tools/run_optee_on_vm_userland.sh [-t <test>]... [-u] [-r] [-v]
 #   -t   test to run, e.g. ta-death or hello-ta; append @default to a TA to
 #        omit its cmds.json (repeatable; default: every scenario, plus
 #        hello-ta@default for the default-commands path)
 #   -u   use unmodified ldelf and TAs; the kernel reflects their syscalls
 #   -r   build and run the release kernel
-#   -v   print the full guest log for passing runs too
+#   -v   print the full guest log and console output for passing runs too
 #
 # Environment:
 #   QEMU          QEMU binary/command (default: qemu-system-x86_64)
 #   QEMU_ACCEL    kvm or tcg (default: kvm if /dev/kvm is usable, else tcg)
+#   QEMU_CPU      QEMU CPU model (default: host,+invtsc for kvm, max for tcg)
 #   TIMEOUT       per-run timeout in seconds (default: 120)
 #   LITEBOX_LOG   guest log level, e.g. debug (default: info)
 #   CARGO_BUILD   command that builds the runners (and the rewriter unless
@@ -93,6 +98,33 @@ prepare() {
     fi
 }
 
+STDIN_LINE="hello from the host"
+
+# The virtio console's files for test $1.
+console_args() {
+    printf '%s\n' "$STDIN_LINE" >"$WORK/$1.stdin"
+    : >"$WORK/$1.stdout"
+    echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
+        -chardev "file,id=con0,path=$WORK/$1.stdout,input-path=$WORK/$1.stdin" \
+        -device virtconsole,chardev=con0,bus=vs0.0
+}
+
+# Run check: TA output, and the echoed input, on the console.
+check_console() {
+    local out="$WORK/$1.stdout"
+    if [[ ${verbose:-0} -ne 0 ]]; then
+        echo "--- console ($1) ---" >&2
+        cat "$out" >&2
+        echo "---" >&2
+    fi
+    grep -q "/TA:" "$out" || { echo "no TA output on the console"; return 1; }
+    if [[ $profile == debug ]] && ! grep -qF "[stdin] $STDIN_LINE" "$out"; then
+        echo "standard input was not echoed on the console"
+        return 1
+    fi
+}
+check=check_console
+
 for ta in "${tas[@]}"; do
     name=${ta%@default}
     if [[ -f "$VM_TESTS_DIR/$name-cmds.json" ]]; then
@@ -118,6 +150,7 @@ for ta in "${tas[@]}"; do
         files+=(cmds.json)
     fi
     tar --format=ustar -cf "$WORK/$ta.tar" -C "$WORK/$ta" "${files[@]}"
-    run_vm "$ta" "$KERNEL" "$WORK/$ta.tar"
+    # shellcheck disable=SC2046 # console_args prints separate arguments
+    run_vm "$ta" "$KERNEL" "$WORK/$ta.tar" $(console_args "$ta")
 done
 summary

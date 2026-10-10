@@ -436,6 +436,65 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
+    /// Gives the kernel PML4 slot holding `va` its P3 table now, as Linux
+    /// preallocates its vmalloc area's: task tables share the kernel's slots
+    /// as they are at creation, so they see later mappings in it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `va` is below the kernel slots or the frame allocation fails.
+    pub(crate) fn preallocate_kernel_slot(&self, va: VirtAddr) {
+        assert!(usize::from(va.p4_index()) >= KERNEL_PML4_START);
+        let mut inner = self.inner.lock();
+        let entry = &mut inner.level_4_table_mut()[va.p4_index()];
+        if entry.is_unused() {
+            let frame = PageTableAllocator::<M>::allocate_frame()
+                .expect("Failed to allocate a kernel P3 table");
+            entry.set_frame(
+                frame,
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::ACCESSED
+                    | PageTableFlags::DIRTY,
+            );
+        }
+    }
+
+    /// Maps device registers `frames` uncacheable at `start`, in the kernel
+    /// tables that task tables share.
+    ///
+    /// # Safety
+    ///
+    /// The frames must be device registers, not RAM, and `start..` kernel
+    /// address space in an existing kernel PML4 slot, used for nothing else.
+    pub(crate) unsafe fn map_kernel_mmio(
+        &self,
+        start: Page<Size4KiB>,
+        frames: PhysFrameRange<Size4KiB>,
+    ) -> Result<(), MapToError<Size4KiB>> {
+        let mut allocator = PageTableAllocator::<M>::new();
+        let table_flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::ACCESSED
+            | PageTableFlags::DIRTY;
+        // PCD and PWT select UC with the reset PAT.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::NO_EXECUTE
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::WRITE_THROUGH;
+        let mut inner = self.inner.lock();
+        for (page, frame) in Page::range(start, start + frames.count() as u64).zip(frames) {
+            // Safety: device registers (the caller's contract), mapped only here.
+            unsafe {
+                inner.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator)
+            }?
+            // A newly present entry needs no flush.
+            .ignore();
+        }
+        Ok(())
+    }
+
     /// # Panics
     ///
     /// Panics if the frame allocation fails.

@@ -185,6 +185,7 @@ pub struct OpteeShimBuilder<Platform: OpteeShimPlatform> {
     session_manager: &'static session::SessionManager<Platform>,
     litebox: LiteBox<Platform>,
     ta_signing_cert: &'static [u8],
+    log_file: Option<litebox::fs::FileFd>,
 }
 
 impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
@@ -209,6 +210,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             session_manager,
             litebox,
             ta_signing_cert: &[],
+            log_file: None,
         }
     }
 
@@ -216,6 +218,15 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
     #[must_use]
     pub fn with_ta_signing_cert(mut self, ta_signing_cert: &'static [u8]) -> Self {
         self.ta_signing_cert = ta_signing_cert;
+        self
+    }
+
+    /// Where TA and ldelf messages (`utee_log`) go, as written, instead of
+    /// the log: a file of [`Self::litebox`], such as the broker's
+    /// `/dev/stdout`. Messages the file does not take are logged.
+    #[must_use]
+    pub fn with_log_file(mut self, log_file: litebox::fs::FileFd) -> Self {
+        self.log_file = Some(log_file);
         self
     }
 
@@ -236,6 +247,7 @@ impl<Platform: OpteeShimPlatform> OpteeShimBuilder<Platform> {
             dynamic_ta_uuid_map: TaUuidMap::new(),
             ta_signing_cert: self.ta_signing_cert,
             pta_busy: spin::mutex::SpinMutex::new(HashSet::new()),
+            log_file: self.log_file,
             page_table_keepalive: None,
         });
         OpteeShim(global)
@@ -269,6 +281,8 @@ struct GlobalState<Platform: OpteeShimPlatform> {
     /// blocking/queuing the caller until the PTA is free. We currently reject
     /// instead of serialize; revisit if a PTA needs true serialization.
     pta_busy: spin::mutex::SpinMutex<HashSet<PseudoTa>>,
+    /// See [`OpteeShimBuilder::with_log_file`].
+    log_file: Option<litebox::fs::FileFd>,
     /// Keeps the TA page table alive; declared last to drop after all other shim state.
     // TODO: Replace type erasure with a typed platform page-table handle.
     page_table_keepalive: Option<Box<dyn Send + Sync>>,

@@ -91,8 +91,9 @@
 //!   [`BrokerEnterOp::Wake`] and [`BrokerEnterOp::Wait`] on ring words. The
 //!   kernel serves every published request first.
 //! - The ring's notification direction carries readiness of broker objects
-//!   (e.g., timers) from the kernel. The kernel's broker provides only
-//!   randomness so far, so it produces none yet.
+//!   (e.g., standard input) from the kernel, published as it changes; the
+//!   runner consumes them and waits for them on the direction's producer
+//!   epoch.
 //! - The kernel pins the control ring and accesses it through its own mapping.
 //!   The shared buffers stay lazily populated and are touched only while
 //!   executing a request that names them.
@@ -591,8 +592,9 @@ pub enum BrokerEnterOp {
     Wake = 0,
     /// Returns once the `u32` ring word at `offset`, an epoch, differs from
     /// `expected`. [`Status::TimedOut`] at the deadline; [`Status::Stalled`]
-    /// if nothing could change the word. Deadlines are
-    /// [`Status::Unsupported`] so far.
+    /// if nothing could change the word. Only notifications change words
+    /// while the kernel waits (with no scheduler, it halts the CPU), so
+    /// without a deadline any other word stalls.
     Wait = 1,
 }
 
