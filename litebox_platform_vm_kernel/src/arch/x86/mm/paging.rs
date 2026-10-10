@@ -436,9 +436,32 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         Ok(())
     }
 
+    /// Gives the kernel PML4 slot holding `va` its P3 table now, as Linux
+    /// preallocates its vmalloc area's: task tables share the kernel's slots
+    /// as they are at creation, so they see later mappings in it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `va` is below the kernel slots or the frame allocation fails.
+    pub(crate) fn preallocate_kernel_slot(&self, va: VirtAddr) {
+        assert!(usize::from(va.p4_index()) >= KERNEL_PML4_START);
+        let mut inner = self.inner.lock();
+        let entry = &mut inner.level_4_table_mut()[va.p4_index()];
+        if entry.is_unused() {
+            let frame = PageTableAllocator::<M>::allocate_frame()
+                .expect("Failed to allocate a kernel P3 table");
+            entry.set_frame(
+                frame,
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::ACCESSED
+                    | PageTableFlags::DIRTY,
+            );
+        }
+    }
+
     /// Maps device registers `frames` uncacheable at `start`, in the kernel
-    /// tables that task tables share. Pages already mapped to the same frame
-    /// are kept.
+    /// tables that task tables share.
     ///
     /// # Safety
     ///
@@ -463,14 +486,11 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         let mut inner = self.inner.lock();
         for (page, frame) in Page::range(start, start + frames.count() as u64).zip(frames) {
             // Safety: device registers (the caller's contract), mapped only here.
-            match unsafe {
+            unsafe {
                 inner.map_to_with_table_flags(page, frame, flags, table_flags, &mut allocator)
-            } {
-                // A newly present entry needs no flush.
-                Ok(flush) => flush.ignore(),
-                Err(MapToError::PageAlreadyMapped(mapped)) if mapped == frame => {}
-                Err(error) => return Err(error),
-            }
+            }?
+            // A newly present entry needs no flush.
+            .ignore();
         }
         Ok(())
     }

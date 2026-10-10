@@ -125,13 +125,20 @@ impl AddressSpaceId {
     pub const KERNEL: Self = Self(0);
 }
 
-// Virtual address space:
-//   0xFFFF_E200_0000_0000 ..  kernel: all owned RAM at PA + KERNEL_OFFSET
-//   0x0000_0000_0001_0000 .. 0x0000_7FFF_FFFF_F000  user
+// Virtual address space, one 512 GiB PML4 slot per kernel region, as in
+// Linux's Documentation/arch/x86/x86_64/mm.rst:
+//   0x0000_0000_0001_0000 .. 0x0000_7FFF_FFFF_F000  user, per task
+//   0xFFFF_E200_0000_0000 .. 0xFFFF_E280_0000_0000  direct map of all RAM,
+//                                                   at PA + KERNEL_OFFSET
+//   0xFFFF_E280_0000_0000 .. 0xFFFF_E300_0000_0000  ioremap: device memory
 
 /// `VA = PA + KERNEL_OFFSET` for kernel-owned RAM. Must be 512 GiB aligned
 /// (one PML4 slot).
 pub const KERNEL_OFFSET: u64 = 0xFFFF_E200_0000_0000;
+
+/// Device memory mappings ([`litebox_hal::dma::Hal::map_mmio`]), the slot
+/// after the direct map, which RAM must end below.
+const IOREMAP: core::ops::Range<u64> = KERNEL_OFFSET + (512 << 30)..KERNEL_OFFSET + (1024 << 30);
 
 /// Exclusive; the last page of the low canonical half is a guard page.
 const USER_ADDR_MAX: usize = 0x0000_7FFF_FFFF_F000;
@@ -309,8 +316,8 @@ pub struct VmKernel {
     clock: &'static dyn clock::ClockSource,
     /// Guest RAM owned by this kernel (mapped at `PA + KERNEL_OFFSET`).
     ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>>,
-    /// The next free offset in `dma::MMIO_WINDOW`.
-    mmio_next: spin::Mutex<u64>,
+    /// The next free address in [`IOREMAP`].
+    ioremap_next: spin::Mutex<u64>,
 }
 
 /// Confines user pointers to the user range and opens SMAP around accesses.
@@ -441,7 +448,14 @@ impl VmKernel {
             "kernel text and read-only data overlap"
         );
 
+        assert!(
+            ram_frame_ranges
+                .iter()
+                .all(|r| KERNEL_OFFSET + r.end.start_address().as_u64() <= IOREMAP.start),
+            "guest RAM extends past the direct map"
+        );
         let base_pt = mm::PageTable::new_top_level();
+        base_pt.preallocate_kernel_slot(VirtAddr::new(IOREMAP.start));
         for range in &ram_frame_ranges {
             if let Err(e) = base_pt.map_kernel_ram(*range, text, read_only) {
                 panic!("failed to map guest RAM {range:?}: {e:?}");
@@ -460,7 +474,7 @@ impl VmKernel {
             page_table_manager: PageTableManager::new(base_pt),
             clock,
             ram_frame_ranges,
-            mmio_next: spin::Mutex::new(dma::MMIO_WINDOW.start),
+            ioremap_next: spin::Mutex::new(IOREMAP.start),
         }))
     }
 
