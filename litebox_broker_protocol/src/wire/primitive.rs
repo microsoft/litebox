@@ -6,7 +6,9 @@ use alloc::vec::Vec;
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SharedBufferSequence, SharedBufferSlotIndex,
 };
-use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
+use crate::{
+    ObjectHandle, ProcessGroupId, ProcessId, ProtocolVersion, RequestId, SessionId, ThreadId,
+};
 
 use super::WireError;
 
@@ -42,6 +44,14 @@ impl Encoder {
 
     pub(super) fn process_id(&mut self, process_id: ProcessId) {
         self.u32(process_id.0);
+    }
+
+    pub(super) fn process_group_id(&mut self, process_group: ProcessGroupId) {
+        self.u32(process_group.0);
+    }
+
+    pub(super) fn session_id(&mut self, session: SessionId) {
+        self.u32(session.0);
     }
 
     pub(super) fn thread_id(&mut self, thread_id: ThreadId) {
@@ -112,6 +122,14 @@ impl<'a> Decoder<'a> {
 
     pub(super) fn process_id(&mut self) -> Result<ProcessId, WireError> {
         Ok(ProcessId(self.u32()?))
+    }
+
+    pub(super) fn process_group_id(&mut self) -> Result<ProcessGroupId, WireError> {
+        Ok(ProcessGroupId(self.u32()?))
+    }
+
+    pub(super) fn session_id(&mut self) -> Result<SessionId, WireError> {
+        Ok(SessionId(self.u32()?))
     }
 
     pub(super) fn thread_id(&mut self) -> Result<ThreadId, WireError> {

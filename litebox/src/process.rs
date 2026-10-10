@@ -14,7 +14,7 @@ use litebox_broker_protocol::process::{
     ProcessInfo,
 };
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
@@ -140,7 +140,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn set_process_group(
         &self,
         process_id: ProcessId,
-        process_group: ProcessId,
+        process_group: ProcessGroupId,
     ) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         broker

@@ -8,15 +8,15 @@
 //! need not still exist. A child process starts in its creator's group and
 //! session, while a root process, which has no creator, leads its own.
 
-use crate::ProcessId;
+use crate::{ProcessGroupId, ProcessId, SessionId};
 
 /// A process's group and session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessGroupMembership {
     /// Process group.
-    pub process_group: ProcessId,
+    pub process_group: ProcessGroupId,
     /// Session.
-    pub session: ProcessId,
+    pub session: SessionId,
 }
 
 /// Request to move a process into a process group.
@@ -29,6 +29,6 @@ pub struct ProcessGroupMembership {
 pub struct SetProcessGroupRequest {
     /// Process to move.
     pub process_id: ProcessId,
-    /// Group to join, which is created if it is `process_id`.
-    pub process_group: ProcessId,
+    /// Group to join, which is created if its ID is `process_id`.
+    pub process_group: ProcessGroupId,
 }

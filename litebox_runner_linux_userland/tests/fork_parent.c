@@ -27,6 +27,9 @@ static pid_t raw_fork(void) {
 static int global_value = 1;
 static volatile sig_atomic_t usr1_count;
 static volatile sig_atomic_t sigchld_count;
+// The children reaped, and whether each one's `SIGCHLD` was handled when `waitpid` reaped it.
+static int reaped_count;
+static int sigchld_before_reap = 1;
 // A page written and then made inaccessible, and an inaccessible reservation never written.
 static unsigned char *hidden;
 static unsigned char *reserved;
@@ -58,12 +61,15 @@ static unsigned long checksum(const unsigned char *buffer, size_t size) {
     return sum;
 }
 
-static int wait_for(pid_t child, const char *name) {
+// Reaps `child`, polling if `options` has `WNOHANG`, which reaps it as soon as it exits.
+static int wait_for(pid_t child, const char *name, int options) {
     int status = 0;
     pid_t waited;
     do {
-        waited = waitpid(child, &status, 0);
-    } while (waited == -1 && errno == EINTR);
+        waited = waitpid(child, &status, options);
+    } while (waited == 0 || (waited == -1 && errno == EINTR));
+    // Like Linux, a child's `SIGCHLD` is handled by the time `waitpid` reaps it.
+    sigchld_before_reap &= sigchld_count >= ++reaped_count;
     printf("%s child=%d waited=%d exited=%d code=%d\n", name, child, waited, WIFEXITED(status),
            WEXITSTATUS(status));
     return waited == child ? 0 : 1;
@@ -178,7 +184,7 @@ int main(void) {
         }
     }
     printf("pipe %s", message);
-    int failures = wait_for(child, "fork");
+    int failures = wait_for(child, "fork", 0);
 
     pid_t raw_child = raw_fork();
     if (raw_child == 0) {
@@ -188,7 +194,7 @@ int main(void) {
         perror("raw fork");
         return 5;
     }
-    failures += wait_for(raw_child, "raw-fork");
+    failures += wait_for(raw_child, "raw-fork", WNOHANG);
 
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
@@ -196,6 +202,6 @@ int main(void) {
            global_value,
            checksum(buffer, BUFFER_SIZE) == expected_sum && exec_only() == 42 &&
                hidden_is_intact(),
-           usr1_count, sigchld_count > 0, again == -1 && again_errno == ECHILD);
+           usr1_count, sigchld_before_reap, again == -1 && again_errno == ECHILD);
     return failures;
 }

@@ -23,9 +23,9 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::process::ProcessError;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::ProcessExitStatus;
 use litebox_broker_protocol::signal::SignalTarget;
+use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::signal::{
     CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL,
     SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal,
@@ -843,7 +843,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             ),
             -1 => SignalTarget::All,
             i32::MIN => return Err(Errno::ESRCH),
-            _ => SignalTarget::ProcessGroup(ProcessId(pid.unsigned_abs())),
+            _ => SignalTarget::ProcessGroup(ProcessGroupId(pid.unsigned_abs())),
         };
         let number = signal.map_or(0, |signal| signal.as_i32().cast_unsigned());
         match self.global.litebox.send_signal(target, number) {

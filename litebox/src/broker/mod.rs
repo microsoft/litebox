@@ -121,7 +121,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn set_process_group(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
-        process_group: litebox_broker_protocol::ProcessId,
+        process_group: litebox_broker_protocol::ProcessGroupId,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn create_session(
@@ -651,7 +651,7 @@ where
     fn set_process_group(
         &self,
         process_id: litebox_broker_protocol::ProcessId,
-        process_group: litebox_broker_protocol::ProcessId,
+        process_group: litebox_broker_protocol::ProcessGroupId,
     ) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.set_process_group(process_id, process_group))
     }

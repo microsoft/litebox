@@ -7,7 +7,7 @@ use crate::process_group::ProcessGroupMembership;
 use crate::shared_buffer::{
     MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
 };
-use crate::{ProcessId, ThreadId};
+use crate::{ProcessGroupId, ProcessId, ThreadId};
 
 /// Maximum size of one process bootstrap carried through the broker.
 pub const MAX_PROCESS_BOOTSTRAP_SIZE: u32 = 64 * 1024;
@@ -67,7 +67,7 @@ pub enum ChildSelector {
     /// One child.
     Process(ProcessId),
     /// Any child in a process group.
-    ProcessGroup(ProcessId),
+    ProcessGroup(ProcessGroupId),
 }
 
 /// A process's place in the process tree.

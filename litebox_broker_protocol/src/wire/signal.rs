@@ -63,7 +63,7 @@ fn encode_signal_target(encoder: &mut Encoder, target: SignalTarget) {
         }
         SignalTarget::ProcessGroup(process_group) => {
             encoder.u8(SIGNAL_TARGET_TAG_PROCESS_GROUP);
-            encoder.process_id(process_group);
+            encoder.process_group_id(process_group);
         }
         SignalTarget::All => encoder.u8(SIGNAL_TARGET_TAG_ALL),
     }
@@ -72,7 +72,7 @@ fn encode_signal_target(encoder: &mut Encoder, target: SignalTarget) {
 fn decode_signal_target(decoder: &mut Decoder<'_>) -> Result<SignalTarget, WireError> {
     Ok(match decoder.u8()? {
         SIGNAL_TARGET_TAG_PROCESS => SignalTarget::Process(decoder.process_id()?),
-        SIGNAL_TARGET_TAG_PROCESS_GROUP => SignalTarget::ProcessGroup(decoder.process_id()?),
+        SIGNAL_TARGET_TAG_PROCESS_GROUP => SignalTarget::ProcessGroup(decoder.process_group_id()?),
         SIGNAL_TARGET_TAG_ALL => SignalTarget::All,
         _ => return Err(WireError::InvalidTag),
     })

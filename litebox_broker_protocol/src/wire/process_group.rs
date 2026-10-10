@@ -18,7 +18,7 @@ pub(super) fn encode_process_group_request(encoder: &mut Encoder, request: Proce
         ProcessGroupRequest::Set(request) => {
             encoder.u8(PROCESS_GROUP_REQUEST_TAG_SET);
             encoder.process_id(request.process_id);
-            encoder.process_id(request.process_group);
+            encoder.process_group_id(request.process_group);
         }
         ProcessGroupRequest::CreateSession(process_id) => {
             encoder.u8(PROCESS_GROUP_REQUEST_TAG_CREATE_SESSION);
@@ -33,7 +33,7 @@ pub(super) fn decode_process_group_request(
     Ok(match decoder.u8()? {
         PROCESS_GROUP_REQUEST_TAG_SET => ProcessGroupRequest::Set(SetProcessGroupRequest {
             process_id: decoder.process_id()?,
-            process_group: decoder.process_id()?,
+            process_group: decoder.process_group_id()?,
         }),
         PROCESS_GROUP_REQUEST_TAG_CREATE_SESSION => {
             ProcessGroupRequest::CreateSession(decoder.process_id()?)

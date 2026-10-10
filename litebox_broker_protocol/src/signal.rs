@@ -11,7 +11,7 @@
 //! took one, and at most one pending child removal.
 
 use crate::process::ChildExit;
-use crate::{ObjectHandle, ProcessId};
+use crate::{ObjectHandle, ProcessGroupId, ProcessId};
 
 /// Largest signal number the broker delivers.
 pub const MAX_SIGNAL: u32 = 64;
@@ -22,7 +22,7 @@ pub enum SignalTarget {
     /// One process.
     Process(ProcessId),
     /// Every process in a process group.
-    ProcessGroup(ProcessId),
+    ProcessGroup(ProcessGroupId),
     /// Every process except the caller and the root processes, which have no
     /// creator.
     All,
