@@ -302,7 +302,7 @@ fn test_nine_p_file_status() {
 
     // Check file_status via path
     let status = fs
-        .file_status(&ctx, "/status_test.txt")
+        .file_status(&ctx, "/status_test.txt", true)
         .expect("failed to stat file");
     assert_eq!(
         status.file_type,
@@ -314,7 +314,7 @@ fn test_nine_p_file_status() {
     // Check directory status
     fs.mkdir(&ctx, "/stat_dir", Mode::RWXU).unwrap();
     let status = fs
-        .file_status(&ctx, "/stat_dir")
+        .file_status(&ctx, "/stat_dir", true)
         .expect("failed to stat dir");
     assert_eq!(
         status.file_type,
@@ -540,13 +540,15 @@ fn test_nine_p_broken_read() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // Pre-create a file via normal connection
+    // A nested path also verifies that the resolution pass batches ordinary components.
     {
         let fs = connect_9p(&litebox, &server);
+        fs.mkdir(&ctx, "/parent", Mode::RWXU).unwrap();
+        fs.mkdir(&ctx, "/parent/nested", Mode::RWXU).unwrap();
         let fd = fs
             .open(
                 &ctx,
-                "/read_me.txt",
+                "/parent/nested/read_me.txt",
                 OFlags::CREAT | OFlags::WRONLY,
                 Mode::RWXU,
             )
@@ -555,10 +557,16 @@ fn test_nine_p_broken_read() {
         fs.close(&fd).unwrap();
     }
 
-    // 4 writes: version + attach + walk + lopen. Then read will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then read will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
-        .open(&ctx, "/read_me.txt", OFlags::RDONLY, Mode::empty())
+        .open(
+            &ctx,
+            "/parent/nested/read_me.txt",
+            OFlags::RDONLY,
+            Mode::empty(),
+        )
         .expect("open should succeed before break");
 
     let mut buf = alloc::vec![0u8; 64];
@@ -573,9 +581,9 @@ fn test_nine_p_broken_write() {
     let litebox = crate::LiteBox::new(MockPlatform::new());
     let server = DiodServer::start();
 
-    // 5 writes: version + attach + walk (which reports the file as missing) + the clone of the
-    // parent directory's fid + create. Then write will fail.
-    let fs = connect_9p_broken(&litebox, &server, 5);
+    // 6 writes: version + attach + resolution walk + open walk (both report the missing file)
+    // + the clone of the parent directory's fid + create. Then write will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
         .open(
             &ctx,
@@ -670,7 +678,7 @@ fn test_nine_p_broken_file_status() {
     let server = DiodServer::start();
     let fs = connect_9p_broken(&litebox, &server, 2);
 
-    let result = fs.file_status(&ctx, "/");
+    let result = fs.file_status(&ctx, "/", true);
     assert!(matches!(result, Err(FileStatusError::Io)));
 }
 
@@ -696,8 +704,9 @@ fn test_nine_p_broken_truncate() {
         fs.close(&fd).unwrap();
     }
 
-    // 4 writes: version + attach + walk + lopen. Then truncate will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then truncate will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
         .open(&ctx, "/to_trunc.txt", OFlags::RDWR, Mode::empty())
         .expect("open should succeed before break");
@@ -728,8 +737,9 @@ fn test_nine_p_broken_seek() {
         fs.close(&fd).unwrap();
     }
 
-    // 4 writes: version + attach + walk + lopen. Then the getattr for seek will fail.
-    let fs = connect_9p_broken(&litebox, &server, 4);
+    // 6 writes: version + attach + resolution walk + clunk + open walk + lopen.
+    // Then the getattr for seek will fail.
+    let fs = connect_9p_broken(&litebox, &server, 6);
     let fd = fs
         .open(&ctx, "/to_seek.txt", OFlags::RDONLY, Mode::empty())
         .expect("open should succeed before break");
@@ -781,7 +791,7 @@ fn test_nine_p_deep_path_walk() {
 
     // Verify file_status works through the deep path
     let status = fs
-        .file_status(&ctx, &*file_path)
+        .file_status(&ctx, &*file_path, true)
         .expect("failed to stat deep file");
     assert_eq!(status.file_type, crate::fs::FileType::RegularFile);
     assert_eq!(status.size, 12);
@@ -822,7 +832,7 @@ fn test_nine_p_chmod() {
 
     // Also verify via 9P file_status
     let status = fs
-        .file_status(&ctx, "/chmod_test.txt")
+        .file_status(&ctx, "/chmod_test.txt", true)
         .expect("file_status failed");
     assert!(status.mode.contains(Mode::RUSR), "mode should contain RUSR");
     assert!(
@@ -851,7 +861,7 @@ fn test_nine_p_chown() {
 
     // Get current ownership
     let status_before = fs
-        .file_status(&ctx, "/chown_test.txt")
+        .file_status(&ctx, "/chown_test.txt", true)
         .expect("file_status failed");
 
     // Change group to the same value (chown to a different uid/gid requires root)
@@ -865,7 +875,7 @@ fn test_nine_p_chown() {
 
     // Verify ownership hasn't changed
     let status_after = fs
-        .file_status(&ctx, "/chown_test.txt")
+        .file_status(&ctx, "/chown_test.txt", true)
         .expect("file_status failed after chown");
     assert_eq!(status_after.owner.user, status_before.owner.user);
     assert_eq!(status_after.owner.group, status_before.owner.group);
