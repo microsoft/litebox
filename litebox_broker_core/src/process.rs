@@ -315,8 +315,8 @@ impl BrokerProcess {
     ) -> Self {
         let membership = creator.map_or(
             ProcessGroupMembership {
-                process_group: id,
-                session: id,
+                process_group: id.into(),
+                session: id.into(),
             },
             |creator| creator.membership(),
         );
@@ -2262,7 +2262,7 @@ mod tests {
         let second = child_of(&root);
         let third = child_of(&root);
         let pending = child_of(&root);
-        crate::process_group::set(&root, third.id(), third.id()).unwrap();
+        crate::process_group::set(&root, third.id(), third.id().into()).unwrap();
         let other = broker
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap();
@@ -2278,15 +2278,15 @@ mod tests {
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            reap(ChildSelector::ProcessGroup(other.id())),
+            reap(ChildSelector::ProcessGroup(other.id().into())),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
-            reap(ChildSelector::ProcessGroup(third.id())),
+            reap(ChildSelector::ProcessGroup(third.id().into())),
             Ok(child_exit(&third, SIGNALED))
         );
         assert_eq!(
-            reap(ChildSelector::ProcessGroup(third.id())),
+            reap(ChildSelector::ProcessGroup(third.id().into())),
             Err(BrokerError::UnknownObject)
         );
         assert_eq!(
@@ -2294,7 +2294,7 @@ mod tests {
             Ok(child_exit(&second, EXITED))
         );
         assert_eq!(
-            reap(ChildSelector::ProcessGroup(root.id())),
+            reap(ChildSelector::ProcessGroup(root.id().into())),
             Ok(child_exit(&first, EXITED))
         );
         assert_eq!(

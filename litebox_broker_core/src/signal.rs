@@ -240,7 +240,7 @@ mod tests {
     use litebox_broker_protocol::process::{ChildExit, ProcessExitStatus};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
-    use litebox_broker_protocol::{ObjectHandle, ProcessId};
+    use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
 
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::TestBrokerCoreBuilder;
@@ -361,7 +361,7 @@ mod tests {
         let second = broker
             .create_process(CallerCredential::Unauthenticated, Some(root.id()))
             .unwrap();
-        crate::process_group::set(&root, second.id(), second.id()).unwrap();
+        crate::process_group::set(&root, second.id(), second.id().into()).unwrap();
         let sink = Arc::new(TestReadinessSink::default());
         let handles = [&root, &other, &first, &second]
             .map(|process| (process, super::open(process, sink.clone()).unwrap()));
@@ -375,13 +375,17 @@ mod tests {
                 .collect::<std::vec::Vec<_>>()
         };
 
-        super::send(&other, SignalTarget::ProcessGroup(root.id()), 10).unwrap();
+        super::send(&other, SignalTarget::ProcessGroup(root.id().into()), 10).unwrap();
         assert_eq!(take_all(), [(root.id(), 10), (first.id(), 10)]);
-        super::send(&other, SignalTarget::ProcessGroup(second.id()), 0).unwrap();
-        super::send(&other, SignalTarget::ProcessGroup(second.id()), 12).unwrap();
+        super::send(&other, SignalTarget::ProcessGroup(second.id().into()), 0).unwrap();
+        super::send(&other, SignalTarget::ProcessGroup(second.id().into()), 12).unwrap();
         assert_eq!(take_all(), [(second.id(), 12)]);
         assert_eq!(
-            super::send(&other, SignalTarget::ProcessGroup(ProcessId(u32::MAX)), 0),
+            super::send(
+                &other,
+                SignalTarget::ProcessGroup(ProcessGroupId(u32::MAX)),
+                0
+            ),
             Err(BrokerError::UnknownObject)
         );
 

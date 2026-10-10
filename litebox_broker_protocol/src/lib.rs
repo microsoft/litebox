@@ -47,6 +47,32 @@ pub struct ProcessId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ThreadId(pub u32);
 
+/// Guest process group ID carried by broker protocol messages.
+///
+/// A process group is identified by the ID of the process that created it.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ProcessGroupId(pub u32);
+
+impl From<ProcessId> for ProcessGroupId {
+    fn from(creator: ProcessId) -> Self {
+        Self(creator.0)
+    }
+}
+
+/// Guest session ID carried by broker protocol messages.
+///
+/// A session is identified by the ID of the process that created it.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SessionId(pub u32);
+
+impl From<ProcessId> for SessionId {
+    fn from(creator: ProcessId) -> Self {
+        Self(creator.0)
+    }
+}
+
 /// Opaque broker object reference handle.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

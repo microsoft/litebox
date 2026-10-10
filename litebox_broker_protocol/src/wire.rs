@@ -803,7 +803,7 @@ fn encode_child_selector(encoder: &mut Encoder, selector: ChildSelector) {
         }
         ChildSelector::ProcessGroup(process_group) => {
             encoder.u8(CHILD_SELECTOR_TAG_PROCESS_GROUP);
-            encoder.process_id(process_group);
+            encoder.process_group_id(process_group);
         }
     }
 }
@@ -812,7 +812,9 @@ fn decode_child_selector(decoder: &mut Decoder<'_>) -> Result<ChildSelector, Wir
     Ok(match decoder.u8()? {
         CHILD_SELECTOR_TAG_ANY => ChildSelector::Any,
         CHILD_SELECTOR_TAG_PROCESS => ChildSelector::Process(decoder.process_id()?),
-        CHILD_SELECTOR_TAG_PROCESS_GROUP => ChildSelector::ProcessGroup(decoder.process_id()?),
+        CHILD_SELECTOR_TAG_PROCESS_GROUP => {
+            ChildSelector::ProcessGroup(decoder.process_group_id()?)
+        }
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -820,8 +822,8 @@ fn decode_child_selector(decoder: &mut Decoder<'_>) -> Result<ChildSelector, Wir
 fn encode_process_info(encoder: &mut Encoder, info: ProcessInfo) {
     encode_optional_process_id(encoder, info.creator);
     encode_optional_process_id(encoder, info.parent);
-    encoder.process_id(info.membership.process_group);
-    encoder.process_id(info.membership.session);
+    encoder.process_group_id(info.membership.process_group);
+    encoder.session_id(info.membership.session);
 }
 
 fn decode_process_info(decoder: &mut Decoder<'_>) -> Result<ProcessInfo, WireError> {
@@ -829,8 +831,8 @@ fn decode_process_info(decoder: &mut Decoder<'_>) -> Result<ProcessInfo, WireErr
         creator: decode_optional_process_id(decoder)?,
         parent: decode_optional_process_id(decoder)?,
         membership: ProcessGroupMembership {
-            process_group: decoder.process_id()?,
-            session: decoder.process_id()?,
+            process_group: decoder.process_group_id()?,
+            session: decoder.session_id()?,
         },
     })
 }
@@ -984,7 +986,9 @@ mod tests {
         CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
         ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
     };
-    use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
+    use crate::{
+        ObjectHandle, ProcessGroupId, ProcessId, ProtocolVersion, RequestId, SessionId, ThreadId,
+    };
     use core::net::{Ipv4Addr, SocketAddrV4};
     use core::num::NonZeroU64;
 
@@ -1149,7 +1153,7 @@ mod tests {
                 signal: 9,
             })),
             BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
-                target: SignalTarget::ProcessGroup(process_id(7)),
+                target: SignalTarget::ProcessGroup(ProcessGroupId(7)),
                 signal: 0,
             })),
             BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
@@ -1158,7 +1162,7 @@ mod tests {
             })),
             BrokerOperation::ProcessGroup(ProcessGroupRequest::Set(SetProcessGroupRequest {
                 process_id: process_id(3),
-                process_group: process_id(u32::MAX),
+                process_group: ProcessGroupId(u32::MAX),
             })),
             BrokerOperation::ProcessGroup(ProcessGroupRequest::CreateSession(process_id(5))),
             BrokerOperation::Signal(SignalRequest::Take(TakeSignalRequest { handle })),
@@ -1355,7 +1359,7 @@ mod tests {
             }),
             BrokerOperation::ReapChild(ChildSelector::Any),
             BrokerOperation::ReapChild(ChildSelector::Process(process_id(u32::MAX))),
-            BrokerOperation::ReapChild(ChildSelector::ProcessGroup(process_id(7))),
+            BrokerOperation::ReapChild(ChildSelector::ProcessGroup(ProcessGroupId(7))),
             BrokerOperation::CancelChildProcess(process_id(u32::MAX)),
             BrokerOperation::SetOrphanAdoption(false),
             BrokerOperation::SetOrphanAdoption(true),
@@ -1779,16 +1783,16 @@ mod tests {
                 creator: None,
                 parent: None,
                 membership: ProcessGroupMembership {
-                    process_group: process_id(1),
-                    session: process_id(1),
+                    process_group: ProcessGroupId(1),
+                    session: SessionId(1),
                 },
             }),
             BrokerResult::ProcessInfo(ProcessInfo {
                 creator: Some(process_id(u32::MAX)),
                 parent: Some(process_id(1)),
                 membership: ProcessGroupMembership {
-                    process_group: process_id(u32::MAX),
-                    session: process_id(3),
+                    process_group: ProcessGroupId(u32::MAX),
+                    session: SessionId(3),
                 },
             }),
             BrokerResult::ObjectsDuplicated,
@@ -2005,7 +2009,7 @@ mod tests {
             operation: BrokerOperation::ProcessGroup(ProcessGroupRequest::Set(
                 SetProcessGroupRequest {
                     process_id: process_id(1),
-                    process_group: process_id(2),
+                    process_group: ProcessGroupId(2),
                 },
             )),
         });
@@ -2546,8 +2550,8 @@ mod tests {
                 creator: None,
                 parent: None,
                 membership: ProcessGroupMembership {
-                    process_group: process_id(1),
-                    session: process_id(1),
+                    process_group: ProcessGroupId(1),
+                    session: SessionId(1),
                 },
             }),
         });

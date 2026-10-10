@@ -24,11 +24,11 @@ use litebox::platform::TimerHandle;
 use litebox::process::ProcessError;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
 use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::SignalEvent;
+use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::ProtFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
@@ -494,7 +494,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Unless `force` is set, this only takes signals after being notified of them. A forced take
     /// does not wait for the notification, so, like Linux, a process that signals its own process
-    /// group handles the signal before `kill` returns.
+    /// group handles the signal before `kill` returns, and one that reaps a child handles its
+    /// `SIGCHLD` before `wait4` returns.
     ///
     /// During a `vfork` window the signal state is the child's, so the parent takes the signals
     /// once it resumes.
@@ -2192,7 +2193,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 Err(ProcessError::Unavailable) => return Err(Errno::ECHILD),
                 Err(error) => return Err(error.into()),
             },
-            _ => ChildSelector::ProcessGroup(ProcessId(pid.unsigned_abs())),
+            _ => ChildSelector::ProcessGroup(ProcessGroupId(pid.unsigned_abs())),
         };
         // Every child is created with the default exit signal, so only __WALL selects it
         // together with __WCLONE.
@@ -2228,6 +2229,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             Err(TryOpError::TryAgain) => return Ok(0),
             Err(error) => return Err(error.into()),
         };
+        // Like Linux, which queues a child's `SIGCHLD` before the child can be reaped, queue it
+        // before returning: the broker has already posted the child's exit, but may not yet have
+        // notified this process of it.
+        self.take_signals(true);
         let (code, status) = child_termination(exit.exit_status);
         let status = if code == CLD_EXITED {
             status << 8
@@ -2281,7 +2286,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         self.global.litebox.set_process_group(
             ProcessId(pid.cast_unsigned()),
-            ProcessId(process_group.cast_unsigned()),
+            ProcessGroupId(process_group.cast_unsigned()),
         )?;
         Ok(0)
     }

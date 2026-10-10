@@ -2633,8 +2633,8 @@ mod tests {
                 creator: Some(parent.id()),
                 parent: Some(parent.id()),
                 membership: ProcessGroupMembership {
-                    process_group: process_group.id(),
-                    session: parent.id(),
+                    process_group: process_group.id().into(),
+                    session: parent.id().into(),
                 },
             })
         };
@@ -2648,7 +2648,7 @@ mod tests {
                 &parent,
                 ProcessGroupRequest::Set(SetProcessGroupRequest {
                     process_id: child.id(),
-                    process_group: child.id(),
+                    process_group: child.id().into(),
                 })
             ),
             BrokerResult::ProcessGroup(ProcessGroupResponse::Set)
@@ -2669,7 +2669,7 @@ mod tests {
             handle_test_request(
                 &parent,
                 BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
-                    target: SignalTarget::ProcessGroup(child.id()),
+                    target: SignalTarget::ProcessGroup(child.id().into()),
                     signal: 0,
                 }))
             ),

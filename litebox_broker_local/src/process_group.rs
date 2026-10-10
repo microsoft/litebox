@@ -1,11 +1,11 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, ProcessGroupRequest, ProcessGroupResponse,
 };
 use litebox_broker_protocol::process_group::SetProcessGroupRequest;
+use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -20,7 +20,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn set_process_group(
         &self,
         process_id: ProcessId,
-        process_group: ProcessId,
+        process_group: ProcessGroupId,
     ) -> Result<(), Channel::Error> {
         match self.request_process_group(ProcessGroupRequest::Set(SetProcessGroupRequest {
             process_id,
