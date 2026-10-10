@@ -13,8 +13,8 @@
 #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 
 use litebox_syscall_rewriter::{
-    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost, hook_syscalls_in_elf,
-    hook_syscalls_in_elf_with_options,
+    Error, RewriteOptions, TRAMPOLINE_MAGIC, TargetHost, aarch64_trampoline_regions,
+    hook_syscalls_in_elf, hook_syscalls_in_elf_with_options,
 };
 
 const HELLO_AARCH64: &[u8] = include_bytes!("hello-aarch64");
@@ -103,15 +103,19 @@ fn first_site(data: &[u8], mask: u32, bits: u32) -> Option<usize> {
     None
 }
 
-/// Decode the trailing [`TrampolineHeader64`]: `(file_offset, vaddr, size)`.
+/// Decode the AArch64 sub-trampoline table, which must describe exactly one
+/// sub-trampoline: `(file_offset, vaddr, size)`.
 fn trampoline_header(out: &[u8]) -> (u64, u64, u64) {
-    let header = &out[out.len() - 32..];
-    assert_eq!(&header[..8], TRAMPOLINE_MAGIC, "trampoline magic mismatch");
-    (
-        read_u64(header, 8),
-        read_u64(header, 16),
-        read_u64(header, 24),
-    )
+    assert_eq!(
+        &out[out.len() - 32..][..8],
+        TRAMPOLINE_MAGIC,
+        "trampoline magic mismatch"
+    );
+    let regions = aarch64_trampoline_regions(out)
+        .unwrap()
+        .expect("well-formed sub-trampoline table");
+    assert_eq!(regions.len(), 1, "fixture fits one sub-trampoline");
+    (regions[0].file_offset, regions[0].vaddr, regions[0].size)
 }
 
 #[test]
@@ -139,8 +143,8 @@ fn aarch64_hello_world_is_hooked() {
     assert_eq!(vaddr % 0x1000, 0, "trampoline vaddr page-aligned");
     assert_eq!(
         file_offset + size,
-        (out.len() - 32) as u64,
-        "trampoline must end right before the 32-byte header"
+        (out.len() - 32 - 24) as u64,
+        "trampoline must end right before its table entry and the footer"
     );
 
     // --- Trampoline prologue invariants ---
@@ -312,4 +316,14 @@ fn aarch64_rehooking_is_idempotent() {
         again, out,
         "already-hooked binary must be returned unchanged"
     );
+
+    // A trailer that has the magic but is malformed is an error, not a binary
+    // to rewrite again.
+    let mut corrupt = out;
+    let reserved = corrupt.len() - 8;
+    corrupt[reserved] = 1;
+    assert!(matches!(
+        hook_syscalls_in_elf(&corrupt, Some(0)),
+        Err(Error::MalformedTrailer(_))
+    ));
 }

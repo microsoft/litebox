@@ -89,6 +89,7 @@ use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};
 use object::read::pe::{ImageNtHeaders as _, ImageOptionalHeader as _, PeFile64};
 use object::read::{Object as _, ObjectSection as _, ObjectSegment as _};
 use thiserror::Error;
+use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// Possible errors during hooking of `syscall` instructions
@@ -109,6 +110,10 @@ pub enum Error {
     TrampolinePatchFailure(String),
     #[error("trampoline needs {needed:#x} bytes but only {available:#x} are available")]
     TrampolineTooLarge { needed: u64, available: u64 },
+    #[error("malformed LiteBox trailer: {0}")]
+    MalformedTrailer(String),
+    #[error("invalid trampoline space: {0}")]
+    InvalidTrampolineSpace(String),
 }
 
 /// Internal-only error variants used for control flow within the crate.
@@ -149,6 +154,9 @@ const BUN_FOOTER_MARKER: &[u8] = b"\n---- Bun! ----\n";
 /// The magic bytes used to identify the trampoline data.
 /// This is checked by the loader to verify that the trampoline is valid.
 pub const TRAMPOLINE_MAGIC: &[u8; 8] = b"LITEBOX0";
+
+/// Most sub-trampolines an AArch64 ELF footer may describe.
+pub const MAX_AARCH64_TRAMPOLINE_REGIONS: usize = 4096;
 
 /// Required file alignment of the appended trampoline payload.
 pub const TRAMPOLINE_FILE_ALIGNMENT: usize = 0x1000;
@@ -366,6 +374,29 @@ struct TrampolineHeader64 {
     trampoline_size: u64,
 }
 
+/// One entry of an AArch64 ELF's sub-trampoline table; see
+/// [`parse_aarch64_trampoline_footer`].
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable)]
+struct Aarch64TrampolineTableEntry64 {
+    file_offset: U64,
+    vaddr: U64,
+    size: U64,
+}
+
+/// Footer of an AArch64 ELF; see [`parse_aarch64_trampoline_footer`].
+#[repr(C)]
+#[derive(FromBytes, IntoBytes, Immutable)]
+struct Aarch64TrampolineFooter64 {
+    magic: [u8; 8],
+    table_file_offset: U64,
+    region_count: U64,
+    reserved: U64,
+}
+
+/// Size of an AArch64 ELF's footer.
+pub const AARCH64_TRAMPOLINE_FOOTER_BYTES: usize = size_of::<Aarch64TrampolineFooter64>();
+
 /// Metadata about an executable section, extracted from a read-only object parse.
 #[derive(Clone, Copy)]
 struct TextSectionInfo {
@@ -409,6 +440,10 @@ const NT_SYSNO_REWRITE_LOOKBACK: usize = 16;
 /// header carrying a `trampoline_size = 0` *sentinel* (no trampoline body), so a
 /// loader can distinguish "processed, nothing to patch" from "never processed";
 /// no instructions are rewritten in that case.
+///
+/// AArch64 ELFs instead end in a table of independently mapped sub-trampolines
+/// and a footer of the same size; see [`parse_aarch64_trampoline_footer`]. An
+/// empty table is their sentinel.
 ///
 /// For patch-site discovery, AArch64 also rewrites guest thread-pointer accesses
 /// (`MSR TPIDR_EL0` writes and `MRS TPIDR_EL0` reads) and, when requested,
@@ -529,6 +564,11 @@ fn hook_syscalls_in_elf_inner(
             (sections, Vec::new())
         };
 
+        // AArch64 ELFs end in a sub-trampoline table rather than a header; a
+        // malformed one is an error, not a binary to rewrite again.
+        if arch == Arch::Aarch64 && aarch64_trampoline_regions(buf)?.is_some() {
+            return Ok(input_binary.to_vec());
+        }
         if is_already_hooked(&*buf, arch) {
             return Ok(input_binary.to_vec());
         }
@@ -1109,12 +1149,8 @@ fn append_trampoline_footer(
     out.extend_from_slice(header.as_bytes());
 }
 
-/// Rewrites an AArch64 ELF, honoring `placement`.
-///
-/// The address is baked into every rewritten site, so it has to be chosen
-/// before the trampoline's size is known. The rewrite therefore runs at the
-/// preferred address and, if the trampoline outgrew the object's inter-segment
-/// hole, runs again at the unreserved fallback address.
+/// Rewrites an AArch64 ELF, spreading its gates over every inter-segment hole
+/// and then `placement`'s fallback; see [`aarch64_trampoline_spaces`].
 fn hook_aarch64_elf(
     input_binary: &[u8],
     buf: &mut [u8],
@@ -1123,109 +1159,109 @@ fn hook_aarch64_elf(
     callback: u64,
     options: RewriteOptions,
 ) -> Result<Vec<u8>> {
-    if let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } = placement {
-        let mut attempt = buf.to_vec();
-        let out = hook_aarch64_elf_at(
-            input_binary,
-            &mut attempt,
-            sections,
-            addr,
-            Some(limit),
-            callback,
-            options,
-        );
-        // A gap that is too small, or too far from the text for a gate's
-        // branch to reach back, is a property of this address rather than of
-        // the binary, so both are worth retrying elsewhere.
-        if !matches!(
-            out,
-            Err(Error::TrampolineTooLarge { .. } | Error::UnpatchableSyscalls(_))
-        ) {
-            buf.copy_from_slice(&attempt);
-            return out;
-        }
-        // Fall through to retry at the fallback address. `buf` is still
-        // pristine: only `attempt` was patched, and a rescan of already-patched
-        // bytes would find no sites.
-    }
-    hook_aarch64_elf_at(
+    // The shared caller provides only `placement`; holes come from the
+    // program headers.
+    let granule = aarch64_trampoline_page_size(options.target_host());
+    let spaces = {
+        let file = object::File::parse(&*buf).map_err(|e| Error::ParseError(e.to_string()))?;
+        aarch64_trampoline_spaces(&elf_load_segments(&file), granule, placement)?
+    };
+    hook_aarch64_elf_in_spaces(
         input_binary,
         buf,
         sections,
-        placement.fallback_addr(),
-        None,
+        &spaces,
+        granule,
         callback,
         options,
     )
 }
 
-/// Rewrites an AArch64 ELF at a fixed trampoline address, appending the
-/// trampoline and trailing header.
+/// Rewrites an AArch64 ELF, spreading its gates over `spaces`.
 ///
-/// `input_binary` is the original, unmodified ELF; `buf` is the mutable copy
-/// (patched in place by the arm64 module). `callback` is the absolute address
-/// stored in the trampoline's callback slot (0 when the loader fills it in
-/// later). `trampoline_limit` bounds how many bytes the trampoline may occupy,
-/// or is `None` where nothing bounds it; overshooting a bound is reported as
-/// [`Error::TrampolineTooLarge`].
-///
-/// Like the x86-64 path, a binary with no patch sites is emitted as the
-/// original bytes followed by a size-0 trampoline sentinel header (the arm64
-/// module signals this by returning `None`). Otherwise the output layout is
-/// `[patched ELF][padding to page boundary][trampoline code][header]`.
-fn hook_aarch64_elf_at(
+/// Each site's gate goes to the first space, in preference order, with room
+/// for it and in its branch reach; see
+/// [`aarch64::hook_split_aarch64_with_code_ranges`]. The output layout is
+/// described at [`parse_aarch64_trampoline_footer`].
+fn hook_aarch64_elf_in_spaces(
     input_binary: &[u8],
     buf: &mut [u8],
     sections: aarch64::ScanSections<'_>,
-    trampoline_base_addr: u64,
-    trampoline_limit: Option<u64>,
+    spaces: &[aarch64::TrampolineSpace],
+    granule: u64,
     callback: u64,
     options: RewriteOptions,
 ) -> Result<Vec<u8>> {
-    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
+    let Some(outcome) = aarch64::hook_split_aarch64_with_code_ranges(
         buf,
-        sections.executable,
-        sections.code,
-        trampoline_base_addr,
+        sections,
+        spaces,
+        granule,
         callback,
         aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
     )?
     else {
-        // No patch sites: emit the original binary with a size-0 sentinel
-        // header so the loader knows there is no trampoline to map.
+        // No patch sites: the original binary with an empty table.
         let mut out = input_binary.to_vec();
-        let header = TrampolineHeader64 {
-            magic: *TRAMPOLINE_MAGIC,
-            file_offset: 0,
-            vaddr: 0,
-            trampoline_size: 0,
-        };
-        out.extend_from_slice(header.as_bytes());
+        append_aarch64_trampolines(&mut out, &[])?;
         return Ok(out);
     };
-
-    // Build output: [patched ELF][padding to page boundary][trampoline][header].
-    let mut trampoline_data = outcome.trampoline;
-    let needed = trampoline_data.len() as u64;
-    if let Some(limit) = trampoline_limit
-        && needed > limit
-    {
-        return Err(Error::TrampolineTooLarge {
-            needed,
-            available: limit,
-        });
-    }
     if !outcome.trapped_sites.is_empty() {
-        return Err(Error::UnpatchableSyscalls(format!(
-            "{} unpatchable AArch64 patch site(s) (SVC / TPIDR_EL0 / x18) at {:?}",
-            outcome.trapped_sites.len(),
-            outcome.trapped_sites,
-        )));
+        return Err(unpatchable_aarch64_sites(&outcome.trapped_sites));
     }
     let mut out = buf.to_vec();
-    append_trampoline_footer(&mut out, &mut trampoline_data, trampoline_base_addr, false);
-
+    append_aarch64_trampolines(&mut out, &outcome.trampolines)?;
     Ok(out)
+}
+
+fn unpatchable_aarch64_sites(trapped_sites: &[u64]) -> Error {
+    Error::UnpatchableSyscalls(format!(
+        "{} unpatchable AArch64 patch site(s) (SVC / TPIDR_EL0 / x18) at {:?}",
+        trapped_sites.len(),
+        trapped_sites,
+    ))
+}
+
+/// Appends sub-trampolines, their table, and the AArch64 ELF footer described
+/// at [`parse_aarch64_trampoline_footer`].
+fn append_aarch64_trampolines(
+    out: &mut Vec<u8>,
+    trampolines: &[aarch64::SubTrampoline],
+) -> Result<()> {
+    if trampolines.len() > MAX_AARCH64_TRAMPOLINE_REGIONS {
+        return Err(Error::TrampolinePatchFailure(format!(
+            "cannot describe {} AArch64 sub-trampolines",
+            trampolines.len()
+        )));
+    }
+    let as_u64 = |value: usize| {
+        u64::try_from(value).map_err(|_| Error::AddressOverflow("AArch64 trampoline table".into()))
+    };
+    let mut table =
+        Vec::with_capacity(trampolines.len() * size_of::<Aarch64TrampolineTableEntry64>());
+    for sub in trampolines {
+        let file_offset = out
+            .len()
+            .checked_next_multiple_of(TRAMPOLINE_FILE_ALIGNMENT)
+            .ok_or_else(|| Error::AddressOverflow("AArch64 sub-trampoline offset".into()))?;
+        out.resize(file_offset, 0);
+        let entry = Aarch64TrampolineTableEntry64 {
+            file_offset: as_u64(file_offset)?.into(),
+            vaddr: sub.vaddr.into(),
+            size: as_u64(sub.data.len())?.into(),
+        };
+        table.extend_from_slice(entry.as_bytes());
+        out.extend_from_slice(&sub.data);
+    }
+    let footer = Aarch64TrampolineFooter64 {
+        magic: *TRAMPOLINE_MAGIC,
+        table_file_offset: as_u64(out.len())?.into(),
+        region_count: as_u64(trampolines.len())?.into(),
+        reserved: 0.into(),
+    };
+    out.extend_from_slice(&table);
+    out.extend_from_slice(footer.as_bytes());
+    Ok(())
 }
 
 /// (private) Get metadata for executable sections
@@ -1259,6 +1295,174 @@ fn text_sections(
         return Err(InternalError::NoTextSectionFound);
     }
     Ok(text_sections)
+}
+
+/// One independently mapped sub-trampoline of an AArch64 ELF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrampolineRegion {
+    /// File offset of the region's bytes.
+    pub file_offset: u64,
+    /// Virtual address the region is mapped at (object-relative for `ET_DYN`).
+    pub vaddr: u64,
+    /// Size of the region's bytes.
+    pub size: u64,
+}
+
+impl TrampolineRegion {
+    /// The `page`-sized pages the region occupies, or `None` on overflow.
+    pub fn page_range(&self, page: u64) -> Option<Range<u64>> {
+        let end = self
+            .vaddr
+            .checked_add(self.size)?
+            .checked_next_multiple_of(page)?;
+        Some(self.vaddr..end)
+    }
+}
+
+/// Why an AArch64 sub-trampoline table is unusable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrampolineTableError {
+    /// The trailer carries an unknown `LITEBOX` version.
+    UnknownVersion,
+    /// The trailer carries the magic but is malformed.
+    Malformed,
+}
+
+/// Where an AArch64 ELF's sub-trampoline table lies in the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrampolineTableLocation {
+    /// File offset of the table.
+    pub file_offset: u64,
+    /// Size of the table.
+    pub len: usize,
+}
+
+/// Parses the footer that ends a `file_len`-byte AArch64 ELF the rewriter has
+/// processed, returning where its sub-trampoline table lies, or `None` if the
+/// file carries no LiteBox trailer.
+///
+/// The file layout is
+/// `[ELF][padding][sub 0][padding][sub 1]...[sub N-1][table][footer]`, all
+/// little-endian. The 32-byte footer is
+/// `(TRAMPOLINE_MAGIC, table_file_offset, N, 0)`, and the table that ends at it
+/// holds `N` 24-byte `(file_offset, vaddr, size)` entries in file order; see
+/// [`parse_aarch64_trampoline_table`]. `N == 0` means nothing was patched.
+///
+/// Each sub-trampoline has the layout of a whole trampoline: the loader writes
+/// the callback into its first 8 bytes and finalizes it independently.
+///
+/// # Errors
+///
+/// See [`TrampolineTableError`].
+pub fn parse_aarch64_trampoline_footer(
+    footer: &[u8; AARCH64_TRAMPOLINE_FOOTER_BYTES],
+    file_len: u64,
+) -> core::result::Result<Option<TrampolineTableLocation>, TrampolineTableError> {
+    let version_at = TRAMPOLINE_MAGIC.len() - 1;
+    if footer[..TRAMPOLINE_MAGIC.len()] != *TRAMPOLINE_MAGIC {
+        if footer[..version_at] == TRAMPOLINE_MAGIC[..version_at] {
+            return Err(TrampolineTableError::UnknownVersion);
+        }
+        return Ok(None);
+    }
+    let footer = Aarch64TrampolineFooter64::read_from_bytes(footer)
+        .map_err(|_| TrampolineTableError::Malformed)?;
+    let count = usize::try_from(footer.region_count.get())
+        .ok()
+        .filter(|&count| count <= MAX_AARCH64_TRAMPOLINE_REGIONS)
+        .ok_or(TrampolineTableError::Malformed)?;
+    let len = count * size_of::<Aarch64TrampolineTableEntry64>();
+    let file_offset = footer.table_file_offset.get();
+    let footer_start = file_len.checked_sub(AARCH64_TRAMPOLINE_FOOTER_BYTES as u64);
+    if footer.reserved.get() != 0 || file_offset.checked_add(len as u64) != footer_start {
+        return Err(TrampolineTableError::Malformed);
+    }
+    Ok(Some(TrampolineTableLocation { file_offset, len }))
+}
+
+/// Parses the sub-trampoline table found at `location` by
+/// [`parse_aarch64_trampoline_footer`], returning the regions in file order,
+/// empty if nothing was patched.
+///
+/// Regions must be non-empty, start at [`TRAMPOLINE_FILE_ALIGNMENT`]-aligned
+/// file offsets and 4KiB-aligned addresses, appear in ascending,
+/// non-overlapping file order before the table, and occupy disjoint pages.
+///
+/// # Errors
+///
+/// [`TrampolineTableError::Malformed`] if `table` is not `location.len` bytes
+/// or breaks one of the rules above.
+pub fn parse_aarch64_trampoline_table(
+    table: &[u8],
+    location: TrampolineTableLocation,
+) -> core::result::Result<Vec<TrampolineRegion>, TrampolineTableError> {
+    const PAGE: u64 = TRAMPOLINE_PAGE_SIZE;
+    const ENTRY_SIZE: usize = size_of::<Aarch64TrampolineTableEntry64>();
+    let malformed = TrampolineTableError::Malformed;
+    if table.len() != location.len {
+        return Err(malformed);
+    }
+    let mut regions: Vec<TrampolineRegion> = Vec::with_capacity(table.len() / ENTRY_SIZE);
+    let mut file_cursor = 0u64;
+    for entry in table.as_chunks::<ENTRY_SIZE>().0 {
+        let entry = Aarch64TrampolineTableEntry64::read_from_bytes(entry).map_err(|_| malformed)?;
+        let region = TrampolineRegion {
+            file_offset: entry.file_offset.get(),
+            vaddr: entry.vaddr.get(),
+            size: entry.size.get(),
+        };
+        let file_end = region
+            .file_offset
+            .checked_add(region.size)
+            .ok_or(malformed)?;
+        if region.size == 0
+            || !region
+                .file_offset
+                .is_multiple_of(TRAMPOLINE_FILE_ALIGNMENT as u64)
+            || !region.vaddr.is_multiple_of(PAGE)
+            || region.file_offset < file_cursor
+            || file_end > location.file_offset
+            || region.page_range(PAGE).is_none()
+        {
+            return Err(malformed);
+        }
+        file_cursor = file_end;
+        regions.push(region);
+    }
+    let mut pages: Vec<Range<u64>> = regions
+        .iter()
+        .filter_map(|region| region.page_range(PAGE))
+        .collect();
+    pages.sort_unstable_by_key(|range| range.start);
+    if pages.windows(2).any(|pair| pair[0].end > pair[1].start) {
+        return Err(malformed);
+    }
+    Ok(regions)
+}
+
+/// The sub-trampolines of a whole rewritten AArch64 ELF, or `None` if it
+/// carries no LiteBox trailer; see [`parse_aarch64_trampoline_footer`].
+///
+/// # Errors
+///
+/// [`Error::MalformedTrailer`] if `rewritten` ends in a malformed or unknown
+/// LiteBox trailer.
+pub fn aarch64_trampoline_regions(rewritten: &[u8]) -> Result<Option<Vec<TrampolineRegion>>> {
+    let malformed = |error: TrampolineTableError| Error::MalformedTrailer(format!("{error:?}"));
+    let Some(footer) = rewritten.last_chunk::<AARCH64_TRAMPOLINE_FOOTER_BYTES>() else {
+        return Ok(None);
+    };
+    let Some(location) =
+        parse_aarch64_trampoline_footer(footer, rewritten.len() as u64).map_err(malformed)?
+    else {
+        return Ok(None);
+    };
+    // The footer check bounds the table to the file.
+    let start = usize::try_from(location.file_offset)
+        .map_err(|_| malformed(TrampolineTableError::Malformed))?;
+    parse_aarch64_trampoline_table(&rewritten[start..start + location.len], location)
+        .map(Some)
+        .map_err(malformed)
 }
 
 /// Check if the binary is already hooked by looking for TRAMPOLINE_MAGIC at the end of the file.
@@ -1905,15 +2109,23 @@ fn patch_aarch64_code_segment(
     syscall_entry_addr: u64,
     options: RewriteOptions,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
-    let ranges = whole_code_scan_ranges(code.len());
-    patch_aarch64_code_segment_with_options_and_ranges(
+    let sections = [TextSectionInfo {
+        vaddr: code_vaddr,
+        file_offset: 0,
+        size: code.len() as u64,
+    }];
+    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
         code,
-        code_vaddr,
-        &ranges,
+        &sections,
+        &sections,
         trampoline_write_vaddr,
         syscall_entry_addr,
-        options,
-    )
+        aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
+    )?
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    Ok((outcome.trampoline, outcome.trapped_sites))
 }
 
 #[cfg(any(test, target_arch = "aarch64"))]
@@ -1926,30 +2138,58 @@ fn whole_code_scan_ranges(code_len: usize) -> aarch64::CodeScanRanges {
     }
 }
 
-/// Runtime AArch64 rewriting constrained by mapping-relative ELF code ranges.
-pub fn patch_aarch64_code_segment_with_options_and_ranges(
+/// Runtime AArch64 rewriting of one mapped code region, spreading its gates
+/// over sub-trampolines in `spaces`; see [`aarch64::TrampolineSpace`] and
+/// [`aarch64::SubTrampoline`].
+///
+/// `ranges` constrains scanning to mapping-relative ELF code ranges; `None`
+/// scans all of `code`. `callback` is written into every sub-trampoline's
+/// header. Sub-trampolines in one space are `granule`-aligned and never share a
+/// `granule`; a caller that maps and protects each space as a whole may pass
+/// [`aarch64::GATE_ALIGNMENT`] to pack them.
+///
+/// # Returns
+///
+/// `(sub_trampolines, trapped_addrs)`, both empty if `code` has no patchable
+/// instructions. The caller must finalize each sub-trampoline with
+/// [`aarch64::finalize_trampoline_gates_for_host`], copy it to its `vaddr`, and
+/// synchronize the instruction stream before executing `code`.
+pub fn patch_aarch64_code_segment_in_spaces(
     code: &mut [u8],
     code_vaddr: u64,
-    ranges: &aarch64::CodeScanRanges,
-    trampoline_write_vaddr: u64,
-    syscall_entry_addr: u64,
+    ranges: Option<&aarch64::CodeScanRanges>,
+    spaces: &[aarch64::TrampolineSpace],
+    granule: u64,
+    callback: u64,
     options: RewriteOptions,
-) -> Result<(Vec<u8>, Vec<u64>)> {
+) -> Result<(Vec<aarch64::SubTrampoline>, Vec<u64>)> {
+    let whole;
+    let ranges = if let Some(ranges) = ranges {
+        ranges
+    } else {
+        whole = aarch64::CodeScanRanges {
+            executable: alloc::vec![0..code.len()],
+            identified: alloc::vec![0..code.len()],
+        };
+        &whole
+    };
     let executable = scan_sections(code_vaddr, &ranges.executable, code.len())?;
     let identified = scan_sections(code_vaddr, &ranges.identified, code.len())?;
-    let Some(outcome) = aarch64::hook_syscalls_aarch64_with_code_ranges(
+    let Some(outcome) = aarch64::hook_split_aarch64_with_code_ranges(
         code,
-        &executable,
-        &identified,
-        trampoline_write_vaddr,
-        syscall_entry_addr,
+        aarch64::ScanSections {
+            executable: &executable,
+            code: &identified,
+        },
+        spaces,
+        granule,
+        callback,
         aarch64::RewriteConfig::new(options.target_host(), options.virtualizes_x18()),
     )?
     else {
         return Ok((Vec::new(), Vec::new()));
     };
-
-    Ok((outcome.trampoline, outcome.trapped_sites))
+    Ok((outcome.trampolines, outcome.trapped_sites))
 }
 
 fn scan_sections(
@@ -2087,7 +2327,7 @@ pub fn trampoline_addr_for(max_load_end: u64, max_align: u64, e_machine: u16) ->
 
 /// A `PT_LOAD` segment, reduced to the fields trampoline placement needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LoadSegment {
+pub struct LoadSegment {
     /// `p_vaddr`.
     pub vaddr: u64,
     /// `p_filesz`.
@@ -2100,13 +2340,8 @@ pub(crate) struct LoadSegment {
 
 /// Where an object's appended trampoline goes, and how large it may grow.
 ///
-/// TODO: one trampoline per object bounds every gate twice over -- by the hole
-/// it is placed in, and by the callback literal's +-1MiB reach from the single
-/// header. Both hold for `SVC` and thread-pointer sites, which are sparse, and
-/// both fail if a host ever needs a gate per guest `x18` access: those run to
-/// ~2% of instructions, several times the current site count. Placing several
-/// smaller trampolines, each with its own header, near the sites they serve
-/// would lift both limits and fit the page-sized holes real objects leave.
+/// AArch64 ELF rewriting uses only the fallback address, after spreading gates
+/// over every hole; see [`aarch64_trampoline_spaces`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrampolinePlacement {
     /// A hole between two `PT_LOAD` segments, inside the object's own load
@@ -2232,6 +2467,92 @@ fn largest_inter_segment_hole(segments: &[LoadSegment], page: u64) -> Option<(u6
         covered_to = covered_to.max(end);
     }
     best
+}
+
+/// Returns every page-granular gap between consecutive `PT_LOAD` segments, as
+/// `(start, end)` in ascending address order. Empty when the segments are
+/// contiguous or their extents overflow.
+///
+/// This is the scan of `largest_inter_segment_hole`, keeping every gap rather
+/// than only the largest.
+///
+/// The bounds mirror glibc's `mapend` / `mapstart`, except that a segment is
+/// treated as occupying `max(p_filesz, p_memsz)` rather than `p_filesz`:
+/// `_dl_map_segments` maps anonymous pages over the difference for any segment
+/// whose `p_memsz` exceeds its `p_filesz`, not only the last one, so counting
+/// only `p_filesz` would open a gap that is actually backed.
+///
+/// # Errors
+///
+/// [`Error::InvalidTrampolineSpace`] if `page` is not a power of two.
+pub fn inter_segment_holes(segments: &[LoadSegment], page: u64) -> Result<Vec<(u64, u64)>> {
+    if !page.is_power_of_two() {
+        return Err(Error::InvalidTrampolineSpace(format!(
+            "page size {page:#x}"
+        )));
+    }
+    let mut sorted: Vec<&LoadSegment> = segments.iter().collect();
+    sorted.sort_unstable_by_key(|s| s.vaddr);
+
+    let mut holes = Vec::new();
+    // `mapend` must account for every earlier segment, not just the previous
+    // one, so that overlapping or out-of-order segments cannot open a fake gap.
+    let mut covered_to = 0u64;
+    for s in sorted {
+        let start = s.vaddr & !(page - 1);
+        // A segment whose memsz exceeds its filesz has anonymous pages mapped
+        // over the difference, so treat the whole memsz as occupied.
+        let Some(end) = s
+            .vaddr
+            .checked_add(s.filesz.max(s.memsz))
+            .and_then(|e| e.checked_next_multiple_of(page))
+        else {
+            return Ok(Vec::new());
+        };
+        if start > covered_to && covered_to != 0 {
+            holes.push((covered_to, start));
+        }
+        covered_to = covered_to.max(end);
+    }
+    Ok(holes)
+}
+
+/// Spaces an AArch64 object's sub-trampolines may occupy, in preference order:
+/// every inter-segment hole, largest first, then the unreserved address past
+/// the last segment, which nothing bounds.
+///
+/// Holes come first because they lie inside the object's own load span, which
+/// the dynamic loader reserves for it; see [`trampoline_placement_for`].
+pub(crate) fn aarch64_trampoline_spaces(
+    segments: &[LoadSegment],
+    page_size: u64,
+    placement: TrampolinePlacement,
+) -> Result<Vec<aarch64::TrampolineSpace>> {
+    let mut holes = inter_segment_holes(segments, page_size)?;
+    // Stable: equally sized holes keep ascending address order.
+    holes.sort_by_key(|(start, end)| core::cmp::Reverse(end - start));
+    let mut spaces: Vec<_> = holes
+        .into_iter()
+        .map(|(start, end)| aarch64::TrampolineSpace {
+            start,
+            end: Some(end),
+        })
+        .collect();
+    spaces.push(aarch64::TrampolineSpace {
+        start: placement.fallback_addr(),
+        end: None,
+    });
+    Ok(spaces)
+}
+
+/// Page size AArch64 sub-trampoline placement uses on `host`; matches the
+/// AArch64 case of `find_addr_for_trampoline_code`.
+fn aarch64_trampoline_page_size(host: TargetHost) -> u64 {
+    if host == TargetHost::MacOs {
+        MACOS_TRAMPOLINE_PAGE_SIZE
+    } else {
+        TRAMPOLINE_PAGE_SIZE
+    }
 }
 
 fn find_addr_for_trampoline_code(
@@ -2654,21 +2975,22 @@ mod tests {
             file_offset: 0,
             size: 4,
         }];
-        let output = hook_aarch64_elf(
+        let output = hook_aarch64_elf_in_spaces(
             &input,
             &mut code,
             aarch64::ScanSections {
                 executable: &sections,
                 code: &sections,
             },
-            placement,
+            &spaces_of(placement),
+            MACOS_TRAMPOLINE_PAGE_SIZE,
             0,
             RewriteOptions::new(TargetHost::MacOs, true),
         )
         .unwrap();
-        let footer = TrampolineHeader64::read_from_bytes(&output[output.len() - 32..]).unwrap();
-        let vaddr = footer.vaddr;
-        assert_eq!(vaddr, 0x184000);
+        let regions = aarch64_trampoline_regions(&output).unwrap().unwrap();
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].vaddr, 0x184000);
 
         // A larger 4 KiB gap need not contain any complete 16 KiB page.
         let segments = [
@@ -2684,6 +3006,28 @@ mod tests {
             largest_inter_segment_hole(&segments[..2], MACOS_TRAMPOLINE_PAGE_SIZE),
             None
         );
+    }
+
+    fn placement_of(segments: &[LoadSegment]) -> TrampolinePlacement {
+        trampoline_placement_for(segments, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE).unwrap()
+    }
+
+    /// The spaces a `placement` describes: its hole, then its fallback.
+    fn spaces_of(placement: TrampolinePlacement) -> Vec<aarch64::TrampolineSpace> {
+        let fallback = aarch64::TrampolineSpace {
+            start: placement.fallback_addr(),
+            end: None,
+        };
+        match placement {
+            TrampolinePlacement::InsideLoadSpan { addr, limit, .. } => alloc::vec![
+                aarch64::TrampolineSpace {
+                    start: addr,
+                    end: Some(addr + limit),
+                },
+                fallback,
+            ],
+            TrampolinePlacement::PastLastSegment { .. } => alloc::vec![fallback],
+        }
     }
 
     fn seg(vaddr: u64, filesz: u64, memsz: u64, align: u64) -> LoadSegment {
@@ -2939,15 +3283,18 @@ mod tests {
             file_offset: code_offset as u64,
             size: (elf.len() - code_offset) as u64,
         };
-        let out = hook_aarch64_elf_at(
+        let out = hook_aarch64_elf_in_spaces(
             &input,
             &mut elf,
             aarch64::ScanSections {
                 executable: &[section],
                 code: &[section],
             },
-            0x220000,
-            None,
+            &[aarch64::TrampolineSpace {
+                start: 0x220000,
+                end: None,
+            }],
+            TRAMPOLINE_PAGE_SIZE,
             0,
             RewriteOptions::default(),
         )
@@ -3012,15 +3359,18 @@ mod tests {
         let mut direct = elf.clone();
         assert!(
             matches!(
-                hook_aarch64_elf_at(
+                hook_aarch64_elf_in_spaces(
                     &input,
                     &mut direct,
                     aarch64::ScanSections {
                         executable: &[section()],
                         code: &[section()],
                     },
-                    UNREACHABLE_GAP,
-                    None,
+                    &[aarch64::TrampolineSpace {
+                        start: UNREACHABLE_GAP,
+                        end: None,
+                    }],
+                    TRAMPOLINE_PAGE_SIZE,
                     0,
                     RewriteOptions::default(),
                 ),
@@ -3035,18 +3385,133 @@ mod tests {
             limit: 0x10000,
             fallback_addr: 0x20000,
         };
-        hook_aarch64_elf(
+        hook_aarch64_elf_in_spaces(
             &input,
             &mut elf,
             aarch64::ScanSections {
                 executable: &[section()],
                 code: &[section()],
             },
-            placement,
+            &spaces_of(placement),
+            TRAMPOLINE_PAGE_SIZE,
             0,
             RewriteOptions::default(),
         )
         .expect("the reachable fallback address must be retried");
+    }
+
+    #[test]
+    fn aarch64_spaces_prefer_every_hole_largest_first_then_the_fallback() {
+        let segments = [
+            seg(0x0, 0x1000, 0x1000, 0x1000),
+            seg(0x3000, 0x1000, 0x1000, 0x1000),
+            seg(0x9000, 0x1000, 0x1000, 0x1000),
+            seg(0xc000, 0x800, 0x800, 0x1000),
+        ];
+        let spaces =
+            aarch64_trampoline_spaces(&segments, TRAMPOLINE_PAGE_SIZE, placement_of(&segments))
+                .unwrap();
+        let expected = [
+            (0x4000, Some(0x9000)),
+            (0x1000, Some(0x3000)),
+            (0xa000, Some(0xc000)),
+            (0xd000, None),
+        ];
+        assert_eq!(
+            spaces
+                .iter()
+                .map(|space| (space.start, space.end))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        // The first space is the hole `trampoline_placement_for` picks.
+        let TrampolinePlacement::InsideLoadSpan { addr, limit, .. } =
+            trampoline_placement_for(&segments, object::elf::EM_AARCH64, TRAMPOLINE_PAGE_SIZE)
+                .unwrap()
+        else {
+            panic!("expected a hole");
+        };
+        assert_eq!((addr, Some(addr + limit)), expected[0]);
+    }
+
+    /// A trampoline too large for any one hole is split over all of them, and
+    /// described by a sub-trampoline table that round-trips.
+    #[test]
+    fn aarch64_trampoline_split_over_holes_round_trips() {
+        let input: Vec<u8> = (0..200)
+            .flat_map(|_| 0xD400_0001u32.to_le_bytes())
+            .collect();
+        let mut code = input.clone();
+        let sections = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: code.len() as u64,
+        }];
+        // 200 SVC slots need 12.5KiB; the holes hold 8KiB and 4KiB, and the
+        // rest goes past the last segment.
+        let segments = [
+            seg(0x0, 0x2000, 0x2000, 0x1000),
+            seg(0x4000, 0x1000, 0x1000, 0x1000),
+            seg(0x6000, 0x1000, 0x1000, 0x1000),
+        ];
+        let spaces =
+            aarch64_trampoline_spaces(&segments, TRAMPOLINE_PAGE_SIZE, placement_of(&segments))
+                .unwrap();
+        let out = hook_aarch64_elf_in_spaces(
+            &input,
+            &mut code,
+            aarch64::ScanSections {
+                executable: &sections,
+                code: &sections,
+            },
+            &spaces,
+            TRAMPOLINE_PAGE_SIZE,
+            0,
+            RewriteOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(&out[out.len() - 32..][..8], TRAMPOLINE_MAGIC);
+        let regions = aarch64_trampoline_regions(&out)
+            .unwrap()
+            .expect("well-formed footer");
+        assert_eq!(
+            regions
+                .iter()
+                .map(|region| region.vaddr)
+                .collect::<Vec<_>>(),
+            [0x2000, 0x5000, 0x7000]
+        );
+        assert_eq!(&out[..code.len()], code.as_slice());
+        for region in &regions {
+            let start = usize::try_from(region.file_offset).unwrap();
+            let data = &out[start..start + usize::try_from(region.size).unwrap()];
+            let mut finalized = data.to_vec();
+            aarch64::finalize_trampoline_gates(&mut finalized, 96).unwrap();
+        }
+        // Every site branches into one of the regions.
+        for (index, word) in code.as_chunks::<4>().0.iter().enumerate() {
+            let site = 0x1000 + 4 * index as u64;
+            let target = aarch64::decode_branch_target(u32::from_le_bytes(*word), site).unwrap();
+            assert!(
+                regions
+                    .iter()
+                    .any(|region| (region.vaddr..region.vaddr + region.size).contains(&target))
+            );
+        }
+
+        // Corrupting the footer is detected.
+        let mut corrupt = out.clone();
+        let footer = corrupt.len() - 32;
+        corrupt[footer + 24] = 1; // reserved
+        assert!(aarch64_trampoline_regions(&corrupt).is_err());
+        let mut overlapping = out.clone();
+        let table = usize::try_from(u64::from_le_bytes(
+            out[footer + 8..footer + 16].try_into().unwrap(),
+        ))
+        .unwrap();
+        overlapping[table + 24 + 8..table + 24 + 16].copy_from_slice(&0x2000u64.to_le_bytes());
+        assert!(aarch64_trampoline_regions(&overlapping).is_err());
     }
 
     /// x86-64 placement is deliberately unchanged; see `trampoline_addr_for`.
@@ -3153,14 +3618,15 @@ mod tests {
             size: buf.len() as u64,
         }];
         let placement = TrampolinePlacement::PastLastSegment { addr: 0x1000_0000 };
-        let err = hook_aarch64_elf(
+        let err = hook_aarch64_elf_in_spaces(
             &input,
             &mut buf,
             aarch64::ScanSections {
                 executable: &sections,
                 code: &sections,
             },
-            placement,
+            &spaces_of(placement),
+            TRAMPOLINE_PAGE_SIZE,
             0,
             RewriteOptions::default(),
         )
