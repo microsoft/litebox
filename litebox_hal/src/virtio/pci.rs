@@ -7,7 +7,8 @@
 use super::Error;
 use super::queue::VirtQueue;
 use crate::dma::{Hal, Mmio};
-use crate::pci::{self, Function, MemoryBar, MsiMessage};
+use crate::interrupt::MsiMessage;
+use crate::pci::{self, Function, MemoryBar};
 
 const CAP_VENDOR_SPECIFIC: u8 = 0x09;
 

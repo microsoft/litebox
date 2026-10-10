@@ -2067,8 +2067,6 @@ dependencies = [
  "arrayvec",
  "base64",
  "litebox_bootloader",
- "litebox_broker_core",
- "litebox_broker_protocol",
  "litebox_broker_vm_kernel",
  "litebox_common_optee",
  "litebox_common_vm_abi",

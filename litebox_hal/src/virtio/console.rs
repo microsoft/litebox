@@ -22,7 +22,7 @@ use super::Error;
 use super::pci::PciTransport;
 use super::queue::{Buffer, VirtQueue};
 use crate::dma::{DmaRegion, Hal};
-use crate::pci::MsiMessage;
+use crate::interrupt::MsiMessage;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;

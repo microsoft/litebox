@@ -34,7 +34,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.tsc_khz);
     let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
-        stdio: alloc::sync::Arc::new(devices::Stdio(devices)),
+        console: devices,
         events: devices,
     });
     let mut service = service::optee::Optee::new(kernel.platform, kernel.tsc_khz, &payload, broker);

@@ -4,21 +4,17 @@
 //! Devices the kernel drives, from `litebox_hal`, for the broker
 //! ([`litebox_broker_vm_kernel::Config`]):
 //!
-//! - Runner processes' standard streams: a virtio console if there is one,
-//!   else output to the serial console and no input.
-//! - Events: the console's interrupt (MSI-X), and the local APIC's timer
+//! - [`Console`]: a virtio console if there is one, else output to the
+//!   serial console and no input.
+//! - [`Events`]: the console's interrupt (MSI-X), and the local APIC's timer
 //!   for deadlines.
 //!
-//! The interrupt handler only ends the interrupt; the kernel services the
-//! device when it next polls or halts.
+//! The interrupt handler only ends the interrupt; the broker looks at the
+//! devices when it next runs.
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicBool, Ordering};
-use litebox_broker_core::readiness::{ReadinessRegistration, ReadinessWatchers};
-use litebox_broker_core::stdio::{
-    StdioOutputStream, StdioProvider, StdioProviderError, StdioStream,
-};
-use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_vm_kernel::Events;
+use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::interrupt::LocalApic;
 use litebox_hal::virtio::console::VirtioConsole;
 use litebox_platform_vm_kernel::VmKernel;
@@ -31,28 +27,13 @@ const WRITE_TIMEOUT_NANOS: u64 = 100_000_000;
 const TIMER_VECTOR: u8 = 0x30;
 const CONSOLE_VECTOR: u8 = 0x31;
 
-struct Console {
-    device: Mutex<VirtioConsole>,
-    /// Whether it interrupts; else it is polled.
-    interrupts: bool,
-    /// Standard-input files, to wake when input arrives.
-    stdin_watchers: Mutex<ReadinessWatchers>,
-    /// Whether input was pending when last looked at; watchers are woken
-    /// when it starts to be.
-    stdin_readable: AtomicBool,
-}
-
-impl Console {
-    fn readable(&self) -> bool {
-        self.device.lock().has_input()
-    }
-}
-
 pub struct Devices {
     platform: &'static VmKernel,
     apic: LocalApic,
     tsc_khz: u64,
-    console: Option<Console>,
+    console: Option<Mutex<VirtioConsole>>,
+    /// Whether the console interrupts; else it is polled.
+    console_interrupts: bool,
 }
 
 impl Devices {
@@ -75,25 +56,22 @@ impl Devices {
                 None
             }
             Some(Ok(device)) => {
-                let interrupts = device.transport().interrupts();
                 litebox_util_log::info!(
                     pci:% = device.transport().function(),
-                    interrupts:% = interrupts;
+                    interrupts:% = device.transport().interrupts();
                     "virtio console: standard streams"
                 );
-                Some(Console {
-                    device: Mutex::new(device),
-                    interrupts,
-                    stdin_watchers: Mutex::new(ReadinessWatchers::default()),
-                    stdin_readable: AtomicBool::new(false),
-                })
+                Some(device)
             }
         };
         let devices: &'static Self = Box::leak(Box::new(Self {
             platform,
             apic,
             tsc_khz,
-            console,
+            console_interrupts: console
+                .as_ref()
+                .is_some_and(|device| device.transport().interrupts()),
+            console: console.map(Mutex::new),
         }));
         litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
             devices.on_interrupt(vector)
@@ -128,95 +106,43 @@ fn rdtsc() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-impl litebox_broker_vm_kernel::Events for Devices {
-    fn poll(&self) {
-        // Wake watchers when input starts to be pending.
-        if let Some(console) = &self.console {
-            let readable = console.readable();
-            if readable && !console.stdin_readable.swap(true, Ordering::Relaxed) {
-                console.stdin_watchers.lock().publish(ReadinessFlags::READ);
-            } else if !readable {
-                console.stdin_readable.store(false, Ordering::Relaxed);
-            }
-        }
-    }
-
+impl Events for Devices {
     fn wait(&self, deadline: Option<u64>) -> bool {
-        let interrupts = self
-            .console
-            .as_ref()
-            .is_some_and(|console| console.interrupts);
-        if deadline.is_none() && !interrupts {
+        if deadline.is_none() && !self.console_interrupts {
             return false;
         }
         self.halt(deadline);
-        self.poll();
         true
     }
 }
 
-/// Standard streams over [`Devices`]. Never a terminal. Without a console,
-/// standard input is at its end.
-pub struct Stdio(pub &'static Devices);
-
-impl StdioProvider for Stdio {
-    fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
-        let Some(console) = &self.0.console else {
-            return Ok(0);
-        };
-        match console.device.lock().read(output) {
-            0 => Err(StdioProviderError::WouldBlock),
-            read => Ok(read),
-        }
+/// Without a virtio console, input is at its end.
+impl Console for Devices {
+    fn read(&self, output: &mut [u8]) -> Option<usize> {
+        Some(self.console.as_ref()?.lock().read(output))
     }
 
-    /// Waits (bounded) for the console to take all of `input`.
-    fn write(&self, _stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        let Some(console) = &self.0.console else {
+    fn has_input(&self) -> bool {
+        self.console
+            .as_ref()
+            .is_none_or(|device| device.lock().has_input())
+    }
+
+    /// Waits (bounded) for the device to take all of `input`.
+    fn write(&self, input: &[u8]) -> usize {
+        let Some(device) = &self.console else {
             litebox_hal::console::print_bytes(input);
-            return Ok(input.len());
+            return input.len();
         };
-        let deadline = rdtsc() + WRITE_TIMEOUT_NANOS * self.0.tsc_khz / 1_000_000;
+        let deadline = rdtsc() + WRITE_TIMEOUT_NANOS * self.tsc_khz / 1_000_000;
         let mut written = 0;
         loop {
-            written += console.device.lock().write(&input[written..]);
+            written += device.lock().write(&input[written..]);
             if written == input.len() || rdtsc() >= deadline {
-                break;
+                return written;
             }
             // Until the device returns a transmit buffer.
-            self.0.halt(Some(deadline));
+            self.halt(Some(deadline));
         }
-        if written == 0 {
-            return Err(StdioProviderError::WouldBlock);
-        }
-        Ok(written)
-    }
-
-    fn is_terminal(&self, _stream: StdioStream) -> bool {
-        false
-    }
-
-    fn readiness(&self, stream: StdioStream) -> ReadinessFlags {
-        match stream {
-            StdioStream::Stdin => match &self.0.console {
-                Some(console) if !console.readable() => ReadinessFlags(0),
-                _ => ReadinessFlags::READ,
-            },
-            StdioStream::Stdout | StdioStream::Stderr => ReadinessFlags::WRITE,
-        }
-    }
-
-    fn watch(
-        &self,
-        stream: StdioStream,
-        registration: &ReadinessRegistration,
-    ) -> litebox_broker_core::Result<()> {
-        if let (StdioStream::Stdin, Some(console)) = (stream, &self.0.console) {
-            console.stdin_watchers.lock().watch(registration)?;
-            if console.readable() {
-                registration.publish(ReadinessFlags::READ)?;
-            }
-        }
-        Ok(())
     }
 }

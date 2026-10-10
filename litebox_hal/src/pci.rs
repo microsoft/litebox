@@ -6,6 +6,7 @@
 //! already assigned BARs.
 
 use crate::dma::Hal;
+use crate::interrupt::MsiMessage;
 use x86_64::instructions::port::Port;
 
 const CONFIG_ADDRESS: u16 = 0xcf8;
@@ -239,13 +240,6 @@ impl Function {
         }
         true
     }
-}
-
-/// An MSI message: a write of `data` to `address` raises the interrupt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MsiMessage {
-    pub address: u64,
-    pub data: u32,
 }
 
 /// A memory BAR's physical range.

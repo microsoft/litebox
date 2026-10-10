@@ -8,10 +8,10 @@
 //! kernel's mapping; payloads are in the process's lazily populated shared
 //! buffers.
 //!
-//! Files are the devices under `/dev`, with standard streams from the
-//! runner's [`StdioProvider`]. Readiness (e.g., of standard input) goes to
-//! the association's notification ring. Waiting ([`BrokerEnterOp::Wait`])
-//! halts until the runner's [`Events`] report something, e.g., an interrupt.
+//! Files are the devices under `/dev`, with standard streams on the
+//! runner's [`stdio::Console`]. Readiness (e.g., of standard input) goes to the
+//! association's notification ring. Waiting ([`BrokerEnterOp::Wait`]) halts
+//! until the runner's [`Events`] report something, e.g., an interrupt.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -22,6 +22,7 @@ extern crate alloc;
 mod memory;
 mod providers;
 mod readiness;
+pub mod stdio;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -30,7 +31,6 @@ use core::cell::RefCell;
 use core::convert::Infallible;
 use litebox_broker_core::BrokerCore;
 use litebox_broker_core::readiness::ReadinessSink;
-use litebox_broker_core::stdio::StdioProvider;
 use litebox_broker_host::BrokerHostAssociation;
 use litebox_broker_protocol::message::{BrokerHandshakeRequest, BrokerHandshakeResponse};
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE};
@@ -47,6 +47,7 @@ use litebox_platform_vm_kernel::PinnedUserPages;
 
 use memory::{PinnedControlRing, UserSharedMemory};
 use readiness::KernelReadiness;
+use stdio::ConsoleStdio;
 
 /// Size of a process's broker shared memory.
 pub const SHARED_MEMORY_SIZE: usize = SHARED_BUFFER_POOL_SIZE;
@@ -57,20 +58,16 @@ pub const CONTROL_RING_SIZE: usize = CONTROL_RING_MEMORY_SIZE;
 /// What the broker waits for: the runner's event sources (e.g., device
 /// interrupts and a timer).
 pub trait Events: Sync {
-    /// Acts on events since the last call, e.g., publishes the readiness of
-    /// input that arrived.
-    fn poll(&self);
-
     /// Halts until an event may have happened, or until `deadline` (TSC)
-    /// passes; then [`Self::poll`] runs. Without a deadline, false if no
-    /// event could ever end the halt (and it does not halt).
+    /// passes. Without a deadline, false if no event could ever end the halt
+    /// (and it does not halt).
     fn wait(&self, deadline: Option<u64>) -> bool;
 }
 
 /// The runner's sources for a [`Broker`].
 pub struct Config {
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
-    pub stdio: Arc<dyn StdioProvider>,
+    pub console: &'static dyn stdio::Console,
     pub events: &'static dyn Events,
 }
 
@@ -79,6 +76,7 @@ pub struct Config {
 pub struct Broker {
     core: BrokerCore,
     events: &'static dyn Events,
+    stdio: Arc<ConsoleStdio>,
 }
 
 impl Broker {
@@ -88,9 +86,11 @@ impl Broker {
     ///
     /// Without a hardware CSPRNG, or on a second call.
     pub fn new(config: Config) -> Self {
+        let stdio = Arc::new(ConsoleStdio::new(config.console));
         Self {
-            core: providers::core(config.stdio),
+            core: providers::core(stdio.clone()),
             events: config.events,
+            stdio,
         }
     }
 
@@ -254,7 +254,8 @@ impl Association {
     /// changes or the deadline passes. Only notifications change ring words
     /// asynchronously; a wait on another word without a deadline, or on the
     /// notification epoch when no event could publish, is
-    /// [`Status::Stalled`].
+    /// [`Status::Stalled`]. A corrupted notification ring fails the
+    /// association, as a corrupted request ring does.
     ///
     /// # Errors
     ///
@@ -264,6 +265,20 @@ impl Association {
         let State::Active(active) = &mut *state else {
             return Err(EnterError::Status(Status::Denied));
         };
+        let result = self.enter_active(active, request);
+        if result == Err(EnterError::Failed)
+            && let State::Active(active) = core::mem::replace(&mut *state, State::Ended)
+        {
+            end(active.association, &self.readiness);
+        }
+        result
+    }
+
+    fn enter_active(
+        &self,
+        active: &mut Active,
+        request: &BrokerEnterRequest,
+    ) -> Result<(), EnterError> {
         let invalid = || EnterError::Status(Status::InvalidArgument);
         let wait_offset = match request.op {
             BrokerEnterOp::Wake => {
@@ -280,14 +295,9 @@ impl Association {
                 Some(offset)
             }
         };
-        self.broker.events.poll();
-        if active.serve().is_err() {
-            if let State::Active(active) = core::mem::replace(&mut *state, State::Ended) {
-                end(active.association, &self.readiness);
-            }
-            return Err(EnterError::Failed);
-        }
-        self.readiness.flush();
+        self.broker.stdio.poll();
+        active.serve().map_err(|Failed| EnterError::Failed)?;
+        self.flush_readiness()?;
         let Some(offset) = wait_offset else {
             return Ok(());
         };
@@ -310,8 +320,19 @@ impl Association {
             if !self.broker.events.wait(deadline) {
                 return Err(EnterError::Status(Status::Stalled));
             }
-            self.readiness.flush();
+            self.broker.stdio.poll();
+            self.flush_readiness()?;
         }
+    }
+
+    /// Publishes pending readiness; a corrupted notification ring fails the
+    /// association.
+    fn flush_readiness(&self) -> Result<(), EnterError> {
+        self.readiness.flush();
+        if self.readiness.failed() {
+            return Err(EnterError::Failed);
+        }
+        Ok(())
     }
 }
 

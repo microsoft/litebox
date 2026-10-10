@@ -5,6 +5,7 @@
 //! at once, whichever process is current. What a full ring cannot take
 //! stays pending until the next [`KernelReadiness::flush`].
 
+use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerError, Result};
 use litebox_broker_host::readiness::{
@@ -29,6 +30,8 @@ pub(crate) struct KernelReadiness {
     publisher: ReadinessPublisher,
     /// Until the handshake and after the association ends: `None`.
     notifications: SpinMutex<Option<Producer>>,
+    /// The process corrupted its notification ring.
+    failed: AtomicBool,
 }
 
 impl KernelReadiness {
@@ -55,13 +58,18 @@ impl KernelReadiness {
         match publish_pending_readiness(&self.publisher, &mut Ring(producer)) {
             Ok(()) | Err(RingError::Full) => {}
             Err(RingError::Ring(error)) => {
-                // The process corrupted its ring; its next broker entry fails
-                // the association.
                 log::warn!("broker notification ring failed: {error:?}");
                 *notifications = None;
                 self.publisher.close();
+                self.failed.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Whether the process corrupted its notification ring, which fails the
+    /// association.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
     }
 }
 

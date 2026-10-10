@@ -4,16 +4,18 @@
 # Licensed under the MIT license.
 
 # Shared by the dev_tools/run_optee_on_*.sh scripts; source it. Reads QEMU,
-# QEMU_ACCEL, TIMEOUT, LITEBOX_LOG and CARGO_BUILD (see the scripts), makes a
-# relative CARGO_TARGET_DIR absolute, and creates $WORK, removed on exit.
+# QEMU_ACCEL, QEMU_CPU, TIMEOUT, LITEBOX_LOG and CARGO_BUILD (see the scripts),
+# makes a relative CARGO_TARGET_DIR absolute, and creates $WORK, removed on
+# exit.
 
 QEMU=${QEMU:-qemu-system-x86_64}
 if [[ -z ${QEMU_ACCEL:-} ]]; then
     if [[ -r /dev/kvm && -w /dev/kvm ]]; then QEMU_ACCEL=kvm; else QEMU_ACCEL=tcg; fi
 fi
 case $QEMU_ACCEL in
-    kvm) CPU=host ;;
-    tcg) CPU=max ;;
+    # invtsc (not migratable) lets QEMU publish the TSC frequency to the guest.
+    kvm) CPU=${QEMU_CPU:-host,+invtsc} ;;
+    tcg) CPU=${QEMU_CPU:-max} ;;
     *) echo "error: unknown QEMU_ACCEL '$QEMU_ACCEL'" >&2; exit 2 ;;
 esac
 TIMEOUT=${TIMEOUT:-120}

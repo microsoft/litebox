@@ -101,8 +101,8 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
         .collect();
     let to_pa = |va: u64| VmKernel::va_to_pa(x86_64::VirtAddr::new(va));
     litebox_hal::interrupt::init_legacy_pics();
-    let tsc_khz = litebox_hal::clock::calibrate_tsc_khz();
-    litebox_util_log::info!(mhz:% = tsc_khz / 1000; "TSC calibrated against the PIT");
+    let (tsc_khz, source) = litebox_hal::clock::tsc_khz();
+    litebox_util_log::info!(mhz:% = tsc_khz / 1000, source:? = source; "TSC frequency");
     BOOT.call_once(|| (info, tsc_khz));
     let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(TscClock::new(tsc_khz)));
     // Safety: the front end established the direct mapping with IRQs off on one

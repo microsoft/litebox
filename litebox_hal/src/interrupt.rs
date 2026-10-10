@@ -6,7 +6,6 @@
 //! xAPIC mode (e.g., QEMU's TCG); the legacy 8259 PICs are only masked.
 
 use crate::dma::{Hal, Mmio};
-use crate::pci::MsiMessage;
 use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::Msr;
 
@@ -69,6 +68,13 @@ pub fn init_legacy_pics() {
         Port::<u8>::new(MASTER_DATA).write(0xff);
         Port::<u8>::new(SLAVE_DATA).write(0xff);
     }
+}
+
+/// An MSI message: a write of `data` to `address` raises the interrupt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MsiMessage {
+    pub address: u64,
+    pub data: u32,
 }
 
 /// This CPU's local APIC, enabled, with its timer raising a vector when
