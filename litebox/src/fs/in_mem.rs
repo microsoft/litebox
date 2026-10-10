@@ -53,13 +53,14 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     /// Entries are inserted in order, bypassing all permission checks, which is what lets a caller
     /// set up root-owned directories and files without ever acting as root at runtime. Each
     /// entry's parent must already exist, either as the root or from an earlier entry;
-    /// re-specifying an existing path updates its mode and owner (and, for a file, its contents),
-    /// which is how the root directory's own permissions are set (via the path `/`).
+    /// re-specifying an existing path updates its mode and owner (and, for a file, its contents
+    /// or symlink target), which is how the root directory's own permissions are set (via `/`).
     ///
     /// # Panics
     ///
     /// Panics if an entry's parent does not exist or is not a directory, if an entry changes the
-    /// type of an existing path, or if the root is given as a file.
+    /// type of an existing path, if the root is given as a non-directory, or if a symlink target
+    /// is malformed.
     #[must_use]
     pub fn new_initialized<Path: AsRef<str>>(
         entries: impl IntoIterator<Item = (Path, InitialNode)>,
@@ -73,6 +74,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
 
     /// Insert a single [`InitialNode`], as described on [`Self::new_initialized`].
     fn insert_initial(&self, path: &str, node: InitialNode) {
+        if let InitialNode::Symlink { mode, target, .. } = &node {
+            assert!(
+                !target.is_empty() && !target.as_bytes().contains(&0),
+                "symlink targets must be nonempty and contain no NUL bytes"
+            );
+            if *mode != Mode::RWXU | Mode::RWXG | Mode::RWXO {
+                litebox_util_log::debug!(
+                    path:? = path, mode:? = mode;
+                    "symlink modes other than 0777 may not be fully supported"
+                );
+            }
+        }
         let mut components = path.split('/').filter(|component| {
             assert!(
                 !matches!(*component, "." | ".."),
@@ -83,7 +96,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
         let Some(mut name) = components.next() else {
             // The path is the root itself, which already exists, so only its permissions apply.
             let InitialNode::Directory { mode, owner } = node else {
-                panic!("the root directory cannot be initialized as a file")
+                panic!("the root directory must be initialized as a directory")
             };
             self.root.write().perms = Permissions {
                 mode,
@@ -117,11 +130,36 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
             }
             (Some(Node::File(existing)), InitialNode::File { mode, owner, data }) => {
                 let mut existing = existing.write();
+                assert_eq!(
+                    existing.file_type,
+                    FileType::RegularFile,
+                    "{path:?} already exists with a different type"
+                );
                 existing.perms = Permissions {
                     mode,
                     userinfo: owner,
                 };
                 existing.data = data;
+            }
+            (
+                Some(Node::File(existing)),
+                InitialNode::Symlink {
+                    mode,
+                    owner,
+                    target,
+                },
+            ) => {
+                let mut existing = existing.write();
+                assert_eq!(
+                    existing.file_type,
+                    FileType::SymbolicLink,
+                    "{path:?} already exists with a different type"
+                );
+                existing.perms = Permissions {
+                    mode,
+                    userinfo: owner,
+                };
+                existing.data = target.into_bytes().into();
             }
             (Some(_), _) => panic!("{path:?} already exists with a different type"),
             (None, InitialNode::Directory { mode, owner }) => {
@@ -141,7 +179,27 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
                         mode,
                         userinfo: owner,
                     },
+                    file_type: FileType::RegularFile,
                     data,
+                    node_info: self.inode_allocator.next(),
+                }));
+                dir.children.insert(name.into(), Node::File(child));
+            }
+            (
+                None,
+                InitialNode::Symlink {
+                    mode,
+                    owner,
+                    target,
+                },
+            ) => {
+                let child = Arc::new(sync::RwLock::new(FileData {
+                    perms: Permissions {
+                        mode,
+                        userinfo: owner,
+                    },
+                    file_type: FileType::SymbolicLink,
+                    data: target.into_bytes().into(),
                     node_info: self.inode_allocator.next(),
                 }));
                 dir.children.insert(name.into(), Node::File(child));
@@ -161,13 +219,18 @@ impl<Platform: sync::RawSyncPrimitivesProvider> InMem<Platform> {
     ///
     /// # Panics
     ///
-    /// Panics if used on a file that already contains data.
+    /// Panics if used on a symlink or a file that already contains data.
     pub fn initialize_primarily_read_heavy_file(
         &self,
         h: &super::backend::FileHandle,
         data: alloc::borrow::Cow<'static, [u8]>,
     ) {
         let mut file = h.get_typed::<Self>().file.write();
+        assert_eq!(
+            file.file_type,
+            FileType::RegularFile,
+            "must only be used on regular files during initialization"
+        );
         assert!(
             file.data.is_empty(),
             "must only be used on empty files during initialization"
@@ -196,6 +259,15 @@ pub enum InitialNode {
         /// Borrowed data is kept borrowed until the first write to the file, which makes this the
         /// cheap way to set up large read-heavy files (such as executables).
         data: alloc::borrow::Cow<'static, [u8]>,
+    },
+    /// A symbolic link.
+    Symlink {
+        /// Permission bits for the link.
+        mode: Mode,
+        /// Owning user and group.
+        owner: UserInfo,
+        /// The link's target; it need not exist or be normalized.
+        target: String,
     },
 }
 
@@ -264,12 +336,17 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 .get(*component)
                 .ok_or(PathError::NoSuchFileOrDirectory)?
                 .clone();
-            let Node::Dir(child) = child else {
-                return Ok(super::backend::WalkOutcome {
-                    components: walked_components,
-                    last: super::backend::WalkingDirHandle::from_typed::<Self>(current),
-                    stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory,
-                });
+            let child = match child {
+                Node::Dir(child) => child,
+                Node::File(file) => {
+                    return Ok(super::backend::WalkOutcome {
+                        components: walked_components,
+                        last: super::backend::WalkingDirHandle::from_typed::<Self>(current),
+                        stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory {
+                            file_type: file.read().file_type,
+                        },
+                    });
+                }
             };
             let perms = child.read().perms.clone();
             walked_components.push(super::backend::WalkedComponent {
@@ -290,6 +367,25 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             last: super::backend::WalkingDirHandle::from_typed::<Self>(current),
             stop_reason: super::backend::WalkStopReason::CompleteDirectory,
         })
+    }
+
+    fn read_link_at(
+        &self,
+        dir: &super::backend::WalkingDirHandle<'_>,
+        name: &str,
+    ) -> Result<String, super::errors::WalkError> {
+        let dir = dir.as_typed::<Self>().dir.read();
+        let file = match dir.children.get(name) {
+            Some(Node::File(file)) => file.read(),
+            Some(Node::Dir(_)) => return Err(PathError::InvalidPathname.into()),
+            None => return Err(PathError::NoSuchFileOrDirectory.into()),
+        };
+        if file.file_type != FileType::SymbolicLink {
+            return Err(PathError::InvalidPathname.into());
+        }
+        Ok(core::str::from_utf8(&file.data)
+            .expect("symlink targets are initialized from strings")
+            .into())
     }
 
     fn owned_dir_at(
@@ -374,7 +470,10 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             .iter()
             .map(|(name, child)| {
                 let (file_type, node_info) = match child {
-                    Node::File(file) => (FileType::RegularFile, file.read().node_info.clone()),
+                    Node::File(file) => {
+                        let file = file.read();
+                        (file.file_type, file.node_info.clone())
+                    }
                     Node::Dir(dir) => (FileType::Directory, dir.read().node_info.clone()),
                 };
                 DirEntry {
@@ -448,7 +547,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
             super::backend::HandleRef::File(h) => {
                 let file = h.get_typed::<Self>().file.read();
                 Ok(FileStatus {
-                    file_type: FileType::RegularFile,
+                    file_type: file.file_type,
                     mode: file.perms.mode,
                     size: file.data.len(),
                     owner: file.perms.userinfo,
@@ -488,6 +587,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
                 mode: metadata.mode,
                 userinfo: metadata.owner,
             },
+            file_type: FileType::RegularFile,
             data: Vec::new().into(),
             node_info: self.inode_allocator.next(),
         }));
@@ -569,7 +669,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     fn chmod(&self, h: super::backend::HandleRef<'_>, mode: Mode) -> Result<(), ChmodError> {
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
-                sync::RwLockWriteGuard::map(h.get_typed::<Self>().file.write(), |f| &mut f.perms)
+                let file = h.get_typed::<Self>().file.write();
+                if file.file_type == FileType::SymbolicLink {
+                    return Err(ChmodError::IsSymlink);
+                }
+                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
             }
             super::backend::HandleRef::Dir(h) => {
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
@@ -587,7 +691,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     ) -> Result<(), ChownError> {
         let mut perms = match h {
             super::backend::HandleRef::File(h) => {
-                sync::RwLockWriteGuard::map(h.get_typed::<Self>().file.write(), |f| &mut f.perms)
+                let file = h.get_typed::<Self>().file.write();
+                if file.file_type == FileType::SymbolicLink {
+                    return Err(ChownError::IsSymlink);
+                }
+                sync::RwLockWriteGuard::map(file, |f| &mut f.perms)
             }
             super::backend::HandleRef::Dir(h) => {
                 sync::RwLockWriteGuard::map(h.get_typed::<Self>().dir.write(), |d| &mut d.perms)
@@ -603,7 +711,11 @@ impl<Platform: sync::RawSyncPrimitivesProvider> super::backend::Backend for InMe
     }
 
     fn get_static_backing_data(&self, h: &super::backend::FileHandle) -> Option<&'static [u8]> {
-        match h.get_typed::<Self>().file.read().data {
+        let file = h.get_typed::<Self>().file.read();
+        if file.file_type == FileType::SymbolicLink {
+            return None;
+        }
+        match file.data {
             alloc::borrow::Cow::Borrowed(slice) => Some(slice),
             alloc::borrow::Cow::Owned(_) => None,
         }
@@ -658,6 +770,8 @@ struct DirData<Platform: sync::RawSyncPrimitivesProvider> {
 type FileNode<Platform> = Arc<sync::RwLock<Platform, FileData>>;
 struct FileData {
     perms: Permissions,
+    file_type: FileType,
+    /// The contents of a regular file, or the target of a symlink.
     data: alloc::borrow::Cow<'static, [u8]>,
     node_info: NodeInfo,
 }

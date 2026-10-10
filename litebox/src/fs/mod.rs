@@ -70,12 +70,13 @@ bitflags! {
 /// Types of files on a file-system.
 ///
 /// See [`resolver::Resolver::file_status`].
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[non_exhaustive]
 pub enum FileType {
     RegularFile,
     Directory,
     CharacterDevice,
+    SymbolicLink,
 }
 
 bitflags! {
@@ -123,7 +124,7 @@ bitflags! {
         const NOATIME = 0x40000;
         /// `O_NOCTTY`: do not assign controlling terminal
         const NOCTTY = 0x100;
-        /// `O_NOFOLLOW`: fail if the path does not point to a regular file
+        /// `O_NOFOLLOW`: do not follow a final symlink (open it only with `O_PATH`)
         #[cfg(target_arch = "x86_64")]
         const NOFOLLOW = 0x20000;
         #[cfg(target_arch = "aarch64")]
