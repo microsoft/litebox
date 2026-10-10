@@ -163,6 +163,18 @@ pub(super) fn get_guest_fsbase() -> usize {
     value
 }
 
+/// Copies the current host TLS base from FS to the saved GS base.
+pub(super) unsafe fn set_saved_host_tls_base() {
+    unsafe {
+        core::arch::asm!(
+            "rdfsbase {host_tls}",
+            "wrgsbase {host_tls}",
+            host_tls = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Saves the guest's extended state to its TLS save area. Clobbers rax, rdx, r10, and flags.
 macro_rules! save_guest_xstate {
     () => {

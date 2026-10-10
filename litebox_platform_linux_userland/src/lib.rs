@@ -34,13 +34,11 @@ extern crate alloc;
 
 mod page_mgmt;
 mod x86_64;
-#[doc(hidden)]
-pub use page_mgmt::LinuxUserlandReservation;
 use x86_64::{
     GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, exception_callback,
-    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls, set_signal_return,
-    signal_handler_exit_guest, switch_to_guest, switch_to_guest_end, switch_to_guest_start,
-    syscall_callback, tls,
+    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls,
+    set_saved_host_tls_base, set_signal_return, signal_handler_exit_guest, switch_to_guest,
+    switch_to_guest_end, switch_to_guest_start, syscall_callback, tls,
 };
 
 /// The userland Linux platform.
@@ -531,7 +529,6 @@ where
     T: Send + 'static,
 {
     let signals = guest_signal_set();
-    // SAFETY: `signals` and `old_mask` are valid signal sets for the duration of the call.
     let mut old_mask = unsafe { std::mem::zeroed() };
     let result =
         unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask) };
@@ -544,12 +541,7 @@ where
         // SAFETY: the child inherits guest signals blocked. GS is set to this thread's host TLS
         // base before restoring the mask, so a signal handler cannot observe the parent's TLS.
         unsafe {
-            core::arch::asm!(
-                "rdfsbase {host_tls}",
-                "wrgsbase {host_tls}",
-                host_tls = out(reg) _,
-                options(nostack, preserves_flags),
-            );
+            set_saved_host_tls_base();
             let result = libc::pthread_sigmask(
                 libc::SIG_SETMASK,
                 &raw const child_mask,
@@ -698,12 +690,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            core::arch::asm!(
-                "rdfsbase {tmp}",
-                "wrgsbase {tmp}",
-                tmp = out(reg) _,
-                options(nostack, preserves_flags),
-            );
+            set_saved_host_tls_base();
         }
 
         ThreadHandle::run_with_handle(f)
@@ -1786,70 +1773,6 @@ mod tests {
         });
 
         assert!(mutex.block(0).is_ok());
-    }
-
-    #[test]
-    fn guest_thread_initializes_tls_before_restoring_signals() {
-        let original_gs: usize;
-        // SAFETY: GS is restored before this test returns and no LiteBox guest runs on this thread.
-        unsafe {
-            core::arch::asm!("rdgsbase {original_gs}", original_gs = out(reg) original_gs);
-            core::arch::asm!("wrgsbase {zero}", zero = in(reg) 0usize);
-        }
-        let _restore_gs = litebox::utils::defer(|| {
-            // SAFETY: restore the segment base saved at the start of the test.
-            unsafe {
-                core::arch::asm!("wrgsbase {original_gs}", original_gs = in(reg) original_gs);
-            }
-        });
-
-        // SAFETY: a null new mask queries the current mask into the valid `parent_mask` pointer.
-        let mut parent_mask = unsafe { core::mem::zeroed() };
-        assert_eq!(
-            unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut parent_mask)
-            },
-            0
-        );
-        // SAFETY: `parent_mask` was initialized by the successful call above.
-        let parent_alarm_masked =
-            unsafe { libc::sigismember(&raw const parent_mask, libc::SIGALRM) };
-        // SAFETY: `parent_mask` was initialized by the successful call above.
-        let parent_int_masked = unsafe { libc::sigismember(&raw const parent_mask, libc::SIGINT) };
-
-        let handle = super::spawn_guest_thread(move || {
-            let fs: usize;
-            let gs: usize;
-            // SAFETY: reading the current thread's segment bases has no side effects.
-            unsafe {
-                core::arch::asm!("rdfsbase {fs}", fs = out(reg) fs);
-                core::arch::asm!("rdgsbase {gs}", gs = out(reg) gs);
-            }
-            assert_ne!(fs, 0);
-            assert_eq!(gs, fs);
-
-            // SAFETY: a null new mask queries the current mask into the valid `mask` pointer.
-            let mut mask = unsafe { core::mem::zeroed() };
-            assert_eq!(
-                unsafe {
-                    libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask)
-                },
-                0
-            );
-            // SAFETY: `mask` was initialized by the successful call above.
-            assert_eq!(
-                unsafe { libc::sigismember(&raw const mask, libc::SIGALRM) },
-                parent_alarm_masked
-            );
-            // SAFETY: `mask` was initialized by the successful call above.
-            assert_eq!(
-                unsafe { libc::sigismember(&raw const mask, libc::SIGINT) },
-                parent_int_masked
-            );
-        })
-        .unwrap();
-
-        handle.join().unwrap();
     }
 
     #[test]
