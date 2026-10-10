@@ -22,7 +22,6 @@ pub mod fd;
 pub mod fs;
 pub mod inet_socket;
 pub mod mm;
-pub mod path;
 pub mod pipes;
 pub mod platform;
 pub mod process;
