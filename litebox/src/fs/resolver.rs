@@ -742,7 +742,12 @@ impl<Platform: sync::RawSyncPrimitivesProvider, Backend: super::backend::Backend
                     })
                     && !flags.contains(OFlags::PATH | OFlags::NOFOLLOW)
                 {
-                    return Err(PathError::TooManySymlinks.into());
+                    return Err(if flags.contains(OFlags::DIRECTORY) {
+                        PathError::ComponentNotADirectory
+                    } else {
+                        PathError::TooManySymlinks
+                    }
+                    .into());
                 }
                 let file = self.backend.open_file_at(outcome.last, name, flags)?;
                 if !path_only
