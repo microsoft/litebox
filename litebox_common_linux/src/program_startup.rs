@@ -20,7 +20,7 @@ use crate::signal::{NSIG, SigAction, SigAltStack, SigSet};
 use crate::vmem::VmFlags;
 use crate::{PtRegs, TASK_COMM_LEN};
 
-const HEADER_SIZE: usize = size_of::<u8>() + size_of::<[u32; 11]>() + size_of::<[u64; 2]>();
+const HEADER_SIZE: usize = size_of::<u8>() + size_of::<[u32; 10]>() + size_of::<[u64; 2]>();
 /// Size of an inherited descriptor's number, handle, and kind tag, which precede its kind's fields.
 const INHERITED_FD_HEADER_SIZE: usize = size_of::<u32>() + size_of::<u64>() + size_of::<u8>();
 /// Size of a memory region's start, end, and flags.
@@ -57,8 +57,6 @@ impl LinuxProcessStartup {
 /// Platform-managed architectural context is intentionally outside this payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LinuxProgramStartup {
-    /// Parent process ID visible to the child.
-    pub parent_process_id: i32,
     /// Real user ID.
     pub uid: u32,
     /// Effective user ID.
@@ -95,7 +93,7 @@ pub struct InheritedFd {
     /// Descriptor number.
     pub fd: u32,
     /// The child's broker handle to the descriptor's object, as returned by
-    /// [`litebox::process::Process::inherit`].
+    /// [`litebox::process::PendingChild::inherit`].
     ///
     /// Descriptors with the same handle share one open file description, whose kind is taken from
     /// the first of them.
@@ -124,8 +122,6 @@ pub enum InheritedFdKind {
 /// each region that [has contents](ForkMemoryRegion::has_contents) back to back, in region order.
 #[derive(Clone)]
 pub struct LinuxForkStartup {
-    /// Parent process ID visible to the child.
-    pub parent_process_id: i32,
     /// Real user ID.
     pub uid: u32,
     /// Effective user ID.
@@ -215,9 +211,6 @@ pub enum LinuxProgramStartupError {
     /// The file mode creation mask has bits other than permission bits.
     #[error("invalid Linux program umask")]
     InvalidUmask,
-    /// The parent process ID is not representable by Linux process semantics.
-    #[error("invalid Linux program parent process ID")]
-    InvalidParentProcess,
     /// An argument or environment string contains an interior NUL.
     #[error("invalid Linux program string")]
     InvalidString,
@@ -233,7 +226,6 @@ impl LinuxProgramStartup {
             .try_reserve_exact(encoded_len)
             .map_err(|_| LinuxProgramStartupError::TooLarge)?;
         output.push(PROGRAM_STARTUP_TAG);
-        push_u32(&mut output, self.parent_process_id.cast_unsigned());
         push_u32(&mut output, self.uid);
         push_u32(&mut output, self.euid);
         push_u32(&mut output, self.gid);
@@ -288,7 +280,6 @@ impl LinuxProgramStartup {
         if read_u8(&mut input)? != PROGRAM_STARTUP_TAG {
             return Err(LinuxProgramStartupError::Malformed);
         }
-        let parent_process_id = read_u32(&mut input)?.cast_signed();
         let real_user_id = read_u32(&mut input)?;
         let effective_user_id = read_u32(&mut input)?;
         let real_group_id = read_u32(&mut input)?;
@@ -347,7 +338,6 @@ impl LinuxProgramStartup {
         }
         let envp = values.split_off(argv_count);
         let startup = Self {
-            parent_process_id,
             uid: real_user_id,
             euid: effective_user_id,
             gid: real_group_id,
@@ -372,7 +362,6 @@ impl LinuxForkStartup {
         validate_fork(self)?;
         let mut output = Vec::new();
         output.push(FORK_STARTUP_TAG);
-        push_u32(&mut output, self.parent_process_id.cast_unsigned());
         push_u32(&mut output, self.uid);
         push_u32(&mut output, self.euid);
         push_u32(&mut output, self.gid);
@@ -430,7 +419,6 @@ impl LinuxForkStartup {
         if read_u8(&mut input)? != FORK_STARTUP_TAG {
             return Err(LinuxProgramStartupError::Malformed);
         }
-        let parent_process_id = read_u32(&mut input)?.cast_signed();
         let uid = read_u32(&mut input)?;
         let euid = read_u32(&mut input)?;
         let gid = read_u32(&mut input)?;
@@ -494,7 +482,6 @@ impl LinuxForkStartup {
             return Err(LinuxProgramStartupError::Malformed);
         }
         let startup = Self {
-            parent_process_id,
             uid,
             euid,
             gid,
@@ -567,9 +554,6 @@ impl InheritedFd {
 }
 
 fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupError> {
-    if startup.parent_process_id <= 0 {
-        return Err(LinuxProgramStartupError::InvalidParentProcess);
-    }
     if !startup.path.starts_with('/') || startup.path.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidPath);
     }
@@ -583,9 +567,6 @@ fn validate(startup: &LinuxProgramStartup) -> Result<(), LinuxProgramStartupErro
 }
 
 fn validate_fork(startup: &LinuxForkStartup) -> Result<(), LinuxProgramStartupError> {
-    if startup.parent_process_id <= 0 {
-        return Err(LinuxProgramStartupError::InvalidParentProcess);
-    }
     if !startup.cwd.starts_with('/') || startup.cwd.as_bytes().contains(&0) {
         return Err(LinuxProgramStartupError::InvalidWorkingDirectory);
     }
@@ -723,7 +704,6 @@ mod tests {
     #[test]
     fn program_startup_round_trips() {
         let startup = LinuxProgramStartup {
-            parent_process_id: 17,
             uid: 1000,
             euid: 1001,
             gid: 1002,
@@ -775,7 +755,6 @@ mod tests {
     #[test]
     fn program_startup_vector_count_is_payload_bounded() {
         let startup = LinuxProgramStartup {
-            parent_process_id: 1,
             uid: 0,
             euid: 0,
             gid: 0,
@@ -826,7 +805,6 @@ mod tests {
             mask: SigSet::empty().with(Signal::SIGUSR2),
         };
         LinuxForkStartup {
-            parent_process_id: 17,
             uid: 1000,
             euid: 1001,
             gid: 1002,
@@ -938,7 +916,6 @@ mod tests {
     #[test]
     fn program_startup_rejects_trailing_and_invalid_strings() {
         let startup = LinuxProgramStartup {
-            parent_process_id: 1,
             uid: 0,
             euid: 0,
             gid: 0,

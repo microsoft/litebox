@@ -19,13 +19,13 @@ use litebox_broker_protocol::fs::{
 };
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
-    CreatedProcess, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessTermination,
+    ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
-use litebox_broker_protocol::signal::PendingSignal;
+use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
@@ -54,7 +54,12 @@ use shared_buffer::{AcquireError, SlotAllocator, SlotLease};
 /// Longer-term broker integrations should move away from blocking control calls
 /// once the local-core wait and notification model supports that shape.
 pub(crate) trait BrokerControl: Send + Sync {
-    fn allocate_child_process(&self) -> core::result::Result<CreatedProcess, BrokerControlError>;
+    fn allocate_child_process(&self) -> core::result::Result<ProcessIdentity, BrokerControlError>;
+
+    fn cancel_child_process(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn start_child_process(
         &self,
@@ -88,23 +93,41 @@ pub(crate) trait BrokerControl: Send + Sync {
 
     fn set_child_reaping(&self, enabled: bool) -> core::result::Result<(), BrokerControlError>;
 
-    fn process_exit_status(
+    fn set_orphan_adoption(&self, enabled: bool) -> core::result::Result<(), BrokerControlError>;
+
+    fn reap_child(
         &self,
-        handle: ObjectHandle,
-    ) -> core::result::Result<ProcessTermination, BrokerControlError>;
+        selector: ChildSelector,
+    ) -> core::result::Result<ChildExit, BrokerControlError>;
+
+    fn process_info(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<ProcessInfo, BrokerControlError>;
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn send_signal(
         &self,
-        process_id: litebox_broker_protocol::ProcessId,
+        target: SignalTarget,
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError>;
 
     fn take_signal(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<PendingSignal, BrokerControlError>;
+    ) -> core::result::Result<SignalEvent, BrokerControlError>;
+
+    fn set_process_group(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        process_group: litebox_broker_protocol::ProcessGroupId,
+    ) -> core::result::Result<(), BrokerControlError>;
+
+    fn create_session(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError>;
 
@@ -512,8 +535,15 @@ where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
     Channel: LocalCallChannel + Send + Sync,
 {
-    fn allocate_child_process(&self) -> core::result::Result<CreatedProcess, BrokerControlError> {
+    fn allocate_child_process(&self) -> core::result::Result<ProcessIdentity, BrokerControlError> {
         self.request(BrokerLocal::allocate_child_process)
+    }
+
+    fn cancel_child_process(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.cancel_child_process(child_process_id))
     }
 
     fn start_child_process(
@@ -581,11 +611,22 @@ where
         self.request(|local| local.set_child_reaping(enabled))
     }
 
-    fn process_exit_status(
+    fn set_orphan_adoption(&self, enabled: bool) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_orphan_adoption(enabled))
+    }
+
+    fn reap_child(
         &self,
-        handle: ObjectHandle,
-    ) -> core::result::Result<ProcessTermination, BrokerControlError> {
-        self.request(|local| local.process_exit_status(handle))
+        selector: ChildSelector,
+    ) -> core::result::Result<ChildExit, BrokerControlError> {
+        self.request(|local| local.reap_child(selector))
+    }
+
+    fn process_info(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<ProcessInfo, BrokerControlError> {
+        self.request(|local| local.process_info(process_id))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
@@ -594,17 +635,32 @@ where
 
     fn send_signal(
         &self,
-        process_id: litebox_broker_protocol::ProcessId,
+        target: SignalTarget,
         signal: u32,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.send_signal(process_id, signal))
+        self.request(|local| local.send_signal(target, signal))
     }
 
     fn take_signal(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<PendingSignal, BrokerControlError> {
+    ) -> core::result::Result<SignalEvent, BrokerControlError> {
         self.request(|local| local.take_signal(handle))
+    }
+
+    fn set_process_group(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+        process_group: litebox_broker_protocol::ProcessGroupId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_process_group(process_id, process_group))
+    }
+
+    fn create_session(
+        &self,
+        process_id: litebox_broker_protocol::ProcessId,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.create_session(process_id))
     }
 
     fn create_thread(&self) -> core::result::Result<ThreadId, BrokerControlError> {

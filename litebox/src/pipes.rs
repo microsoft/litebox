@@ -401,7 +401,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Returns a descriptor for a pipe end this process inherited from its
-    /// parent through [`Process::inherit`](crate::process::Process::inherit).
+    /// parent through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
     ///
     /// The descriptor owns `handle`, so callers adopt each handle once and
     /// duplicate the descriptor for every other use. The end has no peer in

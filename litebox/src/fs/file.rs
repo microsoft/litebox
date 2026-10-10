@@ -76,7 +76,7 @@ impl<Platform: sync::RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform>
     }
 
     /// Returns a descriptor for a file this process inherited from its parent
-    /// through [`Process::inherit`](crate::process::Process::inherit).
+    /// through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
     ///
     /// The descriptor owns `handle`, so callers adopt each handle once and
     /// duplicate the descriptor for every other use.

@@ -23,8 +23,9 @@ use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use litebox::process::ProcessError;
 use litebox::{shim::Exception, sync::Mutex, utils::ReinterpretUnsignedExt as _};
-use litebox_broker_protocol::ProcessId;
 use litebox_broker_protocol::process::ProcessExitStatus;
+use litebox_broker_protocol::signal::SignalTarget;
+use litebox_broker_protocol::{ProcessGroupId, ProcessId};
 use litebox_common_linux::signal::{
     CLD_EXITED, CLD_KILLED, FPE_INTDIV, ILL_ILLOPN, MINSIGSTKSZ, NSIG, SI_KERNEL, SI_USER, SIG_DFL,
     SIG_IGN, SaFlags, SigAction, SigAltStack, SigSet, Siginfo, SiginfoData, SigmaskHow, Signal,
@@ -752,10 +753,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         };
         if signal == Signal::SIGCHLD && act.is_some() {
             // Linux decides whether to send `SIGCHLD` as the child terminates, so terminations
-            // already notified to this process are observed under the old action. A termination
+            // already notified to this process are taken under the old action. A termination
             // concurrent with this call, or not yet notified, which the guest cannot tell apart,
             // may still be reaped under the old action and signaled under the new one.
-            let _ = self.observe_child_terminations();
+            self.take_signals(false);
         }
 
         let handlers = self.signals.handlers.borrow();
@@ -821,22 +822,43 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 self.send_signal(signal, siginfo_kill(signal));
             }
             Ok(0)
-        } else if let (Some(pid @ 1..), None) = (pid, tid) {
-            let signal = signal.map_or(0, |signal| signal.as_i32().cast_unsigned());
-            match self
-                .global
-                .litebox
-                .send_signal(ProcessId(pid.cast_unsigned()), signal)
-            {
-                Ok(()) => Ok(0),
-                // Without a process service, no other process exists.
-                Err(ProcessError::Unavailable) => Err(Errno::ESRCH),
-                Err(error) => Err(error.into()),
-            }
+        } else if let (Some(pid), None) = (pid, tid) {
+            self.kill_processes(pid, signal)
         } else {
             log_unsupported!("sys_{{t|tg}}kill with remote pid/tid");
             Err(Errno::ESRCH)
         }
+    }
+
+    /// Sends `signal` to the processes `kill` selects with `pid`, other than this process alone.
+    fn kill_processes(&self, pid: i32, signal: Option<Signal>) -> Result<usize, Errno> {
+        let target = match pid {
+            1.. => SignalTarget::Process(ProcessId(pid.cast_unsigned())),
+            0 => SignalTarget::ProcessGroup(
+                self.global
+                    .litebox
+                    .process_info(ProcessId(self.pid.cast_unsigned()))?
+                    .membership
+                    .process_group,
+            ),
+            -1 => SignalTarget::All,
+            i32::MIN => return Err(Errno::ESRCH),
+            _ => SignalTarget::ProcessGroup(ProcessGroupId(pid.unsigned_abs())),
+        };
+        let number = signal.map_or(0, |signal| signal.as_i32().cast_unsigned());
+        match self.global.litebox.send_signal(target, number) {
+            Ok(()) => {}
+            // Without a process service, no other process exists.
+            Err(ProcessError::Unavailable) if matches!(target, SignalTarget::Process(_)) => {
+                return Err(Errno::ESRCH);
+            }
+            Err(error) => return Err(error.into()),
+        }
+        // The group may include this process.
+        if signal.is_some() && matches!(target, SignalTarget::ProcessGroup(_)) {
+            self.take_signals(true);
+        }
+        Ok(0)
     }
 
     /// Returns whether there are any pending signals that can be delivered.

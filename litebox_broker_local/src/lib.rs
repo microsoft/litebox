@@ -24,6 +24,7 @@ mod error;
 mod event;
 mod fs;
 mod pipe;
+mod process_group;
 mod random;
 mod signal;
 mod socket;
@@ -42,10 +43,11 @@ use litebox_broker_protocol::message::{
     BrokerRequest, BrokerResponse, BrokerResult,
 };
 use litebox_broker_protocol::process::{
-    CreateThreadRequest, CreateThreadResponse, CreatedProcess, DuplicateObjectsToChildRequest,
-    ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessStartupData, ProcessStartupDescriptor,
-    ProcessTermination, StartChildProcessRequest, WriteChildMemoryRequest,
+    ChildExit, ChildSelector, CreateThreadRequest, CreateThreadResponse,
+    DuplicateObjectsToChildRequest, ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
+    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity,
+    ProcessInfo, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
+    WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -276,6 +278,22 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
+    /// Discards a pending child created by [`Self::allocate_child_process`]
+    /// that never started, as if it had never been created.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn cancel_child_process(&self, child_process_id: ProcessId) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::CancelChildProcess(child_process_id))? {
+            BrokerResult::ChildProcessCancelled => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected cancel-child-process response: {response:?}")
+            }
+        }
+    }
+
     /// Duplicates this process's object references into a pending child
     /// created by [`Self::allocate_child_process`], returning the child's
     /// handles in the same order.
@@ -359,12 +377,28 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Allocates one pending child process and its parent-owned handle.
+    /// Sets whether this process adopts the orphaned children of its exiting
+    /// descendants.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn allocate_child_process(&self) -> Result<CreatedProcess, Channel::Error> {
+    pub fn set_orphan_adoption(&self, enabled: bool) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::SetOrphanAdoption(enabled))? {
+            BrokerResult::OrphanAdoptionSet => Ok(()),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => {
+                panic!("broker returned unexpected orphan-adoption response: {response:?}")
+            }
+        }
+    }
+
+    /// Allocates one pending child process of this process.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn allocate_child_process(&self) -> Result<ProcessIdentity, Channel::Error> {
         match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Process))? {
             BrokerResult::CreateThread(CreateThreadResponse::Process(child)) => Ok(child),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
@@ -374,23 +408,35 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Returns a process's termination status through a process handle.
+    /// Reaps this process's oldest exited child that `selector` matches,
+    /// returning its exit.
     ///
-    /// Returns `WouldBlock` while the process is live.
+    /// Returns `WouldBlock` if only live children match, and `UnknownObject`
+    /// if none does.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn process_exit_status(
-        &self,
-        handle: ObjectHandle,
-    ) -> Result<ProcessTermination, Channel::Error> {
-        match self.request(BrokerOperation::GetProcessExitStatus(handle))? {
-            BrokerResult::ProcessExitStatus(status) => Ok(status),
+    pub fn reap_child(&self, selector: ChildSelector) -> Result<ChildExit, Channel::Error> {
+        match self.request(BrokerOperation::ReapChild(selector))? {
+            BrokerResult::ChildReaped(exit) => Ok(exit),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected process-exit-status response: {response:?}")
-            }
+            response => panic!("broker returned unexpected reap-child response: {response:?}"),
+        }
+    }
+
+    /// Returns the place in the process tree of process `process_id`.
+    ///
+    /// Returns `UnknownObject` if no such process exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn process_info(&self, process_id: ProcessId) -> Result<ProcessInfo, Channel::Error> {
+        match self.request(BrokerOperation::GetProcessInfo(process_id))? {
+            BrokerResult::ProcessInfo(info) => Ok(info),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected process-info response: {response:?}"),
         }
     }
 
