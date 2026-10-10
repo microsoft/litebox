@@ -113,6 +113,8 @@ pub enum ChmodError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("the named file is a symbolic link")]
+    IsSymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]
@@ -130,6 +132,8 @@ pub enum ChownError {
     NotTheOwner,
     #[error("the named file resides on a read-only filesystem")]
     ReadOnlyFileSystem,
+    #[error("the named file is a symbolic link")]
+    IsSymlink,
     #[error("I/O error")]
     Io,
     #[error(transparent)]
@@ -229,6 +233,8 @@ pub enum WalkError {
 /// Possible errors in any file-system function due to path errors.
 #[derive(Error, Debug)]
 pub enum PathError {
+    #[error("too many symbolic links encountered")]
+    TooManySymlinks,
     #[error("no such file or directory")]
     NoSuchFileOrDirectory,
     #[error("one of the directories in pathname did not allow search permission")]

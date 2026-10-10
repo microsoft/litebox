@@ -342,8 +342,16 @@ where
                 }
                 .into(),
             ),
-            stop_reason: WalkStopReason::StoppedAtNonDirectory,
+            stop_reason: WalkStopReason::StoppedAtNonDirectory {
+                file_type: qid_type_to_file_type(result.wqids[stopped_at].typ),
+            },
         })
+    }
+
+    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
+        // TODO: support `Treadlink` once `qid_type_to_file_type` reports symlinks.
+        litebox_util_log::debug!(name:? = name; "9P symlink targets are not yet readable");
+        Err(PathError::InvalidPathname.into())
     }
 
     fn owned_dir_at(
@@ -690,6 +698,10 @@ fn qid_type_to_file_type(qid_type: fcall::QidType) -> super::FileType {
     if qid_type.contains(fcall::QidType::DIR) {
         super::FileType::Directory
     } else {
+        if qid_type.contains(fcall::QidType::SYMLINK) {
+            // TODO: report `SymbolicLink` once `read_link_at` supports `Treadlink`.
+            litebox_util_log::debug!("9P symlink treated as a regular file");
+        }
         super::FileType::RegularFile
     }
 }

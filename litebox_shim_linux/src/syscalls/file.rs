@@ -1347,12 +1347,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         mode: AccessFlags,
         caller: AccessUserInfo,
+        follow_symlink: bool,
     ) -> Result<(), Errno> {
         let status = {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.file_status(&context, pathname)?
+            files.fs.file_status(&context, pathname, follow_symlink)?
         };
         let owner = status.owner.into();
         Self::do_access_mode(status.mode, owner, caller, &mode)
@@ -1368,21 +1369,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ) -> Result<(), Errno> {
         let supported_flags =
             AtFlags::AT_EACCESS | AtFlags::AT_SYMLINK_NOFOLLOW | AtFlags::AT_EMPTY_PATH;
-        // TODO: `AT_SYMLINK_NOFOLLOW` is accepted for Linux compatibility, but LiteBox file
-        // status lookups do not currently follow symlinks in any backend.
         if flags.intersects(supported_flags.complement()) {
             return Err(Errno::EINVAL);
         }
 
         Self::validate_access_mode(&mode)?;
         let caller = self.access_user(&flags);
+        let follow_symlink = !flags.contains(AtFlags::AT_SYMLINK_NOFOLLOW);
         let get_cwd = || self.cwd_prefix();
         let fs_path = FsPath::new(dirfd, pathname, get_cwd)?;
         match fs_path {
-            FsPath::Absolute { path } => self.do_access(path, mode, caller),
+            FsPath::Absolute { path } => self.do_access(path, mode, caller, follow_symlink),
             FsPath::Cwd if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let cwd = get_cwd();
-                self.do_access(cwd, mode, caller)
+                self.do_access(cwd, mode, caller, follow_symlink)
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 let stat: FileStat = self.with_typed_fd(fd, |fd| self.do_stat(fd))?;
@@ -1408,9 +1408,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Read the target of a symbolic link
     ///
     /// The caller must pass an absolute path.
-    ///
-    /// Note that this function only handles the following cases that we hardcoded:
-    /// - `/proc/self/fd/<fd>`
+    // XXX(jayb): `/proc/self/fd/<fd>` should be backed by the file system rather than hardcoded.
     fn do_readlink(&self, fullpath: &str) -> Result<String, Errno> {
         if let Some(stripped) = fullpath.strip_prefix("/proc/self/fd/") {
             let fd = stripped.parse::<u32>().map_err(|_| Errno::EINVAL)?;
@@ -1422,8 +1420,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
-        // TODO: we do not support symbolic links other than stdio yet.
-        Err(Errno::ENOENT)
+        let files = self.files.borrow();
+        let fs = self.fs.borrow();
+        let context = fs.context.read();
+        Ok(files.fs.read_link(&context, fullpath)?)
     }
 
     /// Handle syscall `readlink`
@@ -1525,18 +1525,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         follow_symlink: bool,
     ) -> Result<T, Errno> {
-        let normalized_path = pathname.normalized()?;
-        let path = if follow_symlink {
-            self.do_readlink(normalized_path.as_str())
-                .unwrap_or(normalized_path)
+        let path = pathname.as_rust_str()?;
+        // `/proc/self/fd/<fd>` is not backed by the file system, so it is followed here.
+        let path = if follow_symlink && path.starts_with("/proc/self/fd/") {
+            self.do_readlink(path).unwrap_or_else(|_| path.into())
         } else {
-            normalized_path
+            path.into()
         };
         let status = {
             let files = self.files.borrow();
             let fs = self.fs.borrow();
             let context = fs.context.read();
-            files.fs.file_status(&context, path)?
+            files.fs.file_status(&context, path, follow_symlink)?
         };
         Ok(T::from(status))
     }
@@ -1551,7 +1551,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// `lstat` is identical to `stat`, except that if `pathname` is a symbolic link,
     /// then it returns information about the link itself, not the file that the link refers to.
-    /// TODO: we do not support symbolic links yet.
     pub fn sys_lstat(&self, pathname: impl path::Arg) -> Result<FileStat, Errno> {
         let pathname = self.resolve_path(pathname)?;
         self.do_path_stat(pathname, false)
@@ -1584,7 +1583,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let files = self.files.borrow();
                 let fs = self.fs.borrow();
                 let context = fs.context.read();
-                Ok(T::from(files.fs.file_status(&context, cwd)?))
+                Ok(T::from(files.fs.file_status(&context, cwd, true)?))
             }
             FsPath::Fd(fd) if flags.contains(AtFlags::AT_EMPTY_PATH) => {
                 self.with_typed_fd(fd, |fd| self.do_stat(fd))
@@ -1604,7 +1603,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
         pathname: impl path::Arg,
         flags: AtFlags,
     ) -> Result<FileStat, Errno> {
-        let current_support_flags = AtFlags::AT_EMPTY_PATH;
+        let current_support_flags = AtFlags::AT_EMPTY_PATH | AtFlags::AT_SYMLINK_NOFOLLOW;
         if flags.intersects(current_support_flags.complement()) {
             log_unsupported!("unsupported flags: {flags:?}");
             return Err(Errno::EINVAL);
@@ -1866,18 +1865,18 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENOENT);
         }
 
-        // Resolve relative paths against the CWD, and normalize (handle `.` / `..`).
-        let target = fs
-            .context
-            .read()
-            .resolve(pathname)
-            .map_err(|_| Errno::EINVAL)?;
+        // Resolve relative paths against the CWD, following symlinks and `.` / `..`.
+        let target = {
+            let files = self.files.borrow();
+            let context = fs.context.read();
+            files.fs.resolve_following_symlinks(&context, pathname)?
+        };
 
         // Verify the path exists and is a directory.
         {
             let files = self.files.borrow();
             let context = fs.context.read();
-            match files.fs.file_status(&context, target.to_string()) {
+            match files.fs.file_status(&context, target.to_string(), true) {
                 Ok(status) => {
                     if status.file_type != FileType::Directory {
                         return Err(Errno::ENOTDIR);
@@ -2696,7 +2695,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 ino: entry.ino_info.as_ref().map_or(0, |node_info| node_info.ino) as u64,
                 off: dir_off as u64,
                 len: len.trunc(),
-                typ: litebox_common_linux::DirentType::from(entry.file_type.clone()) as u8,
+                typ: litebox_common_linux::DirentType::from(entry.file_type) as u8,
                 __name: [0; 0],
             };
             let hdr_ptr = UserPtrMut::from_usize(dirp.as_usize() + nbytes);

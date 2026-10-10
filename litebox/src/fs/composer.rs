@@ -477,7 +477,7 @@ impl Backend for Composer {
                                         index += walked_len;
                                         current = last;
                                     }
-                                    WalkStopReason::StoppedAtNonDirectory
+                                    WalkStopReason::StoppedAtNonDirectory { .. }
                                     | WalkStopReason::Continue => {
                                         return Ok(WalkOutcome {
                                             components: walked_components,
@@ -498,8 +498,8 @@ impl Backend for Composer {
                         }
                     } else {
                         // TODO(jayb): Decide whether future backends need absolute-ish namespace
-                        // views instead of this mount-root-relative suffix view. POSIX `..` across
-                        // mount roots is also deferred; the resolver normalizes it before walking.
+                        // views instead of this mount-root-relative suffix view. The resolver handles
+                        // `..`, including across mount roots, before walking.
                         let prefix_len = self.mounted_walk_prefix_len(&path, &components[index..]);
                         assert!(prefix_len > 0);
                         let outcome = self.mounts[mount_index]
@@ -522,7 +522,8 @@ impl Backend for Composer {
                                 index += walked_len;
                                 current = last;
                             }
-                            WalkStopReason::StoppedAtNonDirectory | WalkStopReason::Continue => {
+                            WalkStopReason::StoppedAtNonDirectory { .. }
+                            | WalkStopReason::Continue => {
                                 return Ok(WalkOutcome {
                                     components: walked_components,
                                     last: WalkingDirHandle::from_typed::<Self>(last),
@@ -590,6 +591,19 @@ impl Backend for Composer {
                         .into(),
                     )
                 }),
+        }
+    }
+
+    fn read_link_at(&self, dir: &WalkingDirHandle<'_>, name: &str) -> Result<String, WalkError> {
+        match &dir.as_typed::<Self>().inner {
+            ComposerWalkingDirHandleInner::Virtual { .. } => {
+                Err(PathError::NoSuchFileOrDirectory.into())
+            }
+            ComposerWalkingDirHandleInner::Mounted {
+                mount_index,
+                handle,
+                ..
+            } => self.mounts[*mount_index].backend.read_link_at(handle, name),
         }
     }
 
