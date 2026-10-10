@@ -102,7 +102,8 @@ where
     {
         for (range, _) in vmas.iter() {
             // SAFETY: The caller relinquishes this provider-owned range without remaining users.
-            let _ = unsafe { platform.release_pages(range.clone()) };
+            unsafe { platform.release_pages(range.clone()) }
+                .expect("failed to release provider-owned page range");
         }
     }
 
@@ -214,7 +215,8 @@ impl<Reservation: PageReservation> TrackedReservations<Reservation> {
                 Err(error) => {
                     for reservation in acquired {
                         // SAFETY: These unpublished reservations have no users.
-                        let _ = unsafe { platform.release_pages(reservation) };
+                        unsafe { platform.release_pages(reservation) }
+                            .expect("failed to roll back unpublished page reservation");
                     }
                     return Err(error);
                 }
@@ -243,7 +245,8 @@ impl<Reservation: PageReservation> ReservationStore for TrackedReservations<Rese
     {
         for (_, reservation) in core::mem::take(&mut self.0) {
             // SAFETY: The caller relinquishes this reservation without remaining users.
-            let _ = unsafe { platform.release_pages(reservation) };
+            unsafe { platform.release_pages(reservation) }
+                .expect("failed to release tracked page reservation");
         }
     }
 

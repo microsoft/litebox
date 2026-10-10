@@ -1014,11 +1014,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let restore_trampoline_rx = |task: &Self, state: &ElfPatchState| {
             if state.trampoline_mapped_len > 0 {
-                let _ = task.sys_mprotect_raw(
+                task.sys_mprotect_raw(
                     UserPtrMut::<u8>::from_usize(state.trampoline_addr),
                     state.trampoline_mapped_len,
                     ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-                );
+                )
+                .expect("fatal: failed to restore trampoline to RX");
             }
         };
 
@@ -1174,11 +1175,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
 
         // Restore the code segment to RX.
-        let _ = self.sys_mprotect_raw(
+        self.sys_mprotect_raw(
             mapped_addr,
             len,
             ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
-        );
+        )
+        .expect("fatal: failed to restore code segment to RX");
         restore_trampoline_rx(self, state);
         true
     }
