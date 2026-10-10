@@ -50,6 +50,17 @@ extern crate alloc;
 #[cfg(target_arch = "aarch64")]
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 mod page_mgmt;
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
+#[doc(hidden)]
+pub use page_mgmt::LinuxUserlandReservation;
+#[cfg(target_arch = "x86_64")]
+use x86_64::{
+    GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, exception_callback,
+    interrupt_callback, interrupt_callback_no_xsave, is_guest_thread, run_thread_arch, saved_tls,
+    set_signal_return, signal_handler_exit_guest, switch_to_guest, switch_to_guest_end,
+    switch_to_guest_start, syscall_callback, syscall_callback_guest_gs, tls,
+};
 
 /// The admitted open syscall and its flags index must remain paired.
 #[cfg(target_arch = "x86_64")]
@@ -60,67 +71,6 @@ const OPEN_FLAGS_ARG: u8 = 1;
 const OPEN_SYSNO: i64 = libc::SYS_openat;
 #[cfg(target_arch = "aarch64")]
 const OPEN_FLAGS_ARG: u8 = 2;
-// ---------------------------------------------------------------------------
-// TLS (`.tbss`) access helpers
-//
-// On x86_64, the ELF TLS model uses `@tpoff`; on x86 it uses `@ntpoff`.
-// At guest-host transitions we swap `fs` and `gs`, so after the swap the host TLS base
-// is in the normal segment register. Before the swap (e.g. in a signal
-// handler that fires while the guest is running), the host TLS base is
-// in the *saved* segment register (`gs` on x86_64, `fs` on x86).
-//
-// The macros below produce string literals so they can be used inside
-// `concat!()` within `core::arch::asm!()`.
-// ---------------------------------------------------------------------------
-
-/// TLS relocation suffix: `"@tpoff"` on x86_64, `"@ntpoff"` on x86.
-#[cfg(target_arch = "x86_64")]
-macro_rules! tls_suffix {
-    () => {
-        "@tpoff"
-    };
-}
-
-/// Segment register used for TLS after the fs/gs swap (normal host context).
-#[cfg(target_arch = "x86_64")]
-macro_rules! tls_seg {
-    () => {
-        "fs"
-    };
-}
-
-/// Segment register where the host TLS base is saved before the swap
-/// (signal handler context while the guest is running).
-#[cfg(target_arch = "x86_64")]
-macro_rules! saved_tls_seg {
-    () => {
-        "gs"
-    };
-}
-
-/// Full TLS memory operand for a `.tbss` variable in normal host context
-/// (after the fs/gs swap).
-///
-/// Example: `tls!("pending_host_signals")` expands to
-/// `"fs:pending_host_signals@tpoff"` on x86_64.
-#[cfg(target_arch = "x86_64")]
-macro_rules! tls {
-    ($var:literal) => {
-        concat!(tls_seg!(), ":", $var, tls_suffix!())
-    };
-}
-
-/// Full TLS memory operand for a `.tbss` variable accessed via the *saved*
-/// segment register (before the fs/gs swap, e.g. from a signal handler).
-///
-/// Example: `saved_tls!("in_guest")` expands to
-/// `"gs:in_guest@tpoff"` on x86_64.
-#[cfg(target_arch = "x86_64")]
-macro_rules! saved_tls {
-    ($var:literal) => {
-        concat!(saved_tls_seg!(), ":", $var, tls_suffix!())
-    };
-}
 
 /// The userland Linux platform.
 ///
@@ -551,6 +501,9 @@ pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
+    #[cfg(target_arch = "x86_64")]
+    run_thread_inner(&shim, ctx, GuestXstateInit::Initial);
+    #[cfg(target_arch = "aarch64")]
     run_thread_inner(&shim, ctx, false);
 }
 
@@ -565,6 +518,9 @@ pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
+    #[cfg(target_arch = "x86_64")]
+    run_thread_inner(shim, ctx, GuestXstateInit::Initial);
+    #[cfg(target_arch = "aarch64")]
     run_thread_inner(shim, ctx, false);
 }
 
@@ -579,6 +535,9 @@ pub unsafe fn reenter_thread<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
+    #[cfg(target_arch = "x86_64")]
+    run_thread_inner(shim, ctx, GuestXstateInit::Reenter);
+    #[cfg(target_arch = "aarch64")]
     run_thread_inner(shim, ctx, true);
 }
 
@@ -590,8 +549,13 @@ struct ThreadContext<'a> {
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
-    reenter: bool,
+    #[cfg(target_arch = "x86_64")] xstate_init: GuestXstateInit,
+    #[cfg(target_arch = "aarch64")] reenter: bool,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    let reenter = matches!(xstate_init, GuestXstateInit::Reenter);
+    #[cfg(target_arch = "x86_64")]
+    activate_xstate(xstate_init);
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     let _guest_thread = GuestThreadMarker::enter();
@@ -600,97 +564,6 @@ fn run_thread_inner(
             run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
         });
     });
-}
-
-#[cfg(target_arch = "x86_64")]
-core::arch::global_asm!(
-    "
-    .section .tbss
-    .align 8
-scratch:
-    .quad 0
-host_sp:
-    .quad 0
-host_bp:
-    .quad 0
-guest_context_top:
-    .quad 0
-.globl guest_fsbase
-guest_fsbase:
-    .quad 0
-.globl guest_thread
-guest_thread:
-    .byte 0
-in_guest:
-    .byte 0
-.globl interrupt
-interrupt:
-    .byte 0
-    .align 4
-.globl pending_host_signals
-pending_host_signals:
-    .long 0
-    .align 8
-.globl wait_waker_addr
-wait_waker_addr:
-    .quad 0
-    "
-);
-
-#[cfg(target_arch = "x86_64")]
-fn set_guest_fsbase(value: usize) {
-    unsafe {
-        core::arch::asm! {
-            "mov fs:guest_fsbase@tpoff, {}",
-            in(reg) value,
-            options(nostack, preserves_flags)
-        }
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn get_guest_fsbase() -> usize {
-    let value: usize;
-    unsafe {
-        core::arch::asm! {
-            "mov {}, fs:guest_fsbase@tpoff",
-            out(reg) value,
-            options(nostack, preserves_flags)
-        }
-    }
-    value
-}
-
-#[cfg(target_arch = "x86_64")]
-fn is_guest_thread() -> bool {
-    macro_rules! read_guest_thread {
-        ($access:ident) => {{
-            let marker: u8;
-            core::arch::asm!(
-                concat!("mov {marker}, BYTE PTR ", $access!("guest_thread")),
-                marker = out(reg_byte) marker,
-                options(nostack, preserves_flags),
-            );
-            marker
-        }};
-    }
-
-    let marker = match GUEST_TLS_MODE.load(Ordering::Relaxed) {
-        mode if mode == GuestTlsMode::Windows as u8 => {
-            // SAFETY: Windows guests leave host TLS active in FS.
-            unsafe { read_guest_thread!(tls) }
-        }
-        _ => {
-            // SAFETY: this platform requires FSGSBASE support.
-            if unsafe { litebox_common_linux::rdgsbase() } == 0 {
-                return false;
-            }
-            // SAFETY: nonzero GS holds this thread's host TLS in Linux guest mode,
-            // including after guest exit, when the lifetime marker has been cleared.
-            unsafe { read_guest_thread!(saved_tls) }
-        }
-    };
-    marker != 0
 }
 
 /// Tracks the whole guest-thread lifetime and preserves nested-entry state.
@@ -732,7 +605,7 @@ impl Drop for GuestThreadMarker {
         // SAFETY: drop runs after host FS is restored and accesses this thread's marker.
         unsafe {
             core::arch::asm!(
-            concat!("mov BYTE PTR ", tls!("guest_thread"), ", {previous}"),
+                concat!("mov BYTE PTR ", tls!("guest_thread"), ", {previous}"),
                 previous = in(reg_byte) self.previous,
                 options(nostack, preserves_flags),
             );
@@ -742,239 +615,10 @@ impl Drop for GuestThreadMarker {
     }
 }
 
-/// Runs the guest thread until it terminates.
-///
-/// This saves all non-volatile register state then switches to the guest
-/// context. When the guest makes a syscall, it jumps back into the middle of
-/// this routine, at `syscall_callback`. This code then updates the guest
-/// context structure, switches back to the host stack, and calls the syscall
-/// handler.
-///
-/// When the guest thread terminates, this function returns after restoring
-/// non-volatile register state.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-unsafe extern "C-unwind" fn run_thread_arch(
-    thread_ctx: &mut ThreadContext,
-    ctx: *mut litebox_common_linux::PtRegs,
-    reenter: u8,
-) {
-    core::arch::naked_asm!(
-    "
-    .macro restore_guest_context scratch
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbp
-    pop rbx
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rax
-    pop rcx
-    pop rdx
-    pop rsi
-    pop rdi
-    add rsp, 8       // skip orig_rax
-    pop \\scratch    // read rip into scratch
-    add rsp, 8       // skip cs
-    popfq
-    pop rsp
-    jmp \\scratch    // jump to the guest
-    .endm
-
-    .cfi_startproc
-    // Push all non-volatiles.
-    push rbp
-    mov rbp, rsp
-    .cfi_def_cfa rbp, 16
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    push rdi // save thread context
-
-    // Save host rsp and rbp and guest context top in TLS.
-    mov fs:host_sp@tpoff, rsp
-    mov fs:host_bp@tpoff, rbp
-    lea r8, [rsi + {GUEST_CONTEXT_SIZE}]
-    mov fs:guest_context_top@tpoff, r8
-
-    // Linux guests use FS, so preserve host FS in GS. Windows guests retain
-    // their GS base and leave host FS active.
-    cmp BYTE PTR [rip + GUEST_TLS_MODE], {WINDOWS_TLS_MODE}
-    je 2f
-    rdfsbase r8
-    wrgsbase r8
-2:
-
-    // Call init_handler or reenter_handler based on reenter flag (in dl).
-    test dl, dl
-    jnz 1f
-    call {init_handler}
-    jmp .Ldone
-1:
-    call {reenter_handler}
-    jmp .Ldone
-
-    // This entry point is called from the guest when it issues a syscall
-    // instruction.
-    //
-    // At entry, the register context is the guest context with the
-    // return address in rcx. r11 is an available scratch register (it would
-    // contain rflags if the syscall instruction had actually been issued).
-    .globl syscall_callback
-syscall_callback:
-    // Clear in_guest flag. This must be the first instruction to match the
-    // expectations of `interrupt_signal_handler`.
-    mov      BYTE PTR gs:in_guest@tpoff, 0
-
-    // Restore host fs base.
-    rdfsbase r11
-    mov      gs:guest_fsbase@tpoff, r11
-    rdgsbase r11
-    wrfsbase r11
-    jmp .Lhost_tls_restored
-
-    .globl syscall_callback_guest_gs
-syscall_callback_guest_gs:
-    // Windows guests use GS, different from Linux hosts which use FS.
-    // Thus no need to swap FS and GS like we do for Linux guests.
-    mov      BYTE PTR fs:in_guest@tpoff, 0
-
-.Lhost_tls_restored:
-
-    // Switch to the top of the guest context.
-    mov     r11, rsp
-    mov     rsp, fs:guest_context_top@tpoff
-
-    // TODO: save float and vector registers (xsave or fxsave)
-    // Save caller-saved registers
-    push    0x2b       // pt_regs->ss = __USER_DS
-    push    r11        // pt_regs->sp
-    pushfq             // pt_regs->eflags
-    push    0x33       // pt_regs->cs = __USER_CS
-    push    rcx        // pt_regs->ip
-    push    rax        // pt_regs->orig_ax
-
-    push    rdi         // pt_regs->di
-    push    rsi         // pt_regs->si
-    push    rdx         // pt_regs->dx
-    push    rcx         // pt_regs->cx
-    push    -38         // pt_regs->ax = ENOSYS
-    push    r8          // pt_regs->r8
-    push    r9          // pt_regs->r9
-    push    r10         // pt_regs->r10
-    push    [rsp + 88]  // pt_regs->r11 = rflags
-    push    rbx         // pt_regs->bx
-    push    rbp         // pt_regs->bp
-    push    r12         // pt_regs->r12
-    push    r13         // pt_regs->r13
-    push    r14         // pt_regs->r14
-    push    r15         // pt_regs->r15
-
-    // Restore the stack and frame pointer.
-    mov     rsp, fs:host_sp@tpoff
-    mov     rbp, fs:host_bp@tpoff
-
-    // Handle the syscall. This will jump back to the guest but
-    // will return if the thread is exiting.
-    mov rdi, [rsp] // pass thread_ctx
-    call {syscall_handler}
-    // This thread is done. Return.
-    jmp .Ldone
-
-exception_callback:
-    // Restore the stack and frame pointer.
-    mov     rsp, fs:host_sp@tpoff
-    mov     rbp, fs:host_bp@tpoff
-
-    mov rdi, [rsp] // pass thread_ctx
-    call {exception_handler}
-    jmp .Ldone
-
-interrupt_callback:
-    // Restore the stack and frame pointer.
-    mov     rsp, fs:host_sp@tpoff
-    mov     rbp, fs:host_bp@tpoff
-
-    mov rdi, [rsp] // pass thread_ctx
-    call {interrupt_handler}
-
-.Ldone:
-
-    lea  rsp, [rbp - 5*8]
-    pop  r15
-    pop  r14
-    pop  r13
-    pop  r12
-    pop  rbx
-    pop  rbp
-    .cfi_def_cfa rsp, 8
-    ret
-    .cfi_endproc
-",
-    GUEST_CONTEXT_SIZE = const core::mem::size_of::<litebox_common_linux::PtRegs>(),
-    init_handler = sym init_handler,
-    reenter_handler = sym reenter_handler,
-    syscall_handler = sym syscall_handler,
-    exception_handler = sym exception_handler,
-    interrupt_handler = sym interrupt_handler,
-    WINDOWS_TLS_MODE = const GuestTlsMode::Windows as u8,
-    );
-}
-
-/// Switches to the provided guest context.
-///
-/// # Safety
-/// The context must be valid guest context. This can only be called if
-/// `run_thread_arch` is on the stack; after the guest exits, it will return to
-/// the interior of `run_thread_arch`.
-///
-/// Do not call this at a point where the stack needs to be unwound to run
-/// destructors.
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-unsafe extern "C" fn switch_to_guest(ctx: &litebox_common_linux::PtRegs) -> ! {
-    core::arch::naked_asm!(
-        "switch_to_guest_start:",
-        // Set `in_guest` now, then check if there is a pending interrupt. If an
-        // interrupt arrives while `in_guest` is set, the signal handler will
-        // see that the IP is between `switch_to_guest_start` and
-        // `switch_to_guest_end` and will set `interrupt` and jump to
-        // `interrupt_callback`.
-        //
-        // If an interrupt is already pending, clear `in_guest` and jump to
-        // `interrupt_callback` without entering the guest. `interrupt_callback`
-        // runs host code, and a signal arriving there with `in_guest` still set
-        // would be taken for a guest interrupt and overwrite the saved guest
-        // context with host registers.
-        "mov BYTE PTR fs:in_guest@tpoff, 1",
-        "cmp BYTE PTR fs:interrupt@tpoff, 0",
-        "je 2f",
-        "mov BYTE PTR fs:in_guest@tpoff, 0",
-        "jmp interrupt_callback",
-        "2:",
-        // Restore guest context from ctx.
-        "mov rsp, rdi",
-        "cmp BYTE PTR [rip + GUEST_TLS_MODE], {WINDOWS_TLS_MODE}",
-        "je 2f",
-        // Linux guest: switch FS and use saved host FS through GS.
-        "mov rdx, fs:guest_fsbase@tpoff",
-        "wrfsbase rdx",
-        "restore_guest_context gs:scratch@tpoff",
-        "2:",
-        // Windows guest: host FS and guest GS are already active.
-        "restore_guest_context fs:scratch@tpoff",
-        "switch_to_guest_end:",
-        ".purgem restore_guest_context",
-        WINDOWS_TLS_MODE = const GuestTlsMode::Windows as u8,
-    );
-}
-
+/// Non-guest threads (e.g., network workers, background tasks) should call this
+/// function at the start of their execution so the kernel only delivers
+/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
+/// context to re-enter the shim.
 fn guest_signal_set() -> libc::sigset_t {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -1065,6 +709,7 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
+    #[cfg(target_arch = "x86_64")] xstate_init: GuestXstateInit,
     #[cfg(target_arch = "aarch64")] vector_state: litebox_common_linux::GuestVectorState,
 ) {
     #[cfg(target_arch = "aarch64")]
@@ -1072,6 +717,9 @@ fn thread_start(
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
+    #[cfg(target_arch = "x86_64")]
+    run_thread_inner(shim.as_ref(), &mut ctx, xstate_init);
+    #[cfg(target_arch = "aarch64")]
     run_thread_inner(shim.as_ref(), &mut ctx, false);
     // TODO: have syscall_callback return if we need to terminate the process.
     // We should return this value to the caller so load_program can return it
@@ -1142,11 +790,20 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         #[cfg(target_arch = "aarch64")]
         let vector_state =
             litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
+        // Inherits the calling guest's saved extended CPU state.
+        #[cfg(target_arch = "x86_64")]
+        let xstate_init = GUEST_XSTATE.with_borrow(|guest| {
+            guest.as_ref().map_or(GuestXstateInit::Initial, |guest| {
+                GuestXstateInit::Inherited(guest.clone())
+            })
+        });
         // TODO: do we need to wait for the handle in the main thread?
         let _handle = std::thread::Builder::new().spawn(move || {
             thread_start(
                 init_thread,
                 ctx,
+                #[cfg(target_arch = "x86_64")]
+                xstate_init,
                 #[cfg(target_arch = "aarch64")]
                 vector_state,
             );
@@ -1165,7 +822,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
 
     #[cfg(debug_assertions)]
     fn run_test_thread<R>(f: impl FnOnce() -> R) -> R {
-        // Sets `gsbase = fsbase` (x86_64) or `fs = gs` (x86) on the current thread
+        // Sets `gsbase = fsbase` (x86_64) on the current thread
         // to mirror the TLS base used in guest context, so that test threads can use the
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
@@ -1439,81 +1096,6 @@ impl SystemTimeTrait for SystemTime {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-impl litebox::platform::ArchSpecificProvider for LinuxUserland {
-    fn set_arch_specific_register(
-        &self,
-        reg: &litebox::platform::ArchSpecificRegister,
-        val: usize,
-    ) -> Result<(), litebox::platform::ArchSpecificError> {
-        match reg {
-            litebox::platform::ArchSpecificRegister::FsBase
-                if Self::guest_tls_mode() == GuestTlsMode::Linux =>
-            {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
-                    // We swap gs and fs before and after a syscall, so while handling a guest
-                    // syscall the guest's fs base is stored in the gs base register; the
-                    // per-thread `guest_fsbase` slot holds the value that will be programmed
-                    // into fs base on guest re-entry.
-                    set_guest_fsbase(val);
-                    Ok(())
-                } else {
-                    Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
-                }
-            }
-            litebox::platform::ArchSpecificRegister::FsBase => {
-                // Windows guests leave host TLS active in FS.
-                Err(litebox::platform::ArchSpecificError::RegisterReserved)
-            }
-            litebox::platform::ArchSpecificRegister::GsBase => {
-                match Self::guest_tls_mode() {
-                    GuestTlsMode::Windows => {
-                        if litebox_common_linux::arch::is_valid_user_fs_base(val) {
-                            // SAFETY: this platform requires FSGSBASE support.
-                            unsafe { litebox_common_linux::wrgsbase(val) };
-                            Ok(())
-                        } else {
-                            Err(litebox::platform::ArchSpecificError::RegisterUnpermittedValue)
-                        }
-                    }
-                    GuestTlsMode::Linux => {
-                        // GS holds host TLS across guest/host fs-gs swaps for Linux guests.
-                        Err(litebox::platform::ArchSpecificError::RegisterReserved)
-                    }
-                }
-            }
-            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
-        }
-    }
-    fn get_arch_specific_register(
-        &self,
-        reg: &litebox::platform::ArchSpecificRegister,
-    ) -> Result<usize, litebox::platform::ArchSpecificError> {
-        match reg {
-            litebox::platform::ArchSpecificRegister::FsBase
-                if Self::guest_tls_mode() == GuestTlsMode::Linux =>
-            {
-                Ok(get_guest_fsbase())
-            }
-            litebox::platform::ArchSpecificRegister::FsBase => {
-                Err(litebox::platform::ArchSpecificError::RegisterReserved)
-            }
-            litebox::platform::ArchSpecificRegister::GsBase => {
-                match Self::guest_tls_mode() {
-                    GuestTlsMode::Windows => {
-                        // SAFETY: this platform requires FSGSBASE support.
-                        Ok(unsafe { litebox_common_linux::rdgsbase() })
-                    }
-                    GuestTlsMode::Linux => {
-                        Err(litebox::platform::ArchSpecificError::RegisterReserved)
-                    }
-                }
-            }
-            _ => Err(litebox::platform::ArchSpecificError::RegisterUnsupported),
-        }
-    }
-}
-
 type UserMutPtr<T> = litebox::platform::common_providers::userspace_pointers::UserMutPtr<
     litebox::platform::common_providers::userspace_pointers::NoValidation,
     T,
@@ -1606,17 +1188,14 @@ fn futex_val2(
 }
 
 unsafe extern "C" {
+    #[cfg(target_arch = "aarch64")]
     fn syscall_callback() -> isize;
-    #[cfg(target_arch = "x86_64")]
-    fn syscall_callback_guest_gs() -> isize;
     #[cfg(target_arch = "aarch64")]
     fn syscall_callback_in_guest_cleared();
+    #[cfg(target_arch = "aarch64")]
     fn exception_callback();
+    #[cfg(target_arch = "aarch64")]
     fn interrupt_callback();
-    #[cfg(target_arch = "x86_64")]
-    fn switch_to_guest_start();
-    #[cfg(target_arch = "x86_64")]
-    fn switch_to_guest_end();
     #[cfg(target_arch = "aarch64")]
     fn switch_to_guest_via_outbound_stub_start();
     #[cfg(target_arch = "aarch64")]
@@ -2026,134 +1605,6 @@ fn with_signal_alt_stack<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// Called from signal handlers to fix up thread state after potentially running
-/// in the guest.
-///
-/// Restores the proper host `fsbase` so that TLS can be used. Clears `in_guest`
-/// and optionally sets `interrupt`. If `in_guest` was previously set, returns
-/// the guest context pointer (which does not necessarily have up-to-date guest
-/// register state yet).
-#[cfg(target_arch = "x86_64")]
-fn signal_handler_exit_guest(
-    _context: &libc::ucontext_t,
-    set_interrupt: bool,
-    _capture_vector_state: bool,
-) -> Option<*mut litebox_common_linux::PtRegs> {
-    unsafe {
-        macro_rules! take_guest {
-            ($access:ident) => {{
-                let in_guest: u8;
-                core::arch::asm!(
-                    concat!("mov {in_guest}, BYTE PTR ", $access!("in_guest")),
-                    concat!("mov BYTE PTR ", $access!("in_guest"), ", 0"),
-                    in_guest = out(reg_byte) in_guest,
-                    options(nostack, preserves_flags)
-                );
-                if set_interrupt {
-                    core::arch::asm!(
-                        concat!("mov BYTE PTR ", $access!("interrupt"), ", 1"),
-                        options(nostack, preserves_flags)
-                    );
-                }
-                in_guest != 0
-            }};
-        }
-        match GUEST_TLS_MODE.load(Ordering::Relaxed) {
-            mode if mode == GuestTlsMode::Windows as u8 => {
-                if !take_guest!(tls) {
-                    return None;
-                }
-            }
-            _ => {
-                let gsbase = litebox_common_linux::rdgsbase();
-                if gsbase == 0 || !take_guest!(saved_tls) {
-                    return None;
-                }
-                litebox_common_linux::wrfsbase(gsbase);
-            }
-        }
-        let guest_context_top: *mut litebox_common_linux::PtRegs;
-        core::arch::asm!(
-            concat!("mov {guest_context_top}, ", tls!("guest_context_top")),
-            guest_context_top = out(reg) guest_context_top,
-            options(nostack, preserves_flags)
-        );
-        Some(guest_context_top.sub(1))
-    }
-}
-
-/// Copies register state from a Linux signal context to a LiteBox PtRegs
-/// structure.
-#[cfg(target_arch = "x86_64")]
-fn copy_signal_context(regs: &mut litebox_common_linux::PtRegs, context: &libc::ucontext_t) {
-    let litebox_common_linux::PtRegs {
-        r15,
-        r14,
-        r13,
-        r12,
-        rbp,
-        rbx,
-        r11,
-        r10,
-        r9,
-        r8,
-        rax,
-        rcx,
-        rdx,
-        rsi,
-        rdi,
-        orig_rax,
-        rip,
-        cs: _,
-        eflags,
-        rsp,
-        ss: _,
-    } = regs;
-    for (reg, sig_reg) in [
-        (r15, libc::REG_R15),
-        (r14, libc::REG_R14),
-        (r13, libc::REG_R13),
-        (r12, libc::REG_R12),
-        (rbp, libc::REG_RBP),
-        (rbx, libc::REG_RBX),
-        (r11, libc::REG_R11),
-        (r10, libc::REG_R10),
-        (r9, libc::REG_R9),
-        (r8, libc::REG_R8),
-        (rax, libc::REG_RAX),
-        (rcx, libc::REG_RCX),
-        (rdx, libc::REG_RDX),
-        (rsi, libc::REG_RSI),
-        (rdi, libc::REG_RDI),
-        (rip, libc::REG_RIP),
-        (rsp, libc::REG_RSP),
-        (eflags, libc::REG_EFL),
-    ] {
-        *reg = context.uc_mcontext.gregs[sig_reg.reinterpret_as_unsigned() as usize]
-            .reinterpret_as_unsigned()
-            .trunc();
-    }
-    *orig_rax = *rax;
-}
-
-/// Updates a Linux signal context to return to `f` with the given arguments.
-#[cfg(target_arch = "x86_64")]
-fn set_signal_return(
-    context: &mut libc::ucontext_t,
-    f: unsafe extern "C" fn(),
-    p0: isize,
-    p1: isize,
-    p2: isize,
-    p3: isize,
-) {
-    let sigctx = &mut context.uc_mcontext;
-    sigctx.gregs[libc::REG_RIP as usize] = (f as usize).reinterpret_as_signed() as i64;
-    sigctx.gregs[libc::REG_RDI as usize] = p0 as i64;
-    sigctx.gregs[libc::REG_RSI as usize] = p1 as i64;
-    sigctx.gregs[libc::REG_RDX as usize] = p2 as i64;
-    sigctx.gregs[libc::REG_RCX as usize] = p3 as i64;
-}
-
 #[cfg(target_arch = "aarch64")]
 fn is_synchronous_memory_fault(signum: libc::c_int, code: libc::c_int) -> bool {
     match signum {
@@ -2294,7 +1745,7 @@ unsafe extern "C" fn exception_signal_handler(
     }
 
     #[cfg(target_arch = "x86_64")]
-    let Some(regs) = signal_handler_exit_guest(context, false, true) else {
+    let Some(regs) = signal_handler_exit_guest(context, false) else {
         return unsafe { next_signal_handler(signum, info, context) };
     };
     #[cfg(target_arch = "aarch64")]
@@ -2578,7 +2029,7 @@ unsafe fn interrupt_signal_handler(
 
     let in_switch_to_guest = in_switch_to_guest(ip);
     #[cfg(target_arch = "x86_64")]
-    let Some(regs) = signal_handler_exit_guest(context, true, !in_switch_to_guest) else {
+    let Some(regs) = signal_handler_exit_guest(context, true) else {
         return;
     };
     #[cfg(target_arch = "aarch64")]
@@ -2604,7 +2055,16 @@ unsafe fn interrupt_signal_handler(
             GateInterruption::Asynchronous,
         );
     }
-    set_signal_return(context, interrupt_callback, 0, 0, 0, 0);
+    // Cases 3 and 4: jump to interrupt handler.
+    #[cfg(target_arch = "x86_64")]
+    let callback = if in_switch_to_guest {
+        interrupt_callback_no_xsave
+    } else {
+        interrupt_callback
+    };
+    #[cfg(target_arch = "aarch64")]
+    let callback = interrupt_callback;
+    set_signal_return(context, callback, 0, 0, 0, 0);
 }
 
 impl litebox::platform::DerivedKeyProvider for LinuxUserland {
