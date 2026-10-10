@@ -34,13 +34,11 @@ extern crate alloc;
 
 mod page_mgmt;
 mod x86_64;
-#[doc(hidden)]
-pub use page_mgmt::LinuxUserlandReservation;
 use x86_64::{
     GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, exception_callback,
-    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls, set_signal_return,
-    signal_handler_exit_guest, switch_to_guest, switch_to_guest_end, switch_to_guest_start,
-    syscall_callback, tls,
+    interrupt_callback, interrupt_callback_no_xsave, run_thread_arch, saved_tls,
+    set_saved_host_tls_base, set_signal_return, signal_handler_exit_guest, switch_to_guest,
+    switch_to_guest_end, switch_to_guest_start, syscall_callback, tls,
 };
 
 /// The userland Linux platform.
@@ -505,12 +503,61 @@ fn run_thread_inner(
 /// context to re-enter the shim.
 fn block_guest_signals() {
     unsafe {
+        let set = guest_signal_set();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+    }
+}
+
+fn guest_signal_set() -> libc::sigset_t {
+    // SAFETY: `set` is initialized before use, and each signal number is valid.
+    unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&raw mut set);
         libc::sigaddset(&raw mut set, libc::SIGALRM);
         libc::sigaddset(&raw mut set, libc::SIGINT);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
+        let interrupt_signal = INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed);
+        if interrupt_signal != 0 {
+            libc::sigaddset(&raw mut set, interrupt_signal);
+        }
+        set
     }
+}
+
+fn spawn_guest_thread<F, T>(f: F) -> std::io::Result<std::thread::JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let signals = guest_signal_set();
+    let mut old_mask = unsafe { std::mem::zeroed() };
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask) };
+    if result != 0 {
+        return Err(std::io::Error::from_raw_os_error(result));
+    }
+
+    let child_mask = old_mask;
+    let spawn_result = std::thread::Builder::new().spawn(move || {
+        // SAFETY: the child inherits guest signals blocked. GS is set to this thread's host TLS
+        // base before restoring the mask, so a signal handler cannot observe the parent's TLS.
+        unsafe {
+            set_saved_host_tls_base();
+            let result = libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const child_mask,
+                std::ptr::null_mut(),
+            );
+            assert_eq!(result, 0, "failed to restore guest thread signal mask");
+        }
+        f()
+    });
+
+    // SAFETY: `old_mask` was initialized by the successful call above and remains valid.
+    let result = unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old_mask, std::ptr::null_mut())
+    };
+    assert_eq!(result, 0, "failed to restore spawning thread signal mask");
+    spawn_result
 }
 
 /// Spawn a non-guest ("host") thread that automatically blocks guest interrupt
@@ -623,8 +670,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
             })
         });
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new()
-            .spawn(move || thread_start(init_thread, ctx, xstate_init))?;
+        let _handle = spawn_guest_thread(move || thread_start(init_thread, ctx, xstate_init))?;
 
         Ok(())
     }
@@ -644,12 +690,7 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         // same TLS access code as guest threads.
         #[cfg(target_arch = "x86_64")]
         unsafe {
-            core::arch::asm!(
-                "rdfsbase {tmp}",
-                "wrgsbase {tmp}",
-                tmp = out(reg) _,
-                options(nostack, preserves_flags),
-            );
+            set_saved_host_tls_base();
         }
 
         ThreadHandle::run_with_handle(f)
