@@ -645,6 +645,8 @@ pub fn decode_ta_request<Platform: crate::OpteeShimPlatform>(
 /// `ta_params` is a reference to `UteeParams` structure that stores TA's output within its memory.
 /// `ta_req_info` refers to the decoded TA request information including the normal world
 /// shared memory addresses to write back output data.
+/// `memref_addresses` locates memref output data in TA memory; `None` means the
+/// data was already written to shared memory in place (client PTAs).
 #[allow(clippy::too_many_arguments)]
 pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
@@ -713,9 +715,10 @@ pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
                     }
                     // Update the output size in msg_args before attempting any copy-out.
                     msg_args.set_param_memref_size(wire_index, len as u64)?;
-                    let address = memref_addresses
-                        .and_then(|addresses| addresses[index])
-                        .ok_or(OpteeSmcReturnCode::EBadAddr)?;
+                    let Some(memref_addresses) = memref_addresses else {
+                        continue;
+                    };
+                    let address = memref_addresses[index].ok_or(OpteeSmcReturnCode::EBadAddr)?;
                     let ptr = crate::UserConstPtr::<Platform, u8>::from_usize(address);
                     shm_info.copy_from_user(platform, ptr, len)?;
                 }
@@ -724,6 +727,39 @@ pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
         }
     }
     Ok(())
+}
+
+/// Build `UteeParams` for a client PTA from a decoded request.
+///
+/// Memref addresses are 0: the buffer is `ta_req_info.shm_info[i]`, whose
+/// length equals the memref size except for NULL buffers (length 0). Nothing
+/// is copied from shared memory.
+pub fn client_pta_params(ta_req_info: &TaRequestInfo<PAGE_SIZE>) -> UteeParams {
+    let mut params = UteeParams::new();
+    for (index, param) in ta_req_info.params.iter().enumerate() {
+        let shm_len = || ta_req_info.shm_info[index].as_ref().map_or(0, ShmInfo::len) as u64;
+        let (param_type, a, b) = match param {
+            UteeParamOwned::None => (TeeParamType::None, 0, 0),
+            UteeParamOwned::ValueInput { value_a, value_b } => {
+                (TeeParamType::ValueInput, *value_a, *value_b)
+            }
+            UteeParamOwned::ValueOutput => (TeeParamType::ValueOutput, 0, 0),
+            UteeParamOwned::ValueInout { value_a, value_b } => {
+                (TeeParamType::ValueInout, *value_a, *value_b)
+            }
+            UteeParamOwned::MemrefInput { .. } => (TeeParamType::MemrefInput, 0, shm_len()),
+            UteeParamOwned::MemrefOutput { buffer_size } => {
+                (TeeParamType::MemrefOutput, 0, *buffer_size as u64)
+            }
+            UteeParamOwned::MemrefInout { buffer_size, .. } => {
+                (TeeParamType::MemrefInout, 0, *buffer_size as u64)
+            }
+        };
+        // `index` is in range.
+        let _ = params.set_type(index, param_type);
+        let _ = params.set_values(index, a, b);
+    }
+    params
 }
 
 /// A scatter-gather list of OP-TEE physical page addresses in the normal world (VTL0) to
@@ -809,6 +845,33 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
             self.page_offset,
         )?;
         ptr.read_slice_at_offset(offset, buffer)?;
+        Ok(())
+    }
+
+    /// Write `data` to the normal-world shared memory pages referenced by `self`,
+    /// starting at byte `offset` within the view.
+    /// Returns `EBadAddr` if the requested range is not entirely within the view.
+    pub(crate) fn write_at<Platform: litebox_common_linux::vmap::VmapManager<ALIGN>>(
+        &self,
+        platform: &Platform,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<(), OpteeSmcReturnCode> {
+        if offset
+            .checked_add(data.len())
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(OpteeSmcReturnCode::EBadAddr);
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        let ptr = NormalWorldMutPtr::<Platform, u8, ALIGN>::new(
+            platform,
+            &self.page_addrs,
+            self.page_offset,
+        )?;
+        ptr.write_slice_at_offset(offset, data)?;
         Ok(())
     }
 
@@ -1006,22 +1069,7 @@ pub fn write_rpc_args_to_regd_shm<Platform: litebox_common_linux::vmap::VmapMana
     let rpc_args_size = optee_msg_args_total_size(rpc_args.num_params);
     let mut blob = alloc::vec![0u8; rpc_args_size];
     rpc_args.serialize(&mut blob)?;
-    if rpc_args_offset
-        .checked_add(blob.len())
-        .is_none_or(|end| end > shm_info.len)
-    {
-        return Err(OpteeSmcReturnCode::EBadAddr);
-    }
-    if blob.is_empty() {
-        return Ok(());
-    }
-    let ptr = NormalWorldMutPtr::<Platform, u8, PAGE_SIZE>::new(
-        platform,
-        &shm_info.page_addrs,
-        shm_info.page_offset,
-    )?;
-    ptr.write_slice_at_offset(rpc_args_offset, &blob)?;
-    Ok(())
+    shm_info.write_at(platform, rpc_args_offset, &blob)
 }
 
 fn shm_ref_map() -> &'static ShmRefMap<PAGE_SIZE> {

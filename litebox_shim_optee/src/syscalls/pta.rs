@@ -4,6 +4,7 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
+use crate::msg_handler::ShmInfo;
 use crate::{Task, UserConstPtr, UserMutPtr, idk::IdksPta, syscalls::Cleanup};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,8 +13,8 @@ use litebox::platform::{DerivedKeyError, KDFParams, RawConstPointer as _, RawMut
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmem::PAGE_SIZE;
 use litebox_common_optee::{
-    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, TaFlags, TeeParamType, TeeResult, TeeUuid,
-    UteeParams,
+    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, OpteeSmcReturnCode, TaFlags, TeeParamType,
+    TeeResult, TeeUuid, UteeParams,
 };
 use num_enum::TryFromPrimitive;
 use sha2::Sha256;
@@ -75,6 +76,48 @@ impl PseudoTa {
         match self {
             Self::System => SystemPta::FLAGS,
             Self::Idks => IdksPta::FLAGS,
+        }
+    }
+}
+
+/// PTAs reachable by normal-world clients via OP-TEE messages.
+///
+/// A separate registry from `PseudoTa`: a PTA is reachable only by the
+/// callers it is registered for (OP-TEE OS instead has one registry and each
+/// PTA gates callers itself). Like OP-TEE PTAs, these update `UteeParams` in
+/// place and write memref outputs directly into the client's shared memory.
+///
+/// Assumptions: all are stateless, and none has an open-session hook (so
+/// open-session params and client identity are ignored and opening fails
+/// only on TEE resource limits).
+#[derive(Clone, Copy, Debug)]
+pub enum ClientPta {
+    Device,
+}
+
+impl ClientPta {
+    pub fn from_uuid(uuid: &TeeUuid) -> Option<Self> {
+        match *uuid {
+            DevicePta::UUID => Some(Self::Device),
+            _ => None,
+        }
+    }
+
+    /// `params` follows [`crate::msg_handler::client_pta_params`]: memref
+    /// buffers are `shm_info[i]`, not addresses.
+    ///
+    /// # Errors
+    ///
+    /// `EBadAddr` if writing to shared memory fails; the TEE result otherwise.
+    pub fn invoke_command<Platform: crate::OpteeShimPlatform>(
+        self,
+        platform: &Platform,
+        cmd_id: u32,
+        params: &mut UteeParams,
+        shm_info: &[Option<ShmInfo<PAGE_SIZE>>; UteeParams::TEE_NUM_PARAMS],
+    ) -> Result<TeeResult, OpteeSmcReturnCode> {
+        match self {
+            Self::Device => DevicePta::invoke_command(platform, cmd_id, params, shm_info),
         }
     }
 }
@@ -471,4 +514,156 @@ fn huk_subkey_derive_inner(huk: &[u8], params: KDFParams<'_>) -> Result<(), TeeR
     params.output.copy_from_slice(&hmac_bytes[..subkey_len]);
     hmac_bytes.zeroize();
     Ok(())
+}
+
+/// Device enumeration PTA, following OP-TEE OS `core/pta/device.c`.
+///
+/// Called by the Linux driver (`__optee_enumerate_devices()`) with
+/// `TEE_LOGIN_PUBLIC`; Linux treats any open-session failure as "PTA absent",
+/// so opening must not be restricted (OP-TEE registers no open hook).
+///
+/// Differences from OP-TEE OS:
+/// - Only embedded TAs are listed: no LiteBox PTA needs a Linux driver bound
+///   to it, and there is no StMM.
+/// - No persistent storage (neither `CFG_REE_FS` nor `CFG_RPMB_FS`):
+///   `TEE_STORAGE_PRIVATE` TAs are never enumerated and `GET_DEVICES_RPMB`
+///   returns an empty list.
+/// - UUIDs are sorted rather than in link order.
+struct DevicePta;
+
+const PTA_CMD_GET_DEVICES: u32 = 0;
+const PTA_CMD_GET_DEVICES_SUPP: u32 = 1;
+const PTA_CMD_GET_DEVICES_RPMB: u32 = 2;
+
+const UUID_OCTETS: usize = 16;
+
+/// A TA may carry at most one of these.
+const DEVICE_ENUM_MASK: TaFlags = TaFlags::DEVICE_ENUM
+    .union(TaFlags::DEVICE_ENUM_SUPP)
+    .union(TaFlags::DEVICE_ENUM_TEE_STORAGE_PRIVATE);
+
+impl DevicePta {
+    /// 7011a688-ddde-4053-a5a9-7b3c4ddf13b8
+    const UUID: TeeUuid = TeeUuid {
+        time_low: 0x7011_a688,
+        time_mid: 0xddde,
+        time_hi_and_version: 0x4053,
+        clock_seq_and_node: [0xa5, 0xa9, 0x7b, 0x3c, 0x4d, 0xdf, 0x13, 0xb8],
+    };
+
+    fn invoke_command<Platform: crate::OpteeShimPlatform>(
+        platform: &Platform,
+        cmd_id: u32,
+        params: &mut UteeParams,
+        shm_info: &[Option<ShmInfo<PAGE_SIZE>>; UteeParams::TEE_NUM_PARAMS],
+    ) -> Result<TeeResult, OpteeSmcReturnCode> {
+        let rflags = match cmd_id {
+            PTA_CMD_GET_DEVICES => TaFlags::DEVICE_ENUM,
+            PTA_CMD_GET_DEVICES_SUPP => TaFlags::DEVICE_ENUM_SUPP,
+            PTA_CMD_GET_DEVICES_RPMB => TaFlags::empty(),
+            _ => return Ok(TeeResult::NotImplemented),
+        };
+
+        if !params.has_types([
+            TeeParamType::MemrefOutput,
+            TeeParamType::None,
+            TeeParamType::None,
+            TeeParamType::None,
+        ]) {
+            return Ok(TeeResult::BadParameters);
+        }
+        let Ok(Some((_, blen))) = params.get_values(0) else {
+            return Ok(TeeResult::BadParameters);
+        };
+        let blen = usize::try_from(blen).map_err(|_| OpteeSmcReturnCode::EBadAddr)?;
+        // A NULL buffer has an empty `shm_info` regardless of `blen`.
+        let Some(out) = shm_info[0].as_ref().filter(|shm| shm.len() == blen) else {
+            return Ok(TeeResult::BadParameters);
+        };
+
+        let tas = crate::embedded_ta_uuid_map()
+            .inner
+            .read()
+            .iter()
+            .map(|(uuid, info)| (*uuid, info.flags))
+            .collect();
+        let (size, data) = Self::device_list(rflags, tas, blen);
+        out.write_at(platform, 0, &data)?;
+        let _ = params.set_values(0, 0, size as u64);
+        Ok(if size > blen {
+            TeeResult::ShortBuffer
+        } else {
+            TeeResult::Success
+        })
+    }
+
+    /// Returns `(size, data)` like OP-TEE's `get_devices()`: `size` covers all
+    /// matching UUIDs (RFC 4122 octets); `data` holds the whole UUIDs that fit
+    /// in `blen`.
+    fn device_list(
+        rflags: TaFlags,
+        mut tas: Vec<(TeeUuid, TaFlags)>,
+        blen: usize,
+    ) -> (usize, Vec<u8>) {
+        tas.sort_unstable_by_key(|(uuid, _)| uuid.to_bytes());
+
+        let mut size = 0usize;
+        let mut data = Vec::new();
+        for (uuid, flags) in tas {
+            let flags = flags.intersection(DEVICE_ENUM_MASK);
+            if flags.bits().count_ones() > 1 {
+                litebox_util_log::warn!(uuid:? = uuid; "device PTA: skipping TA with inconsistent flags");
+                continue;
+            }
+            if flags.intersects(rflags) {
+                if size + UUID_OCTETS <= blen {
+                    data.extend_from_slice(&uuid.to_bytes());
+                }
+                size += UUID_OCTETS;
+            }
+        }
+        (size, data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uuid(seed: u8) -> TeeUuid {
+        TeeUuid::from_bytes([seed; 16])
+    }
+
+    fn octets(uuids: &[TeeUuid]) -> Vec<u8> {
+        uuids.iter().flat_map(|u| u.to_bytes()).collect()
+    }
+
+    #[test]
+    fn device_list_filters_and_encodes() {
+        let tas = alloc::vec![
+            (uuid(3), TaFlags::DEVICE_ENUM_SUPP),
+            (uuid(2), TaFlags::DEVICE_ENUM | TaFlags::SINGLE_INSTANCE),
+            (uuid(1), TaFlags::DEVICE_ENUM),
+            (uuid(4), TaFlags::SINGLE_INSTANCE),
+            // More than one stage: skipped.
+            (uuid(5), TaFlags::DEVICE_ENUM | TaFlags::DEVICE_ENUM_SUPP),
+            (
+                uuid(6),
+                TaFlags::DEVICE_ENUM | TaFlags::DEVICE_ENUM_TEE_STORAGE_PRIVATE
+            ),
+        ];
+        let list = |rflags, blen| DevicePta::device_list(rflags, tas.clone(), blen);
+
+        assert_eq!(list(TaFlags::DEVICE_ENUM, 0), (32, Vec::new()));
+        // Partial copy on short buffer.
+        assert_eq!(list(TaFlags::DEVICE_ENUM, 31), (32, octets(&[uuid(1)])));
+        assert_eq!(
+            list(TaFlags::DEVICE_ENUM, 64),
+            (32, octets(&[uuid(1), uuid(2)]))
+        );
+        assert_eq!(
+            list(TaFlags::DEVICE_ENUM_SUPP, 16),
+            (16, octets(&[uuid(3)]))
+        );
+    }
 }
