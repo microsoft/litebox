@@ -24,10 +24,18 @@ pub mod mm;
 pub mod physical_pointers;
 pub mod program_startup;
 pub mod signal;
-#[cfg(target_arch = "aarch64")]
-pub use signal::aarch64::GuestVectorState;
-#[cfg(not(target_arch = "aarch64"))]
-pub type GuestVectorState = ();
+mod guest_vector_state {
+    cfg_if::cfg_if! {
+        if #[cfg(target_arch = "x86_64")] {
+            pub type Selected = litebox_common::arch::x86_64::xstate::XsaveArea;
+        } else if #[cfg(target_arch = "aarch64")] {
+            pub type Selected = crate::signal::aarch64::GuestVectorState;
+        } else {
+            pub type Selected = ();
+        }
+    }
+}
+pub use guest_vector_state::Selected as GuestVectorState;
 pub mod user_pointers;
 pub mod vmap;
 pub mod vmem;

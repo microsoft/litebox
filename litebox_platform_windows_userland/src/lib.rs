@@ -430,7 +430,15 @@ fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
 ) {
-    let tls_state = TlsState::new();
+    run_thread_inner_with_xstate(shim, ctx, XsaveArea::initial(XsaveLayout::get()));
+}
+
+fn run_thread_inner_with_xstate(
+    shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
+    ctx: &mut litebox_common_linux::PtRegs,
+    guest_xsave_area: XsaveArea,
+) {
+    let tls_state = TlsState::with_guest_xsave_area(guest_xsave_area);
     tls_state
         .guest_context_top
         .set(std::ptr::from_mut(ctx).wrapping_add(1));
@@ -634,7 +642,10 @@ struct TlsState {
 impl TlsState {
     /// Creates a new `TlsState` with all fields zeroed / defaulted.
     fn new() -> Self {
-        let mut guest_xsave_area = XsaveArea::initial(XsaveLayout::get());
+        Self::with_guest_xsave_area(XsaveArea::initial(XsaveLayout::get()))
+    }
+
+    fn with_guest_xsave_area(mut guest_xsave_area: XsaveArea) -> Self {
         let guest_xsave_ptr = guest_xsave_area.as_mut_ptr();
         Self {
             host_sp: Cell::new(core::ptr::null_mut()),
@@ -1067,11 +1078,36 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
+    guest_xsave_area: XsaveArea,
 ) {
     // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
 
-    run_thread_inner(shim.as_ref(), &mut ctx);
+    run_thread_inner_with_xstate(shim.as_ref(), &mut ctx, guest_xsave_area);
+}
+
+impl<const ALIGN: usize> litebox::platform::GuestVectorStateProvider for WindowsUserland<ALIGN> {
+    type GuestVectorState = XsaveArea;
+
+    fn get_guest_vector_state(&self) -> Self::GuestVectorState {
+        let tls = get_tls_ptr().expect("current thread is not managed by LiteBox");
+        // SAFETY: managed threads own their TLS until `run_thread_arch` returns,
+        // and guest state is accessed only while execution is on the host.
+        unsafe { (&*(*tls).guest_xsave_area.get()).clone() }
+    }
+
+    fn set_guest_vector_state(&self, state: &Self::GuestVectorState) {
+        let tls = get_tls_ptr().expect("current thread is not managed by LiteBox");
+        // SAFETY: managed threads own their TLS until `run_thread_arch` returns,
+        // and guest state is accessed only while execution is on the host.
+        let tls = unsafe { &*tls };
+        // SAFETY: the guest XSAVE area has no overlapping access while on the host.
+        unsafe { *tls.guest_xsave_area.get() = state.clone() };
+        // Replacing `XsaveArea` changes its backing allocation.
+        let pointer = unsafe { (&mut *tls.guest_xsave_area.get()).as_mut_ptr() };
+        tls.guest_xsave_ptr.set(pointer);
+        tls.guest_xstate_format.set(GuestXstateFormat::Native);
+    }
 }
 
 impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<ALIGN> {
@@ -1087,9 +1123,11 @@ impl<const ALIGN: usize> litebox::platform::ThreadProvider for WindowsUserland<A
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
-        // TODO: Inherit the calling guest's saved extended CPU state.
+        let guest_xsave_area =
+            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new().spawn(move || thread_start(init_thread, ctx))?;
+        let _handle = std::thread::Builder::new()
+            .spawn(move || thread_start(init_thread, ctx, guest_xsave_area))?;
 
         Ok(())
     }

@@ -58,39 +58,60 @@ thread_local! {
     pub(super) static GUEST_XSTATE: RefCell<Option<XsaveArea>> = const { RefCell::new(None) };
 }
 
-pub(super) enum GuestXstateInit {
-    Initial,
-    Reenter,
-    Inherited(XsaveArea),
+fn install_xstate(guest: &mut XsaveArea, layout: &XsaveLayout) {
+    // SAFETY: The buffer remains owned by this thread's TLS until thread exit.
+    // No guest is running while these assembly TLS slots are initialized.
+    unsafe {
+        core::arch::asm!(
+            "mov fs:guest_xsave@tpoff, {guest}",
+            "mov fs:xsave_mask@tpoff, {mask}",
+            "mov BYTE PTR fs:use_xsaveopt@tpoff, {xsaveopt}",
+            guest = in(reg) guest.as_mut_ptr(),
+            mask = in(reg) layout.mask,
+            xsaveopt = in(reg_byte) u8::from(layout.xsaveopt),
+            options(nostack, preserves_flags),
+        );
+    }
 }
 
-pub(super) fn activate_xstate(init: GuestXstateInit) {
+impl litebox::platform::GuestVectorStateProvider for LinuxUserland {
+    type GuestVectorState = XsaveArea;
+
+    fn get_guest_vector_state(&self) -> XsaveArea {
+        GUEST_XSTATE.with_borrow(|guest| {
+            guest
+                .clone()
+                .unwrap_or_else(|| XsaveArea::initial(XsaveLayout::get()))
+        })
+    }
+
+    fn set_guest_vector_state(&self, state: &XsaveArea) {
+        set_guest_vector_state(state);
+    }
+}
+
+fn set_guest_vector_state(state: &XsaveArea) {
     let layout = XsaveLayout::get();
     GUEST_XSTATE.with_borrow_mut(|guest| {
-        match init {
-            GuestXstateInit::Initial => {
-                if let Some(guest) = guest.as_mut() {
-                    guest.reset_to_initial();
-                }
-            }
-            GuestXstateInit::Reenter => {}
-            GuestXstateInit::Inherited(inherited) => *guest = Some(inherited),
-        }
-        let guest = guest.get_or_insert_with(|| XsaveArea::initial(layout));
-        // SAFETY: The buffer remains owned by this thread's TLS until thread exit.
-        // No guest is running while these assembly TLS slots are initialized.
-        unsafe {
-            core::arch::asm!(
-                "mov fs:guest_xsave@tpoff, {guest}",
-                "mov fs:xsave_mask@tpoff, {mask}",
-                "mov BYTE PTR fs:use_xsaveopt@tpoff, {xsaveopt}",
-                guest = in(reg) guest.as_mut_ptr(),
-                mask = in(reg) layout.mask,
-                xsaveopt = in(reg_byte) u8::from(layout.xsaveopt),
-                options(nostack, preserves_flags),
-            );
-        }
+        let guest = guest.insert(state.clone());
+        install_xstate(guest, layout);
     });
+}
+
+/// Prepares guest vector state for entry, optionally using inherited state.
+pub(super) fn prepare_guest_vector_state(inherited: Option<&XsaveArea>) {
+    if let Some(state) = inherited {
+        set_guest_vector_state(state);
+    } else {
+        let layout = XsaveLayout::get();
+        GUEST_XSTATE.with_borrow_mut(|guest| {
+            if guest.is_some() {
+                return;
+            }
+            let guest = guest.insert(XsaveArea::initial(layout));
+            install_xstate(guest, layout);
+        });
+    }
 }
 
 core::arch::global_asm!(

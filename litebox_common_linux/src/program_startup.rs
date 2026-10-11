@@ -148,7 +148,7 @@ pub struct LinuxForkStartup {
     pub alternate_signal_stack: SigAltStack,
     /// Registers at the `fork` system call, which the child returns from.
     pub registers: PtRegs,
-    /// Floating-point and vector state at the `fork` system call (encoded only on AArch64).
+    /// Floating-point and vector state at the `fork` system call.
     pub vector_state: GuestVectorState,
     /// Thread pointer, such as the FS base on x86-64 or `TPIDR_EL0` on AArch64.
     pub thread_pointer: usize,
@@ -383,7 +383,7 @@ impl LinuxForkStartup {
         output.extend_from_slice(self.signal_actions.as_bytes());
         output.extend_from_slice(self.alternate_signal_stack.as_bytes());
         output.extend_from_slice(self.registers.as_bytes());
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         push_vector_state(&mut output, &self.vector_state);
         for value in [
             self.thread_pointer,
@@ -443,7 +443,7 @@ impl LinuxForkStartup {
         let signal_actions = read_value(&mut input)?;
         let alternate_signal_stack = read_value(&mut input)?;
         let registers = read_value(&mut input)?;
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let vector_state = read_vector_state(&mut input)?;
         let thread_pointer = read_usize(&mut input)?;
         let syscall_entry_point = read_usize(&mut input)?;
@@ -506,9 +506,9 @@ impl LinuxForkStartup {
             signal_actions,
             alternate_signal_stack,
             registers,
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             vector_state,
-            #[cfg(not(target_arch = "aarch64"))]
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
             vector_state: (),
             thread_pointer,
             syscall_entry_point,
@@ -675,6 +675,25 @@ fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgram
     Ok(state)
 }
 
+/// Appends a length-delimited standard-layout XSAVE area.
+#[cfg(target_arch = "x86_64")]
+fn push_vector_state(output: &mut Vec<u8>, state: &GuestVectorState) {
+    push_u32(
+        output,
+        u32::try_from(state.as_bytes().len()).expect("XSAVE area length must fit in u32"),
+    );
+    output.extend_from_slice(state.as_bytes());
+}
+
+#[cfg(target_arch = "x86_64")]
+fn read_vector_state(input: &mut &[u8]) -> Result<GuestVectorState, LinuxProgramStartupError> {
+    let length =
+        usize::try_from(read_u32(input)?).map_err(|_| LinuxProgramStartupError::Malformed)?;
+    let bytes = take_bytes(input, length)?;
+    let layout = litebox_common::arch::x86_64::xstate::XsaveLayout::get();
+    GuestVectorState::from_bytes(bytes, layout).ok_or(LinuxProgramStartupError::Malformed)
+}
+
 fn read_u32(input: &mut &[u8]) -> Result<u32, LinuxProgramStartupError> {
     let bytes = take_bytes(input, size_of::<u32>())?;
     Ok(u32::from_le_bytes(
@@ -807,7 +826,12 @@ mod tests {
         state
     }
 
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    fn fork_vector_state() -> GuestVectorState {
+        GuestVectorState::initial(litebox_common::arch::x86_64::xstate::XsaveLayout::get())
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     fn fork_vector_state() -> GuestVectorState {}
 
     fn fork_startup() -> LinuxForkStartup {

@@ -1338,8 +1338,15 @@ pub(super) fn get_guest_vector_state() -> GuestVectorState {
     }
 }
 
+/// Prepares guest vector state for entry, optionally using inherited state.
+pub(super) fn prepare_guest_vector_state(inherited: Option<&GuestVectorState>) {
+    if let Some(state) = inherited {
+        set_guest_vector_state(state);
+    }
+}
+
 /// Replaces the current thread's platform-owned guest vector state.
-pub(super) fn set_guest_vector_state(state: &GuestVectorState) {
+fn set_guest_vector_state(state: &GuestVectorState) {
     let block: usize;
     // SAFETY: callers run on an initialized guest thread with guest execution
     // stopped, giving exclusive access to this aligned TLS slot. Volatile
@@ -1356,6 +1363,21 @@ pub(super) fn set_guest_vector_state(state: &GuestVectorState) {
 }
 
 unsafe extern "C" {
+    pub(super) fn syscall_callback() -> isize;
+    pub(super) fn syscall_callback_in_guest_cleared();
+    pub(super) fn exception_callback();
+    pub(super) fn interrupt_callback();
+    pub(super) fn switch_to_guest_via_outbound_stub_start();
+    pub(super) fn switch_to_guest_via_outbound_stub_end();
+    pub(super) fn switch_to_guest_via_sigreturn_start();
+    pub(super) fn switch_to_guest_via_sigreturn_end();
+    #[cfg(test)]
+    fn switch_to_guest_stage_x16();
+    #[cfg(test)]
+    fn switch_to_guest_stage_x16_end();
+    #[cfg(test)]
+    fn switch_to_guest_stage_x16_fixup();
+
     /// The compiler runtime's cache-synchronization helper: cleans the data
     /// cache to the point of unification and invalidates the instruction cache
     /// over `[start, end)`.
@@ -2071,7 +2093,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let mut reader = fixture_reader(&code, &trampoline, &[], &guest_tp);
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2123,7 +2145,7 @@ mod tests {
             };
             context.uc_mcontext.regs[5] = saved.regs[5] as u64;
             let mut reader = fixture_reader(&code, &trampoline, &frame, &guest_tp);
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2165,7 +2187,7 @@ mod tests {
             } else {
                 0x1004
             };
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2196,7 +2218,7 @@ mod tests {
         for offset in [36usize, 40, 44] {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             for (stub, pc) in [(0, 0x1004), (0x400010 + 36, 0), (0x400010 + 36, 0x2004)] {
-                let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+                let result = super::canonicalize_aarch64_gate_signal_context(
                     &context,
                     &saved,
                     0x500000,
@@ -2870,7 +2892,7 @@ mod tests {
         // `NotGate`. No failure may mutate the saved registers.
         for denied_address in [0x400010usize, 0x1000, 0x8000] {
             let mut reader = fixture_reader(&code, &trampoline, &frame, &[]);
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2891,7 +2913,7 @@ mod tests {
 
         let mut wrong_branch = code.clone();
         wrong_branch.copy_from_slice(&0x1400_0000u32.to_le_bytes());
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2904,7 +2926,7 @@ mod tests {
 
         let mut wrong_template = trampoline.clone();
         wrong_template[16 + 8..16 + 12].copy_from_slice(&0xd503_201fu32.to_le_bytes());
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2916,7 +2938,7 @@ mod tests {
         assert_eq!(ptregs_bytes(&saved), before);
 
         frame[16..24].copy_from_slice(&0xdead_beef_u64.to_le_bytes());
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2928,7 +2950,7 @@ mod tests {
         assert_eq!(ptregs_bytes(&saved), before);
 
         context.uc_mcontext.pc = 0x400010 + 24;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -2974,7 +2996,7 @@ mod tests {
             (0x400010 + 60, false, "SVC metadata"),
         ] {
             context.uc_mcontext.pc = pc;
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -2999,7 +3021,7 @@ mod tests {
         ] {
             let mut mutated = trampoline.clone();
             mutated[16 + word_offset..16 + word_offset + 4].copy_from_slice(&0u32.to_le_bytes());
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3012,7 +3034,7 @@ mod tests {
 
         let mut bad_metadata = trampoline.clone();
         bad_metadata[16 + 60] ^= 0x80;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3028,7 +3050,7 @@ mod tests {
             (0x1400_0001, "inbound B wrong target"),
         ] {
             let wrong_code = branch.to_le_bytes();
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3058,7 +3080,7 @@ mod tests {
         assert_eq!(trapped, []);
         second_slot.copy_from_slice(&relocated[16..80]);
         context.uc_mcontext.pc = second_pc as u64;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3089,7 +3111,7 @@ mod tests {
         // Gate stack arithmetic wraps exactly like the AArch64 ADD/SUB pair.
         context.uc_mcontext.pc = 0x400010 + 4;
         context.uc_mcontext.sp = u64::MAX - 15;
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3108,7 +3130,7 @@ mod tests {
         let (code, trampoline, mut context, saved) = gate_fixture(0xd53b_d049);
         context.uc_mcontext.pc = 0x400010 + 4;
         let before = (saved.regs, saved.sp, saved.pc, saved.pstate, saved.orig_x0);
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3144,7 +3166,7 @@ mod tests {
             } else {
                 0xfeed_f000_0000_0010
             };
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3177,7 +3199,7 @@ mod tests {
                 0x8000
             };
             context.uc_mcontext.regs[5] = saved.regs[5] as u64;
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3202,7 +3224,7 @@ mod tests {
         context.uc_mcontext.regs[5] = saved.regs[5] as u64;
         let captured = saved.regs[5].to_ne_bytes();
         let mut reader = fixture_reader(&msr_code, &msr_slot, &[], &[]);
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3230,7 +3252,7 @@ mod tests {
         for offset in [12usize, 20, 24] {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             context.uc_mcontext.sp = 0x8000;
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3248,7 +3270,7 @@ mod tests {
         for offset in (0usize..=32).step_by(4) {
             context.uc_mcontext.pc = 0x400010 + offset as u64;
             context.uc_mcontext.sp = if offset == 0 { 0x8020 } else { 0x8000 };
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3319,7 +3341,7 @@ mod tests {
         trampoline[28..32].copy_from_slice(&0x1f11_b807u32.to_le_bytes());
         context.uc_mcontext.pc = 0x400010;
 
-        let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+        let result = super::canonicalize_aarch64_gate_signal_context(
             &context,
             &saved,
             0x500000,
@@ -3344,7 +3366,7 @@ mod tests {
             frame[8..16].copy_from_slice(&0x1717u64.to_ne_bytes());
             frame[16..24].copy_from_slice(&(expected as u64).to_ne_bytes());
 
-            let result = super::aarch64::canonicalize_aarch64_gate_signal_context(
+            let result = super::canonicalize_aarch64_gate_signal_context(
                 &context,
                 &saved,
                 0x500000,
@@ -3624,7 +3646,7 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "aarch64::tests::nested_exception_during_sigsys_preserves_guest_context",
+                    "arch::tests::nested_exception_during_sigsys_preserves_guest_context",
                     "--nocapture",
                 ])
                 .env(CHILD_ENV, "1")

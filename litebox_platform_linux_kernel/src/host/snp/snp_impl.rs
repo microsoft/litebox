@@ -268,6 +268,19 @@ impl litebox::platform::ThreadProvider for SnpLinuxKernel {
     }
 }
 
+// TODO: Preserve guest XSAVE state once SNP floating-point support is implemented.
+impl litebox::platform::GuestVectorStateProvider for SnpLinuxKernel {
+    type GuestVectorState = litebox_common_linux::GuestVectorState;
+
+    fn get_guest_vector_state(&self) -> Self::GuestVectorState {
+        litebox_common_linux::GuestVectorState::initial(
+            litebox_common::arch::x86_64::xstate::XsaveLayout::get(),
+        )
+    }
+
+    fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
+}
+
 impl litebox::platform::TimerProvider for SnpLinuxKernel {
     type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
     type Signal = litebox_common_linux::signal::Signal;

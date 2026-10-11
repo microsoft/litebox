@@ -1212,10 +1212,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
     /// of the calling one; the parent's other threads pause while the parent is copied.
     ///
-    /// Floating-point and vector state is copied only on AArch64; x86-64 needs a real
-    /// [`GuestVectorStateProvider`](litebox::platform::GuestVectorStateProvider) and a payload
-    /// encoding first.
-    ///
     /// Only a process outside a `vfork` window, with default resource-limit and alarm state, no
     /// shared memory mappings, no ELF file mid-load, and only descriptors a fresh runner can
     /// inherit is duplicated; otherwise this fails with `EAGAIN`.

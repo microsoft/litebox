@@ -80,7 +80,7 @@ impl Default for XsaveHeader {
 
 /// An initialized, 64-byte-aligned storage chunk for CPU or host context buffers.
 #[repr(C, align(64))]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XsaveChunk(
     /// The chunk's raw storage bytes.
     pub [u8; 64],
@@ -179,9 +179,10 @@ impl XsaveLayout {
 }
 
 /// Represents the standard-layout XSAVE area for a guest context.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct XsaveArea {
     storage: Box<[XsaveChunk]>,
+    size: usize,
 }
 
 impl XsaveArea {
@@ -207,6 +208,7 @@ impl XsaveArea {
         let chunks = layout.size.div_ceil(size_of::<XsaveChunk>());
         let mut area = Self {
             storage: vec![XsaveChunk([0; 64]); chunks].into_boxed_slice(),
+            size: layout.size,
         };
         area.legacy_area_mut().mxcsr = Self::GUEST_INITIAL_MXCSR;
         area
@@ -290,9 +292,76 @@ impl XsaveArea {
         self.storage.as_mut_ptr().cast()
     }
 
+    /// Returns the logical XSAVE bytes, excluding trailing allocation padding.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `size` is the requested layout size used to allocate enough
+        // whole chunks, and the allocation remains live for the returned borrow.
+        unsafe { core::slice::from_raw_parts(self.as_ptr(), self.size) }
+    }
+
+    /// Reconstructs a standard-layout XSAVE area from untrusted bytes.
+    ///
+    /// Returns `None` if the size, component mask, format, or reserved fields
+    /// could make restoring the state invalid for `layout`.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8], layout: &XsaveLayout) -> Option<Self> {
+        if bytes.len() != layout.size {
+            return None;
+        }
+        let mut area = Self::initial(layout);
+        // SAFETY: source and destination are distinct valid buffers of exactly
+        // `layout.size` bytes.
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), area.as_mut_ptr(), bytes.len()) };
+        let header = area.header();
+        if header.xcomp_bv != 0
+            || header.xstate_bv & !layout.mask != 0
+            || header.reserved != [0; 48]
+            || area.legacy_area().mxcsr & !0xffff != 0
+        {
+            return None;
+        }
+        Some(area)
+    }
+
     /// Returns the header's bitmap of state components that are not initial.
     #[must_use]
     pub fn xstate_bv(&self) -> u64 {
         self.header().xstate_bv
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{XsaveArea, XsaveLayout};
+
+    #[test]
+    fn bytes_round_trip() {
+        let layout = XsaveLayout::get();
+        let area = XsaveArea::initial(layout);
+
+        assert_eq!(XsaveArea::from_bytes(area.as_bytes(), layout), Some(area));
+    }
+
+    #[test]
+    fn bytes_reject_invalid_state() {
+        let layout = XsaveLayout::get();
+        let mut area = XsaveArea::initial(layout);
+        assert!(XsaveArea::from_bytes(&area.as_bytes()[1..], layout).is_none());
+
+        area.header_mut().xcomp_bv = 1 << 63;
+        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
+        area.header_mut().xcomp_bv = 0;
+
+        area.header_mut().xstate_bv = 1 << 63;
+        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
+        area.header_mut().xstate_bv = 0;
+
+        area.header_mut().reserved[0] = 1;
+        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
+        area.header_mut().reserved[0] = 0;
+
+        area.legacy_area_mut().mxcsr = 1 << 16;
+        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
     }
 }

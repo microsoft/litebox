@@ -31,18 +31,25 @@ use std::time::Duration;
 
 use zerocopy::{FromBytes, IntoBytes};
 
-#[cfg(target_arch = "aarch64")]
-mod aarch64;
+#[cfg_attr(target_arch = "aarch64", path = "aarch64.rs")]
+#[cfg_attr(target_arch = "x86_64", path = "x86_64.rs")]
+mod arch;
 #[cfg(all(test, target_arch = "aarch64"))]
-use aarch64::get_guest_vector_state;
+use arch::get_guest_vector_state;
 #[cfg(target_arch = "aarch64")]
-use aarch64::{
+use arch::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
     canonicalize_runtime_aarch64_gate_signal_context, fatal_aarch64_runtime_state,
-    guest_thread_pointer_tp_offset, is_guest_thread, load_tls_block_base, run_thread_arch,
-    set_guest_vector_state, set_is_guest_thread, set_signal_return,
+    guest_thread_pointer_tp_offset, load_tls_block_base, set_is_guest_thread,
     signal_handler_capture_guest_vector_state, signal_handler_set_interrupt,
-    signal_handler_take_guest, switch_to_guest, sync_instruction_stream, tls_offset,
+    signal_handler_take_guest, switch_to_guest_via_outbound_stub_end,
+    switch_to_guest_via_outbound_stub_start, switch_to_guest_via_sigreturn_end,
+    switch_to_guest_via_sigreturn_start, sync_instruction_stream,
+    syscall_callback_in_guest_cleared, tls_offset,
+};
+use arch::{
+    exception_callback, interrupt_callback, is_guest_thread, prepare_guest_vector_state,
+    run_thread_arch, set_signal_return, switch_to_guest, syscall_callback,
 };
 
 extern crate alloc;
@@ -51,15 +58,9 @@ extern crate alloc;
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
 mod page_mgmt;
 #[cfg(target_arch = "x86_64")]
-mod x86_64;
-#[doc(hidden)]
-pub use page_mgmt::LinuxUserlandReservation;
-#[cfg(target_arch = "x86_64")]
-use x86_64::{
-    GUEST_XSTATE, GuestXstateInit, activate_xstate, copy_signal_context, exception_callback,
-    interrupt_callback, interrupt_callback_no_xsave, is_guest_thread, run_thread_arch, saved_tls,
-    set_signal_return, signal_handler_exit_guest, switch_to_guest, switch_to_guest_end,
-    switch_to_guest_start, syscall_callback, syscall_callback_guest_gs, tls,
+use arch::{
+    copy_signal_context, interrupt_callback_no_xsave, saved_tls, signal_handler_exit_guest,
+    switch_to_guest_end, switch_to_guest_start, syscall_callback_guest_gs, tls,
 };
 
 /// The admitted open syscall and its flags index must remain paired.
@@ -501,10 +502,7 @@ pub unsafe fn run_thread<T>(shim: T, ctx: &mut litebox_common_linux::PtRegs)
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    #[cfg(target_arch = "x86_64")]
-    run_thread_inner(&shim, ctx, GuestXstateInit::Initial);
-    #[cfg(target_arch = "aarch64")]
-    run_thread_inner(&shim, ctx, false);
+    run_thread_inner(&shim, ctx, GuestVectorStateMode::Fresh);
 }
 
 /// Run a guest thread using a reference to the shim.
@@ -518,10 +516,7 @@ pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    #[cfg(target_arch = "x86_64")]
-    run_thread_inner(shim, ctx, GuestXstateInit::Initial);
-    #[cfg(target_arch = "aarch64")]
-    run_thread_inner(shim, ctx, false);
+    run_thread_inner(shim, ctx, GuestVectorStateMode::Fresh);
 }
 
 /// Re-enter a guest thread using a reference to the shim.
@@ -535,10 +530,13 @@ pub unsafe fn reenter_thread<T>(shim: &T, ctx: &mut litebox_common_linux::PtRegs
 where
     T: litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
 {
-    #[cfg(target_arch = "x86_64")]
-    run_thread_inner(shim, ctx, GuestXstateInit::Reenter);
-    #[cfg(target_arch = "aarch64")]
-    run_thread_inner(shim, ctx, true);
+    run_thread_inner(shim, ctx, GuestVectorStateMode::Resume);
+}
+
+enum GuestVectorStateMode {
+    Fresh,
+    Resume,
+    Inherited(Box<litebox_common_linux::GuestVectorState>),
 }
 
 struct ThreadContext<'a> {
@@ -549,19 +547,22 @@ struct ThreadContext<'a> {
 fn run_thread_inner(
     shim: &dyn litebox::shim::EnterShim<ExecutionContext = litebox_common_linux::PtRegs>,
     ctx: &mut litebox_common_linux::PtRegs,
-    #[cfg(target_arch = "x86_64")] xstate_init: GuestXstateInit,
-    #[cfg(target_arch = "aarch64")] reenter: bool,
+    vector_state_mode: GuestVectorStateMode,
 ) {
-    #[cfg(target_arch = "x86_64")]
-    let reenter = matches!(xstate_init, GuestXstateInit::Reenter);
-    #[cfg(target_arch = "x86_64")]
-    activate_xstate(xstate_init);
+    prepare_guest_vector_state(match &vector_state_mode {
+        GuestVectorStateMode::Inherited(state) => Some(state.as_ref()),
+        GuestVectorStateMode::Fresh | GuestVectorStateMode::Resume => None,
+    });
     let ctx_ptr = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     let _guest_thread = GuestThreadMarker::enter();
     ThreadHandle::run_with_handle(|| {
         with_signal_alt_stack(|| unsafe {
-            run_thread_arch(&mut thread_ctx, ctx_ptr, u8::from(reenter));
+            run_thread_arch(
+                &mut thread_ctx,
+                ctx_ptr,
+                u8::from(matches!(vector_state_mode, GuestVectorStateMode::Resume)),
+            );
         });
     });
 }
@@ -625,6 +626,10 @@ fn guest_signal_set() -> libc::sigset_t {
         libc::sigemptyset(&raw mut set);
         libc::sigaddset(&raw mut set, libc::SIGALRM);
         libc::sigaddset(&raw mut set, libc::SIGINT);
+        let interrupt_signal = INTERRUPT_SIGNAL_NUMBER.load(Ordering::Relaxed);
+        if interrupt_signal != 0 {
+            libc::sigaddset(&raw mut set, interrupt_signal);
+        }
         set
     }
 }
@@ -709,18 +714,14 @@ fn thread_start(
         dyn litebox::shim::InitThread<ExecutionContext = litebox_common_linux::PtRegs>,
     >,
     mut ctx: litebox_common_linux::PtRegs,
-    #[cfg(target_arch = "x86_64")] xstate_init: GuestXstateInit,
-    #[cfg(target_arch = "aarch64")] vector_state: litebox_common_linux::GuestVectorState,
+    vector_state: Box<litebox_common_linux::GuestVectorState>,
 ) {
-    #[cfg(target_arch = "aarch64")]
-    set_guest_vector_state(&vector_state);
-    // Allow caller to run some code before we return to the new thread.
     let shim = init_thread.init();
-
-    #[cfg(target_arch = "x86_64")]
-    run_thread_inner(shim.as_ref(), &mut ctx, xstate_init);
-    #[cfg(target_arch = "aarch64")]
-    run_thread_inner(shim.as_ref(), &mut ctx, false);
+    run_thread_inner(
+        shim.as_ref(),
+        &mut ctx,
+        GuestVectorStateMode::Inherited(vector_state),
+    );
     // TODO: have syscall_callback return if we need to terminate the process.
     // We should return this value to the caller so load_program can return it
     // to the user.
@@ -787,27 +788,11 @@ impl litebox::platform::ThreadProvider for LinuxUserland {
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
         let ctx = ctx.clone();
-        #[cfg(target_arch = "aarch64")]
         let vector_state =
-            litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self);
-        // Inherits the calling guest's saved extended CPU state.
-        #[cfg(target_arch = "x86_64")]
-        let xstate_init = GUEST_XSTATE.with_borrow(|guest| {
-            guest.as_ref().map_or(GuestXstateInit::Initial, |guest| {
-                GuestXstateInit::Inherited(guest.clone())
-            })
-        });
+            Box::new(litebox::platform::GuestVectorStateProvider::get_guest_vector_state(self));
         // TODO: do we need to wait for the handle in the main thread?
-        let _handle = std::thread::Builder::new().spawn(move || {
-            thread_start(
-                init_thread,
-                ctx,
-                #[cfg(target_arch = "x86_64")]
-                xstate_init,
-                #[cfg(target_arch = "aarch64")]
-                vector_state,
-            );
-        })?;
+        let _handle = std::thread::Builder::new()
+            .spawn(move || thread_start(init_thread, ctx, vector_state))?;
 
         Ok(())
     }
@@ -1185,31 +1170,6 @@ fn futex_val2(
             0,
         )
     }
-}
-
-unsafe extern "C" {
-    #[cfg(target_arch = "aarch64")]
-    fn syscall_callback() -> isize;
-    #[cfg(target_arch = "aarch64")]
-    fn syscall_callback_in_guest_cleared();
-    #[cfg(target_arch = "aarch64")]
-    fn exception_callback();
-    #[cfg(target_arch = "aarch64")]
-    fn interrupt_callback();
-    #[cfg(target_arch = "aarch64")]
-    fn switch_to_guest_via_outbound_stub_start();
-    #[cfg(target_arch = "aarch64")]
-    fn switch_to_guest_via_outbound_stub_end();
-    #[cfg(target_arch = "aarch64")]
-    fn switch_to_guest_via_sigreturn_start();
-    #[cfg(target_arch = "aarch64")]
-    fn switch_to_guest_via_sigreturn_end();
-    #[cfg(all(test, target_arch = "aarch64"))]
-    fn switch_to_guest_stage_x16();
-    #[cfg(all(test, target_arch = "aarch64"))]
-    fn switch_to_guest_stage_x16_end();
-    #[cfg(all(test, target_arch = "aarch64"))]
-    fn switch_to_guest_stage_x16_fixup();
 }
 
 /// Whether `pc` is inside a sequence switching this thread to guest state.
@@ -2159,7 +2119,7 @@ mod tests {
         use litebox::shim::{ContinueOperation, EnterShim, InitThread};
 
         struct ObserveInit(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
-        struct TerminateShim;
+        struct ObserveShim(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
 
         impl InitThread for ObserveInit {
             type ExecutionContext = litebox_common_linux::PtRegs;
@@ -2167,15 +2127,15 @@ mod tests {
             fn init(
                 self: Box<Self>,
             ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
-                self.0.send(super::get_guest_vector_state()).unwrap();
-                Box::new(TerminateShim)
+                Box::new(ObserveShim(self.0))
             }
         }
 
-        impl EnterShim for TerminateShim {
+        impl EnterShim for ObserveShim {
             type ExecutionContext = litebox_common_linux::PtRegs;
 
             fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                self.0.send(super::get_guest_vector_state()).unwrap();
                 ContinueOperation::Terminate
             }
 
