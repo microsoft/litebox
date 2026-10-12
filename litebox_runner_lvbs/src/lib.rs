@@ -1207,10 +1207,6 @@ fn open_session_new_instance(
         rpc.prepare_load_ta_rpc(ta_uuid, None)?;
         return Err(OpteeSmcReturnCode::RpcCmd);
     }
-    let ta_dynamic = shim
-        .get_ta_dynamic(&ta_uuid)
-        .expect("successfully loaded TA must have dynamic-loading metadata");
-    debug_serial_println!("Loading TA: uuid={:?}, dynamic={}", ta_uuid, ta_dynamic);
 
     // Token is declared before `task_pt_guard` so it drops AFTER it.
     // Marker only releases once CR3 is back to base. See
@@ -1243,7 +1239,7 @@ fn open_session_new_instance(
     })?;
 
     if let Some(ta_binary) = ta_binary
-        && !shim.store_ta_bin(&ta_uuid, &ta_binary, true)
+        && !shim.store_ta_bin(&ta_uuid, &ta_binary)
     {
         teardown_ta_page_table(platform, task_pt_id);
         return Err(OpteeSmcReturnCode::EBadCmd);

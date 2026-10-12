@@ -290,21 +290,6 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     ///
     /// Raw ELF binaries are stored directly. Signed TAs are verified and unwrapped.
     pub(crate) fn store_embedded_ta(&self, ta_bin: &[u8]) -> bool {
-        self.store_ta(None, ta_bin, false)
-    }
-
-    /// Store the TA binary associated with the given TA UUID.
-    ///
-    /// Built-in binaries are trusted raw ELF files or verified signed TAs.
-    /// Dynamic binaries must be signed and are verified before their inner ELF is cached.
-    ///
-    /// Returns `true` if the binary was successfully stored, `false` if the binary's
-    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
-    pub(crate) fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], ta_dynamic: bool) -> bool {
-        self.store_ta(Some(*ta_uuid), ta_bin, ta_dynamic)
-    }
-
-    fn store_ta(&self, expected_uuid: Option<TeeUuid>, ta_bin: &[u8], ta_dynamic: bool) -> bool {
         let (ta_uuid, ta_svn, ta_elf) = if ta_bin.starts_with(&SHDR_MAGIC.to_le_bytes()) {
             let Some((ta_uuid, ta_svn, ta_elf)) =
                 verify_signed_ta(ta_bin, self.ta_signing_key.as_ref())
@@ -313,27 +298,28 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
             };
             (ta_uuid, ta_svn, ta_elf)
         } else {
-            // Dynamic TAs must be signed
-            if ta_dynamic {
-                return false;
-            }
             let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_bin) else {
                 return false;
             };
             // Raw ELF has no signed-header version; preserve the default version.
             (ta_head.uuid, 0, ta_bin)
         };
-        if expected_uuid.is_some_and(|expected_uuid| expected_uuid != ta_uuid) {
+        self.embedded_ta_uuid_map
+            .insert(ta_uuid, ta_elf.into(), ta_svn)
+    }
+
+    /// Verify and store a signed dynamic TA.
+    pub(crate) fn store_ta_bin(&self, expected_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
+        let Some((ta_uuid, ta_svn, ta_elf)) =
+            verify_signed_ta(ta_bin, self.ta_signing_key.as_ref())
+        else {
+            return false;
+        };
+        if ta_uuid != *expected_uuid {
             return false;
         }
-
-        if ta_dynamic {
-            self.dynamic_ta_uuid_map
-                .insert(ta_uuid, ta_elf.into(), ta_svn, true)
-        } else {
-            self.embedded_ta_uuid_map
-                .insert(ta_uuid, ta_elf.into(), ta_svn, false)
-        }
+        self.dynamic_ta_uuid_map
+            .insert(ta_uuid, ta_elf.into(), ta_svn)
     }
 
     /// Get the cached TA binary associated with the given TA UUID.
@@ -346,13 +332,6 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     /// Return whether a TA binary is cached for the given UUID.
     pub(crate) fn contains_ta_bin(&self, ta_uuid: &TeeUuid) -> bool {
         self.dynamic_ta_uuid_map.contains(ta_uuid) || self.embedded_ta_uuid_map.contains(ta_uuid)
-    }
-
-    /// Get whether the cached TA binary was loaded dynamically.
-    pub(crate) fn get_ta_dynamic(&self, ta_uuid: &TeeUuid) -> Option<bool> {
-        self.dynamic_ta_uuid_map
-            .get_ta_dynamic(ta_uuid)
-            .or_else(|| self.embedded_ta_uuid_map.get_ta_dynamic(ta_uuid))
     }
 
     /// Monotonic time elapsed since this instance was created, used as GP
@@ -419,7 +398,13 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
             .0
             .dynamic_ta_uuid_map
             .get_with_flags(&ta_uuid)
-            .or_else(|| self.0.embedded_ta_uuid_map.get_with_flags(&ta_uuid))
+            .map(|(binary, flags, svn)| (binary, flags, svn, true))
+            .or_else(|| {
+                self.0
+                    .embedded_ta_uuid_map
+                    .get_with_flags(&ta_uuid)
+                    .map(|(binary, flags, svn)| (binary, flags, svn, false))
+            })
             .ok_or(loader::elf::ElfLoaderError::OpenError(Errno::ENOENT))?;
         let ta_digest = Sha256::digest(&ta_binary).into();
         let entrypoints = crate::OpteeShimEntrypoints {
@@ -481,19 +466,19 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
         &self.0.mm
     }
 
-    /// Store a TA binary associated with the given TA UUID.
+    /// Verify and store a signed dynamic TA.
     ///
     /// Returns `true` if the binary was successfully stored, `false` if the binary's
     /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
-    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8], ta_dynamic: bool) -> bool {
-        self.0.store_ta_bin(ta_uuid, ta_bin, ta_dynamic)
+    pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
+        self.0.store_ta_bin(ta_uuid, ta_bin)
     }
 
     /// Store a TA binary embedded in the runner image.
     pub fn store_embedded_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &'static [u8]) -> bool {
         self.0
             .embedded_ta_uuid_map
-            .insert(*ta_uuid, ta_bin.into(), 0, false)
+            .insert(*ta_uuid, ta_bin.into(), 0)
     }
 
     /// Store a raw or signed TA embedded in the runner image.
@@ -504,11 +489,6 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
     /// Get the cached TA binary associated with the given TA UUID.
     pub fn get_ta_bin(&self, ta_uuid: &TeeUuid) -> Option<Arc<[u8]>> {
         self.0.get_ta_bin(ta_uuid)
-    }
-
-    /// Get whether the cached TA binary was loaded dynamically.
-    pub fn get_ta_dynamic(&self, ta_uuid: &TeeUuid) -> Option<bool> {
-        self.0.get_ta_dynamic(ta_uuid)
     }
 
     /// Release all user-space memory mappings owned by this shim instance.
@@ -1558,8 +1538,6 @@ struct TaInfo {
     flags: TaFlags,
     /// TA security version from the signed bootstrap header; raw ELF defaults to 0.
     ta_svn: u32,
-    /// Whether the TA binary was loaded dynamically.
-    ta_dynamic: bool,
 }
 
 /// Data structure to maintain a mapping from TA UUIDs to their binary data and flags.
@@ -1574,13 +1552,7 @@ impl TaUuidMap {
         }
     }
 
-    pub(crate) fn insert(
-        &self,
-        uuid: TeeUuid,
-        ta_bin: Arc<[u8]>,
-        ta_svn: u32,
-        ta_dynamic: bool,
-    ) -> bool {
+    pub(crate) fn insert(&self, uuid: TeeUuid, ta_bin: Arc<[u8]>, ta_svn: u32) -> bool {
         // Parse TA head from the binary's .ta_head section
         let Some(ta_head) = litebox_common_optee::parse_ta_head(&ta_bin) else {
             return false;
@@ -1597,7 +1569,6 @@ impl TaUuidMap {
                 binary: ta_bin,
                 flags: ta_head.flags,
                 ta_svn,
-                ta_dynamic,
             },
         );
         true
@@ -1611,20 +1582,11 @@ impl TaUuidMap {
         self.inner.read().contains_key(uuid)
     }
 
-    fn get_with_flags(&self, uuid: &TeeUuid) -> Option<(Arc<[u8]>, TaFlags, u32, bool)> {
-        self.inner.read().get(uuid).map(|info| {
-            (
-                info.binary.clone(),
-                info.flags,
-                info.ta_svn,
-                info.ta_dynamic,
-            )
-        })
-    }
-
-    /// Get whether the TA binary for a given UUID was loaded dynamically.
-    pub(crate) fn get_ta_dynamic(&self, uuid: &TeeUuid) -> Option<bool> {
-        self.inner.read().get(uuid).map(|info| info.ta_dynamic)
+    fn get_with_flags(&self, uuid: &TeeUuid) -> Option<(Arc<[u8]>, TaFlags, u32)> {
+        self.inner
+            .read()
+            .get(uuid)
+            .map(|info| (info.binary.clone(), info.flags, info.ta_svn))
     }
 
     // Lazy removal of TA binaries when they are no longer needed.
