@@ -51,7 +51,12 @@ impl Clock {
 
     /// [`now`] in nanoseconds.
     pub fn nanos(self) -> u64 {
-        u64::try_from(u128::from(now()) * 1_000_000 / u128::from(self.khz)).unwrap_or(u64::MAX)
+        self.nanos_at(now())
+    }
+
+    /// Tick `ticks` (a [`now`] value) in nanoseconds, as [`Self::nanos`].
+    pub fn nanos_at(self, ticks: u64) -> u64 {
+        u64::try_from(u128::from(ticks) * 1_000_000 / u128::from(self.khz)).unwrap_or(u64::MAX)
     }
 
     /// The first tick [`now`] reaches where [`Self::nanos`] is at least

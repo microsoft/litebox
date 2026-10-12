@@ -1873,6 +1873,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "litebox",
+ "litebox_broker_transport",
  "litebox_common",
  "litebox_common_linux",
  "litebox_common_vm_abi",

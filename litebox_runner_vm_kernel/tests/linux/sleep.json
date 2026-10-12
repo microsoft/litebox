@@ -1,0 +1,3 @@
+[
+  { "argv": ["/sleep"], "expect_stdout": "nanosleep: ok\nusleep: ok\nfutex: ok\n" }
+]

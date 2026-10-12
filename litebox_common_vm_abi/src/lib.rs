@@ -801,6 +801,24 @@ impl UpcallFrame {
     }
 }
 
+/// The wall clock, as the Unix time at an instant (see [Clock](crate#clock)):
+/// at instant `at`, it was `unix_ns` nanoseconds since the Unix epoch.
+/// Without a source of the time, [`Self::EPOCH_AT_BOOT`].
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+#[repr(C)]
+pub struct WallClock {
+    pub unix_ns: u64,
+    pub at: u64,
+}
+
+impl WallClock {
+    /// The Unix epoch at the kernel clock's origin, about when the machine
+    /// started: dates are fake, but intervals are right.
+    pub const EPOCH_AT_BOOT: Self = Self { unix_ns: 0, at: 0 };
+}
+
 /// Read-only; its address is the entry point's `rdi`. Regions are in
 /// [`RUNNER_MANAGED_MAX`]..[`USER_END`] and fixed for the process's
 /// lifetime.
@@ -815,6 +833,7 @@ pub struct StartupInfo {
     /// Ticks per millisecond of the counter ring 3 reads the kernel clock
     /// from; see [Clock](crate#clock).
     pub clock_khz: u64,
+    pub wall_clock: WallClock,
     /// Fixed at creation; its meaning is the protocol's (e.g.
     /// [`envelope::Protocol::OPTEE_MSG`]).
     pub identity: [u8; IDENTITY_LEN],

@@ -28,7 +28,7 @@ pub mod kcall;
 pub mod start;
 pub mod thread;
 
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use litebox::platform::page_mgmt::{
     AllocationError, DeallocationError, FixedAddressBehavior, HintPlacementBehavior,
     MemoryRegionPermissions, PermissionUpdateError,
@@ -43,7 +43,7 @@ use litebox_common_linux::vmap::{
 use litebox_common_linux::vmem::{PAGE_SIZE, PageFaultError, VmFlags, VmemPageFaultHandler};
 use litebox_common_vm_abi::{
     LogLevel, Placement, Populate, Prot, RUNNER_MANAGED_MAX, RUNNER_MANAGED_MIN, StartupInfo,
-    Status,
+    Status, WallClock,
 };
 use litebox_platform::sync::{
     ImmediatelyWokenUp, RawMutex as RawMutexTrait, RawMutexProvider, UnblockedOrTimedOut,
@@ -62,7 +62,7 @@ const MANAGED_MAX: usize = RUNNER_MANAGED_MAX as usize;
 /// Guest pointers are confined to the runner-managed area, so the shim never
 /// accesses runner memory on the guest's behalf.
 pub struct VmUserland {
-    clock_khz: u64,
+    wall_clock: WallClock,
 }
 
 impl VmUserland {
@@ -71,8 +71,14 @@ impl VmUserland {
     /// Panics if the clock frequency is zero.
     pub fn new(info: &StartupInfo) -> Self {
         assert!(info.clock_khz != 0, "clock frequency must not be zero");
+        TIMED_WAIT
+            .clock_khz
+            .store(info.clock_khz, Ordering::Relaxed);
+        TIMED_WAIT
+            .control_ring
+            .store(info.broker_control_ring.start, Ordering::Relaxed);
         Self {
-            clock_khz: info.clock_khz,
+            wall_clock: info.wall_clock,
         }
     }
 
@@ -150,7 +156,9 @@ impl RawMutexProvider for VmUserland {
 
 impl WaitWakerProvider for VmUserland {}
 
-/// Blocking panics: with one thread, nothing could wake the waiter.
+/// One thread: nothing else can change a waiter's word. So a wait with a
+/// timeout sleeps it out on the kernel's deadline wait, and one without
+/// panics, as nothing could end it.
 pub struct RawMutex {
     inner: AtomicU32,
 }
@@ -169,24 +177,74 @@ impl RawMutexTrait for RawMutex {
     }
 
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val).map(|_| ())
+        if self.inner.load(Ordering::Relaxed) != val {
+            return Err(ImmediatelyWokenUp);
+        }
+        panic!(
+            "blocking without a timeout in the single-threaded VM userland runner would deadlock"
+        )
     }
 
     fn block_or_timeout(
         &self,
         val: u32,
-        _time: core::time::Duration,
+        time: core::time::Duration,
     ) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        self.block_or_maybe_timeout(val)
+        if self.inner.load(Ordering::Relaxed) != val {
+            return Err(ImmediatelyWokenUp);
+        }
+        let Some(deadline) = now().checked_add(time) else {
+            // Too far off to represent: as a wait without a timeout.
+            return self.block(val).map(|()| UnblockedOrTimedOut::Unblocked);
+        };
+        TIMED_WAIT.sleep_until(deadline);
+        Ok(UnblockedOrTimedOut::TimedOut)
     }
 }
 
-impl RawMutex {
-    fn block_or_maybe_timeout(&self, val: u32) -> Result<UnblockedOrTimedOut, ImmediatelyWokenUp> {
-        if self.inner.load(core::sync::atomic::Ordering::Relaxed) != val {
-            return Err(ImmediatelyWokenUp);
+/// What [`RawMutex`] needs for timed waits, which get no platform reference;
+/// set by [`VmUserland::new`].
+struct TimedWait {
+    /// [`StartupInfo::clock_khz`], for [`now`].
+    clock_khz: AtomicU64,
+    /// [`StartupInfo::broker_control_ring`]'s start.
+    control_ring: AtomicU64,
+}
+
+static TIMED_WAIT: TimedWait = TimedWait {
+    clock_khz: AtomicU64::new(0),
+    control_ring: AtomicU64::new(0),
+};
+
+impl TimedWait {
+    /// Halts until `deadline` with the kernel's deadline wait (`BrokerEnter`'s
+    /// Wait), on a control-ring word that only the kernel's serving changes:
+    /// the request ring's consumer epoch.
+    ///
+    /// # Panics
+    ///
+    /// If the kernel refuses the wait, e.g., before the broker handshake.
+    fn sleep_until(&self, deadline: Instant) {
+        use litebox_broker_transport::control_ring::ControlRingDirection;
+        let offset = ControlRingDirection::Requests.consumer_epoch_offset();
+        let word = usize::try_from(self.control_ring.load(Ordering::Relaxed))
+            .expect("x86-64 addresses fit usize")
+            + offset;
+        while now() < deadline {
+            // Safety: the control ring is mapped for the process's lifetime,
+            // and its words are aligned `u32`s.
+            let current = unsafe { (*(word as *const AtomicU32)).load(Ordering::Acquire) };
+            let request = litebox_common_vm_abi::BrokerEnterRequest::wait(
+                offset as u64,
+                current,
+                deadline.as_nanos(),
+            );
+            match kcall::call(&request) {
+                // The word changed (served requests), or the deadline passed.
+                Ok(()) | Err(Status::TimedOut) => {}
+                Err(status) => panic!("timed wait: {status:?}"),
+            }
         }
-        panic!("blocking in the single-threaded VM userland runner would deadlock")
     }
 }
 
@@ -211,21 +269,30 @@ fn read_counter() -> u64 {
     unsafe { core::arch::x86_64::_rdtsc() }
 }
 
-pub struct SystemTime;
+/// The kernel clock, once [`VmUserland::new`] has run.
+fn now() -> Instant {
+    let khz = u128::from(TIMED_WAIT.clock_khz.load(Ordering::Relaxed));
+    debug_assert!(khz != 0, "the clock is read before `VmUserland::new`");
+    Instant(u64::try_from(u128::from(read_counter()) * 1_000_000 / khz).unwrap_or(u64::MAX))
+}
+
+/// Nanoseconds since the Unix epoch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SystemTime(u64);
 
 impl TimeProvider for VmUserland {
     type Instant = Instant;
     type SystemTime = SystemTime;
 
     fn now(&self) -> Instant {
-        let counter = u128::from(read_counter());
-        Instant(u64::try_from(counter * 1_000_000 / u128::from(self.clock_khz)).unwrap_or(u64::MAX))
+        now()
     }
 
-    /// Panics: the kernel has no wall clock (`time`, `gettimeofday`, and
-    /// `CLOCK_REALTIME` reach this).
+    /// The kernel's wall clock ([`StartupInfo::wall_clock`]), advanced by the
+    /// kernel clock: `time`, `gettimeofday`, and `CLOCK_REALTIME`.
     fn current_time(&self) -> SystemTime {
-        panic!("no wall clock")
+        let WallClock { unix_ns, at } = self.wall_clock;
+        SystemTime(unix_ns.saturating_add(now().0.saturating_sub(at)))
     }
 }
 
@@ -243,13 +310,14 @@ impl InstantTrait for Instant {
 }
 
 impl SystemTimeTrait for SystemTime {
-    const UNIX_EPOCH: Self = SystemTime;
+    const UNIX_EPOCH: Self = SystemTime(0);
 
-    fn duration_since(
-        &self,
-        _earlier: &Self,
-    ) -> Result<core::time::Duration, core::time::Duration> {
-        panic!("no wall clock")
+    fn duration_since(&self, earlier: &Self) -> Result<core::time::Duration, core::time::Duration> {
+        let nanos = core::time::Duration::from_nanos;
+        match self.0.checked_sub(earlier.0) {
+            Some(since) => Ok(nanos(since)),
+            None => Err(nanos(earlier.0 - self.0)),
+        }
     }
 }
 

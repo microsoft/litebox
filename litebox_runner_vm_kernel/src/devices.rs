@@ -9,6 +9,8 @@
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
 //!
+//! Also the wall clock ([`wall_clock`]), for runners.
+//!
 //! The interrupt handler only ends the interrupt; the broker looks at the
 //! devices when it next runs.
 
@@ -97,6 +99,20 @@ impl Events for Devices {
         }
         self.halt(deadline);
         true
+    }
+}
+
+/// The wall clock from kvm-clock, else
+/// [`WallClock::EPOCH_AT_BOOT`](litebox_common_vm_abi::WallClock::EPOCH_AT_BOOT).
+pub fn wall_clock(platform: &'static VmKernel, clock: Clock) -> litebox_common_vm_abi::WallClock {
+    let Some((unix_ns, ticks)) = litebox_hal::kvmclock::wall_clock(platform) else {
+        litebox_util_log::info!("no kvm-clock: runners' wall clock starts at the Unix epoch");
+        return litebox_common_vm_abi::WallClock::EPOCH_AT_BOOT;
+    };
+    litebox_util_log::info!(unix_seconds:% = unix_ns / 1_000_000_000; "wall clock");
+    litebox_common_vm_abi::WallClock {
+        unix_ns,
+        at: clock.nanos_at(ticks),
     }
 }
 

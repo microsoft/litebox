@@ -12,7 +12,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use litebox_common_optee::TeeUuid;
 use litebox_common_optee::envelope::{LDELF_IMAGE, TA_IMAGE};
-use litebox_common_vm_abi::IDENTITY_LEN;
+use litebox_common_vm_abi::{IDENTITY_LEN, WallClock};
 use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::optee::Completion;
@@ -40,6 +40,7 @@ impl Optee {
     pub fn new(
         platform: &'static VmKernel,
         clock: Clock,
+        wall_clock: WallClock,
         payload: &Payload,
         broker: litebox_broker_vm_kernel::Broker,
     ) -> Self {
@@ -90,6 +91,7 @@ impl Optee {
                     images: &images,
                     identity,
                     clock_khz: clock.khz(),
+                    wall_clock,
                 },
             )
             .map_err(|error| {

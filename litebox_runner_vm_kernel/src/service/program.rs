@@ -8,6 +8,7 @@
 
 use super::Service;
 use crate::payload::Payload;
+use litebox_common_vm_abi::WallClock;
 use litebox_common_vm_abi::program::{ExitStatus, Program};
 use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::VmKernel;
@@ -17,6 +18,7 @@ use litebox_shim_vm_kernel::{Process, ProcessConfig};
 pub struct Programs {
     platform: &'static VmKernel,
     clock: Clock,
+    wall_clock: WallClock,
     broker: litebox_broker_vm_kernel::Broker,
     runner: &'static [u8],
 }
@@ -35,12 +37,14 @@ impl Programs {
     pub fn new(
         platform: &'static VmKernel,
         clock: Clock,
+        wall_clock: WallClock,
         payload: &Payload,
         broker: litebox_broker_vm_kernel::Broker,
     ) -> Self {
         Self {
             platform,
             clock,
+            wall_clock,
             broker,
             runner: payload
                 .file("runner.elf")
@@ -63,6 +67,7 @@ impl Service for Programs {
                 images: &[],
                 identity: [0; litebox_common_vm_abi::IDENTITY_LEN],
                 clock_khz: self.clock.khz(),
+                wall_clock: self.wall_clock,
             },
         )
         .unwrap_or_else(|error| panic!("failed to spawn a program runner: {error}"));

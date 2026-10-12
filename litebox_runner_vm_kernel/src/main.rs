@@ -38,6 +38,7 @@ fn kernel_main(kernel: Kernel) -> ! {
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
+    let wall_clock = devices::wall_clock(kernel.platform, kernel.clock);
     let broker = |console| {
         litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
             platform: kernel.platform,
@@ -49,12 +50,22 @@ fn kernel_main(kernel: Kernel) -> ! {
     if let Some(programs) = payload.file("programs.json") {
         let stdio: &'static client::program::Stdio =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(client::program::Stdio::new(devices)));
-        let mut service =
-            service::program::Programs::new(kernel.platform, kernel.clock, &payload, broker(stdio));
+        let mut service = service::program::Programs::new(
+            kernel.platform,
+            kernel.clock,
+            wall_clock,
+            &payload,
+            broker(stdio),
+        );
         client::program::run(programs, &mut service, stdio);
     } else {
-        let mut service =
-            service::optee::Optee::new(kernel.platform, kernel.clock, &payload, broker(devices));
+        let mut service = service::optee::Optee::new(
+            kernel.platform,
+            kernel.clock,
+            wall_clock,
+            &payload,
+            broker(devices),
+        );
         client::script::run(&payload, &mut service);
     }
     serial_println!("[litebox] ALL TESTS PASSED");

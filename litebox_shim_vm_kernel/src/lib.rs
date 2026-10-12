@@ -48,7 +48,7 @@ use litebox_common_vm_abi::{
     KernelCall, LogLevel, LogRequest, MAX_IMAGES, MAX_KDF_CONTEXT_LEN, MAX_LOG_LEN, MapReply,
     MapRequest, Message, PAGE_SIZE, Placement, Populate, Prot, ProtectRequest, RUNNER_MANAGED_MAX,
     RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest, StartupInfo, Status, UnmapRequest,
-    UpcallFrame, UpcallKind, UserRange,
+    UpcallFrame, UpcallKind, UserRange, WallClock,
 };
 use litebox_platform_vm_kernel::{AddressSpaceId, PinnedUserPages, VmKernel};
 use zerocopy::IntoBytes;
@@ -65,6 +65,7 @@ pub struct ProcessConfig<'a> {
     /// [`StartupInfo::clock_khz`]: the frequency of the counter behind the
     /// platform's installed clock source, which must be the same clock.
     pub clock_khz: u64,
+    pub wall_clock: WallClock,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -202,6 +203,7 @@ impl Process {
             abi_version: ABI_VERSION,
             max_log_level: log::max_level() as u32,
             clock_khz: config.clock_khz,
+            wall_clock: config.wall_clock,
             identity: config.identity,
             images,
             heap: layout::HEAP,

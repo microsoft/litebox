@@ -19,6 +19,8 @@ pub mod dma;
 #[cfg(target_arch = "x86_64")]
 pub mod interrupt;
 #[cfg(target_arch = "x86_64")]
+pub mod kvmclock;
+#[cfg(target_arch = "x86_64")]
 pub mod pci;
 #[cfg(target_arch = "x86_64")]
 pub mod power;

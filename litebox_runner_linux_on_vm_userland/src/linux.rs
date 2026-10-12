@@ -9,13 +9,17 @@
 //! only [`SERVING_CALLS`]. Executable memory stays allowed, as a Linux
 //! program may map code (W^X still holds).
 //!
+//! Time: monotonic clocks are the kernel clock; the wall clock (`time`,
+//! `gettimeofday`, `CLOCK_REALTIME`) is the kernel's, read from kvm-clock at
+//! boot and advanced by the kernel clock, or, without kvm-clock (e.g., under
+//! QEMU's TCG), starting at the Unix epoch. Waits with a timeout (`nanosleep`,
+//! `sleep`, timed futex waits) halt until it passes.
+//!
 //! Limits, which end the runner (the kernel sees it exit with
 //! `EXIT_FAILURE`) rather than fail the program's call:
-//! - No wall clock: `time`, `gettimeofday`, and `CLOCK_REALTIME`. Monotonic
-//!   clocks work (the kernel clock).
-//! - One thread, and no timers or asynchronous signals: nothing could end a
-//!   wait, so any wait ends the runner, e.g., `nanosleep`, `sleep`, a timed
-//!   futex wait, or a read of standard input before it has data.
+//! - One thread, and no timers or asynchronous signals: a wait without a
+//!   timeout, e.g., a read of standard input before it has data, could never
+//!   end.
 
 use alloc::boxed::Box;
 use litebox::utils::TruncateExt as _;
