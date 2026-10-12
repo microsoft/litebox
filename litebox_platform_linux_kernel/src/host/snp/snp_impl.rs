@@ -198,7 +198,7 @@ pub unsafe fn run_thread(
     let shim = tls.shim.get().unwrap().as_ref();
     match shim.init(regs) {
         litebox::shim::ContinueOperation::Resume => {
-            if regs.sanitize_for_user_return() {
+            if regs.sanitize_for_user_return::<SnpLinuxKernel>() {
                 unsafe { crate::switch_to_guest(regs) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
@@ -232,7 +232,7 @@ pub fn handle_syscall(pt_regs: &mut litebox_common_linux::PtRegs) -> ! {
     let tls = unsafe { &*get_tls() };
     match tls.shim.get().unwrap().syscall(pt_regs) {
         litebox::shim::ContinueOperation::Resume => {
-            if pt_regs.sanitize_for_user_return() {
+            if pt_regs.sanitize_for_user_return::<SnpLinuxKernel>() {
                 unsafe { crate::switch_to_guest(pt_regs) }
             }
             litebox_util_log::warn!("terminating thread with invalid user return context");
@@ -320,7 +320,7 @@ const fn is_err_value(x: u64) -> bool {
     x >= !MAX_ERRNO
 }
 
-const PAGE_SIZE: u64 = litebox_common_linux::vmem::PAGE_SIZE as u64;
+const PAGE_SIZE: u64 = litebox_common::PAGE_SIZE as u64;
 /// Max physical address
 const PHYS_ADDR_MAX: u64 = 0x10_0000_0000u64; // 64GB
 

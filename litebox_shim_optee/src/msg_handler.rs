@@ -23,7 +23,7 @@ use litebox::{
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt,
 };
-use litebox_common_linux::{vmap::PhysPageAddr, vmem::PAGE_SIZE};
+use litebox_common::{PAGE_SIZE, vmap::PhysPageAddr};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
     OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,
@@ -209,9 +209,7 @@ pub fn read_optee_msg_args_from_phys<Platform: crate::OpteeShimPlatform>(
 
 /// Read main and RPC arguments from an explicitly identified registered SHM view.
 #[allow(clippy::type_complexity)]
-pub fn read_optee_msg_args_from_regd_shm<
-    Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>,
->(
+pub fn read_optee_msg_args_from_regd_shm<Platform: litebox_common::vmap::VmapManager<PAGE_SIZE>>(
     platform: &Platform,
     shm_ref: u64,
     offset: usize,
@@ -244,7 +242,7 @@ pub fn read_optee_msg_args_from_regd_shm<
 }
 
 /// Register a page-list-backed TMEM allocation returned by normal world.
-pub fn register_rpc_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+pub fn register_rpc_shm<Platform: litebox_common::vmap::VmapManager<PAGE_SIZE>>(
     platform: &Platform,
     tmem: &OpteeMsgParamTmem,
 ) -> Result<(), OpteeSmcReturnCode> {
@@ -274,7 +272,7 @@ pub fn unregister_rpc_shm(shm_ref: u64) -> bool {
 }
 
 /// Copy bytes from a registered RPC allocation into trusted memory.
-pub fn read_rpc_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+pub fn read_rpc_shm<Platform: litebox_common::vmap::VmapManager<PAGE_SIZE>>(
     platform: &Platform,
     shm_ref: u64,
     offset: usize,
@@ -824,7 +822,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
     /// Read into `buffer` from the normal-world shared memory pages referenced by `self`,
     /// starting at byte `offset` within the view.
     /// Returns `EBadAddr` if the requested range is not entirely within the view.
-    fn read_at<Platform: litebox_common_linux::vmap::VmapManager<ALIGN>>(
+    fn read_at<Platform: litebox_common::vmap::VmapManager<ALIGN>>(
         &self,
         platform: &Platform,
         offset: usize,
@@ -883,7 +881,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
         len: usize,
     ) -> Result<(), OpteeSmcReturnCode>
     where
-        Platform: crate::OpteeShimPlatform + litebox_common_linux::vmap::VmapManager<ALIGN>,
+        Platform: crate::OpteeShimPlatform + litebox_common::vmap::VmapManager<ALIGN>,
     {
         if len > self.len {
             return Err(OpteeSmcReturnCode::EBadAddr);
@@ -911,7 +909,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
         len: usize,
     ) -> Result<(), OpteeSmcReturnCode>
     where
-        Platform: crate::OpteeShimPlatform + litebox_common_linux::vmap::VmapManager<ALIGN>,
+        Platform: crate::OpteeShimPlatform + litebox_common::vmap::VmapManager<ALIGN>,
     {
         if len > self.len {
             return Err(OpteeSmcReturnCode::EBadAddr);
@@ -988,7 +986,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     /// `aligned_size` indicates the page-aligned size of the shared memory region to register
     /// (i.e., `page_align_up(page_offset + size)`) and determines how many physical pages are
     /// walked from the [`ShmRefPagesData`] list.
-    pub fn register_shm<Platform: litebox_common_linux::vmap::VmapManager<ALIGN>>(
+    pub fn register_shm<Platform: litebox_common::vmap::VmapManager<ALIGN>>(
         &self,
         platform: &Platform,
         shm_ref_pages_data_phys_addr: u64,
@@ -1053,7 +1051,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
 }
 
 /// Serialize RPC arguments immediately after the main message in registered shared memory.
-pub fn write_rpc_args_to_regd_shm<Platform: litebox_common_linux::vmap::VmapManager<PAGE_SIZE>>(
+pub fn write_rpc_args_to_regd_shm<Platform: litebox_common::vmap::VmapManager<PAGE_SIZE>>(
     platform: &Platform,
     shm_ref: u64,
     msg_args_offset: usize,

@@ -20,7 +20,7 @@ use core::alloc::Layout;
 use core::cell::{Cell, UnsafeCell};
 use core::mem::offset_of;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::{rdgsbase, wrgsbase};
+use litebox_common::arch::x86_64::{rdgsbase, wrgsbase};
 use litebox_common_lvbs::MAX_CORES;
 use x86_64::VirtAddr;
 
@@ -650,7 +650,7 @@ pub fn allocate_per_cpu_variables() {
 /// Requires the permanent page table, hypercalls, and VTL1 VP tracking.
 /// The raw stack arena stays allocated; guard pages must never be accessed.
 pub fn unmap_per_cpu_stack_guards(manager: &crate::PageTableManager) {
-    use litebox_common_linux::vmem::PageRange;
+    use litebox_common::page::PageRange;
 
     let base = with_per_cpu_variables(|pcv| pcv.stacks.base);
     for offset in STACK_GUARD_OFFSETS {

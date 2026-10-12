@@ -31,12 +31,16 @@ use litebox::{
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
+use litebox_common::{
+    PAGE_SIZE,
+    page::{NonZeroAddress, NonZeroPageSize},
+    user_pointers::{UserPtr, UserPtrMut},
+};
 use litebox_common_linux::{
     SyscallRequest,
     errno::Errno,
     mm::VmemManager,
-    user_pointers::{UserPtr, UserPtrMut},
-    vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE},
+    vmem::{CreatePagesFlags, MappingError},
 };
 
 /// On debug builds, logs that the user attempted to use an unsupported feature.

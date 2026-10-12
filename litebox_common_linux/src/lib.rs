@@ -11,6 +11,7 @@ use core::time::Duration;
 use int_enum::IntEnum;
 use litebox::{
     fs::OFlags,
+    platform::PageManagementProvider,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
 use syscalls::Sysno;
@@ -21,20 +22,15 @@ use crate::signal::SigSet;
 pub mod errno;
 pub mod loader;
 pub mod mm;
-pub mod physical_pointers;
 pub mod signal;
-pub mod user_pointers;
-pub mod vmap;
 pub mod vmem;
 
 extern crate alloc;
 
-use user_pointers::{UserPtr, UserPtrMut};
-
-/// Number of AArch64 general-purpose registers saved by the Linux user ABI
-/// (`x0` through `x30`).
-#[cfg(target_arch = "aarch64")]
-pub const AARCH64_GENERAL_REGISTER_COUNT: usize = 31;
+use litebox_common::{
+    PAGE_SIZE,
+    user_pointers::{UserPtr, UserPtrMut},
+};
 
 // TODO(jayb): Should errno::Errno be publicly re-exported?
 
@@ -1078,81 +1074,6 @@ pub enum ArchPrctlArg {
     CETStatus,
     CETDisable,
     CETLock,
-}
-
-/// Reads the FS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, calling this instruction from user land will throw an `#UD`.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn rdfsbase() -> usize {
-    let ret: usize;
-    unsafe {
-        core::arch::asm!(
-            "rdfsbase {}",
-            out(reg) ret,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-    ret
-}
-
-/// Writes the FS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, calling this instruction from user land will throw an `#UD`.
-///
-/// The caller must ensure that this write operation has no unsafe side
-/// effects, as the FS segment base address is often used for thread
-/// local storage.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn wrfsbase(fs_base: usize) {
-    unsafe {
-        core::arch::asm!(
-            "wrfsbase {}",
-            in(reg) fs_base,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-}
-
-/// Reads the GS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, this instruction will throw an `#UD`.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn rdgsbase() -> usize {
-    let ret: usize;
-    unsafe {
-        core::arch::asm!(
-            "rdgsbase {}",
-            out(reg) ret,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
-    ret
-}
-
-/// Writes the GS segment base address
-///
-/// ## Safety
-///
-/// If `CR4.FSGSBASE` is not set, this instruction will throw an `#UD`.
-///
-/// The caller must ensure that this write operation has no unsafe side
-/// effects, as the GS segment base address might be in use.
-#[cfg(target_arch = "x86_64")]
-pub unsafe fn wrgsbase(gs_base: usize) {
-    unsafe {
-        core::arch::asm!(
-            "wrgsbase {}",
-            in(reg) gs_base,
-            options(nostack, nomem, preserves_flags)
-        );
-    }
 }
 
 /// Flags for the clone3 system call as defined in `/usr/include/linux/sched.h`.
@@ -3128,7 +3049,7 @@ pub struct PtRegs {
 #[derive(Clone, Debug, Default)]
 pub struct PtRegs {
     /// General-purpose registers x0-x30.
-    pub regs: [usize; AARCH64_GENERAL_REGISTER_COUNT],
+    pub regs: [usize; litebox_common::arch::aarch64::GENERAL_REGISTER_COUNT],
     /// Stack pointer.
     pub sp: usize,
     /// Program counter.
@@ -3146,23 +3067,13 @@ pub struct PtRegs {
 
 #[cfg(target_arch = "x86_64")]
 pub mod arch {
-    // User returns must not target the null-guard region.
-    pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
-    // Exclusive upper bound; the final low-canonical page is reserved as a guard page.
-    pub const USER_ADDR_END: usize = 0x0000_7fff_ffff_f000;
+    use litebox_common::arch::x86_64::{
+        EFLAGS_AF, EFLAGS_CF, EFLAGS_DF, EFLAGS_FIXED, EFLAGS_ID, EFLAGS_IF, EFLAGS_OF, EFLAGS_PF,
+        EFLAGS_RF, EFLAGS_SF, EFLAGS_ZF,
+    };
+
     pub const USER_CS: usize = 0x33;
     pub const USER_DS: usize = 0x2b;
-    pub const EFLAGS_CF: usize = 1 << 0;
-    pub const EFLAGS_FIXED: usize = 1 << 1;
-    pub const EFLAGS_PF: usize = 1 << 2;
-    pub const EFLAGS_AF: usize = 1 << 4;
-    pub const EFLAGS_ZF: usize = 1 << 6;
-    pub const EFLAGS_SF: usize = 1 << 7;
-    pub const EFLAGS_IF: usize = 1 << 9;
-    pub const EFLAGS_DF: usize = 1 << 10;
-    pub const EFLAGS_OF: usize = 1 << 11;
-    pub const EFLAGS_RF: usize = 1 << 16;
-    pub const EFLAGS_ID: usize = 1 << 21;
     pub const SAFE_USER_EFLAGS: usize = EFLAGS_CF
         | EFLAGS_FIXED
         | EFLAGS_PF
@@ -3174,81 +3085,74 @@ pub mod arch {
         | EFLAGS_OF
         | EFLAGS_RF
         | EFLAGS_ID;
-
-    /// Returns whether `base` is a valid x86_64 Linux user FS-segment base.
-    ///
-    /// A user FS base is valid iff it is below the top of the user address
-    /// space. Especially, if a given address is non-canonical, `wrfsbase`
-    /// can result in a #GP fault. This check is based on Linux kernel's
-    /// `do_arch_prctl_64`.
-    #[must_use]
-    pub fn is_valid_user_fs_base(base: usize) -> bool {
-        base < USER_ADDR_END
-    }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub mod arch {
-    // User returns must not target the null-guard region.
-    pub const USER_ADDR_MIN: usize = 0x0000_0000_0001_0000;
-    // Exclusive upper bound; keep the final low-userspace page reserved as a guard page.
-    pub const USER_ADDR_END: usize = 0x0000_ffff_ffff_f000;
-    /// PSTATE condition flags (N, Z, C, V) — guest-controllable arithmetic state.
-    pub const PSR_NZCV_MASK: u64 = 0b1111 << 28;
-    /// Speculative Store Bypass Safe bit — a benign, user-settable mitigation bit.
-    pub const PSR_SSBS_BIT: u64 = 1 << 12;
-    /// Data Independent Timing bit — a benign, user-settable mitigation bit.
-    pub const PSR_DIT_BIT: u64 = 1 << 24;
+    use litebox_common::arch::aarch64::{PSR_DIT_BIT, PSR_NZCV_MASK, PSR_SSBS_BIT};
+
     /// PSTATE bits a guest may keep when returning to EL0.
     pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
 }
 
 impl PtRegs {
-    /// Returns whether `rip` and `rsp` are in the x86_64 Linux user address range.
+    /// Returns whether `rip` and `rsp` are in the platform task address range.
     #[cfg(target_arch = "x86_64")]
     #[must_use]
-    pub fn has_user_return_addresses(&self) -> bool {
-        (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.rip)
-            && (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.rsp)
+    pub fn has_user_return_addresses<Platform>(&self) -> bool
+    where
+        Platform: PageManagementProvider<PAGE_SIZE>,
+    {
+        (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.rip)
+            && (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.rsp)
     }
 
     /// Sanitizes CPU state and normalizes the context to the x86_64 Linux user ABI.
     ///
-    /// Returns `false` if `rip` or `rsp` are outside the x86_64 Linux user address range.
-    /// On success, privileged or unsafe RFLAGS bits are cleared, the fixed
-    /// RFLAGS bit is set, interrupts are enabled, and the user CS/SS selectors
-    /// are set to the x86_64 Linux ABI values.
+    /// Returns `false` if `rip` or `rsp` are outside the platform task address range. On success,
+    /// privileged or unsafe RFLAGS bits are cleared, the fixed RFLAGS bit is set, interrupts are
+    /// enabled, and the user CS/SS selectors are restored.
     #[cfg(target_arch = "x86_64")]
     #[must_use]
-    pub fn sanitize_for_user_return(&mut self) -> bool {
-        if !self.has_user_return_addresses() {
+    pub fn sanitize_for_user_return<Platform>(&mut self) -> bool
+    where
+        Platform: PageManagementProvider<PAGE_SIZE>,
+    {
+        if !self.has_user_return_addresses::<Platform>() {
             return false;
         }
-        self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS) | arch::EFLAGS_FIXED | arch::EFLAGS_IF;
+        self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS)
+            | litebox_common::arch::x86_64::EFLAGS_FIXED
+            | litebox_common::arch::x86_64::EFLAGS_IF;
         self.cs = arch::USER_CS;
         self.ss = arch::USER_DS;
         true
     }
 
-    /// Returns whether `pc` and `sp` are in the aarch64 Linux user address range.
+    /// Returns whether `pc` and `sp` are in the platform task address range.
     #[cfg(target_arch = "aarch64")]
     #[must_use]
-    pub fn has_user_return_addresses(&self) -> bool {
-        (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.pc)
-            && (arch::USER_ADDR_MIN..arch::USER_ADDR_END).contains(&self.sp)
+    pub fn has_user_return_addresses<Platform>(&self) -> bool
+    where
+        Platform: PageManagementProvider<PAGE_SIZE>,
+    {
+        (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.pc)
+            && (Platform::TASK_ADDR_MIN..Platform::TASK_ADDR_MAX).contains(&self.sp)
     }
 
-    /// Sanitizes CPU state and normalizes the context to the aarch64 Linux user ABI.
+    /// Sanitizes CPU state and normalizes the context to the AArch64 Linux user ABI.
     ///
-    /// Returns `false` if `pc` or `sp` are outside the aarch64 Linux user address
-    /// range. On success, `pstate` is coerced to a clean AArch64 EL0t state: the
-    /// guest keeps only the condition flags and benign mitigation bits. Every
-    /// other bit is cleared, forcing EL0t, AArch64 execution state, unmasked
-    /// exceptions, and no illegal-state or single-step.
+    /// Returns `false` if `pc` or `sp` are outside the platform task address range. On success,
+    /// `pstate` is coerced to a clean AArch64 EL0t state: the guest keeps only condition flags and
+    /// benign mitigation bits. Every other bit is cleared, forceing EL0t, AArch64 execution state,
+    /// unmasked exceptions, and no illegal-state or single-step exceptions.
     #[cfg(target_arch = "aarch64")]
     #[must_use]
-    pub fn sanitize_for_user_return(&mut self) -> bool {
-        if !self.has_user_return_addresses() {
+    pub fn sanitize_for_user_return<Platform>(&mut self) -> bool
+    where
+        Platform: PageManagementProvider<PAGE_SIZE>,
+    {
+        if !self.has_user_return_addresses::<Platform>() {
             return false;
         }
         self.pstate &= arch::SAFE_USER_PSTATE;

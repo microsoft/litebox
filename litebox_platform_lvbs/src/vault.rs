@@ -56,7 +56,8 @@ use core::panic::Location;
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::platform::{ComputeParams, KDFParams};
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmem::{PAGE_SIZE, PageRange, VmFlags};
+use litebox_common::{PAGE_SIZE, page::PageRange};
+use litebox_common_linux::vmem::VmFlags;
 use litebox_common_lvbs::PRK_LEN;
 use x86_64::{
     VirtAddr,

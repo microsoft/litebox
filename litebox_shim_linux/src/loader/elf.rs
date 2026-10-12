@@ -9,11 +9,15 @@ use litebox::{
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
+use litebox_common::{
+    PAGE_SIZE,
+    page::{NonZeroAddress, NonZeroPageSize},
+};
 use litebox_common_linux::{
     MapFlags,
     errno::Errno,
     loader::ElfParsedFile,
-    vmem::{CreatePagesFlags, MappingError, NonZeroAddress, NonZeroPageSize, PAGE_SIZE},
+    vmem::{CreatePagesFlags, MappingError},
 };
 use thiserror::Error;
 
@@ -305,9 +309,8 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         };
 
         let sp = unsafe {
-            let length =
-                litebox_common_linux::vmem::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
-                    .expect("DEFAULT_STACK_SIZE is not page-aligned");
+            let length = litebox_common::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+                .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
                 .mm
                 .create_stack_pages(None, length, CreatePagesFlags::TOP_DOWN)

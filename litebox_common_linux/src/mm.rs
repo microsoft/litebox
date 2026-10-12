@@ -18,14 +18,17 @@ use litebox::{
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
+use litebox_common::{
+    PAGE_SIZE,
+    page::{NonZeroAddress, NonZeroPageSize, PageRange},
+};
 
 use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,
     errno::Errno,
     vmem::{
-        self, CreatePagesFlags, LinuxReservationStore, MappingError, NonZeroAddress,
-        NonZeroPageSize, PAGE_SIZE, PageFaultError, PageRange, VmFlags, Vmem, VmemPageFaultHandler,
-        VmemProtectError, VmemResetError, VmemUnmapError,
+        self, CreatePagesFlags, LinuxReservationStore, MappingError, PageFaultError, VmFlags, Vmem,
+        VmemPageFaultHandler, VmemProtectError, VmemResetError, VmemUnmapError,
     },
 };
 

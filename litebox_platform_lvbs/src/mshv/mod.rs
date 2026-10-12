@@ -13,7 +13,7 @@ pub mod vtl1_mem_layout;
 pub mod vtl_switch;
 
 use crate::mshv::vtl1_mem_layout::PAGE_SIZE;
-use litebox_common_linux::vmap::{
+use litebox_common::vmap::{
     PhysPageAddrArray, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use litebox_common_lvbs::MAX_CORES;
@@ -72,18 +72,13 @@ unsafe impl<const ALIGN: usize, P: VmapManager<ALIGN>> VmapManager<ALIGN>
 }
 
 type Vtl0PhysConstPtr<'a, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysConstPtr<
-        'a,
-        crate::host::LvbsLinuxKernel,
-        T,
-        ALIGN,
-    >;
+    litebox_common::physical_pointers::PhysConstPtr<'a, crate::host::LvbsLinuxKernel, T, ALIGN>;
 
 /// Mutable VTL0 pointer reserved for callers that have independently validated the destination.
 /// It bypasses ordinary protected-frame access checks and synchronization. Do not use it for other
 /// VTL0 destinations that could enable confused-deputy writes.
 type PrivilegedVtl0PhysMutPtr<'a, T, const ALIGN: usize> =
-    litebox_common_linux::physical_pointers::PhysMutPtr<
+    litebox_common::physical_pointers::PhysMutPtr<
         'a,
         PrivilegedVmap<'a, crate::host::LvbsLinuxKernel>,
         T,

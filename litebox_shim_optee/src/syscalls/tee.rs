@@ -6,7 +6,10 @@
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmem::{NonZeroAddress, NonZeroPageSize, PAGE_SIZE};
+use litebox_common::{
+    PAGE_SIZE,
+    page::{NonZeroAddress, NonZeroPageSize},
+};
 use litebox_common_optee::{
     TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeTime, TeeTimeCategory,
     TeeUuid, UserTaPropType, UteeParams,

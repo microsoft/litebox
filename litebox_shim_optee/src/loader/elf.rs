@@ -22,11 +22,12 @@ use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt,
 };
+use litebox_common::PAGE_SIZE;
 use litebox_common_linux::{
     MapFlags, ProtFlags,
     errno::Errno,
     loader::{ElfParseError, ElfParsedFile},
-    vmem::{MappingError, PAGE_SIZE},
+    vmem::MappingError,
 };
 use litebox_common_optee::{LdelfArg, TeeUuid};
 use thiserror::Error;

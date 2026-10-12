@@ -16,8 +16,8 @@ use litebox::platform::{
     ImmediatelyWokenUp, PageManagementProvider, Provider, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
+use litebox_common::page::PageRange;
 use litebox_common_linux::errno::Errno;
-use litebox_common_linux::vmem::PageRange;
 
 extern crate alloc;
 
@@ -79,8 +79,12 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
-                    unsafe { litebox_common_linux::wrfsbase(val) };
+                if litebox_common::arch::x86_64::is_valid_user_fs_base::<
+                    Self,
+                    { litebox_common::PAGE_SIZE },
+                >(val)
+                {
+                    unsafe { litebox_common::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
@@ -99,7 +103,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
         reg: &ArchSpecificRegister,
     ) -> Result<usize, ArchSpecificError> {
         match reg {
-            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common_linux::rdfsbase() }),
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common::arch::x86_64::rdfsbase() }),
             ArchSpecificRegister::GsBase => {
                 // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
                 unimplemented!()

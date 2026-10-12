@@ -5,7 +5,8 @@ use arrayvec::ArrayVec;
 use core::ops::Range;
 use litebox::platform::page_mgmt;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmem::{PageFaultError, PageRange, VmFlags, VmemPageFaultHandler};
+use litebox_common::page::PageRange;
+use litebox_common_linux::vmem::{PageFaultError, VmFlags, VmemPageFaultHandler};
 use x86_64::{
     PhysAddr, VirtAddr,
     structures::{

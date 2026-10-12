@@ -18,7 +18,7 @@ use crate::{
 use alloc::vec::Vec;
 use hashbrown::HashSet;
 use litebox::utils::TruncateExt;
-use litebox_common_linux::vmap::PhysPageAddr;
+use litebox_common::vmap::PhysPageAddr;
 use litebox_common_lvbs::{
     HekiKdataType, HekiKernelInfo, HekiKexecType, HekiPage, HekiPatch, KEXEC_SEGMENT_MAX, Kimage,
     MemAttr, ModMemType, PAGE_SIZE, ReservationStatus, VsmError, Vtl0Gate, Vtl0PrivilegedWrite,

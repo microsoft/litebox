@@ -598,7 +598,11 @@ impl litebox::platform::ArchSpecificProvider for LinuxUserland {
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
-                if litebox_common_linux::arch::is_valid_user_fs_base(val) {
+                if litebox_common::arch::x86_64::is_valid_user_fs_base::<
+                    Self,
+                    { litebox_common::PAGE_SIZE },
+                >(val)
+                {
                     set_guest_fsbase(val);
                     Ok(())
                 } else {

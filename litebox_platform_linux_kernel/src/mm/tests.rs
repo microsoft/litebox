@@ -7,12 +7,13 @@ use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
 use litebox::{mm::allocator::SafeZoneAllocator, platform::RawConstPointer};
+use litebox_common::{
+    PAGE_SIZE,
+    page::{NonZeroAddress, NonZeroPageSize, PageRange},
+};
 use litebox_common_linux::{
     mm::VmemManager,
-    vmem::{
-        CreatePagesFlags, NonZeroAddress, NonZeroPageSize, PAGE_SIZE, PageFaultError, PageRange,
-        VmFlags,
-    },
+    vmem::{CreatePagesFlags, PageFaultError, VmFlags},
 };
 use spin::mutex::SpinMutex;
 

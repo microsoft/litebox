@@ -14,10 +14,11 @@ use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},
 };
+use litebox_common::PAGE_SIZE;
 use thiserror::Error;
 use zerocopy::FromBytes;
 
-use crate::{errno::Errno, vmem::PAGE_SIZE};
+use crate::errno::Errno;
 
 type Endian = elf::endian::LittleEndian;
 

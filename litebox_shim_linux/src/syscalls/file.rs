@@ -15,10 +15,11 @@ use litebox::{
     platform::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
+use litebox_common::PAGE_SIZE;
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,
-    signal::Signal, vmem::PAGE_SIZE,
+    signal::Signal,
 };
 use thiserror::Error;
 

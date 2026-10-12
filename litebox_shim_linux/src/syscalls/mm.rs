@@ -8,13 +8,14 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use litebox::fs::errors::ReadError;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox_common::PAGE_SIZE;
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,
     loader::{
         TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, TrampolineLayout, parse_trampoline_header,
     },
-    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError},
+    vmem::{CreatePagesFlags, MappingError, VmemProtectError},
 };
 
 use crate::FileFd;
