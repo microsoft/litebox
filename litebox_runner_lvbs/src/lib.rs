@@ -1450,7 +1450,7 @@ fn handle_invoke_command(
     let params = &ta_req_info.params;
     let session_id = ta_req_info.session;
 
-    if let Some(pta) = session_manager().client_pta_for_session(session_id) {
+    if let Some(pta) = ClientPta::from_session_id(session_id) {
         return client_pta_invoke_command(
             platform,
             msg_args,
@@ -1577,7 +1577,8 @@ fn handle_close_session(
 
     debug_serial_println!("CloseSession: session_id={}", session_id);
 
-    if session_manager().close_client_pta_session(session_id) {
+    // Client PTA sessions are not tracked; closing is a no-op.
+    if ClientPta::from_session_id(session_id).is_some() {
         msg_args.ret = TeeResult::Success;
         msg_args.ret_origin = TeeOrigin::Tee;
         return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
@@ -1673,40 +1674,20 @@ fn handle_close_session(
     })
 }
 
-/// Runs on the base page table.
 fn client_pta_open_session(
     platform: &'static Platform,
     msg_args: &mut OpteeMsgArgs,
     msg_args_phys_addr: u64,
     pta: ClientPta,
 ) -> Result<(), OpteeSmcReturnCode> {
-    let result = session_manager().open_client_pta_session(pta);
-    match result {
-        Ok(session_id) => {
-            msg_args.session = session_id;
-            msg_args.ret = TeeResult::Success;
-            msg_args.ret_origin = TeeOrigin::TrustedApp;
-        }
-        // Resource limits, not PTA errors.
-        Err(error) => {
-            msg_args.ret = error;
-            msg_args.ret_origin = TeeOrigin::Tee;
-        }
-    }
-
-    write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr).inspect_err(
-        |_| {
-            // The client never learns the ID.
-            if let Ok(session_id) = result {
-                session_manager().close_client_pta_session(session_id);
-            }
-        },
-    )?;
+    msg_args.session = pta.session_id();
+    msg_args.ret = TeeResult::Success;
+    msg_args.ret_origin = TeeOrigin::TrustedApp;
+    write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
     debug_serial_println!("OpenSession on client PTA {:?}: {:?}", pta, msg_args.ret);
     Ok(())
 }
 
-/// Runs on the base page table.
 fn client_pta_invoke_command(
     platform: &'static Platform,
     msg_args: &mut OpteeMsgArgs,

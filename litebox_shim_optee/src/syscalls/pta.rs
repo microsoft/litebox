@@ -86,7 +86,9 @@ impl PseudoTa {
 /// callers it is registered for. These update `UteeParams` in place and
 /// write memref outputs directly into the client's shared memory.
 ///
-/// Assumptions: all are stateless, and none has an open-session hook.
+/// Assumptions: all are stateless, and none has an open-session hook. So
+/// sessions are not tracked: every session to a PTA shares one fixed session
+/// ID that `SessionIdPool` never allocates, and closing is a no-op.
 #[derive(Clone, Copy, Debug)]
 pub enum ClientPta {
     Device,
@@ -97,6 +99,19 @@ impl ClientPta {
         match *uuid {
             DevicePta::UUID => Some(Self::Device),
             _ => None,
+        }
+    }
+
+    pub fn from_session_id(session_id: u32) -> Option<Self> {
+        match session_id {
+            DevicePta::SESSION_ID => Some(Self::Device),
+            _ => None,
+        }
+    }
+
+    pub fn session_id(self) -> u32 {
+        match self {
+            Self::Device => DevicePta::SESSION_ID,
         }
     }
 
@@ -539,12 +554,17 @@ enum PtaDeviceCommandId {
     Rpmb = 2,
 }
 
+const _: () = assert!(DevicePta::SESSION_ID > crate::SessionIdPool::MAX_SESSION_ID);
+
 /// A TA may carry at most one of these.
 const DEVICE_ENUM_MASK: TaFlags = TaFlags::DEVICE_ENUM
     .union(TaFlags::DEVICE_ENUM_SUPP)
     .union(TaFlags::DEVICE_ENUM_TEE_STORAGE_PRIVATE);
 
 impl DevicePta {
+    /// Reserved: `SessionIdPool` never allocates it. OP-TEE treats 0 as invalid.
+    const SESSION_ID: u32 = u32::MAX;
+
     /// 7011a688-ddde-4053-a5a9-7b3c4ddf13b8
     const UUID: TeeUuid = TeeUuid {
         time_low: 0x7011_a688,
