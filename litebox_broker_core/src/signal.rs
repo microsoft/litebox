@@ -66,7 +66,7 @@ pub fn send(process: &BrokerProcess, target: SignalTarget, signal: u32) -> Resul
         SignalTarget::Process(id) => vec![process.core.registered_process(id)?],
         SignalTarget::ProcessGroup(process_group) => {
             // Members cannot move between groups while they are selected.
-            let _tree = process.core.process_tree.lock();
+            let _tree = process.core.process_tree_lock.lock();
             let mut targets = process.core.registered_processes();
             targets.retain(|target| target.membership().process_group == process_group);
             targets

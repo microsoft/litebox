@@ -242,7 +242,7 @@ pub struct BrokerCore {
     ///
     /// Lock order: this lock, then process state locks, then the registry
     /// and ID allocator, then process tree links.
-    pub(crate) process_tree: Arc<Mutex<()>>,
+    pub(crate) process_tree_lock: Arc<Mutex<()>>,
     /// Number of broker threads created and not normally retired.
     pub(crate) active_thread_count: Arc<AtomicUsize>,
     pub(crate) next_reference_handle: Arc<RwLock<u64>>,
@@ -306,7 +306,7 @@ impl BrokerCore {
             limits,
             ids: Arc::new(Mutex::new(ids)),
             processes: Arc::new(RwLock::new(HashMap::new())),
-            process_tree: Arc::new(Mutex::new(())),
+            process_tree_lock: Arc::new(Mutex::new(())),
             active_thread_count: Arc::new(AtomicUsize::new(0)),
             next_reference_handle: Arc::new(RwLock::new(1)),
             references: Arc::new(RwLock::new(HashMap::new())),
@@ -441,7 +441,7 @@ impl BrokerCore {
         };
 
         // The tree lock orders the new link against the parent's exit.
-        let _tree = self.process_tree.lock();
+        let _tree = self.process_tree_lock.lock();
         let Some(parent_id) = parent_id else {
             return allocate_process(None);
         };

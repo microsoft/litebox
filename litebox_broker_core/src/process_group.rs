@@ -29,7 +29,7 @@ pub fn set(
     target: ProcessId,
     process_group: ProcessGroupId,
 ) -> Result<()> {
-    let _tree = process.core.process_tree.lock();
+    let _tree = process.core.process_tree_lock.lock();
     let target = process.core.registered_process(target)?;
     if !core::ptr::eq(Arc::as_ptr(&target), process) && !target.is_child_of(process) {
         return Err(BrokerError::UnknownObject);
@@ -63,7 +63,7 @@ pub fn set(
 /// `UnknownObject`. Returns `PolicyDenied` if a process group already has
 /// `target`'s ID.
 pub fn create_session(process: &BrokerProcess, target: ProcessId) -> Result<()> {
-    let _tree = process.core.process_tree.lock();
+    let _tree = process.core.process_tree_lock.lock();
     let processes = process.core.registered_processes();
     let create = |target: &BrokerProcess| {
         let id = target.id();

@@ -631,7 +631,7 @@ impl BrokerProcess {
 
     /// Updates this running process's place in the process tree.
     fn update_links(&self, update: impl FnOnce(&mut ProcessLinks)) -> Result<()> {
-        let _tree = self.core.process_tree.lock();
+        let _tree = self.core.process_tree_lock.lock();
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
@@ -646,7 +646,7 @@ impl BrokerProcess {
     /// if none does. Each matching child's exit or removal is then posted to
     /// this process's signals.
     pub fn collect_child_exit(&self, selector: ChildSelector) -> Result<ChildExit> {
-        let _tree = self.core.process_tree.lock();
+        let _tree = self.core.process_tree_lock.lock();
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
@@ -910,7 +910,7 @@ impl BrokerProcess {
         // owner dies.
         self.handle_owner_death();
         {
-            let _tree = self.core.process_tree.lock();
+            let _tree = self.core.process_tree_lock.lock();
             self.state
                 .lock()
                 .status
@@ -1067,7 +1067,7 @@ impl BrokerProcess {
         expected_shutdown: bool,
     ) -> Result<()> {
         let shutdown = {
-            let _tree = self.core.process_tree.lock();
+            let _tree = self.core.process_tree_lock.lock();
             let shutdown = {
                 let mut state = self.state.lock();
                 match state.status {
@@ -1130,7 +1130,7 @@ impl BrokerProcess {
             // Child creation checks cancellation under the tree lock, so once
             // this lock is taken every child created for a live owner is
             // listed.
-            let _tree = self.core.process_tree.lock();
+            let _tree = self.core.process_tree_lock.lock();
             let mut children = core::mem::take(&mut self.links.lock().children);
             let count = children.len();
             children.retain(|child| {
