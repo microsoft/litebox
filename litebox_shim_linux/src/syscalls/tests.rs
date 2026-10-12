@@ -687,6 +687,45 @@ fn test_rlimit_nofile() {
 }
 
 #[test]
+fn test_prlimit_and_get_robust_list_by_id() {
+    use litebox_common_linux::{Rlimit64, RlimitResource, errno::Errno};
+
+    let task = init_platform();
+    let mut limit = Rlimit64 {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    task.sys_prlimit(
+        task.pid,
+        RlimitResource::NOFILE,
+        None,
+        Some(UserPtrMut::from_usize(&raw mut limit as usize)),
+    )
+    .expect("prlimit must accept this process's ID");
+    let expected = litebox_common_linux::rlimit_to_rlimit64(
+        task.do_prlimit(RlimitResource::NOFILE, None).unwrap(),
+    );
+    assert_eq!(
+        (limit.rlim_cur, limit.rlim_max),
+        (expected.rlim_cur, expected.rlim_max)
+    );
+    assert_eq!(
+        task.sys_prlimit(i32::MAX, RlimitResource::NOFILE, None, None),
+        Err(Errno::ESRCH)
+    );
+
+    let mut head = usize::MAX;
+    let head_ptr = UserPtrMut::from_usize(&raw mut head as usize);
+    task.sys_get_robust_list(Some(task.tid()), head_ptr)
+        .expect("get_robust_list must accept the calling thread's ID");
+    assert_eq!(head, 0);
+    assert_eq!(
+        task.sys_get_robust_list(Some(i32::MAX), head_ptr),
+        Err(Errno::ESRCH)
+    );
+}
+
+#[test]
 fn test_unlinkat() {
     let task = init_platform();
 

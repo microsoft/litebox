@@ -5,8 +5,10 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -85,6 +87,37 @@ static pid_t reap(pid_t pid, int *code) {
     return waited;
 }
 
+// Checks that, like Linux, `getpgid`, `getsid` and `kill` given a thread's ID select its process.
+static void *query_by_thread_id(void *arg) {
+    (void)arg;
+    pid_t thread = (pid_t)syscall(SYS_gettid);
+    CHECK(thread != getpid());
+    CHECK(getpgid(thread) == getpgrp());
+    CHECK(getsid(thread) == getsid(0));
+    CHECK(kill(thread, 0) == 0);
+    // Like Linux, `setpgid` rejects a thread's ID.
+    CHECK(setpgid(thread, 0) == -1 && errno == EINVAL);
+    return NULL;
+}
+
+// Writes this thread's ID to the pipe `arg`, then waits for its process to exit.
+static void *report_thread_id(void *arg) {
+    pid_t thread = (pid_t)syscall(SYS_gettid);
+    if (write(*(int *)arg, &thread, sizeof(thread)) != sizeof(thread)) {
+        _exit(1);
+    }
+    for (;;) {
+        pause();
+    }
+}
+
+// Sends `SIGUSR1` with `kill` given this thread's ID, which this thread blocks.
+static void *kill_own_thread(void *arg) {
+    (void)arg;
+    CHECK(kill((pid_t)syscall(SYS_gettid), SIGUSR1) == 0);
+    return NULL;
+}
+
 int main(void) {
     pid_t self = getpid();
     // LiteBox's initial process leads its own process group and session.
@@ -96,6 +129,9 @@ int main(void) {
     CHECK(getpgid(-1) == -1 && errno == ESRCH);
     CHECK(getsid(-1) == -1 && errno == ESRCH);
     CHECK(getpgid(0x7fffff) == -1 && errno == ESRCH);
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, query_by_thread_id, NULL) == 0);
+    CHECK(pthread_join(thread, NULL) == 0);
     CHECK(setpgid(0, -1) == -1 && errno == EINVAL);
     // Like Linux, a session leader cannot change its process group.
     CHECK(setpgid(0, 0) == -1 && errno == EPERM);
@@ -111,6 +147,16 @@ int main(void) {
     sigaddset(&blocked, SIGUSR1);
     sigaddset(&blocked, SIGUSR2);
     sigprocmask(SIG_BLOCK, &blocked, NULL);
+
+    // Like Linux, `kill` directs a signal to the whole process, so another thread takes it once
+    // it unblocks the signal, even after the sending thread exits.
+    CHECK(pthread_create(&thread, NULL, kill_own_thread, NULL) == 0);
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(usr1_count == 0);
+    sigprocmask(SIG_UNBLOCK, &blocked, NULL);
+    CHECK(usr1_count == 1);
+    sigprocmask(SIG_BLOCK, &blocked, NULL);
+    usr1_count = 0;
 
     // Two children in a new group and one in this process's group.
     pid_t leader = fork_member(0, 10, &blocked);
@@ -148,6 +194,30 @@ int main(void) {
     CHECK(codes == 30);
     CHECK(waitpid(-leader, NULL, 0) == -1 && errno == ECHILD);
     CHECK(no_process_remains(-leader));
+
+    // Like Linux, the ID of another process's thread selects that process.
+    int thread_ids[2];
+    CHECK(pipe(thread_ids) == 0);
+    pid_t threaded = fork();
+    if (threaded == 0) {
+        usr1_count = 0;
+        usr2_count = 0;
+        pthread_t reporter;
+        if (pthread_create(&reporter, NULL, report_thread_id, &thread_ids[1]) != 0) {
+            _exit(1);
+        }
+        wait_for_signal(&blocked);
+        _exit(usr1_count == 1 ? 60 : 61);
+    }
+    close(thread_ids[1]);
+    pid_t thread_id = 0;
+    CHECK(read(thread_ids[0], &thread_id, sizeof(thread_id)) == sizeof(thread_id));
+    CHECK(thread_id > 0 && thread_id != threaded);
+    CHECK(getpgid(thread_id) == getpgid(threaded));
+    CHECK(setpgid(thread_id, 0) == -1 && errno == EINVAL);
+    CHECK(thread_id > 0 && kill(thread_id, SIGUSR1) == 0);
+    CHECK(reap(threaded, &code) == threaded && code == 60);
+    close(thread_ids[0]);
 
     // A forked child starts a session, after which it can neither start another nor be moved.
     int ready[2];

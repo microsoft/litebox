@@ -21,7 +21,7 @@ use crate::pipe::{
 use crate::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, WriteChildMemoryRequest,
+    StartChildProcessRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::SetProcessGroupRequest;
 use crate::readiness::ReadinessFlags;
@@ -138,7 +138,8 @@ impl BrokerOperation {
                 | ProcessRequest::SetChildExitRetention(_)
                 | ProcessRequest::SetOrphanAdoption(_)
                 | ProcessRequest::CollectChildExit(_)
-                | ProcessRequest::GetInfo(_),
+                | ProcessRequest::GetInfo(_)
+                | ProcessRequest::GetThreadInfo(_),
             )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
@@ -283,6 +284,10 @@ pub enum ProcessRequest {
     ///
     /// The broker returns `UnknownObject` if no such process exists.
     GetInfo(ProcessId),
+    /// Read which process a thread belongs to.
+    ///
+    /// The broker returns `UnknownObject` if no such thread exists.
+    GetThreadInfo(ThreadId),
 }
 
 /// Request about process groups and sessions.
@@ -460,6 +465,8 @@ pub enum ProcessResponse {
     CollectChildExit(ChildExit),
     /// A process's place in the process tree.
     GetInfo(ProcessInfo),
+    /// The process a thread belongs to.
+    GetThreadInfo(ThreadInfo),
 }
 
 /// Response to a process group request.

@@ -818,9 +818,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
         } else {
             Some(Signal::try_from(signal)?)
         };
+        // Like Linux, `kill` given the ID of any of this process's threads signals this process.
+        let pid = match (pid, tid) {
+            (Some(pid), None) if self.process().has_thread(pid) => Some(self.pid),
+            _ => pid,
+        };
         if pid.is_none_or(|pid| pid == self.pid) && tid.is_none_or(|tid| tid == self.tid()) {
             if let Some(signal) = signal {
-                self.send_signal(signal, siginfo_kill(signal));
+                // `kill` directs the signal to the process, so any of its threads not blocking
+                // the signal may take it, while `tkill` and `tgkill` direct it to this thread.
+                if tid.is_none() {
+                    self.send_shared_signal(signal, siginfo_kill(signal));
+                } else {
+                    self.send_signal(signal, siginfo_kill(signal));
+                }
             }
             Ok(0)
         } else if let (Some(pid), None) = (pid, tid) {
@@ -847,7 +858,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
             _ => SignalTarget::ProcessGroup(ProcessGroupId(pid.unsigned_abs())),
         };
         let number = signal.map_or(0, |signal| signal.as_i32().cast_unsigned());
-        match self.global.litebox.send_signal(target, number) {
+        let litebox = &self.global.litebox;
+        let result = match litebox.send_signal(target, number) {
+            // Like Linux, the ID of any of a process's threads selects the process.
+            Err(ProcessError::NoSuchProcess) if matches!(target, SignalTarget::Process(_)) => self
+                .thread_owner(pid)
+                .and_then(|owner| litebox.send_signal(SignalTarget::Process(owner), number)),
+            result => result,
+        };
+        match result {
             Ok(()) => {}
             // Without a process service, no other process exists.
             Err(ProcessError::Unavailable) if matches!(target, SignalTarget::Process(_)) => {

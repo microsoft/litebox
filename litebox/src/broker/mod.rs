@@ -20,7 +20,7 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::pipe::{CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE};
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES,
-    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -107,6 +107,11 @@ pub(crate) trait BrokerControl: Send + Sync {
         &self,
         process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<ProcessInfo, BrokerControlError>;
+
+    fn thread_info(
+        &self,
+        thread_id: ThreadId,
+    ) -> core::result::Result<ThreadInfo, BrokerControlError>;
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
@@ -633,6 +638,13 @@ where
         process_id: litebox_broker_protocol::ProcessId,
     ) -> core::result::Result<ProcessInfo, BrokerControlError> {
         self.request(|local| local.process_info(process_id))
+    }
+
+    fn thread_info(
+        &self,
+        thread_id: ThreadId,
+    ) -> core::result::Result<ThreadInfo, BrokerControlError> {
+        self.request(|local| local.thread_info(thread_id))
     }
 
     fn open_signals(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {

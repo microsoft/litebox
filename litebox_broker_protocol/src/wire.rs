@@ -598,7 +598,7 @@ mod tests {
     };
     use crate::process::{
         ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
-        ProcessExitStatus, ProcessIdentity, ProcessInfo, StartChildProcessRequest,
+        ProcessExitStatus, ProcessIdentity, ProcessInfo, StartChildProcessRequest, ThreadInfo,
         WriteChildMemoryRequest,
     };
     use crate::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
@@ -1022,6 +1022,7 @@ mod tests {
                 ChildSelector::ProcessGroup(ProcessGroupId(7)),
             )),
             BrokerOperation::Process(ProcessRequest::GetInfo(process_id(u32::MAX))),
+            BrokerOperation::Process(ProcessRequest::GetThreadInfo(thread_id(u32::MAX))),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1428,6 +1429,14 @@ mod tests {
                     process_group: ProcessGroupId(u32::MAX),
                     session: SessionId(3),
                 },
+            })),
+            BrokerResult::Process(ProcessResponse::GetThreadInfo(ThreadInfo {
+                process_id: process_id(1),
+                initial: false,
+            })),
+            BrokerResult::Process(ProcessResponse::GetThreadInfo(ThreadInfo {
+                process_id: process_id(u32::MAX),
+                initial: true,
             })),
             BrokerResult::Error(ErrorCode::PolicyDenied),
             BrokerResult::Error(ErrorCode::WouldBlock),

@@ -11,10 +11,10 @@ use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, WriteChildMemoryRequest,
+    StartChildProcessRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
@@ -241,6 +241,20 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn process_info(&self, process_id: ProcessId) -> Result<ProcessInfo, Channel::Error> {
         match self.request_process(ProcessRequest::GetInfo(process_id))? {
             ProcessResponse::GetInfo(info) => Ok(info),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    /// Returns the process thread `thread_id` belongs to.
+    ///
+    /// Returns `UnknownObject` if no such thread exists.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for another operation.
+    pub fn thread_info(&self, thread_id: ThreadId) -> Result<ThreadInfo, Channel::Error> {
+        match self.request_process(ProcessRequest::GetThreadInfo(thread_id))? {
+            ProcessResponse::GetThreadInfo(info) => Ok(info),
             response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }

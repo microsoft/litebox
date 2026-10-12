@@ -87,6 +87,15 @@ pub struct ProcessInfo {
     pub membership: ProcessGroupMembership,
 }
 
+/// The process a thread belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadInfo {
+    /// Process the thread belongs to.
+    pub process_id: ProcessId,
+    /// Whether the thread is the process's initial thread.
+    pub initial: bool,
+}
+
 /// Starts a pending child created earlier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartChildProcessRequest {

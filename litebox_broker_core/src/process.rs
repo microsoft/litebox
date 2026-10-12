@@ -18,7 +18,7 @@ use crate::{BrokerCore, BrokerError, Result};
 use hashbrown::{HashMap, HashSet};
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, ProcessExitStatus, ProcessIdentity, ProcessInfo,
+    ChildExit, ChildSelector, ProcessExitStatus, ProcessIdentity, ProcessInfo, ThreadInfo,
 };
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -671,6 +671,26 @@ impl BrokerProcess {
             parent: parent.as_ref().map(|parent| parent.id),
             membership,
         })
+    }
+
+    /// Returns the process the thread `target` belongs to.
+    ///
+    /// Returns `UnknownObject` if no such thread exists.
+    pub fn thread_info(&self, target: ThreadId) -> Result<ThreadInfo> {
+        self.core
+            .registered_processes()
+            .into_iter()
+            .find(|process| process.threads.lock().contains(&target))
+            .map(|process| ThreadInfo {
+                process_id: process.id,
+                // Until process creation records its initial thread, that is
+                // its only thread.
+                initial: process
+                    .initial_thread_id
+                    .get()
+                    .is_none_or(|&initial| initial == target),
+            })
+            .ok_or(BrokerError::UnknownObject)
     }
 
     /// Duplicates object references into the pending child selected by
@@ -1931,10 +1951,12 @@ mod tests {
     use litebox_broker_protocol::fs::{
         FileAccessMode, FileError, FileMode, FileOpenFlags, FileSeekWhence, FileType, FileUser,
     };
-    use litebox_broker_protocol::process::{ChildExit, ChildSelector, ProcessExitStatus};
+    use litebox_broker_protocol::process::{
+        ChildExit, ChildSelector, ProcessExitStatus, ThreadInfo,
+    };
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::SignalEvent;
-    use litebox_broker_protocol::{ObjectHandle, ProcessId};
+    use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
     use std::{boxed::Box, sync::Arc, vec, vec::Vec};
 
     const TEST_MAX_REFERENCES: usize = 4;
@@ -3236,6 +3258,43 @@ mod tests {
 
         assert_eq!(second.exit_thread(thread), Err(BrokerError::UnknownObject));
         assert_eq!(first.exit_thread(thread), Ok(()));
+    }
+
+    #[test]
+    fn thread_info_names_the_owning_process() {
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
+            ObjectRights::all(),
+        ))
+        .build()
+        .unwrap();
+        let root = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        root.complete_start().unwrap();
+        let child = child_of(&root);
+        let thread = child.create_thread().unwrap();
+
+        assert_eq!(
+            root.thread_info(root.initial_thread_id()),
+            Ok(ThreadInfo {
+                process_id: root.id(),
+                initial: true,
+            })
+        );
+        assert_eq!(
+            root.thread_info(thread),
+            Ok(ThreadInfo {
+                process_id: child.id(),
+                initial: false,
+            })
+        );
+        // A process ID names no thread.
+        assert_eq!(
+            root.thread_info(ThreadId(root.id().0)),
+            Err(BrokerError::UnknownObject)
+        );
+        child.exit_thread(thread).unwrap();
+        assert_eq!(root.thread_info(thread), Err(BrokerError::UnknownObject));
     }
 
     #[test]

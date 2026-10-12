@@ -479,8 +479,8 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                litebox_thread: Cell::new(Some(initial_thread)),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                litebox_thread: Cell::new(None),
+                thread: syscalls::process::ThreadState::new_process(pid, Some(initial_thread)),
                 wait_state: wait::WaitState::new(self.0.platform),
                 vfork: RefCell::new(None),
                 pid,
@@ -580,7 +580,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             .map_err(ForkRestoreError::WorkingDirectory)?;
         fs_state.set_umask(umask);
 
-        let thread = syscalls::process::ThreadState::new_process(pid);
+        let thread = syscalls::process::ThreadState::new_process(pid, Some(initial_thread));
         thread.set_forked_init_state(
             registers,
             vector_state,
@@ -592,7 +592,7 @@ impl<Platform: ShimPlatform> LinuxShim<Platform> {
             _not_send: core::marker::PhantomData,
             task: Task {
                 global: self.0.clone(),
-                litebox_thread: Cell::new(Some(initial_thread)),
+                litebox_thread: Cell::new(None),
                 thread,
                 wait_state: wait::WaitState::new(self.0.platform),
                 vfork: RefCell::new(None),
@@ -1535,6 +1535,8 @@ struct GlobalState<Platform: ShimPlatform> {
 
 struct Task<Platform: ShimPlatform> {
     global: Arc<GlobalState<Platform>>,
+    /// The broker thread whose ID is this task's thread ID. The main thread has none, since its
+    /// thread ID is the process ID.
     litebox_thread: Cell<Option<litebox::thread::Thread>>,
     wait_state: wait::WaitState<Platform>,
     thread: syscalls::process::ThreadState<Platform>,
@@ -1617,7 +1619,7 @@ mod test_utils {
             Task {
                 wait_state: wait::WaitState::new(self.platform),
                 litebox_thread: Cell::new(None),
-                thread: syscalls::process::ThreadState::new_process(pid),
+                thread: syscalls::process::ThreadState::new_process(pid, None),
                 vfork: RefCell::new(None),
                 pid,
                 credentials,

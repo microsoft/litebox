@@ -11,10 +11,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::process::{
     ChildExit, ChildSelector, MAX_CHILD_MEMORY_WRITE_SIZE, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo,
+    ProcessInfo, ThreadInfo,
 };
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
-use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId};
+use litebox_broker_protocol::{ObjectHandle, ProcessGroupId, ProcessId, ThreadId};
 use litebox_platform::time::TimeProvider;
 
 use crate::LiteBox;
@@ -124,6 +124,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         broker.process_info(process_id).map_err(no_such_process)
     }
 
+    /// Returns the process thread `thread_id` belongs to.
+    ///
+    /// Returns [`ProcessError::NoSuchProcess`] if no thread has the ID.
+    pub fn thread_info(&self, thread_id: ThreadId) -> Result<ThreadInfo, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        broker.thread_info(thread_id).map_err(no_such_process)
+    }
+
     /// Sends `signal` to the processes `target` selects, or only checks that
     /// one exists if `signal` is zero.
     ///
@@ -142,6 +150,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     /// Returns [`ProcessError::PolicyDenied`] if the process is in another
     /// session than this process or leads a session, or if `process_group` is
     /// neither `process_id` nor an existing group in this process's session.
+    /// Returns [`ProcessError::NoSuchProcess`] if `process_id` names neither
+    /// this process nor one of its children.
     pub fn set_process_group(
         &self,
         process_id: ProcessId,

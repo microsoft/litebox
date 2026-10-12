@@ -606,6 +606,9 @@ fn handle_process_request<Memory: SharedMemory>(
         ProcessRequest::GetInfo(process_id) => process
             .process_info(process_id)
             .map(ProcessResponse::GetInfo),
+        ProcessRequest::GetThreadInfo(thread_id) => process
+            .thread_info(thread_id)
+            .map(ProcessResponse::GetThreadInfo),
     };
     response.map_err(RequestFailure::from)
 }

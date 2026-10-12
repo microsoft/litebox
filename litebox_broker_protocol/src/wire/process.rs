@@ -6,7 +6,7 @@ use crate::message::{ProcessRequest, ProcessResponse};
 use crate::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, WriteChildMemoryRequest,
+    StartChildProcessRequest, ThreadInfo, WriteChildMemoryRequest,
 };
 use crate::process_group::ProcessGroupMembership;
 
@@ -24,6 +24,7 @@ const PROCESS_REQUEST_TAG_SET_CHILD_EXIT_RETENTION: u8 = 7;
 const PROCESS_REQUEST_TAG_SET_ORPHAN_ADOPTION: u8 = 8;
 const PROCESS_REQUEST_TAG_COLLECT_CHILD_EXIT: u8 = 9;
 const PROCESS_REQUEST_TAG_GET_INFO: u8 = 10;
+const PROCESS_REQUEST_TAG_GET_THREAD_INFO: u8 = 11;
 
 const PROCESS_RESPONSE_TAG_ALLOCATE_CHILD: u8 = 0;
 const PROCESS_RESPONSE_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 1;
@@ -36,6 +37,7 @@ const PROCESS_RESPONSE_TAG_SET_CHILD_EXIT_RETENTION: u8 = 7;
 const PROCESS_RESPONSE_TAG_SET_ORPHAN_ADOPTION: u8 = 8;
 const PROCESS_RESPONSE_TAG_COLLECT_CHILD_EXIT: u8 = 9;
 const PROCESS_RESPONSE_TAG_GET_INFO: u8 = 10;
+const PROCESS_RESPONSE_TAG_GET_THREAD_INFO: u8 = 11;
 
 const PROCESS_EXIT_STATUS_TAG_EXITED: u8 = 0;
 const PROCESS_EXIT_STATUS_TAG_SIGNALED: u8 = 1;
@@ -106,6 +108,10 @@ pub(super) fn encode_process_request(encoder: &mut Encoder, request: ProcessRequ
             encoder.u8(PROCESS_REQUEST_TAG_GET_INFO);
             encoder.process_id(process_id);
         }
+        ProcessRequest::GetThreadInfo(thread_id) => {
+            encoder.u8(PROCESS_REQUEST_TAG_GET_THREAD_INFO);
+            encoder.thread_id(thread_id);
+        }
     }
 }
 
@@ -151,6 +157,7 @@ pub(super) fn decode_process_request(
             ProcessRequest::CollectChildExit(decode_child_selector(decoder)?)
         }
         PROCESS_REQUEST_TAG_GET_INFO => ProcessRequest::GetInfo(decoder.process_id()?),
+        PROCESS_REQUEST_TAG_GET_THREAD_INFO => ProcessRequest::GetThreadInfo(decoder.thread_id()?),
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -187,6 +194,14 @@ pub(super) fn encode_process_response(encoder: &mut Encoder, response: ProcessRe
             encoder.u8(PROCESS_RESPONSE_TAG_GET_INFO);
             encode_process_info(encoder, info);
         }
+        ProcessResponse::GetThreadInfo(ThreadInfo {
+            process_id,
+            initial,
+        }) => {
+            encoder.u8(PROCESS_RESPONSE_TAG_GET_THREAD_INFO);
+            encoder.process_id(process_id);
+            encoder.u8(u8::from(initial));
+        }
     }
 }
 
@@ -210,6 +225,10 @@ pub(super) fn decode_process_response(
             ProcessResponse::CollectChildExit(decode_child_exit(decoder)?)
         }
         PROCESS_RESPONSE_TAG_GET_INFO => ProcessResponse::GetInfo(decode_process_info(decoder)?),
+        PROCESS_RESPONSE_TAG_GET_THREAD_INFO => ProcessResponse::GetThreadInfo(ThreadInfo {
+            process_id: decoder.process_id()?,
+            initial: decode_bool(decoder)?,
+        }),
         _ => return Err(WireError::InvalidTag),
     })
 }

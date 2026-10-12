@@ -25,10 +25,10 @@ use litebox::process::ProcessError;
 use litebox::sync::{Mutex, RwLock};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_protocol::process::MAX_CHILD_MEMORY_WRITE_SIZE;
-use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus};
+use litebox_broker_protocol::process::{ChildSelector, ProcessExitStatus, ThreadInfo};
 use litebox_broker_protocol::process_group::ProcessGroupMembership;
 use litebox_broker_protocol::signal::SignalEvent;
-use litebox_broker_protocol::{ProcessGroupId, ProcessId};
+use litebox_broker_protocol::{ProcessGroupId, ProcessId, ThreadId};
 use litebox_common_linux::ProtFlags;
 use litebox_common_linux::program_startup::{ForkMemoryRegion, LinuxForkStartup};
 use litebox_common_linux::signal::{CLD_EXITED, Signal};
@@ -69,11 +69,13 @@ pub(crate) struct ThreadState<Platform: ShimPlatform> {
 unsafe impl<Platform: ShimPlatform> Send for ThreadState<Platform> {}
 
 impl<Platform: ShimPlatform> ThreadState<Platform> {
-    pub fn new_process(pid: i32) -> Self {
+    /// Creates the main thread of a new process, which holds the broker's `initial_thread` for
+    /// it, if any.
+    pub fn new_process(pid: i32, initial_thread: Option<litebox::thread::Thread>) -> Self {
         let remote = Arc::new(ThreadRemote::new());
         Self {
             init_state: Cell::new(ThreadInitState::None),
-            process: Arc::new(ProcessState::new(pid, remote.clone())),
+            process: Arc::new(ProcessState::new(pid, remote.clone(), initial_thread)),
             remote,
             tid: Cell::new(Some(pid)),
             clear_child_tid: Cell::new(None),
@@ -240,6 +242,10 @@ pub(crate) struct ProcessState<Platform: ShimPlatform> {
     pub(crate) alarm_timer: Mutex<Platform, Alarm<Platform>>,
     #[cfg(target_arch = "aarch64")]
     pub(crate) sigreturn_trampoline: Mutex<Platform, Option<usize>>,
+    /// The broker thread created with this process. The main thread's ID is the process ID, so
+    /// no thread has this ID. Holding it until the process ends keeps the broker from giving
+    /// the ID to another of this process's threads.
+    _initial_thread: Option<litebox::thread::Thread>,
 }
 
 /// Watcher of the signals other processes send to a process and its children's exits, which
@@ -326,7 +332,11 @@ pub(crate) enum ExitStatus {
 
 impl<Platform: ShimPlatform> ProcessState<Platform> {
     /// Creates a new process with the given initial thread.
-    fn new(pid: i32, remote: Arc<ThreadRemote<Platform>>) -> Self {
+    fn new(
+        pid: i32,
+        remote: Arc<ThreadRemote<Platform>>,
+        initial_thread: Option<litebox::thread::Thread>,
+    ) -> Self {
         let nr_threads = <Platform as RawMutexProvider>::RawMutex::INIT;
         nr_threads.underlying_atomic().store(1, Ordering::Relaxed);
         let inner = Arc::new(Mutex::new(ProcessInner {
@@ -357,12 +367,18 @@ impl<Platform: ShimPlatform> ProcessState<Platform> {
             }),
             #[cfg(target_arch = "aarch64")]
             sigreturn_trampoline: Mutex::new(None),
+            _initial_thread: initial_thread,
         }
     }
 
     /// Returns the current number of threads in this process.
     pub fn nr_threads(&self) -> u32 {
         self.nr_threads.underlying_atomic().load(Ordering::Relaxed)
+    }
+
+    /// Returns whether `tid` is the ID of one of this process's threads.
+    pub(crate) fn has_thread(&self, tid: i32) -> bool {
+        self.inner.lock().threads.contains_key(&tid)
     }
 
     fn has_default_alarm_state(&self) -> bool {
@@ -516,8 +532,17 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if !watcher.changed.swap(false, Ordering::SeqCst) && !force {
             return;
         }
-        // Failure means the process service failed, so no more signals can be taken.
-        while let Ok(Some(event)) = signals.take() {
+        loop {
+            let event = match signals.take() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                // Failure means the process service failed, so no more signals can be taken.
+                // Wake the threads waiting for a child, so they retry and see the failure.
+                Err(_) => {
+                    process.child_exits.notify_observers(Events::ERR);
+                    break;
+                }
+            };
             match event {
                 SignalEvent::Signal(received) => {
                     if let Ok(signal) = Signal::try_from(received.signal.cast_signed()) {
@@ -705,7 +730,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Transfers a surviving nonleader exec caller to the process leader
-    /// identity while retaining its broker thread ownership.
+    /// identity, releasing its former thread ID as Linux does.
     fn rebind_exec_identity(&self) {
         let Some(old_tid) = self.thread.rebind_for_exec(self.pid) else {
             return;
@@ -720,7 +745,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
             old_tid,
             "LiteBox thread ownership must match the old Linux thread ID"
         );
-        self.litebox_thread.set(Some(thread));
+        let thread_id = thread.id();
+        if let Err(error) = thread.exit() {
+            litebox_util_log::error!(
+                error:% = error,
+                thread_id;
+                "failed to record thread exit"
+            );
+        }
     }
 
     /// Returns true if the task is exiting and should not continue running
@@ -1772,8 +1804,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Handle syscall `prlimit64`.
     ///
-    /// Note for now setting new limits is not supported yet, and thus returning constant values
-    /// for the requested resource. Getting resources for a specific PID is also not supported yet.
+    /// Unlike Linux, the limits of another process cannot be read or changed.
     pub(crate) fn sys_prlimit(
         &self,
         pid: i32,
@@ -1781,9 +1812,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         new_rlim: Option<UserPtr<litebox_common_linux::Rlimit64>>,
         old_rlim: Option<UserPtrMut<litebox_common_linux::Rlimit64>>,
     ) -> Result<(), Errno> {
-        if pid != 0 {
-            unimplemented!("prlimit for a specific PID is not supported yet");
-        }
         let new_limit = match new_rlim {
             Some(rlim) => {
                 let rlim = rlim.read_at_offset::<Platform>(0).ok_or(Errno::EINVAL)?;
@@ -1791,6 +1819,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
             None => None,
         };
+        // Like Linux, any of this process's thread IDs selects this process.
+        if pid != 0 && pid != self.pid && !self.process().has_thread(pid) {
+            return Err(self.unreachable_target_error(pid));
+        }
         let old_limit =
             litebox_common_linux::rlimit_to_rlimit64(self.do_prlimit(resource, new_limit)?);
         if let Some(old_rlim) = old_rlim {
@@ -1830,13 +1862,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     }
 
     /// Handle syscall `get_robust_list`.
+    ///
+    /// Unlike Linux, only the calling thread's list can be read.
     pub(crate) fn sys_get_robust_list(
         &self,
         pid: Option<i32>,
         head_ptr: UserPtrMut<usize>,
     ) -> Result<(), Errno> {
-        if pid.is_some() {
-            unimplemented!("Getting robust list for a specific PID is not supported yet");
+        if let Some(pid) = pid.filter(|&pid| pid != self.tid()) {
+            return Err(self.unreachable_target_error(pid));
         }
         let head = self
             .thread
@@ -2250,16 +2284,61 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Returns the process group and session of process `pid`, or of this process if `pid` is
     /// zero.
+    ///
+    /// Like Linux, the ID of any of a process's threads selects the process.
     fn membership(&self, pid: i32) -> Result<ProcessGroupMembership, ProcessError> {
         let pid = match pid {
             0 => self.sys_getpid(),
             1.. => pid,
             _ => return Err(ProcessError::NoSuchProcess),
         };
-        self.global
+        let litebox = &self.global.litebox;
+        match litebox.process_info(ProcessId(pid.cast_unsigned())) {
+            Err(ProcessError::NoSuchProcess) => litebox.process_info(self.thread_owner(pid)?),
+            result => result,
+        }
+        .map(|info| info.membership)
+    }
+
+    /// Returns the process that has a thread with ID `tid` other than its main thread, whose
+    /// thread ID is the process ID.
+    ///
+    /// Returns [`ProcessError::NoSuchProcess`] if there is no such thread.
+    pub(super) fn thread_owner(&self, tid: i32) -> Result<ProcessId, ProcessError> {
+        let tid = u32::try_from(tid).map_err(|_| ProcessError::NoSuchProcess)?;
+        // The main thread's ID is the process ID rather than its initial broker thread's.
+        match self.global.litebox.thread_info(ThreadId(tid))? {
+            ThreadInfo {
+                process_id,
+                initial: false,
+            } => Ok(process_id),
+            ThreadInfo { initial: true, .. } => Err(ProcessError::NoSuchProcess),
+        }
+    }
+
+    /// Returns the error for targeting the process or thread `pid` whose state lives beyond this
+    /// thread's reach: `EPERM` if a process or thread has the ID, or else `ESRCH`.
+    fn unreachable_target_error(&self, pid: i32) -> Errno {
+        if pid <= 0 {
+            return Errno::ESRCH;
+        }
+        if pid == self.pid || self.process().has_thread(pid) {
+            return Errno::EPERM;
+        }
+        let exists = match self
+            .global
             .litebox
             .process_info(ProcessId(pid.cast_unsigned()))
-            .map(|info| info.membership)
+        {
+            Err(ProcessError::NoSuchProcess) => self.thread_owner(pid).map(drop),
+            result => result.map(drop),
+        };
+        match exists {
+            Ok(()) => Errno::EPERM,
+            // Without a process service, no other process exists.
+            Err(ProcessError::NoSuchProcess | ProcessError::Unavailable) => Errno::ESRCH,
+            Err(error) => error.into(),
+        }
     }
 
     /// Handle syscall `setpgid`.
@@ -2280,11 +2359,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
         if pid < 0 || (self.vfork.borrow().is_some() && pid != self.sys_getpid()) {
             return Err(Errno::ESRCH);
         }
-        self.global.litebox.set_process_group(
+        match self.global.litebox.set_process_group(
             ProcessId(pid.cast_unsigned()),
             ProcessGroupId(process_group.cast_unsigned()),
-        )?;
-        Ok(0)
+        ) {
+            Ok(()) => Ok(0),
+            // Like Linux, a thread other than a main thread cannot be moved.
+            Err(ProcessError::NoSuchProcess) => match self.thread_owner(pid) {
+                Ok(_) => Err(Errno::EINVAL),
+                Err(ProcessError::NoSuchProcess) => Err(Errno::ESRCH),
+                Err(error) => Err(error.into()),
+            },
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Handle syscall `getpgid`.
@@ -2973,7 +3060,7 @@ mod tests {
     }
 
     #[test]
-    fn nonleader_exec_rebinds_identity_and_retains_broker_thread() {
+    fn nonleader_exec_rebinds_identity_and_releases_old_thread_id() {
         use litebox::thread::CreateError;
         use litebox_broker_core::BrokerCoreLimits;
 
@@ -2994,6 +3081,7 @@ mod tests {
         let process = task.process().clone();
 
         assert_ne!(old_tid, process_id);
+        assert_eq!(task.sys_getpgid(old_tid), task.sys_getpgid(0));
         assert!(matches!(
             task.global.create_thread(),
             Err(CreateError::ResourceExhausted)
@@ -3010,17 +3098,16 @@ mod tests {
             assert!(inner.threads.contains_key(&process_id));
             assert!(!inner.threads.contains_key(&old_tid));
         }
+        // Like Linux, the old thread ID no longer names a thread.
+        assert_eq!(
+            task.sys_getpgid(old_tid),
+            Err(litebox_common_linux::errno::Errno::ESRCH)
+        );
 
-        assert!(matches!(
-            task.global.create_thread(),
-            Err(CreateError::ResourceExhausted)
-        ));
-
-        let global = task.global.clone();
-        drop(task);
-        let replacement = global
+        let replacement = task
+            .global
             .create_thread()
-            .expect("task exit must release the retained broker thread slot");
+            .expect("exec must release the old broker thread slot");
         replacement
             .exit()
             .expect("the replacement broker thread must exit");
