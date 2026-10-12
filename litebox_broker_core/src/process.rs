@@ -223,8 +223,6 @@ struct BrokerProcessState {
     reported_exit_status: Option<ProcessExitStatus>,
     /// Child retained until this process requests startup.
     pending_child_process: Option<PendingChild>,
-    /// Whether a starting child continues after its parent dies.
-    continue_startup_on_parent_death: bool,
     retirement: ProcessRetirement,
     shutdown_request: ProcessShutdownRequest,
     shutdown: Option<ProcessShutdown>,
@@ -341,7 +339,6 @@ impl BrokerProcess {
                 status: ProcessStatus::Starting,
                 reported_exit_status: None,
                 pending_child_process: None,
-                continue_startup_on_parent_death: false,
                 retirement: ProcessRetirement::Active { abnormal: false },
                 shutdown_request: ProcessShutdownRequest::None,
                 shutdown: None,
@@ -394,34 +391,6 @@ impl BrokerProcess {
     #[must_use]
     pub const fn caller_credential(&self) -> CallerCredential {
         self.caller_credential
-    }
-
-    /// Prepares a newly created child for duplication startup.
-    ///
-    /// The child must have been created directly from this running process.
-    /// Holding the parent state lock while marking the child ensures parent
-    /// death either rejects ordinary startup or lets prepared startup continue.
-    pub fn prepare_duplication_child(&self, child: &BrokerProcess) -> Result<()> {
-        if !self.core.policy.process_duplication_enabled() {
-            return Err(BrokerError::PolicyDenied);
-        }
-        if core::ptr::eq(self, child) || !Arc::ptr_eq(&self.core.processes, &child.core.processes) {
-            return Err(BrokerError::Internal);
-        }
-
-        let state = self.state.lock();
-        if !self.accepts_operations(&state) {
-            return Err(BrokerError::PeerClosed);
-        }
-        let mut child_state = child.state.lock();
-        if !child.awaits_startup(&child_state)
-            || !child.is_child_of(self)
-            || child_state.continue_startup_on_parent_death
-        {
-            return Err(BrokerError::Internal);
-        }
-        child_state.continue_startup_on_parent_death = true;
-        Ok(())
     }
 
     /// Allocates and retains one pending child process.
@@ -851,7 +820,6 @@ impl BrokerProcess {
                 }
             }
             state.status.transition(ProcessStatus::Running)?;
-            state.continue_startup_on_parent_death = false;
         }
         self.core.process_lifecycle_sink.changed();
         Ok(())
@@ -1081,7 +1049,6 @@ impl BrokerProcess {
                     state.retirement.mark_abnormal();
                 }
                 state.status.transition(ProcessStatus::Failed(error))?;
-                state.continue_startup_on_parent_death = false;
                 if state.shutdown_request == ProcessShutdownRequest::None {
                     state.shutdown_request = if expected_shutdown {
                         ProcessShutdownRequest::Expected
@@ -1120,7 +1087,7 @@ impl BrokerProcess {
 
     /// Applies owner-death handling to every direct child process.
     ///
-    /// Ordinary startup fails and prepared duplication startup continues.
+    /// Children that are still starting fail.
     /// Calling this method more than once is harmless.
     pub fn handle_owner_death(&self) {
         self.cancellation.cancel();
@@ -1192,14 +1159,14 @@ impl BrokerProcess {
             .is_some_and(|own_parent| core::ptr::eq(own_parent.as_ptr(), parent))
     }
 
-    /// Fails ordinary startup after the parent's owner dies, returning
-    /// whether it failed and the runner shutdown to run.
+    /// Fails this child if it is still starting after its parent's owner
+    /// dies, returning whether it failed and the runner shutdown to run.
     ///
     /// A child whose startup failed leaves the process tree. Callers hold the
     /// core's process tree lock and remove the child from its parent.
     fn handle_parent_death(&self) -> (bool, Option<ProcessShutdown>) {
         let mut state = self.state.lock();
-        if state.status != ProcessStatus::Starting || state.continue_startup_on_parent_death {
+        if state.status != ProcessStatus::Starting {
             return (false, None);
         }
         state
@@ -2039,15 +2006,6 @@ mod tests {
             .map(|parent| parent.id())
     }
 
-    fn prepared_duplication(parent: &Arc<BrokerProcess>) -> Arc<BrokerProcess> {
-        let child = parent
-            .core
-            .create_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap();
-        parent.prepare_duplication_child(&child).unwrap();
-        child
-    }
-
     fn process_statuses() -> [ProcessStatus; 5] {
         use ProcessStatus as State;
 
@@ -2651,28 +2609,6 @@ mod tests {
     }
 
     #[test]
-    fn process_duplication_policy_is_enforced_at_admission() {
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .build()
-        .unwrap();
-        let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let child = broker
-            .allocate_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap();
-
-        assert!(matches!(
-            parent.prepare_duplication_child(&child),
-            Err(BrokerError::PolicyDenied)
-        ));
-        child.complete_start().unwrap();
-    }
-
-    #[test]
     fn child_process_allocation_is_policy_gated() {
         let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
             ObjectRights::all(),
@@ -2772,53 +2708,6 @@ mod tests {
         assert!(!broker.processes.read().contains_key(&process_id));
         // The pending slot is free again.
         parent.allocate_child_process().unwrap();
-    }
-
-    #[test]
-    fn adopted_child_that_fails_to_start_is_reported_removed() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-        let root = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        root.complete_start().unwrap();
-        root.set_orphan_adoption(true).unwrap();
-        let parent = child_of(&root);
-        parent.complete_start().unwrap();
-        let starting = prepared_duplication(&parent);
-        run_to_exit(&parent, EXITED);
-        assert_eq!(parent_id(&starting), Some(root.id()));
-        assert_eq!(
-            root.collect_child_exit(ChildSelector::Any),
-            Ok(child_exit(&parent, EXITED))
-        );
-        assert_eq!(
-            root.collect_child_exit(ChildSelector::Any),
-            Err(BrokerError::WouldBlock)
-        );
-        let (signals, _) = open_signals(&root);
-        assert_eq!(
-            crate::signal::take(&root, signals),
-            Ok(child_exited(&parent, EXITED))
-        );
-
-        assert_eq!(
-            starting.fail_start(BrokerError::PeerClosed, false, true),
-            Err(BrokerError::PeerClosed)
-        );
-
-        assert_eq!(
-            crate::signal::take(&root, signals),
-            Ok(SignalEvent::ChildRemoved)
-        );
-        assert_eq!(
-            root.collect_child_exit(ChildSelector::Any),
-            Err(BrokerError::UnknownObject)
-        );
     }
 
     #[test]
@@ -3133,123 +3022,6 @@ mod tests {
             parent.check_readiness(first),
             Ok(ReadinessFlags::READ | ReadinessFlags::WRITE)
         );
-    }
-
-    #[test]
-    fn duplication_preparation_validates_the_created_child() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-        let owner = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        owner.complete_start().unwrap();
-        let other_owner = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        other_owner.complete_start().unwrap();
-        let child = broker
-            .create_process(owner.caller_credential(), Some(owner.id()))
-            .unwrap();
-
-        assert_eq!(
-            other_owner.prepare_duplication_child(&child),
-            Err(BrokerError::Internal)
-        );
-        assert_eq!(child.startup_result(), None);
-        owner.prepare_duplication_child(&child).unwrap();
-        assert_eq!(
-            owner.prepare_duplication_child(&child),
-            Err(BrokerError::Internal)
-        );
-        child.complete_start().unwrap();
-        assert!(child.is_running());
-        assert_eq!(
-            owner.prepare_duplication_child(&owner),
-            Err(BrokerError::Internal)
-        );
-    }
-
-    #[test]
-    fn duplication_children_publish_independently() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-        let parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let first_child = prepared_duplication(&parent);
-        let second_child = prepared_duplication(&parent);
-
-        first_child.complete_start().unwrap();
-        second_child.complete_start().unwrap();
-
-        assert!(first_child.is_running());
-        assert!(second_child.is_running());
-    }
-
-    #[test]
-    fn duplication_publication_survives_parent_teardown_and_rejects_child_failure() {
-        let broker = TestBrokerCoreBuilder::new(
-            PolicyEngine::with_unauthenticated_rights(ObjectRights::all())
-                .with_process_duplication_enabled(true),
-        )
-        .build()
-        .unwrap();
-
-        let cancelled_parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        cancelled_parent.complete_start().unwrap();
-        let cancelled_child = prepared_duplication(&cancelled_parent);
-        let unprepared_child = broker
-            .allocate_process(
-                cancelled_parent.caller_credential(),
-                Some(cancelled_parent.id()),
-            )
-            .unwrap();
-        let shutdowns = Arc::new(AtomicUsize::new(0));
-        let shutdown_count = Arc::clone(&shutdowns);
-        cancelled_child.install_shutdown(Arc::new(move || {
-            shutdown_count.fetch_add(1, Ordering::Relaxed);
-        }));
-        cancelled_parent.request_cancellation();
-
-        cancelled_child.complete_start().unwrap();
-        assert_eq!(cancelled_child.state.lock().status, ProcessStatus::Running);
-        assert_eq!(shutdowns.load(Ordering::Relaxed), 0);
-        assert!(matches!(
-            cancelled_parent.prepare_duplication_child(&unprepared_child),
-            Err(BrokerError::PeerClosed)
-        ));
-
-        let dead_parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        dead_parent.complete_start().unwrap();
-        let dead_child = prepared_duplication(&dead_parent);
-        dead_parent.handle_owner_death();
-
-        dead_child.complete_start().unwrap();
-        assert_eq!(dead_child.state.lock().status, ProcessStatus::Running);
-
-        let live_parent = broker
-            .allocate_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        live_parent.complete_start().unwrap();
-        let failed_child = prepared_duplication(&live_parent);
-        assert_eq!(
-            failed_child.fail_start(BrokerError::PeerClosed, false, true),
-            Err(BrokerError::PeerClosed)
-        );
-        assert_eq!(failed_child.complete_start(), Err(BrokerError::PeerClosed));
     }
 
     #[test]

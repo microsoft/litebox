@@ -1841,7 +1841,6 @@ mod tests {
         test_channel_aborts_without_response_on_shared_memory_failure(&broker);
         setup_failure_transfers_process_to_the_deployment_owner(&broker);
         precreated_root_negotiates_without_startup_data(&broker);
-        prepared_duplication_publishes_after_activation(&broker);
         test_channel_rejects_incompatible_shared_buffer_layout(&broker);
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
@@ -1921,30 +1920,6 @@ mod tests {
         assert_eq!(association.process.id(), process.id());
         association.activate_process().unwrap();
         association.finish();
-    }
-
-    fn prepared_duplication_publishes_after_activation(broker: &BrokerCore) {
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let child = broker
-            .create_process(parent.caller_credential(), Some(parent.id()))
-            .unwrap();
-        parent.prepare_duplication_child(&child).unwrap();
-        let association = BrokerHostAssociation::new(
-            Arc::clone(&child),
-            Arc::new(test_shared_buffers()),
-            test_readiness_sink(),
-        );
-
-        assert!(!child.is_running());
-        association.activate_process().unwrap();
-        assert!(child.is_running());
-
-        association.finish();
-        drop(child);
-        parent.retire(true);
     }
 
     fn association_shared_buffer_sequences_stage_file_data(broker: &BrokerCore) {
