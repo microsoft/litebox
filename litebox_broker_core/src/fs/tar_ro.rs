@@ -101,7 +101,9 @@ impl super::backend::Backend for TarRo {
                 return Ok(super::backend::WalkOutcome {
                     components: walked_components,
                     last: WalkingDirHandle::from_typed::<Self>(current),
-                    stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory,
+                    stop_reason: super::backend::WalkStopReason::StoppedAtNonDirectory {
+                        file_type: FileType::RegularFile,
+                    },
                 });
             };
 
@@ -121,6 +123,10 @@ impl super::backend::Backend for TarRo {
             last: WalkingDirHandle::from_typed::<Self>(current),
             stop_reason: super::backend::WalkStopReason::CompleteDirectory,
         })
+    }
+
+    fn read_link_at(&self, _dir: &WalkingDirHandle<'_>, _name: &str) -> Result<String, WalkError> {
+        Err(PathError::InvalidPathname.into())
     }
 
     fn owned_dir_at(
