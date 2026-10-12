@@ -41,6 +41,7 @@ use litebox_platform_lvbs::{
         },
     },
 };
+use litebox_shim_optee::ClientPta;
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance};
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
 use litebox_shim_optee::{
@@ -965,6 +966,13 @@ fn handle_open_session(
 
     let ta_uuid = ta_req_info.uuid.ok_or(OpteeSmcReturnCode::EBadCmd)?;
     let client_identity = ta_req_info.client_identity;
+
+    if let Some(pta) = ClientPta::from_uuid(&ta_uuid) {
+        pta.open_session(msg_args);
+        debug_serial_println!("OpenSession on client PTA {:?}", pta);
+        return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
+    }
+
     let params = &ta_req_info.params;
 
     session_manager().with_ta(&ta_uuid, |target| match target {
@@ -1445,6 +1453,11 @@ fn handle_invoke_command(
     let params = &ta_req_info.params;
     let session_id = ta_req_info.session;
 
+    if let Some(pta) = ClientPta::from_session_id(session_id) {
+        pta.invoke_command(platform, &ta_req_info, msg_args)?;
+        return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
+    }
+
     session_manager().with_session(session_id, |instance| {
         let Some(instance) = instance else {
             return finalize_dead_session(
@@ -1561,6 +1574,11 @@ fn handle_close_session(
     let session_id = ta_req_info.session;
 
     debug_serial_println!("CloseSession: session_id={}", session_id);
+
+    if let Some(pta) = ClientPta::from_session_id(session_id) {
+        pta.close_session(msg_args);
+        return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
+    }
 
     session_manager().with_session(session_id, |instance| {
         let Some(instance) = instance else {

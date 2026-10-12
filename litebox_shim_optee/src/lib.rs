@@ -41,6 +41,7 @@ pub mod idk;
 
 // Re-export session management types for convenience
 pub use session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
+pub use syscalls::pta::ClientPta;
 
 const MAX_KERNEL_BUF_SIZE: usize = 0x80_000;
 pub(crate) const TA_DIGEST_LEN: usize = 32;
@@ -1638,7 +1639,8 @@ pub(crate) enum ThreadInitState {
 /// With MAX_RECYCLABLE_SESSION_ID = 65536:
 /// - Bitmap memory usage: 65536 bits = 8 KB
 /// - Recyclable IDs: 1..=65536 (65536 IDs)
-/// - Fallback (non-recyclable) IDs: 65537..=u32::MAX (~4.3B IDs)
+/// - Fallback (non-recyclable) IDs: 65537..=MAX_SESSION_ID (~4.3B IDs)
+/// - IDs above MAX_SESSION_ID are reserved for client PTAs.
 ///
 /// Design notes:
 /// - A single TA instance can serve many concurrent sessions (no per-instance cap),
@@ -1673,6 +1675,8 @@ fn session_id_pool() -> &'static spin::mutex::SpinMutex<SessionIdPool> {
 impl SessionIdPool {
     /// Maximum recyclable session ID tracked by the bitmap.
     const MAX_RECYCLABLE_SESSION_ID: u32 = 65536;
+    /// Maximum allocatable session ID.
+    pub(crate) const MAX_SESSION_ID: u32 = u32::MAX - 1;
     /// Allocate a new session ID.
     ///
     /// Returns `None` if all recyclable session IDs are currently in use and
@@ -1694,7 +1698,7 @@ impl SessionIdPool {
         }
 
         let fallback_id = self.fallback_next;
-        if fallback_id == u32::MAX {
+        if fallback_id == Self::MAX_SESSION_ID {
             self.fallback_exhausted = true;
         } else {
             self.fallback_next = fallback_id + 1;

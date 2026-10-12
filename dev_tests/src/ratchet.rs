@@ -50,7 +50,7 @@ fn ratchet_pub_uses() -> Result<()> {
             ("litebox_platform_lvbs/", 2),
             ("litebox_platform_vm_kernel/", 1),
             ("litebox_platform_vm_userland/", 1),
-            ("litebox_shim_optee/", 1),
+            ("litebox_shim_optee/", 2),
             ("litebox_syscall_rewriter/", 1),
             ("litebox_util_log/", 7),
         ],
