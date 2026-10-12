@@ -2110,7 +2110,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .transpose()?;
                 Ok((chunk_waitall, is_stream, deadline))
             }
-            // The Unix socket applies its own receive timeout to each receive.
+            // No deadline: `litebox::unix_sockets::UnixSocket` bounds each
+            // blocking receive by the socket's stored receive timeout itself.
             ReceiveSocket::Unix(handle) => {
                 Ok((false, handle.with_entry(UnixSocket::is_stream), None))
             }

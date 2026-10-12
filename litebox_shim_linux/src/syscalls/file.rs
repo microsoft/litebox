@@ -647,7 +647,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 AnyTypedFd::Unix(socket) => (
                     InheritedFdKind::UnixSocket,
                     InheritableFd::UnixSocket(self.global.with_unix_socket(&socket, |socket| {
-                        Ok(alloc::sync::Arc::clone(socket.broker_socket()))
+                        Ok(alloc::sync::Arc::clone(socket.unix_socket()))
                     })?),
                 ),
                 _ => return Err(Errno::EAGAIN),

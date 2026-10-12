@@ -42,7 +42,7 @@ use crate::{
 
 use errors::UnixSocketError;
 
-/// Data a [`BrokerUnixSocket::receive`] copied into its buffer.
+/// Data a [`UnixSocket::receive`] copied into its buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Received {
     /// Number of bytes copied into the buffer.
@@ -55,7 +55,7 @@ pub struct Received {
 
 /// A reference to a broker-owned Unix socket, which closes its handle when
 /// dropped.
-pub struct BrokerUnixSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
+pub struct UnixSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
     socket_type: SocketType,
@@ -73,12 +73,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         &self,
         socket_type: SocketType,
         flags: FileOpenFlags,
-    ) -> Result<BrokerUnixSocket<Platform>, UnixSocketError> {
+    ) -> Result<UnixSocket<Platform>, UnixSocketError> {
         let broker = self.broker_control().ok_or(UnixSocketError::Io)?;
         let handle = broker
             .create_unix_socket(socket_type, flags)
             .map_err(UnixSocketError::from)?;
-        Ok(BrokerUnixSocket::new(self, broker, handle, socket_type))
+        Ok(UnixSocket::new(self, broker, handle, socket_type))
     }
 
     /// Creates a pair of unnamed Unix sockets connected to each other.
@@ -88,14 +88,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         &self,
         socket_type: SocketType,
         flags: FileOpenFlags,
-    ) -> Result<(BrokerUnixSocket<Platform>, BrokerUnixSocket<Platform>), UnixSocketError> {
+    ) -> Result<(UnixSocket<Platform>, UnixSocket<Platform>), UnixSocketError> {
         let broker = self.broker_control().ok_or(UnixSocketError::Io)?;
         let response = broker
             .create_unix_socket_pair(socket_type, flags)
             .map_err(UnixSocketError::from)?;
         Ok((
-            BrokerUnixSocket::new(self, Arc::clone(&broker), response.first, socket_type),
-            BrokerUnixSocket::new(self, broker, response.second, socket_type),
+            UnixSocket::new(self, Arc::clone(&broker), response.first, socket_type),
+            UnixSocket::new(self, broker, response.second, socket_type),
         ))
     }
 
@@ -107,7 +107,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     pub fn adopt_inherited_unix_socket(
         &self,
         handle: ObjectHandle,
-    ) -> Result<BrokerUnixSocket<Platform>, ProcessError> {
+    ) -> Result<UnixSocket<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         let socket_type = match broker.unix_socket_options(handle) {
             Ok(response) => response.socket_type,
@@ -116,11 +116,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
                 return Err(error.into());
             }
         };
-        Ok(BrokerUnixSocket::new(self, broker, handle, socket_type))
+        Ok(UnixSocket::new(self, broker, handle, socket_type))
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUnixSocket<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     fn new(
         litebox: &LiteBox<Platform>,
         broker: Arc<dyn BrokerControl>,
@@ -376,7 +376,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUnixSocket<Platfo
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerUnixSocket<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for UnixSocket<Platform> {
     fn register_observer(&self, observer: Weak<dyn Observer<Events>>, filter: Events) {
         self.pollee.register_observer(observer, filter);
     }
@@ -388,7 +388,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerUn
     }
 }
 
-impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerUnixSocket<Platform> {
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for UnixSocket<Platform> {
     fn drop(&mut self) {
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
