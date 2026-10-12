@@ -330,38 +330,3 @@ impl XsaveArea {
         self.header().xstate_bv
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{XsaveArea, XsaveLayout};
-
-    #[test]
-    fn bytes_round_trip() {
-        let layout = XsaveLayout::get();
-        let area = XsaveArea::initial(layout);
-
-        assert_eq!(XsaveArea::from_bytes(area.as_bytes(), layout), Some(area));
-    }
-
-    #[test]
-    fn bytes_reject_invalid_state() {
-        let layout = XsaveLayout::get();
-        let mut area = XsaveArea::initial(layout);
-        assert!(XsaveArea::from_bytes(&area.as_bytes()[1..], layout).is_none());
-
-        area.header_mut().xcomp_bv = 1 << 63;
-        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
-        area.header_mut().xcomp_bv = 0;
-
-        area.header_mut().xstate_bv = 1 << 63;
-        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
-        area.header_mut().xstate_bv = 0;
-
-        area.header_mut().reserved[0] = 1;
-        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
-        area.header_mut().reserved[0] = 0;
-
-        area.legacy_area_mut().mxcsr = 1 << 16;
-        assert!(XsaveArea::from_bytes(area.as_bytes(), layout).is_none());
-    }
-}

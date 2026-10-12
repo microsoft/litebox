@@ -16,6 +16,8 @@ pub trait GuestVectorStateProvider {
     fn set_guest_vector_state(&self, state: &Self::GuestVectorState);
 }
 
+// TODO: replace this blanket with architecture-specific providers before
+// implementing guest vector-state preservation outside AArch64.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 impl<T> GuestVectorStateProvider for T {
     type GuestVectorState = ();
