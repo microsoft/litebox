@@ -497,17 +497,6 @@ fn run_thread_inner(
     });
 }
 
-/// Non-guest threads (e.g., network workers, background tasks) should call this
-/// function at the start of their execution so the kernel only delivers
-/// `SIGALRM` / `SIGINT` to guest threads, which have the proper signal-handler
-/// context to re-enter the shim.
-fn block_guest_signals() {
-    unsafe {
-        let set = guest_signal_set();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, std::ptr::null_mut());
-    }
-}
-
 fn guest_signal_set() -> libc::sigset_t {
     // SAFETY: `set` is initialized before use, and each signal number is valid.
     unsafe {
@@ -523,41 +512,72 @@ fn guest_signal_set() -> libc::sigset_t {
     }
 }
 
+struct GuestSignalMaskGuard {
+    previous: libc::sigset_t,
+}
+
+impl Drop for GuestSignalMaskGuard {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was populated by `pthread_sigmask` for this thread and remains valid
+        // for the lifetime of the guard.
+        let result = unsafe {
+            libc::pthread_sigmask(
+                libc::SIG_SETMASK,
+                &raw const self.previous,
+                std::ptr::null_mut(),
+            )
+        };
+        debug_assert_eq!(result, 0, "failed to restore the thread signal mask");
+    }
+}
+
+/// Runs `f` while blocking signals reserved for delivery to guest threads.
+///
+/// Threads spawned by `f` inherit the blocked mask. The calling thread's previous mask is restored
+/// when `f` returns or unwinds.
+///
+/// # Panics
+///
+/// Panics if the calling thread's signal mask cannot be changed.
+pub fn with_guest_signals_blocked<T>(f: impl FnOnce() -> T) -> T {
+    let set = guest_signal_set();
+    let mut previous = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` and `previous` are valid signal sets owned by this thread.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut previous) };
+    assert_eq!(result, 0, "failed to block guest signals");
+    let _guard = GuestSignalMaskGuard { previous };
+    f()
+}
+
+/// Unblocks signals reserved for delivery to guest threads on the calling thread.
+///
+/// # Panics
+///
+/// Panics if the calling thread's signal mask cannot be changed.
+pub fn unblock_guest_signals() {
+    let set = guest_signal_set();
+    // SAFETY: `set` is a valid signal set and the null third argument means the previous mask is
+    // not requested.
+    let result =
+        unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) };
+    assert_eq!(result, 0, "failed to unblock guest signals");
+}
+
 fn spawn_guest_thread<F, T>(f: F) -> std::io::Result<std::thread::JoinHandle<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let signals = guest_signal_set();
-    let mut old_mask = unsafe { std::mem::zeroed() };
-    let result =
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &raw const signals, &raw mut old_mask) };
-    if result != 0 {
-        return Err(std::io::Error::from_raw_os_error(result));
-    }
-
-    let child_mask = old_mask;
-    let spawn_result = std::thread::Builder::new().spawn(move || {
-        // SAFETY: the child inherits guest signals blocked. GS is set to this thread's host TLS
-        // base before restoring the mask, so a signal handler cannot observe the parent's TLS.
-        unsafe {
-            set_saved_host_tls_base();
-            let result = libc::pthread_sigmask(
-                libc::SIG_SETMASK,
-                &raw const child_mask,
-                std::ptr::null_mut(),
-            );
-            assert_eq!(result, 0, "failed to restore guest thread signal mask");
-        }
-        f()
-    });
-
-    // SAFETY: `old_mask` was initialized by the successful call above and remains valid.
-    let result = unsafe {
-        libc::pthread_sigmask(libc::SIG_SETMASK, &raw const old_mask, std::ptr::null_mut())
-    };
-    assert_eq!(result, 0, "failed to restore spawning thread signal mask");
-    spawn_result
+    with_guest_signals_blocked(|| {
+        std::thread::Builder::new().spawn(move || {
+            // SAFETY: the child inherits guest signals blocked. GS is set to this thread's host
+            // TLS base before unblocking them, so a signal handler cannot observe the parent's TLS.
+            unsafe { set_saved_host_tls_base() };
+            unblock_guest_signals();
+            f()
+        })
+    })
 }
 
 /// Spawn a non-guest ("host") thread that automatically blocks guest interrupt
@@ -580,10 +600,7 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    std::thread::spawn(move || {
-        block_guest_signals();
-        f()
-    })
+    with_guest_signals_blocked(|| std::thread::spawn(f))
 }
 
 fn thread_start(
