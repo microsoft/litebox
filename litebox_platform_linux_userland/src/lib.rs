@@ -31,37 +31,30 @@ use std::time::Duration;
 
 use zerocopy::{FromBytes, IntoBytes};
 
+extern crate alloc;
+
 #[cfg_attr(target_arch = "aarch64", path = "aarch64.rs")]
 #[cfg_attr(target_arch = "x86_64", path = "x86_64.rs")]
 mod arch;
-#[cfg(all(test, target_arch = "aarch64"))]
-use arch::get_guest_vector_state;
+mod page_mgmt;
+
 #[cfg(target_arch = "aarch64")]
 use arch::{
     Aarch64GateSignalResult, GateInterruption, assert_tls_block_placement,
     canonicalize_runtime_aarch64_gate_signal_context, fatal_aarch64_runtime_state,
-    guest_thread_pointer_tp_offset, load_tls_block_base, set_is_guest_thread,
-    signal_handler_capture_guest_vector_state, signal_handler_set_interrupt,
-    signal_handler_take_guest, switch_to_guest_via_outbound_stub_end,
-    switch_to_guest_via_outbound_stub_start, switch_to_guest_via_sigreturn_end,
-    switch_to_guest_via_sigreturn_start, sync_instruction_stream,
-    syscall_callback_in_guest_cleared, tls_offset,
+    guest_thread_pointer_tp_offset, signal_handler_capture_guest_vector_state,
+    signal_handler_set_interrupt, signal_handler_take_guest, sync_instruction_stream,
 };
+#[cfg(target_arch = "x86_64")]
+use arch::{copy_signal_context, interrupt_callback_no_xsave, signal_handler_exit_guest};
 use arch::{
-    exception_callback, interrupt_callback, is_guest_thread, prepare_guest_vector_state,
-    run_thread_arch, set_signal_return, switch_to_guest, syscall_callback,
+    exception_callback, interrupt_callback, is_guest_thread_from_signal_context,
+    prepare_guest_vector_state, replace_guest_thread_marker, run_thread_arch,
+    set_guest_thread_marker, set_signal_return, switch_to_guest,
 };
-
-extern crate alloc;
 
 #[cfg(target_arch = "aarch64")]
 const AT_FDCWD: usize = (litebox_common_linux::AT_FDCWD as isize).cast_unsigned();
-mod page_mgmt;
-#[cfg(target_arch = "x86_64")]
-use arch::{
-    copy_signal_context, interrupt_callback_no_xsave, saved_tls, signal_handler_exit_guest,
-    switch_to_guest_end, switch_to_guest_start, syscall_callback_guest_gs, tls,
-};
 
 /// The admitted open syscall and its flags index must remain paired.
 #[cfg(target_arch = "x86_64")]
@@ -458,37 +451,7 @@ impl litebox::platform::SignalProvider for LinuxUserland {
 fn take_pending_host_signals() -> litebox_common_linux::signal::SigSet {
     // Atomically swap the per-thread pending signals with zero.
     // Only the low 32 bits are used (covers traditional signals 1-31).
-    let lo: u32;
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        core::arch::asm!(
-            "xor {tmp:e}, {tmp:e}",
-            concat!("xchg DWORD PTR ", tls!("pending_host_signals"), ", {tmp:e}"),
-            tmp = out(reg) lo,
-            options(nostack)
-        );
-    }
-    // Atomic against this thread's signal handlers; use the ARMv8.0 baseline
-    // rather than ARMv8.1 LSE.
-    #[cfg(target_arch = "aarch64")]
-    // SAFETY: reads and clears a naturally aligned `u32` in this thread's own
-    // TLS control block, whose offset from `TPIDR_EL0` is checked by
-    // `assert_tls_block_placement`.
-    unsafe {
-        core::arch::asm!(
-            load_tls_block_base!("{addr}"),
-            "add {addr}, {addr}, #{off}",
-            "2:",
-            "ldaxr {val:w}, [{addr}]",
-            "stlxr {status:w}, wzr, [{addr}]",
-            "cbnz {status:w}, 2b",
-            addr = out(reg) _,
-            val = out(reg) lo,
-            status = out(reg) _,
-            off = const tls_offset::PENDING_HOST_SIGNALS,
-            options(nostack)
-        );
-    }
+    let lo = arch::take_pending_host_signals_bits();
     litebox_common_linux::signal::SigSet::from_u64(u64::from(lo))
 }
 
@@ -569,50 +532,20 @@ fn run_thread_inner(
 
 /// Tracks the whole guest-thread lifetime and preserves nested-entry state.
 struct GuestThreadMarker {
-    #[cfg(target_arch = "x86_64")]
-    previous: u8,
-    #[cfg(target_arch = "aarch64")]
     previous: bool,
 }
 
 impl GuestThreadMarker {
     fn enter() -> Self {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let previous: u8;
-            // SAFETY: entry runs with host TLS active in FS and accesses this thread's marker.
-            unsafe {
-                core::arch::asm!(
-                    concat!("mov {previous}, BYTE PTR ", tls!("guest_thread")),
-                    concat!("mov BYTE PTR ", tls!("guest_thread"), ", 1"),
-                    previous = out(reg_byte) previous,
-                    options(nostack, preserves_flags),
-                );
-            }
-            Self { previous }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let previous = is_guest_thread();
-            set_is_guest_thread(true);
-            Self { previous }
+        Self {
+            previous: replace_guest_thread_marker(true),
         }
     }
 }
 
 impl Drop for GuestThreadMarker {
     fn drop(&mut self) {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: drop runs after host FS is restored and accesses this thread's marker.
-        unsafe {
-            core::arch::asm!(
-                concat!("mov BYTE PTR ", tls!("guest_thread"), ", {previous}"),
-                previous = in(reg_byte) self.previous,
-                options(nostack, preserves_flags),
-            );
-        }
-        #[cfg(target_arch = "aarch64")]
-        set_is_guest_thread(self.previous);
+        set_guest_thread_marker(self.previous);
     }
 }
 
@@ -906,37 +839,8 @@ impl RawMutexProvider for LinuxUserland {
 
 impl WaitWakerProvider for LinuxUserland {
     fn update_waker(&self, waker: Option<core::task::Waker>) {
-        let mut waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!(
-                concat!("xchg ", tls!("wait_waker_addr"), ", {}"),
-                inout(reg) waker_ptr,
-                options(nostack),
-            );
-        }
-        // Atomic against `record_pending_signal` in this thread's handler.
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: exchanges a naturally aligned `u64` in this thread's own TLS
-        // control block, whose offset from `TPIDR_EL0` is checked by
-        // `assert_tls_block_placement`.
-        unsafe {
-            let new_ptr = waker_ptr;
-            core::arch::asm!(
-                load_tls_block_base!("{addr}"),
-                "add {addr}, {addr}, #{off}",
-                "2:",
-                "ldaxr {old}, [{addr}]",
-                "stlxr {status:w}, {new}, [{addr}]",
-                "cbnz {status:w}, 2b",
-                addr = out(reg) _,
-                old = out(reg) waker_ptr,
-                new = in(reg) new_ptr,
-                status = out(reg) _,
-                off = const tls_offset::WAIT_WAKER_ADDR,
-                options(nostack),
-            );
-        }
+        let waker_ptr = waker.map_or(std::ptr::null_mut(), |w| Box::into_raw(Box::new(w)));
+        let waker_ptr = arch::swap_wait_waker_addr(waker_ptr as usize) as *mut core::task::Waker;
         if !waker_ptr.is_null() {
             // SAFETY: old waker_ptr was created by Box::into_raw in a previous call to update_waker.
             unsafe { drop(Box::from_raw(waker_ptr)) };
@@ -1182,27 +1086,7 @@ fn futex_val2(
 /// AArch64 has two such sequences to x86-64's one, in separate functions, so
 /// this is a union of two ranges: one span would depend on link order.
 fn in_switch_to_guest(pc: usize) -> bool {
-    fn body(start: unsafe extern "C" fn(), end: unsafe extern "C" fn()) -> core::ops::Range<usize> {
-        start as *const () as usize..end as *const () as usize
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        body(switch_to_guest_start, switch_to_guest_end).contains(&pc)
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        body(
-            switch_to_guest_via_outbound_stub_start,
-            switch_to_guest_via_outbound_stub_end,
-        )
-        .contains(&pc)
-            || body(
-                switch_to_guest_via_sigreturn_start,
-                switch_to_guest_via_sigreturn_end,
-            )
-            .contains(&pc)
-    }
+    arch::in_switch_to_guest(pc)
 }
 
 /// Whether `ip` is inside `syscall_callback`'s prologue, i.e. before the guest
@@ -1215,22 +1099,7 @@ fn in_switch_to_guest(pc: usize) -> bool {
 /// frame's shifted sp, and `syscallno = NO_SYSCALL` — silently dropping the
 /// in-flight guest syscall.
 fn in_syscall_callback_prologue(ip: usize) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let start = match GUEST_TLS_MODE.load(Ordering::Relaxed) {
-            mode if mode == GuestTlsMode::Windows as u8 => {
-                syscall_callback_guest_gs as *const () as usize
-            }
-            _ => syscall_callback as *const () as usize,
-        };
-        ip == start
-    }
-    // The label keeps the multi-instruction AArch64 bound tied to the asm.
-    #[cfg(target_arch = "aarch64")]
-    {
-        let start = syscall_callback as *const () as usize;
-        (start..syscall_callback_in_guest_cleared as *const () as usize).contains(&ip)
-    }
+    arch::in_syscall_callback_prologue(ip)
 }
 
 unsafe extern "C-unwind" fn init_handler(thread_ctx: &mut ThreadContext) {
@@ -1319,24 +1188,7 @@ impl ThreadContext<'_> {
         // Clear the interrupt flag before calling the shim, since we've handled it
         // now (by calling into the shim), and it might be set again by the shim
         // before returning.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!(
-                concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
-                options(nostack, preserves_flags)
-            );
-        }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: writes a single byte in this thread's own TLS control block.
-        unsafe {
-            core::arch::asm!(
-                load_tls_block_base!("{tmp}"),
-                "strb wzr, [{tmp}, #{off}]",
-                tmp = out(reg) _,
-                off = const tls_offset::INTERRUPT,
-                options(nostack, preserves_flags)
-            );
-        }
+        arch::clear_interrupt();
         let op = f(self.shim, self.ctx);
         match op {
             ContinueOperation::Resume => unsafe { switch_to_guest(self.ctx) },
@@ -1347,17 +1199,7 @@ impl ThreadContext<'_> {
 
 impl litebox::platform::SystemInfoProvider for LinuxUserland {
     fn get_syscall_entry_point(&self) -> usize {
-        #[cfg(target_arch = "x86_64")]
-        {
-            match Self::guest_tls_mode() {
-                GuestTlsMode::Windows => syscall_callback_guest_gs as *const () as usize,
-                GuestTlsMode::Linux => syscall_callback as *const () as usize,
-            }
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            syscall_callback as *const () as usize
-        }
+        arch::syscall_entry_point()
     }
 
     fn get_vdso_address(&self) -> Option<usize> {
@@ -1841,61 +1683,9 @@ unsafe fn next_signal_handler(
 /// through FS in Windows guest mode.
 unsafe fn record_pending_signal(signal: litebox_common_linux::signal::Signal) {
     let mask: u32 = 1u32 << (signal.as_i32() - 1);
-    let waker_addr: usize;
-
-    // SAFETY: the bitmask and waker slot are reached through this thread's own
-    // saved host TLS segment, which the caller guarantees is valid, and both
-    // accesses are naturally aligned.
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        macro_rules! record {
-            ($access:ident) => {{
-                let waker: usize;
-                core::arch::asm!(
-                    concat!("lock or DWORD PTR ", $access!("pending_host_signals"), ", {mask:e}"),
-                    concat!("mov {waker}, ", $access!("wait_waker_addr")),
-                    mask = in(reg) mask,
-                    waker = out(reg) waker,
-                    options(nostack)
-                );
-                waker
-            }};
-        }
-        waker_addr = match GUEST_TLS_MODE.load(Ordering::Relaxed) {
-            mode if mode == GuestTlsMode::Windows as u8 => record!(tls),
-            _ => record!(saved_tls),
-        };
-    }
-
-    // Atomic against an interrupted exchange; a plain load/or/store can lose a bit.
-    //
-    // SAFETY: both slots are in this thread's own TLS control block at offsets
-    // checked by `assert_tls_block_placement`, and both accesses are naturally aligned.
-    // The exclusive monitor reservation is opened and closed within the loop.
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!(
-            load_tls_block_base!("{block}"),
-            "add {addr}, {block}, #{pending_off}",
-            "2:",
-            "ldaxr {old:w}, [{addr}]",
-            "orr {new:w}, {old:w}, {mask:w}",
-            "stlxr {status:w}, {new:w}, [{addr}]",
-            "cbnz {status:w}, 2b",
-            "ldr {waker}, [{block}, #{waker_off}]",
-            block = out(reg) _,
-            addr = out(reg) _,
-            old = out(reg) _,
-            new = out(reg) _,
-            status = out(reg) _,
-            waker = out(reg) waker_addr,
-            mask = in(reg) mask,
-            pending_off = const tls_offset::PENDING_HOST_SIGNALS,
-            waker_off = const tls_offset::WAIT_WAKER_ADDR,
-            options(nostack)
-        );
-    }
-
+    // SAFETY: the caller satisfies the architecture-specific TLS access
+    // requirements documented above.
+    let waker_addr = unsafe { arch::record_pending_signal(mask) };
     if waker_addr == 0 {
         return;
     }
@@ -1950,7 +1740,7 @@ unsafe fn interrupt_signal_handler(
         if let Ok(signal) = litebox_common_linux::signal::Signal::try_from(guest_signum) {
             // Check whether this is a guest thread. If not, re-raise the signal
             // process-wide.
-            if is_guest_thread() {
+            if is_guest_thread_from_signal_context() {
                 // SAFETY: we verified above that this is a guest thread.
                 unsafe { record_pending_signal(signal) };
             } else {
@@ -2111,74 +1901,6 @@ mod tests {
     use crate::LinuxUserland;
 
     extern crate std;
-
-    #[cfg(target_arch = "aarch64")]
-    #[test]
-    fn spawned_thread_installs_inherited_vector_state() {
-        use litebox::platform::{GuestVectorStateProvider as _, ThreadProvider as _};
-        use litebox::shim::{ContinueOperation, EnterShim, InitThread};
-
-        struct ObserveInit(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
-        struct ObserveShim(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
-
-        impl InitThread for ObserveInit {
-            type ExecutionContext = litebox_common_linux::PtRegs;
-
-            fn init(
-                self: Box<Self>,
-            ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
-                Box::new(ObserveShim(self.0))
-            }
-        }
-
-        impl EnterShim for ObserveShim {
-            type ExecutionContext = litebox_common_linux::PtRegs;
-
-            fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-                self.0.send(super::get_guest_vector_state()).unwrap();
-                ContinueOperation::Terminate
-            }
-
-            fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-                unreachable!()
-            }
-
-            fn exception(
-                &self,
-                _ctx: &mut Self::ExecutionContext,
-                _info: &litebox::shim::ExceptionInfo,
-            ) -> ContinueOperation {
-                unreachable!()
-            }
-
-            fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
-                unreachable!()
-            }
-        }
-
-        let platform = LinuxUserland::new();
-        let original = platform.get_guest_vector_state();
-        let expected = litebox_common_linux::GuestVectorState {
-            registers: core::array::from_fn(|index| index as u128 * 0x101),
-            fpsr: 0x1234,
-            fpcr: 0x5678,
-        };
-        platform.set_guest_vector_state(&expected);
-        let (send, receive) = std::sync::mpsc::channel();
-        unsafe {
-            platform
-                .spawn_thread(
-                    &litebox_common_linux::PtRegs::default(),
-                    Box::new(ObserveInit(send)),
-                )
-                .unwrap();
-        }
-        let observed = receive
-            .recv_timeout(core::time::Duration::from_secs(5))
-            .unwrap();
-        platform.set_guest_vector_state(&original);
-        assert_eq!(observed, expected);
-    }
 
     /// An interrupt pending at guest entry diverts to the interrupt handler
     /// without entering the guest, so a further interrupt taken while that

@@ -41,7 +41,6 @@ macro_rules! tls {
         concat!("fs:", $var, "@tpoff")
     };
 }
-pub(super) use tls;
 
 /// Full TLS memory operand for a `.tbss` variable accessed via the *saved*
 /// segment register (before the fs/gs swap, e.g. from a signal handler).
@@ -52,7 +51,6 @@ macro_rules! saved_tls {
         concat!("gs:", $var, "@tpoff")
     };
 }
-pub(super) use saved_tls;
 
 thread_local! {
     pub(super) static GUEST_XSTATE: RefCell<Option<XsaveArea>> = const { RefCell::new(None) };
@@ -165,6 +163,68 @@ wait_waker_addr:
     "
 );
 
+pub(super) fn take_pending_host_signals_bits() -> u32 {
+    let signals: u32;
+    // SAFETY: atomically exchanges this thread's naturally aligned TLS slot.
+    unsafe {
+        core::arch::asm!(
+            "xor {tmp:e}, {tmp:e}",
+            concat!("xchg DWORD PTR ", tls!("pending_host_signals"), ", {tmp:e}"),
+            tmp = out(reg) signals,
+            options(nostack)
+        );
+    }
+    signals
+}
+
+pub(super) fn swap_wait_waker_addr(mut new_addr: usize) -> usize {
+    // SAFETY: atomically exchanges this thread's naturally aligned TLS slot.
+    unsafe {
+        core::arch::asm!(
+            concat!("xchg ", tls!("wait_waker_addr"), ", {addr}"),
+            addr = inout(reg) new_addr,
+            options(nostack),
+        );
+    }
+    new_addr
+}
+
+pub(super) fn clear_interrupt() {
+    // SAFETY: accesses this thread's marker with host TLS active in FS.
+    unsafe {
+        core::arch::asm!(
+            concat!("mov BYTE PTR ", tls!("interrupt"), ", 0"),
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub(super) unsafe fn record_pending_signal(mask: u32) -> usize {
+    macro_rules! record {
+        ($access:ident) => {{
+            let waker: usize;
+            core::arch::asm!(
+                concat!("lock or DWORD PTR ", $access!("pending_host_signals"), ", {mask:e}"),
+                concat!("mov {waker}, ", $access!("wait_waker_addr")),
+                mask = in(reg) mask,
+                waker = out(reg) waker,
+                options(nostack)
+            );
+            waker
+        }};
+    }
+
+    // SAFETY: the bitmask and waker slot are reached through this thread's own
+    // saved host TLS segment, which the caller guarantees is valid, and both
+    // accesses are naturally aligned.
+    unsafe {
+        match super::GUEST_TLS_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+            mode if mode == super::GuestTlsMode::Windows as u8 => record!(tls),
+            _ => record!(saved_tls),
+        }
+    }
+}
+
 pub(super) fn set_guest_fsbase(value: usize) {
     unsafe {
         core::arch::asm! {
@@ -187,7 +247,36 @@ pub(super) fn get_guest_fsbase() -> usize {
     value
 }
 
-pub(super) fn is_guest_thread() -> bool {
+/// Updates the marker while host TLS is active in FS.
+pub(super) fn set_guest_thread_marker(value: bool) {
+    // SAFETY: accesses this thread's marker with host TLS active in FS.
+    unsafe {
+        core::arch::asm!(
+            concat!("mov BYTE PTR ", tls!("guest_thread"), ", {value}"),
+            value = in(reg_byte) u8::from(value),
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Replaces the marker while host TLS is active in FS.
+pub(super) fn replace_guest_thread_marker(value: bool) -> bool {
+    let previous: u8;
+    // SAFETY: accesses this thread's marker with host TLS active in FS.
+    unsafe {
+        core::arch::asm!(
+            concat!("mov {previous}, BYTE PTR ", tls!("guest_thread")),
+            concat!("mov BYTE PTR ", tls!("guest_thread"), ", {value}"),
+            previous = out(reg_byte) previous,
+            value = in(reg_byte) u8::from(value),
+            options(nostack, preserves_flags),
+        );
+    }
+    previous != 0
+}
+
+/// Reads the marker from a signal context, where Linux guest TLS may be active in FS.
+pub(super) fn is_guest_thread_from_signal_context() -> bool {
     macro_rules! read_guest_thread {
         ($access:ident) => {{
             let marker: u8;
@@ -525,6 +614,28 @@ unsafe extern "C" {
     pub(super) fn switch_to_guest_end();
 }
 
+pub(super) fn syscall_entry_point() -> usize {
+    match LinuxUserland::guest_tls_mode() {
+        super::GuestTlsMode::Windows => syscall_callback_guest_gs as *const () as usize,
+        super::GuestTlsMode::Linux => syscall_callback as *const () as usize,
+    }
+}
+
+pub(super) fn in_switch_to_guest(pc: usize) -> bool {
+    (switch_to_guest_start as *const () as usize..switch_to_guest_end as *const () as usize)
+        .contains(&pc)
+}
+
+pub(super) fn in_syscall_callback_prologue(ip: usize) -> bool {
+    let start = match super::GUEST_TLS_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+        mode if mode == super::GuestTlsMode::Windows as u8 => {
+            syscall_callback_guest_gs as *const () as usize
+        }
+        _ => syscall_callback as *const () as usize,
+    };
+    ip == start
+}
+
 /// Called from signal handlers to fix up thread state after potentially running
 /// in the guest.
 ///
@@ -773,7 +884,7 @@ mod tests {
                 "ud2",
                 control_word = const TEST_CW,
                 mxcsr = const TEST_MXCSR,
-                syscall_callback = sym crate::syscall_callback,
+                syscall_callback = sym super::syscall_callback,
             );
         }
 
@@ -1046,7 +1157,7 @@ mod tests {
                 control_word = const TEST_CW,
                 mxcsr = const TEST_MXCSR,
                 tgkill = const libc::SYS_tgkill,
-                syscall_callback = sym crate::syscall_callback,
+                syscall_callback = sym super::syscall_callback,
             );
         }
 

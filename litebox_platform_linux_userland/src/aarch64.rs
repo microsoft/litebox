@@ -32,7 +32,6 @@ macro_rules! load_tls_block_base {
         )
     };
 }
-pub(super) use load_tls_block_base;
 
 macro_rules! tprel_offset {
     ($var:ident) => {
@@ -222,7 +221,8 @@ pub(super) fn set_guest_thread_pointer(value: usize) {
     }
 }
 
-pub(super) fn set_is_guest_thread(value: bool) {
+/// Updates the marker from host execution context.
+pub(super) fn set_guest_thread_marker(value: bool) {
     // SAFETY: an own-thread [`tls_offset`] slot access.
     unsafe {
         core::arch::asm! {
@@ -236,7 +236,27 @@ pub(super) fn set_is_guest_thread(value: bool) {
     }
 }
 
-pub(super) fn is_guest_thread() -> bool {
+/// Replaces the marker from host execution context.
+pub(super) fn replace_guest_thread_marker(value: bool) -> bool {
+    let previous: u32;
+    // SAFETY: an own-thread [`tls_offset`] slot access.
+    unsafe {
+        core::arch::asm! {
+            load_tls_block_base!("{tmp}"),
+            "ldrb {previous:w}, [{tmp}, #{off}]",
+            "strb {value:w}, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            previous = out(reg) previous,
+            value = in(reg) u32::from(value),
+            off = const tls_offset::IS_GUEST_THREAD,
+            options(nostack, preserves_flags)
+        }
+    }
+    previous != 0
+}
+
+/// Reads the marker from a signal context or host execution context.
+pub(super) fn is_guest_thread_from_signal_context() -> bool {
     let value: u32;
     // SAFETY: an own-thread [`tls_offset`] slot access. Also safe from a signal
     // handler: `TPIDR_EL0` is the host anchor at all times, guest code included.
@@ -251,6 +271,102 @@ pub(super) fn is_guest_thread() -> bool {
         }
     }
     value != 0
+}
+
+pub(super) fn take_pending_host_signals_bits() -> u32 {
+    let signals: u32;
+    // Atomic against this thread's signal handlers; use the ARMv8.0 baseline
+    // rather than ARMv8.1 LSE.
+    // SAFETY: reads and clears a naturally aligned `u32` in this thread's own
+    // TLS control block, whose offset from `TPIDR_EL0` is checked by
+    // `assert_tls_block_placement`.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{addr}"),
+            "add {addr}, {addr}, #{off}",
+            "2:",
+            "ldaxr {val:w}, [{addr}]",
+            "stlxr {status:w}, wzr, [{addr}]",
+            "cbnz {status:w}, 2b",
+            addr = out(reg) _,
+            val = out(reg) signals,
+            status = out(reg) _,
+            off = const tls_offset::PENDING_HOST_SIGNALS,
+            options(nostack)
+        );
+    }
+    signals
+}
+
+pub(super) fn swap_wait_waker_addr(new_addr: usize) -> usize {
+    let old_addr: usize;
+    // Atomic against `record_pending_signal` in this thread's handler.
+    // SAFETY: exchanges a naturally aligned `u64` in this thread's own TLS
+    // control block, whose offset from `TPIDR_EL0` is checked by
+    // `assert_tls_block_placement`.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{addr}"),
+            "add {addr}, {addr}, #{off}",
+            "2:",
+            "ldaxr {old}, [{addr}]",
+            "stlxr {status:w}, {new}, [{addr}]",
+            "cbnz {status:w}, 2b",
+            addr = out(reg) _,
+            old = out(reg) old_addr,
+            new = in(reg) new_addr,
+            status = out(reg) _,
+            off = const tls_offset::WAIT_WAKER_ADDR,
+            options(nostack),
+        );
+    }
+    old_addr
+}
+
+pub(super) fn clear_interrupt() {
+    // SAFETY: writes a single byte in this thread's own TLS control block.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{tmp}"),
+            "strb wzr, [{tmp}, #{off}]",
+            tmp = out(reg) _,
+            off = const tls_offset::INTERRUPT,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+pub(super) unsafe fn record_pending_signal(mask: u32) -> usize {
+    let waker_addr: usize;
+
+    // Atomic against an interrupted exchange; a plain load/or/store can lose a bit.
+    //
+    // SAFETY: both slots are in this thread's own TLS control block at offsets
+    // checked by `assert_tls_block_placement`, and both accesses are naturally aligned.
+    // The exclusive monitor reservation is opened and closed within the loop.
+    unsafe {
+        core::arch::asm!(
+            load_tls_block_base!("{block}"),
+            "add {addr}, {block}, #{pending_off}",
+            "2:",
+            "ldaxr {old:w}, [{addr}]",
+            "orr {new:w}, {old:w}, {mask:w}",
+            "stlxr {status:w}, {new:w}, [{addr}]",
+            "cbnz {status:w}, 2b",
+            "ldr {waker}, [{block}, #{waker_off}]",
+            block = out(reg) _,
+            addr = out(reg) _,
+            old = out(reg) _,
+            new = out(reg) _,
+            status = out(reg) _,
+            waker = out(reg) waker_addr,
+            mask = in(reg) mask,
+            pending_off = const tls_offset::PENDING_HOST_SIGNALS,
+            waker_off = const tls_offset::WAIT_WAKER_ADDR,
+            options(nostack)
+        );
+    }
+    waker_addr
 }
 
 pub(super) fn get_guest_thread_pointer() -> usize {
@@ -1384,6 +1500,33 @@ unsafe extern "C" {
     fn __clear_cache(start: *mut core::ffi::c_char, end: *mut core::ffi::c_char);
 }
 
+pub(super) fn syscall_entry_point() -> usize {
+    syscall_callback as *const () as usize
+}
+
+pub(super) fn in_switch_to_guest(pc: usize) -> bool {
+    fn body(start: unsafe extern "C" fn(), end: unsafe extern "C" fn()) -> core::ops::Range<usize> {
+        start as *const () as usize..end as *const () as usize
+    }
+
+    body(
+        switch_to_guest_via_outbound_stub_start,
+        switch_to_guest_via_outbound_stub_end,
+    )
+    .contains(&pc)
+        || body(
+            switch_to_guest_via_sigreturn_start,
+            switch_to_guest_via_sigreturn_end,
+        )
+        .contains(&pc)
+}
+
+pub(super) fn in_syscall_callback_prologue(ip: usize) -> bool {
+    // The label keeps the multi-instruction bound tied to the asm.
+    let start = syscall_callback as *const () as usize;
+    (start..syscall_callback_in_guest_cleared as *const () as usize).contains(&ip)
+}
+
 /// Make code just written to `range` visible to the instruction fetch path,
 /// before that range becomes executable.
 ///
@@ -1716,6 +1859,73 @@ mod tests {
     use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};
     use litebox_common_linux::PtRegs;
     use litebox_common_linux::signal::{SigSet, Signal};
+
+    #[test]
+    fn spawned_thread_installs_inherited_vector_state() {
+        use litebox::platform::{GuestVectorStateProvider as _, ThreadProvider as _};
+        use litebox::shim::InitThread;
+
+        struct ObserveInit(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
+        struct ObserveShim(std::sync::mpsc::Sender<litebox_common_linux::GuestVectorState>);
+
+        impl InitThread for ObserveInit {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(
+                self: Box<Self>,
+            ) -> Box<dyn EnterShim<ExecutionContext = Self::ExecutionContext>> {
+                Box::new(ObserveShim(self.0))
+            }
+        }
+
+        impl EnterShim for ObserveShim {
+            type ExecutionContext = litebox_common_linux::PtRegs;
+
+            fn init(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                self.0.send(get_guest_vector_state()).unwrap();
+                ContinueOperation::Terminate
+            }
+
+            fn syscall(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn exception(
+                &self,
+                _ctx: &mut Self::ExecutionContext,
+                _info: &litebox::shim::ExceptionInfo,
+            ) -> ContinueOperation {
+                unreachable!()
+            }
+
+            fn interrupt(&self, _ctx: &mut Self::ExecutionContext) -> ContinueOperation {
+                unreachable!()
+            }
+        }
+
+        let platform = LinuxUserland::new();
+        let original = platform.get_guest_vector_state();
+        let expected = litebox_common_linux::GuestVectorState {
+            registers: core::array::from_fn(|index| index as u128 * 0x101),
+            fpsr: 0x1234,
+            fpcr: 0x5678,
+        };
+        platform.set_guest_vector_state(&expected);
+        let (send, receive) = std::sync::mpsc::channel();
+        unsafe {
+            platform
+                .spawn_thread(
+                    &litebox_common_linux::PtRegs::default(),
+                    Box::new(ObserveInit(send)),
+                )
+                .unwrap();
+        }
+        let observed = receive
+            .recv_timeout(core::time::Duration::from_secs(5))
+            .unwrap();
+        platform.set_guest_vector_state(&original);
+        assert_eq!(observed, expected);
+    }
 
     fn live_fp_state() -> FpState {
         let status: u64;
@@ -3412,13 +3622,14 @@ mod tests {
         // waker slot is null on this thread (asserted below), so no waker is
         // dereferenced.
         assert_eq!(read_tls_slot!(usize, tls_offset::WAIT_WAKER_ADDR), 0);
+        let alarm_bit = 1u32 << (Signal::SIGALRM.as_i32() - 1);
+        let interrupt_bit = 1u32 << (Signal::SIGINT.as_i32() - 1);
         unsafe {
-            super::record_pending_signal(Signal::SIGALRM);
-            super::record_pending_signal(Signal::SIGINT);
+            super::record_pending_signal(alarm_bit);
+            super::record_pending_signal(interrupt_bit);
         }
 
-        let expected_bits =
-            (1u32 << (Signal::SIGALRM.as_i32() - 1)) | (1u32 << (Signal::SIGINT.as_i32() - 1));
+        let expected_bits = alarm_bit | interrupt_bit;
         assert_eq!(
             read_tls_slot!(u32, tls_offset::PENDING_HOST_SIGNALS),
             expected_bits,
@@ -3510,38 +3721,44 @@ mod tests {
 
         assert!(result.is_err(), "the panic must propagate to the caller");
         assert!(
-            !super::is_guest_thread(),
+            !super::is_guest_thread_from_signal_context(),
             "unwinding must run `GuestThreadMarker`'s drop"
         );
     }
 
     #[test]
     fn test_guest_thread_marker() {
-        assert!(!is_guest_thread(), "a plain test thread is not a guest");
+        assert!(
+            !is_guest_thread_from_signal_context(),
+            "a plain test thread is not a guest"
+        );
 
         {
             let _outer = GuestThreadMarker::enter();
-            assert!(is_guest_thread());
+            assert!(is_guest_thread_from_signal_context());
             {
                 let _inner = GuestThreadMarker::enter();
-                assert!(is_guest_thread());
+                assert!(is_guest_thread_from_signal_context());
             }
             assert!(
-                is_guest_thread(),
+                is_guest_thread_from_signal_context(),
                 "dropping a nested marker must not un-mark the thread while \
                  an outer frame is still running the guest"
             );
         }
-        assert!(!is_guest_thread(), "the outermost marker must restore");
+        assert!(
+            !is_guest_thread_from_signal_context(),
+            "the outermost marker must restore"
+        );
 
         let result = std::panic::catch_unwind(|| {
             let _marker = GuestThreadMarker::enter();
-            assert!(is_guest_thread());
+            assert!(is_guest_thread_from_signal_context());
             panic!("unwind out of guest execution");
         });
         assert!(result.is_err());
         assert!(
-            !is_guest_thread(),
+            !is_guest_thread_from_signal_context(),
             "the marker must be restored when the guest frame unwinds"
         );
     }
