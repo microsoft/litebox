@@ -54,7 +54,6 @@ impl ConsoleStdio {
     }
 }
 
-/// Never a terminal.
 impl StdioProvider for ConsoleStdio {
     fn read(&self, output: &mut [u8]) -> Result<usize, StdioProviderError> {
         match self.console.read(output) {
@@ -71,6 +70,7 @@ impl StdioProvider for ConsoleStdio {
         }
     }
 
+    /// No terminal control.
     fn is_terminal(&self, _stream: StdioStream) -> bool {
         false
     }
