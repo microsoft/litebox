@@ -2666,10 +2666,6 @@ fn test_broker_with_iperf3() {
 }
 
 #[test]
-#[cfg_attr(
-    target_arch = "aarch64",
-    ignore = "AArch64 bash requires the unsupported getpgid syscall"
-)]
 fn test_shebang() {
     let bash_path = run_which("bash");
 
