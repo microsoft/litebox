@@ -172,7 +172,7 @@ pub struct BrokerProcess {
     ///
     /// No other lock is taken while this one is held. Changes are serialized
     /// by the core's process tree lock.
-    links: Mutex<ProcessLinks>,
+    tree_node: Mutex<ProcessTreeNode>,
     state: Mutex<BrokerProcessState>,
     /// Broker-entry-authenticated caller credential for this process.
     pub(crate) caller_credential: CallerCredential,
@@ -191,7 +191,7 @@ pub struct BrokerProcess {
 }
 
 /// A process's place in the process tree.
-struct ProcessLinks {
+struct ProcessTreeNode {
     /// Process group and session.
     membership: ProcessGroupMembership,
     /// Process that collects this one's exit, if any.
@@ -328,7 +328,7 @@ impl BrokerProcess {
             id,
             initial_thread_id: Once::new(),
             creator: creator.map(|creator| creator.id),
-            links: Mutex::new(ProcessLinks {
+            tree_node: Mutex::new(ProcessTreeNode {
                 membership,
                 parent: creator.map(Arc::downgrade),
                 children: Vec::new(),
@@ -616,7 +616,7 @@ impl BrokerProcess {
     /// Each child applies the setting in effect when it exits, so exits
     /// already retained are kept until collected.
     pub fn set_child_exit_retention(&self, enabled: bool) -> Result<()> {
-        self.update_links(|links| links.retain_child_exits = enabled)
+        self.update_tree_node(|node| node.retain_child_exits = enabled)
     }
 
     /// Sets whether this running process adopts the orphaned children of its
@@ -626,16 +626,16 @@ impl BrokerProcess {
     /// that adopts orphans. Without one, they have no parent, and their exits
     /// are discarded as soon as they exit.
     pub fn set_orphan_adoption(&self, enabled: bool) -> Result<()> {
-        self.update_links(|links| links.adopts_orphans = enabled)
+        self.update_tree_node(|node| node.adopts_orphans = enabled)
     }
 
     /// Updates this running process's place in the process tree.
-    fn update_links(&self, update: impl FnOnce(&mut ProcessLinks)) -> Result<()> {
+    fn update_tree_node(&self, update: impl FnOnce(&mut ProcessTreeNode)) -> Result<()> {
         let _tree = self.core.process_tree_lock.lock();
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
-        update(&mut self.links.lock());
+        update(&mut self.tree_node.lock());
         Ok(())
     }
 
@@ -650,22 +650,22 @@ impl BrokerProcess {
         if !self.accepts_operations(&self.state.lock()) {
             return Err(BrokerError::PeerClosed);
         }
-        // This process's links are released while its children's are read,
+        // This process's node lock is released while its children's are read,
         // since no other lock is taken while one is held.
-        let mut children = core::mem::take(&mut self.links.lock().children);
+        let mut children = core::mem::take(&mut self.tree_node.lock().children);
         let mut matched = false;
         let exited = children.iter().position(|child| {
-            let links = child.links.lock();
+            let node = child.tree_node.lock();
             let selected = match selector {
                 ChildSelector::Any => true,
                 ChildSelector::Process(id) => child.id == id,
-                ChildSelector::ProcessGroup(id) => links.membership.process_group == id,
+                ChildSelector::ProcessGroup(id) => node.membership.process_group == id,
             };
             matched |= selected;
-            selected && links.exit_status.is_some()
+            selected && node.exit_status.is_some()
         });
         let collected = exited.map(|index| children.remove(index));
-        self.links.lock().children = children;
+        self.tree_node.lock().children = children;
         let Some(child) = collected else {
             return Err(if matched {
                 BrokerError::WouldBlock
@@ -673,11 +673,11 @@ impl BrokerProcess {
                 BrokerError::UnknownObject
             });
         };
-        let mut links = child.links.lock();
-        links.released = true;
+        let mut node = child.tree_node.lock();
+        node.released = true;
         Ok(ChildExit {
             process_id: child.id,
-            exit_status: links.exit_status.ok_or(BrokerError::Internal)?,
+            exit_status: node.exit_status.ok_or(BrokerError::Internal)?,
         })
     }
 
@@ -686,15 +686,15 @@ impl BrokerProcess {
     /// Returns `UnknownObject` if no such process exists.
     pub fn process_info(&self, target: ProcessId) -> Result<ProcessInfo> {
         let target = self.core.registered_process(target)?;
-        // While the links reference a parent, it has yet to finish exiting,
+        // While the node references a parent, it has yet to finish exiting,
         // so it is still registered; once an adoption replaces it, its exit
-        // may be collected. Upgrade it under the links, and drop it only after
-        // them.
+        // may be collected. Upgrade it under the node's lock, and drop it only
+        // after releasing that lock.
         let (parent, membership) = {
-            let links = target.links.lock();
+            let node = target.tree_node.lock();
             (
-                links.parent.as_ref().and_then(Weak::upgrade),
-                links.membership,
+                node.parent.as_ref().and_then(Weak::upgrade),
+                node.membership,
             )
         };
         Ok(ProcessInfo {
@@ -744,7 +744,7 @@ impl BrokerProcess {
 
     /// Returns this process's group and session.
     pub(crate) fn membership(&self) -> ProcessGroupMembership {
-        self.links.lock().membership
+        self.tree_node.lock().membership
     }
 
     /// Moves this process into another group or session.
@@ -753,7 +753,7 @@ impl BrokerProcess {
     pub(crate) fn set_membership(&self, membership: ProcessGroupMembership) {
         let mut ids = self.core.ids.lock();
         Self::retain_membership_ids(&mut ids, membership);
-        let previous = core::mem::replace(&mut self.links.lock().membership, membership);
+        let previous = core::mem::replace(&mut self.tree_node.lock().membership, membership);
         Self::release_membership_ids(&mut ids, previous);
     }
 
@@ -779,14 +779,14 @@ impl BrokerProcess {
     /// Returns whether this process's exit was collected or discarded, or it
     /// never started, so it no longer exists for other processes.
     pub(crate) fn is_released(&self) -> bool {
-        self.links.lock().released
+        self.tree_node.lock().released
     }
 
     /// Reserves room for one more child.
     ///
     /// Callers hold the core's process tree lock.
     pub(crate) fn reserve_child(&self) -> Result<()> {
-        self.links
+        self.tree_node
             .lock()
             .children
             .try_reserve(1)
@@ -798,7 +798,7 @@ impl BrokerProcess {
     ///
     /// Callers hold the core's process tree lock.
     pub(crate) fn add_child(&self, child: Arc<BrokerProcess>) {
-        self.links.lock().children.push(child);
+        self.tree_node.lock().children.push(child);
     }
 
     /// Calls `f` with the pending child selected by `child_process_id`, which
@@ -916,18 +916,18 @@ impl BrokerProcess {
                 .status
                 .transition(ProcessStatus::Exited(exit_status))?;
             let (parent, children) = {
-                let mut links = self.links.lock();
-                links.exit_status = Some(exit_status);
+                let mut node = self.tree_node.lock();
+                node.exit_status = Some(exit_status);
                 (
-                    links.parent.as_ref().and_then(Weak::upgrade),
-                    core::mem::take(&mut links.children),
+                    node.parent.as_ref().and_then(Weak::upgrade),
+                    core::mem::take(&mut node.children),
                 )
             };
             let adopter = Self::nearest_adopter(parent.clone()).filter(|adopter| {
                 // Without room for the orphans, they are left without a
                 // parent.
                 adopter
-                    .links
+                    .tree_node
                     .lock()
                     .children
                     .try_reserve(children.len())
@@ -951,13 +951,13 @@ impl BrokerProcess {
     fn nearest_adopter(mut ancestor: Option<Arc<Self>>) -> Option<Arc<Self>> {
         while let Some(process) = ancestor {
             let running = process.accepts_operations(&process.state.lock());
-            let links = process.links.lock();
-            if running && links.adopts_orphans {
-                drop(links);
+            let node = process.tree_node.lock();
+            if running && node.adopts_orphans {
+                drop(node);
                 return Some(process);
             }
-            let parent = links.parent.as_ref().and_then(Weak::upgrade);
-            drop(links);
+            let parent = node.parent.as_ref().and_then(Weak::upgrade);
+            drop(node);
             ancestor = parent;
         }
         None
@@ -971,12 +971,12 @@ impl BrokerProcess {
     /// Callers hold the core's process tree lock.
     fn adopt(parent: Option<&Arc<Self>>, child: Arc<Self>) {
         let exit_status = {
-            let mut links = child.links.lock();
-            links.parent = parent.map(Arc::downgrade);
-            links.exit_status
+            let mut node = child.tree_node.lock();
+            node.parent = parent.map(Arc::downgrade);
+            node.exit_status
         };
         if let Some(parent) = parent {
-            parent.links.lock().children.push(Arc::clone(&child));
+            parent.tree_node.lock().children.push(Arc::clone(&child));
         }
         if let Some(exit_status) = exit_status {
             child.report_exit(parent.map(|parent| &**parent), exit_status);
@@ -991,18 +991,18 @@ impl BrokerProcess {
     fn report_exit(&self, parent: Option<&Self>, exit_status: ProcessExitStatus) {
         let mut discarded = parent.is_none();
         // The last reference may run this process's teardown, so it drops
-        // only after the parent's links are released.
+        // only after the parent's node lock is released.
         let mut removed = None;
         if let Some(parent) = parent {
             {
-                let mut links = parent.links.lock();
-                if !links.retain_child_exits {
+                let mut node = parent.tree_node.lock();
+                if !node.retain_child_exits {
                     discarded = true;
-                    let index = links
+                    let index = node
                         .children
                         .iter()
                         .position(|child| core::ptr::eq(Arc::as_ptr(child), self));
-                    removed = index.map(|index| links.children.remove(index));
+                    removed = index.map(|index| node.children.remove(index));
                 }
             }
             parent.signals.post_child_exit(ChildExit {
@@ -1011,7 +1011,7 @@ impl BrokerProcess {
             });
         }
         if discarded {
-            self.links.lock().released = true;
+            self.tree_node.lock().released = true;
         }
         drop(removed);
     }
@@ -1023,20 +1023,20 @@ impl BrokerProcess {
     /// Callers hold the core's process tree lock.
     fn release_unstarted(&self) {
         let parent = {
-            let mut links = self.links.lock();
-            links.released = true;
-            links.parent.take().as_ref().and_then(Weak::upgrade)
+            let mut node = self.tree_node.lock();
+            node.released = true;
+            node.parent.take().as_ref().and_then(Weak::upgrade)
         };
         let Some(parent) = parent else {
             return;
         };
         let removed = {
-            let mut links = parent.links.lock();
-            let index = links
+            let mut node = parent.tree_node.lock();
+            let index = node
                 .children
                 .iter()
                 .position(|child| core::ptr::eq(Arc::as_ptr(child), self));
-            index.map(|index| links.children.remove(index))
+            index.map(|index| node.children.remove(index))
         };
         if removed.is_some() {
             parent.signals.post_child_removed();
@@ -1131,7 +1131,7 @@ impl BrokerProcess {
             // this lock is taken every child created for a live owner is
             // listed.
             let _tree = self.core.process_tree_lock.lock();
-            let mut children = core::mem::take(&mut self.links.lock().children);
+            let mut children = core::mem::take(&mut self.tree_node.lock().children);
             let count = children.len();
             children.retain(|child| {
                 let (failed, shutdown) = child.handle_parent_death();
@@ -1139,7 +1139,7 @@ impl BrokerProcess {
                 !failed
             });
             let changed = children.len() != count;
-            self.links.lock().children = children;
+            self.tree_node.lock().children = children;
             changed
         };
         if changed {
@@ -1185,7 +1185,7 @@ impl BrokerProcess {
     pub(crate) fn is_child_of(&self, parent: &BrokerProcess) -> bool {
         // The weak reference keeps the parent's allocation, so its address
         // cannot be reused by another process.
-        self.links
+        self.tree_node
             .lock()
             .parent
             .as_ref()
@@ -1209,9 +1209,9 @@ impl BrokerProcess {
         if state.shutdown_request == ProcessShutdownRequest::None {
             state.shutdown_request = ProcessShutdownRequest::Expected;
         }
-        let mut links = self.links.lock();
-        links.released = true;
-        links.parent = None;
+        let mut node = self.tree_node.lock();
+        node.released = true;
+        node.parent = None;
         (true, state.shutdown.clone())
     }
 
@@ -2031,7 +2031,7 @@ mod tests {
 
     fn parent_id(process: &BrokerProcess) -> Option<ProcessId> {
         process
-            .links
+            .tree_node
             .lock()
             .parent
             .as_ref()
@@ -2845,7 +2845,7 @@ mod tests {
 
         assert_eq!(child.startup_result(), Some(Err(BrokerError::PeerClosed)));
         assert!(child.is_released());
-        assert!(parent.links.lock().children.is_empty());
+        assert!(parent.tree_node.lock().children.is_empty());
         assert!(matches!(
             parent.take_child_process(process_id),
             Err(BrokerError::PeerClosed)
@@ -3060,7 +3060,7 @@ mod tests {
             parent.exit_child_process(identity.process_id, EXITED),
             Err(BrokerError::PeerClosed)
         );
-        assert!(parent.links.lock().children.is_empty());
+        assert!(parent.tree_node.lock().children.is_empty());
     }
 
     #[test]

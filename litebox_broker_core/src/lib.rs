@@ -241,7 +241,7 @@ pub struct BrokerCore {
     /// and selections over it.
     ///
     /// Lock order: this lock, then process state locks, then the registry
-    /// and ID allocator, then process tree links.
+    /// and ID allocator, then process tree nodes.
     pub(crate) process_tree_lock: Arc<Mutex<()>>,
     /// Number of broker threads created and not normally retired.
     pub(crate) active_thread_count: Arc<AtomicUsize>,
