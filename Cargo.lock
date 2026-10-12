@@ -1873,6 +1873,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "litebox",
+ "litebox_common",
  "litebox_common_linux",
  "litebox_common_vm_abi",
  "litebox_platform",
@@ -1913,6 +1914,19 @@ dependencies = [
  "litebox_util_log",
  "tempfile",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "litebox_runner_linux_on_vm_userland"
+version = "0.1.0"
+dependencies = [
+ "litebox",
+ "litebox_broker_local_vm_userland",
+ "litebox_broker_protocol",
+ "litebox_common_linux",
+ "litebox_common_vm_abi",
+ "litebox_platform_vm_userland",
+ "litebox_shim_linux",
 ]
 
 [[package]]
@@ -2081,6 +2095,7 @@ dependencies = [
  "arrayvec",
  "base64",
  "litebox_bootloader",
+ "litebox_broker_core",
  "litebox_broker_vm_kernel",
  "litebox_common_optee",
  "litebox_common_vm_abi",

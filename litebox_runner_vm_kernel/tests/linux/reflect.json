@@ -1,0 +1,7 @@
+[
+  {
+    "argv": ["/reflect"],
+    "expect_stdout": "reflected write\nwritten=16 pid_matches=1 bad=-38\n",
+    "min_reflected_syscalls": 3
+  }
+]

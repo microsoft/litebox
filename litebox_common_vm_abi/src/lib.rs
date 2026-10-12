@@ -111,7 +111,10 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod envelope;
+pub mod program;
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, TryFromBytes};
 

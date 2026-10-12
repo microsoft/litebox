@@ -1,0 +1,18 @@
+[
+  {
+    "argv": ["/args"],
+    "expect_stdout": "argv[0] = /args\n",
+    "expect_stderr": "to stderr\n"
+  },
+  {
+    "argv": ["/args-pie", "exit", "3", "a b"],
+    "envp": ["GREETING=hi", "EMPTY="],
+    "expect_exit_code": 3,
+    "expect_stdout": "argv[0] = /args-pie\nargv[1] = exit\nargv[2] = 3\nargv[3] = a b\nenvp[0] = GREETING=hi\nenvp[1] = EMPTY=\n"
+  },
+  {
+    "argv": ["/args", "abort"],
+    "expect_signal": 6,
+    "expect_stdout": "argv[0] = /args\nargv[1] = abort\n"
+  }
+]

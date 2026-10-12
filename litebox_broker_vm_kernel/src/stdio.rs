@@ -22,8 +22,9 @@ pub trait Console: Sync {
     /// Whether [`Self::read`] would not return zero: input or its end.
     fn has_input(&self) -> bool;
 
-    /// How much of `input` the device took; less if it stays full.
-    fn write(&self, input: &[u8]) -> usize;
+    /// How much of `input`, for `stream`, the device took; less if it stays
+    /// full.
+    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> usize;
 }
 
 pub(crate) struct ConsoleStdio {
@@ -63,8 +64,8 @@ impl StdioProvider for ConsoleStdio {
         }
     }
 
-    fn write(&self, _stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
-        match self.console.write(input) {
+    fn write(&self, stream: StdioOutputStream, input: &[u8]) -> Result<usize, StdioProviderError> {
+        match self.console.write(stream, input) {
             0 => Err(StdioProviderError::WouldBlock),
             written => Ok(written),
         }

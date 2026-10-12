@@ -1,0 +1,8 @@
+[
+  {
+    "argv": ["/echo"],
+    "stdin": "hello from the host\nand a second line\n",
+    "expect_stdout": "hello from the host\nand a second line\n"
+  },
+  { "argv": ["/echo"], "expect_stdout": "" }
+]

@@ -2,12 +2,17 @@
 // Licensed under the MIT license.
 
 //! QEMU guest kernel: a [service](service::Service) in ring-3 runner
-//! processes, and a [client](client) for it. Today: OP-TEE TAs in
-//! `litebox_runner_optee_on_vm_userland` processes, one per TA instance
-//! ([`service::optee`]),
-//! driven by a test client ([`client::script`]). QEMU exits with 33 if all
-//! tests pass, 65 otherwise. Runner processes' standard streams are the
-//! VM's console device, if there is one ([`devices`]).
+//! processes, and a [client](client) for it, chosen by the payload:
+//! - With `programs.json`: standalone programs in `runner.elf` processes
+//!   ([`service::program`]), e.g., Linux programs in
+//!   `litebox_runner_linux_on_vm_userland`, driven by [`client::program`].
+//! - Otherwise: OP-TEE TAs in `litebox_runner_optee_on_vm_userland`
+//!   processes, one per TA instance ([`service::optee`]), driven by a test
+//!   client ([`client::script`]).
+//!
+//! QEMU exits with 33 if all tests pass, 65 otherwise. Runner processes'
+//! standard streams are the VM's console device, if there is one
+//! ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -33,13 +38,25 @@ fn kernel_main(kernel: Kernel) -> ! {
     let payload =
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
-    let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
-        platform: kernel.platform,
-        console: devices,
-        events: devices,
-    });
-    let mut service = service::optee::Optee::new(kernel.platform, kernel.clock, &payload, broker);
-    client::script::run(&payload, &mut service);
+    let broker = |console| {
+        litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+            platform: kernel.platform,
+            console,
+            events: devices,
+            root: payload.file("rootfs.tar"),
+        })
+    };
+    if let Some(programs) = payload.file("programs.json") {
+        let stdio: &'static client::program::Stdio =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(client::program::Stdio::new(devices)));
+        let mut service =
+            service::program::Programs::new(kernel.platform, kernel.clock, &payload, broker(stdio));
+        client::program::run(programs, &mut service, stdio);
+    } else {
+        let mut service =
+            service::optee::Optee::new(kernel.platform, kernel.clock, &payload, broker(devices));
+        client::script::run(&payload, &mut service);
+    }
     serial_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)
 }

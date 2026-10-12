@@ -9,7 +9,8 @@
 //! buffers.
 //!
 //! Files are the devices under `/dev`, with standard streams on the
-//! runner's [`stdio::Console`]. Readiness (e.g., of standard input) goes to the
+//! runner's [`stdio::Console`], and those of an optional read-only root
+//! ([`Config::root`]). Readiness (e.g., of standard input) goes to the
 //! association's notification ring. Waiting ([`BrokerEnterOp::Wait`]) halts
 //! until the runner's [`Events`] report something, e.g., an interrupt.
 
@@ -72,6 +73,8 @@ pub struct Config {
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
     pub console: &'static dyn stdio::Console,
     pub events: &'static dyn Events,
+    /// A tar, read-only at `/`, e.g., a Linux program's files.
+    pub root: Option<&'static [u8]>,
 }
 
 /// The kernel's broker; clones share it.
@@ -92,7 +95,7 @@ impl Broker {
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         Self {
-            core: providers::core(stdio.clone()),
+            core: providers::core(config.root, stdio.clone()),
             platform: config.platform,
             events: config.events,
             stdio,

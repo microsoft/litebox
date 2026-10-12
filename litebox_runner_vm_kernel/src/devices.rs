@@ -14,6 +14,7 @@
 
 use alloc::boxed::Box;
 use core::time::Duration;
+use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_vm_kernel::Events;
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
@@ -111,8 +112,9 @@ impl Console for Devices {
         !console.receives() || console.has_input()
     }
 
-    /// Waits (bounded) for the device to take all of `input`.
-    fn write(&self, input: &[u8]) -> usize {
+    /// Waits (bounded) for the device to take all of `input`; both streams
+    /// share it.
+    fn write(&self, _stream: StdioOutputStream, input: &[u8]) -> usize {
         let deadline = self
             .platform
             .now()

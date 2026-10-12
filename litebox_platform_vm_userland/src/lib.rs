@@ -22,6 +22,10 @@
 extern crate alloc;
 
 pub mod kcall;
+/// Only for runners, which are bare-metal programs; host builds (e.g., tests)
+/// keep `std`'s entry, allocator, and panic handler.
+#[cfg(target_os = "none")]
+pub mod start;
 pub mod thread;
 
 use core::sync::atomic::AtomicU32;
@@ -218,7 +222,8 @@ impl TimeProvider for VmUserland {
         Instant(u64::try_from(counter * 1_000_000 / u128::from(self.clock_khz)).unwrap_or(u64::MAX))
     }
 
-    /// Panics: the kernel has no wall clock.
+    /// Panics: the kernel has no wall clock (`time`, `gettimeofday`, and
+    /// `CLOCK_REALTIME` reach this).
     fn current_time(&self) -> SystemTime {
         panic!("no wall clock")
     }
@@ -456,6 +461,56 @@ impl litebox::platform::SystemInfoProvider for VmUserland {
     fn get_vdso_address(&self) -> Option<usize> {
         None
     }
+}
+
+/// One guest thread: the runner's. New threads are unsupported, and nothing
+/// interrupts the only one.
+impl litebox::platform::ThreadProvider for VmUserland {
+    type ExecutionContext = litebox_common_linux::PtRegs;
+    type ThreadSpawnError = litebox_common_linux::errno::Errno;
+    type ThreadHandle = ();
+
+    unsafe fn spawn_thread(
+        &self,
+        _ctx: &Self::ExecutionContext,
+        _init_thread: alloc::boxed::Box<
+            dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
+        >,
+    ) -> Result<(), Self::ThreadSpawnError> {
+        Err(litebox_common_linux::errno::Errno::ENOSYS)
+    }
+
+    fn current_thread(&self) -> Self::ThreadHandle {}
+
+    fn interrupt_thread(&self, _thread: &Self::ThreadHandle) {}
+}
+
+/// The guest's vector state stays in the registers: the runner never touches
+/// them (soft-float), and the kernel preserves them across its calls. No
+/// snapshot or replacement is needed while the runner has neither `fork` nor
+/// asynchronous signals, so, as on SNP, a snapshot is the initial state and a
+/// replacement does nothing.
+impl litebox::platform::GuestVectorStateProvider for VmUserland {
+    type GuestVectorState = litebox_common_linux::GuestVectorState;
+
+    fn get_guest_vector_state(&self) -> Self::GuestVectorState {
+        litebox_common_linux::GuestVectorState::initial(
+            litebox_common::arch::x86_64::xstate::XsaveLayout::get(),
+        )
+    }
+
+    fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
+}
+
+/// No timers: the kernel delivers no asynchronous events to runners.
+impl litebox::platform::TimerProvider for VmUserland {
+    type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
+    type Signal = litebox_common_linux::signal::Signal;
+}
+
+/// No asynchronous signals, as there are no timers.
+impl litebox::platform::SignalProvider for VmUserland {
+    type Signal = litebox_common_linux::signal::Signal;
 }
 
 /// Requires a shim KDF, which runs on a kernel-derived key bound to the

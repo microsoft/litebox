@@ -14,8 +14,8 @@
 //! process; identity-bound results use the identity fixed at
 //! [`Process::spawn`].
 //!
-//! Generic over the service a runner provides; `optee` (feature `optee`, on
-//! by default) is one.
+//! Generic over the service a runner provides: standalone [`program`]s, and
+//! `optee` (feature `optee`, on by default).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -32,6 +32,7 @@ mod lockdown;
 mod memory;
 #[cfg(feature = "optee")]
 pub mod optee;
+pub mod program;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -334,6 +335,12 @@ impl Process {
             self.inner.reflected.get()
         );
         Ok(reply.expect("a waiting process has completed its request"))
+    }
+
+    /// Guest syscalls the kernel reflected to the runner (`syscall`s outside
+    /// its gate) while serving the last request.
+    pub fn reflected_syscalls(&self) -> u64 {
+        self.inner.reflected.get()
     }
 
     pub fn identity(&self) -> &[u8; IDENTITY_LEN] {

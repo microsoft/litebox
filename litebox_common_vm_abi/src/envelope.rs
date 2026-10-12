@@ -39,6 +39,11 @@ impl Protocol {
     /// process identity is the TA's UUID (`TEE_UUID` memory layout),
     /// zero-padded; the images are `ldelf`, then the TA.
     pub const OPTEE_MSG: Self = Self(1);
+    /// A standalone program launch, on any guest OS ([`crate::program`]):
+    /// the request names the program, its arguments, and its environment;
+    /// the reply is its exit status. The program's files are the runner's
+    /// (e.g., the broker's). No identity or images.
+    pub const PROGRAM: Self = Self(2);
 }
 
 #[derive(
