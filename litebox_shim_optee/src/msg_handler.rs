@@ -849,7 +849,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
     /// Write `data` to the normal-world shared memory pages referenced by `self`,
     /// starting at byte `offset` within the view.
     /// Returns `EBadAddr` if the requested range is not entirely within the view.
-    pub(crate) fn write_at<Platform: litebox_common_linux::vmap::VmapManager<ALIGN>>(
+    pub(crate) fn write_at<Platform: litebox_common::vmap::VmapManager<ALIGN>>(
         &self,
         platform: &Platform,
         offset: usize,
