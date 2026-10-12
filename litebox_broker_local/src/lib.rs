@@ -40,14 +40,14 @@ use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags, SetStatusFlagsRequest};
 use litebox_broker_protocol::message::{
     BrokerHandshakeRequest, BrokerHandshakeResponse, BrokerNotification, BrokerOperation,
-    BrokerRequest, BrokerResponse, BrokerResult,
+    BrokerRequest, BrokerResponse, BrokerResult, ProcessRequest, ProcessResponse, ThreadRequest,
+    ThreadResponse,
 };
 use litebox_broker_protocol::process::{
-    ChildExit, ChildSelector, CreateThreadRequest, CreateThreadResponse,
-    DuplicateObjectsToChildRequest, ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessExitStatus, ProcessIdentity,
-    ProcessInfo, ProcessStartupData, ProcessStartupDescriptor, StartChildProcessRequest,
-    WriteChildMemoryRequest,
+    ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    MAX_CHILD_MEMORY_WRITE_SIZE, MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::shared_buffer::{SHARED_BUFFER_LAYOUT, SharedBufferSequence};
@@ -210,15 +210,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
 
         self.write_shared_buffer(buffer, bootstrap);
-        match self.request(BrokerOperation::StartChildProcess(
-            StartChildProcessRequest {
-                child_process_id,
-                startup: ProcessStartupDescriptor { buffer },
-            },
-        ))? {
-            BrokerResult::ProcessStarted => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected process-start response: {response:?}"),
+        match self.request_process(ProcessRequest::StartChild(StartChildProcessRequest {
+            child_process_id,
+            startup: ProcessStartupDescriptor { buffer },
+        }))? {
+            ProcessResponse::StartChild => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -244,16 +241,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
 
         self.write_shared_buffer(buffer, data);
-        match self.request(BrokerOperation::WriteChildMemory(WriteChildMemoryRequest {
+        match self.request_process(ProcessRequest::WriteChildMemory(WriteChildMemoryRequest {
             child_process_id,
             offset,
             data: buffer,
         }))? {
-            BrokerResult::ChildMemoryWritten => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected child-memory-write response: {response:?}")
-            }
+            ProcessResponse::WriteChildMemory => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -268,13 +262,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         child_process_id: ProcessId,
         exit_status: ProcessExitStatus,
     ) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
+        match self.request_process(ProcessRequest::ExitChild(ExitChildProcessRequest {
             child_process_id,
             exit_status,
         }))? {
-            BrokerResult::ProcessExited => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected process-exit response: {response:?}"),
+            ProcessResponse::ExitChild => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -285,12 +278,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn cancel_child_process(&self, child_process_id: ProcessId) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::CancelChildProcess(child_process_id))? {
-            BrokerResult::ChildProcessCancelled => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected cancel-child-process response: {response:?}")
-            }
+        match self.request_process(ProcessRequest::CancelChild(child_process_id))? {
+            ProcessResponse::CancelChild => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -323,13 +313,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
         data.extend(handles.iter().flat_map(|handle| handle.0.to_le_bytes()));
         self.write_shared_buffer(buffer, &data);
-        match self.request(BrokerOperation::DuplicateObjectsToChild(
+        match self.request_process(ProcessRequest::DuplicateObjectsToChild(
             DuplicateObjectsToChildRequest {
                 child_process_id,
                 handles: buffer,
             },
         ))? {
-            BrokerResult::ObjectsDuplicated => {
+            ProcessResponse::DuplicateObjectsToChild => {
                 self.read_shared_buffer(buffer, &mut data);
                 let (handles, _) = data.as_chunks::<{ size_of::<u64>() }>();
                 duplicates.extend(
@@ -339,10 +329,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 );
                 Ok(duplicates)
             }
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected object-duplication response: {response:?}")
-            }
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -353,12 +340,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn report_exit_status(&self, exit_status: ProcessExitStatus) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::ReportExitStatus(exit_status))? {
-            BrokerResult::ExitStatusReported => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected exit-status report response: {response:?}")
-            }
+        match self.request_process(ProcessRequest::ReportExitStatus(exit_status))? {
+            ProcessResponse::ReportExitStatus => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -369,12 +353,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn set_child_exit_retention(&self, enabled: bool) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::SetChildExitRetention(enabled))? {
-            BrokerResult::ChildExitRetentionSet => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected child exit retention response: {response:?}")
-            }
+        match self.request_process(ProcessRequest::SetChildExitRetention(enabled))? {
+            ProcessResponse::SetChildExitRetention => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -385,12 +366,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn set_orphan_adoption(&self, enabled: bool) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::SetOrphanAdoption(enabled))? {
-            BrokerResult::OrphanAdoptionSet => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected orphan-adoption response: {response:?}")
-            }
+        match self.request_process(ProcessRequest::SetOrphanAdoption(enabled))? {
+            ProcessResponse::SetOrphanAdoption => Ok(()),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -400,12 +378,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn allocate_child_process(&self) -> Result<ProcessIdentity, Channel::Error> {
-        match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Process))? {
-            BrokerResult::CreateThread(CreateThreadResponse::Process(child)) => Ok(child),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected allocate-child-process response: {response:?}")
-            }
+        match self.request_process(ProcessRequest::AllocateChild)? {
+            ProcessResponse::AllocateChild(child) => Ok(child),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -419,12 +394,9 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn collect_child_exit(&self, selector: ChildSelector) -> Result<ChildExit, Channel::Error> {
-        match self.request(BrokerOperation::CollectChildExit(selector))? {
-            BrokerResult::ChildExitCollected(exit) => Ok(exit),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected child exit collection response: {response:?}")
-            }
+        match self.request_process(ProcessRequest::CollectChildExit(selector))? {
+            ProcessResponse::CollectChildExit(exit) => Ok(exit),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -436,10 +408,17 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for another operation.
     pub fn process_info(&self, process_id: ProcessId) -> Result<ProcessInfo, Channel::Error> {
-        match self.request(BrokerOperation::GetProcessInfo(process_id))? {
-            BrokerResult::ProcessInfo(info) => Ok(info),
+        match self.request_process(ProcessRequest::GetInfo(process_id))? {
+            ProcessResponse::GetInfo(info) => Ok(info),
+            response => panic!("broker returned unexpected process response: {response:?}"),
+        }
+    }
+
+    fn request_process(&self, request: ProcessRequest) -> Result<ProcessResponse, Channel::Error> {
+        match self.request(BrokerOperation::Process(request))? {
+            BrokerResult::Process(response) => Ok(response),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected process-info response: {response:?}"),
+            response => panic!("broker returned unexpected process response: {response:?}"),
         }
     }
 
@@ -449,10 +428,11 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for a different operation.
     pub fn create_thread(&self) -> Result<ThreadId, Channel::Error> {
-        match self.request(BrokerOperation::CreateThread(CreateThreadRequest::Thread))? {
-            BrokerResult::CreateThread(CreateThreadResponse::Thread(thread_id)) => Ok(thread_id),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected create-thread response: {response:?}"),
+        match self.request_thread(ThreadRequest::Create)? {
+            ThreadResponse::Create(thread_id) => Ok(thread_id),
+            response @ ThreadResponse::Exit => {
+                panic!("broker returned unexpected thread response: {response:?}")
+            }
         }
     }
 
@@ -462,12 +442,19 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for a different operation.
     pub fn exit_thread(&self, thread_id: ThreadId) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::ExitThread(thread_id))? {
-            BrokerResult::ThreadExited => Ok(()),
-            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => {
-                panic!("broker returned unexpected exit-thread response: {response:?}")
+        match self.request_thread(ThreadRequest::Exit(thread_id))? {
+            ThreadResponse::Exit => Ok(()),
+            response @ ThreadResponse::Create(_) => {
+                panic!("broker returned unexpected thread response: {response:?}")
             }
+        }
+    }
+
+    fn request_thread(&self, request: ThreadRequest) -> Result<ThreadResponse, Channel::Error> {
+        match self.request(BrokerOperation::Thread(request))? {
+            BrokerResult::Thread(response) => Ok(response),
+            BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
+            response => panic!("broker returned unexpected thread response: {response:?}"),
         }
     }
 
@@ -709,9 +696,7 @@ mod tests {
         let thread_id = ThreadId(7);
         let channel = FakeControlChannel::new(
             None,
-            Some(BrokerResult::CreateThread(CreateThreadResponse::Thread(
-                thread_id,
-            ))),
+            Some(BrokerResult::Thread(ThreadResponse::Create(thread_id))),
         );
         let local = test_broker_local(channel, noop_shared_memory());
 
@@ -720,17 +705,17 @@ mod tests {
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(0),
-                operation: BrokerOperation::CreateThread(CreateThreadRequest::Thread),
+                operation: BrokerOperation::Thread(ThreadRequest::Create),
             })
         );
 
-        *local.channel.response.borrow_mut() = Some(BrokerResult::ThreadExited);
+        *local.channel.response.borrow_mut() = Some(BrokerResult::Thread(ThreadResponse::Exit));
         local.exit_thread(thread_id).unwrap();
         assert_eq!(
             local.channel.sent_request.borrow().clone(),
             Some(BrokerRequest {
                 request_id: RequestId(1),
-                operation: BrokerOperation::ExitThread(thread_id),
+                operation: BrokerOperation::Thread(ThreadRequest::Exit(thread_id)),
             })
         );
     }

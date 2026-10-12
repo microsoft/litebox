@@ -7,8 +7,9 @@ use crate::signal::{
     TakeSignalRequest,
 };
 
+use super::WireError;
 use super::primitive::{Decoder, Encoder};
-use super::{WireError, decode_child_exit, encode_child_exit};
+use super::process::{decode_child_exit, encode_child_exit};
 
 const SIGNAL_REQUEST_TAG_OPEN: u8 = 0;
 const SIGNAL_REQUEST_TAG_SEND: u8 = 1;

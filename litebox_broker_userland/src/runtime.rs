@@ -30,7 +30,7 @@ use litebox_broker_host::{
     setup_connection,
 };
 use litebox_broker_protocol::error::ErrorCode;
-use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest};
+use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest, ProcessRequest};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_LAYOUT;
 use litebox_broker_transport::channel::{
     HostAssociationShutdown, HostNotificationChannel, HostReceive, HostRequestSource,
@@ -710,7 +710,10 @@ where
             // worker receives meanwhile. Other requests wait at most briefly for
             // broker threads such as the socket reactor, and never for the
             // guest, which learns of readiness through notifications instead.
-            holds_role = !matches!(request.operation, BrokerOperation::StartChildProcess(_));
+            holds_role = !matches!(
+                request.operation,
+                BrokerOperation::Process(ProcessRequest::StartChild(_))
+            );
             if !holds_role {
                 self.pass_role();
             }

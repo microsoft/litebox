@@ -401,9 +401,9 @@ mod tests {
 
     use litebox_broker_local::test_support::test_broker_local;
     use litebox_broker_protocol::message::{
-        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
+        BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult, ProcessRequest,
+        ProcessResponse,
     };
-    use litebox_broker_protocol::process::{CreateThreadRequest, CreateThreadResponse};
     use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_POOL_SIZE;
     use litebox_broker_protocol::{ProcessId, ThreadId};
     use litebox_broker_transport::channel::LocalCallChannel;
@@ -437,22 +437,24 @@ mod tests {
 
         fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, Self::Error> {
             let child = ProcessId(3);
-            let result = match request.operation {
-                BrokerOperation::CreateThread(CreateThreadRequest::Process) => {
-                    BrokerResult::CreateThread(CreateThreadResponse::Process(ProcessIdentity {
-                        process_id: child,
-                        initial_thread_id: ThreadId(4),
-                    }))
-                }
-                BrokerOperation::ExitChildProcess(request) if request.child_process_id == child => {
-                    BrokerResult::ProcessExited
-                }
-                BrokerOperation::CancelChildProcess(process_id) if process_id == child => {
-                    self.0.fetch_add(1, Ordering::SeqCst);
-                    BrokerResult::ChildProcessCancelled
-                }
-                operation => panic!("unexpected operation {operation:?}"),
+            let BrokerOperation::Process(operation) = request.operation else {
+                panic!("unexpected operation {:?}", request.operation);
             };
+            let response = match operation {
+                ProcessRequest::AllocateChild => ProcessResponse::AllocateChild(ProcessIdentity {
+                    process_id: child,
+                    initial_thread_id: ThreadId(4),
+                }),
+                ProcessRequest::ExitChild(request) if request.child_process_id == child => {
+                    ProcessResponse::ExitChild
+                }
+                ProcessRequest::CancelChild(process_id) if process_id == child => {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    ProcessResponse::CancelChild
+                }
+                operation => panic!("unexpected process operation {operation:?}"),
+            };
+            let result = BrokerResult::Process(response);
             Ok(BrokerResponse {
                 request_id: request.request_id,
                 result,

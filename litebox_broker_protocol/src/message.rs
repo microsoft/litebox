@@ -19,9 +19,9 @@ use crate::pipe::{
     WritePipeResponse,
 };
 use crate::process::{
-    ChildExit, ChildSelector, CreateThreadRequest, CreateThreadResponse,
-    DuplicateObjectsToChildRequest, ExitChildProcessRequest, ProcessExitStatus, ProcessInfo,
-    ProcessStartupDescriptor, StartChildProcessRequest, WriteChildMemoryRequest,
+    ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
+    ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
+    StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use crate::process_group::SetProcessGroupRequest;
 use crate::readiness::ReadinessFlags;
@@ -52,10 +52,8 @@ pub struct BrokerHandshakeRequest {
 /// Operation requested over an active broker control channel.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerOperation {
-    /// Create a thread in this process or a pending child process.
-    CreateThread(CreateThreadRequest),
-    /// Record broker thread exit after local teardown completes.
-    ExitThread(ThreadId),
+    /// Thread request family.
+    Thread(ThreadRequest),
     /// Close one broker object reference.
     CloseObject(ObjectHandle),
     /// Check the current readiness of a broker-owned object.
@@ -74,45 +72,8 @@ pub enum BrokerOperation {
     FillRandom(SharedBufferSequence),
     /// File request family.
     File(FileRequest),
-    /// Start one pending child process.
-    StartChildProcess(StartChildProcessRequest),
-    /// Collect the exit of one exited child matching the selector, oldest
-    /// first, without blocking, removing the child from the process tree.
-    ///
-    /// The broker returns `WouldBlock` if only live children match, and
-    /// `UnknownObject` if none does. Each matching child's exit or removal is
-    /// then reported through the caller's signals.
-    CollectChildExit(ChildSelector),
-    /// Record the exit of one pending child process that never started.
-    ExitChildProcess(ExitChildProcessRequest),
-    /// Discard one pending child process that never started, as if it had
-    /// never been created, except that this process learns it was removed.
-    CancelChildProcess(ProcessId),
-    /// Report this process's final termination status before its runner exits.
-    ///
-    /// The status is published once the runner exits, replacing the status the
-    /// broker would otherwise infer from the runner's host termination.
-    ReportExitStatus(ProcessExitStatus),
-    /// Set whether this process retains its children's exits until it
-    /// collects them, rather than discarding each when the child terminates.
-    ///
-    /// Each child applies the setting in effect when it terminates, so a change
-    /// does not affect children that already terminated.
-    SetChildExitRetention(bool),
-    /// Set whether this process adopts the orphaned children of its exiting
-    /// descendants.
-    ///
-    /// When a process exits, its children move to its nearest running ancestor
-    /// that adopts orphans, and otherwise have their exits discarded.
-    SetOrphanAdoption(bool),
-    /// Read a process's place in the process tree.
-    ///
-    /// The broker returns `UnknownObject` if no such process exists.
-    GetProcessInfo(ProcessId),
-    /// Duplicate object references into this process's pending child.
-    DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
-    /// Write bytes into this process's pending child's memory image.
-    WriteChildMemory(WriteChildMemoryRequest),
+    /// Process request family.
+    Process(ProcessRequest),
     /// Process group and session request family.
     ProcessGroup(ProcessGroupRequest),
     /// Timer object request family.
@@ -149,25 +110,19 @@ impl BrokerOperation {
                 | FileRequest::Mkdir(MkdirFileRequest { path: buffer, .. })
                 | FileRequest::Rmdir(RmdirFileRequest { path: buffer, .. }),
             )
-            | Self::StartChildProcess(StartChildProcessRequest {
-                startup: ProcessStartupDescriptor { buffer },
-                ..
-            })
-            | Self::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
-                handles: buffer,
-                ..
-            })
-            | Self::WriteChildMemory(WriteChildMemoryRequest { data: buffer, .. }) => Some(*buffer),
-            Self::CreateThread(_)
-            | Self::ExitThread(_)
+            | Self::Process(
+                ProcessRequest::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
+                    handles: buffer,
+                    ..
+                })
+                | ProcessRequest::WriteChildMemory(WriteChildMemoryRequest { data: buffer, .. })
+                | ProcessRequest::StartChild(StartChildProcessRequest {
+                    startup: ProcessStartupDescriptor { buffer },
+                    ..
+                }),
+            ) => Some(*buffer),
+            Self::Thread(_)
             | Self::CloseObject(_)
-            | Self::ExitChildProcess(_)
-            | Self::CancelChildProcess(_)
-            | Self::ReportExitStatus(_)
-            | Self::SetChildExitRetention(_)
-            | Self::SetOrphanAdoption(_)
-            | Self::GetProcessInfo(_)
-            | Self::CollectChildExit(_)
             | Self::CheckReadiness(_)
             | Self::GetStatusFlags(_)
             | Self::SetStatusFlags(_)
@@ -175,6 +130,16 @@ impl BrokerOperation {
             | Self::ProcessGroup(_)
             | Self::Timer(_)
             | Self::Signal(_)
+            | Self::Process(
+                ProcessRequest::AllocateChild
+                | ProcessRequest::ExitChild(_)
+                | ProcessRequest::CancelChild(_)
+                | ProcessRequest::ReportExitStatus(_)
+                | ProcessRequest::SetChildExitRetention(_)
+                | ProcessRequest::SetOrphanAdoption(_)
+                | ProcessRequest::CollectChildExit(_)
+                | ProcessRequest::GetInfo(_),
+            )
             | Self::Pipe(PipeRequest::Create(_))
             | Self::Socket(
                 SocketRequest::Create(_)
@@ -264,6 +229,62 @@ pub enum TimerRequest {
     Read(ReadTimerRequest),
 }
 
+/// Request about the caller's threads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadRequest {
+    /// Create another thread in the caller.
+    Create,
+    /// Record a thread's exit after its local teardown completes.
+    Exit(ThreadId),
+}
+
+/// Request about the caller's pending child, its own exit, and the process
+/// tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessRequest {
+    /// Create a pending child process and its initial thread.
+    AllocateChild,
+    /// Duplicate object references into this process's pending child.
+    DuplicateObjectsToChild(DuplicateObjectsToChildRequest),
+    /// Write bytes into this process's pending child's memory image.
+    WriteChildMemory(WriteChildMemoryRequest),
+    /// Start one pending child process.
+    StartChild(StartChildProcessRequest),
+    /// Record the exit of one pending child process that never started.
+    ExitChild(ExitChildProcessRequest),
+    /// Discard one pending child process that never started, as if it had
+    /// never been created, except that this process learns it was removed.
+    CancelChild(ProcessId),
+    /// Report this process's final termination status before its runner exits.
+    ///
+    /// The status is published once the runner exits, replacing the status the
+    /// broker would otherwise infer from the runner's host termination.
+    ReportExitStatus(ProcessExitStatus),
+    /// Set whether this process retains its children's exits until it
+    /// collects them, rather than discarding each when the child terminates.
+    ///
+    /// Each child applies the setting in effect when it terminates, so a change
+    /// does not affect children that already terminated.
+    SetChildExitRetention(bool),
+    /// Set whether this process adopts the orphaned children of its exiting
+    /// descendants.
+    ///
+    /// When a process exits, its children move to its nearest running ancestor
+    /// that adopts orphans, and otherwise have their exits discarded.
+    SetOrphanAdoption(bool),
+    /// Collect the exit of one exited child matching the selector, oldest
+    /// first, without blocking, removing the child from the process tree.
+    ///
+    /// The broker returns `WouldBlock` if only live children match, and
+    /// `UnknownObject` if none does. Each matching child's exit or removal is
+    /// then reported through the caller's signals.
+    CollectChildExit(ChildSelector),
+    /// Read a process's place in the process tree.
+    ///
+    /// The broker returns `UnknownObject` if no such process exists.
+    GetInfo(ProcessId),
+}
+
 /// Request about process groups and sessions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessGroupRequest {
@@ -339,10 +360,8 @@ pub enum SocketRequest {
 /// Result returned for an active broker operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerResult {
-    /// Thread or pending-process creation result.
-    CreateThread(CreateThreadResponse),
-    /// Thread exit completed.
-    ThreadExited,
+    /// Thread response family.
+    Thread(ThreadResponse),
     /// Object close operation completed.
     ObjectClosed,
     /// Current readiness of a broker-owned object.
@@ -361,27 +380,8 @@ pub enum BrokerResult {
     RandomFilled,
     /// File response family.
     File(FileResponse),
-    /// A pending child established its broker association.
-    ProcessStarted,
-    /// An exited child's exit was collected.
-    ChildExitCollected(ChildExit),
-    /// A pending child's exit was recorded.
-    ProcessExited,
-    /// A pending child was discarded.
-    ChildProcessCancelled,
-    /// This process's final termination status was recorded.
-    ExitStatusReported,
-    /// This process's child exit retention setting was recorded.
-    ChildExitRetentionSet,
-    /// This process's orphan-adoption setting was recorded.
-    OrphanAdoptionSet,
-    /// A process's place in the process tree.
-    ProcessInfo(ProcessInfo),
-    /// Object references were duplicated into a pending child, whose handles
-    /// replaced the request's handles in its shared buffer.
-    ObjectsDuplicated,
-    /// Bytes were written into a pending child's memory image.
-    ChildMemoryWritten,
+    /// Process response family.
+    Process(ProcessResponse),
     /// Process group and session response family.
     ProcessGroup(ProcessGroupResponse),
     /// Timer object response family.
@@ -423,6 +423,43 @@ pub enum TimerResponse {
     Get(GetTimerResponse),
     /// Read operation response.
     Read(ReadTimerResponse),
+}
+
+/// Response to a thread request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ThreadResponse {
+    /// The thread was created.
+    Create(ThreadId),
+    /// The thread's exit was recorded.
+    Exit,
+}
+
+/// Response to a process request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProcessResponse {
+    /// The pending child was created.
+    AllocateChild(ProcessIdentity),
+    /// Object references were duplicated into the pending child, whose handles
+    /// replaced the request's handles in its shared buffer.
+    DuplicateObjectsToChild,
+    /// Bytes were written into the pending child's memory image.
+    WriteChildMemory,
+    /// The pending child established its broker association.
+    StartChild,
+    /// The pending child's exit was recorded.
+    ExitChild,
+    /// The pending child was discarded.
+    CancelChild,
+    /// This process's final termination status was recorded.
+    ReportExitStatus,
+    /// This process's child exit retention setting was recorded.
+    SetChildExitRetention,
+    /// This process's orphan-adoption setting was recorded.
+    SetOrphanAdoption,
+    /// An exited child's exit was collected.
+    CollectChildExit(ChildExit),
+    /// A process's place in the process tree.
+    GetInfo(ProcessInfo),
 }
 
 /// Response to a process group request.

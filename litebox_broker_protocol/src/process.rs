@@ -87,24 +87,6 @@ pub struct ProcessInfo {
     pub membership: ProcessGroupMembership,
 }
 
-/// Selects whether thread creation extends the current process or creates a child process.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CreateThreadRequest {
-    /// Creates another thread in the requesting process.
-    Thread,
-    /// Creates a pending child process and its initial thread.
-    Process,
-}
-
-/// Successful thread or process creation result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CreateThreadResponse {
-    /// A thread was created in the requesting process.
-    Thread(ThreadId),
-    /// A pending child process was created.
-    Process(ProcessIdentity),
-}
-
 /// Starts a pending child created earlier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartChildProcessRequest {

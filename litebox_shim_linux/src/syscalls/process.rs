@@ -2887,7 +2887,9 @@ mod tests {
     use std::time::Duration;
 
     use litebox_broker_host::test_support::InProcessBrokerChannel;
-    use litebox_broker_protocol::message::{BrokerOperation, BrokerRequest, BrokerResponse};
+    use litebox_broker_protocol::message::{
+        BrokerOperation, BrokerRequest, BrokerResponse, ThreadRequest,
+    };
     use litebox_broker_transport::channel::LocalCallChannel;
 
     struct BlockingThreadExitChannel {
@@ -2903,7 +2905,10 @@ mod tests {
             &self,
             request: BrokerRequest,
         ) -> core::result::Result<BrokerResponse, Self::Error> {
-            if matches!(&request.operation, BrokerOperation::ExitThread(_)) {
+            if matches!(
+                &request.operation,
+                BrokerOperation::Thread(ThreadRequest::Exit(_))
+            ) {
                 self.exit_started
                     .send(())
                     .expect("thread-exit observer must remain available");

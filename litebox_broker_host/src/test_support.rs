@@ -318,8 +318,7 @@ mod tests {
     };
     use litebox_broker_protocol::{
         RequestId,
-        message::{BrokerOperation, BrokerRequest, BrokerResult},
-        process::{CreateThreadRequest, CreateThreadResponse},
+        message::{BrokerOperation, BrokerRequest, BrokerResult, ThreadRequest, ThreadResponse},
     };
     use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
 
@@ -339,11 +338,11 @@ mod tests {
             first
                 .call(BrokerRequest {
                     request_id: RequestId(0),
-                    operation: BrokerOperation::CreateThread(CreateThreadRequest::Thread),
+                    operation: BrokerOperation::Thread(ThreadRequest::Create),
                 })
                 .unwrap()
                 .result,
-            BrokerResult::CreateThread(CreateThreadResponse::Thread(_))
+            BrokerResult::Thread(ThreadResponse::Create(_))
         ));
         drop(first);
 
@@ -352,11 +351,11 @@ mod tests {
             second
                 .call(BrokerRequest {
                     request_id: RequestId(0),
-                    operation: BrokerOperation::CreateThread(CreateThreadRequest::Thread),
+                    operation: BrokerOperation::Thread(ThreadRequest::Create),
                 })
                 .unwrap()
                 .result,
-            BrokerResult::CreateThread(CreateThreadResponse::Thread(_))
+            BrokerResult::Thread(ThreadResponse::Create(_))
         ));
     }
 
