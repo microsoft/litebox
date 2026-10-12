@@ -907,6 +907,9 @@ impl BrokerProcess {
         } else if release_thread_ids {
             self.release_threads(true);
         }
+        // An exited process has no threads, even if teardown has not yet
+        // decided whether their IDs can be reused.
+        self.unregister_threads(&self.threads.lock());
         // Children that cannot start without this process fail, as when its
         // owner dies.
         self.handle_owner_death();
@@ -1846,16 +1849,23 @@ impl BrokerProcess {
         invariant_fault
     }
 
+    /// Removes `threads` from the core thread registry, so they no longer
+    /// resolve. Their IDs stay allocated.
+    fn unregister_threads(&self, threads: &HashSet<ThreadId>) {
+        let mut registry = self.core.threads.write();
+        for thread_id in threads {
+            registry.remove(thread_id);
+        }
+    }
+
     /// Removes every thread owned by this process, optionally releasing their
     /// IDs and global thread accounting.
     fn release_threads(&self, release_ids: bool) {
-        let threads = core::mem::take(&mut *self.threads.lock());
-        {
-            let mut registry = self.core.threads.write();
-            for thread_id in &threads {
-                registry.remove(thread_id);
-            }
-        }
+        let threads = {
+            let mut threads = self.threads.lock();
+            self.unregister_threads(&threads);
+            core::mem::take(&mut *threads)
+        };
         if release_ids {
             self.core
                 .active_thread_count
@@ -3336,6 +3346,15 @@ mod tests {
             root.thread_info(child.initial_thread_id()),
             Err(BrokerError::UnknownObject)
         );
+
+        // Threads of a process that exits without clean retirement end too,
+        // though their IDs stay allocated.
+        let child = child_of(&root);
+        let thread = child.create_thread().unwrap();
+        child.complete_start().unwrap();
+        child.retire(false);
+        child.complete_exit(EXITED).unwrap();
+        assert_eq!(root.thread_info(thread), Err(BrokerError::UnknownObject));
     }
 
     #[test]
