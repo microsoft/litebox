@@ -3,7 +3,7 @@
 
 //! Unix domain sockets for the Linux shim layer.
 //!
-//! Each socket is a broker-owned [`unix_sockets::UnixSocket`], so processes that share a socket
+//! Each socket is a broker-owned [`unix_socket::UnixSocket`], so processes that share a socket
 //! through inheritance see one socket. This module translates between Linux socket calls and the
 //! broker's guest-neutral Unix socket operations.
 
@@ -16,7 +16,7 @@ use litebox::{
     event::{Events, IOPollable, observer::Observer, wait::WaitContext},
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
     process::ProcessError,
-    unix_sockets,
+    unix_socket,
 };
 use litebox_broker_protocol::{
     ObjectHandle,
@@ -102,11 +102,11 @@ impl From<UnixSocketName> for UnixSocketAddr {
 
 /// A Unix domain socket descriptor's open file description.
 pub(crate) struct UnixSocket<Platform: ShimPlatform> {
-    socket: Arc<unix_sockets::UnixSocket<Platform>>,
+    socket: Arc<unix_socket::UnixSocket<Platform>>,
 }
 
-impl<Platform: ShimPlatform> From<unix_sockets::UnixSocket<Platform>> for UnixSocket<Platform> {
-    fn from(socket: unix_sockets::UnixSocket<Platform>) -> Self {
+impl<Platform: ShimPlatform> From<unix_socket::UnixSocket<Platform>> for UnixSocket<Platform> {
+    fn from(socket: unix_socket::UnixSocket<Platform>) -> Self {
         Self {
             socket: Arc::new(socket),
         }
@@ -134,7 +134,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     }
 
     /// The broker-owned socket, which a child process inherits.
-    pub(crate) fn unix_socket(&self) -> &Arc<unix_sockets::UnixSocket<Platform>> {
+    pub(crate) fn unix_socket(&self) -> &Arc<unix_socket::UnixSocket<Platform>> {
         &self.socket
     }
 

@@ -763,9 +763,9 @@ impl From<litebox::pipes::errors::CloseError> for Errno {
     }
 }
 
-impl From<litebox::unix_sockets::errors::UnixSocketError> for Errno {
-    fn from(value: litebox::unix_sockets::errors::UnixSocketError) -> Self {
-        use litebox::unix_sockets::errors::UnixSocketError;
+impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
+    fn from(value: litebox::unix_socket::errors::UnixSocketError) -> Self {
+        use litebox::unix_socket::errors::UnixSocketError;
         use litebox_broker_protocol::fs::FileError;
         use litebox_broker_protocol::unix_socket::UnixSocketError as SocketError;
         match value {
