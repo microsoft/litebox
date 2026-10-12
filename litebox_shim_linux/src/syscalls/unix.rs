@@ -3,9 +3,9 @@
 
 //! Unix domain sockets for the Linux shim layer.
 //!
-//! Each socket is a broker-owned [`unix_socket::UnixSocket`], so processes that share a socket
-//! through inheritance see one socket. This module translates between Linux socket calls and the
-//! broker's guest-neutral Unix socket operations.
+//! Each socket is a LiteBox [`unix_socket::UnixSocket`], so processes that share a socket through
+//! inheritance see one socket. This module translates between Linux socket calls and LiteBox's
+//! guest-neutral Unix socket operations.
 
 use alloc::{
     string::{String, ToString as _},
@@ -66,11 +66,11 @@ pub(crate) enum UnixSocketAddr {
 }
 
 impl UnixSocketAddr {
-    /// Returns the broker address naming `self`, resolving a relative path against the current
-    /// working directory of `task`.
+    /// Returns the guest-neutral address naming `self`, resolving a relative path against the
+    /// current working directory of `task`.
     ///
     /// Fails with `EINVAL` for an unnamed address, which names no socket.
-    fn to_local<Platform: ShimPlatform>(
+    fn to_address<Platform: ShimPlatform>(
         &self,
         task: &Task<Platform>,
     ) -> Result<UnixSocketAddress, Errno> {
@@ -133,7 +133,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         Ok((first.into(), second.into()))
     }
 
-    /// The broker-owned socket, which a child process inherits.
+    /// The LiteBox socket, which a child process inherits.
     pub(crate) fn unix_socket(&self) -> &Arc<unix_socket::UnixSocket<Platform>> {
         &self.socket
     }
@@ -145,7 +145,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     /// Binds the socket to `addr`, creating a filesystem node for a path with the permissions
     /// that the umask of `task` allows.
     pub(super) fn bind(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
-        let address = addr.to_local(task)?;
+        let address = addr.to_address(task)?;
         let mode = (Mode::RWXU | Mode::RWXG | Mode::RWXO) & !task.fs.borrow().umask();
         self.socket.bind(&address, acting_user(task), mode)?;
         Ok(())
@@ -157,7 +157,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     }
 
     pub(super) fn connect(&self, task: &Task<Platform>, addr: UnixSocketAddr) -> Result<(), Errno> {
-        let address = addr.to_local(task)?;
+        let address = addr.to_address(task)?;
         self.socket
             .connect(&task.wait_cx(), &address, acting_user(task), false)?;
         Ok(())
@@ -191,7 +191,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
             log_unsupported!("Unsupported sendto flags: {:?}", flags);
             return Err(Errno::EINVAL);
         }
-        let address = addr.map(|addr| addr.to_local(task)).transpose()?;
+        let address = addr.map(|addr| addr.to_address(task)).transpose()?;
         Ok(self.socket.send(
             &task.wait_cx(),
             address.as_ref(),
