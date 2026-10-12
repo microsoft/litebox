@@ -141,7 +141,9 @@ impl PciTransport {
                 None => *slot.insert(unsafe { function.memory_bar(location.bar) }.ok_or(bad)?),
             };
             let (offset, length) = (u64::from(location.offset), u64::from(location.length));
-            if length < min_len as u64 || offset + length > bar.size {
+            // Fields are up to 4 bytes, naturally aligned; BARs are aligned
+            // to their size, so this aligns the addresses too.
+            if !offset.is_multiple_of(4) || length < min_len as u64 || offset + length > bar.size {
                 return Err(bad);
             }
             let length = usize::try_from(length).map_err(|_| bad)?;

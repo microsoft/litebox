@@ -134,8 +134,9 @@ pub(crate) fn set_external_interrupt_handler(handler: &'static InterruptHandler)
     assert!(installed, "an interrupt handler is already set");
 }
 
-/// Runs with interrupts disabled, on whatever stack and GS the interrupted
-/// context had (see `isr_external`).
+/// Runs with interrupts disabled and the interrupted context's GS (see
+/// `isr_external`), on the interrupted stack from kernel mode or on the
+/// `TSS.RSP0` stack from user mode.
 #[unsafe(no_mangle)]
 extern "C" fn external_interrupt_handler_impl(vector: u64, rip: u64, cs: u64) {
     if let (Some(interrupts), Ok(vector)) = (INTERRUPTS.get(), u8::try_from(vector))

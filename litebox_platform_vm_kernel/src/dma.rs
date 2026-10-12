@@ -36,8 +36,11 @@ unsafe impl Hal for VmKernel {
             .checked_add(u64::try_from(len).ok()?)
             .filter(|_| len != 0)?;
         let first = PhysFrame::<Size4KiB>::containing_address(PhysAddr::try_new(pa).ok()?);
-        let last =
-            PhysFrame::containing_address(PhysAddr::try_new(end).ok()?.align_up(Size4KiB::SIZE));
+        // Not `PhysAddr::align_up`, which panics past the physical address
+        // width.
+        let last = PhysFrame::containing_address(
+            PhysAddr::try_new(end.checked_next_multiple_of(Size4KiB::SIZE)?).ok()?,
+        );
         if self
             .ram_frame_ranges
             .iter()
