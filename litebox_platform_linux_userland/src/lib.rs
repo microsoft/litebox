@@ -1718,6 +1718,24 @@ impl litebox::platform::DerivedKeyProvider for LinuxUserland {
             }
         }
     }
+
+    fn compute_with_derived_key<E, const KEY_LEN: usize>(
+        &self,
+        shim_kdf: fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>,
+        key_context: &[u8],
+        op: fn(&[u8], litebox::platform::ComputeParams) -> Result<(), E>,
+        params: litebox::platform::ComputeParams,
+    ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
+        let mut key = [0u8; KEY_LEN];
+        self.derive_key(
+            Some(shim_kdf),
+            litebox::platform::KDFParams {
+                context: key_context,
+                output: &mut key,
+            },
+        )?;
+        Ok(op(&key, params)?)
+    }
 }
 
 /// Dummy `VmapManager`.

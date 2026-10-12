@@ -181,55 +181,42 @@ impl litebox::platform::DerivedKeyProvider for LvbsLinuxKernel {
         kdf: Option<fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>>,
         params: litebox::platform::KDFParams,
     ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
-        use litebox::platform::{DerivedKeyError, KDFParams};
+        use crate::vault::{Input, Kdf};
+        use litebox::platform::DerivedKeyError;
 
-        struct Ctx<'a, E> {
-            kdf: fn(&[u8], KDFParams) -> Result<(), E>,
-            params: Option<KDFParams<'a>>,
-            result: Option<Result<(), E>>,
-        }
-
-        if !crate::vault::is_installed() {
-            return Err(DerivedKeyError::UnsupportedRebootPersistentKey);
-        }
         let Some(kdf) = kdf else {
             return Err(DerivedKeyError::ShimKDFRequired);
         };
-
-        // Bounce buffers the vault cannot reach through kernel heap memory.
-        let KDFParams { context, output } = params;
-        let context_copy;
-        let context = if crate::vault::is_accessible(context) {
-            context
-        } else {
-            context_copy = Zeroizing::new(context.to_vec());
-            context_copy.as_slice()
+        let stage = Kdf {
+            f: kdf,
+            context: Input::new(params.context),
         };
-        let mut output_copy = (!crate::vault::is_accessible(output))
-            .then(|| Zeroizing::new(::alloc::vec![0u8; output.len()]));
+        crate::vault::run(&stage, params.output).map_err(|_| DerivedKeyError::KeyUnavailable)??;
+        Ok(())
+    }
 
-        let mut ctx = Ctx {
-            kdf,
-            params: Some(KDFParams {
-                context,
-                output: match output_copy.as_mut() {
-                    Some(copy) => copy.as_mut_slice(),
-                    None => &mut *output,
-                },
-            }),
-            result: None,
-        };
-        crate::vault::with_prk(&mut ctx, |prk, ctx| {
-            if let Some(params) = ctx.params.take() {
-                // Safety: this callback runs inside the serialized vault window.
-                ctx.result = Some(unsafe { crate::vault::invoke_kdf(ctx.kdf, prk, params) });
-            }
-        })
-        .map_err(|_| DerivedKeyError::UnsupportedRebootPersistentKey)?;
-        ctx.result.expect("vault did not run the KDF")?;
-        if let Some(copy) = &output_copy {
-            output.copy_from_slice(copy);
-        }
+    fn compute_with_derived_key<E, const KEY_LEN: usize>(
+        &self,
+        kdf: fn(&[u8], litebox::platform::KDFParams) -> Result<(), E>,
+        key_context: &[u8],
+        op: fn(&[u8], litebox::platform::ComputeParams) -> Result<(), E>,
+        params: litebox::platform::ComputeParams,
+    ) -> Result<(), litebox::platform::DerivedKeyError<E>> {
+        use crate::vault::{Compute, Input, Kdf, Then};
+        use litebox::platform::DerivedKeyError;
+
+        // The derived key stays on the vault stack; `op` never sees the PRK.
+        let stage = Then::<_, _, KEY_LEN>(
+            Kdf {
+                f: kdf,
+                context: Input::new(key_context),
+            },
+            Compute {
+                f: op,
+                input: Input::new(params.input),
+            },
+        );
+        crate::vault::run(&stage, params.output).map_err(|_| DerivedKeyError::KeyUnavailable)??;
         Ok(())
     }
 }

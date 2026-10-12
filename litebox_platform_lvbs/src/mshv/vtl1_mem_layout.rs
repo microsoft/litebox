@@ -39,8 +39,8 @@ pub const VTL1_REMAP_PDE_PAGE: usize = VTL1_REMAP_PDPT_PAGE + 1;
 /// Vault backing pages in the unused boot gap, excluded from the normal mapping
 /// and allocator. PRK, dispatch page, then the private stack.
 pub const VTL1_VAULT_START_PAGE: usize = VTL1_REMAP_PDE_PAGE + 1;
-// The current KDF needs ~18 KiB in debug and ~1.3 KiB in release.
-pub const VTL1_VAULT_STACK_PAGES: usize = if cfg!(debug_assertions) { 8 } else { 2 };
+// IDKS P-384 signing needs ~26 KiB in debug and ~8.3 KiB in release.
+pub const VTL1_VAULT_STACK_PAGES: usize = if cfg!(debug_assertions) { 16 } else { 4 };
 pub const VTL1_VAULT_PAGES: usize = 2 + VTL1_VAULT_STACK_PAGES;
 const _: () = assert!(VTL1_VAULT_START_PAGE + VTL1_VAULT_PAGES <= VTL1_INIT_HEAP_START_PAGE);
 

@@ -639,11 +639,30 @@ pub trait DerivedKeyProvider {
     ///
     /// Platforms may run `shim_kdf` in a restricted context (e.g., a separate address space with
     /// interrupts disabled), so it must be a pure computation over its arguments: no locks, no
-    /// allocation, and no access to other memory.
+    /// allocation, no access to other memory, and no panics (which may be fatal there). Since the
+    /// platform cannot hide its timing, it should also avoid secret-dependent branches and memory
+    /// accesses.
     fn derive_key<E>(
         &self,
         shim_kdf: Option<fn(&[u8], KDFParams) -> Result<(), E>>,
         params: KDFParams,
+    ) -> Result<(), DerivedKeyError<E>>;
+
+    /// Derive a `KEY_LEN`-byte key from `key_context` with `shim_kdf` (as [`Self::derive_key`]
+    /// does), then run `op(key, params)` and place its result into `params.output`.
+    ///
+    /// The key is never returned, and `op` never sees the device-specific secret; only
+    /// `params.output` and error values (`E`) leave the platform, so neither may carry key
+    /// material. The platform keeps no state: the same `key_context`
+    /// yields the same key, so freshness (e.g., a per-boot nonce) is up to the caller.
+    ///
+    /// `shim_kdf` and `op` have the same restrictions as `shim_kdf` in [`Self::derive_key`].
+    fn compute_with_derived_key<E, const KEY_LEN: usize>(
+        &self,
+        shim_kdf: fn(&[u8], KDFParams) -> Result<(), E>,
+        key_context: &[u8],
+        op: fn(&[u8], ComputeParams) -> Result<(), E>,
+        params: ComputeParams,
     ) -> Result<(), DerivedKeyError<E>>;
 }
 
@@ -657,6 +676,14 @@ pub struct KDFParams<'a> {
     pub output: &'a mut [u8],
 }
 
+/// Input and output parameters to a computation other than its key.
+pub struct ComputeParams<'a> {
+    /// The input data to the computation.
+    pub input: &'a [u8],
+    /// The output of the computation, of the exact length of the buffer provided.
+    pub output: &'a mut [u8],
+}
+
 #[derive(Debug, Error)]
 /// Errors that might be returned upon attempting to derive a key.
 pub enum DerivedKeyError<ShimKDFError> {
@@ -666,4 +693,6 @@ pub enum DerivedKeyError<ShimKDFError> {
     ShimKDFError(#[from] ShimKDFError),
     #[error("this platform does not support reboot-persistent keys")]
     UnsupportedRebootPersistentKey,
+    #[error("the requested key is not available (yet)")]
+    KeyUnavailable,
 }
