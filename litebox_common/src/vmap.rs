@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Physical-page mapping interfaces shared by LiteBox platforms and shims.
-
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
 use thiserror::Error;
 
@@ -15,15 +13,23 @@ use thiserror::Error;
 /// Implementors must uphold each unsafe method's contract and keep [`Self::MapInfo`] tied to the
 /// mapping it identifies.
 pub unsafe trait VmapManager<const ALIGN: usize> {
-    /// Platform-specific virtual mapping information.
+    /// Implementors use this to carry the virtual mapping and any platform-specific bookkeeping
+    /// needed for unmapping.
     type MapInfo: PhysPageMapInfo;
 
-    /// Map physical pages into virtually contiguous addresses.
+    /// Map the given `PhysPageAddrArray` into virtually contiguous addresses with the given
+    /// [`PhysPageMapPermissions`] while returning [`Self::MapInfo`].
+    ///
+    /// This function is analogous to Linux kernel's `vmap()`.
     ///
     /// # Safety
     ///
-    /// The returned raw address must not alias LiteBox-owned memory. Any later access must obey
-    /// the platform's requirements for shared or foreign physical memory.
+    /// The returned pointer is a raw address; creating or holding it does not access memory or
+    /// create a Rust reference. Any later use of that pointer must satisfy the platform's access
+    /// requirements for the mapped physical pages. Even when access is logically exclusive, callers
+    /// must treat the mapped memory like DMA/shared physical memory rather than ordinary Rust-owned
+    /// RAM. Implementors must not return a VA that aliases LiteBox-owned memory; the returned
+    /// mapping must live in a platform-defined foreign-memory VA range.
     unsafe fn vmap(
         &self,
         _pages: &PhysPageAddrArray<ALIGN>,
@@ -32,11 +38,13 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
         Err(PhysPointerError::UnsupportedOperation)
     }
 
-    /// Map pages while bypassing platform-defined ordinary access checks.
+    /// Map pages while bypassing platform-defined ordinary access checks. Ordinary [`Self::vmap`]
+    /// may delegate here after performing those checks. The default is deny.
     ///
     /// # Safety
     ///
-    /// The caller must independently authorize bypassing the omitted platform checks.
+    /// In addition to [`Self::vmap`]'s raw-mapping requirements, the caller must independently
+    /// authorize bypassing the omitted platform checks.
     unsafe fn vmap_privileged(
         &self,
         _pages: &PhysPageAddrArray<ALIGN>,
@@ -45,12 +53,21 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
         Err(PhysPointerError::UnsupportedOperation)
     }
 
-    /// Unmap a mapping returned by this manager.
+    /// Unmap the previously mapped virtually contiguous addresses ([`Self::MapInfo`]).
+    ///
+    /// This function is analogous to Linux kernel's `vunmap()`.
+    ///
+    /// On failure, the unchanged `vmap_info` is returned alongside the error so the caller can
+    /// retry or otherwise preserve the mapping state. Dropping returned map info is not guaranteed
+    /// to release platform resources; each implementation owns the retention policy for resources
+    /// that cannot be safely reclaimed after a failed unmap.
     ///
     /// # Safety
     ///
-    /// The caller must ensure no outstanding accesses remain. After success, the mapping is
-    /// invalid and its platform resources have been released or otherwise handled.
+    /// The caller must ensure there are no outstanding raw-pointer uses or Rust references derived
+    /// from `PhysPageMapInfo::base()`. After a successful call, the virtual mapping is invalid and
+    /// any platform resources tied to the mapping lifetime have been released or otherwise handled
+    /// by the implementation.
     unsafe fn vunmap(
         &self,
         vmap_info: Self::MapInfo,
@@ -58,15 +75,35 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
         Err((PhysPointerError::UnsupportedOperation, vmap_info))
     }
 
-    /// Validate that the physical pages are not owned by LiteBox.
+    /// Validate that the given physical pages are not owned by LiteBox.
+    ///
+    /// Platform is expected to track which physical memory addresses are owned by LiteBox (e.g., VTL1 memory addresses).
+    ///
+    /// Returns `Ok(())` if the physical pages are not owned by LiteBox. Otherwise, returns `Err(PhysPointerError)`.
+    ///
+    /// # Invariant
+    ///
+    /// The implementor must ensure that, whenever this function returns `Ok(())`, none of the
+    /// given physical pages may name memory owned by LiteBox/Rust (heap, stack, ...). Callers rely
+    /// on a successful return to treat the pages as foreign memory and to map them only through
+    /// platform-defined foreign-memory VA ranges, never through LiteBox-owned VA ranges.
     fn validate_unowned(&self, pages: &PhysPageAddrArray<ALIGN>) -> Result<(), PhysPointerError>;
 
-    /// Protect physical pages against access by another privilege level.
+    /// Protect the given physical pages according to `perms`:
+    /// - Read protection: prevent others from writing to the pages.
+    /// - Read/write protection: prevent others from reading or writing to the pages.
+    /// - No protection: allow others to read and write the pages.
+    ///
+    /// This function can be implemented using EPT/NPT, TZASC, PMP, or some other hardware mechanisms.
+    ///
+    /// Returns `Ok(())` if it successfully protects the pages. If it fails, returns
+    /// `Err(PhysPointerError)`.
     ///
     /// # Safety
     ///
-    /// This operation relies on privileged platform mechanisms. Callers should restore ordinary
-    /// access when protection is no longer needed.
+    /// This function relies on hypercalls or other privileged hardware features and assumes those features
+    /// are safe to use.
+    /// Callers should restore ordinary access when protection is no longer needed.
     unsafe fn protect(
         &self,
         pages: &PhysPageAddrArray<ALIGN>,
@@ -74,38 +111,30 @@ pub unsafe trait VmapManager<const ALIGN: usize> {
     ) -> Result<(), PhysPointerError>;
 }
 
-/// A non-zero, `ALIGN`-aligned physical page address.
-#[derive(Clone, Copy)]
-pub struct PhysPageAddr<const ALIGN: usize>(usize);
+/// Data structure representing a physical address with page alignment.
+///
+/// Currently, this is an alias to [`crate::page::NonZeroAddress`]. This might change if
+/// we selectively conduct sanity checks based on whether an address is virtual or physical
+/// (e.g., whether a virtual address is canonical, whether a physical address is tagged with
+/// a valid key ID, etc.).
+pub type PhysPageAddr<const ALIGN: usize> = crate::page::NonZeroAddress<ALIGN>;
 
-impl<const ALIGN: usize> PhysPageAddr<ALIGN> {
-    /// Create a physical page address if it is non-zero and aligned.
-    pub fn new(address: usize) -> Option<Self> {
-        if address == 0 || !address.is_multiple_of(ALIGN) {
-            return None;
-        }
-        Some(Self(address))
-    }
-
-    /// Return the address as a `usize`.
-    #[inline]
-    pub fn as_usize(self) -> usize {
-        self.0
-    }
-}
-
-/// An array of virtually contiguous physical page addresses.
+/// Data structure for an array of physical page addresses which are virtually contiguous.
 pub type PhysPageAddrArray<const ALIGN: usize> = [PhysPageAddr<ALIGN>];
 
-/// Mapping information returned by [`VmapManager::vmap`].
+/// Mapping information returned by `vmap()`.
+///
+/// Implementors use this value to track the virtual mapping and any platform-specific resources
+/// tied to it. Callers must pass it back to the same platform's `vunmap()` to explicitly unmap;
+/// drop behavior is implementation-specific.
 pub trait PhysPageMapInfo {
-    /// Virtual base address of the mapped region.
+    /// Virtual address of the mapped region which is page aligned.
     fn base(&self) -> *mut u8;
-    /// Size of the mapped region in bytes.
+    /// The size of the mapped region in bytes.
     fn size(&self) -> usize;
 }
 
-/// A no-op map-info implementation for platforms without vmap support.
+/// A no-op [`PhysPageMapInfo`] for platforms that do not support `vmap()`/`vunmap()`.
 #[derive(Debug)]
 pub struct NoopPhysPageMapInfo {
     base: *mut u8,
@@ -129,12 +158,16 @@ impl PhysPageMapInfo for NoopPhysPageMapInfo {
 }
 
 bitflags::bitflags! {
-    /// Permissions supported for physical-page mappings.
+    /// Physical page map permissions which is a restricted version of
+    /// [`litebox::platform::page_mgmt::MemoryRegionPermissions`].
+    ///
+    /// This module only supports READ and WRITE permissions. Both EXECUTE and SHARED
+    /// permissions are explicitly prohibited.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct PhysPageMapPermissions: u8 {
-        /// Readable.
+        /// Readable
         const READ = 1 << 0;
-        /// Writable.
+        /// Writable
         const WRITE = 1 << 1;
     }
 }
@@ -165,7 +198,7 @@ impl From<PhysPageMapPermissions> for MemoryRegionPermissions {
     }
 }
 
-/// Errors from physical-pointer access and physical-page mapping.
+/// Possible errors for physical pointer access with `VmapManager`
 #[non_exhaustive]
 #[derive(Error, Debug)]
 pub enum PhysPointerError {
