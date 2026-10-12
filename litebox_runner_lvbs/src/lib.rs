@@ -45,9 +45,9 @@ use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, TaInstance}
 use litebox_shim_optee::{NormalWorldConstPtr, NormalWorldMutPtr, TaMemrefAddresses, UserConstPtr};
 use litebox_shim_optee::{
     msg_handler::{
-        checked_memref_size, client_pta_params, decode_ta_request, handle_optee_msg_args,
-        handle_optee_smc_args, read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm,
-        unregister_rpc_shm, update_optee_msg_args, write_rpc_args_to_regd_shm,
+        checked_memref_size, decode_ta_request, handle_optee_msg_args, handle_optee_smc_args,
+        read_optee_msg_args_from_regd_shm, read_rpc_shm, register_rpc_shm, unregister_rpc_shm,
+        update_optee_msg_args, write_rpc_args_to_regd_shm,
     },
     rpc_context::{RpcCompletion, RpcContext, rpc_context_map},
 };
@@ -967,7 +967,9 @@ fn handle_open_session(
     let client_identity = ta_req_info.client_identity;
 
     if let Some(pta) = ClientPta::from_uuid(&ta_uuid) {
-        return client_pta_open_session(platform, msg_args, msg_args_phys_addr, pta);
+        pta.open_session(msg_args);
+        debug_serial_println!("OpenSession on client PTA {:?}", pta);
+        return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
     }
 
     let params = &ta_req_info.params;
@@ -1451,13 +1453,8 @@ fn handle_invoke_command(
     let session_id = ta_req_info.session;
 
     if let Some(pta) = ClientPta::from_session_id(session_id) {
-        return client_pta_invoke_command(
-            platform,
-            msg_args,
-            msg_args_phys_addr,
-            pta,
-            &ta_req_info,
-        );
+        pta.invoke_command(platform, &ta_req_info, msg_args)?;
+        return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
     }
 
     session_manager().with_session(session_id, |instance| {
@@ -1577,10 +1574,8 @@ fn handle_close_session(
 
     debug_serial_println!("CloseSession: session_id={}", session_id);
 
-    // Client PTA sessions are not tracked; closing is a no-op.
-    if ClientPta::from_session_id(session_id).is_some() {
-        msg_args.ret = TeeResult::Success;
-        msg_args.ret_origin = TeeOrigin::Tee;
+    if let Some(pta) = ClientPta::from_session_id(session_id) {
+        pta.close_session(msg_args);
         return write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr);
     }
 
@@ -1672,51 +1667,6 @@ fn handle_close_session(
 
         write_result
     })
-}
-
-fn client_pta_open_session(
-    platform: &'static Platform,
-    msg_args: &mut OpteeMsgArgs,
-    msg_args_phys_addr: u64,
-    pta: ClientPta,
-) -> Result<(), OpteeSmcReturnCode> {
-    msg_args.session = pta.session_id();
-    msg_args.ret = TeeResult::Success;
-    msg_args.ret_origin = TeeOrigin::TrustedApp;
-    write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)?;
-    debug_serial_println!("OpenSession on client PTA {:?}: {:?}", pta, msg_args.ret);
-    Ok(())
-}
-
-fn client_pta_invoke_command(
-    platform: &'static Platform,
-    msg_args: &mut OpteeMsgArgs,
-    msg_args_phys_addr: u64,
-    pta: ClientPta,
-    ta_req_info: &litebox_shim_optee::msg_handler::TaRequestInfo<PAGE_SIZE>,
-) -> Result<(), OpteeSmcReturnCode> {
-    let mut params = client_pta_params(ta_req_info);
-    let result = pta.invoke_command(
-        platform,
-        ta_req_info.cmd_id,
-        &mut params,
-        &ta_req_info.shm_info,
-    )?;
-    // Outputs are meaningful only on these results; a rejected NULL memref
-    // would otherwise fail the size check.
-    let outputs = matches!(result, TeeResult::Success | TeeResult::ShortBuffer).then_some(&params);
-    // Memref outputs were written in place: no `memref_addresses`.
-    update_optee_msg_args(
-        platform,
-        result,
-        TeeOrigin::TrustedApp,
-        None,
-        outputs,
-        Some(ta_req_info),
-        None,
-        msg_args,
-    )?;
-    write_non_ta_msg_args_to_normal_world(platform, msg_args, msg_args_phys_addr)
 }
 
 /// Update msg_args with return values and write back to normal world memory.

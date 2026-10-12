@@ -733,7 +733,7 @@ pub fn update_optee_msg_args<Platform: crate::OpteeShimPlatform>(
 ///
 /// Memref addresses are 0: the buffer is `ta_req_info.shm_info[i]`, whose
 /// length equals the memref size except for NULL buffers (length 0).
-pub fn client_pta_params(ta_req_info: &TaRequestInfo<PAGE_SIZE>) -> UteeParams {
+pub(crate) fn client_pta_params(ta_req_info: &TaRequestInfo<PAGE_SIZE>) -> UteeParams {
     let mut params = UteeParams::new();
     for (index, param) in ta_req_info.params.iter().enumerate() {
         let shm_len = || ta_req_info.shm_info[index].as_ref().map_or(0, ShmInfo::len) as u64;
@@ -754,9 +754,10 @@ pub fn client_pta_params(ta_req_info: &TaRequestInfo<PAGE_SIZE>) -> UteeParams {
                 (TeeParamType::MemrefInout, 0, *buffer_size as u64)
             }
         };
-        // `index` is in range.
-        let _ = params.set_type(index, param_type);
-        let _ = params.set_values(index, a, b);
+        params
+            .set_type(index, param_type)
+            .expect("index is in range");
+        params.set_values(index, a, b).expect("index is in range");
     }
     params
 }

@@ -4,7 +4,7 @@
 //! Implementation of pseudo TAs (PTAs) which export system services as
 //! the functions of built-in TAs.
 
-use crate::msg_handler::ShmInfo;
+use crate::msg_handler::{ShmInfo, TaRequestInfo, client_pta_params, update_optee_msg_args};
 use crate::{Task, UserConstPtr, UserMutPtr, idk::IdksPta, syscalls::Cleanup};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -13,8 +13,8 @@ use litebox::platform::{DerivedKeyError, KDFParams, RawConstPointer as _, RawMut
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmem::PAGE_SIZE;
 use litebox_common_optee::{
-    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, OpteeSmcReturnCode, TaFlags, TeeParamType,
-    TeeResult, TeeUuid, UteeParams,
+    HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, OpteeMsgArgs, OpteeSmcReturnCode, TaFlags,
+    TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeParams,
 };
 use num_enum::TryFromPrimitive;
 use sha2::Sha256;
@@ -90,6 +90,7 @@ impl PseudoTa {
 /// sessions are not tracked: every session to a PTA shares one fixed session
 /// ID that `SessionIdPool` never allocates, and closing is a no-op.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum ClientPta {
     Device,
 }
@@ -109,28 +110,58 @@ impl ClientPta {
         }
     }
 
-    pub fn session_id(self) -> u32 {
-        match self {
+    /// Fill `msg_args` with the reply to an `OpenSession`.
+    pub fn open_session(self, msg_args: &mut OpteeMsgArgs) {
+        msg_args.session = match self {
             Self::Device => DevicePta::SESSION_ID,
-        }
+        };
+        msg_args.ret = TeeResult::Success;
+        msg_args.ret_origin = TeeOrigin::TrustedApp;
     }
 
-    /// `params` follows [`crate::msg_handler::client_pta_params`]: memref
-    /// buffers are `shm_info[i]`, not addresses.
+    /// Run an `InvokeCommand` and fill `msg_args` with the reply. Memref
+    /// outputs are written directly into the client's shared memory.
     ///
     /// # Errors
     ///
-    /// `EBadAddr` if writing to shared memory fails; the TEE result otherwise.
+    /// `EBadAddr` if shared memory cannot be written.
     pub fn invoke_command<Platform: crate::OpteeShimPlatform>(
         self,
         platform: &Platform,
-        cmd_id: u32,
-        params: &mut UteeParams,
-        shm_info: &[Option<ShmInfo<PAGE_SIZE>>; UteeParams::TEE_NUM_PARAMS],
-    ) -> Result<TeeResult, OpteeSmcReturnCode> {
-        match self {
-            Self::Device => DevicePta::invoke_command(platform, cmd_id, params, shm_info),
-        }
+        ta_req_info: &TaRequestInfo<PAGE_SIZE>,
+        msg_args: &mut OpteeMsgArgs,
+    ) -> Result<(), OpteeSmcReturnCode> {
+        let mut params = client_pta_params(ta_req_info);
+        let result = match self {
+            Self::Device => DevicePta::invoke_command(
+                platform,
+                ta_req_info.cmd_id,
+                &mut params,
+                &ta_req_info.shm_info,
+            )?,
+        };
+        // Outputs are meaningful only on these results; a rejected NULL memref
+        // would otherwise fail the size check.
+        let outputs =
+            matches!(result, TeeResult::Success | TeeResult::ShortBuffer).then_some(&params);
+        // Memref outputs were written in place: no `memref_addresses`.
+        update_optee_msg_args(
+            platform,
+            result,
+            TeeOrigin::TrustedApp,
+            None,
+            outputs,
+            Some(ta_req_info),
+            None,
+            msg_args,
+        )
+    }
+
+    /// Fill `msg_args` with the reply to a `CloseSession`; sessions are not
+    /// tracked, so there is nothing to close.
+    pub fn close_session(self, msg_args: &mut OpteeMsgArgs) {
+        msg_args.ret = TeeResult::Success;
+        msg_args.ret_origin = TeeOrigin::Tee;
     }
 }
 
@@ -613,7 +644,9 @@ impl DevicePta {
             .collect();
         let (size, data) = Self::device_list(rflags, tas, blen);
         out.write_at(platform, 0, &data)?;
-        let _ = params.set_values(0, 0, size as u64);
+        params
+            .set_values(0, 0, size as u64)
+            .expect("index is in range");
         Ok(if size > blen {
             TeeResult::ShortBuffer
         } else {
