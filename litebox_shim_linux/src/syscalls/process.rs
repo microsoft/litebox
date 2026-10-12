@@ -2197,7 +2197,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ECHILD);
         }
         let process = &self.thread.process;
-        let mut reap_child = || match self.global.litebox.reap_child(selector) {
+        let mut reap_child = || match self.global.litebox.collect_child_exit(selector) {
             Ok(Some(exit)) => Ok(exit),
             Ok(None) => Err(TryOpError::TryAgain),
             // Without a process service, or a matching child, there is nothing to wait for.

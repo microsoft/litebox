@@ -6,8 +6,9 @@
 //! Every process belongs to one process group, and every process group to one
 //! session, each identified by the ID of the process that created it. A child
 //! process starts in its creator's group and session, while a root process
-//! leads its own. A group or session exists while any process, including a
-//! zombie not yet reaped, belongs to it, and its ID is not reused until then.
+//! leads its own. A group or session exists while any process, including an
+//! exited one whose exit is not yet collected, belongs to it, and its ID is
+//! not reused until then.
 
 use alloc::sync::Arc;
 

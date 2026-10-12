@@ -117,7 +117,8 @@ struct ProcessSignalsState {
     /// The earliest child exit since the process last took one.
     ///
     /// Like a pending signal, later exits coalesce into it. The process
-    /// reaps its children separately, so only the notification coalesces.
+    /// collects its children's exits separately, so only the notification
+    /// coalesces.
     child_exit: Option<ChildExit>,
     /// Whether a child left the process without exiting since the process
     /// last took this event.

@@ -525,9 +525,9 @@ fn handle_request<Memory: SharedMemory>(
             .set_status_flags(request)
             .map(|()| BrokerResult::StatusFlagsSet)
             .map_err(RequestFailure::from),
-        BrokerOperation::ReapChild(selector) => process
-            .reap_child(selector)
-            .map(BrokerResult::ChildReaped)
+        BrokerOperation::CollectChildExit(selector) => process
+            .collect_child_exit(selector)
+            .map(BrokerResult::ChildExitCollected)
             .map_err(RequestFailure::from),
         BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
             child_process_id,
@@ -544,9 +544,9 @@ fn handle_request<Memory: SharedMemory>(
             .report_exit_status(exit_status)
             .map(|()| BrokerResult::ExitStatusReported)
             .map_err(RequestFailure::from),
-        BrokerOperation::SetChildReaping(enabled) => process
-            .set_child_reaping(enabled)
-            .map(|()| BrokerResult::ChildReapingSet)
+        BrokerOperation::SetChildExitRetention(enabled) => process
+            .set_child_exit_retention(enabled)
+            .map(|()| BrokerResult::ChildExitRetentionSet)
             .map_err(RequestFailure::from),
         BrokerOperation::SetOrphanAdoption(enabled) => process
             .set_orphan_adoption(enabled)
@@ -2686,10 +2686,11 @@ mod tests {
             .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
             .unwrap();
         child.complete_start().unwrap();
-        let reap = |selector| handle_test_request(&parent, BrokerOperation::ReapChild(selector));
+        let collect =
+            |selector| handle_test_request(&parent, BrokerOperation::CollectChildExit(selector));
 
         assert_eq!(
-            reap(ChildSelector::Any),
+            collect(ChildSelector::Any),
             BrokerResult::Error(ErrorCode::WouldBlock)
         );
         assert_eq!(
@@ -2705,14 +2706,14 @@ mod tests {
             .complete_exit(ProcessExitStatus::Exited { code: 3 })
             .unwrap();
         assert_eq!(
-            reap(ChildSelector::Process(child.id())),
-            BrokerResult::ChildReaped(ChildExit {
+            collect(ChildSelector::Process(child.id())),
+            BrokerResult::ChildExitCollected(ChildExit {
                 process_id: child.id(),
                 exit_status: ProcessExitStatus::Exited { code: 3 },
             })
         );
         assert_eq!(
-            reap(ChildSelector::Any),
+            collect(ChildSelector::Any),
             BrokerResult::Error(ErrorCode::UnknownObject)
         );
         assert_eq!(

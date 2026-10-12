@@ -91,11 +91,14 @@ pub(crate) trait BrokerControl: Send + Sync {
         exit_status: ProcessExitStatus,
     ) -> core::result::Result<(), BrokerControlError>;
 
-    fn set_child_reaping(&self, enabled: bool) -> core::result::Result<(), BrokerControlError>;
+    fn set_child_exit_retention(
+        &self,
+        enabled: bool,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn set_orphan_adoption(&self, enabled: bool) -> core::result::Result<(), BrokerControlError>;
 
-    fn reap_child(
+    fn collect_child_exit(
         &self,
         selector: ChildSelector,
     ) -> core::result::Result<ChildExit, BrokerControlError>;
@@ -607,19 +610,22 @@ where
         self.request(|local| local.report_exit_status(exit_status))
     }
 
-    fn set_child_reaping(&self, enabled: bool) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.set_child_reaping(enabled))
+    fn set_child_exit_retention(
+        &self,
+        enabled: bool,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_child_exit_retention(enabled))
     }
 
     fn set_orphan_adoption(&self, enabled: bool) -> core::result::Result<(), BrokerControlError> {
         self.request(|local| local.set_orphan_adoption(enabled))
     }
 
-    fn reap_child(
+    fn collect_child_exit(
         &self,
         selector: ChildSelector,
     ) -> core::result::Result<ChildExit, BrokerControlError> {
-        self.request(|local| local.reap_child(selector))
+        self.request(|local| local.collect_child_exit(selector))
     }
 
     fn process_info(

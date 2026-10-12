@@ -35,7 +35,7 @@ pub struct ProcessIdentity {
     pub initial_thread_id: ThreadId,
 }
 
-/// Portable process termination status retained until the process is reaped.
+/// Portable process termination status retained until it is collected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProcessExitStatus {
@@ -59,7 +59,7 @@ pub struct ChildExit {
     pub exit_status: ProcessExitStatus,
 }
 
-/// Selects which of the caller's children a reap considers.
+/// Selects which of the caller's children an exit collection considers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChildSelector {
     /// Any child.
@@ -77,11 +77,11 @@ pub struct ProcessInfo {
     ///
     /// The creator never changes, even after it exits.
     pub creator: Option<ProcessId>,
-    /// Process that reaps this one.
+    /// Process that collects this one's exit.
     ///
     /// The parent starts as the creator. When it exits, the nearest running
     /// ancestor that adopts orphans becomes the parent, or none does and the
-    /// process is reaped when it exits.
+    /// process's exit is discarded.
     pub parent: Option<ProcessId>,
     /// Process group and session.
     pub membership: ProcessGroupMembership,
@@ -169,6 +169,6 @@ pub struct WriteChildMemoryRequest {
 pub struct ExitChildProcessRequest {
     /// Pending child that exited.
     pub child_process_id: ProcessId,
-    /// Termination status retained until the child is reaped.
+    /// Termination status retained until it is collected.
     pub exit_status: ProcessExitStatus,
 }

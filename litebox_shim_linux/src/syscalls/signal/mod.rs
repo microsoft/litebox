@@ -791,11 +791,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
         Ok(0)
     }
 
-    /// Sets whether the broker reaps this process's children as they terminate.
+    /// Sets whether this process's children are reaped as they terminate, by having the broker
+    /// discard their exits rather than retain them.
     pub(crate) fn set_child_reaping(&self, enabled: bool) {
         // Failure means the process service is unavailable or has failed, so no child can be
         // created or observed.
-        let _ = self.global.litebox.set_child_reaping(enabled);
+        let _ = self.global.litebox.set_child_exit_retention(!enabled);
     }
 
     pub(crate) fn sys_kill(&self, pid: i32, signal: i32) -> Result<usize, Errno> {

@@ -362,17 +362,18 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Sets whether this process's children are reaped when they terminate.
+    /// Sets whether this process retains its children's exits until it
+    /// collects them, rather than discarding each when the child terminates.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn set_child_reaping(&self, enabled: bool) -> Result<(), Channel::Error> {
-        match self.request(BrokerOperation::SetChildReaping(enabled))? {
-            BrokerResult::ChildReapingSet => Ok(()),
+    pub fn set_child_exit_retention(&self, enabled: bool) -> Result<(), Channel::Error> {
+        match self.request(BrokerOperation::SetChildExitRetention(enabled))? {
+            BrokerResult::ChildExitRetentionSet => Ok(()),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
             response => {
-                panic!("broker returned unexpected child-reaping response: {response:?}")
+                panic!("broker returned unexpected child exit retention response: {response:?}")
             }
         }
     }
@@ -408,8 +409,8 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Reaps this process's oldest exited child that `selector` matches,
-    /// returning its exit.
+    /// Collects the exit of this process's oldest exited child that
+    /// `selector` matches, removing the child from the process tree.
     ///
     /// Returns `WouldBlock` if only live children match, and `UnknownObject`
     /// if none does.
@@ -417,11 +418,13 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     /// # Panics
     ///
     /// Panics if the broker returns a response for another operation.
-    pub fn reap_child(&self, selector: ChildSelector) -> Result<ChildExit, Channel::Error> {
-        match self.request(BrokerOperation::ReapChild(selector))? {
-            BrokerResult::ChildReaped(exit) => Ok(exit),
+    pub fn collect_child_exit(&self, selector: ChildSelector) -> Result<ChildExit, Channel::Error> {
+        match self.request(BrokerOperation::CollectChildExit(selector))? {
+            BrokerResult::ChildExitCollected(exit) => Ok(exit),
             BrokerResult::Error(error) => Err(BrokerLocalError::Broker(error)),
-            response => panic!("broker returned unexpected reap-child response: {response:?}"),
+            response => {
+                panic!("broker returned unexpected child exit collection response: {response:?}")
+            }
         }
     }
 

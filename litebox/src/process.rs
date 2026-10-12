@@ -71,42 +71,47 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
     }
 
     /// Reports this process's final termination status, which its parent
-    /// reaps once this process's runner exits.
+    /// collects once this process's runner exits.
     pub fn report_exit_status(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.report_exit_status(exit_status)?)
     }
 
-    /// Sets whether this process's children are reaped when they terminate.
+    /// Sets whether this process retains its children's exits until it
+    /// collects them, rather than discarding each when the child terminates.
     ///
     /// Each child applies the setting in effect when it terminates, so a
     /// change does not affect children that already terminated.
-    pub fn set_child_reaping(&self, enabled: bool) -> Result<(), ProcessError> {
+    pub fn set_child_exit_retention(&self, enabled: bool) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        Ok(broker.set_child_reaping(enabled)?)
+        Ok(broker.set_child_exit_retention(enabled)?)
     }
 
     /// Sets whether this process adopts the children of its exiting
     /// descendants.
     ///
     /// The children of an exiting process move to its nearest running ancestor
-    /// that adopts them, or are left without a parent, which reaps each as it
-    /// terminates.
+    /// that adopts them, or are left without a parent, which discards each
+    /// one's exit as it terminates.
     pub fn set_orphan_adoption(&self, enabled: bool) -> Result<(), ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
         Ok(broker.set_orphan_adoption(enabled)?)
     }
 
-    /// Reaps the oldest of this process's terminated children that `selector`
-    /// matches, in the order this process gained them, returning its exit.
+    /// Collects the exit of the oldest of this process's terminated children
+    /// that `selector` matches, in the order this process gained them,
+    /// removing the child from the process tree.
     ///
     /// Returns `None` if every matching child is live, and
     /// [`ProcessError::NoSuchProcess`] if no child matches. Each child that
     /// terminates, or leaves without terminating, such as a child whose
     /// startup failed, is also reported through [`Signals`].
-    pub fn reap_child(&self, selector: ChildSelector) -> Result<Option<ChildExit>, ProcessError> {
+    pub fn collect_child_exit(
+        &self,
+        selector: ChildSelector,
+    ) -> Result<Option<ChildExit>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        match broker.reap_child(selector) {
+        match broker.collect_child_exit(selector) {
             Ok(exit) => Ok(Some(exit)),
             Err(BrokerControlError::Broker(ErrorCode::WouldBlock)) => Ok(None),
             Err(error) => Err(no_such_process(error)),
@@ -282,7 +287,7 @@ impl PendingChild {
     }
 
     /// Records that this pending child process exited without starting a
-    /// runner, leaving it a zombie reporting `exit_status`.
+    /// runner, retaining `exit_status` until it is collected.
     pub fn exit(&self, exit_status: ProcessExitStatus) -> Result<(), ProcessError> {
         self.broker
             .exit_child_process(self.identity.process_id, exit_status)?;
@@ -333,8 +338,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Signals<Platform> {
     /// pending.
     ///
     /// Child events are coalesced: while one is pending, later events of its
-    /// kind are not reported, so a taker reaps children until none has
-    /// terminated.
+    /// kind are not reported, so a taker collects child exits until none
+    /// remains.
     pub fn take(&self) -> Result<Option<SignalEvent>, ProcessError> {
         match self.broker.take_signal(self.handle) {
             Ok(event) => Ok(Some(event)),

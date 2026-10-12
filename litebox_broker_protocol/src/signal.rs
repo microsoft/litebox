@@ -69,7 +69,7 @@ pub enum SignalEvent {
     /// One or more children left the caller without exiting since it last
     /// took this event, such as a child whose startup failed.
     ///
-    /// A reap that found only such children live no longer finds them.
+    /// A collection that found only such children live no longer finds them.
     ChildRemoved,
 }
 

@@ -53,10 +53,10 @@ const REQUEST_TAG_FILE: u8 = 8;
 const REQUEST_TAG_CREATE_THREAD: u8 = 9;
 const REQUEST_TAG_EXIT_THREAD: u8 = 10;
 const REQUEST_TAG_START_CHILD_PROCESS: u8 = 11;
-const REQUEST_TAG_REAP_CHILD: u8 = 12;
+const REQUEST_TAG_COLLECT_CHILD_EXIT: u8 = 12;
 const REQUEST_TAG_EXIT_CHILD_PROCESS: u8 = 13;
 const REQUEST_TAG_REPORT_EXIT_STATUS: u8 = 14;
-const REQUEST_TAG_SET_CHILD_REAPING: u8 = 15;
+const REQUEST_TAG_SET_CHILD_EXIT_RETENTION: u8 = 15;
 const REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD: u8 = 16;
 const REQUEST_TAG_TIMER: u8 = 17;
 const REQUEST_TAG_GET_STATUS_FLAGS: u8 = 18;
@@ -89,10 +89,10 @@ const RESPONSE_TAG_FILE: u8 = 8;
 const RESPONSE_TAG_CREATE_THREAD: u8 = 9;
 const RESPONSE_TAG_THREAD_EXITED: u8 = 10;
 const RESPONSE_TAG_PROCESS_STARTED: u8 = 11;
-const RESPONSE_TAG_CHILD_REAPED: u8 = 12;
+const RESPONSE_TAG_CHILD_EXIT_COLLECTED: u8 = 12;
 const RESPONSE_TAG_PROCESS_EXITED: u8 = 13;
 const RESPONSE_TAG_EXIT_STATUS_REPORTED: u8 = 14;
-const RESPONSE_TAG_CHILD_REAPING_SET: u8 = 15;
+const RESPONSE_TAG_CHILD_EXIT_RETENTION_SET: u8 = 15;
 const RESPONSE_TAG_OBJECTS_DUPLICATED: u8 = 16;
 const RESPONSE_TAG_TIMER: u8 = 17;
 const RESPONSE_TAG_STATUS_FLAGS: u8 = 18;
@@ -162,10 +162,10 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_CHILD_PROCESS
-        | REQUEST_TAG_REAP_CHILD
+        | REQUEST_TAG_COLLECT_CHILD_EXIT
         | REQUEST_TAG_EXIT_CHILD_PROCESS
         | REQUEST_TAG_REPORT_EXIT_STATUS
-        | REQUEST_TAG_SET_CHILD_REAPING
+        | REQUEST_TAG_SET_CHILD_EXIT_RETENTION
         | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD
         | REQUEST_TAG_TIMER
         | REQUEST_TAG_GET_STATUS_FLAGS
@@ -259,8 +259,8 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.process_id(request.child_process_id);
             encoder.shared_buffer_sequence(request.startup.buffer);
         }
-        BrokerOperation::ReapChild(selector) => {
-            encoder.u8(REQUEST_TAG_REAP_CHILD);
+        BrokerOperation::CollectChildExit(selector) => {
+            encoder.u8(REQUEST_TAG_COLLECT_CHILD_EXIT);
             encoder.request_id(request_id);
             encode_child_selector(&mut encoder, selector);
         }
@@ -283,8 +283,8 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             encode_process_exit_status(&mut encoder, exit_status);
         }
-        BrokerOperation::SetChildReaping(enabled) => {
-            encoder.u8(REQUEST_TAG_SET_CHILD_REAPING);
+        BrokerOperation::SetChildExitRetention(enabled) => {
+            encoder.u8(REQUEST_TAG_SET_CHILD_EXIT_RETENTION);
             encoder.request_id(request_id);
             encoder.u8(u8::from(enabled));
         }
@@ -353,10 +353,10 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_CREATE_THREAD
         | REQUEST_TAG_EXIT_THREAD
         | REQUEST_TAG_START_CHILD_PROCESS
-        | REQUEST_TAG_REAP_CHILD
+        | REQUEST_TAG_COLLECT_CHILD_EXIT
         | REQUEST_TAG_EXIT_CHILD_PROCESS
         | REQUEST_TAG_REPORT_EXIT_STATUS
-        | REQUEST_TAG_SET_CHILD_REAPING
+        | REQUEST_TAG_SET_CHILD_EXIT_RETENTION
         | REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD
         | REQUEST_TAG_TIMER
         | REQUEST_TAG_GET_STATUS_FLAGS
@@ -396,7 +396,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
                 },
             })
         }
-        REQUEST_TAG_REAP_CHILD => BrokerOperation::ReapChild(decode_child_selector(&mut decoder)?),
+        REQUEST_TAG_COLLECT_CHILD_EXIT => {
+            BrokerOperation::CollectChildExit(decode_child_selector(&mut decoder)?)
+        }
         REQUEST_TAG_EXIT_CHILD_PROCESS => {
             BrokerOperation::ExitChildProcess(ExitChildProcessRequest {
                 child_process_id: decoder.process_id()?,
@@ -409,8 +411,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_CANCEL_CHILD_PROCESS => {
             BrokerOperation::CancelChildProcess(decoder.process_id()?)
         }
-        REQUEST_TAG_SET_CHILD_REAPING => {
-            BrokerOperation::SetChildReaping(decode_bool(&mut decoder)?)
+        REQUEST_TAG_SET_CHILD_EXIT_RETENTION => {
+            BrokerOperation::SetChildExitRetention(decode_bool(&mut decoder)?)
         }
         REQUEST_TAG_SET_ORPHAN_ADOPTION => {
             BrokerOperation::SetOrphanAdoption(decode_bool(&mut decoder)?)
@@ -510,10 +512,10 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_CHILD_REAPED
+        | RESPONSE_TAG_CHILD_EXIT_COLLECTED
         | RESPONSE_TAG_PROCESS_EXITED
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
-        | RESPONSE_TAG_CHILD_REAPING_SET
+        | RESPONSE_TAG_CHILD_EXIT_RETENTION_SET
         | RESPONSE_TAG_OBJECTS_DUPLICATED
         | RESPONSE_TAG_TIMER
         | RESPONSE_TAG_STATUS_FLAGS
@@ -614,8 +616,8 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_PROCESS_STARTED);
             encoder.request_id(request_id);
         }
-        BrokerResult::ChildReaped(child_exit) => {
-            encoder.u8(RESPONSE_TAG_CHILD_REAPED);
+        BrokerResult::ChildExitCollected(child_exit) => {
+            encoder.u8(RESPONSE_TAG_CHILD_EXIT_COLLECTED);
             encoder.request_id(request_id);
             encode_child_exit(&mut encoder, child_exit);
         }
@@ -631,8 +633,8 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.u8(RESPONSE_TAG_EXIT_STATUS_REPORTED);
             encoder.request_id(request_id);
         }
-        BrokerResult::ChildReapingSet => {
-            encoder.u8(RESPONSE_TAG_CHILD_REAPING_SET);
+        BrokerResult::ChildExitRetentionSet => {
+            encoder.u8(RESPONSE_TAG_CHILD_EXIT_RETENTION_SET);
             encoder.request_id(request_id);
         }
         BrokerResult::OrphanAdoptionSet => {
@@ -695,10 +697,10 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_CREATE_THREAD
         | RESPONSE_TAG_THREAD_EXITED
         | RESPONSE_TAG_PROCESS_STARTED
-        | RESPONSE_TAG_CHILD_REAPED
+        | RESPONSE_TAG_CHILD_EXIT_COLLECTED
         | RESPONSE_TAG_PROCESS_EXITED
         | RESPONSE_TAG_EXIT_STATUS_REPORTED
-        | RESPONSE_TAG_CHILD_REAPING_SET
+        | RESPONSE_TAG_CHILD_EXIT_RETENTION_SET
         | RESPONSE_TAG_OBJECTS_DUPLICATED
         | RESPONSE_TAG_TIMER
         | RESPONSE_TAG_STATUS_FLAGS
@@ -735,11 +737,13 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_RANDOM_FILLED => BrokerResult::RandomFilled,
         RESPONSE_TAG_FILE => BrokerResult::File(fs::decode_fs_response(&mut decoder)?),
         RESPONSE_TAG_PROCESS_STARTED => BrokerResult::ProcessStarted,
-        RESPONSE_TAG_CHILD_REAPED => BrokerResult::ChildReaped(decode_child_exit(&mut decoder)?),
+        RESPONSE_TAG_CHILD_EXIT_COLLECTED => {
+            BrokerResult::ChildExitCollected(decode_child_exit(&mut decoder)?)
+        }
         RESPONSE_TAG_PROCESS_EXITED => BrokerResult::ProcessExited,
         RESPONSE_TAG_CHILD_PROCESS_CANCELLED => BrokerResult::ChildProcessCancelled,
         RESPONSE_TAG_EXIT_STATUS_REPORTED => BrokerResult::ExitStatusReported,
-        RESPONSE_TAG_CHILD_REAPING_SET => BrokerResult::ChildReapingSet,
+        RESPONSE_TAG_CHILD_EXIT_RETENTION_SET => BrokerResult::ChildExitRetentionSet,
         RESPONSE_TAG_ORPHAN_ADOPTION_SET => BrokerResult::OrphanAdoptionSet,
         RESPONSE_TAG_PROCESS_INFO => BrokerResult::ProcessInfo(decode_process_info(&mut decoder)?),
         RESPONSE_TAG_OBJECTS_DUPLICATED => BrokerResult::ObjectsDuplicated,
@@ -1029,10 +1033,10 @@ mod tests {
                 RESPONSE_TAG_CREATE_THREAD,
                 RESPONSE_TAG_THREAD_EXITED,
                 RESPONSE_TAG_PROCESS_STARTED,
-                RESPONSE_TAG_CHILD_REAPED,
+                RESPONSE_TAG_CHILD_EXIT_COLLECTED,
                 RESPONSE_TAG_PROCESS_EXITED,
                 RESPONSE_TAG_EXIT_STATUS_REPORTED,
-                RESPONSE_TAG_CHILD_REAPING_SET,
+                RESPONSE_TAG_CHILD_EXIT_RETENTION_SET,
                 RESPONSE_TAG_OBJECTS_DUPLICATED,
                 RESPONSE_TAG_TIMER,
                 RESPONSE_TAG_STATUS_FLAGS,
@@ -1056,10 +1060,10 @@ mod tests {
                 REQUEST_TAG_CREATE_THREAD,
                 REQUEST_TAG_EXIT_THREAD,
                 REQUEST_TAG_START_CHILD_PROCESS,
-                REQUEST_TAG_REAP_CHILD,
+                REQUEST_TAG_COLLECT_CHILD_EXIT,
                 REQUEST_TAG_EXIT_CHILD_PROCESS,
                 REQUEST_TAG_REPORT_EXIT_STATUS,
-                REQUEST_TAG_SET_CHILD_REAPING,
+                REQUEST_TAG_SET_CHILD_EXIT_RETENTION,
                 REQUEST_TAG_DUPLICATE_OBJECTS_TO_CHILD,
                 REQUEST_TAG_TIMER,
                 REQUEST_TAG_GET_STATUS_FLAGS,
@@ -1357,9 +1361,9 @@ mod tests {
                     buffer: largest_sequence,
                 },
             }),
-            BrokerOperation::ReapChild(ChildSelector::Any),
-            BrokerOperation::ReapChild(ChildSelector::Process(process_id(u32::MAX))),
-            BrokerOperation::ReapChild(ChildSelector::ProcessGroup(ProcessGroupId(7))),
+            BrokerOperation::CollectChildExit(ChildSelector::Any),
+            BrokerOperation::CollectChildExit(ChildSelector::Process(process_id(u32::MAX))),
+            BrokerOperation::CollectChildExit(ChildSelector::ProcessGroup(ProcessGroupId(7))),
             BrokerOperation::CancelChildProcess(process_id(u32::MAX)),
             BrokerOperation::SetOrphanAdoption(false),
             BrokerOperation::SetOrphanAdoption(true),
@@ -1379,8 +1383,8 @@ mod tests {
             BrokerOperation::ReportExitStatus(ProcessExitStatus::Exited { code: u32::MAX }),
             BrokerOperation::ReportExitStatus(ProcessExitStatus::Signaled { signal: 6 }),
             BrokerOperation::ReportExitStatus(ProcessExitStatus::Unknown),
-            BrokerOperation::SetChildReaping(false),
-            BrokerOperation::SetChildReaping(true),
+            BrokerOperation::SetChildExitRetention(false),
+            BrokerOperation::SetChildExitRetention(true),
             BrokerOperation::DuplicateObjectsToChild(DuplicateObjectsToChildRequest {
                 child_process_id: process_id(u32::MAX),
                 handles: largest_sequence,
@@ -1762,22 +1766,22 @@ mod tests {
             BrokerResult::File(FileResponse::Rmdir),
             BrokerResult::File(FileResponse::Failed(FileError::Io)),
             BrokerResult::ProcessStarted,
-            BrokerResult::ChildReaped(ChildExit {
+            BrokerResult::ChildExitCollected(ChildExit {
                 process_id: process_id(u32::MAX),
                 exit_status: ProcessExitStatus::Exited { code: u32::MAX },
             }),
-            BrokerResult::ChildReaped(ChildExit {
+            BrokerResult::ChildExitCollected(ChildExit {
                 process_id: process_id(1),
                 exit_status: ProcessExitStatus::Signaled { signal: 11 },
             }),
-            BrokerResult::ChildReaped(ChildExit {
+            BrokerResult::ChildExitCollected(ChildExit {
                 process_id: process_id(1),
                 exit_status: ProcessExitStatus::Unknown,
             }),
             BrokerResult::ProcessExited,
             BrokerResult::ChildProcessCancelled,
             BrokerResult::ExitStatusReported,
-            BrokerResult::ChildReapingSet,
+            BrokerResult::ChildExitRetentionSet,
             BrokerResult::OrphanAdoptionSet,
             BrokerResult::ProcessInfo(ProcessInfo {
                 creator: None,
@@ -2051,13 +2055,13 @@ mod tests {
             decode_request(&unknown_exit_status),
             Err(WireError::InvalidTag)
         );
-        let mut invalid_child_reaping = encode_request(BrokerRequest {
+        let mut invalid_child_exit_retention = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::SetChildReaping(true),
+            operation: BrokerOperation::SetChildExitRetention(true),
         });
-        invalid_child_reaping[9] = 2;
+        invalid_child_exit_retention[9] = 2;
         assert_eq!(
-            decode_request(&invalid_child_reaping),
+            decode_request(&invalid_child_exit_retention),
             Err(WireError::InvalidTag)
         );
         let mut invalid_orphan_adoption = encode_request(BrokerRequest {
@@ -2071,7 +2075,7 @@ mod tests {
         );
         let mut unknown_child_selector = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::ReapChild(ChildSelector::Any),
+            operation: BrokerOperation::CollectChildExit(ChildSelector::Any),
         });
         unknown_child_selector[9] = 0xff;
         assert_eq!(
@@ -2534,7 +2538,7 @@ mod tests {
 
         let mut invalid_exit_status = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::ChildReaped(ChildExit {
+            result: BrokerResult::ChildExitCollected(ChildExit {
                 process_id: process_id(1),
                 exit_status: ProcessExitStatus::Unknown,
             }),

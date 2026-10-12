@@ -76,13 +76,13 @@ pub enum BrokerOperation {
     File(FileRequest),
     /// Start one pending child process.
     StartChildProcess(StartChildProcessRequest),
-    /// Reap one exited child matching the selector, oldest first, without
-    /// blocking.
+    /// Collect the exit of one exited child matching the selector, oldest
+    /// first, without blocking, removing the child from the process tree.
     ///
     /// The broker returns `WouldBlock` if only live children match, and
     /// `UnknownObject` if none does. Each matching child's exit or removal is
     /// then reported through the caller's signals.
-    ReapChild(ChildSelector),
+    CollectChildExit(ChildSelector),
     /// Record the exit of one pending child process that never started.
     ExitChildProcess(ExitChildProcessRequest),
     /// Discard one pending child process that never started, as if it had
@@ -93,17 +93,17 @@ pub enum BrokerOperation {
     /// The status is published once the runner exits, replacing the status the
     /// broker would otherwise infer from the runner's host termination.
     ReportExitStatus(ProcessExitStatus),
-    /// Set whether this process's children are reaped when they terminate
-    /// instead of retaining their termination status.
+    /// Set whether this process retains its children's exits until it
+    /// collects them, rather than discarding each when the child terminates.
     ///
     /// Each child applies the setting in effect when it terminates, so a change
     /// does not affect children that already terminated.
-    SetChildReaping(bool),
+    SetChildExitRetention(bool),
     /// Set whether this process adopts the orphaned children of its exiting
     /// descendants.
     ///
     /// When a process exits, its children move to its nearest running ancestor
-    /// that adopts orphans, and are otherwise reaped when they exit.
+    /// that adopts orphans, and otherwise have their exits discarded.
     SetOrphanAdoption(bool),
     /// Read a process's place in the process tree.
     ///
@@ -164,10 +164,10 @@ impl BrokerOperation {
             | Self::ExitChildProcess(_)
             | Self::CancelChildProcess(_)
             | Self::ReportExitStatus(_)
-            | Self::SetChildReaping(_)
+            | Self::SetChildExitRetention(_)
             | Self::SetOrphanAdoption(_)
             | Self::GetProcessInfo(_)
-            | Self::ReapChild(_)
+            | Self::CollectChildExit(_)
             | Self::CheckReadiness(_)
             | Self::GetStatusFlags(_)
             | Self::SetStatusFlags(_)
@@ -363,16 +363,16 @@ pub enum BrokerResult {
     File(FileResponse),
     /// A pending child established its broker association.
     ProcessStarted,
-    /// An exited child was reaped.
-    ChildReaped(ChildExit),
+    /// An exited child's exit was collected.
+    ChildExitCollected(ChildExit),
     /// A pending child's exit was recorded.
     ProcessExited,
     /// A pending child was discarded.
     ChildProcessCancelled,
     /// This process's final termination status was recorded.
     ExitStatusReported,
-    /// This process's child-reaping setting was recorded.
-    ChildReapingSet,
+    /// This process's child exit retention setting was recorded.
+    ChildExitRetentionSet,
     /// This process's orphan-adoption setting was recorded.
     OrphanAdoptionSet,
     /// A process's place in the process tree.

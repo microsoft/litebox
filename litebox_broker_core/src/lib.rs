@@ -237,8 +237,8 @@ pub struct BrokerCore {
     pub(crate) ids: Arc<Mutex<IdAllocator>>,
     pub(crate) processes: Arc<RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>>,
     /// Serializes changes to the process tree, namely parent and child links,
-    /// exits and reaping, and process group and session membership, and
-    /// selections over it.
+    /// exits and their collection, and process group and session membership,
+    /// and selections over it.
     ///
     /// Lock order: this lock, then process state locks, then the registry
     /// and ID allocator, then process tree links.
@@ -334,7 +334,8 @@ impl BrokerCore {
 
     /// Returns the process `id`, or `UnknownObject` if none exists.
     ///
-    /// A process that was reaped or never started no longer exists.
+    /// A process whose exit was collected or discarded, or that never started,
+    /// no longer exists.
     pub(crate) fn registered_process(&self, id: ProcessId) -> Result<Arc<BrokerProcess>> {
         // The registry lock is released before the process can drop, since a
         // final process drop removes itself from the registry.
