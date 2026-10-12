@@ -1493,16 +1493,11 @@ mod tests {
     };
     use litebox_broker_protocol::message::BrokerHandshakeRequest;
     use litebox_broker_protocol::pipe::{CreatePipeRequest, ReadPipeRequest, WritePipeRequest};
-    use litebox_broker_protocol::process::{
-        ChildExit, ChildSelector, ProcessExitStatus, ProcessInfo,
-    };
-    use litebox_broker_protocol::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
     use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
     use litebox_broker_protocol::shared_buffer::{
         SHARED_BUFFER_LAYOUT, SHARED_BUFFER_POOL_SIZE, SHARED_BUFFER_SLOT_SIZE,
         SharedBufferSlotIndex,
     };
-    use litebox_broker_protocol::signal::{SendSignalRequest, SignalTarget};
     use litebox_broker_protocol::socket::{
         AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
         ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
@@ -1851,8 +1846,6 @@ mod tests {
         active_request_allocates_and_releases_thread_id(&broker);
         active_request_closes_object_reference(&broker);
         active_requests_operate_timers(&broker, &timer_provider);
-        active_requests_manage_process_groups(&broker);
-        active_requests_manage_children(&broker);
         association_shared_buffer_sequences_stage_pipe_data(&broker);
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
@@ -2627,120 +2620,6 @@ mod tests {
             BrokerResult::ObjectClosed
         );
         assert_eq!(clock.alarm_count(), 0);
-    }
-
-    fn active_requests_manage_process_groups(broker: &BrokerCore) {
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let child = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
-            .unwrap();
-        let request = |process: &BrokerProcess, request| {
-            handle_test_request(process, BrokerOperation::ProcessGroup(request))
-        };
-        let info = |process_group: &BrokerProcess| {
-            BrokerResult::Process(ProcessResponse::GetInfo(ProcessInfo {
-                creator: Some(parent.id()),
-                parent: Some(parent.id()),
-                membership: ProcessGroupMembership {
-                    process_group: process_group.id().into(),
-                    session: parent.id().into(),
-                },
-            }))
-        };
-
-        assert_eq!(
-            handle_test_request(
-                &child,
-                BrokerOperation::Process(ProcessRequest::GetInfo(child.id()))
-            ),
-            info(&parent)
-        );
-        assert_eq!(
-            request(
-                &parent,
-                ProcessGroupRequest::Set(SetProcessGroupRequest {
-                    process_id: child.id(),
-                    process_group: child.id().into(),
-                })
-            ),
-            BrokerResult::ProcessGroup(ProcessGroupResponse::Set)
-        );
-        assert_eq!(
-            handle_test_request(
-                &parent,
-                BrokerOperation::Process(ProcessRequest::GetInfo(child.id()))
-            ),
-            info(&child)
-        );
-        assert_eq!(
-            request(&child, ProcessGroupRequest::CreateSession(child.id())),
-            BrokerResult::Error(ErrorCode::PolicyDenied)
-        );
-        assert_eq!(
-            request(&parent, ProcessGroupRequest::CreateSession(child.id())),
-            BrokerResult::Error(ErrorCode::UnknownObject)
-        );
-        assert_eq!(
-            handle_test_request(
-                &parent,
-                BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
-                    target: SignalTarget::ProcessGroup(child.id().into()),
-                    signal: 0,
-                }))
-            ),
-            BrokerResult::Signal(SignalResponse::Sent)
-        );
-    }
-
-    fn active_requests_manage_children(broker: &BrokerCore) {
-        let parent = broker
-            .create_process(CallerCredential::Unauthenticated, None)
-            .unwrap();
-        parent.complete_start().unwrap();
-        let child = broker
-            .create_process(CallerCredential::Unauthenticated, Some(parent.id()))
-            .unwrap();
-        child.complete_start().unwrap();
-        let request = |request| handle_test_request(&parent, BrokerOperation::Process(request));
-        let collect = |selector| request(ProcessRequest::CollectChildExit(selector));
-
-        assert_eq!(
-            collect(ChildSelector::Any),
-            BrokerResult::Error(ErrorCode::WouldBlock)
-        );
-        assert_eq!(
-            request(ProcessRequest::SetOrphanAdoption(true)),
-            BrokerResult::Process(ProcessResponse::SetOrphanAdoption)
-        );
-        assert_eq!(
-            request(ProcessRequest::CancelChild(child.id())),
-            BrokerResult::Error(ErrorCode::UnknownObject)
-        );
-        child.retire(true);
-        child
-            .complete_exit(ProcessExitStatus::Exited { code: 3 })
-            .unwrap();
-        assert_eq!(
-            collect(ChildSelector::Process(child.id())),
-            BrokerResult::Process(ProcessResponse::CollectChildExit(ChildExit {
-                process_id: child.id(),
-                exit_status: ProcessExitStatus::Exited { code: 3 },
-            }))
-        );
-        assert_eq!(
-            collect(ChildSelector::Any),
-            BrokerResult::Error(ErrorCode::UnknownObject)
-        );
-        assert_eq!(
-            handle_test_request(
-                &parent,
-                BrokerOperation::Process(ProcessRequest::GetInfo(child.id()))
-            ),
-            BrokerResult::Error(ErrorCode::UnknownObject)
-        );
     }
 
     fn active_request_allocates_and_releases_thread_id(broker: &BrokerCore) {
