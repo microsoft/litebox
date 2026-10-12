@@ -86,12 +86,16 @@ mod syscall_entry;
 pub struct BootConfig<'a> {
     pub page_allocator: &'static dyn mm::PageAllocator,
     pub clock: &'static dyn clock::ClockSource,
-    /// Physical RAM to map; ranges are rounded inward to whole pages.
+    /// Physical RAM to map; ranges are rounded inward to whole pages. All
+    /// but `image` is mapped RW/NX at `PA + KERNEL_OFFSET`.
     pub ram: &'a [core::ops::Range<PhysAddr>],
-    /// Page-aligned physical kernel code range, mapped RX.
+    /// Page-aligned physical kernel image, within `ram`, mapped only at
+    /// `PA + KERNEL_IMAGE_OFFSET`: `text` RX, `read_only` R/NX, the rest RW/NX.
+    pub image: core::ops::Range<PhysAddr>,
+    /// Page-aligned physical kernel code range.
     pub text: core::ops::Range<PhysAddr>,
-    /// Page-aligned physical constants, mapped R/NX after relocation.
-    /// Must not overlap `text`; remaining RAM is mapped RW/NX.
+    /// Page-aligned physical constants, written no more after relocation.
+    /// Must not overlap `text`.
     pub read_only: core::ops::Range<PhysAddr>,
     /// External vectors that require neither handling nor acknowledgement.
     pub ignored_vectors: &'a [u8],
@@ -125,16 +129,22 @@ impl AddressSpaceId {
     pub const KERNEL: Self = Self(0);
 }
 
-// Virtual address space, one 512 GiB PML4 slot per kernel region, as in
-// Linux's Documentation/arch/x86/x86_64/mm.rst:
+// Virtual address space, as in Linux's Documentation/arch/x86/x86_64/mm.rst:
 //   0x0000_0000_0001_0000 .. 0x0000_7FFF_FFFF_F000  user, per task
-//   0xFFFF_E200_0000_0000 .. 0xFFFF_E280_0000_0000  direct map of all RAM,
-//                                                   at PA + KERNEL_OFFSET
+//   0xFFFF_E200_0000_0000 .. 0xFFFF_E280_0000_0000  direct map of RAM but the
+//                                                   kernel image, at
+//                                                   PA + KERNEL_OFFSET
 //   0xFFFF_E280_0000_0000 .. 0xFFFF_E300_0000_0000  ioremap: device memory
+//   0xFFFF_FFFF_8000_0000 .. 0xFFFF_FFFF_FFFF_FFFF  kernel image, at
+//                                                   PA + KERNEL_IMAGE_OFFSET
 
-/// `VA = PA + KERNEL_OFFSET` for kernel-owned RAM. Must be 512 GiB aligned
-/// (one PML4 slot).
+/// `VA = PA + KERNEL_OFFSET` for kernel-owned RAM but the kernel image (the
+/// direct map). Must be 512 GiB aligned (one PML4 slot).
 pub const KERNEL_OFFSET: u64 = 0xFFFF_E200_0000_0000;
+
+/// `VA = PA + KERNEL_IMAGE_OFFSET` for the kernel image, which must lie
+/// below 2 GiB (Linux's `__START_KERNEL_map`).
+pub const KERNEL_IMAGE_OFFSET: u64 = 0xFFFF_FFFF_8000_0000;
 
 /// Device memory mappings ([`litebox_hal::dma::Hal::map_mmio`]), the slot
 /// after the direct map, which RAM must end below.
@@ -314,7 +324,8 @@ impl PageTableManager {
 pub struct VmKernel {
     page_table_manager: PageTableManager,
     clock: &'static dyn clock::ClockSource,
-    /// Guest RAM owned by this kernel (mapped at `PA + KERNEL_OFFSET`).
+    /// Guest RAM owned by this kernel (mapped at `PA + KERNEL_OFFSET`, but the
+    /// kernel image at `PA + KERNEL_IMAGE_OFFSET`).
     ram_frame_ranges: alloc::vec::Vec<PhysFrameRange<Size4KiB>>,
     /// The next free address in [`IOREMAP`].
     ioremap_next: spin::Mutex<u64>,
@@ -414,6 +425,7 @@ impl ArchSpecificProvider for VmKernel {
 impl VmKernel {
     fn initialize(
         ram: &[core::ops::Range<PhysAddr>],
+        image: &core::ops::Range<PhysAddr>,
         text: &core::ops::Range<PhysAddr>,
         read_only: &core::ops::Range<PhysAddr>,
         clock: &'static dyn clock::ClockSource,
@@ -427,22 +439,27 @@ impl VmKernel {
             })
             .collect();
         assert!(!text.is_empty(), "kernel text is empty");
-        for region in [text, read_only] {
+        for region in [image, text, read_only] {
             assert!(region.start <= region.end, "reversed kernel image range");
-            if region.is_empty() {
-                continue;
-            }
             assert!(
                 region.start.is_aligned(Size4KiB::SIZE) && region.end.is_aligned(Size4KiB::SIZE),
                 "kernel image ranges must be page-aligned"
             );
             assert!(
-                ram_frame_ranges.iter().any(|r| {
-                    r.start.start_address() <= region.start && region.end <= r.end.start_address()
-                }),
-                "kernel image range {region:?} is outside guest RAM"
+                region.is_empty() || (image.start <= region.start && region.end <= image.end),
+                "kernel image range {region:?} is outside the image"
             );
         }
+        assert!(
+            ram_frame_ranges.iter().any(|r| {
+                r.start.start_address() <= image.start && image.end <= r.end.start_address()
+            }),
+            "the kernel image is outside guest RAM"
+        );
+        assert!(
+            image.end.as_u64() <= KERNEL_IMAGE_OFFSET.wrapping_neg(),
+            "the kernel image extends past 2 GiB"
+        );
         assert!(
             read_only.is_empty() || text.end <= read_only.start || read_only.end <= text.start,
             "kernel text and read-only data overlap"
@@ -456,18 +473,31 @@ impl VmKernel {
         );
         let base_pt = mm::PageTable::new_top_level();
         base_pt.preallocate_kernel_slot(VirtAddr::new(IOREMAP.start));
+        let image_frames = PhysFrame::range(
+            PhysFrame::containing_address(image.start),
+            PhysFrame::containing_address(image.end),
+        );
+        let none = PhysAddr::zero()..PhysAddr::zero();
         for range in &ram_frame_ranges {
-            if let Err(e) = base_pt.map_kernel_ram(*range, text, read_only) {
-                panic!("failed to map guest RAM {range:?}: {e:?}");
+            let below = PhysFrame::range(range.start, range.end.min(image_frames.start));
+            let above = PhysFrame::range(range.start.max(image_frames.end), range.end);
+            for part in [below, above].into_iter().filter(|part| !part.is_empty()) {
+                if let Err(e) = base_pt.map_kernel(part, KERNEL_OFFSET, &none, &none) {
+                    panic!("failed to map guest RAM {part:?}: {e:?}");
+                }
             }
+        }
+        if let Err(e) = base_pt.map_kernel(image_frames, KERNEL_IMAGE_OFFSET, text, read_only) {
+            panic!("failed to map the kernel image: {e:?}");
         }
         per_cpu::unmap_stack_guards(&base_pt);
 
         crate::arch::enable_dep();
         crate::arch::enable_write_protect();
 
-        // Safety: maps all of `ram`, which holds the kernel, including the
-        // running code and stack.
+        // Safety: maps the image, which holds the running code, and the rest
+        // of `ram`, which holds the stack (from the heap) at the same
+        // addresses as the boot mappings.
         unsafe { base_pt.load() };
 
         alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {

@@ -5,17 +5,18 @@
 //! after relocation.
 
 unsafe extern "C" {
-    static _heap_start: u8;
+    static _image_end: u8;
     static _text_start: u8;
     static _text_end: u8;
     static _rodata_start: u8;
     static _rodata_end: u8;
 }
 
-/// First address the heap may use: above the image and the boot scratch.
+/// The end of the image, which starts with its text
+/// ([`text_start_address`]).
 #[inline]
-pub fn heap_start_address() -> u64 {
-    &raw const _heap_start as u64
+pub fn image_end_address() -> u64 {
+    &raw const _image_end as u64
 }
 
 #[inline]

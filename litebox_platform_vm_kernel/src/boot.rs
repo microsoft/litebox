@@ -9,6 +9,7 @@ use crate::{BootConfig, VmKernel, arch, clock::ClockSource, mm, per_cpu, syscall
 
 struct BootState {
     ram: Vec<Range<PhysAddr>>,
+    image: Range<PhysAddr>,
     text: Range<PhysAddr>,
     read_only: Range<PhysAddr>,
     ignored_vectors: Vec<u8>,
@@ -22,12 +23,14 @@ impl VmKernel {
     ///
     /// # Safety
     ///
-    /// The caller must be the only running CPU, in long mode at `KERNEL_OFFSET`
-    /// with relocations applied and interrupts disabled. The global allocator
-    /// must be ready. `config.ram` must cover the kernel and all live allocations
-    /// at `VA = PA + KERNEL_OFFSET`; the boot mappings must already make them
-    /// accessible. `config.text` must cover all executable kernel code;
-    /// `config.read_only` must contain no data that needs further writes.
+    /// The caller must be the only running CPU, in long mode with the kernel
+    /// image at `KERNEL_IMAGE_OFFSET`, relocations applied and interrupts
+    /// disabled. The global allocator must be ready. `config.ram` must cover
+    /// all live allocations at `VA = PA + KERNEL_OFFSET`, outside
+    /// `config.image`, and `config.image` the image; the boot mappings must
+    /// already make them accessible. `config.text` must cover all executable
+    /// kernel code; `config.read_only` must contain no data that needs further
+    /// writes.
     /// No live resource may require unwinding or returning to the boot stack.
     /// Interrupt sources must be masked or listed in `ignored_vectors`.
     ///
@@ -44,6 +47,7 @@ impl VmKernel {
 
         let state = Box::into_raw(Box::new(BootState {
             ram: config.ram.to_vec(),
+            image: config.image,
             text: config.text,
             read_only: config.read_only,
             ignored_vectors: config.ignored_vectors.to_vec(),
@@ -72,7 +76,13 @@ unsafe extern "C" fn enter_kernel_stack(_stack: usize, _state: *mut BootState) -
 unsafe extern "C" fn finish_boot(state: *mut BootState) -> ! {
     // Safety: `boot` transferred its unique Box through `enter_kernel_stack`.
     let state = unsafe { Box::from_raw(state) };
-    let platform = VmKernel::initialize(&state.ram, &state.text, &state.read_only, state.clock);
+    let platform = VmKernel::initialize(
+        &state.ram,
+        &state.image,
+        &state.text,
+        &state.read_only,
+        state.clock,
+    );
     per_cpu::allocate_xsave_area();
     arch::gdt::init();
     arch::interrupts::init_idt(&state.ignored_vectors);

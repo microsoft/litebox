@@ -30,11 +30,11 @@ mod pvh;
 use core::ops::Range;
 use handoff::BootInfo;
 use layout::{
-    heap_start_address, rodata_end_address, rodata_start_address, text_end_address,
+    image_end_address, rodata_end_address, rodata_start_address, text_end_address,
     text_start_address,
 };
 use litebox_hal::clock::Clock;
-use litebox_platform_vm_kernel::{BootConfig, KERNEL_OFFSET, VmKernel};
+use litebox_platform_vm_kernel::{BootConfig, KERNEL_IMAGE_OFFSET, KERNEL_OFFSET, VmKernel};
 use x86_64::PhysAddr;
 
 const PAGE_SIZE: u64 = 4096;
@@ -100,20 +100,22 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
         .filter(|r| r.start < ram_end)
         .map(|r| r.start..r.end.min(ram_end))
         .collect();
-    let to_pa = |va: u64| VmKernel::va_to_pa(x86_64::VirtAddr::new(va));
+    let to_pa = |va: u64| PhysAddr::new(va - KERNEL_IMAGE_OFFSET);
     litebox_hal::interrupt::init_legacy_pics();
     let clock = Clock::measure();
     BOOT.call_once(|| (info, clock));
     let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(clock));
-    // Safety: the front end established the direct mapping with IRQs off on one
-    // CPU. The heap contains only `ram`, text bounds come from the linker, and
-    // no live resource needs the boot stack after the handoff.
+    // Safety: the front end established the direct and image mappings with
+    // IRQs off on one CPU. The heap contains only `ram` above the image, image
+    // bounds come from the linker, and no live resource needs the boot stack
+    // after the handoff.
     unsafe {
         VmKernel::boot(
             BootConfig {
                 page_allocator: &heap::KernelPages,
                 clock,
                 ram: &ram,
+                image: to_pa(text_start_address())..to_pa(image_end_address()),
                 text: to_pa(text_start_address())..to_pa(text_end_address()),
                 read_only: to_pa(rodata_start_address())..to_pa(rodata_end_address()),
                 ignored_vectors: &litebox_hal::interrupt::SPURIOUS_VECTORS,
@@ -167,7 +169,7 @@ fn report_unused_ram(info: &BootInfo, ram_end: PhysAddr) {
 }
 
 fn seed_heap(info: &BootInfo) {
-    let heap_floor = PhysAddr::new(heap_start_address() - KERNEL_OFFSET);
+    let heap_floor = PhysAddr::new(image_end_address() - KERNEL_IMAGE_OFFSET);
     let ram_end = ram_end(info);
     // Each reserved range splits at most one free range in two.
     let mut free = arrayvec::ArrayVec::<

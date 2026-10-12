@@ -402,10 +402,13 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
         }
     }
 
-    /// Requires an inactive table. Kernel mappings must not demand-fault.
-    pub(crate) fn map_kernel_ram(
+    /// Maps `frame_range` at `PA + offset`: frames in `text` RX, in
+    /// `read_only` R/NX, the rest RW/NX. Requires an inactive table. Kernel
+    /// mappings must not demand-fault.
+    pub(crate) fn map_kernel(
         &self,
         frame_range: PhysFrameRange<Size4KiB>,
+        offset: u64,
         text: &Range<PhysAddr>,
         read_only: &Range<PhysAddr>,
     ) -> Result<(), MapToError<Size4KiB>> {
@@ -419,7 +422,9 @@ impl<M: MemoryProvider, const ALIGN: usize> X64PageTable<'_, M, ALIGN> {
 
         let mut inner = self.inner.lock();
         for frame in frame_range {
-            let page = Page::containing_address(M::pa_to_va(frame.start_address()));
+            let page =
+                Page::from_start_address(VirtAddr::new(frame.start_address().as_u64() + offset))
+                    .expect("frames are page-aligned");
             let flags = if text.contains(&frame.start_address()) {
                 PageTableFlags::PRESENT
             } else if read_only.contains(&frame.start_address()) {

@@ -2,8 +2,10 @@
 // Licensed under the MIT license.
 
 //! PVH front end: direct kernel boot (e.g. `qemu -kernel`) through the
-//! `XEN_ELFNOTE_PHYS32_ENTRY` note. Maps the low 4 GiB, applies relocations,
-//! and hands off (see `handoff`) on the boot stack in the scratch region.
+//! `XEN_ELFNOTE_PHYS32_ENTRY` note. Maps the low 4 GiB (identity and at
+//! `KERNEL_OFFSET`) and the low 1 GiB, which holds the image, at
+//! `KERNEL_IMAGE_OFFSET`; relocates the image there, and hands off (see
+//! `handoff`) on the boot stack in the scratch region.
 //!
 //! The linker script must define `_memory_base`, `_rela_start` and
 //! `_rela_end`.
@@ -12,7 +14,7 @@ use crate::handoff::{BootInfo, MAX_MODULES, MAX_RAM_REGIONS, MAX_RESERVED};
 use arrayvec::{ArrayString, ArrayVec};
 use core::arch::global_asm;
 use core::ops::Range;
-use litebox_platform_vm_kernel::KERNEL_OFFSET;
+use litebox_platform_vm_kernel::{KERNEL_IMAGE_OFFSET, KERNEL_OFFSET};
 use x86_64::PhysAddr;
 use zerocopy::FromBytes;
 
@@ -27,6 +29,13 @@ const XEN_ELFNOTE_PHYS32_ENTRY: u32 = 18;
 const KERNEL_PML4_INDEX: u32 = ((KERNEL_OFFSET >> 39) & 0x1FF) as u32;
 const _: () = assert!(KERNEL_OFFSET.trailing_zeros() >= 39);
 
+/// `KERNEL_IMAGE_OFFSET` must be 1 GiB aligned so its PDPT entry can share
+/// the first PD.
+const IMAGE_PML4_INDEX: u32 = ((KERNEL_IMAGE_OFFSET >> 39) & 0x1FF) as u32;
+const IMAGE_PDPT_INDEX: u32 = ((KERNEL_IMAGE_OFFSET >> 30) & 0x1FF) as u32;
+const _: () = assert!(KERNEL_IMAGE_OFFSET.trailing_zeros() >= 30);
+const _: () = assert!(IMAGE_PML4_INDEX != KERNEL_PML4_INDEX && IMAGE_PML4_INDEX != 0);
+
 /// Page directories (1 GiB of 2 MiB pages each) in the early page tables.
 const PD_COUNT: u32 = 4;
 const PD_ENTRIES: u32 = PD_COUNT * 512;
@@ -34,17 +43,20 @@ const PD_ENTRIES: u32 = PD_COUNT * 512;
 const MAPPED_LIMIT: u64 = 1 << 32;
 
 /// Must match `.boot_scratch` in the linker script. Everything below lives
-/// there; the region is `NOLOAD`, so the stub initializes what it uses.
+/// there. The region is `NOLOAD`, so the stub initializes what it uses, and
+/// the front end reserves it (see `handoff`).
 const BOOT_SCRATCH_BASE: u32 = 0x0100_0000;
+const BOOT_SCRATCH_SIZE: u32 = 0x80000;
 const OFF_PML4: u32 = 0x0000;
 const OFF_PDPT: u32 = 0x1000;
 /// [`PD_COUNT`] contiguous page directories.
 const OFF_PD: u32 = 0x2000;
-const OFF_GDT: u32 = OFF_PD + PD_COUNT * 0x1000;
+const OFF_PDPT_IMAGE: u32 = OFF_PD + PD_COUNT * 0x1000;
+const OFF_GDT: u32 = OFF_PDPT_IMAGE + 0x1000;
 const OFF_GDTR: u32 = OFF_GDT + 0x20;
 const OFF_HVM_START_INFO: u32 = OFF_GDT + 0x30;
 /// Boot stack top; the stack grows down towards the page tables.
-const OFF_STACK_TOP: u32 = 0x80000;
+const OFF_STACK_TOP: u32 = BOOT_SCRATCH_SIZE;
 
 #[repr(C, align(4))]
 struct PvhNote {
@@ -81,7 +93,7 @@ _start:
     cld
     mov edi, {scratch} + {off_pml4}
     xor eax, eax
-    mov ecx, ((2 + {pd_count}) * 4096) / 4
+    mov ecx, ((3 + {pd_count}) * 4096) / 4
     rep stosd
 
     /* PML4[0] (identity) and PML4[KERNEL_OFFSET] (alias) -> PDPT. */
@@ -89,6 +101,15 @@ _start:
     or eax, 0x03
     mov dword ptr [{scratch} + {off_pml4}], eax
     mov dword ptr [{scratch} + {off_pml4} + {kernel_pml4_index} * 8], eax
+
+    /* PML4[KERNEL_IMAGE_OFFSET] -> image PDPT, whose entry shares the first
+       PD: the low 1 GiB, with the image, at KERNEL_IMAGE_OFFSET. */
+    mov eax, {scratch} + {off_pdpt_image}
+    or eax, 0x03
+    mov dword ptr [{scratch} + {off_pml4} + {image_pml4_index} * 8], eax
+    mov eax, {scratch} + {off_pd}
+    or eax, 0x03
+    mov dword ptr [{scratch} + {off_pdpt_image} + {image_pdpt_index} * 8], eax
 
     xor ecx, ecx
     mov eax, {scratch} + {off_pd}
@@ -151,12 +172,14 @@ _start:
     mov gs, ax
 
     mov rax, offset .Lpa_high
-    mov rcx, {kernel_offset}
+    mov rcx, {image_offset}
     add rax, rcx
     jmp rax
 
 .Lhigh_half:
+    /* The boot stack, in the direct map, which the platform's tables keep. */
     mov rsp, {scratch} + {off_stack_top}
+    mov rcx, {kernel_offset}
     add rsp, rcx
 
     /* No Rust before relocation: generated code may use unrelocated GOT entries. */
@@ -197,12 +220,16 @@ _start:
     entry = const PVH_ENTRY_ADDR,
     kernel_offset = const KERNEL_OFFSET,
     kernel_pml4_index = const KERNEL_PML4_INDEX,
+    image_offset = const KERNEL_IMAGE_OFFSET,
+    image_pml4_index = const IMAGE_PML4_INDEX,
+    image_pdpt_index = const IMAGE_PDPT_INDEX,
     pd_entries = const PD_ENTRIES,
     pd_count = const PD_COUNT,
     scratch = const BOOT_SCRATCH_BASE,
     off_pml4 = const OFF_PML4,
     off_pdpt = const OFF_PDPT,
     off_pd = const OFF_PD,
+    off_pdpt_image = const OFF_PDPT_IMAGE,
     off_gdt = const OFF_GDT,
     off_gdtr = const OFF_GDTR,
     off_sinfo = const OFF_HVM_START_INFO,
@@ -307,6 +334,7 @@ fn boot_info() -> BootInfo {
              raise MAX_RESERVED rather than let the heap overwrite them"
         );
     };
+    reserve(u64::from(BOOT_SCRATCH_BASE), u64::from(BOOT_SCRATCH_SIZE));
     reserve(start_info_pa, size_of::<HvmStartInfo>() as u64);
     reserve(
         info.memmap_paddr,

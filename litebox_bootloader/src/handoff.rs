@@ -3,14 +3,14 @@
 
 //! The front-end handoff. Before calling `kernel_start` with its [`BootInfo`]
 //! parser, a front end establishes: long mode, interrupts off, one CPU, a
-//! boot stack, relocations applied, and the mapping of
-//! [`BootInfo::mapped_limit`].
+//! boot stack, the image running at `KERNEL_IMAGE_OFFSET` with relocations
+//! applied, and the mapping of [`BootInfo::mapped_limit`].
 //! `kernel_start` sets up the console and logging before running the parser.
 //!
-//! The heap gets all usable RAM above `_heap_start` (`x86_64_kernel.ld`)
-//! except [`BootInfo::reserved`], while the boot stack and page tables are
-//! still in use: a front end keeps them, and anything else it still needs,
-//! below `_heap_start` or lists them in `reserved`.
+//! The heap gets all usable RAM above the kernel image (`_image_end` in
+//! `x86_64_kernel.ld`) except [`BootInfo::reserved`], while the boot stack
+//! and page tables are still in use: a front end keeps them, and anything
+//! else it still needs, below the image's end or lists them in `reserved`.
 
 use arrayvec::{ArrayString, ArrayVec};
 use core::ops::Range;

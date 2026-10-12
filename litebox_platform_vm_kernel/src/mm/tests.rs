@@ -332,7 +332,7 @@ fn kernel_image_permissions() {
     ];
     for (frame, flags) in frames.into_iter().zip(expected) {
         pgtable
-            .map_kernel_ram(PhysFrame::range(frame, frame + 1), &text, &read_only)
+            .map_kernel(PhysFrame::range(frame, frame + 1), 0, &text, &read_only)
             .unwrap();
         check_mapped(
             &pgtable,
