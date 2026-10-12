@@ -155,6 +155,15 @@ struct ProcessReferences {
     pending_handles: usize,
 }
 
+/// Broker-owned state for one guest thread.
+#[derive(Clone, Copy)]
+pub(crate) struct BrokerThread {
+    /// Process that owns this thread.
+    process_id: ProcessId,
+    /// Whether this is its process's initial thread.
+    initial: bool,
+}
+
 /// Broker-owned state for one authenticated guest process.
 ///
 /// User mode cannot choose the process ID. The broker entry layer authenticates
@@ -379,12 +388,20 @@ impl BrokerProcess {
             .expect("broker process creation did not initialize its initial thread ID")
     }
 
-    pub(crate) fn set_initial_thread_id(&self, initial_thread_id: ThreadId) {
+    /// Creates this process's initial thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called twice, or if the shared ID allocator violates its
+    /// range or uniqueness invariants.
+    pub(crate) fn create_initial_thread(&self) -> Result<()> {
         assert!(
             self.initial_thread_id.get().is_none(),
-            "broker process initial thread ID was initialized twice"
+            "broker process initial thread was created twice"
         );
-        self.initial_thread_id.call_once(|| initial_thread_id);
+        let thread_id = self.add_thread(true)?;
+        self.initial_thread_id.call_once(|| thread_id);
+        Ok(())
     }
 
     /// Returns the credential authenticated for this process association.
@@ -677,20 +694,16 @@ impl BrokerProcess {
     ///
     /// Returns `UnknownObject` if no such thread exists.
     pub fn thread_info(&self, target: ThreadId) -> Result<ThreadInfo> {
-        self.core
-            .registered_processes()
-            .into_iter()
-            .find(|process| process.threads.lock().contains(&target))
-            .map(|process| ThreadInfo {
-                process_id: process.id,
-                // Until process creation records its initial thread, that is
-                // its only thread.
-                initial: process
-                    .initial_thread_id
-                    .get()
-                    .is_none_or(|&initial| initial == target),
-            })
-            .ok_or(BrokerError::UnknownObject)
+        let thread = *self
+            .core
+            .threads
+            .read()
+            .get(&target)
+            .ok_or(BrokerError::UnknownObject)?;
+        Ok(ThreadInfo {
+            process_id: thread.process_id,
+            initial: thread.initial,
+        })
     }
 
     /// Duplicates object references into the pending child selected by
@@ -1243,11 +1256,19 @@ impl BrokerProcess {
     /// Panics if the shared ID allocator violates its range or uniqueness
     /// invariants.
     pub fn create_thread(&self) -> Result<ThreadId> {
+        self.add_thread(false)
+    }
+
+    fn add_thread(&self, initial: bool) -> Result<ThreadId> {
         let mut threads = self.threads.lock();
         if threads.len() >= self.core.limits.max_threads_per_process {
             return Err(BrokerError::ResourceExhausted);
         }
         threads
+            .try_reserve(1)
+            .map_err(|_| BrokerError::OutOfMemory)?;
+        let mut registry = self.core.threads.write();
+        registry
             .try_reserve(1)
             .map_err(|_| BrokerError::OutOfMemory)?;
         self.core
@@ -1266,9 +1287,17 @@ impl BrokerProcess {
             }
         };
         let thread_id = ThreadId(raw_id);
+        let thread = BrokerThread {
+            process_id: self.id,
+            initial,
+        };
         assert!(
             threads.insert(thread_id),
             "the ID allocator returned an occupied thread ID"
+        );
+        assert!(
+            registry.insert(thread_id, thread).is_none(),
+            "the ID allocator returned a registered thread ID"
         );
         Ok(thread_id)
     }
@@ -1279,6 +1308,7 @@ impl BrokerProcess {
         if !threads.remove(&thread_id) {
             return Err(BrokerError::UnknownObject);
         }
+        self.core.threads.write().remove(&thread_id);
         drop(threads);
         self.core
             .active_thread_count
@@ -1820,6 +1850,12 @@ impl BrokerProcess {
     /// IDs and global thread accounting.
     fn release_threads(&self, release_ids: bool) {
         let threads = core::mem::take(&mut *self.threads.lock());
+        {
+            let mut registry = self.core.threads.write();
+            for thread_id in &threads {
+                registry.remove(thread_id);
+            }
+        }
         if release_ids {
             self.core
                 .active_thread_count
@@ -3295,6 +3331,11 @@ mod tests {
         );
         child.exit_thread(thread).unwrap();
         assert_eq!(root.thread_info(thread), Err(BrokerError::UnknownObject));
+        run_to_exit(&child, EXITED);
+        assert_eq!(
+            root.thread_info(child.initial_thread_id()),
+            Err(BrokerError::UnknownObject)
+        );
     }
 
     #[test]

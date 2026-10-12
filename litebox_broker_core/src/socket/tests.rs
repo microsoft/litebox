@@ -1329,6 +1329,7 @@ fn test_broker_with_policy(
             crate::id::IdAllocator::new(crate::id::MAX_ALLOCATED_ID).unwrap(),
         )),
         processes: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
+        threads: Arc::new(spin::RwLock::new(hashbrown::HashMap::new())),
         process_tree_lock: Arc::new(spin::Mutex::new(())),
         active_thread_count: Arc::new(AtomicUsize::new(0)),
         next_reference_handle: Arc::new(spin::RwLock::new(1)),

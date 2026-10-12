@@ -44,7 +44,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use litebox_broker_protocol::{ObjectHandle, ProcessId};
+use litebox_broker_protocol::{ObjectHandle, ProcessId, ThreadId};
 use spin::{Mutex, rwlock::RwLock};
 
 pub use error::BrokerError;
@@ -56,6 +56,7 @@ pub use policy::{
     DestinationPortRange, DestinationRule, Ipv4Cidr, MAX_DESTINATION_RULES, PolicyEngine,
     PolicyProfile, SocketPolicy, SocketPolicyError,
 };
+use process::BrokerThread;
 pub use process::{
     AssociationCancellation, BrokerProcess, CallerCredential, ChildImage, ProcessImage,
     ProcessLifecycleSink, ProcessShutdown,
@@ -236,6 +237,11 @@ pub struct BrokerCore {
     pub(crate) limits: BrokerCoreLimits,
     pub(crate) ids: Arc<Mutex<IdAllocator>>,
     pub(crate) processes: Arc<RwLock<HashMap<ProcessId, Weak<BrokerProcess>>>>,
+    /// Every live broker thread.
+    ///
+    /// Lock order: a process's thread set, then this lock, then the ID
+    /// allocator.
+    pub(crate) threads: Arc<RwLock<HashMap<ThreadId, BrokerThread>>>,
     /// Serializes changes to the process tree, namely parent and child links,
     /// exits and their collection, and process group and session membership,
     /// and selections over it.
@@ -306,6 +312,7 @@ impl BrokerCore {
             limits,
             ids: Arc::new(Mutex::new(ids)),
             processes: Arc::new(RwLock::new(HashMap::new())),
+            threads: Arc::new(RwLock::new(HashMap::new())),
             process_tree_lock: Arc::new(Mutex::new(())),
             active_thread_count: Arc::new(AtomicUsize::new(0)),
             next_reference_handle: Arc::new(RwLock::new(1)),
@@ -464,11 +471,8 @@ impl BrokerCore {
         parent_id: Option<ProcessId>,
     ) -> Result<Arc<BrokerProcess>> {
         let process = self.allocate_process(caller_credential, parent_id)?;
-        match process.create_thread() {
-            Ok(initial_thread_id) => {
-                process.set_initial_thread_id(initial_thread_id);
-                Ok(process)
-            }
+        match process.create_initial_thread() {
+            Ok(()) => Ok(process),
             Err(error) => {
                 let _ = process.fail_start(error, false, true);
                 process.retire(true);
