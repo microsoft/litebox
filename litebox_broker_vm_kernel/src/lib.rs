@@ -58,9 +58,10 @@ pub const CONTROL_RING_SIZE: usize = CONTROL_RING_MEMORY_SIZE;
 /// What the broker waits for: the runner's event sources (e.g., device
 /// interrupts and a timer).
 pub trait Events: Sync {
-    /// Halts until an event may have happened, or until `deadline` (TSC)
-    /// passes. Without a deadline, false if no event could ever end the halt
-    /// (and it does not halt).
+    /// Halts until an event may have happened, or until `deadline` (a TSC
+    /// value, from ring 3; see [`litebox_hal::clock::now`]) passes. Without a
+    /// deadline, false if no event could ever end the halt (and it does not
+    /// halt).
     fn wait(&self, deadline: Option<u64>) -> bool;
 }
 
@@ -309,9 +310,7 @@ impl Association {
                 Ok(_) => {}
                 Err(_) => return Err(invalid()),
             }
-            // Safety: RDTSC has no side effects.
-            if deadline.is_some_and(|deadline| unsafe { core::arch::x86_64::_rdtsc() } >= deadline)
-            {
+            if deadline.is_some_and(|deadline| litebox_hal::clock::now() >= deadline) {
                 return Err(EnterError::Status(Status::TimedOut));
             }
             if deadline.is_none() && !asynchronous {

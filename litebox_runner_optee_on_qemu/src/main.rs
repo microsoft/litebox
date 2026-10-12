@@ -18,7 +18,7 @@ mod tests;
 
 use core::panic::PanicInfo;
 use litebox_bootloader::Kernel;
-use litebox_hal::{console, console_println, power};
+use litebox_hal::{power, serial, serial_println};
 use litebox_platform_vm_kernel::providers::set_platform_root_key;
 
 litebox_bootloader::entry!(kernel_main, &SERIAL_LOGGER);
@@ -28,7 +28,7 @@ fn kernel_main(kernel: Kernel) -> ! {
     tests::check_user_memory_protection(kernel.platform);
 
     optee::run(kernel.platform, kernel.boot_info);
-    console_println!("[litebox] ALL TESTS PASSED");
+    serial_println!("[litebox] ALL TESTS PASSED");
     power::exit(true)
 }
 
@@ -45,7 +45,7 @@ impl log::Log for SerialLogger {
         }
         let mut buf: arrayvec::ArrayString<1024> = arrayvec::ArrayString::new();
         let _ = litebox_util_log::format_record(&mut buf, record);
-        console::print_str(&buf);
+        serial::print_str(&buf);
     }
 
     fn flush(&self) {}
@@ -69,7 +69,7 @@ static SERIAL_LOGGER: SerialLogger = SerialLogger;
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    console::panic_print(format_args!(
+    serial::panic_print(format_args!(
         "[litebox] PANIC: {info}\n[litebox] TESTS FAILED\n"
     ));
     power::exit(false)

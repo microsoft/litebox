@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Console: a 16550 UART on COM1. Output is dropped if no UART answers.
+//! The serial port, for the kernel's own output: a 16550 UART on COM1.
+//! Output is dropped if no UART answers.
 
 use core::fmt;
 use spin::{Mutex, Once};
@@ -138,9 +139,9 @@ pub fn panic_print(args: core::fmt::Arguments) {
     let _ = com.write_fmt(args);
 }
 
-/// `println!` to the console.
+/// `println!` to the serial port.
 #[macro_export]
-macro_rules! console_println {
-    () => ($crate::console::print(format_args!("\n")));
-    ($($arg:tt)*) => ($crate::console::print(format_args!("{}\n", format_args!($($arg)*))));
+macro_rules! serial_println {
+    () => ($crate::serial::print(format_args!("\n")));
+    ($($arg:tt)*) => ($crate::serial::print(format_args!("{}\n", format_args!($($arg)*))));
 }

@@ -5,6 +5,7 @@
 //! the timer, in x2APIC mode (as on LVBS) where the CPU has it, else in
 //! xAPIC mode (e.g., QEMU's TCG); the legacy 8259 PICs are only masked.
 
+use crate::clock::{Clock, now};
 use crate::dma::{Hal, Mmio};
 use x86_64::instructions::port::Port;
 use x86_64::registers::model_specific::Msr;
@@ -77,6 +78,28 @@ pub struct MsiMessage {
     pub data: u32,
 }
 
+/// Where a device interrupt goes: `vector` on the CPU with local APIC ID
+/// `apic_id`. Each delivery mechanism derives its own form (e.g., an MSI
+/// message).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InterruptTarget {
+    pub apic_id: u32,
+    pub vector: u8,
+}
+
+impl InterruptTarget {
+    /// As an MSI message (fixed delivery, edge); `None` if the APIC ID does
+    /// not fit an MSI address, which without interrupt remapping holds 8
+    /// bits.
+    pub fn msi_message(self) -> Option<MsiMessage> {
+        let id = u8::try_from(self.apic_id).ok()?;
+        Some(MsiMessage {
+            address: 0xfee0_0000 | (u64::from(id) << 12),
+            data: u32::from(self.vector),
+        })
+    }
+}
+
 /// This CPU's local APIC, enabled, with its timer raising a vector when
 /// armed.
 pub struct LocalApic {
@@ -91,20 +114,15 @@ fn has_cpu_feature(ecx_bit: u32) -> bool {
     core::arch::x86_64::__cpuid_count(1, 0).ecx & (1 << ecx_bit) != 0
 }
 
-fn rdtsc() -> u64 {
-    // Safety: RDTSC has no side effects.
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
-
 impl LocalApic {
     /// Enables the local APIC and sets its timer to raise `timer_vector`,
-    /// disarmed. Calibrates the timer against the TSC (`tsc_khz`) if it has
-    /// no TSC-deadline mode.
+    /// disarmed. Calibrates the timer against `clock` if it has no
+    /// TSC-deadline mode.
     ///
     /// # Panics
     ///
     /// If the xAPIC registers cannot be mapped.
-    pub fn init(hal: &dyn Hal, timer_vector: u8, tsc_khz: u64) -> Self {
+    pub fn init(hal: &dyn Hal, timer_vector: u8, clock: Clock) -> Self {
         // The local APIC belongs to this kernel, and interrupts are disabled.
         // The SDM requires enabling xAPIC before x2APIC.
         let mut base = Msr::new(IA32_APIC_BASE);
@@ -139,9 +157,9 @@ impl LocalApic {
             apic.write(reg::TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
             apic.write(reg::LVT_TIMER, LVT_TIMER_MASKED | u32::from(timer_vector));
             apic.write(reg::TIMER_INITIAL_COUNT, u32::MAX);
-            let start = rdtsc();
-            let cycles = TIMER_CALIBRATION_MS * tsc_khz;
-            while rdtsc() - start < cycles {}
+            let start = now();
+            let cycles = TIMER_CALIBRATION_MS * clock.khz();
+            while now() - start < cycles {}
             let ticks = u64::from(u32::MAX - apic.read(reg::TIMER_CURRENT_COUNT));
             apic.write(reg::TIMER_INITIAL_COUNT, 0);
             apic.write(reg::LVT_TIMER, u32::from(timer_vector));
@@ -183,26 +201,16 @@ impl LocalApic {
         self.write(reg::EOI, 0);
     }
 
-    /// The MSI message that raises `vector` on this CPU (fixed delivery,
-    /// edge).
-    ///
-    /// # Panics
-    ///
-    /// If the APIC ID does not fit an MSI address (above 255).
-    pub fn msi_message(&self, vector: u8) -> MsiMessage {
-        let id = match self.xapic {
+    /// Interrupts raising `vector` on this CPU.
+    pub fn target(&self, vector: u8) -> InterruptTarget {
+        let apic_id = match self.xapic {
             Some(_) => self.read(reg::ID) >> 24,
             None => self.read(reg::ID),
         };
-        // Without interrupt remapping, MSI addresses an 8-bit APIC ID.
-        assert!(id <= 0xff, "APIC ID {id} beyond MSI's reach");
-        MsiMessage {
-            address: 0xfee0_0000 | (u64::from(id) << 12),
-            data: u32::from(vector),
-        }
+        InterruptTarget { apic_id, vector }
     }
 
-    /// Raises the timer's vector once, when the TSC reaches `deadline` (at
+    /// Raises the timer's vector once, when [`now`] reaches `deadline` (at
     /// once if it has; without TSC-deadline mode, a distant deadline may come
     /// early); replaces a pending deadline.
     pub fn arm_timer(&self, deadline: u64) {
@@ -210,7 +218,7 @@ impl LocalApic {
             // Safety: programs this CPU's timer; zero would disarm.
             None => unsafe { Msr::new(IA32_TSC_DEADLINE).write(deadline.max(1)) },
             Some((ticks, cycles)) => {
-                let delta = u128::from(deadline.saturating_sub(rdtsc()));
+                let delta = u128::from(deadline.saturating_sub(now()));
                 let count = delta * u128::from(ticks) / u128::from(cycles);
                 self.write(
                     reg::TIMER_INITIAL_COUNT,

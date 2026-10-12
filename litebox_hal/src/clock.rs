@@ -1,11 +1,17 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Clocks: the TSC's frequency, from the most authoritative source the
-//! machine has: CPUID, the hypervisor, or else calibration against the
-//! legacy PIT (which, e.g., Firecracker and Cloud Hypervisor lack).
+//! The CPU's clock: a free-running counter ([`now`], in ticks) and its
+//! frequency ([`Clock`]). On x86-64, the counter is the TSC, which ring 3
+//! reads too: `BrokerEnter` deadlines are TSC values and
+//! `StartupInfo::tsc_khz` is [`Clock::khz`] (see `litebox_common_vm_abi`), so
+//! the TSC is part of the ABI. Its frequency comes from the most
+//! authoritative source the machine has: CPUID, the hypervisor, or else
+//! calibration against the legacy PIT (which, e.g., Firecracker and Cloud
+//! Hypervisor lack).
 
 use core::arch::x86_64::__cpuid_count as cpuid;
+use core::time::Duration;
 
 const PIT_HZ: u64 = 1_193_182;
 const CALIBRATION_MS: u64 = 50;
@@ -14,9 +20,52 @@ const CALIBRATION_TIMEOUT_CYCLES: u64 = 1 << 36;
 /// Frequencies outside this range are not believed.
 const PLAUSIBLE_KHZ: core::ops::RangeInclusive<u64> = 100_000..=100_000_000;
 
+/// The counter: the TSC, as ring 3 reads it (see the module docs). Never
+/// decreases (one CPU, constant rate).
+pub fn now() -> u64 {
+    // Safety: RDTSC has no side effects.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// The counter's frequency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Clock {
+    khz: u64,
+}
+
+impl Clock {
+    /// Finds the frequency (logged, with its source). Call once, at boot;
+    /// calibration takes a while.
+    ///
+    /// # Panics
+    ///
+    /// If no source works.
+    pub fn measure() -> Self {
+        let (khz, source) = tsc_khz();
+        litebox_util_log::info!(mhz:% = khz / 1000, source:? = source; "clock frequency");
+        Self { khz }
+    }
+
+    /// Ticks per millisecond: the TSC frequency in kHz, as ring 3 gets it.
+    pub fn khz(self) -> u64 {
+        self.khz
+    }
+
+    /// [`now`] in nanoseconds.
+    pub fn nanos(self) -> u64 {
+        u64::try_from(u128::from(now()) * 1_000_000 / u128::from(self.khz)).unwrap_or(u64::MAX)
+    }
+
+    /// The tick [`now`] reaches `timeout` from now.
+    pub fn deadline(self, timeout: Duration) -> u64 {
+        let ticks = timeout.as_nanos() * u128::from(self.khz) / 1_000_000;
+        now().saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX))
+    }
+}
+
 /// Where [`tsc_khz`] got the frequency.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TscSource {
+enum TscSource {
     /// CPUID leaf 0x15: the core crystal and its ratio (Intel).
     Cpuid,
     /// The hypervisor's timing leaf 0x40000010 (KVM via QEMU, VMware).
@@ -26,11 +75,7 @@ pub enum TscSource {
 }
 
 /// The TSC frequency in kHz, and its source.
-///
-/// # Panics
-///
-/// If no source works.
-pub fn tsc_khz() -> (u64, TscSource) {
+fn tsc_khz() -> (u64, TscSource) {
     if let Some(khz) = cpuid_khz().filter(|khz| PLAUSIBLE_KHZ.contains(khz)) {
         return (khz, TscSource::Cpuid);
     }
@@ -85,18 +130,18 @@ fn calibrate_tsc_khz() -> u64 {
         ch2.write(hi);
 
         // Mode 0 starts counting on the PIT clock after the MSB write.
-        let start = core::arch::x86_64::_rdtsc();
-        let mut now = start;
+        let start = now();
+        let mut end = start;
         while port_b.read() & 0x20 == 0 {
-            now = core::arch::x86_64::_rdtsc();
+            end = now();
             assert!(
-                now - start < CALIBRATION_TIMEOUT_CYCLES,
+                end - start < CALIBRATION_TIMEOUT_CYCLES,
                 "TSC calibration: the legacy PIT (channel 2) never signalled"
             );
         }
         // Bits 4-7 are read-only.
         port_b.write(v & 0x0f);
-        let khz = (now - start) / CALIBRATION_MS;
+        let khz = (end - start) / CALIBRATION_MS;
         assert!(khz != 0, "TSC calibration measured a zero frequency");
         khz
     }

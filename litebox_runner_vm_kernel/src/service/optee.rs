@@ -13,6 +13,7 @@ use alloc::collections::BTreeMap;
 use litebox_common_optee::TeeUuid;
 use litebox_common_optee::envelope::{LDELF_IMAGE, TA_IMAGE};
 use litebox_common_vm_abi::IDENTITY_LEN;
+use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::optee::Completion;
 use litebox_shim_vm_kernel::optee::Invocation;
@@ -38,7 +39,7 @@ impl Optee {
     /// On a missing or malformed payload file.
     pub fn new(
         platform: &'static VmKernel,
-        tsc_khz: u64,
+        clock: Clock,
         payload: &Payload,
         broker: litebox_broker_vm_kernel::Broker,
     ) -> Self {
@@ -88,7 +89,7 @@ impl Optee {
                     runner,
                     images: &images,
                     identity,
-                    tsc_khz,
+                    tsc_khz: clock.khz(),
                 },
             )
             .map_err(|error| {

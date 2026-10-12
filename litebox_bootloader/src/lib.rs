@@ -33,7 +33,8 @@ use layout::{
     heap_start_address, rodata_end_address, rodata_start_address, text_end_address,
     text_start_address,
 };
-use litebox_platform_vm_kernel::{BootConfig, KERNEL_OFFSET, VmKernel, clock::TscClock};
+use litebox_hal::clock::Clock;
+use litebox_platform_vm_kernel::{BootConfig, KERNEL_OFFSET, VmKernel};
 use x86_64::PhysAddr;
 
 const PAGE_SIZE: u64 = 4096;
@@ -43,7 +44,7 @@ pub struct Kernel {
     /// Boot modules stay mapped at `PA + KERNEL_OFFSET`, in kernel-managed
     /// RAM, for the kernel's lifetime.
     pub boot_info: &'static BootInfo,
-    pub tsc_khz: u64,
+    pub clock: Clock,
 }
 
 /// Declares the kernel's `fn(Kernel) -> !`, run on the kernel stack once the
@@ -70,15 +71,15 @@ unsafe extern "Rust" {
     safe fn __litebox_kernel_logger() -> &'static dyn log::Log;
 }
 
-static BOOT: spin::Once<(BootInfo, u64)> = spin::Once::new();
+static BOOT: spin::Once<(BootInfo, Clock)> = spin::Once::new();
 
 fn early_console_init() {
     let _ = log::set_logger(__litebox_kernel_logger());
     log::set_max_level(log::LevelFilter::Info);
 
-    litebox_hal::console_println!("=====================");
-    litebox_hal::console_println!(" Hello from LiteBox! ");
-    litebox_hal::console_println!("=====================");
+    litebox_hal::serial_println!("=====================");
+    litebox_hal::serial_println!(" Hello from LiteBox! ");
+    litebox_hal::serial_println!("=====================");
 }
 
 /// The front ends' entry; see [`handoff`].
@@ -101,10 +102,9 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
         .collect();
     let to_pa = |va: u64| VmKernel::va_to_pa(x86_64::VirtAddr::new(va));
     litebox_hal::interrupt::init_legacy_pics();
-    let (tsc_khz, source) = litebox_hal::clock::tsc_khz();
-    litebox_util_log::info!(mhz:% = tsc_khz / 1000, source:? = source; "TSC frequency");
-    BOOT.call_once(|| (info, tsc_khz));
-    let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(TscClock::new(tsc_khz)));
+    let clock = Clock::measure();
+    BOOT.call_once(|| (info, clock));
+    let clock = alloc::boxed::Box::leak(alloc::boxed::Box::new(clock));
     // Safety: the front end established the direct mapping with IRQs off on one
     // CPU. The heap contains only `ram`, text bounds come from the linker, and
     // no live resource needs the boot stack after the handoff.
@@ -124,7 +124,7 @@ fn kernel_start(boot_info: impl FnOnce() -> BootInfo) -> ! {
 }
 
 fn kernel_main(platform: &'static VmKernel) -> ! {
-    let (boot_info, tsc_khz) = BOOT.get().expect("boot info captured");
+    let (boot_info, clock) = BOOT.get().expect("boot info captured");
     for m in &boot_info.modules {
         assert!(
             platform.contains_ram(m.clone()),
@@ -136,7 +136,7 @@ fn kernel_main(platform: &'static VmKernel) -> ! {
     __litebox_kernel_main(Kernel {
         platform,
         boot_info,
-        tsc_khz: *tsc_khz,
+        clock: *clock,
     })
 }
 

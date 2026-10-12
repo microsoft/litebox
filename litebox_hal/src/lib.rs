@@ -3,8 +3,8 @@
 
 //! Hardware abstraction layer for LiteBox kernel-mode runners: what a VM
 //! cannot do by itself and gets from its (virtual) hardware or hypervisor.
-//! Each module states the hardware it assumes. Runners choose and wire the
-//! sources.
+//! Each module states the hardware it assumes. [`devices`] puts devices
+//! behind device-neutral types; runners choose and wire the sources.
 
 #![no_std]
 #![warn(clippy::undocumented_unsafe_blocks)]
@@ -14,7 +14,7 @@ extern crate alloc;
 #[cfg(target_arch = "x86_64")]
 pub mod clock;
 #[cfg(target_arch = "x86_64")]
-pub mod console;
+pub mod devices;
 pub mod dma;
 #[cfg(target_arch = "x86_64")]
 pub mod interrupt;
@@ -25,5 +25,7 @@ pub mod power;
 pub mod prk;
 #[cfg(target_arch = "x86_64")]
 pub mod rng;
+#[cfg(target_arch = "x86_64")]
+pub mod serial;
 #[cfg(target_arch = "x86_64")]
 pub mod virtio;
