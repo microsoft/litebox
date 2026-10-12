@@ -402,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn child_exits_coalesce_and_follow_pending_signals() {
+    fn child_events_coalesce_and_follow_pending_signals() {
         let broker = broker();
         let parent = process(&broker);
         let sink = Arc::new(TestReadinessSink::default());
@@ -412,55 +412,23 @@ mod tests {
             exit_status: ProcessExitStatus::Exited { code },
         };
 
+        // Later child events coalesce into pending ones, and only a newly
+        // pending event republishes readiness.
+        parent.signals.post_child_removed();
+        parent.signals.post_child_removed();
         parent.signals.post_child_exit(exit(100, 1));
         parent.signals.post_child_exit(exit(101, 2));
         super::send(&parent, to(&parent), 17).unwrap();
         assert_eq!(
             *sink.republished.lock().unwrap(),
-            [
-                (handle, ReadinessFlags::READ),
-                (handle, ReadinessFlags::READ)
-            ]
+            [(handle, ReadinessFlags::READ); 3]
         );
+
+        // Signals are taken first, then the child exit, then the removal.
         assert_eq!(super::take(&parent, handle), Ok(pending(17, parent.id())));
-        assert_eq!(parent.check_readiness(handle), Ok(ReadinessFlags::READ));
         assert_eq!(
             super::take(&parent, handle),
             Ok(SignalEvent::ChildExited(exit(100, 1)))
-        );
-        assert_eq!(super::take(&parent, handle), Err(BrokerError::WouldBlock));
-        assert_eq!(
-            parent.check_readiness(handle),
-            Ok(ReadinessFlags::default())
-        );
-
-        // Once taken, the next exit is notified again.
-        parent.signals.post_child_exit(exit(102, 3));
-        assert_eq!(sink.republished.lock().unwrap().len(), 3);
-        assert_eq!(
-            super::take(&parent, handle),
-            Ok(SignalEvent::ChildExited(exit(102, 3)))
-        );
-    }
-
-    #[test]
-    fn child_removals_coalesce_and_follow_child_exits() {
-        let broker = broker();
-        let parent = process(&broker);
-        let sink = Arc::new(TestReadinessSink::default());
-        let handle = super::open(&parent, sink.clone()).unwrap();
-        let exit = ChildExit {
-            process_id: ProcessId(100),
-            exit_status: ProcessExitStatus::Exited { code: 1 },
-        };
-
-        parent.signals.post_child_removed();
-        parent.signals.post_child_removed();
-        parent.signals.post_child_exit(exit);
-        assert_eq!(sink.republished.lock().unwrap().len(), 2);
-        assert_eq!(
-            super::take(&parent, handle),
-            Ok(SignalEvent::ChildExited(exit))
         );
         assert_eq!(parent.check_readiness(handle), Ok(ReadinessFlags::READ));
         assert_eq!(super::take(&parent, handle), Ok(SignalEvent::ChildRemoved));
@@ -470,9 +438,14 @@ mod tests {
             Ok(ReadinessFlags::default())
         );
 
-        // Once taken, the next removal is notified again.
+        // Once taken, each child event is notified again.
+        parent.signals.post_child_exit(exit(102, 3));
         parent.signals.post_child_removed();
-        assert_eq!(sink.republished.lock().unwrap().len(), 3);
+        assert_eq!(sink.republished.lock().unwrap().len(), 5);
+        assert_eq!(
+            super::take(&parent, handle),
+            Ok(SignalEvent::ChildExited(exit(102, 3)))
+        );
         assert_eq!(super::take(&parent, handle), Ok(SignalEvent::ChildRemoved));
     }
 

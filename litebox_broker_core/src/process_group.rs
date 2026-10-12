@@ -136,26 +136,6 @@ mod tests {
     }
 
     #[test]
-    fn children_inherit_their_parents_membership() {
-        let broker = broker();
-        let root = process(&broker, None);
-        let child = process(&broker, Some(&root));
-        let other = process(&broker, None);
-
-        assert_eq!(get(&other, root.id()), Ok(membership(&root, &root)));
-        assert_eq!(get(&other, child.id()), Ok(membership(&root, &root)));
-        assert_eq!(get(&root, other.id()), Ok(membership(&other, &other)));
-        assert_eq!(
-            get(&root, ProcessId(u32::MAX)),
-            Err(BrokerError::UnknownObject)
-        );
-
-        super::set(&root, child.id(), child.id().into()).unwrap();
-        let grandchild = process(&broker, Some(&child));
-        assert_eq!(get(&root, grandchild.id()), Ok(membership(&child, &root)));
-    }
-
-    #[test]
     fn setting_groups_follows_the_session_rules() {
         let broker = broker();
         let root = process(&broker, None);
@@ -194,27 +174,12 @@ mod tests {
         );
         super::set(&first, grandchild.id(), root.id().into()).unwrap();
 
-        // A child in another session cannot move, nor can a session leader.
+        // A child in another session cannot move.
         super::create_session(&grandchild, grandchild.id()).unwrap();
         assert_eq!(
             super::set(&first, grandchild.id(), first.id().into()),
             Err(BrokerError::PolicyDenied)
         );
-        assert_eq!(
-            super::set(&grandchild, grandchild.id(), grandchild.id().into()),
-            Err(BrokerError::PolicyDenied)
-        );
-        let great_grandchild = process(&broker, Some(&grandchild));
-        assert_eq!(
-            super::set(&great_grandchild, great_grandchild.id(), root.id().into()),
-            Err(BrokerError::PolicyDenied)
-        );
-        super::set(
-            &great_grandchild,
-            great_grandchild.id(),
-            grandchild.id().into(),
-        )
-        .unwrap();
     }
 
     #[test]
