@@ -97,7 +97,7 @@ jobs:
         # The kernel reflects their syscalls to the userland runner.
         run: |
           QEMU_ACCEL=tcg CARGO_BUILD="$PWD/.github/tools/github_actions_run_cargo build" \
-            ./dev_tools/run_optee_on_vm_userland.sh -u
+            ./dev_tools/run_optee_on_vm_userland.sh -u -t concurrent-sessions -t ta-death -t hello-ta
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
           # We need to run `cargo test --doc` separately because doc tests
