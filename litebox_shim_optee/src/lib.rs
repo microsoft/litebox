@@ -289,7 +289,7 @@ impl<Platform: OpteeShimPlatform> GlobalState<Platform> {
     /// Store a trusted TA embedded in the runner image.
     ///
     /// Raw ELF binaries are stored directly. Signed TAs are verified and unwrapped.
-    pub(crate) fn store_embedded_ta(&self, ta_bin: &[u8]) -> bool {
+    pub(crate) fn store_embedded_ta_bin(&self, ta_bin: &[u8]) -> bool {
         let (ta_uuid, ta_svn, ta_elf) = if ta_bin.starts_with(&SHDR_MAGIC.to_le_bytes()) {
             let Some((ta_uuid, ta_svn, ta_elf)) =
                 verify_signed_ta(ta_bin, self.ta_signing_key.as_ref())
@@ -468,22 +468,15 @@ impl<Platform: OpteeShimPlatform> OpteeShim<Platform> {
 
     /// Verify and store a signed dynamic TA.
     ///
-    /// Returns `true` if the binary was successfully stored, `false` if the binary's
-    /// UUID (from `.ta_head` section) doesn't match the provided UUID or parsing failed.
+    /// Returns `true` if the binary was successfully stored, `false` if the signature
+    /// is invalid, the signed UUID doesn't match the provided UUID, or parsing failed.
     pub fn store_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &[u8]) -> bool {
         self.0.store_ta_bin(ta_uuid, ta_bin)
     }
 
-    /// Store a TA binary embedded in the runner image.
-    pub fn store_embedded_ta_bin(&self, ta_uuid: &TeeUuid, ta_bin: &'static [u8]) -> bool {
-        self.0
-            .embedded_ta_uuid_map
-            .insert(*ta_uuid, ta_bin.into(), 0)
-    }
-
     /// Store a raw or signed TA embedded in the runner image.
-    pub fn store_embedded_ta(&self, ta_bin: &[u8]) -> bool {
-        self.0.store_embedded_ta(ta_bin)
+    pub fn store_embedded_ta_bin(&self, ta_bin: &[u8]) -> bool {
+        self.0.store_embedded_ta_bin(ta_bin)
     }
 
     /// Get the cached TA binary associated with the given TA UUID.
@@ -1605,17 +1598,19 @@ fn embedded_ta_uuid_map() -> &'static TaUuidMap {
 struct TaVerifyKey(rsa::RsaPublicKey);
 
 impl TaVerifyKey {
-    fn from_der(der: &[u8]) -> Result<Self, &'static str> {
+    fn from_der(der: &[u8]) -> Result<Self, SignedTaError> {
         use rsa::pkcs8::DecodePublicKey;
 
         rsa::RsaPublicKey::from_public_key_der(der)
             .map(Self)
-            .map_err(|_| "Invalid RSA public key DER")
+            .map_err(|_| SignedTaError::InvalidPublicKeyDer)
     }
 }
 
 #[derive(Debug, Error)]
 enum SignedTaError {
+    #[error("invalid RSA public key DER")]
+    InvalidPublicKeyDer,
     #[error("invalid signed TA file")]
     InvalidFile,
     #[error("invalid signed TA header")]

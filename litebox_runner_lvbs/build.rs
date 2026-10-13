@@ -7,7 +7,7 @@ const KEY_ENV: &str = "LITEBOX_TA_VERIFY_KEY";
 const KEY_OUTPUT_NAME: &str = "ta-signing-public.der";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("cargo:rerun-if-env-changed=LITEBOX_LDELF");
+    println!("cargo::rerun-if-env-changed=LITEBOX_LDELF");
     println!("cargo::rerun-if-env-changed={KEY_ENV}");
 
     let out_dir = env::var_os("OUT_DIR")

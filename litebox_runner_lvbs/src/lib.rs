@@ -1772,7 +1772,7 @@ const TA_SIGNING_CERT_DER: &[u8] =
 /// Register all TA binaries embedded in the runner image.
 fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
     for ta_binary in TA_BINARIES {
-        if !ta_binary.is_empty() && !shim.store_embedded_ta(ta_binary) {
+        if !ta_binary.is_empty() && !shim.store_embedded_ta_bin(ta_binary) {
             serial_println!("Failed to register embedded TA");
         }
     }
