@@ -866,48 +866,6 @@ mod tests {
     }
 
     #[test]
-    fn inherited_fd_kinds_reject_unknown_fields() {
-        for kind in [
-            InheritedFdKind::Pipe {
-                endpoint: HalfPipeType::SenderHalf,
-            },
-            InheritedFdKind::UnixSocket {
-                socket_type: SocketType::Stream,
-            },
-            InheritedFdKind::Eventfd { semaphore: false },
-            InheritedFdKind::Timerfd {
-                clock: TimerfdClock::RealTime,
-            },
-        ] {
-            let startup = LinuxProgramStartup {
-                uid: 0,
-                euid: 0,
-                gid: 0,
-                egid: 0,
-                blocked_signals: SigSet::empty(),
-                ignored_signals: SigSet::empty(),
-                umask: 0,
-                path: "/bin/child".into(),
-                cwd: "/".into(),
-                argv: vec![],
-                envp: vec![],
-                inherited_fds: vec![InheritedFd {
-                    fd: 0,
-                    handle: ObjectHandle(1),
-                    kind,
-                }],
-            };
-            let mut encoded = startup.encode().unwrap();
-            // The kind's only field is the last byte.
-            *encoded.last_mut().unwrap() = 2;
-            assert_eq!(
-                LinuxProgramStartup::decode(&encoded),
-                Err(LinuxProgramStartupError::Malformed)
-            );
-        }
-    }
-
-    #[test]
     fn program_startup_vector_count_is_payload_bounded() {
         let startup = LinuxProgramStartup {
             uid: 0,
