@@ -3,18 +3,32 @@
 
 //! Broker-owned Unix sockets.
 //!
-//! Every Unix socket lives in one broker-wide table behind a single lock,
-//! since connecting, sending, and closing change the sockets at both ends of
-//! a connection. A socket stays in the table while any reference to it
-//! exists, or while it waits in a listener's backlog. Operations call the
-//! file service and drop files only after releasing the table lock.
+//! Every socket has its own locks, so operations on different sockets, and on
+//! the two directions of one connection, proceed in parallel. A socket's
+//! state lock guards its name and connection, and its incoming channel holds
+//! the data queued for it to receive. Connected sockets refer to each other
+//! weakly. A socket is torn down explicitly once its last reference closes,
+//! or once its listener closes without accepting it.
+//!
+//! Locks are taken only in this order:
+//!
+//! 1. one socket's readiness watchers, which serialize its publications;
+//! 2. one socket's state, or two in address order while one connects to the
+//!    other;
+//! 3. the broker's registry of names;
+//! 4. one socket's incoming channel;
+//! 5. the broker's charge for queued data.
+//!
+//! Sockets are published, and waiting senders woken, only once every other
+//! lock is released. Operations call the file service and drop files without
+//! holding any lock.
 //!
 //! Readiness reaches every reference's registration from the moment the
 //! reference exists, since another process can change a socket through a
 //! connection without sharing a reference to it.
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
@@ -33,6 +47,7 @@ use litebox_broker_protocol::unix_socket::{
 };
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
 
+use crate::channel::{Channel, ChannelState, Waiter, Wakeups};
 use crate::fs::File;
 use crate::object::{ObjectEntry, ObjectRights};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
@@ -77,7 +92,7 @@ pub fn create(
     let rights = creation_rights(process, flags)?;
     let reference = process.reserve_object_reference(rights)?;
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
-    let object = new_object(process, socket_type, flags)?;
+    let object = UnixSocketObject::new(process, socket_type, flags)?;
     object.watch(&registration)?;
     reference.commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
 }
@@ -100,16 +115,16 @@ pub fn create_pair(
         ReadinessRegistration::new(first_reference.handle(), Arc::clone(readiness_sink));
     let second_registration =
         ReadinessRegistration::new(second_reference.handle(), Arc::clone(readiness_sink));
-    let first = new_object(process, socket_type, flags)?;
-    let second = new_object(process, socket_type, flags)?;
-    {
-        let mut table = process.core.unix_sockets.lock();
-        for (id, peer) in [(first.id, second.id), (second.id, first.id)] {
-            table.socket_mut(id)?.connection = Connection::Connected {
-                peer: Some(peer),
-                peer_name: UnixSocketName::Unnamed,
-            };
-        }
+    let first = UnixSocketObject::new(process, socket_type, flags)?;
+    let second = UnixSocketObject::new(process, socket_type, flags)?;
+    for (socket, peer) in [
+        (&first.socket, &second.socket),
+        (&second.socket, &first.socket),
+    ] {
+        socket.state.lock().connection = Connection::Connected {
+            peer: Arc::downgrade(peer),
+            peer_name: UnixSocketName::Unnamed,
+        };
     }
     first.watch(&first_registration)?;
     second.watch(&second_registration)?;
@@ -138,23 +153,22 @@ pub fn bind(
     mode: FileMode,
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
+    let socket = &lease.socket;
     let path = {
-        let mut table = lease.lock();
-        let socket = table.socket_mut(lease.id)?;
-        if socket.binding || socket.name != UnixSocketName::Unnamed {
+        let mut state = socket.state.lock();
+        if state.binding || state.name != UnixSocketName::Unnamed {
             return Ok(Err(UnixSocketError::InvalidArgument));
         }
         match address {
             UnixSocketAddress::Abstract(_) => {
-                return table.register_name(
-                    lease.id,
-                    NameKey::of(address, lease.socket_type),
+                return socket.register_name(
+                    &mut state,
+                    NameKey::of(address, socket.kind),
                     address.name(),
-                    &mut None,
                 );
             }
             UnixSocketAddress::Path { path, .. } => {
-                socket.binding = true;
+                state.binding = true;
                 path
             }
         }
@@ -168,11 +182,11 @@ pub fn bind(
         FileOpenFlags::CREATE | FileOpenFlags::EXCLUSIVE,
         mode,
     );
-    // Declared before the table guard, so a marker the socket does not keep
+    // Declared before the state guard, so a marker the socket does not keep
     // drops after the lock.
     let mut marker;
-    let mut table = lease.lock();
-    table.socket_mut(lease.id)?.binding = false;
+    let mut state = socket.state.lock();
+    state.binding = false;
     let key = match created? {
         Ok((file, status)) => {
             marker = Some(file);
@@ -184,7 +198,11 @@ pub fn bind(
         Err(FileError::AlreadyExists) => return Ok(Err(UnixSocketError::AddressInUse)),
         Err(error) => return Ok(Err(UnixSocketError::File(error))),
     };
-    table.register_name(lease.id, key, address.name(), &mut marker)
+    let registered = socket.register_name(&mut state, key, address.name())?;
+    if registered.is_ok() {
+        state.marker = marker.take();
+    }
+    Ok(registered)
 }
 
 /// Starts accepting connections on a bound stream socket, or changes the
@@ -195,27 +213,31 @@ pub fn listen(
     backlog: u32,
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    if lease.socket_type != SocketType::Stream {
+    let socket = &lease.socket;
+    if socket.kind != SocketType::Stream {
         return Ok(Err(UnixSocketError::Unsupported));
     }
     let limit = backlog.min(MAX_UNIX_SOCKET_BACKLOG) as usize;
-    let mut table = lease.lock();
-    let socket = table.socket_mut(lease.id)?;
-    if socket.name == UnixSocketName::Unnamed {
-        return Ok(Err(UnixSocketError::InvalidArgument));
-    }
-    match &mut socket.connection {
-        Connection::None => {
-            socket.connection = Connection::Listening {
-                backlog: VecDeque::new(),
-                limit,
-            };
+    let wakeups = {
+        let mut state = socket.state.lock();
+        if state.name == UnixSocketName::Unnamed {
+            return Ok(Err(UnixSocketError::InvalidArgument));
         }
-        Connection::Listening { limit: current, .. } => *current = limit,
-        Connection::Connected { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
-    }
-    table.wake_waiters(lease.id);
-    table.publish(lease.id);
+        match &mut state.connection {
+            Connection::None => {
+                state.connection = Connection::Listening {
+                    backlog: VecDeque::new(),
+                    limit,
+                };
+            }
+            Connection::Listening { limit: current, .. } => *current = limit,
+            Connection::Connected { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
+        }
+        // Sockets waiting for room in the backlog retry.
+        socket.incoming.lock().wake()
+    };
+    wakeups.wake();
+    socket.publish();
     Ok(Ok(()))
 }
 
@@ -231,43 +253,20 @@ pub fn connect(
     user: FileUser,
 ) -> Result<UnixSocketResult<()>> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    // The node stays open until after the table guard drops, so its identity
-    // cannot be reused while the operation runs.
-    let (key, _node) = match lookup(process, address, user, lease.socket_type)? {
+    let socket = &lease.socket;
+    // The node stays open until the connect finishes, so its identity cannot
+    // be reused meanwhile.
+    let (key, _node) = match lookup(process, address, user, socket.kind)? {
         Ok(found) => found,
         Err(error) => return Ok(Err(error)),
     };
-    let mut table = lease.lock();
-    let target = match table.target(&key, lease.socket_type)? {
+    let target = match socket.sockets.find(&key, socket.kind) {
         Ok(target) => target,
         Err(error) => return Ok(Err(error)),
     };
-    match lease.socket_type {
-        SocketType::Stream => table.connect_stream(lease.id, target, lease.nonblocking),
-        SocketType::Datagram => {
-            if !table.accepts_datagrams_from(target, lease.id)? {
-                return Ok(Err(UnixSocketError::NotPermitted));
-            }
-            let peer_name = table.socket(target)?.name.clone();
-            let socket = table.socket_mut(lease.id)?;
-            let previous = core::mem::replace(
-                &mut socket.connection,
-                Connection::Connected {
-                    peer: Some(target),
-                    peer_name,
-                },
-            );
-            // Like Linux, connecting to another peer discards the queued
-            // datagrams.
-            if matches!(previous, Connection::Connected { peer: Some(old), .. } if old != target) {
-                table.purge_datagrams(lease.id)?;
-            }
-            // Senders blocked on this socket recheck whether it still
-            // accepts their datagrams.
-            table.wake_waiters(lease.id);
-            table.publish(lease.id);
-            Ok(Ok(()))
-        }
+    match socket.kind {
+        SocketType::Stream => socket.connect_stream(&target, lease.nonblocking),
+        SocketType::Datagram => Ok(socket.connect_datagram(&target)),
         _ => Err(BrokerError::Internal),
     }
 }
@@ -286,36 +285,35 @@ pub fn accept(
 ) -> Result<UnixSocketResult<ObjectHandle>> {
     let rights = creation_rights(process, flags)?;
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
-    if lease.socket_type != SocketType::Stream {
+    let listener = &lease.socket;
+    if listener.kind != SocketType::Stream {
         return Ok(Err(UnixSocketError::Unsupported));
     }
     let reference = process.reserve_object_reference(rights)?;
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
-    let accepted = {
-        let mut table = lease.lock();
-        let listener = table.socket_mut(lease.id)?;
-        let Connection::Listening { backlog, .. } = &mut listener.connection else {
+    let (accepted, wakeups) = {
+        let mut state = listener.state.lock();
+        let Connection::Listening { backlog, .. } = &mut state.connection else {
             return Ok(Err(UnixSocketError::InvalidArgument));
         };
+        let mut channel = listener.incoming.lock();
         let Some(accepted) = backlog.pop_front() else {
             // Linux reports a shut-down listener as invalid only to callers
             // that would otherwise wait.
-            return if listener.read_shut && !lease.nonblocking {
+            return if channel.is_shut() && !lease.nonblocking {
                 Ok(Err(UnixSocketError::InvalidArgument))
             } else {
                 Err(BrokerError::would_block(lease.nonblocking))
             };
         };
-        table.refund(lease.id, CONNECTION_OVERHEAD)?;
-        table.wake_waiters(lease.id);
-        accepted
+        listener
+            .sockets
+            .refund(&listener.quota, CONNECTION_OVERHEAD);
+        // Sockets waiting for room in the backlog retry.
+        (accepted, channel.wake())
     };
-    let object = UnixSocketObject::new(
-        Arc::clone(&lease.sockets),
-        accepted,
-        SocketType::Stream,
-        flags,
-    );
+    wakeups.wake();
+    let object = UnixSocketObject::from_socket(accepted, flags);
     object.watch(&registration)?;
     reference
         .commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
@@ -339,25 +337,25 @@ pub fn send(
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    match lease.socket_type {
-        SocketType::Stream => {
-            lease
-                .lock()
-                .send_stream(lease.id, address.is_some(), data, lease.nonblocking)
-        }
+    let socket = &lease.socket;
+    match socket.kind {
+        SocketType::Stream => socket.send_stream(address.is_some(), data, lease.nonblocking),
         SocketType::Datagram => {
-            // The node stays open until after the table guard drops, as for
-            // `connect`.
-            let (key, _node) =
-                match address.map(|address| lookup(process, address, user, SocketType::Datagram)) {
-                    Some(found) => match found? {
-                        Ok((key, node)) => (Some(key), node),
+            // The node stays open until the send finishes, as for `connect`.
+            let (target, _node) = match address {
+                Some(address) => {
+                    let (key, node) = match lookup(process, address, user, SocketType::Datagram)? {
+                        Ok(found) => found,
                         Err(error) => return Ok(Err(error)),
-                    },
-                    None => (None, None),
-                };
-            let mut table = lease.lock();
-            table.send_datagram(lease.id, key.as_ref(), data, lease.nonblocking)
+                    };
+                    match socket.sockets.find(&key, SocketType::Datagram) {
+                        Ok(target) => (Some(target), node),
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
+                None => (None, None),
+            };
+            socket.send_datagram(target, data, lease.nonblocking)
         }
         _ => Err(BrokerError::Internal),
     }
@@ -386,13 +384,11 @@ pub fn receive(
         return Err(BrokerError::ResourceExhausted);
     }
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
+    let socket = &lease.socket;
     let nonblocking = nonblocking || lease.nonblocking;
-    let mut table = lease.lock();
-    match lease.socket_type {
-        SocketType::Stream => table.receive_stream(lease.id, capacity as usize, peek, nonblocking),
-        SocketType::Datagram => {
-            table.receive_datagram(lease.id, capacity as usize, peek, nonblocking)
-        }
+    match socket.kind {
+        SocketType::Stream => socket.receive_stream(capacity as usize, peek, nonblocking),
+        SocketType::Datagram => socket.receive_datagram(capacity as usize, peek, nonblocking),
         _ => Err(BrokerError::Internal),
     }
 }
@@ -413,29 +409,15 @@ pub fn shutdown(
         _ => return Err(BrokerError::UnsupportedOperation),
     };
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    let mut table = lease.lock();
-    let socket = table.socket_mut(lease.id)?;
-    socket.read_shut |= read;
-    socket.write_shut |= write;
-    let peer = match (&socket.connection, socket.kind) {
-        (
-            Connection::Connected {
-                peer: Some(peer), ..
-            },
-            SocketType::Stream,
-        ) => Some(*peer),
-        _ => None,
-    };
-    if let Some(peer) = peer.and_then(|peer| table.sockets.get_mut(&peer)) {
-        peer.read_shut |= write;
-        peer.write_shut |= read;
-    }
-    table.publish(lease.id);
+    let socket = &lease.socket;
+    let (peer, wakeups) = socket.shut_down(read, write);
+    wakeups.wake();
+    socket.publish();
     if let Some(peer) = peer {
-        table.publish(peer);
+        let (_, wakeups) = peer.shut_down(write, read);
+        wakeups.wake();
+        peer.publish();
     }
-    // Senders waiting for room now fail.
-    table.wake_waiters(lease.id);
     Ok(Ok(()))
 }
 
@@ -450,12 +432,11 @@ pub fn name(
         process
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
     )?;
-    let table = lease.lock();
-    let socket = table.socket(lease.id)?;
+    let state = lease.socket.state.lock();
     if !peer {
-        return Ok(Ok(socket.name.clone()));
+        return Ok(Ok(state.name.clone()));
     }
-    match &socket.connection {
+    match &state.connection {
         Connection::Connected { peer_name, .. } => Ok(Ok(peer_name.clone())),
         Connection::None | Connection::Listening { .. } => Ok(Err(UnixSocketError::NotConnected)),
     }
@@ -468,7 +449,7 @@ pub fn set_option(
     value: UnixSocketOptionValue,
 ) -> Result<()> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    lease.lock().socket_mut(lease.id)?.options.set(value);
+    lease.socket.state.lock().options.set(value);
     Ok(())
 }
 
@@ -482,7 +463,7 @@ pub fn get_option(
         process
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
     )?;
-    Ok(lease.lock().socket(lease.id)?.options.get(name))
+    Ok(lease.socket.state.lock().options.get(name))
 }
 
 fn creation_rights(process: &BrokerProcess, flags: FileOpenFlags) -> Result<ObjectRights> {
@@ -493,28 +474,6 @@ fn creation_rights(process: &BrokerProcess, flags: FileOpenFlags) -> Result<Obje
         .core
         .policy
         .principal_object_rights(process.caller_credential)
-}
-
-fn new_object(
-    process: &BrokerProcess,
-    socket_type: SocketType,
-    flags: FileOpenFlags,
-) -> Result<UnixSocketObject> {
-    if !matches!(socket_type, SocketType::Stream | SocketType::Datagram) {
-        return Err(BrokerError::UnsupportedOperation);
-    }
-    let sockets = &process.core.unix_sockets;
-    let id = sockets.lock().insert(Socket::new(
-        socket_type,
-        UnixSocketName::Unnamed,
-        Arc::clone(&process.unix_socket_bytes),
-    ))?;
-    Ok(UnixSocketObject::new(
-        Arc::clone(sockets),
-        id,
-        socket_type,
-        flags,
-    ))
 }
 
 /// Resolves `address` to the key of the name a `socket_type` socket bound to
@@ -573,9 +532,7 @@ impl ObjectEntry {
 
 /// One Unix socket's open state, which its references share.
 pub(crate) struct UnixSocketObject {
-    sockets: Arc<UnixSockets>,
-    id: SocketId,
-    socket_type: SocketType,
+    socket: Arc<Socket>,
     /// Whether operations that would block fail instead of waiting.
     nonblocking: bool,
     /// Whether `O_APPEND` is set, which Linux reports but which has no effect on a socket.
@@ -583,16 +540,25 @@ pub(crate) struct UnixSocketObject {
 }
 
 impl UnixSocketObject {
-    fn new(
-        sockets: Arc<UnixSockets>,
-        id: SocketId,
-        socket_type: SocketType,
-        flags: FileOpenFlags,
-    ) -> Self {
-        Self {
-            sockets,
-            id,
+    /// Creates a new unnamed, unconnected `socket_type` socket.
+    fn new(process: &BrokerProcess, socket_type: SocketType, flags: FileOpenFlags) -> Result<Self> {
+        if !matches!(socket_type, SocketType::Stream | SocketType::Datagram) {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        let socket = Socket::new(
             socket_type,
+            Arc::clone(&process.core.unix_sockets),
+            Arc::clone(&process.unix_socket_bytes),
+            UnixSocketName::Unnamed,
+            Connection::None,
+        );
+        Ok(Self::from_socket(Arc::new(socket), flags))
+    }
+
+    /// Takes ownership of `socket`, which closes once the object drops.
+    fn from_socket(socket: Arc<Socket>, flags: FileOpenFlags) -> Self {
+        Self {
+            socket,
             nonblocking: flags.contains(FileOpenFlags::NONBLOCKING),
             append: flags.contains(FileOpenFlags::APPEND),
         }
@@ -601,15 +567,11 @@ impl UnixSocketObject {
     /// Publishes this socket's readiness changes through `registration`
     /// until every clone of `registration` drops.
     pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
-        self.sockets
-            .lock()
-            .socket_mut(self.id)?
-            .watchers
-            .watch(registration)
+        self.socket.watchers.lock().watch(registration)
     }
 
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        self.sockets.lock().readiness(self.id)
+        self.socket.readiness()
     }
 
     /// Returns the socket's access mode and status flags.
@@ -642,71 +604,115 @@ impl UnixSocketObject {
 
 impl Drop for UnixSocketObject {
     fn drop(&mut self) {
-        let marker = self.sockets.lock().remove(self.id);
-        drop(marker);
+        self.socket.close();
     }
 }
 
 /// An authorized socket whose object stays alive until the lease drops.
 ///
-/// Callers drop table guards before the lease, since dropping the last
-/// reference to the object removes the socket from the table.
+/// Dropping the last reference to the object closes the socket, which takes
+/// the locks of the socket and its peer, so callers release every lock
+/// before the lease drops.
 struct Lease {
     _object: Arc<RwLock<ObjectEntry>>,
-    sockets: Arc<UnixSockets>,
-    id: SocketId,
-    socket_type: SocketType,
+    socket: Arc<Socket>,
     nonblocking: bool,
 }
 
 impl Lease {
     fn new(object: Arc<RwLock<ObjectEntry>>) -> Result<Self> {
-        let (sockets, id, socket_type, nonblocking) = {
+        let (socket, nonblocking) = {
             let entry = object.read();
             let socket = entry.as_unix_socket()?;
-            (
-                Arc::clone(&socket.sockets),
-                socket.id,
-                socket.socket_type,
-                socket.nonblocking,
-            )
+            (Arc::clone(&socket.socket), socket.nonblocking)
         };
         Ok(Self {
             _object: object,
-            sockets,
-            id,
-            socket_type,
+            socket,
             nonblocking,
         })
     }
-
-    fn lock(&self) -> MutexGuard<'_, Table> {
-        self.sockets.lock()
-    }
 }
 
-/// Every Unix socket of a broker.
-pub(crate) struct UnixSockets(Mutex<Table>);
+/// The Unix sockets of a broker: the names they hold, and the charge for the
+/// data queued in them.
+pub(crate) struct UnixSockets {
+    /// Socket holding each bound name.
+    names: RwLock<HashMap<NameKey, Weak<Socket>>>,
+    /// Bytes charged for data queued in every socket. Processes' charges
+    /// change only under this lock too, so a charge commits both or neither.
+    queued: Mutex<usize>,
+    max_queued: usize,
+    max_queued_per_process: usize,
+}
 
 impl UnixSockets {
     pub(crate) fn new(limits: &BrokerCoreLimits) -> Self {
-        Self(Mutex::new(Table {
-            sockets: HashMap::new(),
-            names: HashMap::new(),
-            next_id: 0,
-            queued: 0,
+        Self {
+            names: RwLock::new(HashMap::new()),
+            queued: Mutex::new(0),
             max_queued: limits.max_total_unix_socket_bytes,
             max_queued_per_process: limits.max_unix_socket_bytes_per_process,
-        }))
+        }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Table> {
-        self.0.lock()
+    /// Returns the socket holding the name `key`, which must have type
+    /// `socket_type`.
+    fn find(&self, key: &NameKey, socket_type: SocketType) -> UnixSocketResult<Arc<Socket>> {
+        let socket = self
+            .names
+            .read()
+            .get(key)
+            .and_then(Weak::upgrade)
+            .ok_or(UnixSocketError::ConnectionRefused)?;
+        if socket.kind != socket_type {
+            return Err(UnixSocketError::WrongType);
+        }
+        Ok(socket)
+    }
+
+    /// Releases the name `key` if `socket` still holds it.
+    fn unregister(&self, key: &NameKey, socket: &Socket) {
+        let mut names = self.names.write();
+        if names
+            .get(key)
+            .is_some_and(|holder| core::ptr::eq(holder.as_ptr(), socket))
+        {
+            names.remove(key);
+        }
+    }
+
+    /// Charges `bytes` of newly queued data, to the process quota `quota`
+    /// among others.
+    fn charge(&self, quota: &AtomicUsize, bytes: usize) -> Result<()> {
+        let mut queued = self.queued.lock();
+        let total = queued
+            .checked_add(bytes)
+            .filter(|total| *total <= self.max_queued)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        let charged = quota
+            .load(Ordering::Relaxed)
+            .checked_add(bytes)
+            .filter(|charged| *charged <= self.max_queued_per_process)
+            .ok_or(BrokerError::ResourceExhausted)?;
+        quota.store(charged, Ordering::Relaxed);
+        *queued = total;
+        Ok(())
+    }
+
+    /// Releases the charge for `bytes` of dequeued data.
+    fn refund(&self, quota: &AtomicUsize, bytes: usize) {
+        let mut queued = self.queued.lock();
+        let charged = quota
+            .load(Ordering::Relaxed)
+            .checked_sub(bytes)
+            .expect("a process's Unix socket charge must cover its sockets'");
+        quota.store(charged, Ordering::Relaxed);
+        *queued = queued
+            .checked_sub(bytes)
+            .expect("the broker's Unix socket charge must cover every socket's");
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SocketId(u64);
 
 /// Identity of a bound name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -769,73 +775,72 @@ impl Options {
     }
 }
 
+/// One Unix socket.
+///
+/// Dropping a socket tears nothing down: [`Socket::close`] does once nothing
+/// reaches the socket through a reference or a backlog, so temporary handles
+/// to it may drop anywhere.
 struct Socket {
     kind: SocketType,
+    sockets: Arc<UnixSockets>,
+    /// Quota of the process that created the socket, charged for the data
+    /// queued for it and for its backlog.
+    quota: Arc<AtomicUsize>,
+    state: Mutex<State>,
+    /// Data queued for the socket to receive. Its waiters are the sockets
+    /// waiting for room in it, or in the socket's backlog.
+    incoming: Channel<Queue, Socket>,
+    /// Registrations that receive the socket's readiness. Their lock
+    /// serializes publications, so the last one reflects the latest state.
+    watchers: Mutex<ReadinessWatchers>,
+}
+
+struct State {
     name: UnixSocketName,
-    /// Whether a bind is creating the socket's path outside the table lock.
+    /// Whether a bind is creating the socket's path without holding the lock.
     binding: bool,
     name_key: Option<NameKey>,
     /// File created by binding to a path, held open so the node that
     /// identifies the name stays allocated.
     marker: Option<File>,
     options: Options,
-    read_shut: bool,
+    /// Whether the socket stopped sending. Its incoming channel is shut once
+    /// it stops receiving.
     write_shut: bool,
+    /// Whether the socket was torn down.
+    closed: bool,
     connection: Connection,
-    /// Bytes queued for a stream socket.
-    stream: VecDeque<u8>,
-    /// Datagrams queued for a datagram socket.
-    datagrams: VecDeque<Datagram>,
-    /// Bytes charged for queued data, or for a listener's backlog.
-    queued: usize,
-    /// Quota of the process that created the socket, charged for its queued
-    /// data.
-    quota: Arc<AtomicUsize>,
-    /// Sockets to wake once this socket's queue drains or it closes.
-    waiters: Vec<SocketId>,
-    watchers: ReadinessWatchers,
-}
-
-impl Socket {
-    fn new(kind: SocketType, name: UnixSocketName, quota: Arc<AtomicUsize>) -> Self {
-        Self {
-            kind,
-            name,
-            binding: false,
-            name_key: None,
-            marker: None,
-            options: Options::default(),
-            read_shut: false,
-            write_shut: false,
-            connection: Connection::None,
-            stream: VecDeque::new(),
-            datagrams: VecDeque::new(),
-            queued: 0,
-            quota,
-            waiters: Vec::new(),
-            watchers: ReadinessWatchers::default(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.stream.is_empty() && self.datagrams.is_empty()
-    }
 }
 
 enum Connection {
     None,
     Listening {
         /// Connected sockets not yet accepted.
-        backlog: VecDeque<SocketId>,
+        backlog: VecDeque<Arc<Socket>>,
         /// Backlog length beyond which connecting waits.
         limit: usize,
     },
     Connected {
-        /// The peer, or `None` once a stream peer closes.
-        peer: Option<SocketId>,
+        /// The peer, which a stream socket forgets once the peer closes.
+        peer: Weak<Socket>,
         /// Name the peer had when the connection formed.
         peer_name: UnixSocketName,
     },
+}
+
+/// Data queued for a socket to receive.
+#[derive(Default)]
+struct Queue {
+    /// Bytes queued for a stream socket.
+    bytes: VecDeque<u8>,
+    /// Datagrams queued for a datagram socket.
+    datagrams: VecDeque<Datagram>,
+}
+
+impl Queue {
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty() && self.datagrams.is_empty()
+    }
 }
 
 struct Datagram {
@@ -849,547 +854,603 @@ impl Datagram {
     }
 }
 
-struct Table {
-    sockets: HashMap<SocketId, Socket>,
-    names: HashMap<NameKey, SocketId>,
-    next_id: u64,
-    /// Bytes charged for data queued in every socket.
-    queued: usize,
-    max_queued: usize,
-    max_queued_per_process: usize,
+/// Returns whether `weak` refers to `socket`.
+///
+/// A weak reference keeps its allocation, so no other socket can take its
+/// address while it exists.
+fn refers_to(weak: &Weak<Socket>, socket: &Arc<Socket>) -> bool {
+    core::ptr::eq(weak.as_ptr(), Arc::as_ptr(socket))
 }
 
-impl Table {
-    fn socket(&self, id: SocketId) -> Result<&Socket> {
-        self.sockets.get(&id).ok_or(BrokerError::Internal)
+/// Locks the states of two different sockets in address order, so connects
+/// in opposite directions cannot deadlock.
+fn lock_both<'a>(
+    first: &'a Socket,
+    second: &'a Socket,
+) -> (MutexGuard<'a, State>, MutexGuard<'a, State>) {
+    if core::ptr::from_ref(first) < core::ptr::from_ref(second) {
+        let first = first.state.lock();
+        (first, second.state.lock())
+    } else {
+        let second = second.state.lock();
+        (first.state.lock(), second)
+    }
+}
+
+impl Waiter for Socket {
+    fn wake(self: Arc<Self>) {
+        self.publish();
+    }
+}
+
+impl Socket {
+    fn new(
+        kind: SocketType,
+        sockets: Arc<UnixSockets>,
+        quota: Arc<AtomicUsize>,
+        name: UnixSocketName,
+        connection: Connection,
+    ) -> Self {
+        Self {
+            kind,
+            sockets,
+            quota,
+            state: Mutex::new(State {
+                name,
+                binding: false,
+                name_key: None,
+                marker: None,
+                options: Options::default(),
+                write_shut: false,
+                closed: false,
+                connection,
+            }),
+            incoming: Channel::new(Queue::default(), CAPACITY),
+            watchers: Mutex::new(ReadinessWatchers::default()),
+        }
     }
 
-    fn socket_mut(&mut self, id: SocketId) -> Result<&mut Socket> {
-        self.sockets.get_mut(&id).ok_or(BrokerError::Internal)
+    /// Publishes the socket's readiness after a change that may affect it.
+    fn publish(self: &Arc<Self>) {
+        let watchers = self.watchers.lock();
+        watchers.publish(self.readiness());
     }
 
-    fn insert(&mut self, socket: Socket) -> Result<SocketId> {
-        let id = SocketId(self.next_id);
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        self.sockets
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        self.sockets.insert(id, socket);
-        Ok(id)
+    /// Returns the readiness of the socket.
+    ///
+    /// A socket that cannot send because its peer is full starts waiting for
+    /// the peer to drain, as Linux does when polled. If it cannot wait, it
+    /// reports itself writable, so a send retries and reports the failure
+    /// rather than waiting for a wakeup that never comes.
+    fn readiness(self: &Arc<Self>) -> ReadinessFlags {
+        let (write_shut, connection) = {
+            let state = self.state.lock();
+            let connection = match &state.connection {
+                Connection::None => None,
+                Connection::Listening { backlog, .. } => Some(Err(!backlog.is_empty())),
+                Connection::Connected { peer, .. } => Some(Ok(peer.clone())),
+            };
+            (state.write_shut, connection)
+        };
+        let mut readiness = ReadinessFlags::default();
+        {
+            let channel = self.incoming.lock();
+            if channel.is_shut() {
+                readiness = readiness | ReadinessFlags::READ | ReadinessFlags::HANGUP;
+                if write_shut {
+                    readiness = readiness | ReadinessFlags::CLOSED;
+                }
+            }
+            if !channel.queue.is_empty() {
+                readiness = readiness | ReadinessFlags::READ;
+            }
+        }
+        let peer = match connection {
+            None => {
+                if self.kind == SocketType::Stream {
+                    readiness = readiness | ReadinessFlags::CLOSED;
+                }
+                None
+            }
+            Some(Err(pending)) => {
+                if pending {
+                    readiness = readiness | ReadinessFlags::READ;
+                }
+                return readiness;
+            }
+            Some(Ok(peer)) => peer.upgrade(),
+        };
+        if let Some(peer) = peer {
+            let mut channel = peer.incoming.lock();
+            if !channel.is_shut() && channel.room() == 0 && channel.wait(self).is_ok() {
+                return readiness;
+            }
+        }
+        readiness | ReadinessFlags::WRITE
     }
 
-    /// Records that socket `id` holds the name `name` identified by `key`,
-    /// taking `marker` if it succeeds.
+    /// Records that the socket holds the name `name` identified by `key`.
     fn register_name(
-        &mut self,
-        id: SocketId,
+        self: &Arc<Self>,
+        state: &mut State,
         key: NameKey,
         name: UnixSocketName,
-        marker: &mut Option<File>,
     ) -> Result<UnixSocketResult<()>> {
-        if self.names.contains_key(&key) {
+        let mut names = self.sockets.names.write();
+        if names.contains_key(&key) {
             return Ok(Err(UnixSocketError::AddressInUse));
         }
-        self.names
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-        socket.name = name;
-        socket.name_key = Some(key.clone());
-        socket.marker = marker.take();
-        self.names.insert(key, id);
+        names.try_reserve(1).map_err(|_| BrokerError::OutOfMemory)?;
+        names.insert(key.clone(), Arc::downgrade(self));
+        state.name = name;
+        state.name_key = Some(key);
         Ok(Ok(()))
-    }
-
-    /// Returns the socket holding the name `key`, which must have type
-    /// `socket_type`.
-    fn target(&self, key: &NameKey, socket_type: SocketType) -> Result<UnixSocketResult<SocketId>> {
-        let Some(&target) = self.names.get(key) else {
-            return Ok(Err(UnixSocketError::ConnectionRefused));
-        };
-        if self.socket(target)?.kind != socket_type {
-            return Ok(Err(UnixSocketError::WrongType));
-        }
-        Ok(Ok(target))
-    }
-
-    /// Returns whether datagram socket `receiver` accepts datagrams from
-    /// `sender`, which it does unless connected to another socket.
-    fn accepts_datagrams_from(&self, receiver: SocketId, sender: SocketId) -> Result<bool> {
-        Ok(match self.socket(receiver)?.connection {
-            Connection::Connected {
-                peer: Some(peer), ..
-            } => peer == sender,
-            _ => true,
-        })
     }
 
     fn connect_stream(
-        &mut self,
-        id: SocketId,
-        target: SocketId,
+        self: &Arc<Self>,
+        listener: &Arc<Socket>,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<()>> {
-        let client = self.socket(id)?;
-        match client.connection {
-            Connection::None => {}
-            Connection::Connected { .. } => return Ok(Err(UnixSocketError::AlreadyConnected)),
-            Connection::Listening { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
+        if Arc::ptr_eq(self, listener) {
+            // A socket never listens while connecting.
+            return Ok(Err(match self.state.lock().connection {
+                Connection::None => UnixSocketError::ConnectionRefused,
+                Connection::Connected { .. } => UnixSocketError::AlreadyConnected,
+                Connection::Listening { .. } => UnixSocketError::InvalidArgument,
+            }));
         }
-        let client_name = client.name.clone();
-        let listener = self.socket(target)?;
-        let Connection::Listening { backlog, limit } = &listener.connection else {
-            return Ok(Err(UnixSocketError::ConnectionRefused));
-        };
-        if listener.read_shut {
-            return Ok(Err(UnixSocketError::ConnectionRefused));
-        }
-        if backlog.len() > *limit {
-            self.add_waiter(target, id)?;
-            return Err(BrokerError::would_block(nonblocking));
-        }
-        let listener_name = listener.name.clone();
-        let mut server = Socket::new(
-            SocketType::Stream,
-            listener_name.clone(),
-            Arc::clone(&listener.quota),
-        );
-        server.connection = Connection::Connected {
-            peer: Some(id),
-            peer_name: client_name,
-        };
-        let Connection::Listening { backlog, .. } = &mut self.socket_mut(target)?.connection else {
-            return Err(BrokerError::Internal);
-        };
-        backlog
-            .try_reserve(1)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        self.charge(target, CONNECTION_OVERHEAD)?;
-        let server = match self.insert(server) {
-            Ok(server) => server,
-            Err(error) => {
-                self.refund(target, CONNECTION_OVERHEAD)?;
-                return Err(error);
+        {
+            let (mut state, mut listening) = lock_both(self, listener);
+            // A closed listener is gone, as if its name were never found.
+            if listening.closed {
+                return Ok(Err(UnixSocketError::ConnectionRefused));
             }
-        };
-        let Connection::Listening { backlog, .. } = &mut self.socket_mut(target)?.connection else {
-            return Err(BrokerError::Internal);
-        };
-        backlog.push_back(server);
-        self.socket_mut(id)?.connection = Connection::Connected {
-            peer: Some(server),
-            peer_name: listener_name,
-        };
-        self.publish(target);
-        self.publish(id);
+            match state.connection {
+                Connection::None => {}
+                Connection::Connected { .. } => return Ok(Err(UnixSocketError::AlreadyConnected)),
+                Connection::Listening { .. } => return Ok(Err(UnixSocketError::InvalidArgument)),
+            }
+            let listener_name = listening.name.clone();
+            let Connection::Listening { backlog, limit } = &mut listening.connection else {
+                return Ok(Err(UnixSocketError::ConnectionRefused));
+            };
+            {
+                let mut channel = listener.incoming.lock();
+                if channel.is_shut() {
+                    return Ok(Err(UnixSocketError::ConnectionRefused));
+                }
+                if backlog.len() > *limit {
+                    channel.wait(self)?;
+                    return Err(BrokerError::would_block(nonblocking));
+                }
+            }
+            backlog
+                .try_reserve(1)
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            self.sockets.charge(&listener.quota, CONNECTION_OVERHEAD)?;
+            let server = Arc::new(Socket::new(
+                SocketType::Stream,
+                Arc::clone(&listener.sockets),
+                Arc::clone(&listener.quota),
+                listener_name.clone(),
+                Connection::Connected {
+                    peer: Arc::downgrade(self),
+                    peer_name: state.name.clone(),
+                },
+            ));
+            state.connection = Connection::Connected {
+                peer: Arc::downgrade(&server),
+                peer_name: listener_name,
+            };
+            backlog.push_back(server);
+        }
+        listener.publish();
+        self.publish();
         Ok(Ok(()))
     }
 
+    fn connect_datagram(self: &Arc<Self>, target: &Arc<Socket>) -> UnixSocketResult<()> {
+        // Both states stay locked from the check to the connection, like
+        // Linux, so neither socket connects elsewhere meanwhile.
+        let wakeups = if Arc::ptr_eq(self, target) {
+            let mut state = self.state.lock();
+            let peer_name = self.accept_peer(&state)?;
+            self.set_datagram_peer(&mut state, target, peer_name)
+        } else {
+            let (mut state, target_state) = lock_both(self, target);
+            let peer_name = self.accept_peer(&target_state)?;
+            self.set_datagram_peer(&mut state, target, peer_name)
+        };
+        wakeups.wake();
+        self.publish();
+        Ok(())
+    }
+
+    /// Returns the name of the datagram socket whose state is `target` if it
+    /// lets this socket connect to it.
+    fn accept_peer(self: &Arc<Self>, target: &State) -> UnixSocketResult<UnixSocketName> {
+        if target.closed {
+            return Err(UnixSocketError::ConnectionRefused);
+        }
+        if let Connection::Connected { peer, .. } = &target.connection
+            && !refers_to(peer, self)
+        {
+            return Err(UnixSocketError::NotPermitted);
+        }
+        Ok(target.name.clone())
+    }
+
+    /// Connects this datagram socket, whose state is `state`, to `target`
+    /// named `peer_name`.
+    fn set_datagram_peer(
+        &self,
+        state: &mut State,
+        target: &Arc<Socket>,
+        peer_name: UnixSocketName,
+    ) -> Wakeups<Socket> {
+        let previous = core::mem::replace(
+            &mut state.connection,
+            Connection::Connected {
+                peer: Arc::downgrade(target),
+                peer_name,
+            },
+        );
+        let mut channel = self.incoming.lock();
+        // Like Linux, connecting to another peer discards the queued
+        // datagrams.
+        if matches!(&previous, Connection::Connected { peer, .. } if !refers_to(peer, target)) {
+            self.purge(&mut channel);
+        }
+        // Senders waiting on this socket recheck whether it still accepts
+        // their datagrams.
+        channel.wake()
+    }
+
     fn send_stream(
-        &mut self,
-        id: SocketId,
+        self: &Arc<Self>,
         addressed: bool,
         data: &[u8],
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
-        let socket = self.socket(id)?;
-        let Connection::Connected { peer, .. } = socket.connection else {
-            return Ok(Err(if addressed {
-                UnixSocketError::Unsupported
-            } else {
-                UnixSocketError::NotConnected
-            }));
+        let peer = {
+            let state = self.state.lock();
+            let Connection::Connected { peer, .. } = &state.connection else {
+                return Ok(Err(if addressed {
+                    UnixSocketError::Unsupported
+                } else {
+                    UnixSocketError::NotConnected
+                }));
+            };
+            if addressed {
+                return Ok(Err(UnixSocketError::AlreadyConnected));
+            }
+            if state.write_shut {
+                return Ok(Err(UnixSocketError::BrokenPipe));
+            }
+            peer.clone()
         };
-        if addressed {
-            return Ok(Err(UnixSocketError::AlreadyConnected));
-        }
-        if socket.write_shut {
-            return Ok(Err(UnixSocketError::BrokenPipe));
-        }
         if data.is_empty() {
             return Ok(Ok(0));
         }
-        let Some(peer) = peer.filter(|peer| self.sockets.get(peer).is_some_and(|p| !p.read_shut))
-        else {
+        let Some(peer) = peer.upgrade() else {
             return Ok(Err(UnixSocketError::BrokenPipe));
         };
-        let available = CAPACITY.saturating_sub(self.socket(peer)?.queued);
-        if available == 0 {
-            return Err(BrokerError::would_block(nonblocking));
-        }
-        let length = available.min(data.len());
-        // Charging first keeps a rejected send from growing the queue.
-        self.charge(peer, length)?;
-        let receiver = self.socket_mut(peer)?;
-        if receiver.stream.try_reserve(length).is_err() {
-            self.refund(peer, length)?;
-            return Err(BrokerError::OutOfMemory);
-        }
-        receiver.stream.extend(&data[..length]);
-        self.publish(peer);
+        let length = {
+            let mut channel = peer.incoming.lock();
+            if channel.is_shut() {
+                return Ok(Err(UnixSocketError::BrokenPipe));
+            }
+            let room = channel.room();
+            if room == 0 {
+                channel.wait(self)?;
+                return Err(BrokerError::would_block(nonblocking));
+            }
+            let length = room.min(data.len());
+            // Charging first keeps a rejected send from growing the queue.
+            self.sockets.charge(&peer.quota, length)?;
+            if channel.queue.bytes.try_reserve(length).is_err() {
+                self.sockets.refund(&peer.quota, length);
+                return Err(BrokerError::OutOfMemory);
+            }
+            channel.queue.bytes.extend(&data[..length]);
+            channel.add(length);
+            length
+        };
+        peer.publish();
         Ok(Ok(length))
     }
 
+    /// Sends `data` as one datagram to `target`, or to the connected peer if
+    /// `target` is `None`.
     fn send_datagram(
-        &mut self,
-        id: SocketId,
-        key: Option<&NameKey>,
+        self: &Arc<Self>,
+        target: Option<Arc<Socket>>,
         data: &[u8],
         nonblocking: bool,
     ) -> Result<UnixSocketResult<usize>> {
-        let target = match key {
-            Some(key) => match self.target(key, SocketType::Datagram)? {
-                Ok(target) => target,
-                Err(error) => return Ok(Err(error)),
-            },
-            None => match self.socket(id)?.connection {
-                Connection::Connected {
-                    peer: Some(peer), ..
-                } => {
-                    if !self.sockets.contains_key(&peer) {
-                        self.socket_mut(id)?.connection = Connection::None;
-                        // Like Linux, disconnecting from the closed peer
-                        // discards the queued datagrams.
-                        self.purge_datagrams(id)?;
-                        self.wake_waiters(id);
-                        self.publish(id);
-                        return Ok(Err(UnixSocketError::ConnectionRefused));
-                    }
-                    peer
-                }
-                _ => return Ok(Err(UnixSocketError::NotConnected)),
-            },
+        let (peer, write_shut, source) = {
+            let state = self.state.lock();
+            let peer = match &state.connection {
+                Connection::Connected { peer, .. } => Some(peer.clone()),
+                Connection::None | Connection::Listening { .. } => None,
+            };
+            (peer, state.write_shut, state.name.clone())
+        };
+        let (target, connected) = if let Some(target) = target {
+            (target, false)
+        } else {
+            let Some(peer) = peer else {
+                return Ok(Err(UnixSocketError::NotConnected));
+            };
+            // A closed peer may outlive its close while an operation holds
+            // it.
+            match peer.upgrade() {
+                Some(peer) if !peer.state.lock().closed => (peer, true),
+                _ => return Ok(self.disconnect_from(peer.as_ptr())),
+            }
         };
         if data.len() > CAPACITY {
             return Ok(Err(UnixSocketError::MessageTooLarge));
         }
-        let socket = self.socket(id)?;
-        if socket.write_shut {
+        if write_shut {
             return Ok(Err(UnixSocketError::BrokenPipe));
-        }
-        let source = socket.name.clone();
-        if !self.accepts_datagrams_from(target, id)? {
-            return Ok(Err(UnixSocketError::NotPermitted));
-        }
-        let receiver = self.socket(target)?;
-        if receiver.read_shut {
-            return Ok(Err(UnixSocketError::BrokenPipe));
-        }
-        // A datagram may overrun the capacity, so a socket that is not full
-        // accepts any datagram, as its readiness reports.
-        if receiver.queued >= CAPACITY {
-            self.add_waiter(target, id)?;
-            return Err(BrokerError::would_block(nonblocking));
         }
         let mut copy = Vec::new();
         copy.try_reserve_exact(data.len())
             .map_err(|_| BrokerError::OutOfMemory)?;
         copy.extend_from_slice(data);
         let datagram = Datagram { data: copy, source };
-        self.charge(target, datagram.charge())?;
-        let receiver = self.socket_mut(target)?;
-        if receiver.datagrams.try_reserve(1).is_err() {
-            self.refund(target, datagram.charge())?;
-            return Err(BrokerError::OutOfMemory);
+        let charge = datagram.charge();
+        // The receiver's state stays locked while the datagram is queued, so
+        // connecting it rejects other senders from then on, as in Linux.
+        let closed = {
+            let state = target.state.lock();
+            if let Connection::Connected { peer, .. } = &state.connection
+                && !refers_to(peer, self)
+            {
+                return Ok(Err(UnixSocketError::NotPermitted));
+            }
+            if state.closed {
+                true
+            } else {
+                let mut channel = target.incoming.lock();
+                if channel.is_shut() {
+                    return Ok(Err(UnixSocketError::BrokenPipe));
+                }
+                // A datagram may overrun the capacity, so a socket that is
+                // not full accepts any datagram, as its readiness reports.
+                if channel.room() == 0 {
+                    channel.wait(self)?;
+                    return Err(BrokerError::would_block(nonblocking));
+                }
+                self.sockets.charge(&target.quota, charge)?;
+                if channel.queue.datagrams.try_reserve(1).is_err() {
+                    self.sockets.refund(&target.quota, charge);
+                    return Err(BrokerError::OutOfMemory);
+                }
+                channel.queue.datagrams.push_back(datagram);
+                channel.add(charge);
+                false
+            }
+        };
+        if closed {
+            return Ok(if connected {
+                self.disconnect_from(Arc::as_ptr(&target))
+            } else {
+                Err(UnixSocketError::ConnectionRefused)
+            });
         }
-        receiver.datagrams.push_back(datagram);
-        self.publish(target);
+        target.publish();
         Ok(Ok(data.len()))
     }
 
+    /// Disconnects this datagram socket from `peer`, which closed, and
+    /// refuses the send that found it closed. Like Linux, a send that raced
+    /// a change of connection fails with a reset instead.
+    fn disconnect_from(self: &Arc<Self>, peer: *const Socket) -> UnixSocketResult<usize> {
+        let wakeups = {
+            let mut state = self.state.lock();
+            match &state.connection {
+                Connection::Connected { peer: current, .. }
+                    if core::ptr::eq(current.as_ptr(), peer) => {}
+                _ => return Err(UnixSocketError::ConnectionReset),
+            }
+            state.connection = Connection::None;
+            let mut channel = self.incoming.lock();
+            // Like Linux, disconnecting from the closed peer discards the
+            // queued datagrams.
+            self.purge(&mut channel);
+            // Senders it rejected while connected retry.
+            channel.wake()
+        };
+        wakeups.wake();
+        self.publish();
+        Err(UnixSocketError::ConnectionRefused)
+    }
+
     fn receive_stream(
-        &mut self,
-        id: SocketId,
+        &self,
         capacity: usize,
         peek: bool,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<Received>> {
-        let socket = self.socket_mut(id)?;
-        let Connection::Connected { peer_name, .. } = &socket.connection else {
-            return Ok(Err(UnixSocketError::InvalidArgument));
+        let source = match &self.state.lock().connection {
+            Connection::Connected { peer_name, .. } => peer_name.clone(),
+            Connection::None | Connection::Listening { .. } => {
+                return Ok(Err(UnixSocketError::InvalidArgument));
+            }
         };
-        let source = peer_name.clone();
         if capacity == 0 {
             return Ok(Ok(Received {
                 source,
                 ..Received::default()
             }));
         }
-        if socket.stream.is_empty() {
-            return if socket.read_shut {
-                Ok(Ok(Received {
-                    source,
-                    ..Received::default()
-                }))
-            } else {
-                Err(BrokerError::would_block(nonblocking))
-            };
-        }
-        let length = capacity.min(socket.stream.len());
-        let mut data = Vec::new();
-        data.try_reserve_exact(length)
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        if peek {
-            data.extend(socket.stream.iter().take(length));
-        } else {
-            data.extend(socket.stream.drain(..length));
-            if socket.stream.is_empty() {
-                socket.stream = VecDeque::new();
+        let (data, wakeups) = {
+            let mut channel = self.incoming.lock();
+            if channel.queue.bytes.is_empty() {
+                return if channel.is_shut() {
+                    Ok(Ok(Received {
+                        source,
+                        ..Received::default()
+                    }))
+                } else {
+                    Err(BrokerError::would_block(nonblocking))
+                };
             }
-            self.refund(id, length)?;
-            self.drained(id);
-        }
+            let length = capacity.min(channel.queue.bytes.len());
+            let mut data = Vec::new();
+            data.try_reserve_exact(length)
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            if peek {
+                data.extend(channel.queue.bytes.iter().take(length));
+                (data, Wakeups::default())
+            } else {
+                data.extend(channel.queue.bytes.drain(..length));
+                if channel.queue.bytes.is_empty() {
+                    channel.queue.bytes = VecDeque::new();
+                }
+                channel.remove(length);
+                self.sockets.refund(&self.quota, length);
+                // Senders waiting for room retry.
+                (data, channel.wake())
+            }
+        };
+        wakeups.wake();
         Ok(Ok(Received {
+            length: data.len(),
             data,
-            length,
             source,
         }))
     }
 
     fn receive_datagram(
-        &mut self,
-        id: SocketId,
+        &self,
         capacity: usize,
         peek: bool,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<Received>> {
-        let socket = self.socket_mut(id)?;
-        let Some(datagram) = socket.datagrams.front() else {
-            return if socket.read_shut && !nonblocking {
-                Ok(Ok(Received::default()))
-            } else {
-                Err(BrokerError::would_block(nonblocking))
+        let (received, wakeups) = {
+            let mut channel = self.incoming.lock();
+            let Some(datagram) = channel.queue.datagrams.front() else {
+                return if channel.is_shut() && !nonblocking {
+                    Ok(Ok(Received::default()))
+                } else {
+                    Err(BrokerError::would_block(nonblocking))
+                };
             };
-        };
-        let length = datagram.data.len();
-        let mut data = Vec::new();
-        data.try_reserve_exact(capacity.min(length))
-            .map_err(|_| BrokerError::OutOfMemory)?;
-        data.extend_from_slice(&datagram.data[..capacity.min(length)]);
-        let source = datagram.source.clone();
-        if !peek {
-            let datagram = socket.datagrams.pop_front().ok_or(BrokerError::Internal)?;
-            self.refund(id, datagram.charge())?;
-            self.drained(id);
-        }
-        Ok(Ok(Received {
-            data,
-            length,
-            source,
-        }))
-    }
-
-    /// Charges `bytes` of newly queued data to socket `id`.
-    fn charge(&mut self, id: SocketId, bytes: usize) -> Result<()> {
-        let queued = self
-            .queued
-            .checked_add(bytes)
-            .filter(|queued| *queued <= self.max_queued)
-            .ok_or(BrokerError::ResourceExhausted)?;
-        let max_queued_per_process = self.max_queued_per_process;
-        let socket = self.socket_mut(id)?;
-        socket
-            .quota
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
-                charged
-                    .checked_add(bytes)
-                    .filter(|charged| *charged <= max_queued_per_process)
-            })
-            .map_err(|_| BrokerError::ResourceExhausted)?;
-        socket.queued += bytes;
-        self.queued = queued;
-        Ok(())
-    }
-
-    /// Releases the charge for `bytes` of data dequeued from socket `id`.
-    fn refund(&mut self, id: SocketId, bytes: usize) -> Result<()> {
-        let socket = self.sockets.get_mut(&id).ok_or(BrokerError::Internal)?;
-        Self::release(&mut self.queued, socket, bytes);
-        Ok(())
-    }
-
-    /// Discards the datagrams queued on socket `id`, which is disconnecting
-    /// from its peer.
-    fn purge_datagrams(&mut self, id: SocketId) -> Result<()> {
-        let socket = self.socket_mut(id)?;
-        socket.datagrams.clear();
-        let queued = socket.queued;
-        self.refund(id, queued)
-    }
-
-    fn release(total: &mut usize, socket: &mut Socket, bytes: usize) {
-        socket.queued = socket
-            .queued
-            .checked_sub(bytes)
-            .expect("a socket's charge must cover its queued data");
-        *total = total
-            .checked_sub(bytes)
-            .expect("the broker's Unix socket charge must cover every socket's");
-        socket
-            .quota
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
-                charged.checked_sub(bytes)
-            })
-            .expect("a process's Unix socket charge must cover its sockets'");
-    }
-
-    /// Wakes the sockets that may send to socket `id` after its queue shrank.
-    fn drained(&mut self, id: SocketId) {
-        if let Some(Socket {
-            connection: Connection::Connected {
-                peer: Some(peer), ..
-            },
-            ..
-        }) = self.sockets.get(&id)
-        {
-            let peer = *peer;
-            self.publish(peer);
-        }
-        self.wake_waiters(id);
-    }
-
-    /// Records that socket `waiter` waits for socket `target` to drain or
-    /// accept a connection.
-    fn add_waiter(&mut self, target: SocketId, waiter: SocketId) -> Result<()> {
-        let Self { sockets, .. } = self;
-        let Some(mut waiters) = sockets
-            .get_mut(&target)
-            .map(|target| core::mem::take(&mut target.waiters))
-        else {
-            return Ok(());
-        };
-        // Pruning closed waiters bounds the list by the live sockets.
-        waiters.retain(|waiter| sockets.contains_key(waiter));
-        let reserved = if waiters.contains(&waiter) {
-            Ok(())
-        } else {
-            waiters
-                .try_reserve(1)
-                .map(|()| waiters.push(waiter))
-                .map_err(|_| BrokerError::OutOfMemory)
-        };
-        if let Some(target) = sockets.get_mut(&target) {
-            target.waiters = waiters;
-        }
-        reserved
-    }
-
-    fn wake_waiters(&mut self, id: SocketId) {
-        let Some(waiters) = self
-            .sockets
-            .get_mut(&id)
-            .map(|socket| core::mem::take(&mut socket.waiters))
-        else {
-            return;
-        };
-        for waiter in waiters {
-            self.publish(waiter);
-        }
-    }
-
-    /// Wakes the watchers of socket `id` after a change that may make it ready.
-    ///
-    /// Callers hold the table lock, so publications follow the changes in
-    /// order.
-    fn publish(&mut self, id: SocketId) {
-        let readiness = self.readiness(id);
-        if let Some(socket) = self.sockets.get(&id) {
-            socket.watchers.publish(readiness);
-        }
-    }
-
-    /// Returns the readiness of socket `id`.
-    ///
-    /// A datagram socket that cannot send because its peer is full starts
-    /// waiting for the peer to drain, as Linux does when polled.
-    fn readiness(&mut self, id: SocketId) -> ReadinessFlags {
-        let Some(socket) = self.sockets.get(&id) else {
-            return ReadinessFlags::default();
-        };
-        let socket_type = socket.kind;
-        let mut readiness = ReadinessFlags::default();
-        if socket.read_shut {
-            readiness = readiness | ReadinessFlags::READ | ReadinessFlags::HANGUP;
-            if socket.write_shut {
-                readiness = readiness | ReadinessFlags::CLOSED;
+            let length = datagram.data.len();
+            let mut data = Vec::new();
+            data.try_reserve_exact(capacity.min(length))
+                .map_err(|_| BrokerError::OutOfMemory)?;
+            data.extend_from_slice(&datagram.data[..capacity.min(length)]);
+            let received = Received {
+                data,
+                length,
+                source: datagram.source.clone(),
+            };
+            if peek {
+                (received, Wakeups::default())
+            } else {
+                let datagram = channel
+                    .queue
+                    .datagrams
+                    .pop_front()
+                    .ok_or(BrokerError::Internal)?;
+                channel.remove(datagram.charge());
+                self.sockets.refund(&self.quota, datagram.charge());
+                // Senders waiting for room retry.
+                (received, channel.wake())
             }
+        };
+        wakeups.wake();
+        Ok(Ok(received))
+    }
+
+    /// Stops the socket from receiving if `read` is set, and from sending if
+    /// `write` is set, returning its connected stream peer.
+    fn shut_down(&self, read: bool, write: bool) -> (Option<Arc<Socket>>, Wakeups<Socket>) {
+        let mut state = self.state.lock();
+        state.write_shut |= write;
+        let peer = match &state.connection {
+            Connection::Connected { peer, .. } if self.kind == SocketType::Stream => peer.upgrade(),
+            _ => None,
+        };
+        if !read {
+            return (peer, Wakeups::default());
         }
-        if !socket.is_empty() {
-            readiness = readiness | ReadinessFlags::READ;
-        }
-        let peer = match &socket.connection {
+        let mut channel = self.incoming.lock();
+        channel.shut();
+        // Senders waiting for room now fail.
+        (peer, channel.wake())
+    }
+
+    /// Ends this stream socket's connection after its peer closed.
+    fn hang_up(self: &Arc<Self>) {
+        let wakeups = {
+            let mut state = self.state.lock();
+            state.write_shut = true;
+            if let Connection::Connected { peer, .. } = &mut state.connection {
+                *peer = Weak::new();
+            }
+            let mut channel = self.incoming.lock();
+            channel.shut();
+            channel.wake()
+        };
+        wakeups.wake();
+        self.publish();
+    }
+
+    /// Discards the data queued for the socket.
+    fn purge(&self, channel: &mut ChannelState<Queue, Socket>) {
+        channel.queue = Queue::default();
+        let queued = channel.queued();
+        channel.remove(queued);
+        self.sockets.refund(&self.quota, queued);
+    }
+
+    /// Tears the socket down once nothing reaches it through a reference or a
+    /// backlog.
+    fn close(&self) {
+        let (connection, marker, wakeups) = {
+            let mut state = self.state.lock();
+            if core::mem::replace(&mut state.closed, true) {
+                return;
+            }
+            // The name is released along with the close, so a socket that
+            // finds it closed can bind the name, as in Linux.
+            if let Some(key) = state.name_key.take() {
+                self.sockets.unregister(&key, self);
+            }
+            let mut channel = self.incoming.lock();
+            channel.shut();
+            self.purge(&mut channel);
+            (
+                core::mem::replace(&mut state.connection, Connection::None),
+                state.marker.take(),
+                channel.wake(),
+            )
+        };
+        drop(marker);
+        match connection {
             Connection::Listening { backlog, .. } => {
-                if !backlog.is_empty() {
-                    readiness = readiness | ReadinessFlags::READ;
-                }
-                return readiness;
-            }
-            Connection::None => {
-                if socket_type == SocketType::Stream {
-                    readiness = readiness | ReadinessFlags::CLOSED;
-                }
-                None
-            }
-            Connection::Connected { peer, .. } => *peer,
-        };
-        let full_peer = peer.filter(|peer| {
-            self.sockets
-                .get(peer)
-                .is_some_and(|peer| !peer.read_shut && peer.queued >= CAPACITY)
-        });
-        match full_peer {
-            Some(peer) => {
-                if socket_type == SocketType::Datagram {
-                    // Failing to record the waiter only loses a wakeup the
-                    // waiter's next send would record.
-                    let _ = self.add_waiter(peer, id);
-                }
-                readiness
-            }
-            None => readiness | ReadinessFlags::WRITE,
-        }
-    }
-
-    /// Removes socket `id` once nothing references it, returning the file
-    /// that held its path name for the caller to drop after the table lock.
-    fn remove(&mut self, id: SocketId) -> Option<File> {
-        let mut socket = self.sockets.remove(&id)?;
-        let queued = socket.queued;
-        Self::release(&mut self.queued, &mut socket, queued);
-        if let Some(key) = socket.name_key.take()
-            && self.names.get(&key) == Some(&id)
-        {
-            self.names.remove(&key);
-        }
-        match core::mem::replace(&mut socket.connection, Connection::None) {
-            Connection::Listening { backlog, .. } => {
-                // Unaccepted sockets have no references, so no names.
-                for accepted in backlog {
-                    let marker = self.remove(accepted);
-                    debug_assert!(marker.is_none());
+                self.sockets
+                    .refund(&self.quota, backlog.len() * CONNECTION_OVERHEAD);
+                // Unaccepted sockets have no references, so they close with
+                // their listener.
+                for socket in backlog {
+                    socket.close();
                 }
             }
-            Connection::Connected {
-                peer: Some(peer), ..
-            } if socket.kind == SocketType::Stream => {
-                if let Some(peer_socket) = self.sockets.get_mut(&peer) {
-                    peer_socket.read_shut = true;
-                    peer_socket.write_shut = true;
-                    if let Connection::Connected { peer, .. } = &mut peer_socket.connection {
-                        *peer = None;
-                    }
+            Connection::Connected { peer, .. } if self.kind == SocketType::Stream => {
+                if let Some(peer) = peer.upgrade() {
+                    peer.hang_up();
                 }
-                self.publish(peer);
             }
             Connection::None | Connection::Connected { .. } => {}
         }
-        for waiter in core::mem::take(&mut socket.waiters) {
-            self.publish(waiter);
-        }
-        socket.marker.take()
+        wakeups.wake();
     }
 }
 

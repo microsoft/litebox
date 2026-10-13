@@ -225,6 +225,8 @@ pub enum UnixSocketError {
     BrokenPipe,
     #[error("receiving socket is connected to another socket")]
     NotPermitted,
+    #[error("connection was reset")]
+    ConnectionReset,
     #[error("address lookup failed: {0}")]
     File(FileError),
 }

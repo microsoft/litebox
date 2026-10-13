@@ -18,6 +18,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod channel;
 mod error;
 pub mod event;
 pub mod fs;

@@ -136,9 +136,29 @@ impl Fixture {
     /// Returns the broker-wide and process charges for queued bytes.
     fn queued(&self) -> (usize, usize) {
         (
-            self.process.core.unix_sockets.lock().queued,
+            *self.process.core.unix_sockets.queued.lock(),
             self.process.unix_socket_bytes.load(Ordering::Relaxed),
         )
+    }
+
+    /// Returns a weak reference to the socket behind `handle`.
+    fn socket(&self, handle: ObjectHandle) -> Weak<Socket> {
+        let object = self
+            .process
+            .authorized_object(handle, ObjectRights::WAIT)
+            .unwrap();
+        let entry = object.read();
+        Arc::downgrade(&entry.as_unix_socket().unwrap().socket)
+    }
+
+    /// Repeats `operation` while it would block.
+    fn retry<T>(operation: impl Fn() -> Result<T>) -> T {
+        loop {
+            match operation() {
+                Err(BrokerError::WouldBlock) => std::thread::yield_now(),
+                result => break result.unwrap(),
+            }
+        }
     }
 }
 
@@ -446,8 +466,21 @@ fn closing_a_listener_resets_unaccepted_connections() {
     let client = fixture.create(SocketType::Stream);
     assert_eq!(fixture.connect(client, &address).unwrap(), Ok(()));
     assert_eq!(fixture.send(client, b"lost").unwrap(), Ok(4));
+    let server = match &fixture
+        .socket(client)
+        .upgrade()
+        .unwrap()
+        .state
+        .lock()
+        .connection
+    {
+        Connection::Connected { peer, .. } => peer.clone(),
+        Connection::None | Connection::Listening { .. } => panic!("the client is connected"),
+    };
     fixture.close(listener);
     assert_eq!(fixture.queued(), (0, 0));
+    assert!(server.upgrade().is_none());
+    assert!(fixture.process.core.unix_sockets.names.read().is_empty());
     assert!(
         fixture
             .readiness(client)
@@ -458,6 +491,41 @@ fn closing_a_listener_resets_unaccepted_connections() {
         fixture.send(client, b"x").unwrap(),
         Err(UnixSocketError::BrokenPipe)
     );
+}
+
+#[test]
+fn closed_listeners_refuse_connections_first() {
+    let fixture = Fixture::new();
+    let listener = fixture.listener(&abstract_name(b"listener"), 1);
+    let closed = fixture.socket(listener).upgrade().unwrap();
+    fixture.close(listener);
+    let (client, _) = fixture.pair(SocketType::Stream);
+    let client = fixture.socket(client).upgrade().unwrap();
+
+    // A connect that found the listener before it closed is refused, even if
+    // the client connected elsewhere meanwhile.
+    assert_eq!(
+        client.connect_stream(&closed, false).unwrap(),
+        Err(UnixSocketError::ConnectionRefused)
+    );
+}
+
+#[test]
+fn sends_that_raced_a_reconnect_are_reset() {
+    let fixture = Fixture::new();
+    let (first, second) = fixture.pair(SocketType::Datagram);
+    let (stale, _) = fixture.pair(SocketType::Datagram);
+    let stale = fixture.socket(stale).upgrade().unwrap();
+    let socket = fixture.socket(first).upgrade().unwrap();
+
+    // A send that found a closed peer the socket no longer connects to is
+    // reset, and the current connection stays.
+    assert_eq!(
+        socket.disconnect_from(Arc::as_ptr(&stale)),
+        Err(UnixSocketError::ConnectionReset)
+    );
+    assert_eq!(fixture.send(first, b"x").unwrap(), Ok(1));
+    assert_eq!(fixture.receive_data(second, 8), b"x");
 }
 
 #[test]
@@ -662,7 +730,13 @@ fn connected_datagram_sockets_only_accept_their_peer() {
         Ok(peer_address.name())
     );
 
+    // A closed peer is gone even while an operation still holds it, so the
+    // send disconnects before checking its own shutdown.
+    let held = fixture.socket(peer).upgrade().unwrap();
     fixture.close(peer);
+    shutdown(&fixture.process, receiver, ShutdownMode::Write)
+        .unwrap()
+        .unwrap();
     assert_ne!(fixture.queued(), (0, 0));
     assert_eq!(
         fixture.send(receiver, b"z").unwrap(),
@@ -673,6 +747,7 @@ fn connected_datagram_sockets_only_accept_their_peer() {
         fixture.send(receiver, b"z").unwrap(),
         Err(UnixSocketError::NotConnected)
     );
+    drop(held);
 }
 
 #[test]
@@ -763,6 +838,7 @@ fn queued_bytes_are_limited_and_refunded() {
     let fixture =
         Fixture::with_limits(BrokerCoreLimits::DEFAULT.with_unix_socket_limits(usize::MAX, 1000));
     let (first, second) = fixture.pair(SocketType::Stream);
+    let mut sockets = vec![fixture.socket(first), fixture.socket(second)];
     assert_eq!(fixture.send(first, &[0; 600]).unwrap(), Ok(600));
     assert_eq!(
         fixture.send(first, &[0; 600]),
@@ -776,6 +852,7 @@ fn queued_bytes_are_limited_and_refunded() {
     fixture.close(first);
 
     let (first, second) = fixture.pair(SocketType::Datagram);
+    sockets.extend([fixture.socket(first), fixture.socket(second)]);
     assert_eq!(fixture.send(first, &[0; 600]).unwrap(), Ok(600));
     assert_eq!(
         fixture.queued(),
@@ -788,7 +865,7 @@ fn queued_bytes_are_limited_and_refunded() {
     fixture.close(first);
     fixture.close(second);
     assert_eq!(fixture.queued(), (0, 0));
-    assert!(fixture.process.core.unix_sockets.lock().sockets.is_empty());
+    assert!(sockets.iter().all(|socket| socket.upgrade().is_none()));
 }
 
 #[test]
@@ -885,4 +962,155 @@ fn options_are_stored_with_the_socket() {
         get_option(&fixture.process, socket, UnixSocketOptionName::SendTimeout).unwrap(),
         UnixSocketOptionValue::SendTimeout(None)
     );
+}
+
+#[test]
+fn sockets_connect_to_themselves_only_as_datagram_sockets() {
+    let fixture = Fixture::new();
+    let listening_address = abstract_name(b"listening");
+    let listener = fixture.listener(&listening_address, 8);
+    assert_eq!(
+        fixture.connect(listener, &listening_address).unwrap(),
+        Err(UnixSocketError::InvalidArgument)
+    );
+    let bound_address = abstract_name(b"bound");
+    let bound = fixture.create(SocketType::Stream);
+    fixture.bind(bound, &bound_address).unwrap();
+    assert_eq!(
+        fixture.connect(bound, &bound_address).unwrap(),
+        Err(UnixSocketError::ConnectionRefused)
+    );
+
+    let address = abstract_name(b"datagram");
+    let datagram = fixture.create(SocketType::Datagram);
+    fixture.bind(datagram, &address).unwrap();
+    assert_eq!(fixture.connect(datagram, &address).unwrap(), Ok(()));
+    assert_eq!(fixture.send(datagram, b"self").unwrap(), Ok(4));
+    let received = fixture.receive(datagram, 8).unwrap().unwrap();
+    assert_eq!(received.data, b"self");
+    assert_eq!(received.source, address.name());
+}
+
+#[test]
+fn stream_directions_transfer_in_parallel() {
+    const LENGTH: usize = 4 * CAPACITY;
+    const CHUNK: u32 = 4096;
+    let fixture = Fixture::new();
+    let (first, second) = fixture.pair(SocketType::Stream);
+    let data: Vec<u8> = (0..LENGTH)
+        .map(|index| u8::try_from(index % 251).unwrap())
+        .collect();
+    std::thread::scope(|scope| {
+        for (sender, receiver) in [(first, second), (second, first)] {
+            let (fixture, data) = (&fixture, &data);
+            scope.spawn(move || {
+                let mut sent = 0;
+                while sent < LENGTH {
+                    let end = LENGTH.min(sent + CHUNK as usize);
+                    sent += Fixture::retry(|| fixture.send(sender, &data[sent..end])).unwrap();
+                }
+            });
+            scope.spawn(move || {
+                let mut received = Vec::new();
+                while received.len() < LENGTH {
+                    let chunk = Fixture::retry(|| fixture.receive(receiver, CHUNK));
+                    received.extend(chunk.unwrap().data);
+                }
+                assert_eq!(received, *data);
+            });
+        }
+    });
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn datagram_senders_share_a_receiver_in_parallel() {
+    const SENDERS: usize = 4;
+    const DATAGRAMS: u16 = 500;
+    let fixture = Fixture::new();
+    let address = abstract_name(b"receiver");
+    let receiver = fixture.create(SocketType::Datagram);
+    fixture.bind(receiver, &address).unwrap();
+    let senders: Vec<_> = (0..SENDERS)
+        .map(|_| fixture.create(SocketType::Datagram))
+        .collect();
+    std::thread::scope(|scope| {
+        for (index, &sender) in senders.iter().enumerate() {
+            let (fixture, address) = (&fixture, &address);
+            scope.spawn(move || {
+                for sequence in 0..DATAGRAMS {
+                    let [high, low] = sequence.to_be_bytes();
+                    let datagram = [u8::try_from(index).unwrap(), high, low];
+                    let sent = Fixture::retry(|| fixture.send_to(sender, address, &datagram));
+                    assert_eq!(sent, Ok(3));
+                }
+            });
+        }
+        let mut next = [0; SENDERS];
+        for _ in 0..SENDERS * usize::from(DATAGRAMS) {
+            let datagram = Fixture::retry(|| fixture.receive(receiver, 8)).unwrap();
+            let [index, high, low] = datagram.data[..] else {
+                panic!("datagrams keep their boundaries");
+            };
+            let sequence = &mut next[usize::from(index)];
+            assert_eq!(u16::from_be_bytes([high, low]), *sequence);
+            *sequence += 1;
+        }
+    });
+    assert_eq!(fixture.queued(), (0, 0));
+}
+
+#[test]
+fn closing_a_peer_races_with_sending() {
+    let fixture = Fixture::new();
+    for (socket_type, refused) in [
+        (SocketType::Stream, UnixSocketError::BrokenPipe),
+        (SocketType::Datagram, UnixSocketError::ConnectionRefused),
+    ] {
+        for _ in 0..50 {
+            let (first, second) = fixture.pair(socket_type);
+            let sockets = [fixture.socket(first), fixture.socket(second)];
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    loop {
+                        match fixture.send(first, &[0; 1024]) {
+                            Ok(Ok(_)) | Err(BrokerError::WouldBlock) => {}
+                            Ok(Err(error)) if error == refused => break,
+                            other => panic!("unexpected send result {other:?}"),
+                        }
+                    }
+                });
+                scope.spawn(|| fixture.close(second));
+            });
+            fixture.close(first);
+            assert_eq!(fixture.queued(), (0, 0));
+            assert!(sockets.iter().all(|socket| socket.upgrade().is_none()));
+        }
+    }
+}
+
+#[test]
+fn opposite_connects_do_not_deadlock() {
+    let fixture = Fixture::new();
+    for round in 0..100_u32 {
+        let listening_address = abstract_name(&round.to_be_bytes());
+        let bound_address = abstract_name(&(!round).to_be_bytes());
+        let listener = fixture.listener(&listening_address, 8);
+        let bound = fixture.create(SocketType::Stream);
+        fixture.bind(bound, &bound_address).unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(fixture.connect(bound, &listening_address).unwrap(), Ok(()));
+            });
+            scope.spawn(|| {
+                assert_eq!(
+                    fixture.connect(listener, &bound_address).unwrap(),
+                    Err(UnixSocketError::InvalidArgument)
+                );
+            });
+        });
+        fixture.close(listener);
+        fixture.close(bound);
+    }
+    assert_eq!(fixture.queued(), (0, 0));
 }

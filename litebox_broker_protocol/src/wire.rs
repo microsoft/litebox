@@ -1405,6 +1405,7 @@ mod tests {
             })),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
+            BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::ConnectionReset)),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
                 FileError::NoSuchFileOrDirectory,
             ))),

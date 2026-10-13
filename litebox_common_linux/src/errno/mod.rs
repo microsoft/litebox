@@ -780,6 +780,7 @@ impl From<litebox::unix_socket::errors::UnixSocketError> for Errno {
                 SocketError::MessageTooLarge => Errno::EMSGSIZE,
                 SocketError::BrokenPipe => Errno::EPIPE,
                 SocketError::NotPermitted => Errno::EPERM,
+                SocketError::ConnectionReset => Errno::ECONNRESET,
                 SocketError::File(error) => match error {
                     FileError::NoSuchFileOrDirectory | FileError::MissingComponent => Errno::ENOENT,
                     FileError::AccessNotAllowed

@@ -54,6 +54,7 @@ const ERROR_TAG_MESSAGE_TOO_LARGE: u8 = 7;
 const ERROR_TAG_BROKEN_PIPE: u8 = 8;
 const ERROR_TAG_FILE: u8 = 9;
 const ERROR_TAG_NOT_PERMITTED: u8 = 10;
+const ERROR_TAG_CONNECTION_RESET: u8 = 11;
 
 pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSocketRequest) {
     match request {
@@ -380,6 +381,7 @@ fn encode_error(encoder: &mut Encoder, error: UnixSocketError) {
         UnixSocketError::MessageTooLarge => encoder.u8(ERROR_TAG_MESSAGE_TOO_LARGE),
         UnixSocketError::BrokenPipe => encoder.u8(ERROR_TAG_BROKEN_PIPE),
         UnixSocketError::NotPermitted => encoder.u8(ERROR_TAG_NOT_PERMITTED),
+        UnixSocketError::ConnectionReset => encoder.u8(ERROR_TAG_CONNECTION_RESET),
         UnixSocketError::File(error) => {
             encoder.u8(ERROR_TAG_FILE);
             encode_file_error(encoder, error);
@@ -399,6 +401,7 @@ fn decode_error(decoder: &mut Decoder<'_>) -> Result<UnixSocketError, WireError>
         ERROR_TAG_MESSAGE_TOO_LARGE => UnixSocketError::MessageTooLarge,
         ERROR_TAG_BROKEN_PIPE => UnixSocketError::BrokenPipe,
         ERROR_TAG_NOT_PERMITTED => UnixSocketError::NotPermitted,
+        ERROR_TAG_CONNECTION_RESET => UnixSocketError::ConnectionReset,
         ERROR_TAG_FILE => UnixSocketError::File(decode_file_error(decoder)?),
         _ => return Err(WireError::InvalidTag),
     })
