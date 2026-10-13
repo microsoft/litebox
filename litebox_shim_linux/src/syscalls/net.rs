@@ -4,12 +4,11 @@
 //! Socket-related syscalls, e.g., socket, bind, listen, etc.
 
 use core::{
-    ffi::CStr,
     mem::{offset_of, size_of},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
 };
 
-use alloc::string::ToString;
+use alloc::string::String;
 use alloc::sync::Arc;
 use litebox::{
     event::{
@@ -1132,6 +1131,9 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
             ))))
         }
         AddressFamily::UNIX => {
+            if addrlen > size_of::<CSockUnixAddr>() {
+                return Err(Errno::EINVAL);
+            }
             let path = sockaddr
                 .to_owned_slice::<Platform>(addrlen)
                 .ok_or(Errno::EFAULT)?;
@@ -1145,9 +1147,10 @@ pub(crate) fn read_sockaddr_from_user<Platform: ShimPlatform>(
                     path[1..].to_vec(),
                 )));
             }
-            let s = CStr::from_bytes_until_nul(path).map_err(|_| Errno::EINVAL)?;
+            // Like Linux, accept a path without a NUL terminator (e.g., `addrlen = SUN_LEN(addr)`).
+            let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
             Ok(SocketAddress::Unix(UnixSocketAddr::Path(
-                s.to_string_lossy().to_string(),
+                String::from_utf8_lossy(&path[..end]).into_owned(),
             )))
         }
         _ => todo!("unsupported family {family:?}"),
@@ -2929,7 +2932,11 @@ mod unix_tests {
 
     use crate::{
         UserPtr, UserPtrMut,
-        syscalls::{net::SocketAddress, tests::init_platform, unix::UnixSocketAddr},
+        syscalls::{
+            net::{SocketAddress, read_sockaddr_from_user},
+            tests::init_platform,
+            unix::UnixSocketAddr,
+        },
     };
 
     extern crate std;
@@ -3563,6 +3570,28 @@ mod unix_tests {
         }
         close_socket(&task, raw_fd);
         task.sys_unlinkat(-1, path, AtFlags::empty()).unwrap();
+    }
+
+    #[test]
+    fn unix_paths_may_omit_the_nul_terminator() {
+        let parse = |name: &[u8]| {
+            let mut address = (AddressFamily::UNIX as u16).to_ne_bytes().to_vec();
+            address.extend_from_slice(name);
+            read_sockaddr_from_user::<crate::syscalls::tests::TestPlatform>(
+                UserPtr::from_ptr(address.as_ptr()),
+                address.len(),
+            )
+        };
+        let path = |name: &str| Ok(SocketAddress::Unix(UnixSocketAddr::Path(name.to_string())));
+        // `addrlen = SUN_LEN(addr)` excludes the NUL, so the path ends at `addrlen`.
+        assert_eq!(parse(b"/sun_len.sock"), path("/sun_len.sock"));
+        assert_eq!(parse(b"/sun_len.sock\0ignored"), path("/sun_len.sock"));
+        let path_max = core::mem::size_of::<libc::sockaddr_un>()
+            - core::mem::offset_of!(libc::sockaddr_un, sun_path);
+        let longest = "a".repeat(path_max);
+        assert_eq!(parse(longest.as_bytes()), path(&longest));
+        let too_long = "a".repeat(path_max + 1);
+        assert_eq!(parse(too_long.as_bytes()), Err(Errno::EINVAL));
     }
 
     #[test]
