@@ -241,12 +241,12 @@ unsafe fn apply_relocations() {
 /// | 14              | `VTL1_REMAP_PDPT_PAGE`  | PDPT for the high-canonical PML4 entry|
 /// | 15              | `VTL1_REMAP_PDE_PAGE`   | PDE pointing to PTE pages 5–12        |
 /// | 16              | `VTL1_VAULT_START_PAGE` | Vault PRK                             |
-/// | 17              |                         | Vault dispatch                        |
-/// | 18–33 (debug)   |                         | Vault stack                           |
-/// | 18–21 (release) |                         | Vault stack                           |
+/// | 17–80 (debug)   |                         | Vault stacks (4 slots × 16 pages)     |
+/// | 17–32 (release) |                         | Vault stacks (4 slots × 4 pages)      |
 ///
-/// Vault pages are cleared during boot and excluded from the Phase 2 mapping
-/// and allocator; only the vault page table maps them.
+/// Stack ranges are for the default 4 slots; the `vault-slots-*` features add
+/// slots. Vault pages are cleared during boot and excluded from the Phase 2
+/// mapping and allocator; only the vault page tables map them.
 ///
 /// ## Algorithm
 ///

@@ -11,16 +11,16 @@
 //! PRK. The controls below do not depend on the attacker. Isolating VTL1 memory
 //! from VTL0 is Hyper-V's job.
 //!
-//! - Boot reserves the PRK, dispatch and stack pages outside the normal kernel
-//!   mapping and allocator. Only the vault page table maps them.
+//! - Boot reserves the PRK and stack pages outside the normal kernel mapping
+//!   and allocator. Only the vault page tables map them.
 //! - Shim callbacks (KDFs and computations) run on the vault stack, which is
 //!   wiped on exit, derived keys included. Caller-saved GPRs and VTL1 extended
 //!   state (x87/SSE) are overwritten too.
 //! - Entry: IBPB, STIBP, SSBD, RSB stuffing; vault dispatch uses retpolines.
 //!   Exit: `VERW`, L1D flush (best-effort eviction if unavailable), IBPB.
 //!   Retpolines do not replace SRSO microcode; eviction is not a guaranteed flush.
-//! - Vault entries are serialized with each other, with interrupts disabled.
-//!   Other cores keep running.
+//! - Up to `VAULT_SLOTS` entries run concurrently, with interrupts disabled.
+//!   Each slot's page table maps the shared PRK page and only its own stack.
 //!
 //! Retpolines protect explicit vault dispatches, not indirect branches inside
 //! the shim callbacks. Those rely on available IBPB and eIBRS/AutoIBRS controls.
@@ -28,7 +28,8 @@
 //! SMT: the sibling hyperthread may run userspace or VTL0 of this VM. STIBP
 //! blocks branch injection from it (eIBRS/AutoIBRS does not separate VTL0 and
 //! VTL1 kernel mode); concurrent data sampling is an accepted risk limited to
-//! older CPUs.
+//! older CPUs. Concurrent vault entries on siblings can expose data only to
+//! each other.
 //!
 //! Other cores share the last-level cache, which the vault does not flush; shim
 //! callbacks should avoid secret-dependent branches and memory accesses.
@@ -46,10 +47,11 @@ use crate::arch::spec_ctrl::VaultControls;
 use crate::host::per_cpu_variables::PerCpuVariablesAsm;
 use crate::mm::MemoryProvider;
 use crate::mshv::vtl1_mem_layout::{
-    VTL1_VAULT_STACK_PAGES, get_memory_base_address, vault_frame_range,
+    VTL1_VAULT_SLOTS, VTL1_VAULT_STACK_PAGES, get_memory_base_address, vault_frame_range,
 };
 use crate::{PageTableManager, mm};
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::platform::{ComputeParams, KDFParams};
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmem::{PAGE_SIZE, PageRange, VmFlags};
@@ -61,7 +63,7 @@ use x86_64::{
 use zeroize::Zeroizing;
 
 /// Vault pages, in the guard gap below `KERNEL_OFFSET`. Its top-level entry
-/// is not shared, so only the vault page table maps them.
+/// is not shared, so only the vault page tables map them.
 const VAULT_BASE: u64 = 0xFFFF_E100_0000_0000;
 const _: () = assert!(VAULT_BASE > crate::VMAP_END as u64);
 const _: () = assert!(VAULT_BASE + (1 << 39) <= crate::KERNEL_OFFSET);
@@ -72,16 +74,22 @@ const _: () = assert!(
 
 const VAULT_PRK_VA: u64 = VAULT_BASE;
 
+const VAULT_SLOTS: usize = VTL1_VAULT_SLOTS;
+const _: () = assert!(VAULT_SLOTS >= 1 && VAULT_SLOTS <= u32::BITS as usize);
+
 const VAULT_STACK_PAGES: usize = VTL1_VAULT_STACK_PAGES; // 64 KiB debug, 16 KiB release
 const VAULT_STACK_SIZE: usize = VAULT_STACK_PAGES * PAGE_SIZE;
-/// Unmapped guard pages surround the stack.
+/// Each slot maps its own stack here. Unmapped guard pages surround it.
 const VAULT_STACK_BOTTOM: u64 = VAULT_BASE + 2 * PAGE_SIZE as u64;
 const VAULT_STACK_TOP: u64 = VAULT_STACK_BOTTOM + VAULT_STACK_SIZE as u64;
-// Separate writable dispatch page above the upper stack guard, serialized by the lock.
+/// Initial stack pointer: 16-byte aligned, below the dispatch word.
+const VAULT_STACK_ENTRY: u64 = VAULT_STACK_TOP - 16;
+// Dispatch word at the top of the slot's stack: private to the entry and wiped
+// with the stack.
 const VAULT_DISPATCH_VA: u64 = if cfg!(test) {
     0x7000_0000_0000 // Host ABI tests use a scratch mapping, not the production page.
 } else {
-    VAULT_STACK_TOP + PAGE_SIZE as u64
+    VAULT_STACK_TOP - 8
 };
 
 pub(crate) enum InstallError<E> {
@@ -99,15 +107,49 @@ pub(crate) fn is_accessible(buf: &[u8]) -> bool {
     buf.is_empty() || buf.as_ptr() as u64 >= crate::KERNEL_OFFSET
 }
 
-struct Vault {
-    /// Never dropped; maps the boot-reserved vault frames.
+/// One concurrent vault entry: maps the shared PRK page and this slot's stack.
+struct Slot {
+    /// Never dropped; maps boot-reserved vault frames.
     page_table: mm::PageTable<PAGE_SIZE>,
     /// Physical address of `page_table`'s top-level table.
     p4: u64,
+}
+
+/// Which of the `VAULT_SLOTS` slots are in use.
+struct SlotSet(AtomicU32);
+
+impl SlotSet {
+    /// Claim a free slot. `Acquire` pairs with `release`, so the previous
+    /// holder's writes (e.g., its stack wipe) are visible.
+    fn claim(&self) -> Option<usize> {
+        let mut busy = self.0.load(Ordering::Relaxed);
+        loop {
+            let slot = busy.trailing_ones() as usize;
+            if slot >= VAULT_SLOTS {
+                return None;
+            }
+            match self.0.compare_exchange_weak(
+                busy,
+                busy | (1 << slot),
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(slot),
+                Err(current) => busy = current,
+            }
+        }
+    }
+
+    fn release(&self, slot: usize) {
+        self.0.fetch_and(!(1 << slot), Ordering::Release);
+    }
+}
+
+struct Vault {
+    slots: Box<[Slot]>,
+    busy: SlotSet,
     spec: VaultControls,
     eviction: Option<Box<[u8]>>,
-    /// Serializes vault entries.
-    lock: spin::Mutex<()>,
 }
 
 static VAULT: spin::Once<Vault> = spin::Once::new();
@@ -163,42 +205,52 @@ fn build_vault<E>(
     ));
     let frames = vault_frame_range(memory_start);
     let prk_frame = frames.start;
-    let dispatch_frame = prk_frame + 1;
-    let stack_frames = core::array::from_fn::<_, VAULT_STACK_PAGES, _>(|i| {
-        prk_frame + 2 + u64::try_from(i).unwrap()
-    });
-    let page_table = build_page_table(manager, prk_frame, dispatch_frame, &stack_frames)
-        .ok_or(InstallError::OutOfMemory)?;
+    let mut slots = alloc::vec::Vec::new();
+    slots
+        .try_reserve_exact(VAULT_SLOTS)
+        .map_err(|_| InstallError::OutOfMemory)?;
+    for slot in 0..VAULT_SLOTS {
+        let first = prk_frame + 1 + u64::try_from(slot * VAULT_STACK_PAGES).unwrap();
+        let stack_frames =
+            core::array::from_fn::<_, VAULT_STACK_PAGES, _>(|i| first + u64::try_from(i).unwrap());
+        let page_table =
+            build_page_table(manager, prk_frame, &stack_frames).ok_or(InstallError::OutOfMemory)?;
+        slots.push(Slot {
+            p4: page_table.get_physical_frame().start_address().as_u64(),
+            page_table,
+        });
+    }
     let vault = Vault {
-        p4: page_table.get_physical_frame().start_address().as_u64(),
-        page_table,
+        slots: slots.into_boxed_slice(),
+        busy: SlotSet(AtomicU32::new(0)),
         spec,
         eviction,
-        lock: spin::Mutex::new(()),
     };
+    // Every slot maps the same PRK frame, so writing it through one suffices.
     // Safety: only this installer can access the unpublished vault.
     unsafe { vault.run(copy_key, key.as_mut_ptr()) };
-    // Empty VmFlags leave this present page supervisor-only, read-only and NX.
-    // Safety: no vault window is active; the table has not been published.
-    unsafe {
-        vault.page_table.mprotect_pages(
-            PageRange::new(
-                VAULT_PRK_VA.trunc(),
-                (VAULT_PRK_VA + PAGE_SIZE as u64).trunc(),
+    for slot in &vault.slots {
+        // Empty VmFlags leave this present page supervisor-only, read-only and NX.
+        // Safety: no vault window is active; the table has not been published.
+        unsafe {
+            slot.page_table.mprotect_pages(
+                PageRange::new(
+                    VAULT_PRK_VA.trunc(),
+                    (VAULT_PRK_VA + PAGE_SIZE as u64).trunc(),
+                )
+                .unwrap(),
+                VmFlags::empty(),
             )
-            .unwrap(),
-            VmFlags::empty(),
-        )
+        }
+        .expect("failed to make vault PRK read-only");
     }
-    .expect("failed to make vault PRK read-only");
     Ok(vault)
 }
 
-/// Shared kernel slots plus private PRK and stack mappings.
+/// Shared kernel PML4 entries plus private PRK and stack mappings.
 fn build_page_table(
     manager: &PageTableManager,
     prk_frame: PhysFrame<Size4KiB>,
-    dispatch_frame: PhysFrame<Size4KiB>,
     stack_frames: &[PhysFrame<Size4KiB>],
 ) -> Option<mm::PageTable<PAGE_SIZE>> {
     // Safety: allocates a fresh, empty top-level table.
@@ -209,8 +261,6 @@ fn build_page_table(
     let rw = ro | PageTableFlags::WRITABLE;
     // Writable only for installation; changed to read-only before publication.
     pt.map_non_contiguous_phys_frames(&[prk_frame], VirtAddr::new(VAULT_PRK_VA), rw)
-        .ok()?;
-    pt.map_non_contiguous_phys_frames(&[dispatch_frame], VirtAddr::new(VAULT_DISPATCH_VA), rw)
         .ok()?;
     pt.map_non_contiguous_phys_frames(stack_frames, VirtAddr::new(VAULT_STACK_BOTTOM), rw)
         .ok()?;
@@ -238,7 +288,7 @@ pub(crate) fn with_prk<C>(ctx: &mut C, f: fn(&[u8; PRK_LEN], &mut C)) -> Result<
         let call = unsafe { &mut *call.cast::<Call<'_, C>>() };
         // Safety: `prk` is `VAULT_PRK_VA`, mapped read-only in the vault.
         let prk = unsafe { &*prk.cast::<[u8; PRK_LEN]>() };
-        // Safety: inside the serialized vault window; signature matches `call.f`.
+        // Safety: inside a vault window; signature matches `call.f`.
         unsafe {
             set_dispatch(call.f as *const () as usize);
             (Dispatch {
@@ -283,7 +333,7 @@ impl<'a> Input<'a> {
 pub(crate) trait Stage<E> {
     /// # Safety
     ///
-    /// Must run inside the serialized vault window.
+    /// Must run inside a vault window.
     unsafe fn run(&self, key: &[u8], output: &mut [u8]) -> Result<(), E>;
 }
 
@@ -362,7 +412,7 @@ pub(crate) fn run<E, S: Stage<E>>(
             result: None,
         };
         with_prk(&mut ctx, |prk, ctx| {
-            // Safety: inside the serialized vault window.
+            // Safety: inside a vault window.
             ctx.result = Some(unsafe { ctx.stage.run(prk, ctx.output) });
         })?;
         ctx.result.expect("vault did not run the stage")
@@ -376,15 +426,27 @@ pub(crate) fn run<E, S: Stage<E>>(
 impl Vault {
     /// `thunk` must obey the vault restrictions and accept `arg` plus the PRK address.
     unsafe fn run(&self, thunk: unsafe extern "C" fn(*mut u8, *const u8), arg: *mut u8) {
-        x86_64::instructions::interrupts::without_interrupts(|| {
-            // Lock with interrupts off so an IRQ cannot re-enter and deadlock.
-            let _guard = self.lock.lock();
-            let spec = self.spec.enter();
-            // Safety: interrupts are disabled, lock held, and caller supplies a valid thunk.
-            unsafe { trampoline(self.p4, thunk, arg) };
-            evict_l1d(self.eviction.as_deref());
-            self.spec.exit(spec);
-        });
+        loop {
+            let done = x86_64::instructions::interrupts::without_interrupts(|| {
+                // Hold a slot with interrupts off so an IRQ cannot re-enter the vault.
+                let Some(slot) = self.busy.claim() else {
+                    return false;
+                };
+                let spec = self.spec.enter();
+                // Safety: interrupts are disabled, the slot is held, and the
+                // caller supplies a valid thunk.
+                unsafe { trampoline(self.slots[slot].p4, thunk, arg) };
+                evict_l1d(self.eviction.as_deref());
+                self.spec.exit(spec);
+                self.busy.release(slot);
+                true
+            });
+            if done {
+                return;
+            }
+            // All slots are busy, which is rare: wait with interrupts restored.
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -415,13 +477,13 @@ fn evict_l1d(buffer: Option<&[u8]>) {
 ///
 /// # Safety
 ///
-/// Must run inside the serialized vault window; `f` must obey its restrictions.
+/// Must run inside a vault window; `f` must obey its restrictions.
 unsafe fn invoke<E, P>(f: fn(&[u8], P) -> Result<(), E>, key: &[u8], params: P) -> Result<(), E> {
     union Dispatch<E, P> {
         entry: *const (),
         call: unsafe fn(&[u8], P) -> Result<(), E>,
     }
-    // Safety: caller holds the vault lock and has loaded its page table.
+    // Safety: caller holds a vault slot and has loaded its page table.
     unsafe {
         set_dispatch(f as *const () as usize);
         (Dispatch {
@@ -432,7 +494,7 @@ unsafe fn invoke<E, P>(f: fn(&[u8], P) -> Result<(), E>, key: &[u8], params: P) 
 }
 
 unsafe fn set_dispatch(target: usize) {
-    // Safety: writable dispatch page, accessible only under the vault lock.
+    // Safety: the held slot's private dispatch word.
     unsafe {
         (VAULT_DISPATCH_VA as *mut usize).write_volatile(target);
     }
@@ -472,7 +534,7 @@ core::arch::global_asm!(
 ///
 /// # Safety
 ///
-/// Interrupts disabled, the vault lock held, and `vault_p4` is the vault.
+/// Interrupts disabled, and `vault_p4` is a vault slot held by the caller.
 #[inline(never)]
 #[rustfmt::skip] // rustfmt would break `stringify!` in the asm macro arguments.
 unsafe fn trampoline(vault_p4: u64, thunk: unsafe extern "C" fn(*mut u8, *const u8), arg: *mut u8) {
@@ -556,7 +618,7 @@ unsafe fn trampoline(vault_p4: u64, thunk: unsafe extern "C" fn(*mut u8, *const 
             inout("rdx") vault_p4 => _,
             inout("r8") thunk => _,
             inout("rdi") arg => _,
-            inout("r14") VAULT_STACK_TOP => _,
+            inout("r14") VAULT_STACK_ENTRY => _,
             inout("r15") VAULT_STACK_BOTTOM => _,
             out("r12") _,
             out("r13") _,
@@ -639,5 +701,16 @@ mod tests {
             );
         }
         assert_eq!(output, prk);
+    }
+
+    #[test]
+    fn slot_set_hands_out_each_slot_once() {
+        let slots = SlotSet(AtomicU32::new(0));
+        for slot in 0..VAULT_SLOTS {
+            assert_eq!(slots.claim(), Some(slot));
+        }
+        assert_eq!(slots.claim(), None);
+        slots.release(VAULT_SLOTS - 1);
+        assert_eq!(slots.claim(), Some(VAULT_SLOTS - 1));
     }
 }
