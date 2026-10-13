@@ -449,3 +449,30 @@ fn test_tcp_shutdown_write_before_connect_observed() {
     network.close(&server_fd, CloseBehavior::Immediate).unwrap();
     network.close(&listener, CloseBehavior::Immediate).unwrap();
 }
+
+#[test]
+fn test_tcp_shutdown_while_connecting() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let (client_fd, client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+
+    // Shutting down aborts the connection attempt, which is reported as a reset rather than a
+    // refused connection.
+    network.shutdown(&client_fd, Shutdown::Both).unwrap();
+    pump(&mut network);
+    assert!(
+        client
+            .check_io_events()
+            .contains(Events::OUT | Events::ERR | Events::HUP)
+    );
+    assert!(matches!(
+        client.get_async_error(true),
+        Some(errors::SocketAsyncError::ConnectionReset)
+    ));
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+}

@@ -791,7 +791,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Ok(0) => Err(TryOpError::TryAgain),
                     Ok(n) => Ok(n),
                     Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
-                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
+                    // Like Linux, a pending socket error (such as a reset) is reported, and
+                    // consumed, in place of `EPIPE`.
+                    Err(e) => Err(TryOpError::Other(match Errno::from(e) {
+                        Errno::EPIPE => proxy
+                            .get_async_error(true)
+                            .map_or(Errno::EPIPE, Errno::from),
+                        errno => errno,
+                    })),
                 },
             )
             .map_err(Errno::from)
