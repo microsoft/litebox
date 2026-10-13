@@ -150,3 +150,28 @@ pub fn enable_smep_smap() {
         x86_64::registers::control::Cr4::write(cr4);
     }
 }
+
+/// Enable User-Mode Instruction Prevention (UMIP), if supported.
+///
+/// Blocks `SGDT`/`SIDT`/`SLDT`/`SMSW`/`STR` in user mode (`#GP`).
+/// If unsupported, only the BSP (`is_bsp`) logs a warning.
+#[cfg(target_arch = "x86_64")]
+pub fn enable_umip(is_bsp: bool) {
+    // CPUID.07h:ECX bit 2 = UMIP
+    let structured_features = cpuid_count(0x07, 0);
+    if structured_features.ecx & (1 << 2) == 0 {
+        if is_bsp {
+            litebox_util_log::warn!("CPU does not support UMIP; leaving it disabled");
+        }
+        return;
+    }
+
+    // Safety: CPUID confirmed support, so the bit is not reserved. `update`
+    // preserves all other CR4 bits. UMIP only adds #GP for the instructions
+    // above at CPL > 0; it does not affect paging or kernel execution.
+    unsafe {
+        x86_64::registers::control::Cr4::update(|cr4| {
+            cr4.insert(x86_64::registers::control::Cr4Flags::USER_MODE_INSTRUCTION_PREVENTION);
+        });
+    }
+}

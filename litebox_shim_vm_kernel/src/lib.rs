@@ -61,7 +61,9 @@ pub struct ProcessConfig<'a> {
     pub images: &'a [&'a [u8]],
     /// Binds derived keys; the caller is responsible for what it names.
     pub identity: [u8; IDENTITY_LEN],
-    pub tsc_khz: u64,
+    /// [`StartupInfo::clock_khz`]: the frequency of the counter behind the
+    /// platform's installed clock source, which must be the same clock.
+    pub clock_khz: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -198,7 +200,7 @@ impl Process {
         let info = StartupInfo {
             abi_version: ABI_VERSION,
             max_log_level: log::max_level() as u32,
-            tsc_khz: config.tsc_khz,
+            clock_khz: config.clock_khz,
             identity: config.identity,
             images,
             heap: layout::HEAP,

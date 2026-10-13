@@ -27,6 +27,7 @@ use litebox_common_optee::{
 };
 use litebox_common_vm_abi::envelope::{Envelope, Protocol};
 use litebox_common_vm_abi::{CallId, CallSet, Image, Message, ProtSet, StartupInfo, UserRange};
+use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_userland::{VmUserland, kcall};
 use litebox_shim_optee::session::{OpenSessionTarget, SessionManager, SessionToken, TaInstance};
 use litebox_shim_optee::{LoadedProgram, OpteeShim, TaMemrefAddresses, UserConstPtr};
@@ -152,7 +153,7 @@ pub fn serve(info: &StartupInfo) -> ! {
         Err(error) => log::warn!("TA output stays in the log: /dev/stdout: {error:?}"),
     }
     if cfg!(debug_assertions) {
-        check_stdin(builder.litebox(), &mut notifications, info.tsc_khz);
+        check_stdin(platform, builder.litebox(), &mut notifications);
     }
     let shim = builder.build();
 
@@ -186,7 +187,7 @@ pub fn serve(info: &StartupInfo) -> ! {
         // Requires upcalls, registered by `ready`.
         check_guest_memory_access();
         check_lockdown_validation();
-        litebox_broker_local_vm_userland::self_check(&notifications, info.tsc_khz);
+        litebox_broker_local_vm_userland::self_check(&notifications, platform);
     }
     loop {
         let reply = runner.serve(request);
@@ -748,9 +749,9 @@ fn check_guest_memory_access() {
 /// never read. Waits briefly for input (on broker notifications), and echoes
 /// what arrived to standard output.
 fn check_stdin(
+    platform: &Platform,
     litebox: &litebox::LiteBox<Platform>,
     notifications: &mut litebox_broker_local_vm_userland::Notifications,
-    tsc_khz: u64,
 ) {
     use litebox::fs::errors::ReadError;
     const WAIT_MS: u64 = 20;
@@ -768,15 +769,17 @@ fn check_stdin(
             .unwrap_or_else(|error| panic!("opening {path}: {error:?}"))
     };
     let stdin = open("/dev/stdin", FileAccessMode::ReadOnly);
-    // Safety: RDTSC has no side effects; the kernel allows it in ring 3.
-    let deadline = unsafe { core::arch::x86_64::_rdtsc() } + WAIT_MS * tsc_khz;
+    let deadline = platform
+        .now()
+        .checked_add(core::time::Duration::from_millis(WAIT_MS))
+        .expect("the clock is far from overflowing");
     let mut input = [0u8; 256];
     let len = loop {
         match litebox.read_file(&stdin, &mut input, None, None) {
             Ok(len) => break len,
             Err(ReadError::WouldBlock) => {
                 let dispatch = litebox.broker_notification_dispatcher();
-                match notifications.receive(deadline, dispatch) {
+                match notifications.receive(Some(deadline), dispatch) {
                     Ok(0) => break 0,
                     Ok(_) => {}
                     Err(error) => panic!("waiting for standard input: {error}"),

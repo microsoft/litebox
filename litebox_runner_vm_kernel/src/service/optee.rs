@@ -89,7 +89,7 @@ impl Optee {
                     runner,
                     images: &images,
                     identity,
-                    tsc_khz: clock.khz(),
+                    clock_khz: clock.khz(),
                 },
             )
             .map_err(|error| {
