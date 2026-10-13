@@ -340,7 +340,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     ///
     /// Panics if the broker returns a response for a different operation or
     /// a value for a different option.
-    pub fn unix_socket_option(
+    pub fn get_unix_socket_option(
         &self,
         handle: ObjectHandle,
         name: UnixSocketOptionName,

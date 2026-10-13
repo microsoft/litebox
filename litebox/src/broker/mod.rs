@@ -481,7 +481,7 @@ pub(crate) trait BrokerControl: Send + Sync {
         value: UnixSocketOptionValue,
     ) -> core::result::Result<(), BrokerControlError>;
 
-    fn unix_socket_option(
+    fn get_unix_socket_option(
         &self,
         handle: ObjectHandle,
         name: UnixSocketOptionName,
@@ -1375,12 +1375,12 @@ where
         self.request(|local| local.set_unix_socket_option(handle, value))
     }
 
-    fn unix_socket_option(
+    fn get_unix_socket_option(
         &self,
         handle: ObjectHandle,
         name: UnixSocketOptionName,
     ) -> core::result::Result<UnixSocketOptionValue, BrokerControlError> {
-        self.request(|local| local.unix_socket_option(handle, name))
+        self.request(|local| local.get_unix_socket_option(handle, name))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

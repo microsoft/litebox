@@ -336,7 +336,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
             _ => None,
         };
         if let Some(name) = name {
-            let value = match self.socket.option(name)? {
+            let value = match self.socket.get_option(name)? {
                 UnixSocketOptionValue::ReceiveTimeout(timeout)
                 | UnixSocketOptionValue::SendTimeout(timeout)
                 | UnixSocketOptionValue::Linger(timeout) => SocketOptionValue::Timeout(timeout),

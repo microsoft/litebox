@@ -848,7 +848,7 @@ fn options_are_stored_with_the_socket() {
     let fixture = Fixture::new();
     let socket = fixture.create(SocketType::Datagram);
     assert_eq!(
-        option(
+        get_option(
             &fixture.process,
             socket,
             UnixSocketOptionName::ReceiveTimeout
@@ -869,7 +869,7 @@ fn options_are_stored_with_the_socket() {
     )
     .unwrap();
     assert_eq!(
-        option(
+        get_option(
             &fixture.process,
             socket,
             UnixSocketOptionName::ReceiveTimeout
@@ -878,11 +878,11 @@ fn options_are_stored_with_the_socket() {
         UnixSocketOptionValue::ReceiveTimeout(Some(Duration::from_secs(2)))
     );
     assert_eq!(
-        option(&fixture.process, socket, UnixSocketOptionName::Broadcast).unwrap(),
+        get_option(&fixture.process, socket, UnixSocketOptionName::Broadcast).unwrap(),
         UnixSocketOptionValue::Broadcast(true)
     );
     assert_eq!(
-        option(&fixture.process, socket, UnixSocketOptionName::SendTimeout).unwrap(),
+        get_option(&fixture.process, socket, UnixSocketOptionName::SendTimeout).unwrap(),
         UnixSocketOptionValue::SendTimeout(None)
     );
 }

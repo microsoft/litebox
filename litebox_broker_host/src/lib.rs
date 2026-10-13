@@ -1564,7 +1564,7 @@ fn unix_socket_operation<Memory: SharedMemory>(
             Ok(Ok(UnixSocketResponse::SetOption))
         }
         UnixSocketRequest::GetOption(request) => {
-            let value = unix_socket::option(process, request.handle, request.name)?;
+            let value = unix_socket::get_option(process, request.handle, request.name)?;
             Ok(Ok(UnixSocketResponse::GetOption(
                 GetUnixSocketOptionResponse { value },
             )))

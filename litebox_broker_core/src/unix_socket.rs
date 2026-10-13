@@ -473,7 +473,7 @@ pub fn set_option(
 }
 
 /// Returns one stored option of a Unix socket.
-pub fn option(
+pub fn get_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
     name: UnixSocketOptionName,

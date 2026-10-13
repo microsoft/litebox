@@ -295,11 +295,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     }
 
     /// Returns the stored value of the option `name`.
-    pub fn option(
+    pub fn get_option(
         &self,
         name: UnixSocketOptionName,
     ) -> Result<UnixSocketOptionValue, UnixSocketError> {
-        Ok(self.broker.unix_socket_option(self.handle, name)?)
+        Ok(self.broker.get_unix_socket_option(self.handle, name)?)
     }
 
     /// Returns the socket's access mode and status flags.
@@ -353,7 +353,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
             Err(TryOpError::Other(error)) => return Err(error),
             Err(TryOpError::WaitError(error)) => return Err(UnixSocketError::WaitError(error)),
         }
-        let timeout = match self.option(timeout)? {
+        let timeout = match self.get_option(timeout)? {
             UnixSocketOptionValue::ReceiveTimeout(timeout)
             | UnixSocketOptionValue::SendTimeout(timeout) => timeout,
             value => unreachable!("{value:?} is not a wait timeout"),
