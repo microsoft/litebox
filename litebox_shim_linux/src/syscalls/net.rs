@@ -3586,8 +3586,8 @@ mod unix_tests {
         // `addrlen = SUN_LEN(addr)` excludes the NUL, so the path ends at `addrlen`.
         assert_eq!(parse(b"/sun_len.sock"), path("/sun_len.sock"));
         assert_eq!(parse(b"/sun_len.sock\0ignored"), path("/sun_len.sock"));
-        let path_max = core::mem::size_of::<libc::sockaddr_un>()
-            - core::mem::offset_of!(libc::sockaddr_un, sun_path);
+        // Linux's `sizeof(((struct sockaddr_un *)0)->sun_path)`.
+        let path_max = 108;
         let longest = "a".repeat(path_max);
         assert_eq!(parse(longest.as_bytes()), path(&longest));
         let too_long = "a".repeat(path_max + 1);
