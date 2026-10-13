@@ -34,6 +34,7 @@ fn kernel_main(kernel: Kernel) -> ! {
         payload::Payload::read(kernel.boot_info).unwrap_or_else(|e| panic!("payload: {e}"));
     let devices = devices::Devices::init(kernel.platform, kernel.clock);
     let broker = litebox_broker_vm_kernel::Broker::new(litebox_broker_vm_kernel::Config {
+        platform: kernel.platform,
         console: devices,
         events: devices,
     });

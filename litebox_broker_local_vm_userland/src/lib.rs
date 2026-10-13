@@ -40,7 +40,8 @@ use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, S
 use litebox_common_vm_abi::{
     BrokerEnterRequest, BrokerHandshakeFrame, StartupInfo, Status, UserRange, WireFrame,
 };
-use litebox_platform_vm_userland::kcall;
+use litebox_platform::time::{Instant as _, TimeProvider as _};
+use litebox_platform_vm_userland::{Instant, VmUserland, kcall};
 
 #[derive(Debug)]
 pub enum ChannelError {
@@ -326,7 +327,7 @@ impl WaitableSharedMemory for KernelControlRing {
     }
 
     fn wait_while_equal(&self, offset: usize, expected: u32) -> Result<(), ChannelError> {
-        broker_wait(offset, expected, 0).map_err(ChannelError::Kernel)
+        broker_wait(offset, expected, None).map_err(ChannelError::Kernel)
     }
 
     /// The kernel waits on no ring word: only new requests need it.
@@ -387,8 +388,8 @@ pub fn connect(
 impl Notifications {
     /// Passes every published notification to `dispatch` (e.g.,
     /// `LiteBox::broker_notification_dispatcher`); if there is none, first
-    /// waits for one until `deadline` (TSC; zero for none). Returns how many
-    /// it passed: zero at the deadline.
+    /// waits for one until `deadline`, if any. Returns how many it passed:
+    /// zero at the deadline.
     ///
     /// # Errors
     ///
@@ -396,7 +397,7 @@ impl Notifications {
     /// if nothing could publish).
     pub fn receive(
         &mut self,
-        deadline: u64,
+        deadline: Option<Instant>,
         mut dispatch: impl FnMut(BrokerNotification),
     ) -> Result<usize, ChannelError> {
         let mut received = 0;
@@ -435,8 +436,10 @@ fn broker_wake() -> Result<(), Status> {
 }
 
 /// Serves published broker requests, then waits while the control-ring word
-/// at `offset` equals `expected`, until `deadline` (TSC; zero for none).
-fn broker_wait(offset: usize, expected: u32, deadline: u64) -> Result<(), Status> {
+/// at `offset` equals `expected`, until `deadline`, if any.
+fn broker_wait(offset: usize, expected: u32, deadline: Option<Instant>) -> Result<(), Status> {
+    // Zero means none, so the (theoretical) instant zero waits from 1 ns.
+    let deadline = deadline.map_or(0, |deadline| deadline.as_nanos().max(1));
     kcall::call(&BrokerEnterRequest::wait(offset as u64, expected, deadline))
 }
 
@@ -447,11 +450,10 @@ fn broker_wait(offset: usize, expected: u32, deadline: u64) -> Result<(), Status
 /// # Panics
 ///
 /// On a failed check.
-pub fn self_check(notifications: &Notifications, tsc_khz: u64) {
+pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
     let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
     let served = ControlRingDirection::Requests.consumer_epoch_offset();
-    // Safety: RDTSC has no side effects.
-    let now = || unsafe { core::arch::x86_64::_rdtsc() };
+    let now = || platform.now();
     let current = |offset| {
         notifications
             .words
@@ -461,21 +463,23 @@ pub fn self_check(notifications: &Notifications, tsc_khz: u64) {
     broker_wake().expect("waking an idle broker");
     let notified = current(epoch);
     assert_eq!(
-        broker_wait(epoch, notified.wrapping_add(1), 0),
+        broker_wait(epoch, notified.wrapping_add(1), None),
         Ok(()),
         "word differs"
     );
-    let soon = now() + tsc_khz; // 1 ms
+    let soon = now()
+        .checked_add(core::time::Duration::from_millis(1))
+        .expect("the clock is far from overflowing");
     assert_eq!(
-        broker_wait(served, current(served), 0),
+        broker_wait(served, current(served), None),
         Err(Status::Stalled)
     );
     assert_eq!(
-        broker_wait(served, current(served), soon),
+        broker_wait(served, current(served), Some(soon)),
         Err(Status::TimedOut)
     );
     assert!(now() >= soon, "a timed wait returned early");
-    assert_eq!(broker_wait(0, 0, 0), Err(Status::InvalidArgument));
+    assert_eq!(broker_wait(0, 0, None), Err(Status::InvalidArgument));
     let mut wake = BrokerEnterRequest::wake();
     wake.expected = 1;
     assert_eq!(kcall::call(&wake), Err(Status::InvalidArgument));

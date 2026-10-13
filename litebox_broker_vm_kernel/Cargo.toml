@@ -6,6 +6,7 @@ description = "The LiteBox VM kernel's broker: serves runner processes' broker a
 
 [dependencies]
 litebox = { path = "../litebox/", version = "0.1.0" }
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }

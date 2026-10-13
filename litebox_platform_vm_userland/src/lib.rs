@@ -58,17 +58,17 @@ const MANAGED_MAX: usize = RUNNER_MANAGED_MAX as usize;
 /// Guest pointers are confined to the runner-managed area, so the shim never
 /// accesses runner memory on the guest's behalf.
 pub struct VmUserland {
-    tsc_khz: u64,
+    clock_khz: u64,
 }
 
 impl VmUserland {
     /// # Panics
     ///
-    /// Panics if the TSC frequency is zero.
+    /// Panics if the clock frequency is zero.
     pub fn new(info: &StartupInfo) -> Self {
-        assert!(info.tsc_khz != 0, "TSC frequency must not be zero");
+        assert!(info.clock_khz != 0, "clock frequency must not be zero");
         Self {
-            tsc_khz: info.tsc_khz,
+            clock_khz: info.clock_khz,
         }
     }
 
@@ -186,8 +186,26 @@ impl RawMutex {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// An instant on the kernel clock (see `litebox_common_vm_abi`); `from_nanos`
+/// and `as_nanos` convert to and from ABI times.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
+
+impl Instant {
+    pub const fn from_nanos(nanos: u64) -> Self {
+        Self(nanos)
+    }
+
+    pub const fn as_nanos(self) -> u64 {
+        self.0
+    }
+}
+
+/// The counter the kernel clock is read from.
+fn read_counter() -> u64 {
+    // Safety: RDTSC has no side effects; the kernel allows it in ring 3.
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
 
 pub struct SystemTime;
 
@@ -196,9 +214,8 @@ impl TimeProvider for VmUserland {
     type SystemTime = SystemTime;
 
     fn now(&self) -> Instant {
-        // Safety: RDTSC has no side effects; the kernel allows it in ring 3.
-        let tsc = u128::from(unsafe { core::arch::x86_64::_rdtsc() });
-        Instant(u64::try_from(tsc * 1_000_000 / u128::from(self.tsc_khz)).unwrap_or(u64::MAX))
+        let counter = u128::from(read_counter());
+        Instant(u64::try_from(counter * 1_000_000 / u128::from(self.clock_khz)).unwrap_or(u64::MAX))
     }
 
     /// Panics: the kernel has no wall clock.

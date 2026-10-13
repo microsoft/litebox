@@ -43,7 +43,8 @@ use litebox_broker_transport::control_ring::{
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
 use litebox_common_vm_abi::{BrokerEnterOp, BrokerEnterRequest, Status, UserRange, WireFrame};
-use litebox_platform_vm_kernel::PinnedUserPages;
+use litebox_platform::time::TimeProvider as _;
+use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel};
 
 use memory::{PinnedControlRing, UserSharedMemory};
 use readiness::KernelReadiness;
@@ -58,15 +59,16 @@ pub const CONTROL_RING_SIZE: usize = CONTROL_RING_MEMORY_SIZE;
 /// What the broker waits for: the runner's event sources (e.g., device
 /// interrupts and a timer).
 pub trait Events: Sync {
-    /// Halts until an event may have happened, or until `deadline` (a TSC
-    /// value, from ring 3; see [`litebox_hal::clock::now`]) passes. Without a
-    /// deadline, false if no event could ever end the halt (and it does not
-    /// halt).
-    fn wait(&self, deadline: Option<u64>) -> bool;
+    /// Halts until an event may have happened, or until `deadline` passes.
+    /// Without a deadline, false if no event could ever end the halt (and it
+    /// does not halt).
+    fn wait(&self, deadline: Option<Instant>) -> bool;
 }
 
 /// The runner's sources for a [`Broker`].
 pub struct Config {
+    /// For its clock.
+    pub platform: &'static VmKernel,
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
     pub console: &'static dyn stdio::Console,
     pub events: &'static dyn Events,
@@ -76,6 +78,7 @@ pub struct Config {
 #[derive(Clone)]
 pub struct Broker {
     core: BrokerCore,
+    platform: &'static VmKernel,
     events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
 }
@@ -90,6 +93,7 @@ impl Broker {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         Self {
             core: providers::core(stdio.clone()),
+            platform: config.platform,
             events: config.events,
             stdio,
         }
@@ -302,7 +306,7 @@ impl Association {
         let Some(offset) = wait_offset else {
             return Ok(());
         };
-        let deadline = (request.deadline != 0).then_some(request.deadline);
+        let deadline = (request.deadline != 0).then(|| Instant::from_nanos(request.deadline));
         let asynchronous = offset == ControlRingDirection::Notifications.producer_epoch_offset();
         loop {
             match active.words.load_u32_acquire(offset) {
@@ -310,7 +314,7 @@ impl Association {
                 Ok(_) => {}
                 Err(_) => return Err(invalid()),
             }
-            if deadline.is_some_and(|deadline| litebox_hal::clock::now() >= deadline) {
+            if deadline.is_some_and(|deadline| self.broker.platform.now() >= deadline) {
                 return Err(EnterError::Status(Status::TimedOut));
             }
             if deadline.is_none() && !asynchronous {

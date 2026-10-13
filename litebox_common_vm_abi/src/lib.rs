@@ -32,6 +32,13 @@
 //! - Only a `syscall` in the runner's [`GATE_SECTION`] is a call; any other,
 //!   the guest's or a stray one in the runner, becomes an upcall.
 //!
+//! # Clock
+//!
+//! Times in this ABI (e.g., deadlines) are instants on the kernel clock:
+//! monotonic nanoseconds since an origin fixed at boot. Ring 3 reads it
+//! without a call, from a counter it may read directly (on x86-64, the TSC)
+//! at [`StartupInfo::clock_khz`]: `counter * 1_000_000 / clock_khz`.
+//!
 //! # Upcalls
 //!
 //! The kernel enters [`ReadyRequest::upcall_entry`] with an [`UpcallFrame`]:
@@ -598,8 +605,9 @@ pub enum BrokerEnterOp {
     Wait = 1,
 }
 
-/// `offset` is into the control ring and `deadline` a TSC value or zero for
-/// none. The other fields are zero for [`BrokerEnterOp::Wake`].
+/// `offset` is into the control ring and `deadline` an instant (see
+/// [Clock](crate#clock)) or zero for none. The other fields are zero for
+/// [`BrokerEnterOp::Wake`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct BrokerEnterRequest {
@@ -801,8 +809,9 @@ pub struct StartupInfo {
     pub abi_version: u32,
     /// Most verbose [`LogLevel`] the kernel keeps; zero: none.
     pub max_log_level: u32,
-    /// `rdtsc` is allowed in ring 3.
-    pub tsc_khz: u64,
+    /// Ticks per millisecond of the counter ring 3 reads the kernel clock
+    /// from; see [Clock](crate#clock).
+    pub clock_khz: u64,
     /// Fixed at creation; its meaning is the protocol's (e.g.
     /// [`envelope::Protocol::OPTEE_MSG`]).
     pub identity: [u8; IDENTITY_LEN],

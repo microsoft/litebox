@@ -16,10 +16,11 @@ use alloc::boxed::Box;
 use core::time::Duration;
 use litebox_broker_vm_kernel::Events;
 use litebox_broker_vm_kernel::stdio::Console;
-use litebox_hal::clock::{self, Clock};
+use litebox_hal::clock::Clock;
 use litebox_hal::devices::ConsoleDevice;
 use litebox_hal::interrupt::LocalApic;
-use litebox_platform_vm_kernel::VmKernel;
+use litebox_platform::time::{Instant as _, TimeProvider as _};
+use litebox_platform_vm_kernel::{Instant, VmKernel};
 use spin::Mutex;
 
 /// How long a console write may wait for the device to take output before
@@ -75,10 +76,11 @@ impl Devices {
         true
     }
 
-    /// Halts until an interrupt, or until `deadline` (a [`clock::now`] value).
-    fn halt(&self, deadline: Option<u64>) {
+    /// Halts until an interrupt, or until `deadline`.
+    fn halt(&self, deadline: Option<Instant>) {
         if let Some(deadline) = deadline {
-            self.apic.arm_timer(deadline);
+            self.apic
+                .arm_timer(self.clock.ticks_at(deadline.as_nanos()));
         }
         self.platform.halt_until_interrupt();
         if deadline.is_some() {
@@ -88,7 +90,7 @@ impl Devices {
 }
 
 impl Events for Devices {
-    fn wait(&self, deadline: Option<u64>) -> bool {
+    fn wait(&self, deadline: Option<Instant>) -> bool {
         if deadline.is_none() && !self.console_interrupts {
             return false;
         }
@@ -111,11 +113,15 @@ impl Console for Devices {
 
     /// Waits (bounded) for the device to take all of `input`.
     fn write(&self, input: &[u8]) -> usize {
-        let deadline = self.clock.deadline(WRITE_TIMEOUT);
+        let deadline = self
+            .platform
+            .now()
+            .checked_add(WRITE_TIMEOUT)
+            .expect("the clock is far from overflowing");
         let mut written = 0;
         loop {
             written += self.console.lock().write(&input[written..]);
-            if written == input.len() || clock::now() >= deadline {
+            if written == input.len() || self.platform.now() >= deadline {
                 return written;
             }
             // Until the device takes more output.

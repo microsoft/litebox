@@ -85,6 +85,7 @@ mod syscall_entry;
 /// must keep the clock and allocator alive until reset.
 pub struct BootConfig<'a> {
     pub page_allocator: &'static dyn mm::PageAllocator,
+    /// The kernel clock; see [`clock::ClockSource`] for what it must be.
     pub clock: &'static dyn clock::ClockSource,
     /// Physical RAM to map; ranges are rounded inward to whole pages. All
     /// but `image` is mapped RW/NX at `PA + KERNEL_OFFSET`.
@@ -719,9 +720,21 @@ impl RawMutex {
     }
 }
 
-/// Nanoseconds from the installed [`clock::ClockSource`].
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// An instant on the kernel clock (see `litebox_common_vm_abi`), in
+/// nanoseconds from the installed [`clock::ClockSource`]; `from_nanos` and
+/// `as_nanos` convert to and from ABI times.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant(u64);
+
+impl Instant {
+    pub const fn from_nanos(nanos: u64) -> Self {
+        Self(nanos)
+    }
+
+    pub const fn as_nanos(self) -> u64 {
+        self.0
+    }
+}
 
 pub struct SystemTime;
 

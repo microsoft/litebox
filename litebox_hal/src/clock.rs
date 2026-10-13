@@ -3,15 +3,13 @@
 
 //! The CPU's clock: a free-running counter ([`now`], in ticks) and its
 //! frequency ([`Clock`]). On x86-64, the counter is the TSC, which ring 3
-//! reads too: `BrokerEnter` deadlines are TSC values and
-//! `StartupInfo::tsc_khz` is [`Clock::khz`] (see `litebox_common_vm_abi`), so
-//! the TSC is part of the ABI. Its frequency comes from the most
-//! authoritative source the machine has: CPUID, the hypervisor, or else
-//! calibration against the legacy PIT (which, e.g., Firecracker and Cloud
-//! Hypervisor lack).
+//! reads too: the kernel clock of `litebox_common_vm_abi` is [`Clock::nanos`],
+//! with `StartupInfo::clock_khz` being [`Clock::khz`]. Its frequency comes
+//! from the most authoritative source the machine has: CPUID, the
+//! hypervisor, or else calibration against the legacy PIT (which, e.g.,
+//! Firecracker and Cloud Hypervisor lack).
 
 use core::arch::x86_64::__cpuid_count as cpuid;
-use core::time::Duration;
 
 const PIT_HZ: u64 = 1_193_182;
 const CALIBRATION_MS: u64 = 50;
@@ -56,10 +54,11 @@ impl Clock {
         u64::try_from(u128::from(now()) * 1_000_000 / u128::from(self.khz)).unwrap_or(u64::MAX)
     }
 
-    /// The tick [`now`] reaches `timeout` from now.
-    pub fn deadline(self, timeout: Duration) -> u64 {
-        let ticks = timeout.as_nanos() * u128::from(self.khz) / 1_000_000;
-        now().saturating_add(u64::try_from(ticks).unwrap_or(u64::MAX))
+    /// The first tick [`now`] reaches where [`Self::nanos`] is at least
+    /// `nanos`, e.g., to program a timer for a deadline in nanoseconds.
+    pub fn ticks_at(self, nanos: u64) -> u64 {
+        let ticks = (u128::from(nanos) * u128::from(self.khz)).div_ceil(1_000_000);
+        u64::try_from(ticks).unwrap_or(u64::MAX)
     }
 }
 
