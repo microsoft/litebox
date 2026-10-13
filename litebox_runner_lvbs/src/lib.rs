@@ -1766,7 +1766,8 @@ fn write_non_ta_msg_args_to_normal_world(
 const LDELF_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ldelf.elf"));
 const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
-const TA_SIGNING_CERT_DER: &[u8] = &[0u8; 0];
+const TA_SIGNING_CERT_DER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ta-signing-public.der"));
 
 /// Register all TA binaries embedded in the runner image.
 fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
