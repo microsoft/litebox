@@ -866,7 +866,13 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                         Some(err) => Err(TryOpError::Other(err.into())),
                         None => Ok(0),
                     },
-                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(Errno::ENOTCONN)),
+                    // A pending error, such as the reset of an aborted connection attempt, is
+                    // reported first.
+                    Err(ChannelReadError::NotConnected) => Err(TryOpError::Other(
+                        proxy
+                            .get_async_error(true)
+                            .map_or(Errno::ENOTCONN, Errno::from),
+                    )),
                 },
             )
             .map_err(Errno::from)
@@ -2970,6 +2976,33 @@ mod tests {
             assert_eq!(task.sys_shutdown(fd, SHUT_RDWR), Err(Errno::ENOTCONN));
             close_socket(&task, raw_fd);
         }
+
+        // Like Linux, shutting down a connecting TCP socket reports a reset and leaves the socket
+        // unconnected.
+        let raw_tcp = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let tcp = typed_socket(&task, raw_tcp);
+        assert_eq!(
+            task.do_connect(&tcp, inet_addr([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::EINPROGRESS)
+        );
+        shutdown(&task, raw_tcp, SHUT_RDWR);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            task.do_recvfrom(&tcp, &mut buf, ReceiveFlags::empty(), None),
+            Err(Errno::ECONNRESET)
+        );
+        assert_eq!(
+            task.do_recvfrom(&tcp, &mut buf, ReceiveFlags::empty(), None),
+            Err(Errno::ENOTCONN)
+        );
+        close_socket(&task, raw_tcp);
 
         // Like Linux, `SHUT_WR` leaves a listener alone while `SHUT_RD` stops listening.
         let raw_listener = task

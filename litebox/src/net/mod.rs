@@ -677,6 +677,8 @@ where
                             }
                             proxy.set_peer_closed();
                         }
+                        // A socket that has not connected stays unconnected.
+                        socket_channel::SocketState::Initial => {}
                         _ => {
                             proxy.set_state(socket_channel::SocketState::Closed);
                         }
@@ -1447,8 +1449,8 @@ where
     /// Data received before the read side is shut down can still be read; data written before
     /// the write side is shut down is still sent, followed by a FIN for TCP. Shutting down the
     /// read side of a listening socket stops listening (pending connections are reset), and
-    /// shutting down a TCP socket that is still connecting aborts the connection attempt and
-    /// reports `ConnectionReset`.
+    /// shutting down a TCP socket that is still connecting aborts the connection attempt,
+    /// reports `ConnectionReset`, and leaves the socket unconnected.
     /// An unconnected UDP socket is shut down too, even though `NotConnected` is returned.
     pub fn shutdown(
         &mut self,
@@ -1482,11 +1484,11 @@ where
                 let tcp_socket = self.socket_set.get_mut::<tcp::Socket>(socket_handle.handle);
                 match tcp_socket.state() {
                     tcp::State::SynSent => {
-                        // Close the channel here; otherwise the worker would report the aborted
-                        // attempt as a refused connection.
+                        // The socket is unconnected again, so the worker does not report the
+                        // aborted attempt as a refused connection.
                         tcp_socket.abort();
                         proxy.set_async_error(errors::SocketAsyncError::ConnectionReset);
-                        proxy.set_state(socket_channel::SocketState::Closed);
+                        proxy.set_state(socket_channel::SocketState::Initial);
                     }
                     tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => {
                         return Err(ShutdownError::NotConnected);

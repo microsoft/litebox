@@ -456,12 +456,15 @@ fn test_tcp_shutdown_while_connecting() {
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Manual);
     let (client_fd, client) = stream_socket(&mut network);
+    // A socket that has not connected stays unconnected.
+    pump(&mut network);
+    assert!(matches!(read(&client), Err(ChannelReadError::NotConnected)));
     let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
     let err = network.connect(&client_fd, &addr, false).unwrap_err();
     assert!(matches!(err, ConnectError::InProgress));
 
     // Shutting down aborts the connection attempt, which is reported as a reset rather than a
-    // refused connection.
+    // refused connection, and leaves the socket unconnected.
     network.shutdown(&client_fd, Shutdown::Both).unwrap();
     pump(&mut network);
     assert!(
@@ -473,6 +476,9 @@ fn test_tcp_shutdown_while_connecting() {
         client.get_async_error(true),
         Some(errors::SocketAsyncError::ConnectionReset)
     ));
+    pump(&mut network);
+    assert!(matches!(read(&client), Err(ChannelReadError::NotConnected)));
+    assert!(!client.check_io_events().contains(Events::ERR));
 
     network.close(&client_fd, CloseBehavior::Immediate).unwrap();
 }

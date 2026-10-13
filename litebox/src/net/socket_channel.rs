@@ -754,7 +754,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     ///
     /// State transitions trigger appropriate event notifications:
     /// - `Connected` -> `Events::OUT` (socket is now writable)
-    /// - `Closed` -> `Events::HUP` (hang up)
+    /// - `Initial` or `Closed` -> `Events::HUP` (hang up)
     /// - `Error` -> `Events::ERR` (error condition)
     pub(super) fn set_state(&self, state: SocketState) {
         let old_state = self.inner.state();
@@ -768,7 +768,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
             SocketState::Connected => {
                 self.inner.pollee.notify_observers(Events::OUT);
             }
-            SocketState::Closed => {
+            SocketState::Initial | SocketState::Closed => {
                 self.inner.pollee.notify_observers(Events::HUP);
             }
             SocketState::Error => {
