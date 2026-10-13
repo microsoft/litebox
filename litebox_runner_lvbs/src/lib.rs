@@ -1748,24 +1748,14 @@ fn write_non_ta_msg_args_to_normal_world(
 const LDELF_BINARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ldelf.elf"));
 const TA_BINARY: &[u8] = &[0u8; 0];
 const TA_BINARIES: &[&[u8]] = &[TA_BINARY];
-const TA_SIGNING_CERT_DER: &[u8] = &[0u8; 0];
-
-/// Register a TA binary embedded in the runner image.
-fn register_embedded_ta(
-    shim: &litebox_shim_optee::OpteeShim<Platform>,
-    ta_binary: &'static [u8],
-) -> bool {
-    let Some(ta_head) = litebox_common_optee::parse_ta_head(ta_binary) else {
-        return false;
-    };
-    shim.store_embedded_ta_bin(&ta_head.uuid, ta_binary)
-}
+const TA_SIGNING_CERT_DER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/ta-signing-public.der"));
 
 /// Register all TA binaries embedded in the runner image.
 fn register_embedded_tas(shim: &litebox_shim_optee::OpteeShim<Platform>) {
     for ta_binary in TA_BINARIES {
-        if !ta_binary.is_empty() {
-            assert!(register_embedded_ta(shim, ta_binary));
+        if !ta_binary.is_empty() && !shim.store_embedded_ta_bin(ta_binary) {
+            serial_println!("Failed to register embedded TA");
         }
     }
 }

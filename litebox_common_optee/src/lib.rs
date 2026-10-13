@@ -1032,6 +1032,7 @@ impl TeeMemoryAccessRights {
 
 const TEE_ALG_AES_CTR: u32 = 0x1000_0210;
 const TEE_ALG_AES_GCM: u32 = 0x4000_0810;
+pub const TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256: u32 = 0x7041_4930;
 const TEE_ALG_RSASSA_PKCS1_V1_5_SHA256: u32 = 0x7000_4830;
 const TEE_ALG_RSASSA_PKCS1_V1_5_SHA512: u32 = 0x7000_6830;
 const TEE_ALG_HMAC_SHA256: u32 = 0x3000_0004;
@@ -1047,6 +1048,7 @@ const TEE_ALG_ILLEGAL_VALUE: u32 = 0xefff_ffff;
 pub enum TeeAlgorithm {
     AesCtr = TEE_ALG_AES_CTR,
     AesGcm = TEE_ALG_AES_GCM,
+    RsaPssSha256 = TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256,
     RsaPkcs1Sha256 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA256,
     RsaPkcs1Sha512 = TEE_ALG_RSASSA_PKCS1_V1_5_SHA512,
     HmacSha256 = TEE_ALG_HMAC_SHA256,
@@ -1088,9 +1090,9 @@ impl From<TeeAlgorithm> for TeeAlgorithmClass {
         match algo {
             TeeAlgorithm::AesCtr | TeeAlgorithm::AesGcm => TeeAlgorithmClass::Cipher,
             TeeAlgorithm::HmacSha256 | TeeAlgorithm::HmacSha512 => TeeAlgorithmClass::Mac,
-            TeeAlgorithm::RsaPkcs1Sha256 | TeeAlgorithm::RsaPkcs1Sha512 => {
-                TeeAlgorithmClass::AsymmetricSignature
-            }
+            TeeAlgorithm::RsaPkcs1Sha256
+            | TeeAlgorithm::RsaPkcs1Sha512
+            | TeeAlgorithm::RsaPssSha256 => TeeAlgorithmClass::AsymmetricSignature,
             _ => TeeAlgorithmClass::Unknown,
         }
     }
@@ -2821,6 +2823,34 @@ pub fn parse_ta_head(elf_data: &[u8]) -> Option<TaHead> {
     }
     None
 }
+
+/// `Shdr` from `optee_os/core/include/signed_hdr.h`
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct Shdr {
+    pub magic: u32,
+    pub img_type: u32,
+    pub img_size: u32,
+    pub algo: u32,
+    pub hash_size: u16,
+    pub sig_size: u16,
+}
+
+/// `SHDR_MAGIC` from `optee_os/core/include/signed_hdr.h`
+pub const SHDR_MAGIC: u32 = 0x4f54_5348;
+
+/// `SHDR_BOOTSTRAP_TA` from `enum shdr_img_type` in `optee_os/core/include/signed_hdr.h`.
+pub const SHDR_BOOTSTRAP_TA: u32 = 1;
+
+/// From `optee_os/core/include/signed_hdr.h`
+/// ```c
+/// struct shdr_bootstrap_ta {
+///     uint8_t uuid[sizeof(TEE_UUID)];
+///     uint32_t ta_version;
+/// };
+/// ```
+pub const SHDR_UUID_LEN: usize = size_of::<TeeUuid>();
+pub const SHDR_VERSION_LEN: usize = 4;
 
 /// Hardware Unique Key (HUK) subkey usage identifiers based on OP-TEE's `enum huk_subkey_usage`.
 #[derive(Clone, Copy)]
