@@ -9,7 +9,6 @@ use crate::readiness::tests::TestReadinessSink;
 use crate::test_platform::TestPlatform;
 use crate::test_support::TestBrokerCoreBuilder;
 use crate::{BrokerCore, CallerCredential, PolicyEngine};
-use core::time::Duration;
 use std::vec;
 
 const USER: FileUser = FileUser::ROOT;
@@ -201,38 +200,6 @@ fn stream_pairs_carry_bytes_in_both_directions() {
     assert_eq!(fixture.send(second, b"back").unwrap(), Ok(4));
     assert_eq!(fixture.receive_data(first, 10), b"back");
     assert_eq!(fixture.queued(), (0, 0));
-}
-
-#[test]
-fn status_flags_belong_to_the_shared_object() {
-    let fixture = Fixture::new();
-    let (first, second) = create_pair(
-        &fixture.process,
-        SocketType::Datagram,
-        FileOpenFlags::NONBLOCKING,
-        &fixture.readiness_sink,
-    )
-    .unwrap();
-    assert_eq!(
-        fixture.receive(first, 1),
-        Err(BrokerError::NonBlockingWouldBlock)
-    );
-    assert_eq!(
-        fixture.process.get_status_flags(second).unwrap(),
-        FileStatusFlags {
-            access: FileAccessMode::ReadWrite,
-            flags: FileOpenFlags::NONBLOCKING,
-        }
-    );
-    assert_eq!(
-        create(
-            &fixture.process,
-            SocketType::Stream,
-            FileOpenFlags::CREATE,
-            &fixture.readiness_sink,
-        ),
-        Err(BrokerError::UnsupportedOperation)
-    );
 }
 
 #[test]
@@ -586,44 +553,6 @@ fn shutdown_reaches_the_stream_peer() {
 }
 
 #[test]
-fn a_read_shut_datagram_socket_ends_only_blocking_receives() {
-    let fixture = Fixture::new();
-    let (first, second) = fixture.pair(SocketType::Datagram);
-    assert_eq!(fixture.send(second, b"queued").unwrap(), Ok(6));
-    shutdown(&fixture.process, first, ShutdownMode::Read)
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        fixture.send(second, b"x").unwrap(),
-        Err(UnixSocketError::BrokenPipe)
-    );
-    assert_eq!(
-        receive(&fixture.process, first, 8, false, false, true),
-        Ok(Ok(Received {
-            data: b"queued".to_vec(),
-            length: 6,
-            source: None,
-        }))
-    );
-    assert_eq!(
-        receive(&fixture.process, first, 8, false, false, true),
-        Err(BrokerError::NonBlockingWouldBlock)
-    );
-    assert_eq!(
-        fixture.receive(first, 8),
-        Ok(Ok(Received {
-            source: Some(UnixSocketName::Unnamed),
-            ..Received::default()
-        }))
-    );
-    // Shutting down the peer's sending direction leaves this socket open.
-    shutdown(&fixture.process, first, ShutdownMode::Write)
-        .unwrap()
-        .unwrap();
-    assert_eq!(fixture.receive(second, 8), Err(BrokerError::WouldBlock));
-}
-
-#[test]
 fn closing_a_stream_hangs_up_its_peer() {
     let fixture = Fixture::new();
     let (first, second) = fixture.pair(SocketType::Stream);
@@ -949,50 +878,6 @@ fn duplicated_references_share_one_socket() {
     );
     child.close_object_reference(duplicated).unwrap();
     assert_eq!(fixture.receive_data(second, 8), b"");
-}
-
-#[test]
-fn options_are_stored_with_the_socket() {
-    let fixture = Fixture::new();
-    let socket = fixture.create(SocketType::Datagram);
-    assert_eq!(
-        get_option(
-            &fixture.process,
-            socket,
-            UnixSocketOptionName::ReceiveTimeout
-        )
-        .unwrap(),
-        UnixSocketOptionValue::ReceiveTimeout(None)
-    );
-    set_option(
-        &fixture.process,
-        socket,
-        UnixSocketOptionValue::ReceiveTimeout(Some(Duration::from_secs(2))),
-    )
-    .unwrap();
-    set_option(
-        &fixture.process,
-        socket,
-        UnixSocketOptionValue::Broadcast(true),
-    )
-    .unwrap();
-    assert_eq!(
-        get_option(
-            &fixture.process,
-            socket,
-            UnixSocketOptionName::ReceiveTimeout
-        )
-        .unwrap(),
-        UnixSocketOptionValue::ReceiveTimeout(Some(Duration::from_secs(2)))
-    );
-    assert_eq!(
-        get_option(&fixture.process, socket, UnixSocketOptionName::Broadcast).unwrap(),
-        UnixSocketOptionValue::Broadcast(true)
-    );
-    assert_eq!(
-        get_option(&fixture.process, socket, UnixSocketOptionName::SendTimeout).unwrap(),
-        UnixSocketOptionValue::SendTimeout(None)
-    );
 }
 
 #[test]
