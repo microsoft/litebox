@@ -980,6 +980,7 @@ fn fork_child_resumes_from_parent_snapshot() {
     assert_eq!(numeric_field(parent_line, "usr1="), 0);
     assert_eq!(numeric_field(parent_line, "sigchld="), 1);
     assert_eq!(numeric_field(parent_line, "echild="), 1);
+    assert_eq!(numeric_field(parent_line, "alarm="), 1);
 
     let fork_line = line("fork ");
     let child = numeric_field(fork_line, "child=");

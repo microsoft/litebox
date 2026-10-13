@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #define BUFFER_SIZE (4 * 1024 * 1024)
+#define ALARM_SECONDS 3600
 
 // Forks by system call, bypassing glibc. AArch64 has no `fork`, so use `clone(SIGCHLD)`.
 static pid_t raw_fork(void) {
@@ -96,6 +97,9 @@ static int run_child(pid_t parent, unsigned char *buffer, unsigned long expected
     failures += fcntl(pipe_fd, F_GETFD) != FD_CLOEXEC;
     pid_t pid = getpid();
     failures += pid == parent || getppid() != parent || gettid() != pid;
+    // Like Linux, the child does not inherit its parent's alarm. Its own use of the alarm does
+    // not keep it from forking below.
+    failures += alarm(0) != 0;
 
     pid_t grandchild = fork();
     if (grandchild == 0) {
@@ -161,6 +165,8 @@ int main(void) {
         return 3;
     }
     global_value = 2;
+    // An alarm armed across the forks, too long to fire during the test.
+    alarm(ALARM_SECONDS);
     fflush(stdout);
 
     pid_t child = fork();
@@ -198,10 +204,13 @@ int main(void) {
 
     pid_t again = waitpid(-1, NULL, WNOHANG);
     int again_errno = errno;
-    printf("parent pid=%d global=%d intact=%d usr1=%d sigchld=%d echild=%d\n", getpid(),
+    // The parent keeps its alarm.
+    unsigned int alarm_left = alarm(0);
+    printf("parent pid=%d global=%d intact=%d usr1=%d sigchld=%d echild=%d alarm=%d\n", getpid(),
            global_value,
            checksum(buffer, BUFFER_SIZE) == expected_sum && exec_only() == 42 &&
                hidden_is_intact(),
-           usr1_count, sigchld_before_reap, again == -1 && again_errno == ECHILD);
+           usr1_count, sigchld_before_reap, again == -1 && again_errno == ECHILD,
+           alarm_left > 0 && alarm_left <= ALARM_SECONDS);
     return failures;
 }

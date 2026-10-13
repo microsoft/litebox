@@ -1140,9 +1140,9 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// `MADV_DONTFORK` regions are copied too. Like Linux, the child has a single thread, a copy
     /// of the calling one; the parent's other threads pause while the parent is copied.
     ///
-    /// Only a process outside a `vfork` window, with default resource-limit and alarm state, no
-    /// shared memory mappings, no ELF file mid-load, and only descriptors a fresh runner can
-    /// inherit is duplicated; otherwise this fails with `EAGAIN`.
+    /// Only a process outside a `vfork` window, with default resource-limit state, no shared
+    /// memory mappings, no ELF file mid-load, and only descriptors a fresh runner can inherit is
+    /// duplicated; otherwise this fails with `EAGAIN`.
     fn fork(
         &self,
         ctx: &litebox_common_linux::PtRegs,
@@ -1154,7 +1154,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         let pause = self.pause_other_threads()?;
         if !self.thread.process.limits.has_default_state()
-            || !self.thread.process.has_default_alarm_state()
             || !self.global.elf_patch_cache.lock().is_empty()
         {
             return Err(Errno::EAGAIN);
