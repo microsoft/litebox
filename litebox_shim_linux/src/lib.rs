@@ -68,6 +68,8 @@ mod wait;
 
 pub(crate) use litebox::fs::FileFd;
 
+pub(crate) const RUNTIME_TRAMPOLINE_RESERVATION_SIZE: usize = 16 * 1024 * 1024;
+
 /// Aggregate bound capturing everything the shim requires of a platform.
 ///
 /// This exists so that the (many) `impl` blocks throughout the shim can be written

@@ -152,8 +152,6 @@ impl From<VmFlags> for MemoryRegionPermissions {
     }
 }
 
-pub const DEFAULT_RESERVED_SPACE_SIZE: usize = 0x100_0000; // 16 MiB
-
 bitflags::bitflags! {
     /// Options for page creation.
     #[derive(Clone, Copy)]
@@ -165,9 +163,6 @@ bitflags::bitflags! {
         const IS_STACK       = 1 << 1;
         /// Populate the pages immediately.
         const POPULATE_PAGES_IMMEDIATELY = 1 << 2;
-        /// Ensure there is more space (i.e., `DEFAULT_RESERVED_SPACE_SIZE`) after the
-        /// mapping so that user can grow the mapping later.
-        const ENSURE_SPACE_AFTER = 1 << 3;
         // This flag indicates that the mapping is backed by a file.
         const MAP_FILE = 1 << 4;
         /// When combined with [`Self::FIXED_ADDR`], fail with [`AllocationError::AddressInUse`]
@@ -951,13 +946,6 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        let total_length = (length
-            + if flags.contains(CreatePagesFlags::ENSURE_SPACE_AFTER) {
-                DEFAULT_RESERVED_SPACE_SIZE
-            } else {
-                0
-            })
-        .ok_or(AllocationError::OutOfMemory)?;
         let behavior = FixedAddressBehavior::from(flags);
         let direction = match behavior {
             FixedAddressBehavior::Hint(direction) => Some(direction),
@@ -974,22 +962,22 @@ where
             }
             _ => behavior,
         };
-        let mut request =
-            Self::build_unmapped_area_request(suggested_address, total_length, behavior);
+        let mut request = Self::build_unmapped_area_request(suggested_address, length, behavior);
         loop {
             let new_addr = self
                 .find_area(&request)?
                 .ok_or(AllocationError::OutOfMemory)?;
             // new_addr must be ALIGN aligned
             let new_range = PageRange::new(new_addr, new_addr + length.as_usize()).unwrap();
-            match unsafe {
+            let result = unsafe {
                 self.insert_mapping(
                     new_range,
                     vma,
                     flags.contains(CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY),
                     platform_behavior,
                 )
-            } {
+            };
+            match result {
                 Err(AllocationError::AddressInUseByPlatform)
                     if direction.is_some()
                         && platform_behavior == FixedAddressBehavior::NoReplace =>
@@ -1000,14 +988,14 @@ where
                         .suggested_address
                         .is_some_and(|address| address.as_usize() == new_addr);
                     if rejected_hint {
-                        request = Self::build_unmapped_area_request(None, total_length, behavior);
+                        request = Self::build_unmapped_area_request(None, length, behavior);
                     } else if direction == Some(AllocationDirection::TopDown) {
                         request.suggested_address = None;
                         request.address_range.end = new_addr;
                     } else {
                         request.suggested_address = None;
                         request.address_range.start = new_addr
-                            .checked_add(total_length.as_usize())
+                            .checked_add(length.as_usize())
                             .ok_or(AllocationError::OutOfMemory)?;
                     }
                 }

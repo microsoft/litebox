@@ -113,22 +113,17 @@ where
             let mut vmem = self.vmem.write();
             unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
         };
+        let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
+            .expect("successful mapping must return an aligned, non-empty range");
         // call the user function with the pages
         // Note `op` may trigger page fault handler which requires write lock to `vmem`.
         if let Err(e) = op(addr) {
             // remove the mapping if the user function fails
             let mut vmem = self.vmem.write();
-            unsafe {
-                vmem.remove_mapping(
-                    PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap(),
-                )
-            }
-            .unwrap();
+            unsafe { vmem.remove_mapping(range) }.unwrap();
             return Err(e);
         }
         if before_perms != after_perms {
-            let range =
-                PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize()).unwrap();
             let mut vmem = self.vmem.write();
             if let Err(error) = unsafe { vmem.protect_mapping(range, after_perms) } {
                 unsafe { vmem.remove_mapping(range) }
@@ -787,15 +782,6 @@ impl From<ProtFlags> for MemoryRegionPermissions {
     }
 }
 
-/// Address-selection policy for an mmap operation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MmapPlacement {
-    /// Direction in which to search for free address space.
-    pub direction: AllocationDirection,
-    /// Whether to reserve additional growth space after the mapping.
-    pub ensure_space_after: bool,
-}
-
 impl<Platform> VmemManager<Platform, PAGE_SIZE>
 where
     Platform: litebox::platform::RawPointerProvider
@@ -815,17 +801,13 @@ where
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        placement: MmapPlacement,
+        direction: AllocationDirection,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let mut flags = CreatePagesFlags::from(flags);
         flags.set(
-            CreatePagesFlags::ENSURE_SPACE_AFTER,
-            placement.ensure_space_after,
-        );
-        flags.set(
             CreatePagesFlags::TOP_DOWN,
-            placement.direction == AllocationDirection::TopDown,
+            direction == AllocationDirection::TopDown,
         );
         let suggested_addr = match suggested_addr {
             Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),

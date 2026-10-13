@@ -102,7 +102,7 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
             .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
             .and_then(|len| {
                 len.checked_add(if self.reserve_runtime_trampoline {
-                    litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE
+                    crate::RUNTIME_TRAMPOLINE_RESERVATION_SIZE
                 } else {
                     0
                 })
@@ -265,7 +265,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         // embedded trampoline, reserve space so that brk starts past the
         // runtime trampoline region.
         let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
-            Some(litebox_common_linux::vmem::DEFAULT_RESERVED_SPACE_SIZE)
+            Some(crate::RUNTIME_TRAMPOLINE_RESERVATION_SIZE)
         } else {
             None
         };
