@@ -9,7 +9,6 @@
 //! inheritance see one socket.
 
 use alloc::sync::{Arc, Weak};
-use core::time::Duration;
 use litebox_broker_protocol::{
     ObjectHandle,
     error::ErrorCode,
@@ -18,7 +17,7 @@ use litebox_broker_protocol::{
     socket::{ShutdownMode, SocketType},
     unix_socket::{
         UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError as ProtocolError,
-        UnixSocketName, UnixSocketOption, UnixSocketOptions,
+        UnixSocketName, UnixSocketOptionName, UnixSocketOptionValue,
     },
 };
 use litebox_platform::time::TimeProvider;
@@ -99,23 +98,17 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
         ))
     }
 
-    /// Returns the Unix socket this process inherited from its parent as
-    /// `handle`.
+    /// Returns the Unix socket of type `socket_type` this process inherited
+    /// from its parent as `handle`.
     ///
     /// The socket owns `handle`, so callers adopt each handle once and share
     /// the socket for every other use.
     pub fn adopt_inherited_unix_socket(
         &self,
         handle: ObjectHandle,
+        socket_type: SocketType,
     ) -> Result<UnixSocket<Platform>, ProcessError> {
         let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
-        let socket_type = match broker.unix_socket_options(handle) {
-            Ok(response) => response.socket_type,
-            Err(error) => {
-                let _ = broker.close_object(handle);
-                return Err(error.into());
-            }
-        };
         Ok(UnixSocket::new(self, broker, handle, socket_type))
     }
 }
@@ -184,7 +177,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         user: FileUser,
         nonblock: bool,
     ) -> Result<(), UnixSocketError> {
-        self.wait(cx, nonblock, send_timeout, || {
+        self.wait(cx, nonblock, UnixSocketOptionName::SendTimeout, || {
             self.broker.connect_unix_socket(self.handle, address, user)
         })
     }
@@ -200,7 +193,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         flags: FileOpenFlags,
         nonblock: bool,
     ) -> Result<Self, UnixSocketError> {
-        let handle = self.wait(cx, nonblock, receive_timeout, || {
+        let handle = self.wait(cx, nonblock, UnixSocketOptionName::ReceiveTimeout, || {
             self.broker.accept_unix_socket(self.handle, flags)
         })?;
         let pollee = Arc::new(Pollee::new());
@@ -231,7 +224,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         nonblock: bool,
     ) -> Result<usize, UnixSocketError> {
         if self.socket_type != SocketType::Stream {
-            return self.wait(cx, nonblock, send_timeout, || {
+            return self.wait(cx, nonblock, UnixSocketOptionName::SendTimeout, || {
                 self.broker
                     .send_unix_socket(self.handle, address, data, user)
             });
@@ -242,7 +235,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
                 .saturating_add(UNIX_SOCKET_BUFFER_SIZE as usize)
                 .min(data.len());
             let chunk = &data[sent..end];
-            let result = self.wait(cx, nonblock, send_timeout, || {
+            let result = self.wait(cx, nonblock, UnixSocketOptionName::SendTimeout, || {
                 self.broker
                     .send_unix_socket(self.handle, address, chunk, user)
             });
@@ -273,7 +266,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         peek: bool,
         nonblock: bool,
     ) -> Result<Received, UnixSocketError> {
-        self.wait(cx, nonblock, receive_timeout, || {
+        self.wait(cx, nonblock, UnixSocketOptionName::ReceiveTimeout, || {
             self.broker
                 .receive_unix_socket(self.handle, buffer, peek, nonblock)
                 .map(|result| {
@@ -297,13 +290,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     }
 
     /// Stores one option, which every reference to the socket shares.
-    pub fn set_option(&self, option: UnixSocketOption) -> Result<(), UnixSocketError> {
-        Ok(self.broker.set_unix_socket_option(self.handle, option)?)
+    pub fn set_option(&self, value: UnixSocketOptionValue) -> Result<(), UnixSocketError> {
+        Ok(self.broker.set_unix_socket_option(self.handle, value)?)
     }
 
-    /// Returns the socket's stored options.
-    pub fn options(&self) -> Result<UnixSocketOptions, UnixSocketError> {
-        Ok(self.broker.unix_socket_options(self.handle)?.options)
+    /// Returns the stored value of the option `name`.
+    pub fn option(
+        &self,
+        name: UnixSocketOptionName,
+    ) -> Result<UnixSocketOptionValue, UnixSocketError> {
+        Ok(self.broker.unix_socket_option(self.handle, name)?)
     }
 
     /// Returns the socket's access mode and status flags.
@@ -324,7 +320,9 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
     }
 
     /// Runs `op`, waiting while the broker reports it would block, unless
-    /// `nonblock` is set, for at most the stored timeout `timeout` selects.
+    /// `nonblock` is set, for at most the stored timeout `timeout` names
+    /// ([`UnixSocketOptionName::ReceiveTimeout`] or
+    /// [`UnixSocketOptionName::SendTimeout`]).
     ///
     /// The broker publishes a blocked socket's readiness when the operation
     /// may succeed, so any readiness notification retries it. The timeout is
@@ -334,7 +332,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         &self,
         cx: &WaitContext<'_, Platform>,
         nonblock: bool,
-        timeout: fn(&UnixSocketOptions) -> Option<Duration>,
+        timeout: UnixSocketOptionName,
         mut op: impl FnMut() -> Result<Result<R, ProtocolError>, BrokerControlError>,
     ) -> Result<R, UnixSocketError> {
         let mut attempt = || match op() {
@@ -355,7 +353,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
             Err(TryOpError::Other(error)) => return Err(error),
             Err(TryOpError::WaitError(error)) => return Err(UnixSocketError::WaitError(error)),
         }
-        let timeout = timeout(&self.options()?);
+        let timeout = match self.option(timeout)? {
+            UnixSocketOptionValue::ReceiveTimeout(timeout)
+            | UnixSocketOptionValue::SendTimeout(timeout) => timeout,
+            value => unreachable!("{value:?} is not a wait timeout"),
+        };
         self.pollee
             .wait(
                 &cx.with_timeout(timeout),
@@ -393,14 +395,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for UnixSocket<Pla
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
-}
-
-fn receive_timeout(options: &UnixSocketOptions) -> Option<Duration> {
-    options.receive_timeout
-}
-
-fn send_timeout(options: &UnixSocketOptions) -> Option<Duration> {
-    options.send_timeout
 }
 
 /// Maps Unix socket readiness to events: a socket that can no longer

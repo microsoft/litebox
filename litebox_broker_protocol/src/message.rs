@@ -44,9 +44,9 @@ use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
     ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
     CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
-    GetUnixSocketOptionsResponse, ListenUnixSocketRequest, ReceiveUnixSocketRequest,
-    ReceiveUnixSocketResponse, SendUnixSocketRequest, SendUnixSocketResponse,
-    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
+    GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
+    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+    SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
 };
 use crate::{ObjectHandle, ProcessId, ProtocolVersion, RequestId, ThreadId};
 
@@ -187,7 +187,7 @@ impl BrokerOperation {
                 | UnixSocketRequest::Accept(_)
                 | UnixSocketRequest::Shutdown(_)
                 | UnixSocketRequest::SetOption(_)
-                | UnixSocketRequest::GetOptions(_),
+                | UnixSocketRequest::GetOption(_),
             ) => None,
         }
     }
@@ -386,8 +386,8 @@ pub enum UnixSocketRequest {
     GetName(GetUnixSocketNameRequest),
     /// Store one socket option.
     SetOption(SetUnixSocketOptionRequest),
-    /// Read a socket's type and options.
-    GetOptions(ObjectHandle),
+    /// Read one socket option.
+    GetOption(GetUnixSocketOptionRequest),
 }
 
 /// Broker-owned socket object request.
@@ -626,8 +626,8 @@ pub enum UnixSocketResponse {
     GetName(GetUnixSocketNameResponse),
     /// Option was stored.
     SetOption,
-    /// Options operation response.
-    GetOptions(GetUnixSocketOptionsResponse),
+    /// Option read response.
+    GetOption(GetUnixSocketOptionResponse),
     /// The operation failed in a way the guest ABI reports.
     ///
     /// Waiting, resource, and request-validation failures use

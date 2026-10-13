@@ -22,7 +22,10 @@ use litebox_broker_protocol::{
     ObjectHandle,
     fs::{FileMode as Mode, FileOpenFlags, FileUser},
     socket::{ShutdownMode, SocketType},
-    unix_socket::{UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName, UnixSocketOption},
+    unix_socket::{
+        UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketName, UnixSocketOptionName,
+        UnixSocketOptionValue,
+    },
 };
 use litebox_common_linux::{
     IpOption, OFlags, ReceiveFlags, SendFlags, ShutdownHow, SockFlags, SockType, SocketOption,
@@ -247,28 +250,28 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         optlen: usize,
     ) -> Result<(), Errno> {
         match global.setsockopt_common(optname, optval, optlen, |so, value| {
-            let option = match (so, value) {
+            let value = match (so, value) {
                 (SocketOption::RCVTIMEO, SocketOptionValue::Timeout(timeout)) => {
-                    UnixSocketOption::ReceiveTimeout(timeout)
+                    UnixSocketOptionValue::ReceiveTimeout(timeout)
                 }
                 (SocketOption::SNDTIMEO, SocketOptionValue::Timeout(timeout)) => {
-                    UnixSocketOption::SendTimeout(timeout)
+                    UnixSocketOptionValue::SendTimeout(timeout)
                 }
                 (SocketOption::LINGER, SocketOptionValue::Timeout(timeout)) => {
-                    UnixSocketOption::Linger(timeout)
+                    UnixSocketOptionValue::Linger(timeout)
                 }
                 (SocketOption::REUSEADDR, SocketOptionValue::U32(val)) => {
-                    UnixSocketOption::ReuseAddress(val != 0)
+                    UnixSocketOptionValue::ReuseAddress(val != 0)
                 }
                 (SocketOption::KEEPALIVE, SocketOptionValue::U32(val)) => {
-                    UnixSocketOption::KeepAlive(val != 0)
+                    UnixSocketOptionValue::KeepAlive(val != 0)
                 }
                 (SocketOption::BROADCAST, SocketOptionValue::U32(val)) => {
-                    UnixSocketOption::Broadcast(val != 0)
+                    UnixSocketOptionValue::Broadcast(val != 0)
                 }
                 _ => unreachable!(),
             };
-            Ok(self.socket.set_option(option)?)
+            Ok(self.socket.set_option(value)?)
         }) {
             Err(Errno::ENOPROTOOPT) => {} // continue to handle unix
             other => return other,
@@ -313,25 +316,37 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         optval: UserPtrMut<u8>,
         len: u32,
     ) -> Result<usize, Errno> {
-        if let SocketOptionName::Socket(
-            SocketOption::RCVTIMEO
-            | SocketOption::SNDTIMEO
-            | SocketOption::LINGER
-            | SocketOption::REUSEADDR
-            | SocketOption::KEEPALIVE
-            | SocketOption::BROADCAST,
-        ) = optname
-        {
-            let options = self.socket.options()?;
-            return global.getsockopt_common(optname, optval, len, |sopt| match sopt {
-                SocketOption::RCVTIMEO => SocketOptionValue::Timeout(options.receive_timeout),
-                SocketOption::SNDTIMEO => SocketOptionValue::Timeout(options.send_timeout),
-                SocketOption::LINGER => SocketOptionValue::Timeout(options.linger),
-                SocketOption::REUSEADDR => SocketOptionValue::U32(u32::from(options.reuse_address)),
-                SocketOption::KEEPALIVE => SocketOptionValue::U32(u32::from(options.keep_alive)),
-                SocketOption::BROADCAST => SocketOptionValue::U32(u32::from(options.broadcast)),
-                _ => unreachable!(),
-            });
+        let name = match optname {
+            SocketOptionName::Socket(SocketOption::RCVTIMEO) => {
+                Some(UnixSocketOptionName::ReceiveTimeout)
+            }
+            SocketOptionName::Socket(SocketOption::SNDTIMEO) => {
+                Some(UnixSocketOptionName::SendTimeout)
+            }
+            SocketOptionName::Socket(SocketOption::LINGER) => Some(UnixSocketOptionName::Linger),
+            SocketOptionName::Socket(SocketOption::REUSEADDR) => {
+                Some(UnixSocketOptionName::ReuseAddress)
+            }
+            SocketOptionName::Socket(SocketOption::KEEPALIVE) => {
+                Some(UnixSocketOptionName::KeepAlive)
+            }
+            SocketOptionName::Socket(SocketOption::BROADCAST) => {
+                Some(UnixSocketOptionName::Broadcast)
+            }
+            _ => None,
+        };
+        if let Some(name) = name {
+            let value = match self.socket.option(name)? {
+                UnixSocketOptionValue::ReceiveTimeout(timeout)
+                | UnixSocketOptionValue::SendTimeout(timeout)
+                | UnixSocketOptionValue::Linger(timeout) => SocketOptionValue::Timeout(timeout),
+                UnixSocketOptionValue::ReuseAddress(value)
+                | UnixSocketOptionValue::KeepAlive(value)
+                | UnixSocketOptionValue::Broadcast(value) => {
+                    SocketOptionValue::U32(u32::from(value))
+                }
+            };
+            return global.getsockopt_common(optname, optval, len, |_| value);
         }
 
         let val: u32 = match optname {
@@ -419,12 +434,16 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         handle.with_entry(f)
     }
 
-    /// Adopts a Unix socket this process inherited from its parent as `handle`.
+    /// Adopts a Unix socket of type `socket_type` this process inherited from
+    /// its parent as `handle`.
     pub(super) fn adopt_inherited_unix_socket(
         &self,
         handle: ObjectHandle,
+        socket_type: SocketType,
     ) -> Result<TypedFd<UnixSocketSubsystem<Platform>>, ProcessError> {
-        let socket = self.litebox.adopt_inherited_unix_socket(handle)?;
+        let socket = self
+            .litebox
+            .adopt_inherited_unix_socket(handle, socket_type)?;
         Ok(self
             .litebox
             .descriptor_table_mut()

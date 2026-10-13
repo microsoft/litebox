@@ -847,13 +847,42 @@ fn duplicated_references_share_one_socket() {
 fn options_are_stored_with_the_socket() {
     let fixture = Fixture::new();
     let socket = fixture.create(SocketType::Datagram);
+    assert_eq!(
+        option(
+            &fixture.process,
+            socket,
+            UnixSocketOptionName::ReceiveTimeout
+        )
+        .unwrap(),
+        UnixSocketOptionValue::ReceiveTimeout(None)
+    );
     set_option(
         &fixture.process,
         socket,
-        UnixSocketOption::ReceiveTimeout(Some(Duration::from_secs(2))),
+        UnixSocketOptionValue::ReceiveTimeout(Some(Duration::from_secs(2))),
     )
     .unwrap();
-    let (socket_type, options) = options(&fixture.process, socket).unwrap();
-    assert_eq!(socket_type, SocketType::Datagram);
-    assert_eq!(options.receive_timeout, Some(Duration::from_secs(2)));
+    set_option(
+        &fixture.process,
+        socket,
+        UnixSocketOptionValue::Broadcast(true),
+    )
+    .unwrap();
+    assert_eq!(
+        option(
+            &fixture.process,
+            socket,
+            UnixSocketOptionName::ReceiveTimeout
+        )
+        .unwrap(),
+        UnixSocketOptionValue::ReceiveTimeout(Some(Duration::from_secs(2)))
+    );
+    assert_eq!(
+        option(&fixture.process, socket, UnixSocketOptionName::Broadcast).unwrap(),
+        UnixSocketOptionValue::Broadcast(true)
+    );
+    assert_eq!(
+        option(&fixture.process, socket, UnixSocketOptionName::SendTimeout).unwrap(),
+        UnixSocketOptionValue::SendTimeout(None)
+    );
 }

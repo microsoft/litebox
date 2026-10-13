@@ -35,9 +35,9 @@ use litebox_broker_protocol::socket::{
 };
 use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_protocol::unix_socket::{
-    CreateUnixSocketPairResponse, GetUnixSocketOptionsResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE,
-    MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE,
-    UnixSocketAddress, UnixSocketError, UnixSocketName, UnixSocketOption,
+    CreateUnixSocketPairResponse, MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE,
+    ReceiveUnixSocketResponse, UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError,
+    UnixSocketName, UnixSocketOptionName, UnixSocketOptionValue,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 use litebox_platform::time::TimeProvider;
@@ -478,13 +478,14 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn set_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        option: UnixSocketOption,
+        value: UnixSocketOptionValue,
     ) -> core::result::Result<(), BrokerControlError>;
 
-    fn unix_socket_options(
+    fn unix_socket_option(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<GetUnixSocketOptionsResponse, BrokerControlError>;
+        name: UnixSocketOptionName,
+    ) -> core::result::Result<UnixSocketOptionValue, BrokerControlError>;
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError>;
 
@@ -1369,16 +1370,17 @@ where
     fn set_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        option: UnixSocketOption,
+        value: UnixSocketOptionValue,
     ) -> core::result::Result<(), BrokerControlError> {
-        self.request(|local| local.set_unix_socket_option(handle, option))
+        self.request(|local| local.set_unix_socket_option(handle, value))
     }
 
-    fn unix_socket_options(
+    fn unix_socket_option(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<GetUnixSocketOptionsResponse, BrokerControlError> {
-        self.request(|local| local.unix_socket_options(handle))
+        name: UnixSocketOptionName,
+    ) -> core::result::Result<UnixSocketOptionValue, BrokerControlError> {
+        self.request(|local| local.unix_socket_option(handle, name))
     }
 
     fn close_object(&self, handle: ObjectHandle) -> core::result::Result<(), BrokerControlError> {

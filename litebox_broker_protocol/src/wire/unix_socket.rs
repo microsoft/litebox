@@ -16,10 +16,10 @@ use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
     ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
     CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
-    GetUnixSocketOptionsResponse, ListenUnixSocketRequest, ReceiveUnixSocketRequest,
-    ReceiveUnixSocketResponse, SendUnixSocketRequest, SendUnixSocketResponse,
-    SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError, UnixSocketOption,
-    UnixSocketOptions,
+    GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
+    ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+    SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError,
+    UnixSocketOptionName, UnixSocketOptionValue,
 };
 
 const TAG_CREATE: u8 = 0;
@@ -33,7 +33,7 @@ const TAG_RECEIVE: u8 = 7;
 const TAG_SHUTDOWN: u8 = 8;
 const TAG_GET_NAME: u8 = 9;
 const TAG_SET_OPTION: u8 = 10;
-const TAG_GET_OPTIONS: u8 = 11;
+const TAG_GET_OPTION: u8 = 11;
 const RESPONSE_TAG_FAILED: u8 = 12;
 
 const OPTION_TAG_RECEIVE_TIMEOUT: u8 = 0;
@@ -117,11 +117,12 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
         UnixSocketRequest::SetOption(request) => {
             encoder.u8(TAG_SET_OPTION);
             encoder.handle(request.handle);
-            encode_option(encoder, request.option);
+            encode_option_value(encoder, request.value);
         }
-        UnixSocketRequest::GetOptions(handle) => {
-            encoder.u8(TAG_GET_OPTIONS);
-            encoder.handle(handle);
+        UnixSocketRequest::GetOption(request) => {
+            encoder.u8(TAG_GET_OPTION);
+            encoder.handle(request.handle);
+            encode_option_name(encoder, request.name);
         }
     }
 }
@@ -175,9 +176,12 @@ pub(super) fn decode_unix_socket_request(
         }),
         TAG_SET_OPTION => UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
             handle: decoder.handle()?,
-            option: decode_option(decoder)?,
+            value: decode_option_value(decoder)?,
         }),
-        TAG_GET_OPTIONS => UnixSocketRequest::GetOptions(decoder.handle()?),
+        TAG_GET_OPTION => UnixSocketRequest::GetOption(GetUnixSocketOptionRequest {
+            handle: decoder.handle()?,
+            name: decode_option_name(decoder)?,
+        }),
         _ => return Err(WireError::InvalidTag),
     })
 }
@@ -216,10 +220,9 @@ pub(super) fn encode_unix_socket_response(encoder: &mut Encoder, response: UnixS
             encoder.u32(response.length);
         }
         UnixSocketResponse::SetOption => encoder.u8(TAG_SET_OPTION),
-        UnixSocketResponse::GetOptions(response) => {
-            encoder.u8(TAG_GET_OPTIONS);
-            encode_socket_type(encoder, response.socket_type);
-            encode_options(encoder, response.options);
+        UnixSocketResponse::GetOption(response) => {
+            encoder.u8(TAG_GET_OPTION);
+            encode_option_value(encoder, response.value);
         }
         UnixSocketResponse::Failed(error) => {
             encoder.u8(RESPONSE_TAG_FAILED);
@@ -258,9 +261,8 @@ pub(super) fn decode_unix_socket_response(
             length: decoder.u32()?,
         }),
         TAG_SET_OPTION => UnixSocketResponse::SetOption,
-        TAG_GET_OPTIONS => UnixSocketResponse::GetOptions(GetUnixSocketOptionsResponse {
-            socket_type: decode_socket_type(decoder)?,
-            options: decode_options(decoder)?,
+        TAG_GET_OPTION => UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+            value: decode_option_value(decoder)?,
         }),
         RESPONSE_TAG_FAILED => UnixSocketResponse::Failed(decode_error(decoder)?),
         _ => return Err(WireError::InvalidTag),
@@ -314,64 +316,55 @@ fn decode_duration(decoder: &mut Decoder<'_>) -> Result<Option<Duration>, WireEr
     Ok(Some(Duration::new(seconds, nanoseconds)))
 }
 
-fn encode_option(encoder: &mut Encoder, option: UnixSocketOption) {
-    match option {
-        UnixSocketOption::ReceiveTimeout(timeout) => {
-            encoder.u8(OPTION_TAG_RECEIVE_TIMEOUT);
-            encode_duration(encoder, timeout);
-        }
-        UnixSocketOption::SendTimeout(timeout) => {
-            encoder.u8(OPTION_TAG_SEND_TIMEOUT);
-            encode_duration(encoder, timeout);
-        }
-        UnixSocketOption::Linger(timeout) => {
-            encoder.u8(OPTION_TAG_LINGER);
-            encode_duration(encoder, timeout);
-        }
-        UnixSocketOption::ReuseAddress(value) => {
-            encoder.u8(OPTION_TAG_REUSE_ADDRESS);
-            encode_bool(encoder, value);
-        }
-        UnixSocketOption::KeepAlive(value) => {
-            encoder.u8(OPTION_TAG_KEEP_ALIVE);
-            encode_bool(encoder, value);
-        }
-        UnixSocketOption::Broadcast(value) => {
-            encoder.u8(OPTION_TAG_BROADCAST);
-            encode_bool(encoder, value);
-        }
-    }
+fn encode_option_name(encoder: &mut Encoder, name: UnixSocketOptionName) {
+    encoder.u8(match name {
+        UnixSocketOptionName::ReceiveTimeout => OPTION_TAG_RECEIVE_TIMEOUT,
+        UnixSocketOptionName::SendTimeout => OPTION_TAG_SEND_TIMEOUT,
+        UnixSocketOptionName::Linger => OPTION_TAG_LINGER,
+        UnixSocketOptionName::ReuseAddress => OPTION_TAG_REUSE_ADDRESS,
+        UnixSocketOptionName::KeepAlive => OPTION_TAG_KEEP_ALIVE,
+        UnixSocketOptionName::Broadcast => OPTION_TAG_BROADCAST,
+    });
 }
 
-fn decode_option(decoder: &mut Decoder<'_>) -> Result<UnixSocketOption, WireError> {
+fn decode_option_name(decoder: &mut Decoder<'_>) -> Result<UnixSocketOptionName, WireError> {
     Ok(match decoder.u8()? {
-        OPTION_TAG_RECEIVE_TIMEOUT => UnixSocketOption::ReceiveTimeout(decode_duration(decoder)?),
-        OPTION_TAG_SEND_TIMEOUT => UnixSocketOption::SendTimeout(decode_duration(decoder)?),
-        OPTION_TAG_LINGER => UnixSocketOption::Linger(decode_duration(decoder)?),
-        OPTION_TAG_REUSE_ADDRESS => UnixSocketOption::ReuseAddress(decode_bool(decoder)?),
-        OPTION_TAG_KEEP_ALIVE => UnixSocketOption::KeepAlive(decode_bool(decoder)?),
-        OPTION_TAG_BROADCAST => UnixSocketOption::Broadcast(decode_bool(decoder)?),
+        OPTION_TAG_RECEIVE_TIMEOUT => UnixSocketOptionName::ReceiveTimeout,
+        OPTION_TAG_SEND_TIMEOUT => UnixSocketOptionName::SendTimeout,
+        OPTION_TAG_LINGER => UnixSocketOptionName::Linger,
+        OPTION_TAG_REUSE_ADDRESS => UnixSocketOptionName::ReuseAddress,
+        OPTION_TAG_KEEP_ALIVE => UnixSocketOptionName::KeepAlive,
+        OPTION_TAG_BROADCAST => UnixSocketOptionName::Broadcast,
         _ => return Err(WireError::InvalidTag),
     })
 }
 
-fn encode_options(encoder: &mut Encoder, options: UnixSocketOptions) {
-    encode_duration(encoder, options.receive_timeout);
-    encode_duration(encoder, options.send_timeout);
-    encode_duration(encoder, options.linger);
-    encode_bool(encoder, options.reuse_address);
-    encode_bool(encoder, options.keep_alive);
-    encode_bool(encoder, options.broadcast);
+fn encode_option_value(encoder: &mut Encoder, value: UnixSocketOptionValue) {
+    encode_option_name(encoder, value.name());
+    match value {
+        UnixSocketOptionValue::ReceiveTimeout(timeout)
+        | UnixSocketOptionValue::SendTimeout(timeout)
+        | UnixSocketOptionValue::Linger(timeout) => encode_duration(encoder, timeout),
+        UnixSocketOptionValue::ReuseAddress(value)
+        | UnixSocketOptionValue::KeepAlive(value)
+        | UnixSocketOptionValue::Broadcast(value) => encode_bool(encoder, value),
+    }
 }
 
-fn decode_options(decoder: &mut Decoder<'_>) -> Result<UnixSocketOptions, WireError> {
-    Ok(UnixSocketOptions {
-        receive_timeout: decode_duration(decoder)?,
-        send_timeout: decode_duration(decoder)?,
-        linger: decode_duration(decoder)?,
-        reuse_address: decode_bool(decoder)?,
-        keep_alive: decode_bool(decoder)?,
-        broadcast: decode_bool(decoder)?,
+fn decode_option_value(decoder: &mut Decoder<'_>) -> Result<UnixSocketOptionValue, WireError> {
+    Ok(match decode_option_name(decoder)? {
+        UnixSocketOptionName::ReceiveTimeout => {
+            UnixSocketOptionValue::ReceiveTimeout(decode_duration(decoder)?)
+        }
+        UnixSocketOptionName::SendTimeout => {
+            UnixSocketOptionValue::SendTimeout(decode_duration(decoder)?)
+        }
+        UnixSocketOptionName::Linger => UnixSocketOptionValue::Linger(decode_duration(decoder)?),
+        UnixSocketOptionName::ReuseAddress => {
+            UnixSocketOptionValue::ReuseAddress(decode_bool(decoder)?)
+        }
+        UnixSocketOptionName::KeepAlive => UnixSocketOptionValue::KeepAlive(decode_bool(decoder)?),
+        UnixSocketOptionName::Broadcast => UnixSocketOptionValue::Broadcast(decode_bool(decoder)?),
     })
 }
 

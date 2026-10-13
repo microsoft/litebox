@@ -17,6 +17,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::time::Duration;
 
 use hashbrown::HashMap;
 use litebox_broker_protocol::ObjectHandle;
@@ -27,7 +28,8 @@ use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::socket::{ShutdownMode, SocketType};
 use litebox_broker_protocol::unix_socket::{
     MAX_UNIX_SOCKET_BACKLOG, MAX_UNIX_SOCKET_TRANSFER_SIZE, UNIX_SOCKET_BUFFER_SIZE,
-    UnixSocketAddress, UnixSocketError, UnixSocketName, UnixSocketOption, UnixSocketOptions,
+    UnixSocketAddress, UnixSocketError, UnixSocketName, UnixSocketOptionName,
+    UnixSocketOptionValue,
 };
 use spin::{Mutex, MutexGuard, rwlock::RwLock};
 
@@ -463,24 +465,24 @@ pub fn name(
 pub fn set_option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-    option: UnixSocketOption,
+    value: UnixSocketOptionValue,
 ) -> Result<()> {
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WRITE)?)?;
-    lease.lock().socket_mut(lease.id)?.options.set(option);
+    lease.lock().socket_mut(lease.id)?.options.set(value);
     Ok(())
 }
 
-/// Returns the type and stored options of a Unix socket.
-pub fn options(
+/// Returns one stored option of a Unix socket.
+pub fn option(
     process: &BrokerProcess,
     handle: ObjectHandle,
-) -> Result<(SocketType, UnixSocketOptions)> {
+    name: UnixSocketOptionName,
+) -> Result<UnixSocketOptionValue> {
     let lease = Lease::new(
         process
             .authorized_object_with_any_rights(handle, ObjectRights::WAIT | ObjectRights::WRITE)?,
     )?;
-    let options = lease.lock().socket(lease.id)?.options;
-    Ok((lease.socket_type, options))
+    Ok(lease.lock().socket(lease.id)?.options.get(name))
 }
 
 fn creation_rights(process: &BrokerProcess, flags: FileOpenFlags) -> Result<ObjectRights> {
@@ -726,6 +728,47 @@ impl NameKey {
     }
 }
 
+/// Options stored with a socket and shared by its references.
+#[derive(Default)]
+struct Options {
+    receive_timeout: Option<Duration>,
+    send_timeout: Option<Duration>,
+    linger: Option<Duration>,
+    reuse_address: bool,
+    keep_alive: bool,
+    broadcast: bool,
+}
+
+impl Options {
+    fn set(&mut self, value: UnixSocketOptionValue) {
+        match value {
+            UnixSocketOptionValue::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
+            UnixSocketOptionValue::SendTimeout(timeout) => self.send_timeout = timeout,
+            UnixSocketOptionValue::Linger(timeout) => self.linger = timeout,
+            UnixSocketOptionValue::ReuseAddress(value) => self.reuse_address = value,
+            UnixSocketOptionValue::KeepAlive(value) => self.keep_alive = value,
+            UnixSocketOptionValue::Broadcast(value) => self.broadcast = value,
+        }
+    }
+
+    fn get(&self, name: UnixSocketOptionName) -> UnixSocketOptionValue {
+        match name {
+            UnixSocketOptionName::ReceiveTimeout => {
+                UnixSocketOptionValue::ReceiveTimeout(self.receive_timeout)
+            }
+            UnixSocketOptionName::SendTimeout => {
+                UnixSocketOptionValue::SendTimeout(self.send_timeout)
+            }
+            UnixSocketOptionName::Linger => UnixSocketOptionValue::Linger(self.linger),
+            UnixSocketOptionName::ReuseAddress => {
+                UnixSocketOptionValue::ReuseAddress(self.reuse_address)
+            }
+            UnixSocketOptionName::KeepAlive => UnixSocketOptionValue::KeepAlive(self.keep_alive),
+            UnixSocketOptionName::Broadcast => UnixSocketOptionValue::Broadcast(self.broadcast),
+        }
+    }
+}
+
 struct Socket {
     kind: SocketType,
     name: UnixSocketName,
@@ -735,7 +778,7 @@ struct Socket {
     /// File created by binding to a path, held open so the node that
     /// identifies the name stays allocated.
     marker: Option<File>,
-    options: UnixSocketOptions,
+    options: Options,
     read_shut: bool,
     write_shut: bool,
     connection: Connection,
@@ -761,7 +804,7 @@ impl Socket {
             binding: false,
             name_key: None,
             marker: None,
-            options: UnixSocketOptions::default(),
+            options: Options::default(),
             read_shut: false,
             write_shut: false,
             connection: Connection::None,

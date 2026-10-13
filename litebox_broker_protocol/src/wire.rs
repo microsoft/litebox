@@ -652,10 +652,10 @@ mod tests {
         AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
         ConnectUnixSocketRequest, CreateUnixSocketPairResponse, CreateUnixSocketRequest,
         CreateUnixSocketResponse, GetUnixSocketNameRequest, GetUnixSocketNameResponse,
-        GetUnixSocketOptionsResponse, ListenUnixSocketRequest, ReceiveUnixSocketRequest,
-        ReceiveUnixSocketResponse, SendUnixSocketRequest, SendUnixSocketResponse,
-        SetUnixSocketOptionRequest, ShutdownUnixSocketRequest, UnixSocketError, UnixSocketOption,
-        UnixSocketOptions,
+        GetUnixSocketOptionRequest, GetUnixSocketOptionResponse, ListenUnixSocketRequest,
+        ReceiveUnixSocketRequest, ReceiveUnixSocketResponse, SendUnixSocketRequest,
+        SendUnixSocketResponse, SetUnixSocketOptionRequest, ShutdownUnixSocketRequest,
+        UnixSocketError, UnixSocketOptionName, UnixSocketOptionValue,
     };
     use crate::{
         ObjectHandle, ProcessGroupId, ProcessId, ProtocolVersion, RequestId, SessionId, ThreadId,
@@ -1111,20 +1111,23 @@ mod tests {
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
                 handle,
-                option: UnixSocketOption::ReceiveTimeout(Some(core::time::Duration::new(
+                value: UnixSocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
                     u64::MAX,
                     999_999_999,
                 ))),
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
                 handle,
-                option: UnixSocketOption::Linger(None),
+                value: UnixSocketOptionValue::Linger(None),
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::SetOption(SetUnixSocketOptionRequest {
                 handle,
-                option: UnixSocketOption::Broadcast(true),
+                value: UnixSocketOptionValue::Broadcast(true),
             })),
-            BrokerOperation::UnixSocket(UnixSocketRequest::GetOptions(handle)),
+            BrokerOperation::UnixSocket(UnixSocketRequest::GetOption(GetUnixSocketOptionRequest {
+                handle,
+                name: UnixSocketOptionName::SendTimeout,
+            })),
         ];
         let mut maximum_encoded_size = 0;
 
@@ -1391,19 +1394,15 @@ mod tests {
                 length: 3,
             })),
             BrokerResult::UnixSocket(UnixSocketResponse::SetOption),
-            BrokerResult::UnixSocket(UnixSocketResponse::GetOptions(
-                GetUnixSocketOptionsResponse {
-                    socket_type: SocketType::Datagram,
-                    options: UnixSocketOptions {
-                        receive_timeout: Some(core::time::Duration::new(u64::MAX, 1)),
-                        send_timeout: None,
-                        linger: Some(core::time::Duration::from_secs(3)),
-                        reuse_address: true,
-                        keep_alive: false,
-                        broadcast: true,
-                    },
-                },
-            )),
+            BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+                value: UnixSocketOptionValue::ReceiveTimeout(Some(core::time::Duration::new(
+                    u64::MAX,
+                    1,
+                ))),
+            })),
+            BrokerResult::UnixSocket(UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
+                value: UnixSocketOptionValue::KeepAlive(false),
+            })),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::AddressInUse)),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::NotPermitted)),
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(

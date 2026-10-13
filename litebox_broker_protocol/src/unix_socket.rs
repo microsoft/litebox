@@ -229,52 +229,54 @@ pub enum UnixSocketError {
     File(FileError),
 }
 
-/// Options stored with a Unix socket and shared by its references.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct UnixSocketOptions {
-    /// Longest time a blocking receive or accept waits, or `None` to wait
-    /// indefinitely.
-    pub receive_timeout: Option<Duration>,
-    /// Longest time a blocking send or connect waits, or `None` to wait
-    /// indefinitely.
-    pub send_timeout: Option<Duration>,
-    /// Linger time on close, or `None` to close in the background.
-    pub linger: Option<Duration>,
+/// Unix socket option name.
+///
+/// Every reference to a socket shares its options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnixSocketOptionName {
+    /// Longest time a blocking receive or accept waits.
+    ReceiveTimeout,
+    /// Longest time a blocking send or connect waits.
+    SendTimeout,
+    /// Linger time on close.
+    Linger,
     /// Whether address reuse was requested.
-    pub reuse_address: bool,
+    ReuseAddress,
     /// Whether keepalive was requested.
-    pub keep_alive: bool,
+    KeepAlive,
     /// Whether broadcast was requested.
-    pub broadcast: bool,
+    Broadcast,
 }
 
-/// One Unix socket option value.
+/// Unix socket option value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UnixSocketOption {
-    /// [`UnixSocketOptions::receive_timeout`].
+pub enum UnixSocketOptionValue {
+    /// [`UnixSocketOptionName::ReceiveTimeout`], or `None` to wait
+    /// indefinitely.
     ReceiveTimeout(Option<Duration>),
-    /// [`UnixSocketOptions::send_timeout`].
+    /// [`UnixSocketOptionName::SendTimeout`], or `None` to wait indefinitely.
     SendTimeout(Option<Duration>),
-    /// [`UnixSocketOptions::linger`].
+    /// [`UnixSocketOptionName::Linger`], or `None` to close in the
+    /// background.
     Linger(Option<Duration>),
-    /// [`UnixSocketOptions::reuse_address`].
+    /// [`UnixSocketOptionName::ReuseAddress`].
     ReuseAddress(bool),
-    /// [`UnixSocketOptions::keep_alive`].
+    /// [`UnixSocketOptionName::KeepAlive`].
     KeepAlive(bool),
-    /// [`UnixSocketOptions::broadcast`].
+    /// [`UnixSocketOptionName::Broadcast`].
     Broadcast(bool),
 }
 
-impl UnixSocketOptions {
-    /// Stores `option`.
-    pub fn set(&mut self, option: UnixSocketOption) {
-        match option {
-            UnixSocketOption::ReceiveTimeout(timeout) => self.receive_timeout = timeout,
-            UnixSocketOption::SendTimeout(timeout) => self.send_timeout = timeout,
-            UnixSocketOption::Linger(timeout) => self.linger = timeout,
-            UnixSocketOption::ReuseAddress(value) => self.reuse_address = value,
-            UnixSocketOption::KeepAlive(value) => self.keep_alive = value,
-            UnixSocketOption::Broadcast(value) => self.broadcast = value,
+impl UnixSocketOptionValue {
+    /// Returns the name of the option this value sets.
+    pub fn name(self) -> UnixSocketOptionName {
+        match self {
+            Self::ReceiveTimeout(_) => UnixSocketOptionName::ReceiveTimeout,
+            Self::SendTimeout(_) => UnixSocketOptionName::SendTimeout,
+            Self::Linger(_) => UnixSocketOptionName::Linger,
+            Self::ReuseAddress(_) => UnixSocketOptionName::ReuseAddress,
+            Self::KeepAlive(_) => UnixSocketOptionName::KeepAlive,
+            Self::Broadcast(_) => UnixSocketOptionName::Broadcast,
         }
     }
 }
@@ -455,17 +457,24 @@ pub struct GetUnixSocketNameResponse {
 pub struct SetUnixSocketOptionRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
-    /// Option value.
-    pub option: UnixSocketOption,
+    /// Option value to store.
+    pub value: UnixSocketOptionValue,
 }
 
-/// Response describing a socket's type and options.
+/// Request to read one socket option.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GetUnixSocketOptionsResponse {
-    /// Socket type.
-    pub socket_type: SocketType,
-    /// Stored options.
-    pub options: UnixSocketOptions,
+pub struct GetUnixSocketOptionRequest {
+    /// Socket handle.
+    pub handle: ObjectHandle,
+    /// Option name to read.
+    pub name: UnixSocketOptionName,
+}
+
+/// Response containing one socket option value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetUnixSocketOptionResponse {
+    /// Stored option value.
+    pub value: UnixSocketOptionValue,
 }
 
 #[cfg(test)]

@@ -14,10 +14,11 @@ use litebox_broker_protocol::socket::{ShutdownMode, SocketType};
 use litebox_broker_protocol::unix_socket::{
     AcceptUnixSocketRequest, BindUnixSocketRequest, ConnectUnixSocketRequest,
     CreateUnixSocketPairResponse, CreateUnixSocketRequest, GetUnixSocketNameRequest,
-    GetUnixSocketOptionsResponse, ListenUnixSocketRequest, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
+    GetUnixSocketOptionRequest, ListenUnixSocketRequest, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketRequest,
     ReceiveUnixSocketResponse, SendUnixSocketRequest, SetUnixSocketOptionRequest,
-    ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName, UnixSocketOption,
+    ShutdownUnixSocketRequest, UnixSocketError, UnixSocketName, UnixSocketOptionName,
+    UnixSocketOptionValue,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -323,29 +324,41 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn set_unix_socket_option(
         &self,
         handle: ObjectHandle,
-        option: UnixSocketOption,
+        value: UnixSocketOptionValue,
     ) -> Result<(), Channel::Error> {
         match self.request_unix_socket(UnixSocketRequest::SetOption(
-            SetUnixSocketOptionRequest { handle, option },
+            SetUnixSocketOptionRequest { handle, value },
         ))? {
             UnixSocketResponse::SetOption => Ok(()),
             response => panic!("broker returned unexpected Unix socket response: {response:?}"),
         }
     }
 
-    /// Reads the type and stored options of a Unix socket.
+    /// Reads one stored option of a Unix socket.
     ///
     /// # Panics
     ///
-    /// Panics if the broker returns a response for a different operation.
-    pub fn unix_socket_options(
+    /// Panics if the broker returns a response for a different operation or
+    /// a value for a different option.
+    pub fn unix_socket_option(
         &self,
         handle: ObjectHandle,
-    ) -> Result<GetUnixSocketOptionsResponse, Channel::Error> {
-        match self.request_unix_socket(UnixSocketRequest::GetOptions(handle))? {
-            UnixSocketResponse::GetOptions(response) => Ok(response),
-            response => panic!("broker returned unexpected Unix socket response: {response:?}"),
-        }
+        name: UnixSocketOptionName,
+    ) -> Result<UnixSocketOptionValue, Channel::Error> {
+        let response =
+            self.request_unix_socket(UnixSocketRequest::GetOption(GetUnixSocketOptionRequest {
+                handle,
+                name,
+            }))?;
+        let UnixSocketResponse::GetOption(response) = response else {
+            panic!("broker returned unexpected Unix socket response: {response:?}");
+        };
+        assert_eq!(
+            response.value.name(),
+            name,
+            "broker returned a mismatched Unix socket option value"
+        );
+        Ok(response.value)
     }
 
     fn stage_unix_socket_buffer(

@@ -70,7 +70,7 @@ use litebox_broker_protocol::timer::{
 };
 use litebox_broker_protocol::unix_socket::{
     AcceptUnixSocketResponse, CreateUnixSocketPairResponse, CreateUnixSocketResponse,
-    GetUnixSocketNameResponse, GetUnixSocketOptionsResponse, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
+    GetUnixSocketNameResponse, GetUnixSocketOptionResponse, MAX_ENCODED_UNIX_SOCKET_ADDRESS_SIZE,
     MAX_ENCODED_UNIX_SOCKET_NAME_SIZE, MAX_UNIX_SOCKET_TRANSFER_SIZE, ReceiveUnixSocketResponse,
     SendUnixSocketResponse, UnixSocketAddress, UnixSocketError,
 };
@@ -1560,16 +1560,13 @@ fn unix_socket_operation<Memory: SharedMemory>(
             })))
         }
         UnixSocketRequest::SetOption(request) => {
-            unix_socket::set_option(process, request.handle, request.option)?;
+            unix_socket::set_option(process, request.handle, request.value)?;
             Ok(Ok(UnixSocketResponse::SetOption))
         }
-        UnixSocketRequest::GetOptions(handle) => {
-            let (socket_type, options) = unix_socket::options(process, handle)?;
-            Ok(Ok(UnixSocketResponse::GetOptions(
-                GetUnixSocketOptionsResponse {
-                    socket_type,
-                    options,
-                },
+        UnixSocketRequest::GetOption(request) => {
+            let value = unix_socket::option(process, request.handle, request.name)?;
+            Ok(Ok(UnixSocketResponse::GetOption(
+                GetUnixSocketOptionResponse { value },
             )))
         }
     }
