@@ -174,7 +174,7 @@ pub fn bind(
         }
     };
 
-    let created = crate::fs::open_node(
+    let created = crate::fs::open_without_reference(
         process,
         path,
         user,
@@ -496,7 +496,7 @@ fn lookup(
     };
     // A path-only open does not copy the node up an overlay, so write
     // permission is checked against its status instead.
-    let (file, status) = match crate::fs::open_node(
+    let (file, status) = match crate::fs::open_without_reference(
         process,
         path,
         user,

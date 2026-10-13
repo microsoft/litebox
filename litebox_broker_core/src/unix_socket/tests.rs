@@ -27,16 +27,22 @@ impl Fixture {
     }
 
     fn with_limits(limits: BrokerCoreLimits) -> Self {
+        Self::build(limits, ObjectRights::all())
+    }
+
+    fn with_rights(rights: ObjectRights) -> Self {
+        Self::build(BrokerCoreLimits::DEFAULT, rights)
+    }
+
+    fn build(limits: BrokerCoreLimits, rights: ObjectRights) -> Self {
         let fs = Resolver::<TestPlatform, _>::new(InMem::<TestPlatform>::new(
             InodeAllocator::standalone(),
         ));
-        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(
-            ObjectRights::all(),
-        ))
-        .with_limits(limits)
-        .with_file_service(Arc::new(fs))
-        .build()
-        .unwrap();
+        let broker = TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
+            .with_limits(limits)
+            .with_file_service(Arc::new(fs))
+            .build()
+            .unwrap();
         let process = broker
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
@@ -378,7 +384,7 @@ fn path_connections_require_write_permission() {
     );
     assert!(fixture.accept(listener).unwrap().is_ok());
 
-    let (file, _) = crate::fs::open_node(
+    let (file, _) = crate::fs::open_without_reference(
         &fixture.process,
         "/file",
         USER,
@@ -393,6 +399,20 @@ fn path_connections_require_write_permission() {
     assert_eq!(
         fixture.connect(client, &path("/file")).unwrap(),
         Err(UnixSocketError::ConnectionRefused)
+    );
+}
+
+#[test]
+fn path_lookups_require_the_callers_file_rights() {
+    // Write rights cover creating a path name, but looking one up needs the
+    // rights of a path-only open.
+    let fixture = Fixture::with_rights(ObjectRights::WRITE);
+    let address = path("/server");
+    fixture.listener(&address, 1);
+    let client = fixture.create(SocketType::Stream);
+    assert_eq!(
+        fixture.connect(client, &address),
+        Err(BrokerError::PolicyDenied)
     );
 }
 

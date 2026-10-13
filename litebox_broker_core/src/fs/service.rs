@@ -476,9 +476,9 @@ pub fn open(
 /// Opens `path` for broker-internal use, returning the open file and its
 /// status without installing a reference.
 ///
-/// Dropping the file can reach the backend, so callers drop it outside their
-/// locks.
-pub(crate) fn open_node(
+/// Requires the same rights as [`open`]. Dropping the file can reach the
+/// backend, so callers drop it outside their locks.
+pub(crate) fn open_without_reference(
     process: &BrokerProcess,
     path: &str,
     user: FileUser,
@@ -486,6 +486,7 @@ pub(crate) fn open_node(
     flags: FileOpenFlags,
     mode: FileMode,
 ) -> Result<FileResult<(File, FileStatus)>> {
+    authorize(process, open_required_rights(access, flags)?)?;
     if let Err(error) = validate_path(path) {
         return Ok(Err(error));
     }
