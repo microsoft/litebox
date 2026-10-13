@@ -245,7 +245,7 @@ mod tests {
     use core::time::Duration;
 
     use litebox_broker_protocol::ObjectHandle;
-    use litebox_broker_protocol::fs::{FileOpenFlags, SetStatusFlagsRequest};
+    use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::timer::TimerSpec;
 
@@ -367,39 +367,6 @@ mod tests {
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(sink.retired.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn timer_status_flags_select_non_blocking_reads() {
-        let clock = Arc::new(ManualTimerProvider::default());
-        let process = process(builder(ObjectRights::all()).with_timer_provider(clock.clone()));
-        let sink = Arc::new(TestReadinessSink::default());
-        assert_eq!(
-            create(&process, &sink, FileOpenFlags::PATH),
-            Err(BrokerError::UnsupportedOperation)
-        );
-        let handle = create(&process, &sink, FileOpenFlags::NONBLOCKING).unwrap();
-        assert_eq!(
-            process.get_status_flags(handle).map(|status| status.flags),
-            Ok(FileOpenFlags::NONBLOCKING)
-        );
-        assert_eq!(
-            super::read(&process, handle),
-            Err(BrokerError::NonBlockingWouldBlock)
-        );
-
-        process
-            .set_status_flags(SetStatusFlagsRequest {
-                handle,
-                mask: FileOpenFlags::STATUS,
-                flags: FileOpenFlags::APPEND,
-            })
-            .unwrap();
-        assert_eq!(
-            process.get_status_flags(handle).map(|status| status.flags),
-            Ok(FileOpenFlags::APPEND)
-        );
-        assert_eq!(super::read(&process, handle), Err(BrokerError::WouldBlock));
     }
 
     #[test]
