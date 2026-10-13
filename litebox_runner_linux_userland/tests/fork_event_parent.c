@@ -42,10 +42,13 @@ static int write_count(int fd, uint64_t value) {
     return write(fd, &value, sizeof(value)) == sizeof(value);
 }
 
-// Returns whether a read of `fd` fails with `EAGAIN`.
+// Returns whether `fd` is non-blocking and a read of it fails with `EAGAIN`. It reads only if
+// `fd` is non-blocking, so it cannot block.
 static int read_would_block(int fd) {
+    int flags = fcntl(fd, F_GETFL);
     uint64_t value;
-    return read(fd, &value, sizeof(value)) == -1 && errno == EAGAIN;
+    return flags != -1 && (flags & O_NONBLOCK) != 0 && read(fd, &value, sizeof(value)) == -1 &&
+           errno == EAGAIN;
 }
 
 static void sleep_ms(long ms) {
@@ -111,7 +114,8 @@ static int check_semaphore_eventfd(int *nonblock) {
     int ok = reap(child, 1) == 0;
     int flags = fcntl(fd, F_GETFL);
     *nonblock = flags != -1 && (flags & O_NONBLOCK) != 0 && (flags & O_ACCMODE) == O_RDWR;
-    ok &= read_count(fd) == 1;
+    // Reads only once the child has taken one of the two counts, so the read cannot block.
+    ok = ok && read_count(fd) == 1;
     *nonblock &= read_would_block(fd);
     close(fd);
     return ok;
