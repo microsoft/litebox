@@ -1341,16 +1341,16 @@ impl Socket {
                 };
             };
             let length = datagram.data.len();
-            let mut data = Vec::new();
-            data.try_reserve_exact(capacity.min(length))
-                .map_err(|_| BrokerError::OutOfMemory)?;
-            data.extend_from_slice(&datagram.data[..capacity.min(length)]);
-            let received = Received {
-                data,
-                length,
-                source: datagram.source.clone(),
-            };
             if peek {
+                let mut data = Vec::new();
+                data.try_reserve_exact(capacity.min(length))
+                    .map_err(|_| BrokerError::OutOfMemory)?;
+                data.extend_from_slice(&datagram.data[..capacity.min(length)]);
+                let received = Received {
+                    data,
+                    length,
+                    source: datagram.source.clone(),
+                };
                 (received, Wakeups::default())
             } else {
                 let datagram = channel
@@ -1360,6 +1360,13 @@ impl Socket {
                     .ok_or(BrokerError::Internal)?;
                 channel.remove(datagram.charge());
                 self.sockets.refund(&self.quota, datagram.charge());
+                let Datagram { mut data, source } = datagram;
+                data.truncate(capacity);
+                let received = Received {
+                    data,
+                    length,
+                    source,
+                };
                 // Senders waiting for room retry.
                 (received, channel.wake())
             }

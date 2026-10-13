@@ -246,18 +246,39 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer.length() as usize,
             "shared data must match its buffer sequence"
         );
+        self.write_shared_buffer_at(buffer, 0, data);
+    }
+
+    fn write_shared_buffer_at(&self, buffer: SharedBufferSequence, offset: usize, data: &[u8]) {
+        assert!(
+            offset
+                .checked_add(data.len())
+                .is_some_and(|end| end <= buffer.length() as usize),
+            "shared buffer sequence must cover the data"
+        );
         self.shared_buffers
-            .write_sequence(buffer, data)
+            .write_sequence(buffer, offset, data)
             .expect("validated shared buffer sequence must be accessible");
     }
 
     fn read_shared_buffer(&self, buffer: SharedBufferSequence, destination: &mut [u8]) {
+        self.read_shared_buffer_at(buffer, 0, destination);
+    }
+
+    fn read_shared_buffer_at(
+        &self,
+        buffer: SharedBufferSequence,
+        offset: usize,
+        destination: &mut [u8],
+    ) {
         assert!(
-            destination.len() <= buffer.length() as usize,
+            offset
+                .checked_add(destination.len())
+                .is_some_and(|end| end <= buffer.length() as usize),
             "shared buffer sequence must cover the destination"
         );
         self.shared_buffers
-            .read_sequence(buffer, destination)
+            .read_sequence(buffer, offset, destination)
             .expect("validated shared buffer sequence must be accessible");
     }
 

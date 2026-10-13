@@ -1,8 +1,6 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use alloc::vec::Vec;
-
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::fs::{FileMode, FileOpenFlags, FileUser};
@@ -157,39 +155,42 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Sends `staged`, an encoded destination address of `address_length`
-    /// bytes followed by the data, from a Unix socket.
+    /// Sends `data` from a Unix socket to `address`, an encoded destination
+    /// address that is empty for the connected peer, staging both in
+    /// `buffer`.
     ///
     /// Returns the number of data bytes sent.
     ///
     /// # Panics
     ///
-    /// Panics if `buffer` does not match `staged`, `address_length` exceeds
-    /// it, or the broker returns an invalid response.
+    /// Panics if `buffer` does not match `address` and `data`, or the broker
+    /// returns an invalid response.
     pub fn send_unix_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
-        staged: &[u8],
-        address_length: usize,
+        address: &[u8],
+        data: &[u8],
         user: FileUser,
     ) -> Result<UnixSocketResult<usize>, Channel::Error> {
-        let data_length = staged
-            .len()
-            .checked_sub(address_length)
-            .expect("staged send must hold its address");
-        self.stage_unix_socket_buffer(buffer, staged, MAX_UNIX_SOCKET_TRANSFER_SIZE)?;
+        self.validate_unix_socket_buffer(
+            buffer,
+            address.len() + data.len(),
+            MAX_UNIX_SOCKET_TRANSFER_SIZE,
+        )?;
+        self.write_shared_buffer_at(buffer, 0, address);
+        self.write_shared_buffer_at(buffer, address.len(), data);
         match self.request_unix_socket(UnixSocketRequest::Send(SendUnixSocketRequest {
             handle,
             buffer,
-            address_length: u32::try_from(address_length)
+            address_length: u32::try_from(address.len())
                 .expect("staged address fits the transfer limit"),
             user,
         }))? {
             UnixSocketResponse::Send(response) => {
                 let sent = response.sent as usize;
                 assert!(
-                    sent <= data_length && (sent != 0 || data_length == 0),
+                    sent <= data.len() && (sent != 0 || data.is_empty()),
                     "broker returned an invalid Unix socket send length"
                 );
                 Ok(Ok(sent))
@@ -240,15 +241,10 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                         && source_length <= MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize,
                     "broker returned inconsistent Unix socket receive lengths"
                 );
-                let mut staged = Vec::new();
-                staged
-                    .try_reserve_exact(received + source_length)
-                    .map_err(|_| BrokerLocalError::Broker(ErrorCode::OutOfMemory))?;
-                staged.resize(received + source_length, 0);
-                self.read_shared_buffer(buffer, &mut staged);
-                let (data, source) = staged.split_at(received);
-                destination[..received].copy_from_slice(data);
-                let source = UnixSocketName::decode(source)
+                self.read_shared_buffer(buffer, &mut destination[..received]);
+                let mut source = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
+                self.read_shared_buffer_at(buffer, received, &mut source[..source_length]);
+                let source = UnixSocketName::decode(&source[..source_length])
                     .expect("broker returned an invalid Unix socket source name");
                 Ok(Ok((response, source)))
             }

@@ -1307,25 +1307,18 @@ where
         user: FileUser,
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>
     {
-        let mut staged = match address {
+        let address = match address {
             Some(address) => match address.encode() {
                 Some(address) => address,
                 None => return Ok(Err(UnixSocketError::InvalidArgument)),
             },
             None => Vec::new(),
         };
-        let address_length = staged.len();
-        if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - address_length {
+        if data.len() > MAX_UNIX_SOCKET_TRANSFER_SIZE as usize - address.len() {
             return Ok(Err(UnixSocketError::MessageTooLarge));
         }
-        staged
-            .try_reserve_exact(data.len())
-            .map_err(|_| BrokerControlError::Broker(ErrorCode::OutOfMemory))?;
-        staged.extend_from_slice(data);
-        let lease = self.acquire_shared_buffer(staged.len())?;
-        self.request(|local| {
-            local.send_unix_socket(handle, lease.sequence(), &staged, address_length, user)
-        })
+        let lease = self.acquire_shared_buffer(address.len() + data.len())?;
+        self.request(|local| local.send_unix_socket(handle, lease.sequence(), &address, data, user))
     }
 
     fn receive_unix_socket(

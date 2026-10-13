@@ -918,7 +918,7 @@ pub fn read_shared_buffer<Memory: SharedMemory>(
     validate_shared_buffer(buffer, max_length)?;
     let mut data = allocate_zeroed(buffer.length() as usize)?;
     shared_buffers
-        .read_sequence(buffer, &mut data)
+        .read_sequence(buffer, 0, &mut data)
         .map_err(shared_buffer_access_failure)?;
     Ok(data)
 }
@@ -1073,7 +1073,7 @@ fn write_shared_buffer<Memory: SharedMemory>(
 ) -> RequestResult<()> {
     validate_shared_buffer(buffer, max_length)?;
     shared_buffers
-        .write_sequence(buffer, data)
+        .write_sequence(buffer, 0, data)
         .map_err(shared_buffer_access_failure)
 }
 
@@ -1505,20 +1505,18 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 .ok_or(RequestFailure::Abort(ErrorCode::Internal))?;
             let length = u32::try_from(received.length)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
-            let mut output = received.data;
-            let received = u32::try_from(output.len()).expect("received bytes fit the capacity");
-            output
-                .try_reserve_exact(source.len())
-                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
-            output.extend_from_slice(&source);
+            let data = received.data;
             write_shared_buffer(
                 shared_buffers,
                 request.buffer,
-                &output,
+                &data,
                 MAX_UNIX_SOCKET_TRANSFER_SIZE,
             )?;
+            shared_buffers
+                .write_sequence(request.buffer, data.len(), &source)
+                .map_err(shared_buffer_access_failure)?;
             Ok(UnixSocketResponse::Receive(ReceiveUnixSocketResponse {
-                received,
+                received: u32::try_from(data.len()).expect("received bytes fit the capacity"),
                 length,
                 source_length: u32::try_from(source.len()).expect("encoded names fit in u32"),
             }))

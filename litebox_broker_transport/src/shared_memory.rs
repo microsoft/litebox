@@ -240,35 +240,63 @@ impl<Memory: SharedMemory> SharedBufferPool<Memory> {
         Ok(ranges.into_iter().take(count))
     }
 
-    /// Copies a sequence prefix into `destination`.
+    /// Copies the bytes at `offset` in `sequence` into `destination`.
     pub fn read_sequence(
         &self,
         sequence: SharedBufferSequence,
+        offset: usize,
         destination: &mut [u8],
     ) -> Result<(), SharedBufferError> {
-        let mut offset = 0;
-        for range in self.sequence_ranges(sequence, destination.len())? {
-            let end = offset + range.len();
+        let mut copied = 0;
+        for range in self.ranges_at(sequence, offset, destination.len())? {
+            let end = copied + range.len();
             self.memory
-                .read(range.start, &mut destination[offset..end])?;
-            offset = end;
+                .read(range.start, &mut destination[copied..end])?;
+            copied = end;
         }
         Ok(())
     }
 
-    /// Copies `source` into a sequence prefix.
+    /// Copies `source` into `sequence` at `offset`.
     pub fn write_sequence(
         &self,
         sequence: SharedBufferSequence,
+        offset: usize,
         source: &[u8],
     ) -> Result<(), SharedBufferError> {
-        let mut offset = 0;
-        for range in self.sequence_ranges(sequence, source.len())? {
-            let end = offset + range.len();
-            self.memory.write(range.start, &source[offset..end])?;
-            offset = end;
+        let mut copied = 0;
+        for range in self.ranges_at(sequence, offset, source.len())? {
+            let end = copied + range.len();
+            self.memory.write(range.start, &source[copied..end])?;
+            copied = end;
         }
         Ok(())
+    }
+
+    /// Returns the shared-memory ranges holding the `length` bytes at
+    /// `offset` in `sequence`, in transfer order.
+    fn ranges_at(
+        &self,
+        sequence: SharedBufferSequence,
+        offset: usize,
+        length: usize,
+    ) -> Result<impl Iterator<Item = Range<usize>> + use<Memory>, SharedBufferError> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(SharedBufferError::TransferExceedsSequence)?;
+        let mut skip = offset;
+        Ok(self
+            .sequence_ranges(sequence, end)?
+            .filter_map(move |range| {
+                if skip >= range.len() {
+                    skip -= range.len();
+                    None
+                } else {
+                    let start = range.start + skip;
+                    skip = 0;
+                    Some(start..range.end)
+                }
+            }))
     }
 }
 
@@ -312,18 +340,46 @@ mod tests {
             SharedBufferSequence::new(&[SharedBufferSlotIndex(0), SharedBufferSlotIndex(2)], 6)
                 .unwrap();
 
-        pool.write_sequence(sequence, &[1, 2, 3, 4, 5, 6]).unwrap();
+        pool.write_sequence(sequence, 0, &[1, 2, 3, 4, 5, 6])
+            .unwrap();
         assert_eq!(memory.bytes(), [1, 2, 3, 4, 0, 0, 0, 0, 5, 6, 0, 0]);
 
         let mut destination = [0; 5];
-        pool.read_sequence(sequence, &mut destination).unwrap();
+        pool.read_sequence(sequence, 0, &mut destination).unwrap();
         assert_eq!(destination, [1, 2, 3, 4, 5]);
         assert_eq!(
-            pool.write_sequence(sequence, &[0; 7]),
+            pool.write_sequence(sequence, 0, &[0; 7]),
             Err(SharedBufferError::TransferExceedsSequence)
         );
         assert_eq!(
-            pool.read_sequence(sequence, &mut [0; 7]),
+            pool.read_sequence(sequence, 0, &mut [0; 7]),
+            Err(SharedBufferError::TransferExceedsSequence)
+        );
+    }
+
+    #[test]
+    fn pool_copies_sequence_ranges_at_offsets_across_slots() {
+        let layout = SharedBufferLayout::new(4, 3).unwrap();
+        let memory = Arc::new(TestSharedMemory::new(layout.total_len()));
+        let pool = SharedBufferPool::new(Arc::clone(&memory), layout).unwrap();
+        let sequence =
+            SharedBufferSequence::new(&[SharedBufferSlotIndex(0), SharedBufferSlotIndex(2)], 7)
+                .unwrap();
+
+        pool.write_sequence(sequence, 2, &[1, 2, 3, 4]).unwrap();
+        pool.write_sequence(sequence, 6, &[5]).unwrap();
+        assert_eq!(memory.bytes(), [0, 0, 1, 2, 0, 0, 0, 0, 3, 4, 5, 0]);
+
+        let mut destination = [0; 3];
+        pool.read_sequence(sequence, 3, &mut destination).unwrap();
+        assert_eq!(destination, [2, 3, 4]);
+        pool.read_sequence(sequence, 7, &mut []).unwrap();
+        assert_eq!(
+            pool.write_sequence(sequence, 6, &[0; 2]),
+            Err(SharedBufferError::TransferExceedsSequence)
+        );
+        assert_eq!(
+            pool.read_sequence(sequence, usize::MAX, &mut [0; 1]),
             Err(SharedBufferError::TransferExceedsSequence)
         );
     }
