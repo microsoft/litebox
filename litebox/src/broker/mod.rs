@@ -448,15 +448,17 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<core::result::Result<usize, UnixSocketError>, BrokerControlError>;
 
     /// Receives into at most [`UNIX_SOCKET_BUFFER_SIZE`] bytes of `data`, as
-    /// for a non-blocking socket if `nonblocking` is set.
+    /// for a non-blocking socket if `nonblocking` is set, returning the
+    /// sender's name if `source` is set.
     fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         data: &mut [u8],
         peek: bool,
+        source: bool,
         nonblocking: bool,
     ) -> core::result::Result<
-        core::result::Result<(ReceiveUnixSocketResponse, UnixSocketName), UnixSocketError>,
+        core::result::Result<(ReceiveUnixSocketResponse, Option<UnixSocketName>), UnixSocketError>,
         BrokerControlError,
     >;
 
@@ -1326,17 +1328,22 @@ where
         handle: ObjectHandle,
         data: &mut [u8],
         peek: bool,
+        source: bool,
         nonblocking: bool,
     ) -> core::result::Result<
-        core::result::Result<(ReceiveUnixSocketResponse, UnixSocketName), UnixSocketError>,
+        core::result::Result<(ReceiveUnixSocketResponse, Option<UnixSocketName>), UnixSocketError>,
         BrokerControlError,
     > {
         let capacity = data.len().min(UNIX_SOCKET_BUFFER_SIZE as usize);
         let data = &mut data[..capacity];
-        let lease =
-            self.acquire_shared_buffer(capacity + MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize)?;
+        let name_size = if source {
+            MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
+        } else {
+            0
+        };
+        let lease = self.acquire_shared_buffer(capacity + name_size)?;
         self.request(|local| {
-            local.receive_unix_socket(handle, lease.sequence(), data, peek, nonblocking)
+            local.receive_unix_socket(handle, lease.sequence(), data, peek, source, nonblocking)
         })
     }
 

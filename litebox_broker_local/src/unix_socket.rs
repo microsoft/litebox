@@ -201,28 +201,35 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     }
 
     /// Receives data from a Unix socket into `destination` through
-    /// `buffer`, which must hold `destination` plus an encoded name, as for a
-    /// non-blocking socket if `nonblocking` is set.
+    /// `buffer`, as for a non-blocking socket if `nonblocking` is set.
     ///
-    /// Returns the received lengths and the sender's name.
+    /// Returns the received lengths, and the sender's name if `source` is
+    /// set.
     ///
     /// # Panics
     ///
-    /// Panics if `buffer` is not `destination.len()` plus
-    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] bytes, or the broker returns an
-    /// invalid response.
+    /// Panics if `buffer` is not `destination.len()` bytes, plus
+    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set, or the broker
+    /// returns an invalid response.
     pub fn receive_unix_socket(
         &self,
         handle: ObjectHandle,
         buffer: SharedBufferSequence,
         destination: &mut [u8],
         peek: bool,
+        source: bool,
         nonblocking: bool,
-    ) -> Result<UnixSocketResult<(ReceiveUnixSocketResponse, UnixSocketName)>, Channel::Error> {
+    ) -> Result<UnixSocketResult<(ReceiveUnixSocketResponse, Option<UnixSocketName>)>, Channel::Error>
+    {
         let capacity = destination.len();
+        let name_size = if source {
+            MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize
+        } else {
+            0
+        };
         self.validate_unix_socket_buffer(
             buffer,
-            capacity + MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize,
+            capacity + name_size,
             MAX_UNIX_SOCKET_TRANSFER_SIZE,
         )?;
         match self.request_unix_socket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
@@ -230,6 +237,7 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
             buffer,
             capacity: u32::try_from(capacity).expect("validated capacity fits in u32"),
             peek,
+            source,
             nonblocking,
         }))? {
             UnixSocketResponse::Receive(response) => {
@@ -238,15 +246,17 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
                 assert!(
                     received <= capacity
                         && received <= response.length as usize
-                        && source_length <= MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize,
+                        && source_length <= name_size,
                     "broker returned inconsistent Unix socket receive lengths"
                 );
                 self.read_shared_buffer(buffer, &mut destination[..received]);
-                let mut source = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
-                self.read_shared_buffer_at(buffer, received, &mut source[..source_length]);
-                let source = UnixSocketName::decode(&source[..source_length])
-                    .expect("broker returned an invalid Unix socket source name");
-                Ok(Ok((response, source)))
+                let name = source.then(|| {
+                    let mut name = [0; MAX_ENCODED_UNIX_SOCKET_NAME_SIZE as usize];
+                    self.read_shared_buffer_at(buffer, received, &mut name[..source_length]);
+                    UnixSocketName::decode(&name[..source_length])
+                        .expect("broker returned an invalid Unix socket source name")
+                });
+                Ok(Ok((response, name)))
             }
             UnixSocketResponse::Failed(error) => Ok(Err(error)),
             response => panic!("broker returned unexpected Unix socket response: {response:?}"),

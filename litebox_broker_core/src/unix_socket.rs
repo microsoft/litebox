@@ -74,8 +74,8 @@ pub struct Received {
     pub data: Vec<u8>,
     /// Length of the whole datagram, or of `data` for a stream socket.
     pub length: usize,
-    /// Name of the sending socket.
-    pub source: UnixSocketName,
+    /// Name of the sending socket, if requested.
+    pub source: Option<UnixSocketName>,
 }
 
 /// Creates an unconnected Unix socket.
@@ -362,7 +362,7 @@ pub fn send(
 }
 
 /// Receives up to `capacity` bytes from a Unix socket, leaving them queued
-/// if `peek` is set.
+/// if `peek` is set and returning the sender's name if `source` is set.
 ///
 /// A stream socket receives queued bytes. A datagram socket receives one
 /// datagram, discarding the bytes beyond `capacity` unless peeking. Empty
@@ -378,6 +378,7 @@ pub fn receive(
     handle: ObjectHandle,
     capacity: u32,
     peek: bool,
+    source: bool,
     nonblocking: bool,
 ) -> Result<UnixSocketResult<Received>> {
     if capacity > MAX_UNIX_SOCKET_TRANSFER_SIZE {
@@ -387,8 +388,10 @@ pub fn receive(
     let socket = &lease.socket;
     let nonblocking = nonblocking || lease.nonblocking;
     match socket.kind {
-        SocketType::Stream => socket.receive_stream(capacity as usize, peek, nonblocking),
-        SocketType::Datagram => socket.receive_datagram(capacity as usize, peek, nonblocking),
+        SocketType::Stream => socket.receive_stream(capacity as usize, peek, source, nonblocking),
+        SocketType::Datagram => {
+            socket.receive_datagram(capacity as usize, peek, source, nonblocking)
+        }
         _ => Err(BrokerError::Internal),
     }
 }
@@ -1273,10 +1276,11 @@ impl Socket {
         &self,
         capacity: usize,
         peek: bool,
+        source: bool,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<Received>> {
         let source = match &self.state.lock().connection {
-            Connection::Connected { peer_name, .. } => peer_name.clone(),
+            Connection::Connected { peer_name, .. } => source.then(|| peer_name.clone()),
             Connection::None | Connection::Listening { .. } => {
                 return Ok(Err(UnixSocketError::InvalidArgument));
             }
@@ -1329,13 +1333,17 @@ impl Socket {
         &self,
         capacity: usize,
         peek: bool,
+        source: bool,
         nonblocking: bool,
     ) -> Result<UnixSocketResult<Received>> {
         let (received, wakeups) = {
             let mut channel = self.incoming.lock();
             let Some(datagram) = channel.queue.datagrams.front() else {
                 return if channel.is_shut() && !nonblocking {
-                    Ok(Ok(Received::default()))
+                    Ok(Ok(Received {
+                        source: source.then_some(UnixSocketName::Unnamed),
+                        ..Received::default()
+                    }))
                 } else {
                     Err(BrokerError::would_block(nonblocking))
                 };
@@ -1349,7 +1357,7 @@ impl Socket {
                 let received = Received {
                     data,
                     length,
-                    source: datagram.source.clone(),
+                    source: source.then(|| datagram.source.clone()),
                 };
                 (received, Wakeups::default())
             } else {
@@ -1360,12 +1368,15 @@ impl Socket {
                     .ok_or(BrokerError::Internal)?;
                 channel.remove(datagram.charge());
                 self.sockets.refund(&self.quota, datagram.charge());
-                let Datagram { mut data, source } = datagram;
+                let Datagram {
+                    mut data,
+                    source: name,
+                } = datagram;
                 data.truncate(capacity);
                 let received = Received {
                     data,
                     length,
-                    source,
+                    source: source.then_some(name),
                 };
                 // Senders waiting for room retry.
                 (received, channel.wake())

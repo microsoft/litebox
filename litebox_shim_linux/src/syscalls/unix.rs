@@ -224,12 +224,11 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
             cx,
             buf,
             flags.contains(ReceiveFlags::PEEK),
+            source_addr.is_some() && !self.is_stream(),
             flags.contains(ReceiveFlags::DONTWAIT),
         )?;
-        if let Some(source_addr) = source_addr
-            && !self.is_stream()
-        {
-            *source_addr = Some(received.source.into());
+        if let (Some(source_addr), Some(source)) = (source_addr, received.source) {
+            *source_addr = Some(source.into());
         }
         Ok(received.length)
     }

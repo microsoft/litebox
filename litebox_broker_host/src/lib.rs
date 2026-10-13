@@ -1482,9 +1482,14 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
         }
         UnixSocketRequest::Receive(request) => {
             validate_shared_buffer(request.buffer, MAX_UNIX_SOCKET_TRANSFER_SIZE)?;
+            let name_size = if request.source {
+                MAX_ENCODED_UNIX_SOCKET_NAME_SIZE
+            } else {
+                0
+            };
             if request
                 .capacity
-                .checked_add(MAX_ENCODED_UNIX_SOCKET_NAME_SIZE)
+                .checked_add(name_size)
                 .is_none_or(|length| length > request.buffer.length())
             {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
@@ -1494,15 +1499,12 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 request.handle,
                 request.capacity,
                 request.peek,
+                request.source,
                 request.nonblocking,
             )? {
                 Ok(received) => received,
                 Err(error) => return Ok(UnixSocketResponse::Failed(error)),
             };
-            let source = received
-                .source
-                .encode()
-                .ok_or(RequestFailure::Abort(ErrorCode::Internal))?;
             let length = u32::try_from(received.length)
                 .map_err(|_| RequestFailure::Abort(ErrorCode::Internal))?;
             let data = received.data;
@@ -1512,13 +1514,22 @@ fn handle_unix_socket_request<Memory: SharedMemory>(
                 &data,
                 MAX_UNIX_SOCKET_TRANSFER_SIZE,
             )?;
-            shared_buffers
-                .write_sequence(request.buffer, data.len(), &source)
-                .map_err(shared_buffer_access_failure)?;
+            let source_length = match received.source {
+                Some(source) => {
+                    let source = source
+                        .encode()
+                        .ok_or(RequestFailure::Abort(ErrorCode::Internal))?;
+                    shared_buffers
+                        .write_sequence(request.buffer, data.len(), &source)
+                        .map_err(shared_buffer_access_failure)?;
+                    source.len()
+                }
+                None => 0,
+            };
             Ok(UnixSocketResponse::Receive(ReceiveUnixSocketResponse {
                 received: u32::try_from(data.len()).expect("received bytes fit the capacity"),
                 length,
-                source_length: u32::try_from(source.len()).expect("encoded names fit in u32"),
+                source_length: u32::try_from(source_length).expect("encoded names fit in u32"),
             }))
         }
         UnixSocketRequest::Shutdown(request) => {
@@ -2921,6 +2932,7 @@ mod tests {
                     buffer: single_slot_sequence(9, capacity + MAX_ENCODED_UNIX_SOCKET_NAME_SIZE),
                     capacity,
                     peek: false,
+                    source: true,
                     nonblocking: false,
                 },
             )));
@@ -2976,8 +2988,9 @@ mod tests {
             UnixSocketResponse::Failed(UnixSocketError::InvalidArgument)
         );
 
-        // A receive buffer without room for the source name is malformed.
-        assert_eq!(
+        // A receive that does not ask for the source name needs room only
+        // for the data, and one that does but lacks room for it is malformed.
+        let receive_into_data_buffer = |source| {
             complete_request(handle_request(
                 &process,
                 BrokerOperation::UnixSocket(UnixSocketRequest::Receive(ReceiveUnixSocketRequest {
@@ -2985,12 +2998,34 @@ mod tests {
                     buffer: single_slot_sequence(9, 8),
                     capacity: 8,
                     peek: false,
+                    source,
                     nonblocking: false,
-                },)),
+                })),
                 &shared_buffers,
                 &test_readiness_sink(),
-            )),
+            ))
+        };
+        request(BrokerOperation::UnixSocket(UnixSocketRequest::Send(
+            SendUnixSocketRequest {
+                handle: pair.first,
+                buffer: stage(2, &[4, 5]),
+                address_length: 0,
+                user: ROOT,
+            },
+        )));
+        assert_eq!(
+            receive_into_data_buffer(true),
             Err(ErrorCode::MalformedRequest)
+        );
+        assert_eq!(
+            receive_into_data_buffer(false),
+            Ok(BrokerResult::UnixSocket(UnixSocketResponse::Receive(
+                ReceiveUnixSocketResponse {
+                    received: 2,
+                    length: 2,
+                    source_length: 0,
+                }
+            )))
         );
     }
 

@@ -111,7 +111,7 @@ impl Fixture {
     }
 
     fn receive(&self, handle: ObjectHandle, capacity: u32) -> Result<UnixSocketResult<Received>> {
-        receive(&self.process, handle, capacity, false, false)
+        receive(&self.process, handle, capacity, false, true, false)
     }
 
     fn receive_data(&self, handle: ObjectHandle, capacity: u32) -> Vec<u8> {
@@ -182,11 +182,11 @@ fn stream_pairs_carry_bytes_in_both_directions() {
     assert!(fixture.take_republished().contains(&second));
     assert!(fixture.readiness(second).contains(ReadinessFlags::READ));
 
-    let peeked = receive(&fixture.process, second, 3, true, false)
+    let peeked = receive(&fixture.process, second, 3, true, true, false)
         .unwrap()
         .unwrap();
     assert_eq!(peeked.data, b"hel");
-    assert_eq!(peeked.source, UnixSocketName::Unnamed);
+    assert_eq!(peeked.source, Some(UnixSocketName::Unnamed));
     assert_eq!(fixture.receive_data(second, 3), b"hel");
     assert_eq!(fixture.receive_data(second, 10), b"lo");
     assert_eq!(fixture.receive(second, 10), Err(BrokerError::WouldBlock));
@@ -270,7 +270,7 @@ fn path_listeners_accept_connections_with_names() {
     assert_eq!(received.data, b"ping");
     assert_eq!(
         received.source,
-        UnixSocketName::Abstract(b"client".to_vec())
+        Some(UnixSocketName::Abstract(b"client".to_vec()))
     );
     assert_eq!(fixture.send(server, b"pong").unwrap(), Ok(4));
     assert_eq!(fixture.receive_data(client, 16), b"pong");
@@ -578,17 +578,24 @@ fn a_read_shut_datagram_socket_ends_only_blocking_receives() {
         Err(UnixSocketError::BrokenPipe)
     );
     assert_eq!(
-        receive(&fixture.process, first, 8, false, true)
-            .unwrap()
-            .unwrap()
-            .data,
-        b"queued"
+        receive(&fixture.process, first, 8, false, false, true),
+        Ok(Ok(Received {
+            data: b"queued".to_vec(),
+            length: 6,
+            source: None,
+        }))
     );
     assert_eq!(
-        receive(&fixture.process, first, 8, false, true),
+        receive(&fixture.process, first, 8, false, false, true),
         Err(BrokerError::NonBlockingWouldBlock)
     );
-    assert_eq!(fixture.receive(first, 8), Ok(Ok(Received::default())));
+    assert_eq!(
+        fixture.receive(first, 8),
+        Ok(Ok(Received {
+            source: Some(UnixSocketName::Unnamed),
+            ..Received::default()
+        }))
+    );
     // Shutting down the peer's sending direction leaves this socket open.
     shutdown(&fixture.process, first, ShutdownMode::Write)
         .unwrap()
@@ -669,17 +676,21 @@ fn datagrams_keep_boundaries_and_sources() {
         Received {
             data: b"ab".to_vec(),
             length: 3,
-            source: path("/named").name(),
+            source: Some(path("/named").name()),
         }
     );
     assert_eq!(
         fixture.receive(receiver, 8).unwrap().unwrap(),
-        Received::default()
+        Received {
+            source: Some(UnixSocketName::Unnamed),
+            ..Received::default()
+        }
     );
-    let peeked = receive(&fixture.process, receiver, 8, true, false)
+    let peeked = receive(&fixture.process, receiver, 8, true, false, false)
         .unwrap()
         .unwrap();
     assert_eq!(peeked.data, b"defgh");
+    assert_eq!(peeked.source, None);
     assert_eq!(fixture.receive_data(receiver, 8), b"defgh");
     assert_eq!(fixture.receive(receiver, 8), Err(BrokerError::WouldBlock));
     assert_eq!(fixture.queued(), (0, 0));
@@ -723,7 +734,7 @@ fn connected_datagram_sockets_only_accept_their_peer() {
     assert_eq!(fixture.send(receiver, b"y").unwrap(), Ok(1));
     assert_eq!(
         fixture.receive(peer, 1).unwrap().unwrap().source,
-        receiver_address.name()
+        Some(receiver_address.name())
     );
     assert_eq!(
         name(&fixture.process, receiver, true).unwrap(),
@@ -778,7 +789,7 @@ fn reconnecting_a_datagram_socket_drops_queued_datagrams() {
     assert_eq!(fixture.queued(), (0, 0));
     assert!(!fixture.readiness(receiver).contains(ReadinessFlags::READ));
     assert_eq!(
-        receive(&fixture.process, receiver, 1, false, true),
+        receive(&fixture.process, receiver, 1, false, false, true),
         Err(BrokerError::NonBlockingWouldBlock)
     );
 }
@@ -910,7 +921,7 @@ fn duplicated_references_share_one_socket() {
     fixture.close(first);
     assert_eq!(fixture.send(second, b"child").unwrap(), Ok(5));
     assert_eq!(
-        receive(&child, duplicated, 8, false, false)
+        receive(&child, duplicated, 8, false, false, false)
             .unwrap()
             .unwrap()
             .data,
@@ -988,7 +999,7 @@ fn sockets_connect_to_themselves_only_as_datagram_sockets() {
     assert_eq!(fixture.send(datagram, b"self").unwrap(), Ok(4));
     let received = fixture.receive(datagram, 8).unwrap().unwrap();
     assert_eq!(received.data, b"self");
-    assert_eq!(received.source, address.name());
+    assert_eq!(received.source, Some(address.name()));
 }
 
 #[test]

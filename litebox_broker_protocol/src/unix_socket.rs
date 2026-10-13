@@ -394,16 +394,18 @@ pub struct SendUnixSocketResponse {
 pub struct ReceiveUnixSocketRequest {
     /// Socket handle.
     pub handle: ObjectHandle,
-    /// Shared-buffer region that receives the data followed by the sender's
-    /// encoded [`UnixSocketName`].
+    /// Shared-buffer region that receives the data, followed by the sender's
+    /// encoded [`UnixSocketName`] if `source` is set.
     ///
-    /// It must hold `capacity` bytes plus
-    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`].
+    /// It must hold `capacity` bytes, plus
+    /// [`MAX_ENCODED_UNIX_SOCKET_NAME_SIZE`] if `source` is set.
     pub buffer: SharedBufferSequence,
     /// Maximum data bytes to receive.
     pub capacity: u32,
     /// Whether to leave the data queued.
     pub peek: bool,
+    /// Whether to return the sender's name.
+    pub source: bool,
     /// Whether the caller will not wait for data, as if the socket were
     /// non-blocking.
     ///
@@ -422,7 +424,8 @@ pub struct ReceiveUnixSocketResponse {
     pub received: u32,
     /// Length of the whole datagram, or `received` for a stream socket.
     pub length: u32,
-    /// Length of the sender's encoded name, which follows the data.
+    /// Length of the sender's encoded name, which follows the data, or zero
+    /// if the request did not ask for it.
     pub source_length: u32,
 }
 

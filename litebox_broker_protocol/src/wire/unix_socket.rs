@@ -102,6 +102,7 @@ pub(super) fn encode_unix_socket_request(encoder: &mut Encoder, request: UnixSoc
             encoder.shared_buffer_sequence(request.buffer);
             encoder.u32(request.capacity);
             encode_bool(encoder, request.peek);
+            encode_bool(encoder, request.source);
             encode_bool(encoder, request.nonblocking);
         }
         UnixSocketRequest::Shutdown(request) => {
@@ -164,6 +165,7 @@ pub(super) fn decode_unix_socket_request(
             buffer: decoder.shared_buffer_sequence()?,
             capacity: decoder.u32()?,
             peek: decode_bool(decoder)?,
+            source: decode_bool(decoder)?,
             nonblocking: decode_bool(decoder)?,
         }),
         TAG_SHUTDOWN => UnixSocketRequest::Shutdown(ShutdownUnixSocketRequest {

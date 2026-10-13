@@ -1098,6 +1098,7 @@ mod tests {
                 buffer: largest_sequence,
                 capacity: u32::MAX,
                 peek: true,
+                source: true,
                 nonblocking: true,
             })),
             BrokerOperation::UnixSocket(UnixSocketRequest::Shutdown(ShutdownUnixSocketRequest {

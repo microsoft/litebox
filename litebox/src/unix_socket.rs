@@ -48,8 +48,8 @@ pub struct Received {
     pub received: usize,
     /// Length of the whole datagram, or `received` for a stream socket.
     pub length: usize,
-    /// Name of the sending socket.
-    pub source: UnixSocketName,
+    /// Name of the sending socket, if requested.
+    pub source: Option<UnixSocketName>,
 }
 
 /// A reference to a broker-owned Unix socket, which closes its handle when
@@ -250,7 +250,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         }
     }
 
-    /// Receives into `buffer`, leaving the data queued if `peek` is set.
+    /// Receives into `buffer`, leaving the data queued if `peek` is set and
+    /// returning the sender's name if `source` is set.
     ///
     /// A stream socket receives queued bytes. A datagram socket receives one
     /// datagram, discarding the bytes that do not fit unless peeking. Waits
@@ -264,11 +265,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> UnixSocket<Platform> {
         cx: &WaitContext<'_, Platform>,
         buffer: &mut [u8],
         peek: bool,
+        source: bool,
         nonblock: bool,
     ) -> Result<Received, UnixSocketError> {
         self.wait(cx, nonblock, UnixSocketOptionName::ReceiveTimeout, || {
             self.broker
-                .receive_unix_socket(self.handle, buffer, peek, nonblock)
+                .receive_unix_socket(self.handle, buffer, peek, source, nonblock)
                 .map(|result| {
                     result.map(|(received, source)| Received {
                         received: received.received as usize,
