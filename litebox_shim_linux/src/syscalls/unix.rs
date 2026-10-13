@@ -122,7 +122,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         sock_type: SockType,
         flags: SockFlags,
     ) -> Result<Self, Errno> {
-        let socket = litebox.create_unix_socket(socket_type(sock_type)?, open_flags(flags))?;
+        let socket = litebox.create_unix_socket(to_socket_type(sock_type)?, open_flags(flags))?;
         Ok(socket.into())
     }
 
@@ -132,7 +132,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
         flags: SockFlags,
     ) -> Result<(Self, Self), Errno> {
         let (first, second) =
-            litebox.create_unix_socket_pair(socket_type(sock_type)?, open_flags(flags))?;
+            litebox.create_unix_socket_pair(to_socket_type(sock_type)?, open_flags(flags))?;
         Ok((first.into(), second.into()))
     }
 
@@ -461,7 +461,7 @@ impl<Platform: ShimPlatform> IOPollable for UnixSocket<Platform> {
     }
 }
 
-fn socket_type(sock_type: SockType) -> Result<SocketType, Errno> {
+fn to_socket_type(sock_type: SockType) -> Result<SocketType, Errno> {
     match sock_type {
         SockType::Stream => Ok(SocketType::Stream),
         SockType::Datagram => Ok(SocketType::Datagram),
