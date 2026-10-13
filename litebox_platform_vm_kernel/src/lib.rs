@@ -18,9 +18,10 @@
 //! Interrupts: the kernel runs with interrupts disabled, except while it
 //! halts ([`VmKernel::halt_until_interrupt`]); user code runs with them
 //! enabled. External interrupts go to the handler the runner installs
-//! ([`set_interrupt_handler`]), which returns to the interrupted code: there
-//! is no preemption, so user code that never enters the kernel keeps the
-//! CPU.
+//! ([`set_interrupt_handler`]), which returns to the interrupted code;
+//! [`TIMER_VECTOR`], when it interrupts user code, then also enters the
+//! shim's `interrupt` (the runner's one-shot timer). There is no scheduling:
+//! user code otherwise keeps the CPU.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -104,6 +105,8 @@ pub struct BootConfig<'a> {
 
 /// See [`set_interrupt_handler`].
 pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
+
+pub use arch::interrupts::TIMER_VECTOR;
 
 /// Installs the handler for external interrupts (vectors 32 and up, except
 /// [`BootConfig::ignored_vectors`]), which returns whether it handled the
@@ -1270,6 +1273,26 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         "mov rsi, cr2",   // not yet overwritten: no fault since
         "call {exception_handler}",
         "jmp done",
+        // From `isr_timer`, for a timer fire that interrupted user mode. On
+        // entry: rsp = ISR stack [vector, error_code, rip, cs,
+        // rflags, rsp, ss] (vector and error code are placeholders, unused),
+        // all GPRs hold the interrupted values, IF is clear, and GS is still
+        // the user's.
+        ".globl interrupt_callback",
+        "interrupt_callback:",
+        "cld",
+        "clac",
+        "swapgs",
+        "mov gs:[{scratch_off}], rax",
+        "mov rax, rsp", // ISR stack, for SAVE_PF_USER_CONTEXT_ASM
+        "mov rsp, gs:[{user_context_top_off}]",
+        SAVE_PF_USER_CONTEXT_ASM!(),
+        XSAVE_ASM!({user_xsave_area_off}, {xsave_mask_lo_off}, {xsave_mask_hi_off}, {user_xsaved_off}),
+        "mov rbp, gs:[{cur_kernel_bp_off}]",
+        "mov rsp, gs:[{cur_kernel_sp_off}]",
+        "mov rdi, [rsp]", // pass `thread_ctx`
+        "call {interrupt_handler}",
+        "jmp done",
         // From the #PF stub, for kernel-mode page faults. On entry: rsp = ISR
         // stack [vector, error_code, rip, cs, rflags, rsp, ss], IF is clear, and
         // GS is the kernel's. The handlers try demand paging, then an
@@ -1334,6 +1357,7 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         reenter_handler = sym reenter_handler,
         syscall_handler = sym syscall_handler,
         exception_handler = sym exception_handler,
+        interrupt_handler = sym interrupt_handler,
         kernel_exception_handler = sym kernel_exception_handler,
         kernel_exception_handler_no_ctx = sym kernel_exception_handler_no_ctx,
     );
@@ -1376,6 +1400,20 @@ unsafe extern "C" fn exception_handler(thread_ctx: &ThreadContext, cr2: usize) {
         kernel_mode: false,
     };
     if let ContinueOperation::Resume = thread_ctx.shim.exception(ctx, &info) {
+        resume_user(ctx);
+    }
+}
+
+/// [`TIMER_VECTOR`] fired while a process ran. `ctx` is whatever it was
+/// running at the time; the shim decides whether and how to act on it (e.g.,
+/// deliver `UpcallKind::Interrupt`, defined in `litebox_common_vm_abi`, which
+/// this crate does not depend on).
+///
+/// [`TIMER_VECTOR`]: crate::TIMER_VECTOR
+unsafe extern "C" fn interrupt_handler(thread_ctx: &ThreadContext) {
+    // Safety: entered from user mode; see `ThreadContext`.
+    let ctx = unsafe { &mut *thread_ctx.ctx };
+    if let ContinueOperation::Resume = thread_ctx.shim.interrupt(ctx) {
         resume_user(ctx);
     }
 }

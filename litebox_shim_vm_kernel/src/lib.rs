@@ -38,6 +38,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 use core::ops::Range;
+use core::time::Duration;
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_vm_kernel::{Association, Broker, EnterError};
@@ -47,10 +48,11 @@ use litebox_common_vm_abi::{
     ABI_VERSION, CallId, DERIVED_KEY_LEN, DeriveKeyReply, DeriveKeyRequest, IDENTITY_LEN, Image,
     KernelCall, LogLevel, LogRequest, MAX_IMAGES, MAX_KDF_CONTEXT_LEN, MAX_LOG_LEN, MapReply,
     MapRequest, Message, PAGE_SIZE, Placement, Populate, Prot, ProtectRequest, RUNNER_MANAGED_MAX,
-    RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest, StartupInfo, Status, UnmapRequest,
-    UpcallFrame, UpcallKind, UserRange, WallClock,
+    RUNNER_MANAGED_MIN, Registers, Request, RestrictRequest, SetTimerRequest, StartupInfo, Status,
+    UnmapRequest, UpcallFrame, UpcallKind, UserRange, WallClock,
 };
-use litebox_platform_vm_kernel::{AddressSpaceId, PinnedUserPages, VmKernel};
+use litebox_platform::time::{Instant as _, TimeProvider as _};
+use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, VmKernel};
 use zerocopy::IntoBytes;
 
 use memory::{Mappings, checked_range, copy_from_user, copy_to_user};
@@ -66,6 +68,18 @@ pub struct ProcessConfig<'a> {
     /// platform's installed clock source, which must be the same clock.
     pub clock_khz: u64,
     pub wall_clock: WallClock,
+    /// For the process's [`CallId::SetTimer`] deadline.
+    pub timer: &'static dyn ProcessTimer,
+}
+
+/// The kernel's one-shot hardware timer, which processes' [`CallId::SetTimer`]
+/// deadlines share, one at a time: the runner owns it (e.g., a local APIC's).
+pub trait ProcessTimer: Sync {
+    /// Arms, or with `None` disarms, a one-shot interrupt at `deadline` on
+    /// [`litebox_platform_vm_kernel::TIMER_VECTOR`], which a process running
+    /// then sees as [`UpcallKind::Interrupt`]. Arming replaces an earlier
+    /// deadline.
+    fn arm(&self, deadline: Option<Instant>);
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -130,12 +144,16 @@ struct Inner {
     executable: Vec<Range<u64>>,
     mappings: Mappings,
     broker: Association,
+    timer: &'static dyn ProcessTimer,
     /// Borrowed briefly: killing the process replaces it.
     state: RefCell<State>,
     lockdown: Cell<lockdown::Lockdown>,
     /// Statistics for the current request.
     entries: Cell<u64>,
     reflected: Cell<u64>,
+    /// [`CallId::SetTimer`]'s deadline. Armed to the platform's timer just
+    /// before every resume to ring 3, and cleared once delivered.
+    armed_deadline: Cell<Option<Instant>>,
 }
 
 pub struct Process {
@@ -225,10 +243,12 @@ impl Process {
                 executable: runner.executable,
                 mappings,
                 broker,
+                timer: config.timer,
                 state: RefCell::new(State::New),
                 lockdown: Cell::new(lockdown::Lockdown::OPEN),
                 entries: Cell::new(0),
                 reflected: Cell::new(0),
+                armed_deadline: Cell::new(None),
             },
             ctx: PtRegs::default(),
             fs_base: 0,
@@ -254,6 +274,9 @@ impl Process {
     /// could not restore kills a live process.
     fn deactivate(&mut self) {
         use litebox::platform::{ArchSpecificProvider as _, ArchSpecificRegister};
+        // Not running, so its deadline is not to interrupt anything (e.g.,
+        // the kernel's halts, or the next process); re-armed as it resumes.
+        self.inner.timer.arm(None);
         let fs_base = self
             .inner
             .platform
@@ -601,6 +624,7 @@ impl Inner {
                 Flow::Stop
             }
             Request::Restrict(r) => respond(&r, slot, self.restrict(&r)),
+            Request::SetTimer(r) => respond(&r, slot, self.set_timer(r)),
         }
     }
 
@@ -615,6 +639,41 @@ impl Inner {
         self.lockdown.set(self.lockdown.get().narrowed(r)?);
         log::debug!("lockdown: {}", self.lockdown.get());
         Ok(())
+    }
+
+    /// [`CallId::SetTimer`]: stores the deadline; [`Self::rearm_timer`]
+    /// gives it to the platform just before the process next resumes.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "matches `respond`'s signature, which fallible handlers need"
+    )]
+    fn set_timer(&self, r: SetTimerRequest) -> Result<(), Status> {
+        self.armed_deadline
+            .set((r.deadline != 0).then(|| Instant::from_nanos(r.deadline)));
+        Ok(())
+    }
+
+    /// Gives the platform's one-shot timer the process's armed deadline (or
+    /// disarms it), so a running process sees it even without a kernel call
+    /// of its own. Call before every resume to ring 3.
+    ///
+    /// Not before the process registers an upcall entry, as nothing could be
+    /// delivered: the deadline is kept, and armed once there is one.
+    ///
+    /// Shares the timer with the broker's bounded waits (see
+    /// [`ProcessTimer::arm`]), which always disarm it afterward, so nothing
+    /// is lost by calling this unconditionally.
+    fn rearm_timer(&self) {
+        let deadline = self.upcall_entry().and(self.armed_deadline.get());
+        self.timer.arm(deadline);
+    }
+
+    /// The registered upcall entry, once the process is serving.
+    fn upcall_entry(&self) -> Option<u64> {
+        match *self.state.borrow() {
+            State::Serving { upcall_entry } => upcall_entry,
+            _ => None,
+        }
     }
 
     fn managed(addr: u64, len: u64) -> Result<Range<usize>, Status> {
@@ -748,15 +807,19 @@ impl Inner {
         error_code: u64,
         fault_address: u64,
     ) -> ContinueOperation {
-        let entry = match *self.state.borrow() {
-            State::Serving { upcall_entry } => upcall_entry,
-            _ => None,
-        };
-        let Some(entry) = entry else {
-            return self.kill_and_stop(match kind {
-                UpcallKind::Exception => "unhandled exception",
-                UpcallKind::Syscall => "syscall outside the gate without an upcall entry",
-            });
+        let Some(entry) = self.upcall_entry() else {
+            // An interrupt before the process registered an entry (or with
+            // none registered at all) is not a protocol violation.
+            return if kind == UpcallKind::Interrupt {
+                self.rearm_timer();
+                ContinueOperation::Resume
+            } else {
+                self.kill_and_stop(match kind {
+                    UpcallKind::Exception => "unhandled exception",
+                    UpcallKind::Syscall => "syscall outside the gate without an upcall entry",
+                    UpcallKind::Interrupt => unreachable!("handled above"),
+                })
+            };
         };
         let stack = layout::UPCALL_STACK;
         if stack.contains(ctx.rsp as u64) {
@@ -770,7 +833,44 @@ impl Inner {
         ctx.rip = entry.trunc();
         ctx.rsp = frame_addr.trunc();
         ctx.rdi = frame_addr.trunc();
+        self.rearm_timer();
         ContinueOperation::Resume
+    }
+}
+
+/// What [`Inner::interrupt`] does with a timer fire.
+#[derive(Debug, PartialEq, Eq)]
+enum TimerFire {
+    /// No deadline is armed: spurious, or left over.
+    Ignore,
+    /// Fired before the deadline (e.g., a one-shot count capped short of
+    /// it): arm it again.
+    Rearm,
+    /// Due, but the runner is still taking an earlier upcall, which a nested
+    /// one would overwrite: fire again then. The deadline stays (past), so a
+    /// re-arm in the meantime (a kernel call from the upcall stack) fires at
+    /// once and retries again; runners rarely make one there.
+    Retry(Instant),
+    /// Due: deliver [`UpcallKind::Interrupt`].
+    Deliver,
+}
+
+impl TimerFire {
+    /// Ample for the runner to leave the upcall stack, without spinning on
+    /// retries.
+    const UPCALL_STACK_RETRY: Duration = Duration::from_micros(100);
+
+    /// `deadline` is the armed one, if any.
+    fn decide(deadline: Option<Instant>, now: Instant, on_upcall_stack: bool) -> Self {
+        match deadline {
+            None => Self::Ignore,
+            Some(deadline) if now < deadline => Self::Rearm,
+            Some(_) if on_upcall_stack => Self::Retry(
+                now.checked_add(Self::UPCALL_STACK_RETRY)
+                    .unwrap_or(Instant::from_nanos(u64::MAX)),
+            ),
+            Some(_) => Self::Deliver,
+        }
     }
 }
 
@@ -807,6 +907,7 @@ impl EnterShim for Inner {
             ..PtRegs::default()
         };
         *self.state.borrow_mut() = State::Starting;
+        self.rearm_timer();
         ContinueOperation::Resume
     }
 
@@ -822,6 +923,7 @@ impl EnterShim for Inner {
             upcall_entry: waiter.upcall_entry,
         };
         ctx.rax = Status::to_raw(Ok(())).trunc();
+        self.rearm_timer();
         ContinueOperation::Resume
     }
 
@@ -839,6 +941,7 @@ impl EnterShim for Inner {
                     log::debug!("kernel call {:#x} failed: {status:?}", ctx.orig_rax);
                 }
                 ctx.rax = Status::to_raw(result).trunc();
+                self.rearm_timer();
                 ContinueOperation::Resume
             }
             Flow::Stop => ContinueOperation::Terminate,
@@ -854,6 +957,7 @@ impl EnterShim for Inner {
                 .mappings
                 .demand_page(info.cr2, u64::from(info.error_code))
         {
+            self.rearm_timer();
             return ContinueOperation::Resume;
         }
         if info.kernel_mode {
@@ -863,14 +967,71 @@ impl EnterShim for Inner {
         self.deliver_exception(ctx, info)
     }
 
-    fn interrupt(&self, _ctx: &mut PtRegs) -> ContinueOperation {
-        ContinueOperation::Resume
+    /// [`TIMER_VECTOR`](litebox_platform_vm_kernel::TIMER_VECTOR) fired
+    /// while the process ran. Delivers [`UpcallKind::Interrupt`] (quietly
+    /// ignored before [`CallId::Ready`], like any upcall with no entry
+    /// registered yet) once the armed deadline has passed. Otherwise resumes:
+    /// - with no deadline armed, the fire is spurious, or left over;
+    /// - before the deadline, the timer fired early (e.g., a one-shot count
+    ///   capped short of it), so this re-arms it;
+    /// - on the upcall stack, the runner is still taking an earlier upcall
+    ///   (which a nested one would overwrite), so this retries shortly.
+    fn interrupt(&self, ctx: &mut PtRegs) -> ContinueOperation {
+        let on_upcall_stack = layout::UPCALL_STACK.contains(ctx.rsp as u64);
+        match TimerFire::decide(
+            self.armed_deadline.get(),
+            self.platform.now(),
+            on_upcall_stack,
+        ) {
+            TimerFire::Ignore => ContinueOperation::Resume,
+            TimerFire::Rearm => {
+                self.rearm_timer();
+                ContinueOperation::Resume
+            }
+            TimerFire::Retry(at) => {
+                self.timer.arm(Some(at));
+                ContinueOperation::Resume
+            }
+            // Kept until there is an upcall entry to deliver it to.
+            TimerFire::Deliver if self.upcall_entry().is_none() => {
+                self.timer.arm(None);
+                ContinueOperation::Resume
+            }
+            TimerFire::Deliver => {
+                self.armed_deadline.set(None);
+                self.upcall(ctx, UpcallKind::Interrupt, 0, 0, 0)
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timer_fire_waits_out_early_fires_and_upcall_delivery() {
+        let at = Instant::from_nanos;
+        assert_eq!(TimerFire::decide(None, at(100), false), TimerFire::Ignore);
+        // Early (e.g., a capped one-shot count): keep the deadline.
+        assert_eq!(
+            TimerFire::decide(Some(at(200)), at(100), false),
+            TimerFire::Rearm
+        );
+        assert_eq!(
+            TimerFire::decide(Some(at(200)), at(100), true),
+            TimerFire::Rearm
+        );
+        // Due while the runner takes another upcall: retry, not kill.
+        assert_eq!(
+            TimerFire::decide(Some(at(100)), at(150), true),
+            TimerFire::Retry(at(150 + 100_000))
+        );
+        assert_eq!(
+            TimerFire::decide(Some(at(100)), at(100), false),
+            TimerFire::Deliver
+        );
+    }
 
     #[test]
     fn untrusted_text_is_escaped() {

@@ -43,6 +43,7 @@ const SERVING_CALLS: CallSet = CallSet::EMPTY
     .with(CallId::Unmap)
     .with(CallId::Protect)
     .with(CallId::BrokerEnter)
+    .with(CallId::SetTimer)
     .with(CallId::Log);
 
 pub fn serve(info: &StartupInfo) -> ! {

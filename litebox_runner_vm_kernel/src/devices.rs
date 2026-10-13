@@ -2,12 +2,14 @@
 // Licensed under the MIT license.
 
 //! Devices the kernel drives, from `litebox_hal`, for the broker
-//! ([`litebox_broker_vm_kernel::Config`]):
+//! ([`litebox_broker_vm_kernel::Config`]) and processes:
 //!
 //! - [`Console`]: the VM's console device, else output to the serial port
 //!   and no input.
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
+//! - [`ProcessTimer`]: the same timer, while a process runs, for its
+//!   `SetTimer` deadline.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
@@ -15,6 +17,7 @@
 //! devices when it next runs.
 
 use alloc::boxed::Box;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_vm_kernel::Events;
@@ -24,15 +27,18 @@ use litebox_hal::devices::ConsoleDevice;
 use litebox_hal::interrupt::LocalApic;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
+use litebox_shim_vm_kernel::ProcessTimer;
 use spin::Mutex;
 
 /// How long a console write may wait for the device to take output before
 /// the rest is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
-const TIMER_VECTOR: u8 = 0x30;
 /// Shared by every device: the broker looks at all of them when it runs.
 const DEVICE_VECTOR: u8 = 0x31;
+
+/// [`Devices::armed`]: the timer is in a state no deadline matches.
+const ARMED_UNKNOWN: u64 = u64::MAX;
 
 pub struct Devices {
     platform: &'static VmKernel,
@@ -41,12 +47,24 @@ pub struct Devices {
     console: Mutex<ConsoleDevice>,
     /// Whether the console interrupts; else it is polled.
     console_interrupts: bool,
+    /// What [`ProcessTimer::arm`] last programmed into the timer (see
+    /// [`armed`]), so it can skip rewriting it: under KVM each write is a VM
+    /// exit, and it rearms before every resume of a process.
+    armed: AtomicU64,
+}
+
+/// [`Devices::armed`]'s value for `deadline`: zero for none (the instant zero,
+/// long passed, is the same as 1 ns).
+fn armed(deadline: Option<Instant>) -> u64 {
+    deadline.map_or(0, |deadline| deadline.as_nanos().max(1))
 }
 
 impl Devices {
     /// Brings up the devices and enables their interrupts. Call once.
     pub fn init(platform: &'static VmKernel, clock: Clock) -> &'static Self {
-        let apic = LocalApic::init(platform, TIMER_VECTOR, clock);
+        // The platform's timer vector: a fire while a process runs also
+        // reaches the shim (see `ProcessTimer::arm`).
+        let apic = LocalApic::init(platform, litebox_platform_vm_kernel::TIMER_VECTOR, clock);
         let console = match ConsoleDevice::probe(platform, apic.target(DEVICE_VECTOR)) {
             Ok(Some(device)) => device,
             Ok(None) => ConsoleDevice::serial(),
@@ -61,6 +79,7 @@ impl Devices {
             apic,
             clock,
             console_interrupts: console.interrupts(),
+            armed: AtomicU64::new(ARMED_UNKNOWN),
             console: Mutex::new(console),
         }));
         litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
@@ -72,8 +91,16 @@ impl Devices {
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
     /// per-CPU data.
     fn on_interrupt(&self, vector: u8) -> bool {
-        if !matches!(vector, TIMER_VECTOR | DEVICE_VECTOR) {
+        if !matches!(
+            vector,
+            litebox_platform_vm_kernel::TIMER_VECTOR | DEVICE_VECTOR
+        ) {
             return false;
+        }
+        if vector == litebox_platform_vm_kernel::TIMER_VECTOR {
+            // Fired: arming the same deadline again (e.g., after an early
+            // fire) must reprogram it.
+            self.armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
         }
         self.apic.end_of_interrupt();
         true
@@ -88,6 +115,7 @@ impl Devices {
         self.platform.halt_until_interrupt();
         if deadline.is_some() {
             self.apic.disarm_timer();
+            self.armed.store(armed(None), Ordering::Relaxed);
         }
     }
 }
@@ -99,6 +127,25 @@ impl Events for Devices {
         }
         self.halt(deadline);
         true
+    }
+}
+
+impl ProcessTimer for Devices {
+    /// Shares the same one-shot timer as [`Self::halt`]: a bounded halt
+    /// replaces the deadline and disarms the timer afterward (the process
+    /// re-arms it as it resumes), and one without a deadline keeps it, so it
+    /// may end such a halt early (harmless: waits recheck). Writes the timer
+    /// only when the deadline changed, or it fired since.
+    fn arm(&self, deadline: Option<Instant>) {
+        if self.armed.swap(armed(deadline), Ordering::Relaxed) == armed(deadline) {
+            return;
+        }
+        match deadline {
+            Some(deadline) => self
+                .apic
+                .arm_timer(self.clock.ticks_at(deadline.as_nanos())),
+            None => self.apic.disarm_timer(),
+        }
     }
 }
 

@@ -47,6 +47,10 @@
 //!   return address, `r11` = flags), number in `orig_rax`, `rax` = `-ENOSYS`.
 //! - [`UpcallKind::Exception`]: an exception the kernel could not resolve;
 //!   `rip` is the faulting instruction.
+//! - [`UpcallKind::Interrupt`]: the [`CallId::SetTimer`] deadline passed
+//!   while the process ran; `vector`, `error_code`, and `fault_address` are
+//!   zero. `regs` are whatever the process was running at the time (its own
+//!   code or a further-embedded guest's), unrelated to the deadline.
 //!
 //! The runner resumes the guest itself. Without an upcall entry, an upcall
 //! kills the process.
@@ -311,6 +315,13 @@ kernel_calls! {
     10 => Exit(ExitRequest) -> ();
     /// See [Lockdown](crate#lockdown).
     11 => Restrict(RestrictRequest) -> ();
+    /// Sets the process's one-shot timer: at `deadline` (an instant), the
+    /// kernel delivers [`UpcallKind::Interrupt`] if the process is still
+    /// running then; zero cancels. One timer per process; a later call
+    /// replaces the earlier one. The kernel may deliver
+    /// it late, e.g. while running kernel code on the process's behalf, but
+    /// not early.
+    12 => SetTimer(SetTimerRequest) -> ();
 }
 
 /// One bit per [`CallId`] value.
@@ -764,6 +775,13 @@ pub struct Registers {
 pub enum UpcallKind {
     Exception = 0,
     Syscall = 1,
+    Interrupt = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct SetTimerRequest {
+    pub deadline: u64,
 }
 
 /// See [Upcalls](crate#upcalls). An upcall while `rsp` is on the upcall stack
@@ -992,7 +1010,7 @@ mod tests {
         let mut bytes = [0u8; size_of::<UpcallFrame>()];
         bytes.copy_from_slice(frame.as_bytes());
         assert_eq!(UpcallFrame::try_read_from_bytes(&bytes).unwrap(), frame);
-        bytes[0] = 2;
+        bytes[0] = 3;
         assert!(UpcallFrame::try_read_from_bytes(&bytes).is_err());
     }
 

@@ -13,12 +13,13 @@ use litebox_common_vm_abi::program::{ExitStatus, Program};
 use litebox_hal::clock::Clock;
 use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::program::RunError;
-use litebox_shim_vm_kernel::{Process, ProcessConfig};
+use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer};
 
 pub struct Programs {
     platform: &'static VmKernel,
     clock: Clock,
     wall_clock: WallClock,
+    timer: &'static dyn ProcessTimer,
     broker: litebox_broker_vm_kernel::Broker,
     runner: &'static [u8],
 }
@@ -38,6 +39,7 @@ impl Programs {
         platform: &'static VmKernel,
         clock: Clock,
         wall_clock: WallClock,
+        timer: &'static dyn ProcessTimer,
         payload: &Payload,
         broker: litebox_broker_vm_kernel::Broker,
     ) -> Self {
@@ -45,6 +47,7 @@ impl Programs {
             platform,
             clock,
             wall_clock,
+            timer,
             broker,
             runner: payload
                 .file("runner.elf")
@@ -68,6 +71,7 @@ impl Service for Programs {
                 identity: [0; litebox_common_vm_abi::IDENTITY_LEN],
                 clock_khz: self.clock.khz(),
                 wall_clock: self.wall_clock,
+                timer: self.timer,
             },
         )
         .unwrap_or_else(|error| panic!("failed to spawn a program runner: {error}"));

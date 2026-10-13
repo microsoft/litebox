@@ -8,7 +8,7 @@
 use litebox_common_vm_abi::{
     CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel, LogRequest,
     MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest, ReadyRequest,
-    RestrictRequest, Status, UnmapRequest, UserRange,
+    RestrictRequest, SetTimerRequest, Status, UnmapRequest, UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
 
@@ -141,6 +141,20 @@ pub fn protect(addr: usize, len: usize, prot: Prot) -> Result<(), Status> {
 /// See [`call`].
 pub fn restrict(calls: CallSet, prots: ProtSet) -> Result<(), Status> {
     call(&RestrictRequest::new(calls, prots))
+}
+
+/// Sets the process's one-shot timer: at `deadline`, the kernel
+/// delivers [`litebox_common_vm_abi::UpcallKind::Interrupt`] if the process
+/// still runs then; `None` cancels.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn set_timer(deadline: Option<crate::Instant>) -> Result<(), Status> {
+    call(&SetTimerRequest {
+        // Zero means none, so the (theoretical) instant zero fires at 1 ns.
+        deadline: deadline.map_or(0, |deadline| deadline.as_nanos().max(1)),
+    })
 }
 
 /// # Errors

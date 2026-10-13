@@ -12,6 +12,7 @@ litebox_broker_vm_kernel = { path = "../litebox_broker_vm_kernel", version = "0.
 litebox_common_linux = { path = "../litebox_common_linux/", version = "0.1.0" }
 litebox_common_optee = { path = "../litebox_common_optee/", version = "0.1.0", optional = true }
 litebox_common_vm_abi = { path = "../litebox_common_vm_abi", version = "0.1.0" }
+litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_platform_vm_kernel = { path = "../litebox_platform_vm_kernel", version = "0.1.0" }
 litebox_util_log = { version = "0.1.0", path = "../litebox_util_log" }
 log = { version = "0.4", default-features = false }

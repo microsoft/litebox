@@ -27,6 +27,9 @@ pub mod kcall;
 #[cfg(target_os = "none")]
 pub mod start;
 pub mod thread;
+mod timer;
+
+pub use timer::Timer;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use litebox::platform::page_mgmt::{
@@ -156,8 +159,9 @@ impl RawMutexProvider for VmUserland {
 
 impl WaitWakerProvider for VmUserland {}
 
-/// One thread: nothing else can change a waiter's word. So a wait with a
-/// timeout sleeps it out on the kernel's deadline wait, and one without
+/// One thread: nothing else can change a waiter's word. So a wait sleeps on
+/// the kernel's deadline wait until its timeout or, if earlier, a platform
+/// timer's deadline (whose signal then interrupts it); one with neither
 /// panics, as nothing could end it.
 pub struct RawMutex {
     inner: AtomicU32,
@@ -176,13 +180,22 @@ impl RawMutexTrait for RawMutex {
         0
     }
 
+    /// A wait without a timeout: if a platform timer (`alarm`/`setitimer`)
+    /// is armed, sleeps until its deadline (one may then be pending once
+    /// resumed); otherwise panics, as nothing else could end the wait. So a
+    /// wait the timer's signal does not end (e.g., `pause` with `SIGALRM`
+    /// ignored) panics after it expires, where Linux would block forever.
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
         if self.inner.load(Ordering::Relaxed) != val {
             return Err(ImmediatelyWokenUp);
         }
-        panic!(
-            "blocking without a timeout in the single-threaded VM userland runner would deadlock"
-        )
+        let Some(deadline) = timer::next_deadline() else {
+            panic!(
+                "a wait that nothing could end in the single-threaded VM userland runner would deadlock"
+            );
+        };
+        TIMED_WAIT.sleep_until(deadline);
+        Ok(())
     }
 
     fn block_or_timeout(
@@ -197,6 +210,11 @@ impl RawMutexTrait for RawMutex {
             // Too far off to represent: as a wait without a timeout.
             return self.block(val).map(|()| UnblockedOrTimedOut::Unblocked);
         };
+        // A platform timer due first ends the wait early, to raise its signal.
+        if let Some(timer) = timer::next_deadline().filter(|&timer| timer < deadline) {
+            TIMED_WAIT.sleep_until(timer);
+            return Ok(UnblockedOrTimedOut::Unblocked);
+        }
         TIMED_WAIT.sleep_until(deadline);
         Ok(UnblockedOrTimedOut::TimedOut)
     }
@@ -270,7 +288,7 @@ fn read_counter() -> u64 {
 }
 
 /// The kernel clock, once [`VmUserland::new`] has run.
-fn now() -> Instant {
+pub(crate) fn now() -> Instant {
     let khz = u128::from(TIMED_WAIT.clock_khz.load(Ordering::Relaxed));
     debug_assert!(khz != 0, "the clock is read before `VmUserland::new`");
     Instant(u64::try_from(u128::from(read_counter()) * 1_000_000 / khz).unwrap_or(u64::MAX))
@@ -568,17 +586,6 @@ impl litebox::platform::GuestVectorStateProvider for VmUserland {
     }
 
     fn set_guest_vector_state(&self, _state: &Self::GuestVectorState) {}
-}
-
-/// No timers: the kernel delivers no asynchronous events to runners.
-impl litebox::platform::TimerProvider for VmUserland {
-    type TimerHandle = litebox::platform::trivial_providers::UnsupportedTimerHandle;
-    type Signal = litebox_common_linux::signal::Signal;
-}
-
-/// No asynchronous signals, as there are no timers.
-impl litebox::platform::SignalProvider for VmUserland {
-    type Signal = litebox_common_linux::signal::Signal;
 }
 
 /// Requires a shim KDF, which runs on a kernel-derived key bound to the

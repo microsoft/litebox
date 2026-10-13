@@ -1,0 +1,6 @@
+[
+  { "argv": ["/alarm"], "expect_stdout": "pause: 1\nbusy loop: 1\nalarm: 1\n" },
+  { "argv": ["/alarm", "default"], "expect_signal": 14 },
+  { "argv": ["/alarm", "sleep"], "expect_stdout": "sleep: 1\n" },
+  { "argv": ["/alarm", "stress"], "expect_stdout": "stress missed: 0\n" }
+]

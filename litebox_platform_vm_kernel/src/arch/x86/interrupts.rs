@@ -30,7 +30,17 @@ unsafe extern "C" {
     fn isr_ignore();
     /// One stub per vector from 32, each entering `isr_external`.
     fn isr_external_stubs();
+    /// See [`TIMER_VECTOR`].
+    fn isr_timer();
 }
+
+/// The vector reserved for the runner's one-shot timer. Like other external
+/// interrupts, it runs the registered [`InterruptHandler`] (e.g., to end the
+/// interrupt). Unlike them, a fire while a process runs in ring 3 also
+/// reaches the shim's `interrupt` (see `litebox_shim_vm_kernel`'s
+/// `SetTimer`): its deadlines need no kernel call of the process to be seen.
+/// In ring 0 (e.g., waking a halt), it is just the timer.
+pub const TIMER_VECTOR: u8 = 0x30;
 
 /// Stride of the per-vector stubs in `isr_external_stubs`.
 const UNEXPECTED_STUB_SIZE: usize = 8;
@@ -80,6 +90,8 @@ fn build_idt(ignored_vectors: &[u8]) -> InterruptDescriptorTable {
                 + usize::from(vector - 32) * UNEXPECTED_STUB_SIZE;
             idt[vector].set_handler_addr(VirtAddr::new(stub as u64));
         }
+        // Overrides the generic entry above: ring 3 also reaches the shim.
+        idt[TIMER_VECTOR].set_handler_addr(VirtAddr::from_ptr(isr_timer as *const ()));
         idt.non_maskable_interrupt
             .set_handler_addr(VirtAddr::from_ptr(isr_ignore as *const ()))
             .set_stack_index(NMI_IST_INDEX);

@@ -18,7 +18,7 @@ use litebox_platform_vm_kernel::VmKernel;
 use litebox_shim_vm_kernel::optee::Completion;
 use litebox_shim_vm_kernel::optee::Invocation;
 use litebox_shim_vm_kernel::optee::ta_manager::{InstancePolicy, TaManager};
-use litebox_shim_vm_kernel::{Process, ProcessConfig};
+use litebox_shim_vm_kernel::{Process, ProcessConfig, ProcessTimer};
 use zerocopy::IntoBytes as _;
 
 pub struct Request {
@@ -41,6 +41,7 @@ impl Optee {
         platform: &'static VmKernel,
         clock: Clock,
         wall_clock: WallClock,
+        timer: &'static dyn ProcessTimer,
         payload: &Payload,
         broker: litebox_broker_vm_kernel::Broker,
     ) -> Self {
@@ -92,6 +93,7 @@ impl Optee {
                     identity,
                     clock_khz: clock.khz(),
                     wall_clock,
+                    timer,
                 },
             )
             .map_err(|error| {

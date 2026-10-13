@@ -54,6 +54,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             kernel.platform,
             kernel.clock,
             wall_clock,
+            devices,
             &payload,
             broker(stdio),
         );
@@ -63,6 +64,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             kernel.platform,
             kernel.clock,
             wall_clock,
+            devices,
             &payload,
             broker(devices),
         );
