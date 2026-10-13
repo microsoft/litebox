@@ -278,7 +278,9 @@ fn run_fake_runner(args: &[OsString]) {
             let start = Arc::clone(&start);
             std::thread::spawn(move || {
                 start.wait();
-                local.create_event_with_count(initial_count).unwrap()
+                local
+                    .create_event_with_count(initial_count, FileOpenFlags::NONE)
+                    .unwrap()
             })
         })
         .collect::<Vec<_>>();
@@ -291,7 +293,9 @@ fn run_fake_runner(args: &[OsString]) {
     concurrent_handles.dedup();
     assert_eq!(concurrent_handles.len(), 16);
 
-    let handle = local.create_event_with_count(0).unwrap();
+    let handle = local
+        .create_event_with_count(0, FileOpenFlags::NONE)
+        .unwrap();
     assert_eq!(
         local.check_readiness(handle).unwrap(),
         ReadinessFlags::WRITE

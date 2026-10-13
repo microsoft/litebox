@@ -12,11 +12,12 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::timer::TimerSpec;
 
-use crate::object::{ObjectEntry, ObjectRights};
-use crate::readiness::{ReadinessRegistration, ReadinessSink};
+use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
 
 /// Trusted provider of the broker's monotonic clock and timer alarms.
@@ -24,14 +25,14 @@ pub trait TimerProvider: Send + Sync {
     /// Returns the current time on a monotonic clock with a fixed origin.
     fn now(&self) -> Duration;
 
-    /// Creates a disarmed alarm for one timer.
+    /// Creates a disarmed alarm for one timer, whose references watch it
+    /// through `watchers`.
     ///
     /// Whenever an armed alarm's deadline passes on [`Self::now`]'s clock, the
-    /// provider must disarm it and call
-    /// `readiness.republish(ReadinessFlags::READ)`. The provider must not hold
-    /// locks that [`Alarm::set`] or dropping an alarm acquires while it
-    /// republishes, and it may ignore publication errors.
-    fn create_alarm(&self, readiness: ReadinessRegistration) -> Result<Box<dyn Alarm>>;
+    /// provider must disarm it and call `watchers.publish(ReadinessFlags::READ)`.
+    /// The provider must not hold locks that [`Alarm::set`] or dropping an
+    /// alarm acquires while it publishes.
+    fn create_alarm(&self, watchers: SharedReadinessWatchers) -> Result<Box<dyn Alarm>>;
 }
 
 /// Provider-owned alarm of one timer, cancelled when dropped.
@@ -49,38 +50,43 @@ impl TimerProvider for UnsupportedTimerProvider {
         Duration::ZERO
     }
 
-    fn create_alarm(&self, _readiness: ReadinessRegistration) -> Result<Box<dyn Alarm>> {
+    fn create_alarm(&self, _watchers: SharedReadinessWatchers) -> Result<Box<dyn Alarm>> {
         Err(BrokerError::UnsupportedOperation)
     }
 }
 
 /// Creates a disarmed broker-owned timer.
+///
+/// The timer starts with the status flags `flags`, which must be within
+/// [`FileOpenFlags::STATUS`], and its reference publishes readiness through
+/// `readiness_sink`.
 pub fn create(
     process: &BrokerProcess,
-    readiness_sink: Arc<dyn ReadinessSink>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+    flags: FileOpenFlags,
 ) -> Result<ObjectHandle> {
+    let status = StatusFlags::new(flags)?;
     let rights = process
         .core
         .policy
         .principal_object_rights(process.caller_credential)?;
     let reference = process.reserve_object_reference(rights)?;
-    let readiness = ReadinessRegistration::new(reference.handle(), readiness_sink);
+    let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
+    let watchers = SharedReadinessWatchers::default();
+    watchers.watch(&registration)?;
     let clock = Arc::clone(&process.core.timer_provider);
-    let alarm = match clock.create_alarm(readiness.clone()) {
-        Ok(alarm) => alarm,
-        Err(error) => {
-            // The provider may have retained its registration before failing.
-            readiness.retire();
-            return Err(error);
-        }
-    };
-    reference.commit(ObjectEntry::Timer(TimerObject {
-        clock,
-        alarm,
-        readiness,
-        deadline: None,
-        interval: Duration::ZERO,
-    }))
+    let alarm = clock.create_alarm(watchers.clone())?;
+    reference.commit_with_readiness(
+        ObjectEntry::Timer(TimerObject {
+            clock,
+            alarm,
+            watchers,
+            status,
+            deadline: None,
+            interval: Duration::ZERO,
+        }),
+        Some(registration),
+    )
 }
 
 /// Arms or disarms a timer, returning its previous schedule.
@@ -103,7 +109,8 @@ pub fn get(process: &BrokerProcess, handle: ObjectHandle) -> Result<TimerSpec> {
 
 /// Consumes a timer's pending expirations, returning how many passed.
 ///
-/// Returns `WouldBlock` if none has passed.
+/// Returns `WouldBlock` if none has passed, or `NonBlockingWouldBlock` if the
+/// timer is also non-blocking.
 pub fn read(process: &BrokerProcess, handle: ObjectHandle) -> Result<u64> {
     let object = process.authorized_object(handle, ObjectRights::WAIT)?;
     let mut object = object.write();
@@ -126,10 +133,13 @@ impl ObjectEntry {
     }
 }
 
+/// A timer, whose references share its schedule and status flags.
 pub(crate) struct TimerObject {
     clock: Arc<dyn TimerProvider>,
     alarm: Box<dyn Alarm>,
-    readiness: ReadinessRegistration,
+    /// Registrations of the timer's references, which its alarm wakes.
+    watchers: SharedReadinessWatchers,
+    status: StatusFlags,
     /// Next unconsumed expiration, or `None` while disarmed.
     deadline: Option<Duration>,
     /// Period of subsequent expirations, or zero for a one-shot timer.
@@ -159,11 +169,27 @@ impl TimerObject {
         let now = self.clock.now();
         let expirations = self.expirations(now);
         if expirations == 0 {
-            return Err(BrokerError::WouldBlock);
+            return Err(BrokerError::would_block(self.status.nonblocking()));
         }
         self.deadline = self.next_deadline(now);
         self.alarm.set(self.deadline);
         Ok(expirations)
+    }
+
+    /// Publishes this timer's later expirations through `registration`
+    /// until every clone of `registration` drops.
+    pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.watchers.watch(registration)
+    }
+
+    /// Returns the timer's access mode and status flags.
+    pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
+        self.status.get(FileAccessMode::ReadWrite)
+    }
+
+    /// Changes the status flags in `mask` to their values in `flags`.
+    pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
+        self.status.set(mask, flags);
     }
 
     fn current(&self, now: Duration) -> TimerSpec {
@@ -209,13 +235,6 @@ impl TimerObject {
     }
 }
 
-impl Drop for TimerObject {
-    fn drop(&mut self) {
-        // The provider may still hold a registration clone mid-publication.
-        self.readiness.retire();
-    }
-}
-
 fn saturating_nanos(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -225,9 +244,12 @@ mod tests {
     use alloc::sync::Arc;
     use core::time::Duration;
 
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::fs::{FileOpenFlags, SetStatusFlagsRequest};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::timer::TimerSpec;
 
+    use crate::readiness::ReadinessSink;
     use crate::readiness::tests::TestReadinessSink;
     use crate::test_support::{ManualTimerProvider, TestBrokerCoreBuilder};
     use crate::{BrokerError, BrokerProcess, CallerCredential, ObjectRights, PolicyEngine};
@@ -251,12 +273,20 @@ mod tests {
         TestBrokerCoreBuilder::new(PolicyEngine::with_unauthenticated_rights(rights))
     }
 
+    fn create(
+        process: &BrokerProcess,
+        sink: &Arc<TestReadinessSink>,
+        flags: FileOpenFlags,
+    ) -> crate::Result<ObjectHandle> {
+        super::create(process, &(sink.clone() as Arc<dyn ReadinessSink>), flags)
+    }
+
     #[test]
     fn timer_expirations_are_derived_from_the_clock() {
         let clock = Arc::new(ManualTimerProvider::default());
         let process = process(builder(ObjectRights::all()).with_timer_provider(clock.clone()));
         let sink = Arc::new(TestReadinessSink::default());
-        let handle = super::create(&process, sink.clone()).unwrap();
+        let handle = create(&process, &sink, FileOpenFlags::NONE).unwrap();
         let republished = || sink.republished.lock().unwrap().clone();
 
         assert_eq!(super::get(&process, handle), Ok(spec(0, 0)));
@@ -312,7 +342,12 @@ mod tests {
     fn timer_values_saturate_instead_of_overflowing() {
         let clock = Arc::new(ManualTimerProvider::default());
         let process = process(builder(ObjectRights::all()).with_timer_provider(clock.clone()));
-        let handle = super::create(&process, Arc::new(TestReadinessSink::default())).unwrap();
+        let handle = create(
+            &process,
+            &Arc::new(TestReadinessSink::default()),
+            FileOpenFlags::NONE,
+        )
+        .unwrap();
 
         super::set(&process, handle, spec(u64::MAX, u64::MAX)).unwrap();
         assert_eq!(super::get(&process, handle), Ok(spec(u64::MAX, u64::MAX)));
@@ -328,9 +363,97 @@ mod tests {
         let process = process(builder(ObjectRights::all()));
         let sink = Arc::new(TestReadinessSink::default());
         assert_eq!(
-            super::create(&process, sink.clone()),
+            create(&process, &sink, FileOpenFlags::NONE),
             Err(BrokerError::UnsupportedOperation)
         );
         assert_eq!(sink.retired.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn timer_status_flags_select_non_blocking_reads() {
+        let clock = Arc::new(ManualTimerProvider::default());
+        let process = process(builder(ObjectRights::all()).with_timer_provider(clock.clone()));
+        let sink = Arc::new(TestReadinessSink::default());
+        assert_eq!(
+            create(&process, &sink, FileOpenFlags::PATH),
+            Err(BrokerError::UnsupportedOperation)
+        );
+        let handle = create(&process, &sink, FileOpenFlags::NONBLOCKING).unwrap();
+        assert_eq!(
+            process.get_status_flags(handle).map(|status| status.flags),
+            Ok(FileOpenFlags::NONBLOCKING)
+        );
+        assert_eq!(
+            super::read(&process, handle),
+            Err(BrokerError::NonBlockingWouldBlock)
+        );
+
+        process
+            .set_status_flags(SetStatusFlagsRequest {
+                handle,
+                mask: FileOpenFlags::STATUS,
+                flags: FileOpenFlags::APPEND,
+            })
+            .unwrap();
+        assert_eq!(
+            process.get_status_flags(handle).map(|status| status.flags),
+            Ok(FileOpenFlags::APPEND)
+        );
+        assert_eq!(super::read(&process, handle), Err(BrokerError::WouldBlock));
+    }
+
+    #[test]
+    fn timer_expirations_wake_every_process_holding_the_timer() {
+        let clock = Arc::new(ManualTimerProvider::default());
+        let broker = builder(ObjectRights::all())
+            .with_timer_provider(clock.clone())
+            .build()
+            .unwrap();
+        let source = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let target = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let source_sink = Arc::new(TestReadinessSink::default());
+        let target_sink = Arc::new(TestReadinessSink::default());
+        let handle = create(&source, &source_sink, FileOpenFlags::NONE).unwrap();
+        let duplicated = source
+            .duplicate_object_reference_to(handle, &target, ObjectRights::all())
+            .unwrap();
+        target
+            .register_readiness(&(target_sink.clone() as Arc<dyn ReadinessSink>))
+            .unwrap();
+
+        // Either reference arms the shared schedule, and its alarm wakes both.
+        super::set(&target, duplicated, spec(10, 0)).unwrap();
+        assert_eq!(super::get(&source, handle), Ok(spec(10, 0)));
+        clock.advance(Duration::from_nanos(10));
+        assert_eq!(
+            *source_sink.republished.lock().unwrap(),
+            [(handle, ReadinessFlags::READ)]
+        );
+        assert_eq!(
+            *target_sink.republished.lock().unwrap(),
+            [(duplicated, ReadinessFlags::READ)]
+        );
+        assert_eq!(super::read(&source, handle), Ok(1));
+        assert_eq!(
+            super::read(&target, duplicated),
+            Err(BrokerError::WouldBlock)
+        );
+
+        // The alarm outlives the creating reference while another remains.
+        source.close_object_reference(handle).unwrap();
+        assert_eq!(*source_sink.retired.lock().unwrap(), [handle]);
+        assert_eq!(clock.alarm_count(), 1);
+        super::set(&target, duplicated, spec(5, 0)).unwrap();
+        clock.advance(Duration::from_nanos(5));
+        assert_eq!(source_sink.republished.lock().unwrap().len(), 1);
+        assert_eq!(target_sink.republished.lock().unwrap().len(), 2);
+
+        target.close_object_reference(duplicated).unwrap();
+        assert_eq!(*target_sink.retired.lock().unwrap(), [duplicated]);
+        assert_eq!(clock.alarm_count(), 0);
     }
 }

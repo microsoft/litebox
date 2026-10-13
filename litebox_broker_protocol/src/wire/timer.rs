@@ -3,8 +3,8 @@
 
 use crate::message::{TimerRequest, TimerResponse};
 use crate::timer::{
-    CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest, ReadTimerResponse,
-    SetTimerRequest, SetTimerResponse, TimerSpec,
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
 };
 
 use super::WireError;
@@ -22,7 +22,10 @@ const TIMER_RESPONSE_TAG_READ: u8 = 3;
 
 pub(super) fn encode_timer_request(encoder: &mut Encoder, request: TimerRequest) {
     match request {
-        TimerRequest::Create => encoder.u8(TIMER_REQUEST_TAG_CREATE),
+        TimerRequest::Create(request) => {
+            encoder.u8(TIMER_REQUEST_TAG_CREATE);
+            encoder.u16(request.flags.bits());
+        }
         TimerRequest::Set(request) => {
             encoder.u8(TIMER_REQUEST_TAG_SET);
             encoder.handle(request.handle);
@@ -41,7 +44,9 @@ pub(super) fn encode_timer_request(encoder: &mut Encoder, request: TimerRequest)
 
 pub(super) fn decode_timer_request(decoder: &mut Decoder<'_>) -> Result<TimerRequest, WireError> {
     let request = match decoder.u8()? {
-        TIMER_REQUEST_TAG_CREATE => TimerRequest::Create,
+        TIMER_REQUEST_TAG_CREATE => TimerRequest::Create(CreateTimerRequest {
+            flags: super::fs::decode_open_flags(decoder)?,
+        }),
         TIMER_REQUEST_TAG_SET => TimerRequest::Set(SetTimerRequest {
             handle: decoder.handle()?,
             spec: decode_timer_spec(decoder)?,

@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
+use crate::fs::FileOpenFlags;
 use crate::readiness::ReadinessFlags;
 
 /// How a broker event consume operation should remove readiness credits.
@@ -18,6 +19,8 @@ pub enum EventConsumeMode {
 pub struct CreateEventRequest {
     /// Initial readiness credits.
     pub initial_count: u64,
+    /// Initial status flags, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// Response to an event create request.

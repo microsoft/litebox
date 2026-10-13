@@ -3,7 +3,8 @@
 
 use litebox_broker_protocol::fs::{FileMode as Mode, FileSeekWhence as SeekWhence};
 use litebox_common_linux::{
-    AtFlags, EfdFlags, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags, errno::Errno,
+    AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, IoctlArg, OFlags,
+    errno::Errno,
 };
 use zerocopy::FromBytes as _;
 
@@ -206,6 +207,23 @@ fn test_fcntl() {
             (OFlags::RDONLY | flags).bits()
         );
     }
+
+    // The broker keeps the status flags of eventfds.
+    let eventfd = task
+        .sys_eventfd2(0, EfdFlags::CLOEXEC | EfdFlags::NONBLOCK)
+        .unwrap();
+    let eventfd = i32::try_from(eventfd).unwrap();
+    check(eventfd, OFlags::RDWR | OFlags::NONBLOCK, OFlags::RDWR);
+    // Once `FIONBIO` sets `O_NONBLOCK` again, reading the empty counter fails rather than waiting.
+    let enable = 1i32;
+    let arg = IoctlArg::FIONBIO(UserPtr::from_usize(&raw const enable as usize));
+    assert_eq!(task.sys_ioctl(eventfd, arg), Ok(0));
+    assert_eq!(
+        task.sys_fcntl(eventfd, FcntlArg::GETFL).unwrap(),
+        (OFlags::RDWR | OFlags::NONBLOCK).bits()
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(task.sys_read(eventfd, &mut buf, None), Err(Errno::EAGAIN));
 
     // Test fcntl with DUPFD
     let fd = task
@@ -896,22 +914,25 @@ fn exec_inherits_only_transferable_descriptors() {
         })
     };
 
-    // Broker files and pipes transfer. Close-on-exec descriptors stay behind whatever their kind,
-    // but others must be broker objects.
+    // Broker files, pipes, and eventfds transfer. Close-on-exec descriptors stay behind whatever
+    // their kind, but others must be broker objects.
     let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 3, 4]));
     task.sys_close(read_fd.try_into().unwrap()).unwrap();
     task.sys_close(write_fd.try_into().unwrap()).unwrap();
-    let eventfd = task
-        .sys_eventfd2(0, EfdFlags::CLOEXEC)
+    let eventfd = task.sys_eventfd2(0, EfdFlags::empty()).unwrap();
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, eventfd]));
+    task.sys_close(eventfd.try_into().unwrap()).unwrap();
+    let epoll = task
+        .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
         .unwrap()
         .try_into()
         .unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
-    task.sys_fcntl(eventfd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+    task.sys_fcntl(epoll, FcntlArg::SETFD(FileDescriptorFlags::empty()))
         .unwrap();
     assert_eq!(inherited(), Err(Errno::EAGAIN));
-    task.sys_close(eventfd).unwrap();
+    task.sys_close(epoll).unwrap();
 
     // A fresh runner installs descriptors at most a bounded distance apart.
     assert_eq!(task.sys_dup(1, Some(258), None), Ok(258));

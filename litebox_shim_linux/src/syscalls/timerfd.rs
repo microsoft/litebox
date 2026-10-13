@@ -3,7 +3,7 @@
 
 //! Timer files (`timerfd_create(2)`) backed by broker timers.
 
-use core::sync::atomic::AtomicU32;
+use alloc::sync::Arc;
 use core::time::Duration;
 
 use litebox::{
@@ -13,17 +13,19 @@ use litebox::{
         timer::{Timer, TimerSpec},
         wait::WaitContext,
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
+    process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
+use litebox_broker_protocol::{ObjectHandle, fs::FileOpenFlags};
 use litebox_common_linux::{
     CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_REALTIME, FileDescriptorFlags, Itimerspec, OFlags,
-    TfdFlags, TfdTimerFlags, errno::Errno,
+    TfdFlags, TfdTimerFlags, errno::Errno, program_startup::TimerfdClock,
 };
 use litebox_platform::time::{Instant as _, TimeProvider};
 
-use super::file::AnyTypedFd;
-use crate::{ShimPlatform, Task, UserPtr, UserPtrMut};
+use super::file::{AnyTypedFd, linux_status_flags, status_flags_change};
+use crate::{GlobalState, ShimPlatform, Task, UserPtr, UserPtrMut};
 
 pub(crate) struct TimerfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
 impl<Platform: ShimPlatform> FdEnabledSubsystem for TimerfdSubsystem<Platform> {
@@ -31,34 +33,39 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for TimerfdSubsystem<Platform> {
 }
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for TimerFile<Platform> {}
 
-/// Clock against which absolute expiration times are measured.
-///
-/// The clock is only a shim concern: absolute times are converted to relative
-/// ones when the timer is armed, and the broker timer counts them on its own
-/// monotonic clock. Unlike Linux, an armed `CLOCK_REALTIME` timer therefore
-/// does not follow later wall-clock changes.
-#[derive(Clone, Copy)]
-enum TimerClock {
-    RealTime,
-    Monotonic,
-}
-
+/// A timerfd, whose schedule, expirations, and status flags the broker owns,
+/// so processes that share it through `fork` see one timer.
 pub(crate) struct TimerFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    timer: Timer<Platform>,
-    /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
-    status: AtomicU32,
-    clock: TimerClock,
+    timer: Arc<Timer<Platform>>,
+    clock: TimerfdClock,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> TimerFile<Platform> {
     /// Returns the number of expirations since the last read.
     pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
-        self.timer
-            .read(cx, self.get_status().contains(OFlags::NONBLOCK))
-            .map_err(Errno::from)
+        self.timer.read(cx).map_err(Errno::from)
     }
 
-    super::common_functions_for_file_status!();
+    /// Returns the `F_GETFL` flags of the timerfd.
+    pub(crate) fn get_status(&self) -> Result<OFlags, Errno> {
+        linux_status_flags(self.timer.get_status_flags()?)
+    }
+
+    /// Changes the status flags in `mask` of the timerfd to their values in
+    /// `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
+    pub(crate) fn set_status_flags(&self, mask: OFlags, flags: OFlags) -> Result<(), Errno> {
+        let (mask, flags) = status_flags_change(mask, flags);
+        self.timer.set_status_flags(mask, flags)?;
+        Ok(())
+    }
+
+    pub(crate) fn timer(&self) -> &Arc<Timer<Platform>> {
+        &self.timer
+    }
+
+    pub(crate) fn clock(&self) -> TimerfdClock {
+        self.clock
+    }
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for TimerFile<Platform> {
@@ -78,17 +85,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
         let clock = match clockid {
-            CLOCK_REALTIME => TimerClock::RealTime,
+            CLOCK_REALTIME => TimerfdClock::RealTime,
             // The guest never suspends, so its boot time is its monotonic time.
-            CLOCK_MONOTONIC | CLOCK_BOOTTIME => TimerClock::Monotonic,
+            CLOCK_MONOTONIC | CLOCK_BOOTTIME => TimerfdClock::Monotonic,
             _ => return Err(Errno::EINVAL),
         };
-        let timer = Timer::new(&self.global.litebox).map_err(Errno::from)?;
-        let mut status = OFlags::RDWR;
-        status.set(OFlags::NONBLOCK, flags.contains(TfdFlags::NONBLOCK));
+        let status = if flags.contains(TfdFlags::NONBLOCK) {
+            FileOpenFlags::NONBLOCKING
+        } else {
+            FileOpenFlags::NONE
+        };
+        let timer = Timer::new(&self.global.litebox, status).map_err(Errno::from)?;
         let file = TimerFile {
-            timer,
-            status: AtomicU32::new(status.bits()),
+            timer: Arc::new(timer),
             clock,
         };
 
@@ -171,24 +180,50 @@ impl<Platform: ShimPlatform> Task<Platform> {
         let AnyTypedFd::Timerfd(fd) = self.typed_fd(fd)? else {
             return Err(Errno::EINVAL);
         };
-        let handle = self
-            .global
-            .litebox
-            .descriptor_table()
-            .entry_handle(&fd)
-            .ok_or(Errno::EBADF)?;
-        handle.with_entry(f)
+        self.global.with_timerfd(&fd, f)
     }
 
-    fn timer_clock_now(&self, clock: TimerClock) -> Duration {
+    fn timer_clock_now(&self, clock: TimerfdClock) -> Duration {
         match clock {
-            TimerClock::RealTime => self.real_time_as_duration_since_epoch(),
-            TimerClock::Monotonic => self
+            TimerfdClock::RealTime => self.real_time_as_duration_since_epoch(),
+            TimerfdClock::Monotonic => self
                 .global
                 .platform
                 .now()
                 .duration_since(&self.global.boot_time),
         }
+    }
+}
+
+impl<Platform: ShimPlatform> GlobalState<Platform> {
+    /// Runs `f` on the timerfd at `fd`, without holding the descriptor table.
+    pub(crate) fn with_timerfd<R>(
+        &self,
+        fd: &TypedFd<TimerfdSubsystem<Platform>>,
+        f: impl FnOnce(&TimerFile<Platform>) -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        let handle = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(Errno::EBADF)?;
+        handle.with_entry(f)
+    }
+
+    /// Adopts a timerfd this process inherited from its parent as `handle`.
+    pub(crate) fn adopt_inherited_timerfd(
+        &self,
+        handle: ObjectHandle,
+        clock: TimerfdClock,
+    ) -> Result<TypedFd<TimerfdSubsystem<Platform>>, ProcessError> {
+        let timer = self.litebox.adopt_inherited_timer(handle)?;
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert::<TimerfdSubsystem<Platform>>(TimerFile {
+                timer: Arc::new(timer),
+                clock,
+            }))
     }
 }
 

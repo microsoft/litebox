@@ -64,6 +64,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_parent.c",
     "fork_threads_parent.c",
     "fork_aarch64_state.c",
+    "fork_event_parent.c",
     "fork_unix_parent.c",
     "gate_signals.c",
     "process_group_parent.c",
@@ -1091,6 +1092,28 @@ fn forked_and_exec_children_share_unix_sockets() {
     let child_line = line("child-unix ");
     for field in ["stream=", "sent=", "replied=", "hidden_closed="] {
         assert_eq!(numeric_field(child_line, field), 1, "{field} in {output:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn forked_children_share_eventfds_and_timerfds() {
+    let parent = common::compile(
+        "./tests/fork_event_parent.c",
+        "fork_event_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_event_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = output
+        .lines()
+        .find(|line| line.starts_with("event-fork "))
+        .unwrap_or_else(|| panic!("missing event-fork output in {output:?}"));
+    for field in ["blocked=", "semaphore=", "nonblock=", "timer="] {
+        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
     }
 }
 

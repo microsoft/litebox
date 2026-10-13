@@ -234,6 +234,7 @@ pub(crate) trait BrokerControl: Send + Sync {
     fn create_event_with_count(
         &self,
         initial_count: u64,
+        flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn check_readiness(
@@ -265,7 +266,10 @@ pub(crate) trait BrokerControl: Send + Sync {
         mode: EventConsumeMode,
     ) -> core::result::Result<ConsumeEventResponse, BrokerControlError>;
 
-    fn create_timer(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+    fn create_timer(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError>;
 
     fn set_timer(
         &self,
@@ -977,8 +981,9 @@ where
     fn create_event_with_count(
         &self,
         initial_count: u64,
+        flags: FileOpenFlags,
     ) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(|local| local.create_event_with_count(initial_count))
+        self.request(|local| local.create_event_with_count(initial_count, flags))
     }
 
     fn check_readiness(
@@ -1020,8 +1025,11 @@ where
         self.request(|local| local.consume_event(handle, mode))
     }
 
-    fn create_timer(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
-        self.request(BrokerLocal::create_timer)
+    fn create_timer(
+        &self,
+        flags: FileOpenFlags,
+    ) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(|local| local.create_timer(flags))
     }
 
     fn set_timer(

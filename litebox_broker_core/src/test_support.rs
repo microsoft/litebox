@@ -16,7 +16,7 @@ use crate::{
     BrokerCore, BrokerCoreLimits, PolicyEngine, Result,
     fs::{FileService, UnsupportedFileService},
     random::{RandomProvider, RandomProviderError},
-    readiness::{ReadinessRegistration, ReadinessWatchers},
+    readiness::{ReadinessRegistration, ReadinessWatchers, SharedReadinessWatchers},
     socket::{SocketProvider, UnsupportedSocketProvider},
     stdio::{StdioOutputStream, StdioProvider, StdioProviderError, StdioStream},
     timer::{Alarm, TimerProvider, UnsupportedTimerProvider},
@@ -265,14 +265,14 @@ pub struct ManualTimerProvider {
 struct ManualTimerState {
     now: Duration,
     next_alarm: u64,
-    alarms: BTreeMap<u64, (Option<Duration>, ReadinessRegistration)>,
+    alarms: BTreeMap<u64, (Option<Duration>, SharedReadinessWatchers)>,
 }
 
 impl ManualTimerProvider {
     /// Advances the clock by `duration` and fires every alarm whose deadline
     /// passed.
     pub fn advance(&self, duration: Duration) {
-        let fired: Vec<ReadinessRegistration> = {
+        let fired: Vec<SharedReadinessWatchers> = {
             let mut state = self.state.lock();
             state.now = state.now.saturating_add(duration);
             let now = state.now;
@@ -280,14 +280,14 @@ impl ManualTimerProvider {
                 .alarms
                 .values_mut()
                 .filter(|(deadline, _)| deadline.is_some_and(|deadline| deadline <= now))
-                .map(|(deadline, readiness)| {
+                .map(|(deadline, watchers)| {
                     *deadline = None;
-                    readiness.clone()
+                    watchers.clone()
                 })
                 .collect()
         };
-        for readiness in fired {
-            let _ = readiness.republish(ReadinessFlags::READ);
+        for watchers in fired {
+            watchers.publish(ReadinessFlags::READ);
         }
     }
 
@@ -302,11 +302,11 @@ impl TimerProvider for ManualTimerProvider {
         self.state.lock().now
     }
 
-    fn create_alarm(&self, readiness: ReadinessRegistration) -> Result<Box<dyn Alarm>> {
+    fn create_alarm(&self, watchers: SharedReadinessWatchers) -> Result<Box<dyn Alarm>> {
         let mut state = self.state.lock();
         let id = state.next_alarm;
         state.next_alarm += 1;
-        state.alarms.insert(id, (None, readiness));
+        state.alarms.insert(id, (None, watchers));
         Ok(Box::new(ManualAlarm {
             state: Arc::clone(&self.state),
             id,
@@ -329,8 +329,6 @@ impl Alarm for ManualAlarm {
 
 impl Drop for ManualAlarm {
     fn drop(&mut self) {
-        // Release the registration after unlocking, since dropping it may retire.
-        let alarm = self.state.lock().alarms.remove(&self.id);
-        drop(alarm);
+        self.state.lock().alarms.remove(&self.id);
     }
 }

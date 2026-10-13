@@ -1591,7 +1591,7 @@ fn handle_event_request(
 ) -> RequestResult<EventResponse> {
     match request {
         EventRequest::Create(request) => {
-            litebox_broker_core::event::create(process, request.initial_count)
+            litebox_broker_core::event::create(process, request.initial_count, request.flags)
                 .map(|handle| EventResponse::Create(CreateEventResponse { handle }))
                 .map_err(RequestFailure::from)
         }
@@ -1614,8 +1614,8 @@ fn handle_timer_request(
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> RequestResult<TimerResponse> {
     let response = match request {
-        TimerRequest::Create => {
-            litebox_broker_core::timer::create(process, Arc::clone(readiness_sink))
+        TimerRequest::Create(request) => {
+            litebox_broker_core::timer::create(process, readiness_sink, request.flags)
                 .map(|handle| TimerResponse::Create(CreateTimerResponse { handle }))
         }
         TimerRequest::Set(request) => {
@@ -1723,7 +1723,7 @@ mod tests {
         TcpOptionValue,
     };
     use litebox_broker_protocol::timer::{
-        GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
+        CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
     };
     use litebox_broker_protocol::unix_socket::{
         ConnectUnixSocketRequest, CreateUnixSocketRequest, ReceiveUnixSocketRequest,
@@ -2429,7 +2429,10 @@ mod tests {
             }))]),
             std::vec::Vec::from([
                 Ok(HostReceive::Message(BrokerOperation::Event(
-                    EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+                    EventRequest::Create(CreateEventRequest {
+                        initial_count: 0,
+                        flags: FileOpenFlags::NONE,
+                    }),
                 ))),
                 Ok(HostReceive::PeerClosed),
             ]),
@@ -2567,7 +2570,10 @@ mod tests {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerOperation::Event(
-                EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+                EventRequest::Create(CreateEventRequest {
+                    initial_count: 0,
+                    flags: FileOpenFlags::NONE,
+                }),
             )))]),
         );
         channel.response_send_error = true;
@@ -2585,7 +2591,10 @@ mod tests {
                 protocol_version: BROKER_PROTOCOL_VERSION,
             }))]),
             std::vec::Vec::from([Ok(HostReceive::Message(BrokerOperation::Event(
-                EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+                EventRequest::Create(CreateEventRequest {
+                    initial_count: 0,
+                    flags: FileOpenFlags::NONE,
+                }),
             )))]),
         );
         channel.enqueue_readiness_requests_after_create = true;
@@ -2623,7 +2632,10 @@ mod tests {
                     }),
                 ))),
                 Ok(HostReceive::Message(BrokerOperation::Event(
-                    EventRequest::Create(CreateEventRequest { initial_count: 0 }),
+                    EventRequest::Create(CreateEventRequest {
+                        initial_count: 0,
+                        flags: FileOpenFlags::NONE,
+                    }),
                 ))),
                 Ok(HostReceive::PeerClosed),
             ]),
@@ -2737,6 +2749,7 @@ mod tests {
             &process,
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
+                flags: FileOpenFlags::NONE,
             })),
         );
         let BrokerResult::Event(EventResponse::Create(response)) = response else {
@@ -2765,7 +2778,10 @@ mod tests {
         let process = broker
             .create_process(CallerCredential::Unauthenticated, None)
             .unwrap();
-        let response = handle_test_request(&process, BrokerOperation::Timer(TimerRequest::Create));
+        let response = handle_test_request(
+            &process,
+            BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest::default())),
+        );
         let BrokerResult::Timer(TimerResponse::Create(CreateTimerResponse { handle })) = response
         else {
             panic!("unexpected create response: {response:?}");
@@ -3491,6 +3507,7 @@ mod tests {
             request_id: RequestId(request_id),
             operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
+                flags: FileOpenFlags::NONE,
             })),
         }
     }

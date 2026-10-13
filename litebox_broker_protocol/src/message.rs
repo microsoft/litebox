@@ -37,8 +37,8 @@ use crate::socket::{
     SocketStatusRequest, SocketStatusResponse,
 };
 use crate::timer::{
-    CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest, ReadTimerResponse,
-    SetTimerRequest, SetTimerResponse,
+    CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
+    ReadTimerResponse, SetTimerRequest, SetTimerResponse,
 };
 use crate::unix_socket::{
     AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
@@ -251,7 +251,7 @@ pub enum TimerRequest {
     /// Timers are clock-agnostic: they count relative time on the broker's
     /// monotonic clock, and guests convert their own clocks and absolute
     /// expiration times before arming them.
-    Create,
+    Create(CreateTimerRequest),
     /// Arm or disarm a timer.
     Set(SetTimerRequest),
     /// Read a timer's current schedule.

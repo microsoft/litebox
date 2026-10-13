@@ -4,8 +4,10 @@
 use alloc::sync::Arc;
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::error::ErrorCode;
 use litebox_broker_protocol::event::ConsumeEventResponse;
 pub use litebox_broker_protocol::event::EventConsumeMode as EventCounterReadMode;
+use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_platform::time::TimeProvider;
 use thiserror::Error;
@@ -21,6 +23,8 @@ use crate::{
         Events, IOPollable, observer::Observer, polling::Pollee, polling::TryOpError,
         wait::WaitContext,
     },
+    fs::errors::StatusFlagsError,
+    process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
 
@@ -42,7 +46,8 @@ pub enum EventCounterError {
     Unavailable,
 }
 
-/// A local-core event counter object.
+/// A local-core event counter object, whose count and status flags the broker
+/// owns.
 pub struct EventCounter<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     broker: Arc<dyn BrokerControl>,
     handle: ObjectHandle,
@@ -54,39 +59,59 @@ impl<Platform> EventCounter<Platform>
 where
     Platform: RawSyncPrimitivesProvider + TimeProvider,
 {
-    /// Creates a local-core event counter.
+    /// Creates a local-core event counter with the status flags `flags`,
+    /// within [`FileOpenFlags::STATUS`].
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued event request.
-    pub fn new(litebox: &LiteBox<Platform>, initial_count: u64) -> Result<Self, EventCounterError> {
+    pub fn new(
+        litebox: &LiteBox<Platform>,
+        initial_count: u64,
+        flags: FileOpenFlags,
+    ) -> Result<Self, EventCounterError> {
         let Some(broker) = litebox.broker_control() else {
             return Err(EventCounterError::Unavailable);
         };
         let handle = broker
-            .create_event_with_count(initial_count)
+            .create_event_with_count(initial_count, flags)
             .map_err(BrokerObjectError::from)
             .map_err(EventCounterError::from)?;
+        Ok(Self::from_handle(litebox, broker, handle))
+    }
+
+    fn from_handle(
+        litebox: &LiteBox<Platform>,
+        broker: Arc<dyn BrokerControl>,
+        handle: ObjectHandle,
+    ) -> Self {
         let pollable_registry = litebox.broker_pollable_registry();
         let pollee = Arc::new(Pollee::new());
         pollable_registry.register_pollable(handle, &pollee);
-        Ok(Self {
+        Self {
             broker,
             handle,
             pollable_registry,
             pollee,
-        })
+        }
     }
 
-    /// Reads the event counter.
+    /// The broker handle this counter owns.
+    pub(crate) fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
+    /// Reads the event counter, waiting for a nonzero count unless the counter
+    /// is non-blocking.
     pub fn read(
         &self,
         cx: &WaitContext<'_, Platform>,
-        nonblock: bool,
         mode: EventCounterReadMode,
     ) -> Result<u64, TryOpError<EventCounterError>> {
-        self.pollee.wait(cx, nonblock, Events::IN, || {
+        // On a non-blocking counter, the broker returns `NonBlockingWouldBlock`
+        // instead of `WouldBlock`, so the wait returns instead of blocking.
+        self.pollee.wait(cx, false, Events::IN, || {
             let response = self.consume(mode)?;
             if response.readiness.contains(ReadinessFlags::WRITE) {
                 self.pollee.notify_observers(Events::OUT);
@@ -95,17 +120,17 @@ where
         })
     }
 
-    /// Writes readiness credits to the event counter.
+    /// Writes readiness credits to the event counter, waiting for room unless
+    /// the counter is non-blocking.
     pub fn write(
         &self,
         cx: &WaitContext<'_, Platform>,
-        nonblock: bool,
         value: u64,
     ) -> Result<usize, TryOpError<EventCounterError>> {
         if value == u64::MAX {
             return Err(TryOpError::Other(EventCounterError::InvalidInput));
         }
-        self.pollee.wait(cx, nonblock, Events::OUT, || {
+        self.pollee.wait(cx, false, Events::OUT, || {
             let readiness = self.add(value)?;
             if value != 0 && readiness.contains(ReadinessFlags::READ) {
                 self.pollee.notify_observers(Events::IN);
@@ -114,27 +139,63 @@ where
         })
     }
 
+    /// Returns the counter's access mode and status flags.
+    pub fn get_status_flags(&self) -> Result<FileStatusFlags, StatusFlagsError> {
+        Ok(self.broker.get_status_flags(self.handle)?)
+    }
+
+    /// Changes the status flags in `mask`, within [`FileOpenFlags::STATUS`],
+    /// to their values in `flags`.
+    ///
+    /// Every reference to the counter, including those in other processes,
+    /// sees the change.
+    pub fn set_status_flags(
+        &self,
+        mask: FileOpenFlags,
+        flags: FileOpenFlags,
+    ) -> Result<(), StatusFlagsError> {
+        Ok(self.broker.set_status_flags(self.handle, mask, flags)?)
+    }
+
     fn consume(
         &self,
         mode: EventCounterReadMode,
-    ) -> Result<ConsumeEventResponse, BrokerObjectError> {
+    ) -> Result<ConsumeEventResponse, TryOpError<EventCounterError>> {
         self.broker
             .consume_event(self.handle, mode)
             .map_err(|error| self.broker_request_error(error))
     }
 
-    fn add(&self, value: u64) -> Result<ReadinessFlags, BrokerObjectError> {
+    fn add(&self, value: u64) -> Result<ReadinessFlags, TryOpError<EventCounterError>> {
         self.broker
             .add_event(self.handle, value)
             .map_err(|error| self.broker_request_error(error))
     }
 
-    fn broker_request_error(&self, error: BrokerControlError) -> BrokerObjectError {
-        let error = error.into();
+    fn broker_request_error(&self, error: BrokerControlError) -> TryOpError<EventCounterError> {
+        if error == BrokerControlError::Broker(ErrorCode::NonBlockingWouldBlock) {
+            return TryOpError::Other(EventCounterError::WouldBlock);
+        }
+        let error = BrokerObjectError::from(error);
         if error != BrokerObjectError::WouldBlock {
             self.pollee.notify_observers(Events::ERR);
         }
-        error
+        error.into()
+    }
+}
+
+impl<Platform: RawSyncPrimitivesProvider + TimeProvider> LiteBox<Platform> {
+    /// Returns the event counter this process inherited from its parent as
+    /// `handle` through [`PendingChild::inherit`](crate::process::PendingChild::inherit).
+    ///
+    /// The counter owns `handle`, so callers adopt each handle once and share
+    /// the counter for every other use.
+    pub fn adopt_inherited_event_counter(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<EventCounter<Platform>, ProcessError> {
+        let broker = self.broker_control().ok_or(ProcessError::Unavailable)?;
+        Ok(EventCounter::from_handle(self, broker, handle))
     }
 }
 
@@ -163,7 +224,7 @@ where
             .map_err(|error| self.broker_request_error(error))
         {
             Ok(readiness) => readiness,
-            Err(BrokerObjectError::WouldBlock) => return Events::empty(),
+            Err(TryOpError::TryAgain) => return Events::empty(),
             Err(_) => return Events::ERR,
         };
         readiness_events(readiness)
@@ -212,7 +273,7 @@ mod tests {
             Arc::new(NoopSharedMemory),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
-        let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
+        let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap());
 
         let (result_sender, result_receiver) = std::sync::mpsc::channel();
         {
@@ -221,7 +282,6 @@ mod tests {
                 result_sender
                     .send(counter.read(
                         &WaitState::new(platform).context(),
-                        false,
                         EventCounterReadMode::One,
                     ))
                     .unwrap();
@@ -269,7 +329,7 @@ mod tests {
             Arc::new(NoopSharedMemory),
         );
         let litebox = Arc::new(LiteBox::new_with_broker_local(platform, local));
-        let counter = Arc::new(EventCounter::new(&litebox, 0).unwrap());
+        let counter = Arc::new(EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap());
 
         let (result_sender, result_receiver) = std::sync::mpsc::sync_channel(1);
         let read_counter = Arc::clone(&counter);
@@ -277,7 +337,6 @@ mod tests {
             result_sender
                 .send(read_counter.read(
                     &WaitState::new(platform).context(),
-                    false,
                     EventCounterReadMode::One,
                 ))
                 .unwrap();
@@ -319,8 +378,8 @@ mod tests {
             Arc::new(NoopSharedMemory),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
-        let first = EventCounter::new(&litebox, 0).unwrap();
-        let second = EventCounter::new(&litebox, 0).unwrap();
+        let first = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
+        let second = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
         let first_observer = Arc::new(ErrorObserver(AtomicBool::new(false)));
         let first_observer_dyn: Arc<dyn Observer<Events>> = first_observer.clone();
         first.register_observer(Arc::downgrade(&first_observer_dyn), Events::ERR);
@@ -354,7 +413,7 @@ mod tests {
             Arc::new(NoopSharedMemory),
         );
         let litebox = LiteBox::new_with_broker_local(platform, local);
-        let counter = EventCounter::new(&litebox, 0).unwrap();
+        let counter = EventCounter::new(&litebox, 0, FileOpenFlags::NONE).unwrap();
         let read_observer = Arc::new(ReadObserver(AtomicBool::new(false)));
         let read_observer_dyn: Arc<dyn Observer<Events>> = read_observer.clone();
         counter.register_observer(Arc::downgrade(&read_observer_dyn), Events::IN);

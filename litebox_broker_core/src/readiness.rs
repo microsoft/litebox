@@ -158,6 +158,24 @@ impl ReadinessWatchers {
     }
 }
 
+/// [`ReadinessWatchers`] that an object shares with a provider that publishes
+/// the object's readiness changes outside broker requests, such as a timer
+/// alarm.
+#[derive(Clone, Default)]
+pub struct SharedReadinessWatchers(Arc<Mutex<ReadinessWatchers>>);
+
+impl SharedReadinessWatchers {
+    /// Adds `registration`, as [`ReadinessWatchers::watch`] describes.
+    pub fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.0.lock().watch(registration)
+    }
+
+    /// Wakes every watcher, as [`ReadinessWatchers::publish`] describes.
+    pub fn publish(&self, readiness: ReadinessFlags) {
+        self.0.lock().publish(readiness);
+    }
+}
+
 struct ReadinessRegistrationInner {
     handle: ObjectHandle,
     sink: Arc<dyn ReadinessSink>,

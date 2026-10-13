@@ -5,7 +5,7 @@
 
 use alloc::sync::Arc;
 
-use litebox_broker_protocol::fs::{FileOpenFlags, FileStatusFlags};
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use litebox_broker_protocol::{ObjectHandle, ProcessId};
 use spin::rwlock::RwLock;
@@ -66,8 +66,12 @@ impl ObjectEntry {
     /// other processes must also implement [`Self::watch`].
     pub(crate) fn is_duplicable(&self) -> bool {
         match self {
-            Self::Event(_) | Self::File(_) | Self::UnixSocket(_) | Self::Pipe(_) => true,
-            Self::Socket(_) | Self::Signals(_) | Self::Timer(_) => false,
+            Self::Event(_)
+            | Self::File(_)
+            | Self::UnixSocket(_)
+            | Self::Pipe(_)
+            | Self::Timer(_) => true,
+            Self::Socket(_) | Self::Signals(_) => false,
         }
     }
 
@@ -79,19 +83,72 @@ impl ObjectEntry {
         handle: ObjectHandle,
         readiness_sink: &Arc<dyn ReadinessSink>,
     ) -> Result<Option<ReadinessRegistration>> {
+        let watch = |watch: &dyn Fn(&ReadinessRegistration) -> Result<()>| {
+            let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
+            watch(&registration)?;
+            Ok(Some(registration))
+        };
         match self {
             Self::File(file) => file.watch(handle, readiness_sink),
-            Self::UnixSocket(socket) => {
-                let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
-                socket.watch(&registration)?;
-                Ok(Some(registration))
+            Self::Event(event) => watch(&|registration| event.watch(registration)),
+            Self::UnixSocket(socket) => watch(&|registration| socket.watch(registration)),
+            Self::Pipe(pipe) => watch(&|registration| pipe.watch(registration)),
+            Self::Timer(timer) => watch(&|registration| timer.watch(registration)),
+            Self::Socket(_) | Self::Signals(_) => Ok(None),
+        }
+    }
+}
+
+/// Status flags within [`FileOpenFlags::STATUS`] of an object without a file
+/// position, which every reference to the object shares.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StatusFlags {
+    /// Whether operations that would block fail instead of waiting.
+    nonblocking: bool,
+    /// Whether append mode is set, which is reported but has no effect
+    /// without a file position.
+    append: bool,
+}
+
+impl StatusFlags {
+    /// Creates status flags from `flags`, which must be within
+    /// [`FileOpenFlags::STATUS`].
+    pub(crate) fn new(flags: FileOpenFlags) -> Result<Self> {
+        if !FileOpenFlags::STATUS.contains(flags) {
+            return Err(BrokerError::UnsupportedOperation);
+        }
+        Ok(Self {
+            nonblocking: flags.contains(FileOpenFlags::NONBLOCKING),
+            append: flags.contains(FileOpenFlags::APPEND),
+        })
+    }
+
+    /// Returns whether operations that would block fail instead of waiting.
+    pub(crate) const fn nonblocking(self) -> bool {
+        self.nonblocking
+    }
+
+    /// Returns these status flags with the access mode `access`.
+    pub(crate) fn get(self, access: FileAccessMode) -> FileStatusFlags {
+        let mut flags = FileOpenFlags::NONE;
+        for (set, flag) in [
+            (self.nonblocking, FileOpenFlags::NONBLOCKING),
+            (self.append, FileOpenFlags::APPEND),
+        ] {
+            if set {
+                flags = flags | flag;
             }
-            Self::Pipe(pipe) => {
-                let registration = ReadinessRegistration::new(handle, Arc::clone(readiness_sink));
-                pipe.watch(&registration)?;
-                Ok(Some(registration))
-            }
-            Self::Event(_) | Self::Socket(_) | Self::Signals(_) | Self::Timer(_) => Ok(None),
+        }
+        FileStatusFlags { access, flags }
+    }
+
+    /// Changes the status flags in `mask` to their values in `flags`.
+    pub(crate) fn set(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
+        if mask.contains(FileOpenFlags::NONBLOCKING) {
+            self.nonblocking = flags.contains(FileOpenFlags::NONBLOCKING);
+        }
+        if mask.contains(FileOpenFlags::APPEND) {
+            self.append = flags.contains(FileOpenFlags::APPEND);
         }
     }
 }
@@ -122,12 +179,11 @@ pub(crate) fn get_status_flags(
 ) -> Result<FileStatusFlags> {
     let file = match &*object.read() {
         ObjectEntry::File(file) => file.clone(),
+        ObjectEntry::Event(event) => return Ok(event.get_status_flags()),
         ObjectEntry::UnixSocket(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::Pipe(pipe) => return Ok(pipe.get_status_flags()),
-        ObjectEntry::Event(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Signals(_)
-        | ObjectEntry::Timer(_) => return Err(BrokerError::InvalidRights),
+        ObjectEntry::Timer(timer) => return Ok(timer.get_status_flags()),
+        ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
     };
     crate::fs::get_status_flags(process, &file)
 }
@@ -149,10 +205,15 @@ pub(crate) fn set_status_flags(
             pipe.set_status_flags(mask, flags);
             return Ok(());
         }
-        ObjectEntry::Event(_)
-        | ObjectEntry::Socket(_)
-        | ObjectEntry::Signals(_)
-        | ObjectEntry::Timer(_) => return Err(BrokerError::InvalidRights),
+        ObjectEntry::Event(event) => {
+            event.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::Timer(timer) => {
+            timer.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
     };
     crate::fs::set_status_flags(process, &file, mask, flags)
 }

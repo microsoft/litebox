@@ -377,6 +377,7 @@ mod tests {
     use super::*;
     use core::cell::{Cell, RefCell};
     use core::convert::Infallible;
+    use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::message::ReadinessNotification;
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::{ObjectHandle, ProcessId, ProtocolVersion, ThreadId};
@@ -533,7 +534,7 @@ mod tests {
             let local = test_broker_local(channel, noop_shared_memory());
 
             assert!(matches!(
-                local.create_event_with_count(0),
+                local.create_event_with_count(0, FileOpenFlags::NONE),
                 Err(BrokerLocalError::Broker(actual)) if actual == error
             ));
         }
@@ -545,7 +546,7 @@ mod tests {
         let channel = FakeControlChannel::new(None, Some(BrokerResult::Error(ErrorCode::Internal)));
         let local = test_broker_local(channel, noop_shared_memory());
 
-        let _ = local.create_event_with_count(0);
+        let _ = local.create_event_with_count(0, FileOpenFlags::NONE);
     }
 
     #[test]

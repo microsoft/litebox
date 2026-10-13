@@ -6,6 +6,7 @@ use litebox_broker_protocol::event::{
     AddEventRequest, ConsumeEventRequest, ConsumeEventResponse, CreateEventRequest,
     EventConsumeMode,
 };
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, EventRequest, EventResponse,
 };
@@ -15,7 +16,8 @@ use litebox_broker_transport::channel::LocalCallChannel;
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Creates a broker-owned event object with initial readiness credits.
+    /// Creates a broker-owned event object with initial readiness credits and
+    /// the status flags `flags`, which must be within [`FileOpenFlags::STATUS`].
     ///
     /// # Panics
     ///
@@ -24,9 +26,12 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
     pub fn create_event_with_count(
         &self,
         initial_count: u64,
+        flags: FileOpenFlags,
     ) -> Result<ObjectHandle, Channel::Error> {
-        let response =
-            self.request_event(EventRequest::Create(CreateEventRequest { initial_count }))?;
+        let response = self.request_event(EventRequest::Create(CreateEventRequest {
+            initial_count,
+            flags,
+        }))?;
         match response {
             EventResponse::Create(response) => Ok(response.handle),
             response => panic!("broker returned unexpected event response: {response:?}"),

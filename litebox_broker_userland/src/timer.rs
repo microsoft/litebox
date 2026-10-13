@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use litebox_broker_core::Result;
-use litebox_broker_core::readiness::ReadinessRegistration;
+use litebox_broker_core::readiness::SharedReadinessWatchers;
 use litebox_broker_core::timer::{Alarm, TimerProvider};
 use litebox_broker_protocol::readiness::ReadinessFlags;
 
@@ -39,7 +39,7 @@ struct SchedulerState {
 
 struct AlarmState {
     deadline: Option<Duration>,
-    readiness: ReadinessRegistration,
+    watchers: SharedReadinessWatchers,
 }
 
 impl UserlandTimerProvider {
@@ -69,7 +69,7 @@ impl TimerProvider for UserlandTimerProvider {
         self.scheduler.now()
     }
 
-    fn create_alarm(&self, readiness: ReadinessRegistration) -> Result<Box<dyn Alarm>> {
+    fn create_alarm(&self, watchers: SharedReadinessWatchers) -> Result<Box<dyn Alarm>> {
         let mut state = self.scheduler.lock();
         let id = state.next_id;
         state.next_id += 1;
@@ -77,7 +77,7 @@ impl TimerProvider for UserlandTimerProvider {
             id,
             AlarmState {
                 deadline: None,
-                readiness,
+                watchers,
             },
         );
         Ok(Box::new(UserlandAlarm {
@@ -108,14 +108,14 @@ impl AlarmScheduler {
                 state.queue.pop_first();
                 let alarm = state.alarms.get_mut(&id).expect("queued alarms are live");
                 alarm.deadline = None;
-                fired.push(alarm.readiness.clone());
+                fired.push(alarm.watchers.clone());
             }
             if !fired.is_empty() {
                 // Timer operations take this lock while holding the object lock
                 // that readiness checks need.
                 drop(state);
-                for readiness in fired {
-                    let _ = readiness.republish(ReadinessFlags::READ);
+                for watchers in fired {
+                    watchers.publish(ReadinessFlags::READ);
                 }
                 state = self.lock();
                 continue;
@@ -160,16 +160,11 @@ impl Alarm for UserlandAlarm {
 
 impl Drop for UserlandAlarm {
     fn drop(&mut self) {
-        let alarm = {
-            let mut state = self.scheduler.lock();
-            let alarm = state.alarms.remove(&self.id).expect("alarm is live");
-            if let Some(deadline) = alarm.deadline {
-                state.queue.remove(&(deadline, self.id));
-            }
-            alarm
-        };
-        // Dropping the registration may retire it, so do so without the lock.
-        drop(alarm);
+        let mut state = self.scheduler.lock();
+        let alarm = state.alarms.remove(&self.id).expect("alarm is live");
+        if let Some(deadline) = alarm.deadline {
+            state.queue.remove(&(deadline, self.id));
+        }
     }
 }
 
@@ -185,6 +180,7 @@ mod tests {
         BrokerError, CallerCredential, ObjectRights, PolicyEngine, Result, timer,
     };
     use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::timer::TimerSpec;
 
@@ -235,10 +231,11 @@ mod tests {
         .create_process(CallerCredential::Unauthenticated, None)
         .unwrap();
         let (sender, receiver) = channel();
-        let sink = Arc::new(ChannelReadinessSink(std::sync::Mutex::new(sender)));
-        let later = timer::create(&process, sink.clone()).unwrap();
-        let cancelled = timer::create(&process, sink.clone()).unwrap();
-        let sooner = timer::create(&process, sink).unwrap();
+        let sink: Arc<dyn ReadinessSink> =
+            Arc::new(ChannelReadinessSink(std::sync::Mutex::new(sender)));
+        let later = timer::create(&process, &sink, FileOpenFlags::NONE).unwrap();
+        let cancelled = timer::create(&process, &sink, FileOpenFlags::NONE).unwrap();
+        let sooner = timer::create(&process, &sink, FileOpenFlags::NONE).unwrap();
         let arm = |handle, delay: Duration| {
             let spec = TimerSpec {
                 value_ns: u64::try_from(delay.as_nanos()).unwrap(),

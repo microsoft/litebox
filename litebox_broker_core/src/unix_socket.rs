@@ -49,7 +49,7 @@ use spin::{Mutex, MutexGuard, rwlock::RwLock};
 
 use crate::channel::{Channel, ChannelState, Waiter, Wakeups};
 use crate::fs::File;
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessSink, ReadinessWatchers};
 use crate::{BrokerCoreLimits, BrokerError, BrokerProcess, Result};
 
@@ -89,10 +89,10 @@ pub fn create(
     flags: FileOpenFlags,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<ObjectHandle> {
-    let rights = creation_rights(process, flags)?;
+    let (rights, status) = creation_rights(process, flags)?;
     let reference = process.reserve_object_reference(rights)?;
     let registration = ReadinessRegistration::new(reference.handle(), Arc::clone(readiness_sink));
-    let object = UnixSocketObject::new(process, socket_type, flags)?;
+    let object = UnixSocketObject::new(process, socket_type, status)?;
     object.watch(&registration)?;
     reference.commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
 }
@@ -108,15 +108,15 @@ pub fn create_pair(
     flags: FileOpenFlags,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<(ObjectHandle, ObjectHandle)> {
-    let rights = creation_rights(process, flags)?;
+    let (rights, status) = creation_rights(process, flags)?;
     let first_reference = process.reserve_object_reference(rights)?;
     let second_reference = process.reserve_object_reference(rights)?;
     let first_registration =
         ReadinessRegistration::new(first_reference.handle(), Arc::clone(readiness_sink));
     let second_registration =
         ReadinessRegistration::new(second_reference.handle(), Arc::clone(readiness_sink));
-    let first = UnixSocketObject::new(process, socket_type, flags)?;
-    let second = UnixSocketObject::new(process, socket_type, flags)?;
+    let first = UnixSocketObject::new(process, socket_type, status)?;
+    let second = UnixSocketObject::new(process, socket_type, status)?;
     for (socket, peer) in [
         (&first.socket, &second.socket),
         (&second.socket, &first.socket),
@@ -283,7 +283,7 @@ pub fn accept(
     flags: FileOpenFlags,
     readiness_sink: &Arc<dyn ReadinessSink>,
 ) -> Result<UnixSocketResult<ObjectHandle>> {
-    let rights = creation_rights(process, flags)?;
+    let (rights, status) = creation_rights(process, flags)?;
     let lease = Lease::new(process.authorized_object(handle, ObjectRights::WAIT)?)?;
     let listener = &lease.socket;
     if listener.kind != SocketType::Stream {
@@ -313,7 +313,7 @@ pub fn accept(
         (accepted, channel.wake())
     };
     wakeups.wake();
-    let object = UnixSocketObject::from_socket(accepted, flags);
+    let object = UnixSocketObject::from_socket(accepted, status);
     object.watch(&registration)?;
     reference
         .commit_with_readiness(ObjectEntry::UnixSocket(object), Some(registration))
@@ -469,14 +469,18 @@ pub fn get_option(
     Ok(lease.socket.state.lock().options.get(name))
 }
 
-fn creation_rights(process: &BrokerProcess, flags: FileOpenFlags) -> Result<ObjectRights> {
-    if !FileOpenFlags::STATUS.contains(flags) {
-        return Err(BrokerError::UnsupportedOperation);
-    }
-    process
+/// Returns the rights and status flags of a new socket with the status flags
+/// `flags`.
+fn creation_rights(
+    process: &BrokerProcess,
+    flags: FileOpenFlags,
+) -> Result<(ObjectRights, StatusFlags)> {
+    let status = StatusFlags::new(flags)?;
+    let rights = process
         .core
         .policy
-        .principal_object_rights(process.caller_credential)
+        .principal_object_rights(process.caller_credential)?;
+    Ok((rights, status))
 }
 
 /// Resolves `address` to the key of the name a `socket_type` socket bound to
@@ -536,15 +540,12 @@ impl ObjectEntry {
 /// One Unix socket's open state, which its references share.
 pub(crate) struct UnixSocketObject {
     socket: Arc<Socket>,
-    /// Whether operations that would block fail instead of waiting.
-    nonblocking: bool,
-    /// Whether `O_APPEND` is set, which Linux reports but which has no effect on a socket.
-    append: bool,
+    status: StatusFlags,
 }
 
 impl UnixSocketObject {
     /// Creates a new unnamed, unconnected `socket_type` socket.
-    fn new(process: &BrokerProcess, socket_type: SocketType, flags: FileOpenFlags) -> Result<Self> {
+    fn new(process: &BrokerProcess, socket_type: SocketType, status: StatusFlags) -> Result<Self> {
         if !matches!(socket_type, SocketType::Stream | SocketType::Datagram) {
             return Err(BrokerError::UnsupportedOperation);
         }
@@ -555,16 +556,12 @@ impl UnixSocketObject {
             UnixSocketName::Unnamed,
             Connection::None,
         );
-        Ok(Self::from_socket(Arc::new(socket), flags))
+        Ok(Self::from_socket(Arc::new(socket), status))
     }
 
     /// Takes ownership of `socket`, which closes once the object drops.
-    fn from_socket(socket: Arc<Socket>, flags: FileOpenFlags) -> Self {
-        Self {
-            socket,
-            nonblocking: flags.contains(FileOpenFlags::NONBLOCKING),
-            append: flags.contains(FileOpenFlags::APPEND),
-        }
+    fn from_socket(socket: Arc<Socket>, status: StatusFlags) -> Self {
+        Self { socket, status }
     }
 
     /// Publishes this socket's readiness changes through `registration`
@@ -579,29 +576,12 @@ impl UnixSocketObject {
 
     /// Returns the socket's access mode and status flags.
     pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
-        let mut flags = FileOpenFlags::NONE;
-        for (set, flag) in [
-            (self.nonblocking, FileOpenFlags::NONBLOCKING),
-            (self.append, FileOpenFlags::APPEND),
-        ] {
-            if set {
-                flags = flags | flag;
-            }
-        }
-        FileStatusFlags {
-            access: FileAccessMode::ReadWrite,
-            flags,
-        }
+        self.status.get(FileAccessMode::ReadWrite)
     }
 
     /// Changes the status flags in `mask` to their values in `flags`.
     pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
-        if mask.contains(FileOpenFlags::NONBLOCKING) {
-            self.nonblocking = flags.contains(FileOpenFlags::NONBLOCKING);
-        }
-        if mask.contains(FileOpenFlags::APPEND) {
-            self.append = flags.contains(FileOpenFlags::APPEND);
-        }
+        self.status.set(mask, flags);
     }
 }
 
@@ -627,7 +607,7 @@ impl Lease {
         let (socket, nonblocking) = {
             let entry = object.read();
             let socket = entry.as_unix_socket()?;
-            (Arc::clone(&socket.socket), socket.nonblocking)
+            (Arc::clone(&socket.socket), socket.status.nonblocking())
         };
         Ok(Self {
             _object: object,

@@ -645,8 +645,8 @@ mod tests {
         SocketStatusResponse, SocketType, TcpOptionName, TcpOptionValue,
     };
     use crate::timer::{
-        CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
-        ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
+        CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse,
+        ReadTimerRequest, ReadTimerResponse, SetTimerRequest, SetTimerResponse, TimerSpec,
     };
     use crate::unix_socket::{
         AcceptUnixSocketRequest, AcceptUnixSocketResponse, BindUnixSocketRequest,
@@ -777,9 +777,11 @@ mod tests {
             }),
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
+                flags: FileOpenFlags::NONE,
             })),
             BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 7,
+                flags: FileOpenFlags::NONBLOCKING,
             })),
             BrokerOperation::Event(EventRequest::Add(AddEventRequest { handle, value: 3 })),
             BrokerOperation::Event(EventRequest::Consume(ConsumeEventRequest {
@@ -790,7 +792,12 @@ mod tests {
                 handle,
                 mode: EventConsumeMode::One,
             })),
-            BrokerOperation::Timer(TimerRequest::Create),
+            BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
+                flags: FileOpenFlags::NONE,
+            })),
+            BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest {
+                flags: FileOpenFlags::NONBLOCKING,
+            })),
             BrokerOperation::Timer(TimerRequest::Set(SetTimerRequest {
                 handle,
                 spec: TimerSpec {
@@ -1683,6 +1690,7 @@ mod tests {
                 request_id: TEST_REQUEST_ID,
                 operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                     initial_count: 0,
+                    flags: FileOpenFlags::NONE,
                 })),
             })),
             Err(WireError::WrongMessagePhase)
@@ -1731,7 +1739,7 @@ mod tests {
         );
         let mut unknown_timer_request = encode_request(BrokerRequest {
             request_id: TEST_REQUEST_ID,
-            operation: BrokerOperation::Timer(TimerRequest::Create),
+            operation: BrokerOperation::Timer(TimerRequest::Create(CreateTimerRequest::default())),
         });
         unknown_timer_request[9] = 0xff;
         assert_eq!(
@@ -1883,6 +1891,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                 initial_count: 0,
+                flags: FileOpenFlags::NONE,
             })),
         });
         frame.push(0xff);
@@ -2459,9 +2468,10 @@ mod tests {
                 request_id: RequestId(13),
                 operation: BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
                     initial_count: 7,
+                    flags: FileOpenFlags::NONBLOCKING,
                 })),
             }),
-            [1, 13, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]
+            [1, 13, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 32, 0]
         );
     }
 

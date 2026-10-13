@@ -21,7 +21,9 @@ use crate::LiteBox;
 use crate::broker::{
     BrokerControl, BrokerPollableRegistry, error::BrokerControlError, readiness_events,
 };
-use crate::event::{Events, IOPollable, observer::Observer, polling::Pollee};
+use crate::event::{
+    Events, IOPollable, counter::EventCounter, observer::Observer, polling::Pollee, timer::Timer,
+};
 use crate::fs::FileFd;
 use crate::pipes::PipeFd;
 use crate::sync::RawSyncPrimitivesProvider;
@@ -196,6 +198,10 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     Pipe(Arc<PipeFd<Platform>>),
     /// A Unix socket, adopted with [`LiteBox::adopt_inherited_unix_socket`].
     UnixSocket(Arc<UnixSocket<Platform>>),
+    /// An event counter, adopted with [`LiteBox::adopt_inherited_event_counter`].
+    EventCounter(Arc<EventCounter<Platform>>),
+    /// A timer, adopted with [`LiteBox::adopt_inherited_timer`].
+    Timer(Arc<Timer<Platform>>),
 }
 
 /// A child process that has not started.
@@ -227,7 +233,8 @@ impl PendingChild {
     /// `fds` refer to, returning the child's handles in the same order.
     ///
     /// Like descriptors a Linux child inherits, each child reference shares
-    /// its object's state, such as a file's offset or a pipe's buffer.
+    /// its object's state, such as a file's offset, a pipe's buffer, or an
+    /// event counter's count.
     /// Descriptors sharing an open file description get the same handle. The
     /// child adopts each handle as the [`InheritableFd`] variant describes and
     /// releases its references when it terminates. If this fails, the child
@@ -268,6 +275,8 @@ impl PendingChild {
                     held_sockets.push(Arc::clone(socket));
                     socket.handle()
                 }
+                InheritableFd::EventCounter(counter) => counter.handle(),
+                InheritableFd::Timer(timer) => timer.handle(),
             };
             fd_handles.push(handle);
         }

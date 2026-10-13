@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 use crate::ObjectHandle;
+use crate::fs::FileOpenFlags;
 
 /// Relative expiration schedule of a broker-owned timer.
 ///
@@ -12,6 +13,13 @@ pub struct TimerSpec {
     pub value_ns: u64,
     /// Period of subsequent expirations, or zero for a one-shot timer.
     pub interval_ns: u64,
+}
+
+/// Request to create a disarmed timer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CreateTimerRequest {
+    /// Initial status flags, within [`FileOpenFlags::STATUS`].
+    pub flags: FileOpenFlags,
 }
 
 /// Response to a timer create request.
@@ -53,7 +61,8 @@ pub struct GetTimerResponse {
 
 /// Request to consume a timer's pending expirations.
 ///
-/// The broker returns `WouldBlock` when no expiration is pending.
+/// The broker returns `WouldBlock` when no expiration is pending, or
+/// `NonBlockingWouldBlock` if the timer is also non-blocking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadTimerRequest {
     /// Timer handle.

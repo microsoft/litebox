@@ -238,6 +238,7 @@ impl Drop for SignalsObject {
 mod tests {
     use alloc::sync::Arc;
 
+    use litebox_broker_protocol::fs::FileOpenFlags;
     use litebox_broker_protocol::process::{ChildExit, ProcessExitStatus};
     use litebox_broker_protocol::readiness::ReadinessFlags;
     use litebox_broker_protocol::signal::{PendingSignal, SignalEvent, SignalTarget};
@@ -308,7 +309,7 @@ mod tests {
         assert_eq!(super::take(&target, handle), Ok(pending(15, first.id())));
 
         // Signals are taken only through a signals handle.
-        let event = crate::event::create(&target, 0).unwrap();
+        let event = crate::event::create(&target, 0, FileOpenFlags::NONE).unwrap();
         assert_eq!(super::take(&target, event), Err(BrokerError::InvalidRights));
 
         target.close_object_reference(handle).unwrap();

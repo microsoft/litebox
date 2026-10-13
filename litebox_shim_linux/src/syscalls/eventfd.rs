@@ -3,7 +3,7 @@
 
 //! Event file for notification
 
-use core::sync::atomic::AtomicU32;
+use alloc::sync::Arc;
 
 use litebox::{
     event::{
@@ -12,12 +12,15 @@ use litebox::{
         observer::Observer,
         wait::WaitContext,
     },
-    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry},
+    fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
+    process::ProcessError,
     sync::RawSyncPrimitivesProvider,
 };
+use litebox_broker_protocol::{ObjectHandle, fs::FileOpenFlags};
 use litebox_common_linux::{EfdFlags, OFlags, errno::Errno};
 use litebox_platform::time::TimeProvider;
 
+use super::file::{linux_status_flags, status_flags_change};
 use crate::{GlobalState, ShimPlatform};
 
 pub(crate) struct EventfdSubsystem<Platform: ShimPlatform>(core::marker::PhantomData<Platform>);
@@ -26,29 +29,18 @@ impl<Platform: ShimPlatform> FdEnabledSubsystem for EventfdSubsystem<Platform> {
 }
 impl<Platform: ShimPlatform> FdEnabledSubsystemEntry for EventFile<Platform> {}
 
+/// An eventfd, whose count and status flags the broker owns, so processes
+/// that share it through `fork` see one counter.
 pub(crate) struct EventFile<Platform: RawSyncPrimitivesProvider + TimeProvider> {
-    counter: EventCounter<Platform>,
-    /// File status flags (see [`OFlags::STATUS_FLAGS_MASK`])
-    status: AtomicU32,
+    counter: Arc<EventCounter<Platform>>,
     semaphore: bool,
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
-    fn new(counter: EventCounter<Platform>, flags: EfdFlags) -> Self {
-        let mut status = OFlags::RDWR;
-        status.set(OFlags::NONBLOCK, flags.contains(EfdFlags::NONBLOCK));
-        Self {
-            counter,
-            status: AtomicU32::new(status.bits()),
-            semaphore: flags.contains(EfdFlags::SEMAPHORE),
-        }
-    }
-
     pub(crate) fn read(&self, cx: &WaitContext<'_, Platform>) -> Result<u64, Errno> {
         self.counter
             .read(
                 cx,
-                self.is_nonblocking(),
                 if self.semaphore {
                     EventCounterReadMode::One
                 } else {
@@ -59,15 +51,28 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     pub(crate) fn write(&self, cx: &WaitContext<'_, Platform>, value: u64) -> Result<usize, Errno> {
-        self.counter
-            .write(cx, self.is_nonblocking(), value)
-            .map_err(Errno::from)
+        self.counter.write(cx, value).map_err(Errno::from)
     }
 
-    super::common_functions_for_file_status!();
+    /// Returns the `F_GETFL` flags of the eventfd.
+    pub(crate) fn get_status(&self) -> Result<OFlags, Errno> {
+        linux_status_flags(self.counter.get_status_flags()?)
+    }
 
-    fn is_nonblocking(&self) -> bool {
-        self.get_status().contains(OFlags::NONBLOCK)
+    /// Changes the status flags in `mask` of the eventfd to their values in
+    /// `flags`, ignoring flags other than `O_NONBLOCK` and `O_APPEND`.
+    pub(crate) fn set_status_flags(&self, mask: OFlags, flags: OFlags) -> Result<(), Errno> {
+        let (mask, flags) = status_flags_change(mask, flags);
+        self.counter.set_status_flags(mask, flags)?;
+        Ok(())
+    }
+
+    pub(crate) fn counter(&self) -> &Arc<EventCounter<Platform>> {
+        &self.counter
+    }
+
+    pub(crate) fn is_semaphore(&self) -> bool {
+        self.semaphore
     }
 }
 
@@ -93,9 +98,47 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             return Err(Errno::EINVAL);
         }
 
-        let count = u64::from(initval);
-        let counter = EventCounter::new(&self.litebox, count).map_err(Errno::from)?;
-        Ok(EventFile::new(counter, flags))
+        let status = if flags.contains(EfdFlags::NONBLOCK) {
+            FileOpenFlags::NONBLOCKING
+        } else {
+            FileOpenFlags::NONE
+        };
+        let counter =
+            EventCounter::new(&self.litebox, u64::from(initval), status).map_err(Errno::from)?;
+        Ok(EventFile {
+            counter: Arc::new(counter),
+            semaphore: flags.contains(EfdFlags::SEMAPHORE),
+        })
+    }
+
+    /// Runs `f` on the eventfd at `fd`, without holding the descriptor table.
+    pub(crate) fn with_eventfd<R>(
+        &self,
+        fd: &TypedFd<EventfdSubsystem<Platform>>,
+        f: impl FnOnce(&EventFile<Platform>) -> Result<R, Errno>,
+    ) -> Result<R, Errno> {
+        let handle = self
+            .litebox
+            .descriptor_table()
+            .entry_handle(fd)
+            .ok_or(Errno::EBADF)?;
+        handle.with_entry(f)
+    }
+
+    /// Adopts an eventfd this process inherited from its parent as `handle`.
+    pub(crate) fn adopt_inherited_eventfd(
+        &self,
+        handle: ObjectHandle,
+        semaphore: bool,
+    ) -> Result<TypedFd<EventfdSubsystem<Platform>>, ProcessError> {
+        let counter = self.litebox.adopt_inherited_event_counter(handle)?;
+        Ok(self
+            .litebox
+            .descriptor_table_mut()
+            .insert::<EventfdSubsystem<Platform>>(EventFile {
+                counter: Arc::new(counter),
+                semaphore,
+            }))
     }
 }
 

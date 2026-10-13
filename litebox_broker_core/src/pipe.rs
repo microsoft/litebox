@@ -12,7 +12,7 @@ use litebox_broker_protocol::pipe::MAX_PIPE_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
 use spin::rwlock::RwLock;
 
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
 use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
 
@@ -29,9 +29,7 @@ pub fn create(
     atomic_write_size: u64,
     flags: FileOpenFlags,
 ) -> Result<(ObjectHandle, ObjectHandle)> {
-    if !FileOpenFlags::STATUS.contains(flags) {
-        return Err(BrokerError::UnsupportedOperation);
-    }
+    let status = StatusFlags::new(flags)?;
     let capacity = usize::try_from(capacity).map_err(|_| BrokerError::ResourceExhausted)?;
     let atomic_write_size =
         usize::try_from(atomic_write_size).map_err(|_| BrokerError::ResourceExhausted)?;
@@ -61,9 +59,9 @@ pub fn create(
         ObjectEntry::Pipe(PipeObject::new(
             Arc::clone(&state),
             PipeEndpoint::Read,
-            flags,
+            status,
         )),
-        ObjectEntry::Pipe(PipeObject::new(state, PipeEndpoint::Write, flags)),
+        ObjectEntry::Pipe(PipeObject::new(state, PipeEndpoint::Write, status)),
     )
 }
 
@@ -100,48 +98,29 @@ impl ObjectEntry {
 pub(crate) struct PipeObject {
     state: Arc<RwLock<PipeState>>,
     endpoint: PipeEndpoint,
-    /// Whether reads and writes that would block fail instead of waiting.
-    nonblocking: bool,
-    /// Whether `O_APPEND` is set, which Linux reports but which has no effect on a pipe.
-    append: bool,
+    status: StatusFlags,
 }
 
 impl PipeObject {
-    fn new(state: Arc<RwLock<PipeState>>, endpoint: PipeEndpoint, flags: FileOpenFlags) -> Self {
+    fn new(state: Arc<RwLock<PipeState>>, endpoint: PipeEndpoint, status: StatusFlags) -> Self {
         Self {
             state,
             endpoint,
-            nonblocking: flags.contains(FileOpenFlags::NONBLOCKING),
-            append: flags.contains(FileOpenFlags::APPEND),
+            status,
         }
     }
 
     /// Returns the endpoint's access mode and status flags.
     pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
-        let access = match self.endpoint {
+        self.status.get(match self.endpoint {
             PipeEndpoint::Read => FileAccessMode::ReadOnly,
             PipeEndpoint::Write => FileAccessMode::WriteOnly,
-        };
-        let mut flags = FileOpenFlags::NONE;
-        for (set, flag) in [
-            (self.nonblocking, FileOpenFlags::NONBLOCKING),
-            (self.append, FileOpenFlags::APPEND),
-        ] {
-            if set {
-                flags = flags | flag;
-            }
-        }
-        FileStatusFlags { access, flags }
+        })
     }
 
     /// Changes the status flags in `mask` to their values in `flags`.
     pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
-        if mask.contains(FileOpenFlags::NONBLOCKING) {
-            self.nonblocking = flags.contains(FileOpenFlags::NONBLOCKING);
-        }
-        if mask.contains(FileOpenFlags::APPEND) {
-            self.append = flags.contains(FileOpenFlags::APPEND);
-        }
+        self.status.set(mask, flags);
     }
 
     /// Publishes this endpoint's readiness changes through `registration`
@@ -165,7 +144,7 @@ impl PipeObject {
         let mut state = self.state.write();
         if state.data.is_empty() {
             return if state.write_open {
-                Err(BrokerError::would_block(self.nonblocking))
+                Err(BrokerError::would_block(self.status.nonblocking()))
             } else {
                 Ok(Vec::new())
             };
@@ -194,7 +173,7 @@ impl PipeObject {
 
         let available = state.capacity - state.data.len();
         if available == 0 || (data.len() <= state.atomic_write_size && available < data.len()) {
-            return Err(BrokerError::would_block(self.nonblocking));
+            return Err(BrokerError::would_block(self.status.nonblocking()));
         }
 
         let write_len = available.min(data.len());

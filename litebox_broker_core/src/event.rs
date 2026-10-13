@@ -3,24 +3,38 @@
 
 //! Broker-owned event object operations.
 
-use crate::object::{ObjectEntry, ObjectRights};
+use crate::object::{ObjectEntry, ObjectRights, StatusFlags};
+use crate::readiness::{ReadinessRegistration, ReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, Result};
 use litebox_broker_protocol::ObjectHandle;
 use litebox_broker_protocol::event::{EventConsumeMode, EventConsumption};
+use litebox_broker_protocol::fs::{FileAccessMode, FileOpenFlags, FileStatusFlags};
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use spin::Mutex;
 
 pub(crate) const MAX_EVENT_COUNT: u64 = u64::MAX - 1;
 
 /// Creates a broker-owned event object with initial readiness credits.
-pub fn create(process: &BrokerProcess, initial_count: u64) -> Result<ObjectHandle> {
+///
+/// The event starts with the status flags `flags`, which must be within
+/// [`FileOpenFlags::STATUS`].
+pub fn create(
+    process: &BrokerProcess,
+    initial_count: u64,
+    flags: FileOpenFlags,
+) -> Result<ObjectHandle> {
+    let status = StatusFlags::new(flags)?;
     if initial_count > MAX_EVENT_COUNT {
         return Err(BrokerError::ResourceExhausted);
     }
 
-    process.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count)))
+    process.create_object_reference(ObjectEntry::Event(EventObject::new(initial_count, status)))
 }
 
 /// Adds readiness credits to a broker-owned event object.
+///
+/// Fails with `WouldBlock` if the count would exceed its maximum, or
+/// `NonBlockingWouldBlock` if the event is also non-blocking.
 pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<ReadinessFlags> {
     let object = process.authorized_object(handle, ObjectRights::WRITE)?;
     let mut object = object.write();
@@ -28,6 +42,9 @@ pub fn add(process: &BrokerProcess, handle: ObjectHandle, value: u64) -> Result<
 }
 
 /// Consumes readiness credits from a broker-owned event object.
+///
+/// Fails with `WouldBlock` if the count is zero, or `NonBlockingWouldBlock`
+/// if the event is also non-blocking.
 pub fn consume(
     process: &BrokerProcess,
     handle: ObjectHandle,
@@ -47,14 +64,22 @@ impl ObjectEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An event counter, whose references share its count and status flags.
 pub(crate) struct EventObject {
     count: u64,
+    status: StatusFlags,
+    /// Registrations of references that other processes can change the
+    /// count under.
+    watchers: Mutex<ReadinessWatchers>,
 }
 
 impl EventObject {
-    const fn new(count: u64) -> Self {
-        Self { count }
+    fn new(count: u64, status: StatusFlags) -> Self {
+        Self {
+            count,
+            status,
+            watchers: Mutex::new(ReadinessWatchers::default()),
+        }
     }
 
     fn add(&mut self, value: u64) -> Result<ReadinessFlags> {
@@ -62,13 +87,17 @@ impl EventObject {
             .count
             .checked_add(value)
             .filter(|count| *count <= MAX_EVENT_COUNT)
-            .ok_or(BrokerError::WouldBlock)?;
-        Ok(self.readiness())
+            .ok_or(BrokerError::would_block(self.status.nonblocking()))?;
+        let readiness = self.readiness();
+        if value != 0 {
+            self.watchers.get_mut().publish(readiness);
+        }
+        Ok(readiness)
     }
 
     fn consume(&mut self, mode: EventConsumeMode) -> Result<EventConsumption> {
         if self.count == 0 {
-            return Err(BrokerError::WouldBlock);
+            return Err(BrokerError::would_block(self.status.nonblocking()));
         }
 
         let value = match mode {
@@ -76,13 +105,12 @@ impl EventObject {
             EventConsumeMode::One => 1,
         };
         self.count -= value;
-        Ok(EventConsumption {
-            value,
-            readiness: self.readiness(),
-        })
+        let readiness = self.readiness();
+        self.watchers.get_mut().publish(readiness);
+        Ok(EventConsumption { value, readiness })
     }
 
-    pub(crate) fn readiness(self) -> ReadinessFlags {
+    pub(crate) fn readiness(&self) -> ReadinessFlags {
         let mut readiness = ReadinessFlags::default();
         if self.count > 0 {
             readiness = readiness | ReadinessFlags::READ;
@@ -91,5 +119,21 @@ impl EventObject {
             readiness = readiness | ReadinessFlags::WRITE;
         }
         readiness
+    }
+
+    /// Publishes this event's later readiness changes through `registration`
+    /// until every clone of `registration` drops.
+    pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.watchers.lock().watch(registration)
+    }
+
+    /// Returns the event's access mode and status flags.
+    pub(crate) fn get_status_flags(&self) -> FileStatusFlags {
+        self.status.get(FileAccessMode::ReadWrite)
+    }
+
+    /// Changes the status flags in `mask` to their values in `flags`.
+    pub(crate) fn set_status_flags(&mut self, mask: FileOpenFlags, flags: FileOpenFlags) {
+        self.status.set(mask, flags);
     }
 }

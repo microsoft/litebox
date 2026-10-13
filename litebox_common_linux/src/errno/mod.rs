@@ -680,6 +680,7 @@ impl From<litebox::event::counter::EventCounterError> for Errno {
 impl From<litebox::event::timer::TimerError> for Errno {
     fn from(value: litebox::event::timer::TimerError) -> Self {
         match value {
+            litebox::event::timer::TimerError::WouldBlock => Errno::EAGAIN,
             litebox::event::timer::TimerError::ResourceExhausted => Errno::ENOMEM,
             litebox::event::timer::TimerError::PermissionDenied => Errno::EACCES,
             litebox::event::timer::TimerError::Io

@@ -2,25 +2,27 @@
 // Licensed under the MIT license.
 
 use litebox_broker_protocol::ObjectHandle;
+use litebox_broker_protocol::fs::FileOpenFlags;
 use litebox_broker_protocol::message::{
     BrokerOperation, BrokerResult, TimerRequest, TimerResponse,
 };
 use litebox_broker_protocol::timer::{
-    GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
+    CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
 use crate::{BrokerLocal, BrokerLocalError, Result};
 
 impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
-    /// Creates a disarmed broker-owned timer.
+    /// Creates a disarmed broker-owned timer with the status flags `flags`,
+    /// which must be within [`FileOpenFlags::STATUS`].
     ///
     /// # Panics
     ///
     /// Panics if the broker reports an unrecoverable error or returns a protocol
     /// response that does not match the issued timer request.
-    pub fn create_timer(&self) -> Result<ObjectHandle, Channel::Error> {
-        match self.request_timer(TimerRequest::Create)? {
+    pub fn create_timer(&self, flags: FileOpenFlags) -> Result<ObjectHandle, Channel::Error> {
+        match self.request_timer(TimerRequest::Create(CreateTimerRequest { flags }))? {
             TimerResponse::Create(response) => Ok(response.handle),
             response => panic!("broker returned unexpected timer response: {response:?}"),
         }

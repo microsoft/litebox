@@ -117,13 +117,13 @@ impl From<BrokerObjectError> for TryOpError<TimerError> {
 impl From<BrokerObjectError> for TimerError {
     fn from(error: BrokerObjectError) -> Self {
         match error {
+            BrokerObjectError::WouldBlock => Self::WouldBlock,
             BrokerObjectError::ResourceExhausted | BrokerObjectError::OutOfMemory => {
                 Self::ResourceExhausted
             }
             BrokerObjectError::PermissionDenied => Self::PermissionDenied,
             BrokerObjectError::Control
             | BrokerObjectError::InvalidObject
-            | BrokerObjectError::WouldBlock
             | BrokerObjectError::PeerClosed
             | BrokerObjectError::UnsupportedOperation => Self::Io,
         }

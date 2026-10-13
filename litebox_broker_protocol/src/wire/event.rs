@@ -29,6 +29,7 @@ pub(super) fn encode_event_request(encoder: &mut Encoder, request: EventRequest)
         EventRequest::Create(request) => {
             encoder.u8(EVENT_REQUEST_TAG_CREATE);
             encoder.u64(request.initial_count);
+            encoder.u16(request.flags.bits());
         }
         EventRequest::Add(request) => {
             encoder.u8(EVENT_REQUEST_TAG_ADD);
@@ -47,6 +48,7 @@ pub(super) fn decode_event_request(decoder: &mut Decoder<'_>) -> Result<EventReq
     let request = match decoder.u8()? {
         EVENT_REQUEST_TAG_CREATE => EventRequest::Create(CreateEventRequest {
             initial_count: decoder.u64()?,
+            flags: super::fs::decode_open_flags(decoder)?,
         }),
         EVENT_REQUEST_TAG_ADD => EventRequest::Add(AddEventRequest {
             handle: decoder.handle()?,

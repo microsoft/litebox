@@ -328,6 +328,20 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
+                InheritedFdKind::Eventfd { semaphore } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_eventfd(handle, semaphore)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
+                }
+                InheritedFdKind::Timerfd { clock } => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_timerfd(handle, clock)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
+                }
             }
             descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
@@ -604,8 +618,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// them is:
     ///
     /// - a network socket: the broker does not duplicate socket objects;
-    /// - an eventfd or epoll descriptor: the object is local to this runner;
-    /// - a timerfd: the broker does not duplicate timer objects;
+    /// - an epoll descriptor: the object is local to this runner;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
     ///   runner; or
     /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
@@ -655,7 +668,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         InheritableFd::UnixSocket(socket),
                     )
                 }
-                _ => return Err(Errno::EAGAIN),
+                AnyTypedFd::Eventfd(eventfd) => self.global.with_eventfd(&eventfd, |file| {
+                    Ok((
+                        InheritedFdKind::Eventfd {
+                            semaphore: file.is_semaphore(),
+                        },
+                        InheritableFd::EventCounter(alloc::sync::Arc::clone(file.counter())),
+                    ))
+                })?,
+                AnyTypedFd::Timerfd(timerfd) => self.global.with_timerfd(&timerfd, |file| {
+                    Ok((
+                        InheritedFdKind::Timerfd {
+                            clock: file.clock(),
+                        },
+                        InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
+                    ))
+                })?,
+                AnyTypedFd::Network(_) | AnyTypedFd::Epoll(_) => return Err(Errno::EAGAIN),
             };
             next_fd = raw_fd + 1;
             let inherited_fd = ForkedFd {
@@ -2147,13 +2176,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         |fd| linux_status_flags(self.global.litebox.get_file_status_flags(fd)?),
                         |fd| getfl_from_metadata!(fd, crate::syscalls::net::SocketOFlags),
                         |fd| linux_status_flags(self.global.pipes.get_status_flags(fd)?),
-                        |fd| getfl_from_handle!(fd),
+                        |fd| {
+                            self.global
+                                .with_eventfd(fd, super::eventfd::EventFile::get_status)
+                        },
                         |fd| getfl_from_handle!(fd),
                         |fd| {
                             self.global
                                 .with_unix_socket(fd, super::unix::UnixSocket::get_status)
                         },
-                        |fd| getfl_from_handle!(fd),
+                        |fd| {
+                            self.global
+                                .with_timerfd(fd, super::timerfd::TimerFile::get_status)
+                        },
                     )?
                     .bits())
             }
@@ -2164,25 +2199,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     | OFlags::DIRECT
                     | OFlags::NOATIME;
                 let flags = flags & setfl_mask;
-                macro_rules! toggle_flags {
-                    ($fd:ident) => {{
-                        // TODO: Consider shared metadata table?
-                        let handle = self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .entry_handle($fd)
-                            .ok_or(Errno::EBADF)?;
-                        handle.with_entry(|file| {
-                            let diff = (file.get_status() & setfl_mask) ^ flags;
-                            if diff.intersects(OFlags::APPEND | OFlags::DIRECT | OFlags::NOATIME) {
-                                log_unsupported!("unsupported flags");
-                            }
-                            file.set_status(flags & setfl_mask, true);
-                            file.set_status(flags.complement() & setfl_mask, false);
-                        });
-                    }};
-                }
                 macro_rules! setfl_in_metadata {
                     ($fd:expr, $MetaType:path, $no_metadata_msg:expr) => {
                         setfl_in_metadata!($fd, $MetaType, $no_metadata_msg, |diff: OFlags| {
@@ -2228,8 +2244,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             .set_linux_pipe_status_flags(fd, setfl_mask, flags)
                     },
                     |fd| {
-                        toggle_flags!(fd);
-                        Ok(())
+                        if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
+                        self.global
+                            .with_eventfd(fd, |file| file.set_status_flags(setfl_mask, flags))
                     },
                     |_fd| todo!("epoll"),
                     |fd| {
@@ -2241,8 +2260,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         })
                     },
                     |fd| {
-                        toggle_flags!(fd);
-                        Ok(())
+                        if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
+                        self.global
+                            .with_timerfd(fd, |file| file.set_status_flags(setfl_mask, flags))
                     },
                 )?;
                 Ok(0)
@@ -2474,6 +2496,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             IoctlArg::FIONBIO(arg) => {
                 let val = arg.read_at_offset::<Platform>(0).ok_or(Errno::EFAULT)?;
                 let fd = files.typed_fd(fd)?;
+                let flags = if val != 0 {
+                    OFlags::NONBLOCK
+                } else {
+                    OFlags::empty()
+                };
                 macro_rules! set_nonblock_on_entry {
                     ($fd:ident) => {{
                         let handle = self
@@ -2490,11 +2517,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 }
                 fd.dispatch(
                     |file_fd| {
-                        let flags = if val != 0 {
-                            OFlags::NONBLOCK
-                        } else {
-                            OFlags::empty()
-                        };
                         set_file_status_flags(
                             &self.global.litebox,
                             file_fd,
@@ -2522,27 +2544,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         Ok(())
                     },
                     |fd| {
-                        let flags = if val != 0 {
-                            OFlags::NONBLOCK
-                        } else {
-                            OFlags::empty()
-                        };
                         self.global
                             .set_linux_pipe_status_flags(fd, OFlags::NONBLOCK, flags)
                     },
-                    |fd| set_nonblock_on_entry!(fd),
+                    |fd| {
+                        self.global
+                            .with_eventfd(fd, |file| file.set_status_flags(OFlags::NONBLOCK, flags))
+                    },
                     |fd| set_nonblock_on_entry!(fd),
                     |fd| {
-                        let flags = if val != 0 {
-                            OFlags::NONBLOCK
-                        } else {
-                            OFlags::empty()
-                        };
                         self.global.with_unix_socket(fd, |socket| {
                             socket.set_status_flags(OFlags::NONBLOCK, flags)
                         })
                     },
-                    |fd| set_nonblock_on_entry!(fd),
+                    |fd| {
+                        self.global
+                            .with_timerfd(fd, |file| file.set_status_flags(OFlags::NONBLOCK, flags))
+                    },
                 )?;
                 Ok(0)
             }
