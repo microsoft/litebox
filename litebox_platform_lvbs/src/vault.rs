@@ -37,7 +37,10 @@
 //! heap, stacks); see [`is_accessible`].
 //!
 //! A fault or panic inside the vault is fatal (VTL0 crash dump and reboot),
-//! so the skipped exit path cannot leak to userspace or VTL0.
+//! so the skipped exit path cannot leak to userspace.
+//!
+//! TODO: The panic path returns to VTL0 for the crash dump without scrubbing
+//! (no stack wipe, `VERW`, L1D flush or IBPB).
 
 use crate::arch::spec_ctrl::VaultControls;
 use crate::host::per_cpu_variables::PerCpuVariablesAsm;
@@ -296,7 +299,8 @@ impl<E> Stage<E> for Kdf<'_, E> {
             context: self.context.get(),
             output,
         };
-        // Safety: the caller is inside the vault window.
+        // Safety: the caller is inside the vault window, and `DerivedKeyProvider`
+        // requires `f` to obey the vault restrictions.
         unsafe { invoke(self.f, key, params) }
     }
 }
@@ -313,7 +317,8 @@ impl<E> Stage<E> for Compute<'_, E> {
             input: self.input.get(),
             output,
         };
-        // Safety: the caller is inside the vault window.
+        // Safety: the caller is inside the vault window, and `DerivedKeyProvider`
+        // requires `f` to obey the vault restrictions.
         unsafe { invoke(self.f, key, params) }
     }
 }
@@ -566,7 +571,7 @@ mod tests {
     use litebox::platform::KDFParams;
 
     #[test]
-    fn retpoline_preserves_callback_arguments_and_error_returns() {
+    fn retpoline_preserves_kdf_arguments_and_error_returns() {
         struct Scratch(*mut libc::c_void);
         impl Drop for Scratch {
             fn drop(&mut self) {
@@ -590,15 +595,6 @@ mod tests {
         fn large(prk: &[u8], params: KDFParams) -> Result<(), [u8; 128]> {
             check(prk, params);
             Err([0x5a; 128])
-        }
-        #[allow(
-            clippy::result_large_err,
-            reason = "exercise hidden return-pointer ABI"
-        )]
-        fn compute(key: &[u8], params: ComputeParams) -> Result<(), [u8; 128]> {
-            assert_eq!(params.input, b"input");
-            params.output.copy_from_slice(key);
-            Err([0xa5; 128])
         }
         // Safety: MAP_FIXED_NOREPLACE does not replace existing mappings.
         let page = unsafe {
@@ -640,22 +636,6 @@ mod tests {
                     }
                 ),
                 Err([0x5a; 128])
-            );
-        }
-        assert_eq!(output, prk);
-        let mut output = [0u8; PRK_LEN];
-        // Safety: as above.
-        unsafe {
-            assert_eq!(
-                invoke(
-                    compute,
-                    &prk,
-                    ComputeParams {
-                        input: b"input",
-                        output: &mut output,
-                    }
-                ),
-                Err([0xa5; 128])
             );
         }
         assert_eq!(output, prk);

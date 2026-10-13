@@ -648,22 +648,39 @@ pub trait DerivedKeyProvider {
         params: KDFParams,
     ) -> Result<(), DerivedKeyError<E>>;
 
-    /// Derive a `KEY_LEN`-byte key from `key_context` with `shim_kdf` (as [`Self::derive_key`]
-    /// does), then run `op(key, params)` and place its result into `params.output`.
+    /// Derive a `KEY_LEN`-byte key from the `root` key and `key_context` with `shim_kdf`, then
+    /// run `op(key, params)` and place its result into `params.output`.
     ///
-    /// The key is never returned, and `op` never sees the device-specific secret; only
-    /// `params.output` and error values (`E`) leave the platform, so neither may carry key
-    /// material. The platform keeps no state: the same `key_context`
-    /// yields the same key, so freshness (e.g., a per-boot nonce) is up to the caller.
+    /// A platform may support only some root keys, returning
+    /// [`DerivedKeyError::UnsupportedRebootPersistentKey`] or
+    /// [`DerivedKeyError::UnsupportedPerBootKey`] for the others.
+    ///
+    /// The derived key is never returned: `op` receives only the output of `shim_kdf` as its
+    /// key. Only `params.output` and error values (`E`) leave the platform, so neither may carry
+    /// key material. Errors from both `shim_kdf` and `op` are returned as
+    /// [`DerivedKeyError::ShimKDFError`].
+    ///
+    /// Callers share the root key, so `key_context` should start with a label unique to its use.
     ///
     /// `shim_kdf` and `op` have the same restrictions as `shim_kdf` in [`Self::derive_key`].
     fn compute_with_derived_key<E, const KEY_LEN: usize>(
         &self,
+        root: RootKey,
         shim_kdf: fn(&[u8], KDFParams) -> Result<(), E>,
         key_context: &[u8],
         op: fn(&[u8], ComputeParams) -> Result<(), E>,
         params: ComputeParams,
     ) -> Result<(), DerivedKeyError<E>>;
+}
+
+/// Root key from which [`DerivedKeyProvider::compute_with_derived_key`] derives keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootKey {
+    /// A reboot-persistent device-specific secret: derived keys survive reboots.
+    Persistent,
+    /// A secret that is new every boot and reveals nothing about the device-specific secret:
+    /// derived keys change every boot, and the same context yields the same key within a boot.
+    PerBoot,
 }
 
 /// Input and output parameters to a KDF other than the secret itself.
@@ -693,6 +710,8 @@ pub enum DerivedKeyError<ShimKDFError> {
     ShimKDFError(#[from] ShimKDFError),
     #[error("this platform does not support reboot-persistent keys")]
     UnsupportedRebootPersistentKey,
+    #[error("this platform does not support per-boot keys")]
+    UnsupportedPerBootKey,
     #[error("the requested key is not available (yet)")]
     KeyUnavailable,
 }

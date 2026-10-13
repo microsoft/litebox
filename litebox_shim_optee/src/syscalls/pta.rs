@@ -453,6 +453,7 @@ impl SystemPta {
             .map_err(|err| match err {
                 DerivedKeyError::ShimKDFRequired
                 | DerivedKeyError::UnsupportedRebootPersistentKey
+                | DerivedKeyError::UnsupportedPerBootKey
                 | DerivedKeyError::KeyUnavailable => TeeResult::NotSupported,
                 DerivedKeyError::ShimKDFError(err) => err,
             })?;

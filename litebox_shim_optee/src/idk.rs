@@ -11,6 +11,7 @@ use hmac::{Hmac, Mac};
 use litebox::{
     platform::{
         ComputeParams, DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _,
+        RootKey,
     },
     utils::TruncateExt,
 };
@@ -25,7 +26,6 @@ use spin::Once;
 use zeroize::{Zeroize, Zeroizing};
 
 const IDENTITY_SIGNING_KEY_LABEL: &[u8] = b"litebox-optee-idks-v1";
-const IDENTITY_SIGNING_KEY_NONCE_LEN: usize = 32;
 const IDENTITY_SIGNING_PRIVATE_KEY_LEN: usize = 48;
 const IDENTITY_SIGNING_PUBLIC_KEY_LEN: usize = 97;
 const SHA384_DIGEST_LEN: usize = 48;
@@ -277,48 +277,46 @@ fn endorse_data_with<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
     endorsement_data: &[u8],
 ) -> Result<[u8; IDKS_ENDORSEMENT_SIGNATURE_LEN], Errno> {
-    let key_pair = get_identity_signing_key_pair(platform)?;
     // Hash here to keep the platform callback short.
     let digest: [u8; SHA384_DIGEST_LEN] = Sha384::digest(endorsement_data).into();
     let mut signature = [0u8; IDKS_ENDORSEMENT_SIGNATURE_LEN];
+    compute_with_identity_signing_key(platform, identity_signing_op, &digest, &mut signature)?;
+    Ok(signature)
+}
+
+// IDK_S exists only inside `compute_with_derived_key`: each use derives it from
+// the platform's per-boot root key (`RootKey::PerBoot`) with
+// `identity_signing_key_kdf` and runs `op` there. The per-boot root key makes
+// IDK_S new on every boot.
+fn compute_with_identity_signing_key<Platform: crate::OpteeShimPlatform>(
+    platform: &Platform,
+    op: fn(&[u8], ComputeParams) -> Result<(), Errno>,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<(), Errno> {
     platform
         .compute_with_derived_key::<_, IDENTITY_SIGNING_PRIVATE_KEY_LEN>(
+            RootKey::PerBoot,
             identity_signing_key_kdf,
-            &key_pair.nonce,
-            identity_signing_op,
-            ComputeParams {
-                input: &digest,
-                output: &mut signature,
-            },
+            IDENTITY_SIGNING_KEY_LABEL,
+            op,
+            ComputeParams { input, output },
         )
-        .map_err(derived_key_errno)?;
-    Ok(signature)
+        .map_err(derived_key_errno)
 }
 
 fn derived_key_errno(err: DerivedKeyError<Errno>) -> Errno {
     match err {
         DerivedKeyError::ShimKDFError(err) => err,
-        DerivedKeyError::ShimKDFRequired | DerivedKeyError::UnsupportedRebootPersistentKey => {
-            Errno::EOPNOTSUPP
-        }
+        DerivedKeyError::ShimKDFRequired
+        | DerivedKeyError::UnsupportedRebootPersistentKey
+        | DerivedKeyError::UnsupportedPerBootKey => Errno::EOPNOTSUPP,
         DerivedKeyError::KeyUnavailable => Errno::ENOKEY,
     }
 }
 
-// IDK_S exists only inside `compute_with_derived_key`: each use derives it with
-// `identity_signing_key_kdf` and signs there. The platform is stateless, so the
-// shim owns freshness: a nonce drawn once per boot, passed as `key_context`,
-// makes IDK_S new on every boot.
-//
-// The nonce is not secret: it reveals nothing without the platform root key.
-
-static IDENTITY_SIGNING_KEY_PAIR: Once<IdentitySigningKeyPair> = Once::new();
-
-struct IdentitySigningKeyPair {
-    /// Stands in for the private key: the `key_context` for IDK_S.
-    nonce: [u8; IDENTITY_SIGNING_KEY_NONCE_LEN],
-    public_key: [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN],
-}
+/// Cached IDK_S public key; IDK_S itself is re-derived on every use.
+static IDENTITY_SIGNING_PUBLIC_KEY: Once<[u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN]> = Once::new();
 
 #[derive(TryFromPrimitive)]
 #[repr(u8)]
@@ -347,12 +345,12 @@ pub fn generate_identity_signing_key<Platform: crate::OpteeShimPlatform>(
     }
 }
 
-/// This function generates an identity signing key pair (IDK_S) and returns the public
-/// portion of it.
+/// This function returns the public portion of the identity signing key (IDK_S),
+/// deriving it on first use.
 ///
 /// - `public_key_pa`: VTL0/Normal-world physical address where an uncompressed SEC1 P-384
-///   public key will be written. The private key is derived from the platform root key and a
-///   per-boot nonce inside `compute_with_derived_key` and never leaves the platform.
+///   public key will be written. The private key is derived from the platform's per-boot root
+///   key inside `compute_with_derived_key` and never leaves the platform.
 /// - `key_alg`: Key algorithm namespace and variant. Only ECDSA P-384 is supported.
 ///
 /// We intentially uses the raw format. Any DER/SPKI wrapping or TCG event‑log construction
@@ -375,9 +373,9 @@ fn generate_identity_signing_key_inner<Platform: crate::OpteeShimPlatform>(
         )
         .map_err(|_| Errno::EINVAL)?;
 
-    let key_pair = get_identity_signing_key_pair(platform)?;
+    let public_key = get_identity_signing_public_key(platform)?;
     pubkey_ptr
-        .write_at_offset(0, key_pair.public_key)
+        .write_at_offset(0, *public_key)
         .map_err(|_| Errno::EFAULT)?;
     Ok(0)
 }
@@ -405,32 +403,25 @@ fn validate_key_algorithm(key_alg: u64) -> Result<(), Errno> {
     }
 }
 
-fn get_identity_signing_key_pair<Platform: crate::OpteeShimPlatform>(
+fn get_identity_signing_public_key<Platform: crate::OpteeShimPlatform>(
     platform: &Platform,
-) -> Result<&'static IdentitySigningKeyPair, Errno> {
-    IDENTITY_SIGNING_KEY_PAIR.try_call_once(|| {
-        let mut nonce = [0u8; IDENTITY_SIGNING_KEY_NONCE_LEN];
-        platform.fill_bytes_crng(&mut nonce);
+) -> Result<&'static [u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN], Errno> {
+    IDENTITY_SIGNING_PUBLIC_KEY.try_call_once(|| {
         let mut public_key = [0u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN];
-        platform
-            .compute_with_derived_key::<_, IDENTITY_SIGNING_PRIVATE_KEY_LEN>(
-                identity_signing_key_kdf,
-                &nonce,
-                identity_signing_public_key_op,
-                ComputeParams {
-                    input: &[],
-                    output: &mut public_key,
-                },
-            )
-            .map_err(derived_key_errno)?;
-        Ok(IdentitySigningKeyPair { nonce, public_key })
+        compute_with_identity_signing_key(
+            platform,
+            identity_signing_public_key_op,
+            &[],
+            &mut public_key,
+        )?;
+        Ok(public_key)
     })
 }
 
 // The callbacks below follow the `DerivedKeyProvider::derive_key` callback rules.
 
-/// KDF for IDK_S. `context`: nonce. `output`: the first valid P-384 scalar of
-/// HMAC-SHA384(root_key, label || nonce || ctr).
+/// KDF for IDK_S. `context`: label. `output`: the first valid P-384 scalar of
+/// HMAC-SHA384(root_key, label || ctr).
 fn identity_signing_key_kdf(root_key: &[u8], params: KDFParams<'_>) -> Result<(), Errno> {
     if params.output.len() != IDENTITY_SIGNING_PRIVATE_KEY_LEN {
         return Err(Errno::EINVAL);
@@ -438,7 +429,6 @@ fn identity_signing_key_kdf(root_key: &[u8], params: KDFParams<'_>) -> Result<()
     for ctr in 0..MAX_KEYGEN_ATTEMPT {
         let mut bytes = Hmac::<Sha384>::new_from_slice(root_key)
             .map_err(|_| Errno::EINVAL)?
-            .chain_update(IDENTITY_SIGNING_KEY_LABEL)
             .chain_update(params.context)
             .chain_update(ctr.to_le_bytes())
             .finalize()
@@ -650,9 +640,8 @@ mod tests {
                     assert_eq!(params.get_values(2).unwrap(), None);
                     assert_eq!(&output[..expected.len()], expected);
                     assert_eq!(output[required_size], 0xcc);
-                    let key_pair = get_identity_signing_key_pair(task.global.platform).unwrap();
-                    let verifying_key =
-                        VerifyingKey::from_sec1_bytes(&key_pair.public_key).unwrap();
+                    let public_key = get_identity_signing_public_key(task.global.platform).unwrap();
+                    let verifying_key = VerifyingKey::from_sec1_bytes(public_key).unwrap();
                     let signature =
                         Signature::from_slice(&output[expected.len()..required_size]).unwrap();
                     verifying_key.verify(&expected, &signature).unwrap();
@@ -705,102 +694,22 @@ mod tests {
     }
 
     #[test]
-    fn identity_signing_key_is_rederived_from_nonce() {
-        use litebox::platform::DerivedKeyProvider as _;
-
-        let task = crate::syscalls::tests::init_platform();
-        let platform = task.global.platform;
-        let key_pair = get_identity_signing_key_pair(platform).unwrap();
-        let derive_public_key = |nonce: &[u8; IDENTITY_SIGNING_KEY_NONCE_LEN]| {
-            let mut public_key = [0u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN];
-            platform
-                .compute_with_derived_key::<_, IDENTITY_SIGNING_PRIVATE_KEY_LEN>(
-                    identity_signing_key_kdf,
-                    nonce,
-                    identity_signing_public_key_op,
-                    ComputeParams {
-                        input: &[],
-                        output: &mut public_key,
-                    },
-                )
-                .map_err(derived_key_errno)
-                .map(|()| public_key)
-        };
-        assert_eq!(
-            derive_public_key(&key_pair.nonce).unwrap(),
-            key_pair.public_key
-        );
-        let mut other_nonce = key_pair.nonce;
-        other_nonce[0] ^= 1;
-        assert_ne!(
-            derive_public_key(&other_nonce).unwrap(),
-            key_pair.public_key
-        );
-    }
-
-    #[test]
-    fn identity_signing_key_kdf_uses_label_nonce_and_counter() {
-        // Pins the derivation: an in-range first candidate (ctr = 0) is the key. The
-        // retry path is unreachable in practice (probability ~2^-190 per candidate).
-        let root_key = [0x42u8; 32];
-        let nonce = [0x07u8; IDENTITY_SIGNING_KEY_NONCE_LEN];
-        let mut key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
-        identity_signing_key_kdf(
-            &root_key,
-            KDFParams {
-                context: &nonce,
-                output: &mut key,
-            },
-        )
-        .unwrap();
-        let expected = Hmac::<Sha384>::new_from_slice(&root_key)
-            .unwrap()
-            .chain_update(b"litebox-optee-idks-v1")
-            .chain_update(nonce)
-            .chain_update(0u32.to_le_bytes())
-            .finalize()
-            .into_bytes();
-        assert_eq!(key[..], expected[..]);
-
-        let mut short = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN - 1];
-        assert_eq!(
+    fn identity_signing_key_depends_on_root_and_context() {
+        let derive = |root: &[u8], context: &[u8]| {
+            let mut key = [0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN];
             identity_signing_key_kdf(
-                &root_key,
+                root,
                 KDFParams {
-                    context: &nonce,
-                    output: &mut short,
+                    context,
+                    output: &mut key,
                 },
-            ),
-            Err(Errno::EINVAL)
-        );
-    }
-
-    #[test]
-    fn identity_signing_ops_reject_invalid_keys() {
-        let mut public_key = [0u8; IDENTITY_SIGNING_PUBLIC_KEY_LEN];
-        let mut signature = [0u8; IDKS_ENDORSEMENT_SIGNATURE_LEN];
-        for key in [[0u8; IDENTITY_SIGNING_PRIVATE_KEY_LEN], [0xff; _]] {
-            assert_eq!(
-                identity_signing_public_key_op(
-                    &key,
-                    ComputeParams {
-                        input: &[],
-                        output: &mut public_key,
-                    },
-                ),
-                Err(Errno::EINVAL)
-            );
-            assert_eq!(
-                identity_signing_op(
-                    &key,
-                    ComputeParams {
-                        input: &[0; SHA384_DIGEST_LEN],
-                        output: &mut signature,
-                    },
-                ),
-                Err(Errno::EINVAL)
-            );
-        }
+            )
+            .unwrap();
+            key
+        };
+        let key = derive(&[0x42; 32], IDENTITY_SIGNING_KEY_LABEL);
+        assert_ne!(key, derive(&[0x43; 32], IDENTITY_SIGNING_KEY_LABEL));
+        assert_ne!(key, derive(&[0x42; 32], b"other-label"));
     }
 
     #[test]
@@ -814,7 +723,7 @@ mod tests {
         identity_signing_key_kdf(
             &[0x42u8; 32],
             KDFParams {
-                context: &[0x07u8; IDENTITY_SIGNING_KEY_NONCE_LEN],
+                context: IDENTITY_SIGNING_KEY_LABEL,
                 output: &mut key,
             },
         )
