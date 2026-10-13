@@ -133,7 +133,10 @@ int main(int argc, char **argv) {
                         type == SOCK_STREAM;
         int sent = write(socket_fd, "exec", 4) == 4;
         char reply[8] = {0};
-        int replied = read(socket_fd, reply, sizeof reply - 1) == 5 && strcmp(reply, "reply") == 0;
+        // Bounded like the parent's waits, so a lost reply fails instead of hanging.
+        struct pollfd poll_fd = {.fd = socket_fd, .events = POLLIN};
+        int replied = poll(&poll_fd, 1, 30000) == 1 &&
+                      read(socket_fd, reply, sizeof reply - 1) == 5 && strcmp(reply, "reply") == 0;
         int hidden_closed = fcntl(hidden, F_GETFD) == -1 && errno == EBADF;
         printf("child-unix stream=%d sent=%d replied=%d hidden_closed=%d\n", is_stream, sent,
                replied, hidden_closed);
