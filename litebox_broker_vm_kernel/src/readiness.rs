@@ -32,6 +32,8 @@ pub(crate) struct KernelReadiness {
     notifications: SpinMutex<Option<Producer>>,
     /// The process corrupted its notification ring.
     failed: AtomicBool,
+    /// A notification was written since [`Self::take_published`].
+    published: AtomicBool,
 }
 
 impl KernelReadiness {
@@ -55,7 +57,15 @@ impl KernelReadiness {
         let Some(producer) = notifications.as_mut() else {
             return;
         };
-        match publish_pending_readiness(&self.publisher, &mut Ring(producer)) {
+        let mut ring = Ring {
+            producer,
+            written: false,
+        };
+        let result = publish_pending_readiness(&self.publisher, &mut ring);
+        if ring.written {
+            self.published.store(true, Ordering::Relaxed);
+        }
+        match result {
             Ok(()) | Err(RingError::Full) => {}
             Err(RingError::Ring(error)) => {
                 log::warn!("broker notification ring failed: {error:?}");
@@ -64,6 +74,11 @@ impl KernelReadiness {
                 self.failed.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Whether a notification was written since the last call.
+    pub(crate) fn take_published(&self) -> bool {
+        self.published.swap(false, Ordering::Relaxed)
     }
 
     /// Whether the process corrupted its notification ring, which fails the
@@ -79,7 +94,10 @@ enum RingError {
 }
 
 /// Never blocks: a full ring fails the send.
-struct Ring<'a>(&'a mut Producer);
+struct Ring<'a> {
+    producer: &'a mut Producer,
+    written: bool,
+}
 
 impl HostNotificationChannel for Ring<'_> {
     type Error = RingError;
@@ -89,8 +107,11 @@ impl HostNotificationChannel for Ring<'_> {
         notification: &BrokerNotification,
     ) -> core::result::Result<(), RingError> {
         let frame = wire::encode_notification(notification.clone());
-        match self.0.try_write(&frame).map_err(RingError::Ring)? {
-            ControlRingWriteStatus::Written => Ok(()),
+        match self.producer.try_write(&frame).map_err(RingError::Ring)? {
+            ControlRingWriteStatus::Written => {
+                self.written = true;
+                Ok(())
+            }
             ControlRingWriteStatus::Full { .. } => Err(RingError::Full),
         }
     }

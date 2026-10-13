@@ -159,10 +159,11 @@ impl RawMutexProvider for VmUserland {
 
 impl WaitWakerProvider for VmUserland {}
 
-/// One thread: nothing else can change a waiter's word. So a wait sleeps on
-/// the kernel's deadline wait until its timeout or, if earlier, a platform
-/// timer's deadline (whose signal then interrupts it); one with neither
-/// panics, as nothing could end it.
+/// One thread: nothing else in the runner can change a waiter's word. So a
+/// wait halts in the kernel until its timeout, a platform timer's deadline
+/// (whose signal then interrupts it), or, with a [`NotificationReceiver`],
+/// a broker notification, which it dispatches (possibly waking the waiter).
+/// One that nothing could end panics.
 pub struct RawMutex {
     inner: AtomicU32,
 }
@@ -180,21 +181,25 @@ impl RawMutexTrait for RawMutex {
         0
     }
 
-    /// A wait without a timeout: if a platform timer (`alarm`/`setitimer`)
-    /// is armed, sleeps until its deadline (one may then be pending once
-    /// resumed); otherwise panics, as nothing else could end the wait. So a
-    /// wait the timer's signal does not end (e.g., `pause` with `SIGALRM`
-    /// ignored) panics after it expires, where Linux would block forever.
+    /// A wait without a timeout: halts until a broker notification or an
+    /// armed platform timer's deadline (whose signal may then be pending once
+    /// resumed); panics if nothing could end it. So a wait the timer's signal
+    /// does not end (e.g., `pause` with `SIGALRM` ignored) panics after it
+    /// expires, unless input could still arrive, where Linux would block
+    /// forever.
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
         if self.inner.load(Ordering::Relaxed) != val {
             return Err(ImmediatelyWokenUp);
         }
-        let Some(deadline) = timer::next_deadline() else {
-            panic!(
-                "a wait that nothing could end in the single-threaded VM userland runner would deadlock"
-            );
-        };
-        TIMED_WAIT.sleep_until(deadline);
+        let deadline = timer::next_deadline();
+        let ended = receive(deadline).is_some()
+            || deadline
+                .map(|deadline| TIMED_WAIT.sleep_until(deadline))
+                .is_some();
+        assert!(
+            ended,
+            "a wait that nothing could end in the single-threaded VM userland runner would deadlock"
+        );
         Ok(())
     }
 
@@ -211,27 +216,92 @@ impl RawMutexTrait for RawMutex {
             return self.block(val).map(|()| UnblockedOrTimedOut::Unblocked);
         };
         // A platform timer due first ends the wait early, to raise its signal.
-        if let Some(timer) = timer::next_deadline().filter(|&timer| timer < deadline) {
-            TIMED_WAIT.sleep_until(timer);
-            return Ok(UnblockedOrTimedOut::Unblocked);
-        }
-        TIMED_WAIT.sleep_until(deadline);
-        Ok(UnblockedOrTimedOut::TimedOut)
+        let timer = timer::next_deadline().filter(|&timer| timer < deadline);
+        let wake = timer.unwrap_or(deadline);
+        let received = receive(Some(wake)).unwrap_or_else(|| {
+            TIMED_WAIT.sleep_until(wake);
+            0
+        });
+        Ok(if received != 0 || timer.is_some() {
+            UnblockedOrTimedOut::Unblocked
+        } else {
+            UnblockedOrTimedOut::TimedOut
+        })
     }
 }
 
-/// What [`RawMutex`] needs for timed waits, which get no platform reference;
-/// set by [`VmUserland::new`].
+/// Receives broker notifications (e.g., a timer file's expiry, or standard
+/// input arriving) for the runner, dispatching them (e.g., with
+/// `LiteBox::broker_notification_dispatcher`). They arrive while the guest
+/// runs, too, not only while it waits: the kernel interrupts the process
+/// once it publishes one, i.e., when a broker timer comes due, or as the
+/// broker serves the process's requests (where, e.g., standard input that
+/// arrived meanwhile is published).
+pub trait NotificationReceiver: Sync {
+    /// Dispatches the published notifications, first waiting for one until
+    /// `deadline` if there are none. Returns how many: zero at the deadline;
+    /// `None`, without waiting, if nothing could publish (no deadline and
+    /// nothing to come, or receiving failed for good).
+    fn receive(&self, deadline: Option<Instant>) -> Option<usize>;
+
+    /// Dispatches the published notifications, without waiting; enters the
+    /// kernel only after reading a full ring, for it to publish the rest.
+    fn drain(&self);
+}
+
+impl VmUserland {
+    /// Lets waits end at broker notifications, and dispatches those that
+    /// interrupt the guest. At most once.
+    ///
+    /// # Panics
+    ///
+    /// On a second call.
+    pub fn set_notification_receiver(&self, receiver: &'static dyn NotificationReceiver) {
+        let mut set = false;
+        TIMED_WAIT.receiver.call_once(|| {
+            set = true;
+            receiver
+        });
+        assert!(set, "the notification receiver is already set");
+    }
+}
+
+/// [`NotificationReceiver::receive`], if there is a receiver: `None`, without
+/// waiting, if there is none or nothing could publish (waits then only
+/// sleep until their deadline).
+fn receive(deadline: Option<Instant>) -> Option<usize> {
+    TIMED_WAIT.receiver.get()?.receive(deadline)
+}
+
+/// Dispatches the notifications an interrupt may be for.
+pub(crate) fn drain_notifications() {
+    if let Some(receiver) = TIMED_WAIT.receiver.get() {
+        receiver.drain();
+    }
+}
+
+/// Whether an interrupt may be for the shim: there is a notification
+/// receiver, or a platform timer. Else the kernel interrupted for something
+/// this runner does not take interrupts for (e.g., notifications it receives
+/// only by waiting).
+pub(crate) fn interrupts_for_shim() -> bool {
+    TIMED_WAIT.receiver.get().is_some() || timer::any()
+}
+
+/// What [`RawMutex`] needs for waits, which get no platform reference; set
+/// by [`VmUserland::new`] and [`VmUserland::set_notification_receiver`].
 struct TimedWait {
     /// [`StartupInfo::clock_khz`], for [`now`].
     clock_khz: AtomicU64,
     /// [`StartupInfo::broker_control_ring`]'s start.
     control_ring: AtomicU64,
+    receiver: spin::Once<&'static dyn NotificationReceiver>,
 }
 
 static TIMED_WAIT: TimedWait = TimedWait {
     clock_khz: AtomicU64::new(0),
     control_ring: AtomicU64::new(0),
+    receiver: spin::Once::new(),
 };
 
 impl TimedWait {

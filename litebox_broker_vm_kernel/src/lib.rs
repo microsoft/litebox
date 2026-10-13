@@ -10,9 +10,11 @@
 //!
 //! Files are the devices under `/dev`, with standard streams on the
 //! runner's [`stdio::Console`], and those of an optional read-only root
-//! ([`Config::root`]). Readiness (e.g., of standard input) goes to the
+//! ([`Config::root`]). Timers are on the kernel clock.
+//! Readiness (e.g., of standard input, or a timer's expiry) goes to the
 //! association's notification ring. Waiting ([`BrokerEnterOp::Wait`]) halts
-//! until the runner's [`Events`] report something, e.g., an interrupt.
+//! until the runner's [`Events`] report something, e.g., an interrupt, or
+//! until a timer's deadline.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -24,6 +26,7 @@ mod memory;
 mod providers;
 mod readiness;
 pub mod stdio;
+mod timers;
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -50,6 +53,7 @@ use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel};
 use memory::{PinnedControlRing, UserSharedMemory};
 use readiness::KernelReadiness;
 use stdio::ConsoleStdio;
+use timers::KernelTimers;
 
 /// Size of a process's broker shared memory.
 pub const SHARED_MEMORY_SIZE: usize = SHARED_BUFFER_POOL_SIZE;
@@ -68,7 +72,7 @@ pub trait Events: Sync {
 
 /// The runner's sources for a [`Broker`].
 pub struct Config {
-    /// For its clock.
+    /// For its clock, which timers are on.
     pub platform: &'static VmKernel,
     /// Behind `/dev/stdin`, `/dev/stdout`, and `/dev/stderr`.
     pub console: &'static dyn stdio::Console,
@@ -84,6 +88,7 @@ pub struct Broker {
     platform: &'static VmKernel,
     events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
+    timers: Arc<KernelTimers>,
 }
 
 impl Broker {
@@ -94,11 +99,13 @@ impl Broker {
     /// Without a hardware CSPRNG, or on a second call.
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
+        let timers = Arc::new(KernelTimers::new(config.platform));
         Self {
-            core: providers::core(config.root, stdio.clone()),
+            core: providers::core(config.root, stdio.clone(), timers.clone()),
             platform: config.platform,
             events: config.events,
             stdio,
+            timers,
         }
     }
 
@@ -194,6 +201,29 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 }
 
 impl Association {
+    /// The earliest armed broker timer's deadline, on the kernel clock:
+    /// when [`Self::fire_timers`] next has something to publish.
+    pub fn next_timer_deadline(&self) -> Option<Instant> {
+        self.broker.timers.next_deadline()
+    }
+
+    /// Fires the broker timers that are due, publishing their readiness, as
+    /// [`BrokerEnterOp::Wait`] would; for a process that is running instead.
+    /// A notification ring this corrupts fails the association, which its
+    /// next [`Self::enter`] reports.
+    pub fn fire_timers(&self) {
+        self.broker.timers.fire();
+        let _ = self.flush_readiness();
+    }
+
+    /// Whether a notification was published since the last call (e.g., a
+    /// timer fired, or standard input arrived, as the broker served a
+    /// request): the process then has something to receive, even while it
+    /// runs.
+    pub fn take_published(&self) -> bool {
+        self.readiness.take_published()
+    }
+
     /// [`BrokerHandshake`](litebox_common_vm_abi::CallId::BrokerHandshake):
     /// one attempt, successful or not; success activates the control ring.
     ///
@@ -261,7 +291,7 @@ impl Association {
     /// Waiting halts the kernel (single CPU, no scheduler) until the word
     /// changes or the deadline passes. Only notifications change ring words
     /// asynchronously; a wait on another word without a deadline, or on the
-    /// notification epoch when no event could publish, is
+    /// notification epoch when no event or armed timer could publish, is
     /// [`Status::Stalled`]. A corrupted notification ring fails the
     /// association, as a corrupted request ring does.
     ///
@@ -304,6 +334,7 @@ impl Association {
             }
         };
         self.broker.stdio.poll();
+        self.broker.timers.fire();
         active.serve().map_err(|Failed| EnterError::Failed)?;
         self.flush_readiness()?;
         let Some(offset) = wait_offset else {
@@ -313,7 +344,14 @@ impl Association {
         let asynchronous = offset == ControlRingDirection::Notifications.producer_epoch_offset();
         loop {
             match active.words.load_u32_acquire(offset) {
-                Ok(word) if word != request.expected => return Ok(()),
+                Ok(word) if word != request.expected => {
+                    if asynchronous {
+                        // The runner receives the notifications next, so
+                        // need not also be interrupted for them.
+                        self.readiness.take_published();
+                    }
+                    return Ok(());
+                }
                 Ok(_) => {}
                 Err(_) => return Err(invalid()),
             }
@@ -323,10 +361,17 @@ impl Association {
             if deadline.is_none() && !asynchronous {
                 return Err(EnterError::Status(Status::Stalled));
             }
-            if !self.broker.events.wait(deadline) {
+            // Only notifications see timers, which fire as the broker runs.
+            let wake = if asynchronous {
+                timers::earliest(deadline, self.broker.timers.next_deadline())
+            } else {
+                deadline
+            };
+            if !self.broker.events.wait(wake) {
                 return Err(EnterError::Status(Status::Stalled));
             }
             self.broker.stdio.poll();
+            self.broker.timers.fire();
             self.flush_readiness()?;
         }
     }

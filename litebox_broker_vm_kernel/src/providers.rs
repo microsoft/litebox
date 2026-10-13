@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! The broker core's providers: hardware randomness, `/dev` (standard
+//! The broker core's providers: hardware randomness, timers, `/dev` (standard
 //! streams from the runner's [`StdioProvider`], `null`, `urandom`), and,
 //! optionally, a read-only root from a tar.
 
@@ -12,7 +12,7 @@ use litebox_broker_core::{
     random::{RandomProvider, RandomProviderError},
     socket::UnsupportedSocketProvider,
     stdio::StdioProvider,
-    timer::UnsupportedTimerProvider,
+    timer::TimerProvider,
 };
 use litebox_platform_vm_kernel::VmKernel;
 
@@ -47,13 +47,17 @@ fn file_service(
 /// # Panics
 ///
 /// Without a hardware CSPRNG, or on a second call.
-pub(crate) fn core(root: Option<&'static [u8]>, stdio: Arc<dyn StdioProvider>) -> BrokerCore {
+pub(crate) fn core(
+    root: Option<&'static [u8]>,
+    stdio: Arc<dyn StdioProvider>,
+    timers: Arc<dyn TimerProvider>,
+) -> BrokerCore {
     let random: Arc<dyn RandomProvider> = Arc::new(HardwareRandom(litebox_hal::rng::hardware()));
     BrokerCore::new(
         PolicyEngine::with_host_guaranteed_rights(ObjectRights::WAIT | ObjectRights::WRITE),
         Arc::new(UnsupportedSocketProvider),
         Arc::clone(&random),
-        Arc::new(UnsupportedTimerProvider),
+        timers,
         file_service(root, stdio, random),
     )
     .unwrap_or_else(|error| panic!("broker core: {error:?}"))

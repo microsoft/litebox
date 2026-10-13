@@ -1538,6 +1538,7 @@ dependencies = [
  "litebox_common_vm_abi",
  "litebox_platform",
  "litebox_platform_vm_userland",
+ "log",
  "spin 0.9.8",
 ]
 

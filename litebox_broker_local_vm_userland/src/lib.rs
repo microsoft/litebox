@@ -13,7 +13,8 @@
 //!
 //! Notifications (readiness of broker objects, e.g., standard input) have no
 //! receiver thread: the runner receives them with [`Notifications::receive`],
-//! which also waits for them.
+//! which also waits for them, or, as the platform's waits and interrupts
+//! need, with a [`Receiver`] (in place of the userland receiver thread).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -31,9 +32,10 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::wire::{self, WireError};
 use litebox_broker_transport::channel::{LocalCallChannel, LocalSetupChannel};
 use litebox_broker_transport::control_ring::{
-    CONTROL_RING_MEMORY_SIZE, ControlRing, ControlRingConsumer, ControlRingDirection,
-    ControlRingError, ControlRingProducer, ControlRingReadError, ControlRingReadStatus,
-    ControlRingWriteStatus, LocalControlRingEndpoints, MemoryAccessPolicy, WaitableSharedMemory,
+    CONTROL_RING_MEMORY_SIZE, CONTROL_RING_NOTIFICATION_SLOT_COUNT, ControlRing,
+    ControlRingConsumer, ControlRingDirection, ControlRingError, ControlRingProducer,
+    ControlRingReadError, ControlRingReadStatus, ControlRingWriteStatus, LocalControlRingEndpoints,
+    MemoryAccessPolicy, WaitableSharedMemory,
 };
 use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
@@ -41,7 +43,7 @@ use litebox_common_vm_abi::{
     BrokerEnterRequest, BrokerHandshakeFrame, StartupInfo, Status, UserRange, WireFrame,
 };
 use litebox_platform::time::{Instant as _, TimeProvider as _};
-use litebox_platform_vm_userland::{Instant, VmUserland, kcall};
+use litebox_platform_vm_userland::{Instant, NotificationReceiver, VmUserland, kcall};
 
 #[derive(Debug)]
 pub enum ChannelError {
@@ -400,33 +402,161 @@ impl Notifications {
         deadline: Option<Instant>,
         mut dispatch: impl FnMut(BrokerNotification),
     ) -> Result<usize, ChannelError> {
-        let mut received = 0;
         loop {
-            match self.consumer.try_read(wire::decode_notification) {
-                Ok(ControlRingReadStatus::Message(notification)) => {
-                    dispatch(notification);
-                    received += 1;
-                }
-                Ok(ControlRingReadStatus::Empty { wait_epoch }) => {
-                    if received != 0 {
-                        break;
-                    }
-                    let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
-                    match broker_wait(epoch, wait_epoch, deadline) {
-                        Ok(()) => {}
-                        Err(Status::TimedOut) => return Ok(0),
-                        Err(status) => return Err(ChannelError::Kernel(status)),
-                    }
-                }
-                Err(ControlRingReadError::Ring(error)) => return Err(ChannelError::Ring(error)),
-                Err(ControlRingReadError::Decode(error)) => {
-                    return Err(ChannelError::Wire(error));
-                }
+            let (received, wait_epoch) = self.read_published(&mut dispatch, broker_wake)?;
+            if received != 0 {
+                return Ok(received);
+            }
+            let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
+            match broker_wait(epoch, wait_epoch, deadline) {
+                Ok(()) => {}
+                Err(Status::TimedOut) => return Ok(0),
+                Err(status) => return Err(ChannelError::Kernel(status)),
             }
         }
-        // The kernel sees the freed slots when it next publishes.
-        self.consumer.publish_head().map_err(ChannelError::Ring)?;
-        Ok(received)
+    }
+
+    /// Passes the notifications already published to `dispatch`, without
+    /// waiting. Enters the kernel only after reading a full ring, for it to
+    /// publish what did not fit. Returns how many it passed.
+    ///
+    /// # Errors
+    ///
+    /// A malformed ring, or a kernel call the kernel rejects.
+    pub fn try_receive(
+        &mut self,
+        mut dispatch: impl FnMut(BrokerNotification),
+    ) -> Result<usize, ChannelError> {
+        Ok(self.read_published(&mut dispatch, broker_wake)?.0)
+    }
+
+    /// As [`Self::try_receive`], also returning the producer epoch to wait on
+    /// while the ring stays empty; `publish_rest` (e.g., [`broker_wake`]) has
+    /// the kernel publish what did not fit in a full ring.
+    fn read_published(
+        &mut self,
+        dispatch: &mut impl FnMut(BrokerNotification),
+        mut publish_rest: impl FnMut() -> Result<(), Status>,
+    ) -> Result<(usize, u32), ChannelError> {
+        let mut received = 0;
+        loop {
+            let mut batch = 0;
+            let wait_epoch = loop {
+                match self.consumer.try_read(wire::decode_notification) {
+                    Ok(ControlRingReadStatus::Message(notification)) => {
+                        dispatch(notification);
+                        batch += 1;
+                    }
+                    Ok(ControlRingReadStatus::Empty { wait_epoch }) => break wait_epoch,
+                    Err(error) => return Err(read_error(error)),
+                }
+            };
+            received += batch;
+            if batch != 0 {
+                // The kernel sees the freed slots when it next publishes.
+                self.consumer.publish_head().map_err(ChannelError::Ring)?;
+            }
+            if (batch as u64) < CONTROL_RING_NOTIFICATION_SLOT_COUNT {
+                return Ok((received, wait_epoch));
+            }
+            // A full ring: the kernel may hold more. This publishes them, and
+            // so leaves the kernel to interrupt the process for them once
+            // more, with nothing left to receive by then.
+            publish_rest().map_err(ChannelError::Kernel)?;
+        }
+    }
+}
+
+impl Notifications {
+    /// For the platform's waits and interrupts
+    /// (`VmUserland::set_notification_receiver`).
+    pub fn into_receiver<Dispatch, Failure>(
+        self,
+        dispatch: Dispatch,
+        dispatch_failure: Failure,
+    ) -> Receiver<Dispatch, Failure>
+    where
+        Dispatch: Fn(BrokerNotification) + Sync,
+        Failure: Fn() + Sync,
+    {
+        Receiver {
+            notifications: spin::Mutex::new(Some(self)),
+            dispatch,
+            dispatch_failure,
+        }
+    }
+}
+
+/// Receives the association's notifications as the userland receiver thread
+/// does: each goes to `dispatch` (e.g.,
+/// `LiteBox::broker_notification_dispatcher`); a failure to receive (e.g., a
+/// malformed ring) fails the association's objects, once, with
+/// `dispatch_failure` (e.g., `LiteBox::broker_failure_dispatcher`), and then
+/// nothing more is received.
+pub struct Receiver<Dispatch, Failure> {
+    /// `None` once receiving failed.
+    notifications: spin::Mutex<Option<Notifications>>,
+    dispatch: Dispatch,
+    dispatch_failure: Failure,
+}
+
+impl<Dispatch, Failure> Receiver<Dispatch, Failure>
+where
+    Dispatch: Fn(BrokerNotification) + Sync,
+    Failure: Fn() + Sync,
+{
+    /// `receive` on the notifications, unless receiving failed (`None`);
+    /// fails them on an error.
+    fn with_notifications<T>(
+        &self,
+        receive: impl FnOnce(&mut Notifications, &Dispatch) -> Result<T, ChannelError>,
+    ) -> Option<Result<T, ChannelError>> {
+        let mut notifications = self
+            .notifications
+            .try_lock()
+            .expect("one thread receives at a time");
+        let result = receive(notifications.as_mut()?, &self.dispatch);
+        match &result {
+            Err(ChannelError::Kernel(Status::Stalled)) | Ok(_) => {}
+            Err(error) => {
+                log::error!("failed to receive broker notifications: {error}");
+                *notifications = None;
+                drop(notifications);
+                (self.dispatch_failure)();
+            }
+        }
+        Some(result)
+    }
+}
+
+impl<Dispatch, Failure> NotificationReceiver for Receiver<Dispatch, Failure>
+where
+    Dispatch: Fn(BrokerNotification) + Sync,
+    Failure: Fn() + Sync,
+{
+    /// After a failure, nothing could publish (`None`). The failure itself
+    /// counts as one dispatched notification, so waiters recheck (and see
+    /// their objects failed).
+    fn receive(&self, deadline: Option<Instant>) -> Option<usize> {
+        match self.with_notifications(|notifications, dispatch| {
+            notifications.receive(deadline, dispatch)
+        })? {
+            Ok(received) => Some(received),
+            // Nothing could publish: no input to come, and no timer armed.
+            Err(ChannelError::Kernel(Status::Stalled)) => None,
+            Err(_) => Some(1),
+        }
+    }
+
+    fn drain(&self) {
+        self.with_notifications(|notifications, dispatch| notifications.try_receive(dispatch));
+    }
+}
+
+fn read_error(error: ControlRingReadError<WireError>) -> ChannelError {
+    match error {
+        ControlRingReadError::Ring(error) => ChannelError::Ring(error),
+        ControlRingReadError::Decode(error) => ChannelError::Wire(error),
     }
 }
 
@@ -484,4 +614,129 @@ pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
     wake.expected = 1;
     assert_eq!(kcall::call(&wake), Err(Status::InvalidArgument));
     broker_wake().expect("the association survives");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use litebox_broker_protocol::ObjectHandle;
+    use litebox_broker_protocol::message::ReadinessNotification;
+    use litebox_broker_protocol::readiness::ReadinessFlags;
+
+    /// A control ring in `memory`: the runner's notifications, and the
+    /// kernel's notification producer.
+    fn ring(memory: &mut [u64]) -> (Notifications, ControlRingProducer<KernelControlRing>) {
+        let region = UserRange {
+            start: memory.as_mut_ptr() as u64,
+            len: CONTROL_RING_MEMORY_SIZE as u64,
+        };
+        let ring = || KernelControlRing::new(region).expect("room for the ring");
+        let notifications = Notifications {
+            consumer: ControlRing::new(ring())
+                .expect("ring")
+                .into_local()
+                .notification_consumer,
+            words: ring(),
+        };
+        let producer = ControlRing::new(ring())
+            .expect("ring")
+            .into_broker()
+            .notification_producer;
+        (notifications, producer)
+    }
+
+    fn readiness(handle: u64) -> Vec<u8> {
+        wire::encode_notification(BrokerNotification::Readiness(ReadinessNotification {
+            handle: ObjectHandle(handle),
+            readiness: ReadinessFlags::READ,
+        }))
+    }
+
+    fn ring_memory() -> Vec<u64> {
+        alloc::vec![0u64; CONTROL_RING_MEMORY_SIZE / size_of::<u64>()]
+    }
+
+    #[test]
+    fn receiving_one_at_a_time_frees_every_slot() {
+        let mut memory = ring_memory();
+        let (mut notifications, mut producer) = ring(&mut memory);
+        let slots = usize::try_from(CONTROL_RING_NOTIFICATION_SLOT_COUNT).unwrap();
+        for round in 0..2 * slots {
+            assert_eq!(
+                producer.try_write(&readiness(7)),
+                Ok(ControlRingWriteStatus::Written),
+                "full at round {round}: received slots never freed"
+            );
+            assert_eq!(notifications.receive(None, |_| {}).expect("received"), 1);
+        }
+    }
+
+    #[test]
+    fn receiving_a_full_ring_has_the_kernel_publish_the_rest() {
+        let mut memory = ring_memory();
+        let (mut notifications, mut producer) = ring(&mut memory);
+        for handle in 0..CONTROL_RING_NOTIFICATION_SLOT_COUNT {
+            producer.try_write(&readiness(handle)).expect("written");
+        }
+        assert!(matches!(
+            producer.try_write(&readiness(99)),
+            Ok(ControlRingWriteStatus::Full { .. })
+        ));
+        // As `receive` and `try_receive` read, with the kernel call counted.
+        let mut publish_rest_calls = 0;
+        let (received, _) = notifications
+            .read_published(&mut |_| {}, || {
+                publish_rest_calls += 1;
+                Ok(())
+            })
+            .expect("received");
+        assert_eq!(
+            received,
+            usize::try_from(CONTROL_RING_NOTIFICATION_SLOT_COUNT).unwrap()
+        );
+        assert_eq!(publish_rest_calls, 1);
+        // The kernel's next write finds room again.
+        assert_eq!(
+            producer.try_write(&readiness(99)),
+            Ok(ControlRingWriteStatus::Written)
+        );
+    }
+
+    #[test]
+    fn a_receive_failure_fails_the_association_once_and_stops_receiving() {
+        let mut memory = ring_memory();
+        let (notifications, mut producer) = ring(&mut memory);
+        let dispatched = AtomicUsize::new(0);
+        let failures = AtomicUsize::new(0);
+        let receiver = notifications.into_receiver(
+            |_| {
+                dispatched.fetch_add(1, Ordering::Relaxed);
+            },
+            || {
+                failures.fetch_add(1, Ordering::Relaxed);
+            },
+        );
+
+        producer.try_write(&readiness(7)).expect("written");
+        receiver.drain();
+        assert_eq!(dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(failures.load(Ordering::Relaxed), 0);
+
+        // Not a notification: as the userland receiver, fail rather than
+        // panic, and receive nothing more.
+        producer.try_write(&[0xff; 4]).expect("written");
+        producer.try_write(&readiness(8)).expect("written");
+        receiver.drain();
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+        receiver.drain();
+        assert_eq!(
+            receiver.receive(Some(Instant::from_nanos(1))),
+            None,
+            "nothing could publish, so no wait"
+        );
+        assert_eq!(dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(failures.load(Ordering::Relaxed), 1);
+    }
 }

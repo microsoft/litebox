@@ -12,14 +12,21 @@
 //! Time: monotonic clocks are the kernel clock; the wall clock (`time`,
 //! `gettimeofday`, `CLOCK_REALTIME`) is the kernel's, read from kvm-clock at
 //! boot and advanced by the kernel clock, or, without kvm-clock (e.g., under
-//! QEMU's TCG), starting at the Unix epoch. Waits with a timeout (`nanosleep`,
-//! `sleep`, timed futex waits) halt until it passes.
+//! QEMU's TCG), starting at the Unix epoch. `alarm` and `setitimer` raise
+//! `SIGALRM` from platform timers; timer files are broker timers.
+//!
+//! Waits halt in the kernel until their timeout, a platform timer, or a
+//! broker notification (e.g., a timer file's expiry, or standard input
+//! arriving), which the broker's notification receiver dispatches. The kernel also
+//! interrupts the running program once it publishes one, so a nonblocking
+//! check (e.g., `epoll_wait` with no timeout) sees it: a timer file's expiry
+//! as it comes due, even in a busy loop; standard input once the broker next
+//! serves a request, as the kernel publishes it only then.
 //!
 //! Limits, which end the runner (the kernel sees it exit with
 //! `EXIT_FAILURE`) rather than fail the program's call:
-//! - One thread, and no timers or asynchronous signals: a wait without a
-//!   timeout, e.g., a read of standard input before it has data, could never
-//!   end.
+//! - One thread: a wait that nothing could end (no timeout, no armed timer,
+//!   and no input that could arrive).
 
 use alloc::boxed::Box;
 use litebox::utils::TruncateExt as _;
@@ -48,14 +55,17 @@ const SERVING_CALLS: CallSet = CallSet::EMPTY
 
 pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));
-    // Kept for the process's lifetime; nothing waits for notifications yet.
-    let (local, _notifications) = litebox_broker_local_vm_userland::connect(info)
+    let (local, notifications) = litebox_broker_local_vm_userland::connect(info)
         .unwrap_or_else(|e| panic!("broker association: {e:?}"));
     kcall::restrict(CallSet::ALL.without(CallId::BrokerHandshake), ProtSet::ALL)
         .unwrap_or_else(|status| panic!("lockdown: {status:?}"));
     let (litebox, process_id, initial_thread) =
         litebox::LiteBox::new_process_with_broker_local(platform, local);
     let process_id = i32::try_from(process_id.0).expect("process ID fits pid_t");
+    platform.set_notification_receiver(Box::leak(Box::new(notifications.into_receiver(
+        litebox.broker_notification_dispatcher(),
+        litebox.broker_failure_dispatcher(),
+    ))));
     let shim =
         litebox_shim_linux::LinuxShimBuilder::new_with_litebox(platform, litebox, process_id)
             .build();

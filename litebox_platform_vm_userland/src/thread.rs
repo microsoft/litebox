@@ -123,7 +123,14 @@ unsafe extern "C" fn guest_exception_handler(
 }
 
 unsafe extern "C" fn guest_interrupt_handler(thread_ctx: &mut ThreadContext) {
-    thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
+    crate::drain_notifications();
+    if crate::interrupts_for_shim() {
+        thread_ctx.call_shim(|shim, ctx| shim.interrupt(ctx));
+    } else {
+        // Nothing the shim set up is behind it (e.g., notifications with no
+        // receiver): just resume, as shims need not support interrupts.
+        thread_ctx.call_shim(|_, _| ContinueOperation::Resume);
+    }
 }
 
 /// Guest entries switch back to the host stack saved here and finish at

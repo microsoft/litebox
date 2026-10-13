@@ -154,6 +154,9 @@ struct Inner {
     /// [`CallId::SetTimer`]'s deadline. Armed to the platform's timer just
     /// before every resume to ring 3, and cleared once delivered.
     armed_deadline: Cell<Option<Instant>>,
+    /// The broker published notifications (e.g., as it served a request)
+    /// that the process has not been interrupted for yet.
+    notified: Cell<bool>,
 }
 
 pub struct Process {
@@ -249,6 +252,7 @@ impl Process {
                 entries: Cell::new(0),
                 reflected: Cell::new(0),
                 armed_deadline: Cell::new(None),
+                notified: Cell::new(false),
             },
             ctx: PtRegs::default(),
             fs_base: 0,
@@ -664,7 +668,14 @@ impl Inner {
     /// [`ProcessTimer::arm`]), which always disarm it afterward, so nothing
     /// is lost by calling this unconditionally.
     fn rearm_timer(&self) {
-        let deadline = self.upcall_entry().and(self.armed_deadline.get());
+        if self.broker.take_published() {
+            self.notified.set(true);
+        }
+        let deadline = self.upcall_entry().and(timer_deadline(
+            self.notified.get(),
+            self.armed_deadline.get(),
+            self.broker.next_timer_deadline(),
+        ));
         self.timer.arm(deadline);
     }
 
@@ -838,6 +849,26 @@ impl Inner {
     }
 }
 
+/// When to interrupt the process: at once if the broker published
+/// notifications it has not been interrupted for (`notified`), else at its
+/// own `armed` deadline, or the broker's next timer's, whose readiness it
+/// should see without a kernel call.
+fn timer_deadline(
+    notified: bool,
+    armed: Option<Instant>,
+    broker_timer: Option<Instant>,
+) -> Option<Instant> {
+    /// Already passed.
+    const NOW: Instant = Instant::from_nanos(0);
+    if notified {
+        return Some(NOW);
+    }
+    match (armed, broker_timer) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// What [`Inner::interrupt`] does with a timer fire.
 #[derive(Debug, PartialEq, Eq)]
 enum TimerFire {
@@ -970,7 +1001,8 @@ impl EnterShim for Inner {
     /// [`TIMER_VECTOR`](litebox_platform_vm_kernel::TIMER_VECTOR) fired
     /// while the process ran. Delivers [`UpcallKind::Interrupt`] (quietly
     /// ignored before [`CallId::Ready`], like any upcall with no entry
-    /// registered yet) once the armed deadline has passed. Otherwise resumes:
+    /// registered yet) once the armed deadline, or a broker timer's (fired
+    /// first, so the runner sees its readiness), has passed. Otherwise resumes:
     /// - with no deadline armed, the fire is spurious, or left over;
     /// - before the deadline, the timer fired early (e.g., a one-shot count
     ///   capped short of it), so this re-arms it;
@@ -978,11 +1010,13 @@ impl EnterShim for Inner {
     ///   (which a nested one would overwrite), so this retries shortly.
     fn interrupt(&self, ctx: &mut PtRegs) -> ContinueOperation {
         let on_upcall_stack = layout::UPCALL_STACK.contains(ctx.rsp as u64);
-        match TimerFire::decide(
+        let now = self.platform.now();
+        let deadline = timer_deadline(
+            self.notified.get(),
             self.armed_deadline.get(),
-            self.platform.now(),
-            on_upcall_stack,
-        ) {
+            self.broker.next_timer_deadline(),
+        );
+        match TimerFire::decide(deadline, now, on_upcall_stack) {
             TimerFire::Ignore => ContinueOperation::Resume,
             TimerFire::Rearm => {
                 self.rearm_timer();
@@ -998,7 +1032,17 @@ impl EnterShim for Inner {
                 ContinueOperation::Resume
             }
             TimerFire::Deliver => {
-                self.armed_deadline.set(None);
+                if self
+                    .armed_deadline
+                    .get()
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    self.armed_deadline.set(None);
+                }
+                self.broker.fire_timers();
+                // The upcall is for everything published so far.
+                self.broker.take_published();
+                self.notified.set(false);
                 self.upcall(ctx, UpcallKind::Interrupt, 0, 0, 0)
             }
         }
@@ -1031,6 +1075,27 @@ mod tests {
             TimerFire::decide(Some(at(100)), at(100), false),
             TimerFire::Deliver
         );
+    }
+
+    #[test]
+    fn timer_deadline_is_the_earliest_and_at_once_for_notifications() {
+        let at = |nanos| Some(Instant::from_nanos(nanos));
+        assert_eq!(timer_deadline(false, None, None), None);
+        assert_eq!(timer_deadline(false, at(300), None), at(300));
+        assert_eq!(timer_deadline(false, None, at(200)), at(200));
+        assert_eq!(timer_deadline(false, at(300), at(200)), at(200));
+        // Published while serving a request (e.g., a timer fired as the
+        // broker was entered): interrupt as soon as the process resumes.
+        assert_eq!(timer_deadline(true, None, None), at(0));
+        assert_eq!(timer_deadline(true, at(300), at(200)), at(0));
+        assert!(matches!(
+            TimerFire::decide(
+                timer_deadline(true, None, None),
+                Instant::from_nanos(100),
+                false
+            ),
+            TimerFire::Deliver
+        ));
     }
 
     #[test]

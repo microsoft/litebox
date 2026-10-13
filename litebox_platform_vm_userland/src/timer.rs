@@ -102,6 +102,11 @@ impl litebox::platform::SignalProvider for VmUserland {
     }
 }
 
+/// Whether any timer was created (and is not dropped).
+pub(crate) fn any() -> bool {
+    TIMERS.lock().iter().any(|timer| timer.strong_count() != 0)
+}
+
 /// The earliest live timer's deadline, if any.
 pub(crate) fn next_deadline() -> Option<Instant> {
     TIMERS
