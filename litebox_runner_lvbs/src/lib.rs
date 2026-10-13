@@ -434,8 +434,11 @@ fn vsm_error_to_errno(error: VsmError) -> Errno {
             _ => Errno::EINVAL,
         },
 
-        // Future VSM errors default to an invalid request.
-        _ => Errno::EINVAL,
+        // Future VSM errors default to an invalid request and are logged so they can be mapped.
+        unmapped => {
+            debug_serial_println!("Unmapped VSM error: {unmapped:?}");
+            Errno::EINVAL
+        }
     }
 }
 
