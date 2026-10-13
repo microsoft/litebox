@@ -34,7 +34,7 @@ const TAG_SHUTDOWN: u8 = 8;
 const TAG_GET_NAME: u8 = 9;
 const TAG_SET_OPTION: u8 = 10;
 const TAG_GET_OPTION: u8 = 11;
-const RESPONSE_TAG_FAILED: u8 = 12;
+const TAG_FAILED: u8 = 12;
 
 const OPTION_TAG_RECEIVE_TIMEOUT: u8 = 0;
 const OPTION_TAG_SEND_TIMEOUT: u8 = 1;
@@ -225,7 +225,7 @@ pub(super) fn encode_unix_socket_response(encoder: &mut Encoder, response: UnixS
             encode_option_value(encoder, response.value);
         }
         UnixSocketResponse::Failed(error) => {
-            encoder.u8(RESPONSE_TAG_FAILED);
+            encoder.u8(TAG_FAILED);
             encode_error(encoder, error);
         }
     }
@@ -264,7 +264,7 @@ pub(super) fn decode_unix_socket_response(
         TAG_GET_OPTION => UnixSocketResponse::GetOption(GetUnixSocketOptionResponse {
             value: decode_option_value(decoder)?,
         }),
-        RESPONSE_TAG_FAILED => UnixSocketResponse::Failed(decode_error(decoder)?),
+        TAG_FAILED => UnixSocketResponse::Failed(decode_error(decoder)?),
         _ => return Err(WireError::InvalidTag),
     })
 }
