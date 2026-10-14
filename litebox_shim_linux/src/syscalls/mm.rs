@@ -14,7 +14,7 @@ use litebox_common_linux::{
     loader::{
         TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, TrampolineLayout, parse_trampoline_header,
     },
-    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError, subtract_ranges},
+    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError},
 };
 
 use crate::FileFd;
@@ -226,6 +226,31 @@ impl Ord for ElfPatchKey {
 /// Supporting that sequence requires patch state to follow mapping lifetime,
 /// independently of descriptor lifetime.
 pub(crate) type ElfPatchCache = BTreeMap<ElfPatchKey, ElfPatchState>;
+
+fn subtract_ranges(range: Range<usize>, excluded: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut blocks: Vec<_> = excluded
+        .iter()
+        .filter(|block| block.start < range.end && range.start < block.end)
+        .cloned()
+        .collect();
+    blocks.sort_unstable_by_key(|block| (block.start, block.end));
+
+    let mut out = Vec::new();
+    let mut cursor = range.start;
+    for block in blocks {
+        if block.start > cursor {
+            out.push(cursor..block.start);
+        }
+        cursor = cursor.max(block.end);
+        if cursor >= range.end {
+            return out;
+        }
+    }
+    if cursor < range.end {
+        out.push(cursor..range.end);
+    }
+    out
+}
 
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {

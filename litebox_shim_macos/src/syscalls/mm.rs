@@ -27,6 +27,31 @@ use litebox_syscall_rewriter::macho::{CodeMetadata, Rewriter};
 
 use crate::{SharedCacheRegion, SharedCacheTrampoline, ShimPlatform, Task};
 
+fn subtract_ranges(range: Range<usize>, excluded: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut blocks: Vec<_> = excluded
+        .iter()
+        .filter(|block| block.start < range.end && range.start < block.end)
+        .cloned()
+        .collect();
+    blocks.sort_unstable_by_key(|block| (block.start, block.end));
+
+    let mut out = Vec::new();
+    let mut cursor = range.start;
+    for block in blocks {
+        if block.start > cursor {
+            out.push(cursor..block.start);
+        }
+        cursor = cursor.max(block.end);
+        if cursor >= range.end {
+            return out;
+        }
+    }
+    if cursor < range.end {
+        out.push(cursor..range.end);
+    }
+    out
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SharedCacheRewriteMode {
     Guest,
@@ -1192,7 +1217,7 @@ impl<P: ShimPlatform> Task<P> {
     }
 
     fn release_trampoline_reservation(&self, reservation: Range<usize>, retained: &[Range<usize>]) {
-        for range in litebox_common_linux::vmem::subtract_ranges(reservation, retained) {
+        for range in subtract_ranges(reservation, retained) {
             self.remove_trampoline(range);
         }
     }
