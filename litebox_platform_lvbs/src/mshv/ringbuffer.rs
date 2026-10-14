@@ -5,8 +5,8 @@
 
 use super::{PrivilegedVmap, PrivilegedVtl0PhysMutPtr};
 use core::fmt;
+use litebox::mm::vmap::PhysPageAddr;
 use litebox::utils::TruncateExt;
-use litebox::vmap::PhysPageAddr;
 use litebox_common_lvbs::PAGE_SIZE;
 use spin::{Mutex, Once};
 use x86_64::PhysAddr;

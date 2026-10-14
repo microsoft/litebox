@@ -3,7 +3,7 @@
 
 //! Implementation of generic TEE related syscalls
 
-use litebox::page::{NonZeroAddress, NonZeroPageSize};
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;

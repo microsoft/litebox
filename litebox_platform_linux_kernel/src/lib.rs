@@ -9,7 +9,7 @@
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
-use litebox::page::PageRange;
+use litebox::mm::page::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{

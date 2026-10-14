@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use alloc::sync::Arc;
 use core::cell::{Cell, RefCell};
 use core::ops::Deref;
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     LiteBox,
     net::Network,
@@ -29,11 +30,8 @@ use litebox::{
     shim::ContinueOperation,
     sync::Mutex,
     sync::futex::FutexManager,
-    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
-};
-use litebox::{
-    page::{NonZeroAddress, NonZeroPageSize},
     user_pointers::{UserPtr, UserPtrMut},
+    utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox_common_linux::{
     PAGE_SIZE, SyscallRequest,

@@ -24,8 +24,8 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::ops::Range;
+use litebox::mm::vmap::{PhysPageAddr, PhysPageAddrArray, PhysPointerError};
 use litebox::utils::TruncateExt;
-use litebox::vmap::{PhysPageAddr, PhysPageAddrArray, PhysPointerError};
 use litebox_common_lvbs::{
     FrameTxn, HypervCallError, MemAttr, PAGE_SHIFT, PAGE_SIZE, ReservationStatus, VsmError,
     Vtl0Gate, Vtl0PrivilegedWrite, Vtl1Gate,

@@ -8,7 +8,7 @@
 use core::ops::Range;
 
 use alloc::vec::Vec;
-use litebox::page::{NonZeroAddress, NonZeroPageSize, PageRange};
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,

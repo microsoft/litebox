@@ -4,7 +4,7 @@
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, vec::Vec};
-use litebox::page::{NonZeroAddress, NonZeroPageSize};
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     fs::{Mode, OFlags},
     platform::RawConstPointer,
@@ -306,7 +306,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         };
 
         let sp = unsafe {
-            let length = litebox::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+            let length = litebox::mm::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
                 .mm

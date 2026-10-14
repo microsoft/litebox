@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::page::PageRange;
+use litebox::mm::page::PageRange;
 use litebox::platform::{RawConstPointer as _, page_mgmt};
 use litebox_common_linux::vmem::{PageFaultError, VmFlags, VmemPageFaultHandler};
 use x86_64::{

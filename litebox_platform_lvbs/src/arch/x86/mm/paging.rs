@@ -3,7 +3,7 @@
 
 use arrayvec::ArrayVec;
 use core::ops::Range;
-use litebox::page::PageRange;
+use litebox::mm::page::PageRange;
 use litebox::platform::page_mgmt;
 use litebox::utils::TruncateExt;
 use litebox_common_linux::vmem::{PageFaultError, VmFlags, VmemPageFaultHandler};

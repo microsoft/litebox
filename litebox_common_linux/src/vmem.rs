@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
-use litebox::page::{NonZeroAddress, NonZeroPageSize, PageRange};
+use litebox::mm::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::platform::PageManagementProvider;
 use litebox::platform::RawConstPointer;
 use litebox::platform::RawMutPointer;

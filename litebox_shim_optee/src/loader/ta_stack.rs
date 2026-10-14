@@ -215,7 +215,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         len: usize,
     ) -> Option<usize>
     where
-        Platform: litebox::vmap::VmapManager<ALIGN>,
+        Platform: litebox::mm::vmap::VmapManager<ALIGN>,
     {
         let address = self.push_param_memref(param_type, None, len)?;
         shm_info
@@ -243,7 +243,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
         shm_info: &[Option<ShmInfo<ALIGN>>],
     ) -> Option<TaMemrefAddresses>
     where
-        Platform: litebox::vmap::VmapManager<ALIGN>,
+        Platform: litebox::mm::vmap::VmapManager<ALIGN>,
     {
         if params.len() > UteeParams::TEE_NUM_PARAMS {
             return None;
@@ -348,7 +348,7 @@ pub(crate) fn allocate_stack<Platform: crate::OpteeShimPlatform>(
     let sp = if let Some(stack_base) = stack_base {
         UserMutPtr::<Platform, _>::from_usize(stack_base)
     } else {
-        let length = litebox::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+        let length = litebox::mm::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
             .expect("DEFAULT_STACK_SIZE is not page-aligned");
         unsafe {
             task.global

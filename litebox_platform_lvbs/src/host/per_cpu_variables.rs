@@ -654,7 +654,7 @@ pub fn allocate_per_cpu_variables() {
 ///
 /// Panics if the stack layout contains a guard that is not page-aligned.
 pub fn unmap_per_cpu_stack_guards(manager: &crate::PageTableManager) {
-    use litebox::page::PageRange;
+    use litebox::mm::page::PageRange;
 
     let base = with_per_cpu_variables(|pcv| pcv.stacks.base);
     for offset in STACK_GUARD_OFFSETS {

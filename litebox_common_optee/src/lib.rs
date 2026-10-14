@@ -2695,9 +2695,9 @@ pub enum OpteeSmcReturnCode {
     RpcCmd = OPTEE_SMC_RETURN_RPC_CMD,
 }
 
-impl From<litebox::vmap::PhysPointerError> for OpteeSmcReturnCode {
-    fn from(err: litebox::vmap::PhysPointerError) -> Self {
-        use litebox::vmap::PhysPointerError;
+impl From<litebox::mm::vmap::PhysPointerError> for OpteeSmcReturnCode {
+    fn from(err: litebox::mm::vmap::PhysPointerError) -> Self {
+        use litebox::mm::vmap::PhysPointerError;
         match err {
             PhysPointerError::AlreadyMapped(_) => OpteeSmcReturnCode::EBusy,
             _ => OpteeSmcReturnCode::EBadAddr,

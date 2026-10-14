@@ -10,15 +10,15 @@ use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables}
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
-use litebox::page::PageRange;
+use litebox::mm::page::PageRange;
+use litebox::mm::vmap::{
+    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
+};
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
     ImmediatelyWokenUp, PageManagementProvider, RawMutex as _, RawMutexProvider,
     RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
     page_mgmt::DeallocationError,
-};
-use litebox::vmap::{
-    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use litebox::{
     platform::page_mgmt::FixedAddressBehavior, shim::ContinueOperation, utils::TruncateExt,

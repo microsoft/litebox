@@ -33,11 +33,11 @@
 //! all LiteBox/Rust code and data live, so a raw pointer into a foreign physical
 //! mapping cannot alias any Rust reference.
 
+use crate::mm::vmap::{
+    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
+};
 use crate::platform::common_providers::userspace_pointers::{
     UserConstPtr, UserMutPtr, ValidateAccess,
-};
-use crate::vmap::{
-    PhysPageAddr, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
 use core::marker::PhantomData;
 use zerocopy::{FromBytes, IntoBytes};

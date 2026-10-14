@@ -72,7 +72,7 @@ pub trait OpteeShimPlatform:
     + litebox::platform::SystemInfoProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::DerivedKeyProvider
-    + litebox::vmap::VmapManager<{ PAGE_SIZE }>
+    + litebox::mm::vmap::VmapManager<{ PAGE_SIZE }>
     + 'static
     + Sized
 {
@@ -91,7 +91,7 @@ where
         + litebox::platform::SystemInfoProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::DerivedKeyProvider
-        + litebox::vmap::VmapManager<{ PAGE_SIZE }>
+        + litebox::mm::vmap::VmapManager<{ PAGE_SIZE }>
         + 'static,
     T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
 {
@@ -1937,9 +1937,9 @@ impl SessionIdPool {
 }
 
 pub type NormalWorldConstPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox::physical_pointers::PhysConstPtr<'a, Platform, T, ALIGN>;
+    litebox::mm::physical_pointers::PhysConstPtr<'a, Platform, T, ALIGN>;
 pub type NormalWorldMutPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox::physical_pointers::PhysMutPtr<'a, Platform, T, ALIGN>;
+    litebox::mm::physical_pointers::PhysMutPtr<'a, Platform, T, ALIGN>;
 
 #[cfg(test)]
 mod test_utils {
