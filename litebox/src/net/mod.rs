@@ -1089,22 +1089,16 @@ where
                     match result {
                         Ok(()) => tcp_specific.connect_state = ConnectState::Connected,
                         Err(ConnectError::InvalidState) => {
-                            // Report the failure recorded by the network worker. If the worker
-                            // has not seen it yet, the time taken tells a timeout from a refusal.
+                            // Report the failure recorded for the attempt, if any.
                             let recorded = socket_handle
                                 .proxy
                                 .as_ref()
                                 .and_then(|proxy| proxy.get_async_error(false));
-                            result = match (recorded, tcp_specific.connect_state) {
-                                (Some(errors::SocketAsyncError::ConnectionReset), _) => {
+                            result = match recorded {
+                                Some(errors::SocketAsyncError::ConnectionReset) => {
                                     Err(ConnectError::ConnectionReset)
                                 }
-                                (Some(errors::SocketAsyncError::TimedOut), _) => {
-                                    Err(ConnectError::TimedOut)
-                                }
-                                (None, ConnectState::Connecting { initiated_at })
-                                    if now - initiated_at >= TCP_CONNECT_TIMEOUT =>
-                                {
+                                Some(errors::SocketAsyncError::TimedOut) => {
                                     Err(ConnectError::TimedOut)
                                 }
                                 _ => Err(ConnectError::InvalidState),

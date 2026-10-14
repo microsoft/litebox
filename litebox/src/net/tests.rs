@@ -625,6 +625,16 @@ fn test_tcp_reconnect_after_refused_connect() {
     assert!(matches!(err, ConnectError::InvalidState));
     assert_unconnected();
 
+    // The same holds for a socket without a proxy.
+    let fd = network.socket(Protocol::Tcp).unwrap();
+    let err = network.connect(&fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    pump(&mut network);
+    platform.advance_time(core::time::Duration::from_secs(100));
+    let err = network.connect(&fd, &addr, true).unwrap_err();
+    assert!(matches!(err, ConnectError::InvalidState));
+    network.close(&fd, CloseBehavior::Immediate).unwrap();
+
     // Another attempt then connects from the same local port.
     let listener = listening_socket(&mut network);
     let err = network.connect(&client_fd, &addr, false).unwrap_err();
