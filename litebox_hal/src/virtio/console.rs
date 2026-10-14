@@ -19,13 +19,12 @@
 //! device interrupts when it returns buffers in either direction.
 
 use super::Error;
+use super::buffers::Buffers;
 use super::pci::PciTransport;
-use super::queue::{Buffer, VirtQueue};
-use crate::dma::{DmaRegion, Hal};
+use super::queue::VirtQueue;
+use crate::dma::Hal;
 use crate::interrupt::MsiMessage;
 use alloc::collections::VecDeque;
-use alloc::vec;
-use alloc::vec::Vec;
 
 const DEVICE_TYPE: u16 = 3;
 const RECEIVE_QUEUE: u16 = 0;
@@ -35,65 +34,6 @@ const RECEIVE_BUFFERS: u16 = 16;
 const RECEIVE_BUFFER_SIZE: usize = 256;
 const TRANSMIT_BUFFERS: u16 = 32;
 const TRANSMIT_BUFFER_SIZE: usize = 512;
-
-/// Fixed-size buffers in one DMA region, each a one-descriptor chain while
-/// the device has it.
-struct Buffers {
-    memory: DmaRegion,
-    size: usize,
-    /// By queue head: the buffer the device has.
-    by_head: Vec<Option<u16>>,
-    free: Vec<u16>,
-}
-
-impl Buffers {
-    fn new(
-        hal: &'static dyn Hal,
-        queue: &VirtQueue,
-        count: u16,
-        size: usize,
-    ) -> Result<Self, Error> {
-        let count = count.min(queue.size());
-        Ok(Self {
-            memory: DmaRegion::new(hal, usize::from(count) * size).ok_or(Error::OutOfMemory)?,
-            size,
-            by_head: vec![None; usize::from(queue.size())],
-            free: (0..count).rev().collect(),
-        })
-    }
-
-    fn ptr(&self, buffer: u16, offset: usize, len: usize) -> *mut u8 {
-        assert!(offset + len <= self.size);
-        self.memory
-            .ptr(usize::from(buffer) * self.size + offset, len)
-    }
-
-    /// Gives a free buffer (`len` bytes of it) to the device.
-    fn post(&mut self, queue: &mut VirtQueue, buffer: u16, len: usize, device_writes: bool) {
-        let chain = [Buffer {
-            pa: self.memory.pa() + (usize::from(buffer) * self.size) as u64,
-            len: u32::try_from(len.min(self.size)).expect("buffers are small"),
-            device_writes,
-        }];
-        // Safety: the buffer is ours (free) and DMA memory that lives as
-        // long as the console; it is not accessed until the device returns
-        // it.
-        let head = unsafe { queue.add(&chain) }.expect("a descriptor per buffer");
-        self.by_head[usize::from(head)] = Some(buffer);
-    }
-
-    /// The next buffer the device returned, with its length clamped.
-    fn take_used(&mut self, queue: &mut VirtQueue) -> Option<(u16, usize)> {
-        let (head, len) = queue.pop_used()?;
-        let buffer = self.by_head[usize::from(head)]
-            .take()
-            .expect("in-flight chains are posted buffers");
-        Some((
-            buffer,
-            usize::try_from(len).map_or(self.size, |len| len.min(self.size)),
-        ))
-    }
-}
 
 /// A live console. Not internally synchronized.
 pub struct VirtioConsole {
