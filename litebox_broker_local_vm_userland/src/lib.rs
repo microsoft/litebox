@@ -7,8 +7,9 @@
 //! shared buffers (see `litebox_common_vm_abi`, Broker).
 //!
 //! Where the userland transport uses futexes, this one uses the kernel's
-//! (`BrokerEnter`'s Wake and Wait). The kernel serves the ring within each,
-//! so a call takes one entry. Shared memory is accessed only through
+//! (`BrokerEnter`'s Wake and Wait). The kernel serves the ring apart from
+//! them, so a call takes a Wake and, unless the response is already there, a
+//! Wait. Shared memory is accessed only through
 //! `peer_memory`.
 //!
 //! Notifications (readiness of broker objects, e.g., standard input) have no
@@ -560,13 +561,13 @@ fn read_error(error: ControlRingReadError<WireError>) -> ChannelError {
     }
 }
 
-/// Serves published broker requests.
+/// Has the kernel serve published broker requests.
 fn broker_wake() -> Result<(), Status> {
     kcall::call(&BrokerEnterRequest::wake())
 }
 
-/// Serves published broker requests, then waits while the control-ring word
-/// at `offset` equals `expected`, until `deadline`, if any.
+/// Has the kernel serve published broker requests, and waits while the
+/// control-ring word at `offset` equals `expected`, until `deadline`, if any.
 fn broker_wait(offset: usize, expected: u32, deadline: Option<Instant>) -> Result<(), Status> {
     // Zero means none, so the (theoretical) instant zero waits from 1 ns.
     let deadline = deadline.map_or(0, |deadline| deadline.as_nanos().max(1));

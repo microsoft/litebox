@@ -20,7 +20,8 @@
 //!   take directly, so the kernel reflected them.
 //!
 //! In a group, runs share standard input and output, so they take no
-//! `stdin`, `console_stdin`, `expect_stdout`, or `expect_stderr`.
+//! `stdin`, `expect_stdout`, or `expect_stderr`, and at most one takes
+//! `console_stdin`.
 //!
 //! Output also goes to the console, as it would without this client.
 
@@ -167,11 +168,12 @@ pub fn run(json: &[u8], service: &mut Programs, stdio: &Stdio) {
             Entry::Concurrent(Concurrent { concurrent }) => {
                 assert!(
                     concurrent.iter().all(|run| run.stdin.is_empty()
-                        && !run.console_stdin
                         && run.expect_stdout.is_none()
-                        && run.expect_stderr.is_none()),
+                        && run.expect_stderr.is_none())
+                        && concurrent.iter().filter(|run| run.console_stdin).count() <= 1,
                     "runs {index}..: concurrent runs share standard streams, so they take no \
-                     `stdin`, `console_stdin`, `expect_stdout`, or `expect_stderr`"
+                     `stdin`, `expect_stdout`, or `expect_stderr`, and at most one \
+                     `console_stdin`"
                 );
                 let len = concurrent.len();
                 run_group(index, concurrent, service, stdio);

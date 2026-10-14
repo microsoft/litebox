@@ -993,6 +993,36 @@ where
     run_thread_inner(shim, ctx, true, state, false);
 }
 
+/// Runs `f` outside any thread's run, with `shim` handling kernel page faults
+/// as during one (e.g., demand paging its user memory), for the kernel to
+/// access a thread's memory between its runs. Its address space must be
+/// current.
+///
+/// # Panics
+///
+/// If called during a run, or nested.
+pub fn with_user_faults<R>(
+    shim: &dyn EnterShim<ExecutionContext = PtRegs>,
+    f: impl FnOnce() -> R,
+) -> R {
+    let thread_ctx = ThreadContext {
+        shim,
+        // Kernel-fault handlers do not touch it.
+        ctx: core::ptr::null_mut(),
+    };
+    with_per_cpu_variables(|pcv| {
+        assert!(
+            !pcv.asm.is_in_user() && pcv.fault_context.get().is_null(),
+            "user faults are already handled"
+        );
+        pcv.fault_context
+            .set(core::ptr::from_ref(&thread_ctx).cast());
+    });
+    let result = f();
+    with_per_cpu_variables(|pcv| pcv.fault_context.set(core::ptr::null()));
+    result
+}
+
 /// A user thread's state that the platform keeps across its runs, besides
 /// registers and the FS base (the caller's): extended state (x87, SSE), in
 /// the thread's own XSAVE area, and the GS base.
@@ -1476,6 +1506,18 @@ unsafe extern "C" fn kernel_exception_handler_no_ctx(
     error_code: usize,
     faulting_rip: usize,
 ) -> usize {
+    let fault_context = with_per_cpu_variables(|pcv| pcv.fault_context.get());
+    if !fault_context.is_null() {
+        let regs = PtRegs {
+            orig_rax: error_code,
+            rip: faulting_rip,
+            ..PtRegs::default()
+        };
+        // Safety: `with_user_faults` keeps it alive while set.
+        return unsafe {
+            kernel_exception_handler(&*fault_context.cast::<ThreadContext>(), &regs, cr2)
+        };
+    }
     search_exception_tables(faulting_rip).unwrap_or_else(|| {
         panic!(
             "EXCEPTION: PAGE FAULT outside run_thread_arch (no ThreadContext)\n\

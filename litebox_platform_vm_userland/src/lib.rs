@@ -160,7 +160,7 @@ impl RawMutexProvider for VmUserland {
 impl WaitWakerProvider for VmUserland {}
 
 /// One thread: nothing else in the runner can change a waiter's word. So a
-/// wait halts in the kernel until its timeout, a platform timer's deadline
+/// wait blocks in the kernel until its timeout, a platform timer's deadline
 /// (whose signal then interrupts it), or, with a [`NotificationReceiver`],
 /// a broker notification, which it dispatches (possibly waking the waiter).
 /// One that nothing could end panics.
@@ -181,7 +181,7 @@ impl RawMutexTrait for RawMutex {
         0
     }
 
-    /// A wait without a timeout: halts until a broker notification or an
+    /// A wait without a timeout: blocks until a broker notification or an
     /// armed platform timer's deadline (whose signal may then be pending once
     /// resumed); panics if nothing could end it. So a wait the timer's signal
     /// does not end (e.g., `pause` with `SIGALRM` ignored) panics after it
@@ -305,7 +305,7 @@ static TIMED_WAIT: TimedWait = TimedWait {
 };
 
 impl TimedWait {
-    /// Halts until `deadline` with the kernel's deadline wait (`BrokerEnter`'s
+    /// Blocks until `deadline` with the kernel's deadline wait (`BrokerEnter`'s
     /// Wait), on a control-ring word that only the kernel's serving changes:
     /// the request ring's consumer epoch.
     ///

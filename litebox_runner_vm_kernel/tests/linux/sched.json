@@ -11,7 +11,19 @@
       { "argv": ["/alarm", "default"], "expect_signal": 14 },
       { "argv": ["/timerfd"] },
       { "argv": ["/sched", "sleep", "200", "3"] },
-      { "argv": ["/sched", "spin", "1000", "5", "2000"] }
+      { "argv": ["/sched", "spin", "1000", "5", "150"] }
+    ]
+  },
+  {
+    "concurrent": [
+      { "argv": ["/sched", "input", "1000"], "console_stdin": true },
+      { "argv": ["/sched", "spin", "3000", "0", "3000"] }
+    ]
+  },
+  {
+    "concurrent": [
+      { "argv": ["/sched", "calls", "100", "500"] },
+      { "argv": ["/sched", "spin", "2000", "0", "2000"] }
     ]
   }
 ]

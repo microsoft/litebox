@@ -12,9 +12,11 @@
 //! runner's [`stdio::Console`], and those of an optional read-only root
 //! ([`Config::root`]). Timers are on the kernel clock.
 //! Readiness (e.g., of standard input, or a timer's expiry) goes to the
-//! association's notification ring. Waiting ([`BrokerEnterOp::Wait`]) halts
-//! until the runner's [`Events`] report something, e.g., an interrupt, or
-//! until a timer's deadline.
+//! association's notification ring.
+//!
+//! As in the userland broker, requests are served apart from the runner's
+//! calls ([`Association::serve`]), and a wait blocks only its process: the
+//! kernel's scheduler polls it ([`Association::poll_wait`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -31,8 +33,9 @@ mod timers;
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::convert::Infallible;
+use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::BrokerCore;
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_host::BrokerHostAssociation;
@@ -89,6 +92,8 @@ pub struct Broker {
     events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
     timers: Arc<KernelTimers>,
+    /// See [`Association::take_woken`].
+    woken: Arc<AtomicBool>,
 }
 
 impl Broker {
@@ -106,6 +111,7 @@ impl Broker {
             events: config.events,
             stdio,
             timers,
+            woken: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -127,8 +133,9 @@ impl Broker {
         Association {
             broker: self.clone(),
             shared_memory,
-            readiness: Arc::new(KernelReadiness::default()),
+            readiness: Arc::new(KernelReadiness::new(self.woken.clone())),
             state: RefCell::new(State::New(ring)),
+            submitted: Cell::new(false),
         }
     }
 }
@@ -186,13 +193,45 @@ struct Active {
     overflow: Option<Vec<u8>>,
 }
 
-/// A process's broker association. Accessed only during the process's
-/// kernel calls, while its address space is current.
+/// A process's broker association. Only [`Association::serve`] and the
+/// handshake touch the shared buffers.
 pub struct Association {
     broker: Broker,
     shared_memory: UserRange,
     readiness: Arc<KernelReadiness>,
     state: RefCell<State>,
+    /// See [`Association::has_submitted`].
+    submitted: Cell<bool>,
+}
+
+/// A [`BrokerEnterOp::Wait`] that did not end at once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wait {
+    offset: usize,
+    expected: u32,
+    deadline: Option<Instant>,
+    /// On the notification epoch, which the broker changes on its own.
+    notifications: bool,
+}
+
+/// What [`Association::enter`] leaves to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entered {
+    Done,
+    /// [`BrokerEnterOp::Wake`]: serve before the call returns.
+    Woke,
+    /// Poll it with [`Association::poll_wait`].
+    Wait(Wait),
+}
+
+/// See [`Association::poll_wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitState {
+    Ended(Result<(), EnterError>),
+    /// Until an event, or `wake`, if any (see [`Association::halt`]).
+    Blocked {
+        wake: Option<Instant>,
+    },
 }
 
 /// [`Status::Unsupported`] if the response does not fit a [`WireFrame`].
@@ -285,42 +324,21 @@ impl Association {
         frame(&wire::encode_handshake_response(response))
     }
 
-    /// [`BrokerEnter`](litebox_common_vm_abi::CallId::BrokerEnter): serves
-    /// every published request, unless the response ring fills up, then
-    /// performs `request`'s operation. An invalid request has no effect.
-    /// Before the handshake, any request is [`Status::Denied`].
-    ///
-    /// Waiting halts the kernel (single CPU, no scheduler) until the word
-    /// changes or the deadline passes. Only notifications change ring words
-    /// asynchronously; a wait on another word without a deadline, or on the
-    /// notification epoch when no event or armed timer could publish, is
-    /// [`Status::Stalled`]. A corrupted notification ring fails the
-    /// association, as a corrupted request ring does.
+    /// [`BrokerEnter`](litebox_common_vm_abi::CallId::BrokerEnter): leaves
+    /// published requests to [`Self::serve`], and a wait that does not end at
+    /// once to the caller. An invalid request has no effect. Before the
+    /// handshake, any request is [`Status::Denied`]. A corrupted notification
+    /// ring fails the association, as a corrupted request ring does.
     ///
     /// # Errors
     ///
     /// See [`EnterError`].
-    pub fn enter(&self, request: &BrokerEnterRequest) -> Result<(), EnterError> {
-        let mut state = self.state.borrow_mut();
-        let State::Active(active) = &mut *state else {
+    pub fn enter(&self, request: &BrokerEnterRequest) -> Result<Entered, EnterError> {
+        if !matches!(*self.state.borrow(), State::Active(_)) {
             return Err(EnterError::Status(Status::Denied));
-        };
-        let result = self.enter_active(active, request);
-        if result == Err(EnterError::Failed)
-            && let State::Active(active) = core::mem::replace(&mut *state, State::Ended)
-        {
-            end(active.association, &self.readiness);
         }
-        result
-    }
-
-    fn enter_active(
-        &self,
-        active: &mut Active,
-        request: &BrokerEnterRequest,
-    ) -> Result<(), EnterError> {
         let invalid = || EnterError::Status(Status::InvalidArgument);
-        let wait_offset = match request.op {
+        let wait = match request.op {
             BrokerEnterOp::Wake => {
                 if (request.expected, request.offset, request.deadline) != (0, 0, 0) {
                     return Err(invalid());
@@ -332,50 +350,127 @@ impl Association {
                 if !MemoryAccessPolicy::ControlRing.permits_u32(offset) {
                     return Err(invalid());
                 }
-                Some(offset)
+                Some(Wait {
+                    offset,
+                    expected: request.expected,
+                    deadline: (request.deadline != 0)
+                        .then(|| Instant::from_nanos(request.deadline)),
+                    notifications: offset
+                        == ControlRingDirection::Notifications.producer_epoch_offset(),
+                })
             }
         };
+        self.submitted.set(true);
+        let Some(wait) = wait else {
+            self.with_active(|_| self.poll())?;
+            return Ok(Entered::Woke);
+        };
+        match self.poll_wait(&wait) {
+            WaitState::Ended(result) => result.map(|()| Entered::Done),
+            WaitState::Blocked { .. } => Ok(Entered::Wait(wait)),
+        }
+    }
+
+    /// Whether a call since the last [`Self::serve`] may have published
+    /// requests.
+    pub fn has_submitted(&self) -> bool {
+        self.submitted.get()
+    }
+
+    /// Serves the published requests, unless the response ring fills up.
+    /// Needs the process's address space, for the shared buffers.
+    ///
+    /// # Errors
+    ///
+    /// [`EnterError::Failed`], which ended the association.
+    pub fn serve(&self) -> Result<(), EnterError> {
+        self.submitted.set(false);
+        self.with_active(|active| {
+            active.serve().map_err(|Failed| EnterError::Failed)?;
+            self.flush_readiness()
+        })
+    }
+
+    /// Where `wait` stands, after firing due timers and publishing readiness.
+    /// Without a deadline, a wait on a word other than the notification epoch
+    /// is [`Status::Stalled`] once [`Self::serve`] has nothing left to serve.
+    pub fn poll_wait(&self, wait: &Wait) -> WaitState {
+        let state = self
+            .with_active(|active| {
+                self.poll()?;
+                match active.words.load_u32_acquire(wait.offset) {
+                    Ok(word) if word != wait.expected => {
+                        if wait.notifications {
+                            // The runner receives them next, so need not also
+                            // be interrupted for them.
+                            self.readiness.take_published();
+                        }
+                        return Ok(WaitState::Ended(Ok(())));
+                    }
+                    Ok(_) => {}
+                    Err(_) => return Err(EnterError::Status(Status::InvalidArgument)),
+                }
+                let now = self.broker.platform.now();
+                if wait.deadline.is_some_and(|deadline| now >= deadline) {
+                    return Err(EnterError::Status(Status::TimedOut));
+                }
+                if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
+                    return Err(EnterError::Status(Status::Stalled));
+                }
+                // Only notifications see timers.
+                let wake = if wait.notifications {
+                    timers::earliest(wait.deadline, self.broker.timers.next_deadline())
+                } else {
+                    wait.deadline
+                };
+                Ok(WaitState::Blocked { wake })
+            })
+            .unwrap_or_else(|error| WaitState::Ended(Err(error)));
+        self.readiness
+            .set_waiting(wait.notifications && matches!(state, WaitState::Blocked { .. }));
+        state
+    }
+
+    /// For a blocked wait that the caller ends itself (e.g., stalled, or the
+    /// process killed).
+    pub fn abandon_wait(&self) {
+        self.readiness.set_waiting(false);
+    }
+
+    /// Whether a notification reached a process blocked on its notification
+    /// epoch since the last call (any process's): poll the waits again.
+    pub fn take_woken(&self) -> bool {
+        self.broker.woken.swap(false, Ordering::Relaxed)
+    }
+
+    /// [`Events::wait`]: for when no process can run.
+    pub fn halt(&self, wake: Option<Instant>) -> bool {
+        self.broker.events.wait(wake)
+    }
+
+    /// Runs `f` on the active association, ending it if `f` fails it.
+    fn with_active<T>(
+        &self,
+        f: impl FnOnce(&mut Active) -> Result<T, EnterError>,
+    ) -> Result<T, EnterError> {
+        let mut state = self.state.borrow_mut();
+        let State::Active(active) = &mut *state else {
+            return Err(EnterError::Status(Status::Denied));
+        };
+        let result = f(active);
+        if let Err(EnterError::Failed) = result
+            && let State::Active(active) = core::mem::replace(&mut *state, State::Ended)
+        {
+            end(active.association, &self.readiness);
+        }
+        result
+    }
+
+    /// Looks at the devices, fires the due timers, and publishes readiness.
+    fn poll(&self) -> Result<(), EnterError> {
         self.broker.stdio.poll();
         self.broker.timers.fire();
-        active.serve().map_err(|Failed| EnterError::Failed)?;
-        self.flush_readiness()?;
-        let Some(offset) = wait_offset else {
-            return Ok(());
-        };
-        let deadline = (request.deadline != 0).then(|| Instant::from_nanos(request.deadline));
-        let asynchronous = offset == ControlRingDirection::Notifications.producer_epoch_offset();
-        loop {
-            match active.words.load_u32_acquire(offset) {
-                Ok(word) if word != request.expected => {
-                    if asynchronous {
-                        // The runner receives the notifications next, so
-                        // need not also be interrupted for them.
-                        self.readiness.take_published();
-                    }
-                    return Ok(());
-                }
-                Ok(_) => {}
-                Err(_) => return Err(invalid()),
-            }
-            if deadline.is_some_and(|deadline| self.broker.platform.now() >= deadline) {
-                return Err(EnterError::Status(Status::TimedOut));
-            }
-            if deadline.is_none() && !asynchronous {
-                return Err(EnterError::Status(Status::Stalled));
-            }
-            // Only notifications see timers, which fire as the broker runs.
-            let wake = if asynchronous {
-                timers::earliest(deadline, self.broker.timers.next_deadline())
-            } else {
-                deadline
-            };
-            if !self.broker.events.wait(wake) {
-                return Err(EnterError::Status(Status::Stalled));
-            }
-            self.broker.stdio.poll();
-            self.broker.timers.fire();
-            self.flush_readiness()?;
-        }
+        self.flush_readiness()
     }
 
     /// Publishes pending readiness; a corrupted notification ring fails the

@@ -8,7 +8,7 @@
 //! - Single CPU: processes run only inside [`Process::start`],
 //!   [`Process::call`], or [`sched::run`].
 //! - The kernel does not use FS; user state across switches is the address
-//!   space and the FS base, plus [`UserThreadState`] if preempted.
+//!   space and the FS base, plus [`UserThreadState`] if suspended.
 //!
 //! Contract: runners are untrusted. Every call is validated and scoped to its
 //! process; identity-bound results use the identity fixed at
@@ -42,7 +42,7 @@ use core::ops::Range;
 use core::time::Duration;
 use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
 use litebox::utils::TruncateExt as _;
-use litebox_broker_vm_kernel::{Association, Broker, EnterError};
+use litebox_broker_vm_kernel::{Association, Broker, EnterError, Entered, Wait};
 use litebox_common_linux::PtRegs;
 use litebox_common_vm_abi::envelope::Envelope;
 use litebox_common_vm_abi::{
@@ -162,8 +162,21 @@ struct Inner {
     notified: Cell<bool>,
     /// `None` if no other process needs the CPU.
     slice_end: Cell<Option<Instant>>,
+    suspended: Cell<Suspended>,
+}
+
+/// Why a process stopped mid-run, to resume where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Suspended {
+    No,
     /// Its slice ended, anywhere in ring 3.
-    preempted: Cell<bool>,
+    Preempted,
+    /// In `BrokerEnter`'s Wake, for the broker's worker; it keeps its slice.
+    Yielded,
+    /// In `BrokerEnter`: the scheduler polls the wait.
+    Waiting(Wait),
+    /// `BrokerEnter` returns this once the process resumes.
+    Woken(Result<(), Status>),
 }
 
 pub struct Process {
@@ -171,7 +184,7 @@ pub struct Process {
     ctx: PtRegs,
     /// Saved while another process runs.
     fs_base: usize,
-    /// Kept while preempted.
+    /// Kept while suspended.
     user_state: UserThreadState,
 }
 
@@ -263,7 +276,7 @@ impl Process {
                 armed_deadline: Cell::new(None),
                 notified: Cell::new(false),
                 slice_end: Cell::new(None),
-                preempted: Cell::new(false),
+                suspended: Cell::new(Suspended::No),
             },
             ctx: PtRegs::default(),
             fs_base: 0,
@@ -573,7 +586,12 @@ impl Inner {
     fn kill(&self, reason: &'static str) {
         log::warn!("killing runner process: {reason}");
         *self.state.borrow_mut() = State::Dead(Dead::Killed(reason));
-        self.preempted.set(false);
+        self.suspended.set(Suspended::No);
+        self.broker.abandon_wait();
+    }
+
+    fn is_dead(&self) -> bool {
+        matches!(*self.state.borrow(), State::Dead(_))
     }
 
     fn is_new(&self) -> bool {
@@ -588,6 +606,26 @@ impl Inner {
     fn kill_and_stop(&self, reason: &'static str) -> ContinueOperation {
         self.kill(reason);
         ContinueOperation::Terminate
+    }
+
+    /// Resumes where the process was suspended.
+    fn resume(&self) -> ContinueOperation {
+        // Others may have published to it (e.g., fired its timers).
+        self.broker.poll_events();
+        // That, or an interrupt during a halt in the kernel, may have woken a
+        // blocked process: stop, for the scheduler to see.
+        if self.broker.take_woken() {
+            self.suspended.set(Suspended::Preempted);
+            return ContinueOperation::Terminate;
+        }
+        self.rearm_timer();
+        ContinueOperation::Resume
+    }
+
+    /// Resumes a process suspended in `BrokerEnter`, which returns `result`.
+    fn resume_call(&self, ctx: &mut PtRegs, result: Result<(), Status>) -> ContinueOperation {
+        ctx.rax = Status::to_raw(result).trunc();
+        self.resume()
     }
 
     fn dispatch(&self, ctx: &PtRegs) -> Flow {
@@ -657,7 +695,16 @@ impl Inner {
             Request::Protect(r) => respond(&r, slot, self.protect(&r)),
             Request::BrokerHandshake(r) => respond(&r, slot, self.broker.handshake(&r.0)),
             Request::BrokerEnter(r) => match self.broker.enter(&r) {
-                Ok(()) => respond(&r, slot, Ok(())),
+                Ok(Entered::Done) => respond(&r, slot, Ok(())),
+                // The worker serves at once (see `sched`).
+                Ok(Entered::Woke) => {
+                    self.suspended.set(Suspended::Yielded);
+                    Flow::Stop
+                }
+                Ok(Entered::Wait(wait)) => {
+                    self.suspended.set(Suspended::Waiting(wait));
+                    Flow::Stop
+                }
                 Err(EnterError::Status(status)) => Flow::Return(Err(status)),
                 Err(EnterError::Failed) => {
                     self.kill("broker association failed");
@@ -996,13 +1043,14 @@ impl EnterShim for Inner {
         ContinueOperation::Resume
     }
 
-    /// Resumes a preempted process where it was, or delivers its request.
+    /// Resumes a suspended process where it was, or delivers its request.
     fn reenter(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        if self.preempted.replace(false) {
-            // Others may have published to it (e.g., fired its timers).
-            self.broker.poll_events();
-            self.rearm_timer();
-            return ContinueOperation::Resume;
+        match self.suspended.replace(Suspended::No) {
+            Suspended::No => {}
+            Suspended::Waiting(_) => return self.kill_and_stop("resumed while waiting"),
+            Suspended::Preempted => return self.resume(),
+            Suspended::Yielded => return self.resume_call(ctx, Ok(())),
+            Suspended::Woken(result) => return self.resume_call(ctx, result),
         }
         let (waiter, request) = match &mut *self.state.borrow_mut() {
             State::Delivering { waiter, request } => (*waiter, core::mem::take(request)),
@@ -1049,7 +1097,11 @@ impl EnterShim for Inner {
                 .mappings
                 .demand_page(info.cr2, u64::from(info.error_code))
         {
-            self.rearm_timer();
+            // Kernel code (e.g., the worker serving the process) does not
+            // resume ring 3.
+            if !info.kernel_mode {
+                self.rearm_timer();
+            }
             return ContinueOperation::Resume;
         }
         if info.kernel_mode {
@@ -1061,8 +1113,9 @@ impl EnterShim for Inner {
 
     /// An interrupt (e.g., the timer's, or a device's) stopped the process.
     /// First has the broker look at the devices and fire its due timers, as
-    /// a kernel call would. Past its slice end, then preempts it; what is
-    /// due is delivered once it resumes. Otherwise delivers
+    /// a kernel call would. Past its slice end, or once a notification
+    /// reached a blocked process, then preempts it; what is due is delivered
+    /// once it resumes. Otherwise delivers
     /// [`UpcallKind::Interrupt`] (quietly ignored before [`CallId::Ready`],
     /// like any upcall with no entry registered yet) if that published a
     /// notification, or once the armed deadline has passed. Otherwise
@@ -1078,12 +1131,14 @@ impl EnterShim for Inner {
             self.notified.set(true);
         }
         let now = self.platform.now();
-        if self
-            .slice_end
-            .get()
-            .is_some_and(|slice_end| now >= slice_end)
+        // A woken process may be due to run (see `sched`).
+        if self.broker.take_woken()
+            || self
+                .slice_end
+                .get()
+                .is_some_and(|slice_end| now >= slice_end)
         {
-            self.preempted.set(true);
+            self.suspended.set(Suspended::Preempted);
             return ContinueOperation::Terminate;
         }
         let on_upcall_stack = layout::UPCALL_STACK.contains(ctx.rsp as u64);

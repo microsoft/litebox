@@ -100,7 +100,8 @@
 //! - The runner publishes requests and consumes responses.
 //!   [`CallId::BrokerEnter`] stands in for the userland transport's futex:
 //!   [`BrokerEnterOp::Wake`] and [`BrokerEnterOp::Wait`] on ring words. The
-//!   kernel serves every published request first.
+//!   kernel serves the published requests apart from the call, as the
+//!   userland broker's workers do.
 //! - The ring's notification direction carries readiness of broker objects
 //!   (e.g., standard input) from the kernel, published as it changes; the
 //!   runner consumes them and waits for them on the direction's producer
@@ -606,16 +607,16 @@ impl WireFrame {
 pub struct BrokerHandshakeFrame(pub WireFrame);
 
 /// The futex operations of the userland transport, on control-ring words.
-/// Both serve published requests first.
+/// Both have the kernel serve the published requests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(u32)]
 pub enum BrokerEnterOp {
     Wake = 0,
     /// Returns once the `u32` ring word at `offset`, an epoch, differs from
     /// `expected`. [`Status::TimedOut`] at the deadline; [`Status::Stalled`]
-    /// if nothing could change the word. Only notifications change words
-    /// while the kernel waits (with no scheduler, it halts the CPU), so
-    /// without a deadline any other word stalls.
+    /// if nothing could change the word: without a deadline, a word other
+    /// than the notification epoch stalls once the kernel has served every
+    /// published request. Other processes run meanwhile.
     Wait = 1,
 }
 

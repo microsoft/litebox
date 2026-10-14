@@ -5,6 +5,7 @@
 //! at once, whichever process is current. What a full ring cannot take
 //! stays pending until the next [`KernelReadiness::flush`].
 
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 use litebox_broker_core::readiness::ReadinessSink;
 use litebox_broker_core::{BrokerError, Result};
@@ -25,7 +26,6 @@ use crate::memory::PinnedControlRing;
 
 type Producer = ControlRingProducer<PinnedControlRing>;
 
-#[derive(Default)]
 pub(crate) struct KernelReadiness {
     publisher: ReadinessPublisher,
     /// Until the handshake and after the association ends: `None`.
@@ -34,9 +34,30 @@ pub(crate) struct KernelReadiness {
     failed: AtomicBool,
     /// A notification was written since [`Self::take_published`].
     published: AtomicBool,
+    /// The process is blocked on the notification epoch.
+    waiting: AtomicBool,
+    /// The broker's: set when a waiting process's ring changes.
+    woken: Arc<AtomicBool>,
 }
 
 impl KernelReadiness {
+    pub(crate) fn new(woken: Arc<AtomicBool>) -> Self {
+        Self {
+            publisher: ReadinessPublisher::default(),
+            notifications: SpinMutex::new(None),
+            failed: AtomicBool::new(false),
+            published: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
+            woken,
+        }
+    }
+
+    /// Whether the process is blocked on the notification epoch, for a write
+    /// to its ring to set the broker's `woken`.
+    pub(crate) fn set_waiting(&self, waiting: bool) {
+        self.waiting.store(waiting, Ordering::Relaxed);
+    }
+
     /// Starts publishing to the ring, including what is already pending.
     pub(crate) fn activate(&self, notifications: Producer) {
         *self.notifications.lock() = Some(notifications);
@@ -64,6 +85,11 @@ impl KernelReadiness {
         let result = publish_pending_readiness(&self.publisher, &mut ring);
         if ring.written {
             self.published.store(true, Ordering::Relaxed);
+        }
+        if (ring.written || matches!(result, Err(RingError::Ring(_))))
+            && self.waiting.load(Ordering::Relaxed)
+        {
+            self.woken.store(true, Ordering::Relaxed);
         }
         match result {
             Ok(()) | Err(RingError::Full) => {}

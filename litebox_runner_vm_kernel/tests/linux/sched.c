@@ -12,12 +12,21 @@
 //   switches.
 // - "sleep MS COUNT": sleeps COUNT times for MS milliseconds; fails if one
 //   is too short.
+// - "calls COUNT MAX_MS": makes COUNT broker calls (one-byte reads of a
+//   file); fails if they took longer than MAX_MS, e.g., if each one gave up
+//   the CPU to other programs.
+// - "input MAX_MS": prints `ready`, for the host to send console input (see
+//   sched.input.txt), then waits for it with no timeout; fails if it took
+//   longer than MAX_MS, e.g., while other programs ran.
 // See sched.json.
 
+#include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #include <xmmintrin.h>
 
 static long long now_us(void) {
@@ -70,6 +79,47 @@ static int spin_mode(long long ms, long long min_gap_ms, long long max_gap_ms) {
     return 0;
 }
 
+static int calls_mode(int count, long long max_ms) {
+    int fd = open("/sched", O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "calls: open failed\n");
+        return 1;
+    }
+    char byte;
+    long long start = now_us();
+    for (int i = 0; i < count; i++) {
+        if (pread(fd, &byte, 1, i) != 1) {
+            fprintf(stderr, "calls: read %d failed\n", i);
+            return 1;
+        }
+    }
+    long long took = now_us() - start;
+    close(fd);
+    if (took > max_ms * 1000) {
+        fprintf(stderr, "calls: %d took %lld us\n", count, took);
+        return 1;
+    }
+    return 0;
+}
+
+static int input_mode(long long max_ms) {
+    if (write(1, "ready\n", 6) != 6) {
+        return 1;
+    }
+    long long start = now_us();
+    struct pollfd pfd = {.fd = 0, .events = POLLIN};
+    if (poll(&pfd, 1, -1) != 1 || !(pfd.revents & POLLIN)) {
+        fprintf(stderr, "input: poll failed\n");
+        return 1;
+    }
+    long long waited = now_us() - start;
+    if (waited > max_ms * 1000) {
+        fprintf(stderr, "input: waited %lld us\n", waited);
+        return 1;
+    }
+    return 0;
+}
+
 static int sleep_mode(long long ms, int count) {
     struct timespec duration = {ms / 1000, (ms % 1000) * 1000000};
     for (int i = 0; i < count; i++) {
@@ -89,6 +139,12 @@ int main(int argc, char *argv[]) {
     if (argc == 4 && strcmp(argv[1], "sleep") == 0) {
         return sleep_mode(atoll(argv[2]), atoi(argv[3]));
     }
-    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS | sleep MS COUNT\n");
+    if (argc == 4 && strcmp(argv[1], "calls") == 0) {
+        return calls_mode(atoi(argv[2]), atoll(argv[3]));
+    }
+    if (argc == 3 && strcmp(argv[1], "input") == 0) {
+        return input_mode(atoll(argv[2]));
+    }
+    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS | sleep MS COUNT | calls COUNT MAX_MS | input MAX_MS\n");
     return 2;
 }

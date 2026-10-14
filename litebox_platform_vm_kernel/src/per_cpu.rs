@@ -32,6 +32,8 @@ pub(crate) struct PerCpuVariables {
     pub(crate) asm: PerCpuVariablesAsm,
     pub(crate) gdt: Cell<Option<&'static gdt::GdtWrapper>>,
     pub(crate) tls: Cell<*mut ()>,
+    /// See `with_user_faults`; null otherwise.
+    pub(crate) fault_context: Cell<*const ()>,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
@@ -292,6 +294,11 @@ impl PerCpuVariablesAsm {
     pub(crate) const fn exception_trapno_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, exception_trapno)
     }
+    /// Whether a thread is in a run (see the field).
+    pub(crate) fn is_in_user(&self) -> bool {
+        self.is_in_user.get() != 0
+    }
+
     pub(crate) const fn is_in_user_offset() -> usize {
         offset_of!(PerCpuVariablesAsm, is_in_user)
     }
@@ -338,6 +345,7 @@ pub(crate) fn allocate_per_cpu_variables() {
         asm: PerCpuVariablesAsm::default(),
         gdt: Cell::new(None),
         tls: Cell::new(core::ptr::null_mut()),
+        fault_context: Cell::new(core::ptr::null()),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),
     }));
