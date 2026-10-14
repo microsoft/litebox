@@ -2169,7 +2169,8 @@ mod tests {
         optval
     }
 
-    /// Helper to poll a socket for input, output, and the peer's close without blocking.
+    /// Helper to wait until a socket is ready for input or output, or the peer has closed, and
+    /// return its poll events.
     fn poll_events(task: &TestTask, raw_fd: u32) -> litebox::event::Events {
         use litebox::event::Events;
         let mut pollfd = [litebox_common_linux::Pollfd {

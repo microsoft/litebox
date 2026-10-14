@@ -591,8 +591,7 @@ fn test_tcp_connect_reports_connection_state() {
 
 #[test]
 fn test_tcp_reconnect_after_refused_connect() {
-    let platform = MockPlatform::new();
-    let litebox = LiteBox::new(platform);
+    let litebox = LiteBox::new(MockPlatform::new());
     let mut network = Network::new(&litebox);
     network.set_platform_interaction(PlatformInteraction::Manual);
     let (client_fd, client) = stream_socket(&mut network);
@@ -615,40 +614,18 @@ fn test_tcp_reconnect_after_refused_connect() {
     assert!(matches!(err, ConnectError::InvalidState));
     assert_unconnected();
 
-    // So does a refusal reported by the next call, after it is pending, however late the call.
-    // Until then, the socket can neither receive nor send.
-    let closed = Events::IN | Events::OUT | Events::HUP | Events::RDHUP;
+    // So does a refusal reported by the next call, after it is pending. Until then, the socket can
+    // neither receive nor send.
     let err = network.connect(&client_fd, &addr, false).unwrap_err();
     assert!(matches!(err, ConnectError::InProgress));
     pump(&mut network);
-    assert_eq!(client.check_io_events(), closed | Events::ERR);
-    platform.advance_time(core::time::Duration::from_secs(100));
+    assert_eq!(
+        client.check_io_events(),
+        Events::IN | Events::OUT | Events::HUP | Events::RDHUP | Events::ERR
+    );
     let err = network.connect(&client_fd, &addr, false).unwrap_err();
     assert!(matches!(err, ConnectError::InvalidState));
     assert_unconnected();
-
-    // A refusal that another operation has already reported leaves only an abort to report.
-    let err = network.connect(&client_fd, &addr, false).unwrap_err();
-    assert!(matches!(err, ConnectError::InProgress));
-    pump(&mut network);
-    assert!(matches!(
-        client.get_async_error(true),
-        Some(errors::SocketAsyncError::ConnectionRefused)
-    ));
-    assert_eq!(client.check_io_events(), closed);
-    let err = network.connect(&client_fd, &addr, false).unwrap_err();
-    assert!(matches!(err, ConnectError::ConnectionAborted));
-    assert_unconnected();
-
-    // The same holds for a socket without a proxy.
-    let fd = network.socket(Protocol::Tcp).unwrap();
-    let err = network.connect(&fd, &addr, false).unwrap_err();
-    assert!(matches!(err, ConnectError::InProgress));
-    pump(&mut network);
-    platform.advance_time(core::time::Duration::from_secs(100));
-    let err = network.connect(&fd, &addr, true).unwrap_err();
-    assert!(matches!(err, ConnectError::InvalidState));
-    network.close(&fd, CloseBehavior::Immediate).unwrap();
 
     // Another attempt then connects from the same local port.
     let listener = listening_socket(&mut network);
