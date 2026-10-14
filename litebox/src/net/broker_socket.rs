@@ -101,6 +101,13 @@ impl BrokerTcpSocketState {
         self.connection = connection;
         connection
     }
+
+    /// Returns the socket to the unconnected state once `connect` has reported
+    /// the failure of its connection attempt.
+    fn disconnect(&mut self) {
+        self.take_connection_failure();
+        self.connection = SocketConnectionStatus::Unconnected;
+    }
 }
 
 /// Local state and readiness adapter for one broker-owned TCP socket.
@@ -272,11 +279,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             SocketConnectionStatus::Connecting => Err(ConnectError::InProgress),
             SocketConnectionStatus::Failed(error) => {
                 let error = error.into();
-                self.state.lock().take_connection_failure();
+                self.state.lock().disconnect();
                 drop(status_guard);
                 self.pollee.wake_observers();
-                self.pollee
-                    .notify_observers(Events::IN | Events::OUT | Events::HUP);
+                self.pollee.notify_observers(Events::OUT | Events::HUP);
                 return Err(ConnectError::OperationFailed(error));
             }
             SocketConnectionStatus::Unconnected => Err(ConnectError::InvalidState),
@@ -297,11 +303,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if let SocketConnectionStatus::Failed(error) = status {
             let error = error.into();
             self.apply_socket_status(response);
-            self.state.lock().take_connection_failure();
+            self.state.lock().disconnect();
             drop(status_guard);
             self.pollee.wake_observers();
-            self.pollee
-                .notify_observers(Events::IN | Events::OUT | Events::HUP);
+            self.pollee.notify_observers(Events::OUT | Events::HUP);
             return Err(ConnectError::OperationFailed(error));
         }
         self.apply_socket_status(response);
@@ -337,12 +342,16 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
     }
 
     pub(super) fn shutdown(&self, mode: ShutdownMode) -> Result<(), SocketAsyncError> {
+        let connecting = self.state.lock().connection == SocketConnectionStatus::Connecting;
         match self
             .broker
             .shutdown_socket(self.handle, mode)
             .map_err(|error| SocketAsyncError::from(BrokerObjectError::from(error)))?
         {
             SocketOutcome::Completed(()) => {
+                if connecting && self.abort_connect() {
+                    return Ok(());
+                }
                 if matches!(mode, ShutdownMode::Write | ShutdownMode::Both) {
                     self.write_shutdown.store(true, Ordering::Release);
                     self.pollee.notify_observers(Events::OUT);
@@ -354,6 +363,29 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
                 Err(error)
             }
         }
+    }
+
+    /// Returns the socket to the unconnected state, retaining the error, if
+    /// shutting it down aborted its pending connect.
+    fn abort_connect(&self) -> bool {
+        let status_guard = self.status_lock.lock();
+        let Ok(response) = self.broker.socket_status(self.handle) else {
+            return false;
+        };
+        let SocketConnectionStatus::Failed(error) = response.status else {
+            self.apply_socket_status(response);
+            return false;
+        };
+        {
+            let mut state = self.state.lock();
+            state.connection = SocketConnectionStatus::Unconnected;
+            state.append_retained_error(BrokerTcpAsyncError::Other(error.into()));
+        }
+        drop(status_guard);
+        self.pollee.wake_observers();
+        self.pollee
+            .notify_observers(Events::OUT | Events::HUP | Events::ERR);
+        true
     }
 
     pub(super) fn is_listening(&self) -> bool {
@@ -412,12 +444,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             .map_err(|error| SocketAsyncError::from(BrokerObjectError::from(error)))?
         {
             SocketOutcome::Completed(()) => {
-                let mut state = self.state.lock();
-                state.listening = false;
-                state.update_connection(SocketConnectionStatus::Failed(
-                    BrokerSocketError::NotConnected,
-                ));
-                drop(state);
+                self.state.lock().listening = false;
                 self.pollee.notify_observers(Events::OUT | Events::HUP);
                 Ok(())
             }
@@ -500,6 +527,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         }
         if buffer.is_empty() {
             return Ok(0);
+        }
+        match self.state.lock().connection {
+            SocketConnectionStatus::Unconnected => return Err(ChannelReadError::NotConnected),
+            SocketConnectionStatus::Failed(_) => return Err(ChannelReadError::ConnectionClosed),
+            _ => {}
         }
         let _receive = self.receive_lock.lock();
         let discard = flags.contains(ReceiveFlags::DISCARD);
@@ -588,6 +620,12 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
         if self.write_shutdown.load(Ordering::Acquire) {
             return Err(ChannelWriteError::WriteShutdown);
         }
+        if matches!(
+            self.state.lock().connection,
+            SocketConnectionStatus::Unconnected | SocketConnectionStatus::Failed(_)
+        ) {
+            return Err(ChannelWriteError::NotConnected);
+        }
         let length = buffer.len().min(MAX_SOCKET_TRANSFER_SIZE as usize);
         let outcome = self
             .broker
@@ -601,6 +639,10 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platfor
             })?;
         match outcome {
             SocketOutcome::Completed(sent) => Ok(sent),
+            SocketOutcome::Failed(BrokerSocketError::NotConnected) => {
+                self.refresh_after_synchronous_error();
+                Err(ChannelWriteError::NotConnected)
+            }
             SocketOutcome::Failed(error) => {
                 let error = error.into();
                 self.refresh_after_synchronous_error();
@@ -743,30 +785,46 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTc
         if self.closed.load(Ordering::Acquire) {
             return Events::OUT | Events::HUP;
         }
-        let (mut events, broker_readiness_available) =
-            match self.broker.check_readiness(self.handle) {
-                Ok(readiness) => (readiness_events(readiness), true),
-                Err(_) => (Events::ERR, false),
-            };
-        let connection = self.state.lock().connection;
-        if connection == SocketConnectionStatus::Connecting
-            || events.intersects(Events::OUT | Events::ERR)
+        let (listening, connection) = {
+            let state = self.state.lock();
+            (state.listening, state.connection)
+        };
+        // Only a listening or connecting/connected socket has broker readiness
+        // to observe; the other states are fully described by the cache.
+        let mut events = Events::empty();
+        if listening
+            || matches!(
+                connection,
+                SocketConnectionStatus::Connecting | SocketConnectionStatus::Connected
+            )
         {
-            self.refresh_connection_status(events.contains(Events::ERR));
+            events = self
+                .broker
+                .check_readiness(self.handle)
+                .map_or(Events::ERR, readiness_events);
+            if connection == SocketConnectionStatus::Connecting
+                || events.intersects(Events::OUT | Events::ERR)
+            {
+                self.refresh_connection_status(events.contains(Events::ERR));
+            }
         }
         let state = self.state.lock();
+        let listening = state.listening;
         let connection = state.connection;
         let has_async_error = state.async_error.is_some();
         drop(state);
+        match connection {
+            // A failed connection attempt leaves the socket closed in both directions.
+            SocketConnectionStatus::Failed(_) => {
+                events = Events::IN | Events::OUT | Events::HUP | Events::RDHUP;
+            }
+            SocketConnectionStatus::Unconnected if !listening => {
+                events = Events::OUT | Events::HUP;
+            }
+            _ => {}
+        }
         if has_async_error {
             events.insert(Events::ERR);
-        } else if broker_readiness_available
-            && matches!(connection, SocketConnectionStatus::Failed(_))
-        {
-            events.remove(Events::ERR);
-        }
-        if matches!(connection, SocketConnectionStatus::Failed(_)) {
-            events.insert(Events::IN | Events::OUT | Events::HUP);
         }
         if self.write_shutdown.load(Ordering::Acquire) {
             events.insert(Events::OUT);

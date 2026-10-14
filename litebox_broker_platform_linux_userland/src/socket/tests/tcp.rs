@@ -350,7 +350,7 @@ fn reactor_drives_a_loopback_tcp_socket() {
     );
     let read_shutdown_readiness = process.check_readiness(read_shutdown_handle).unwrap();
     assert!(read_shutdown_readiness.contains(ReadinessFlags::READ));
-    assert!(!read_shutdown_readiness.contains(ReadinessFlags::HANGUP));
+    assert!(read_shutdown_readiness.contains(ReadinessFlags::HANGUP));
     assert!(!read_shutdown_readiness.contains(ReadinessFlags::ERROR));
 
     let unconnected_handle = create_socket(&process, readiness.clone());

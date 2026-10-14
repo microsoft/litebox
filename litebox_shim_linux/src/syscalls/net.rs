@@ -968,7 +968,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     Ok(n) => Ok(n),
                     Err(ChannelWriteError::BufferFull) if is_empty_stream => Ok(0),
                     Err(ChannelWriteError::BufferFull) => Err(TryOpError::TryAgain),
-                    Err(e) => Err(TryOpError::Other(Errno::from(e))),
+                    // Like Linux, a pending socket error (such as a reset) is reported, and
+                    // consumed, in place of `EPIPE`.
+                    Err(e) => Err(TryOpError::Other(match Errno::from(e) {
+                        Errno::EPIPE => proxy
+                            .get_async_error(true)
+                            .map_or(Errno::EPIPE, Errno::from),
+                        errno => errno,
+                    })),
                 },
             )
             .map_err(|error| wait_errno(timeout, socket_io_errno(error)))
@@ -1173,8 +1180,14 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                         proxy.set_async_error(error);
                         return Ok(received);
                     }
+                    // A pending error, such as the reset of an aborted connection attempt, is
+                    // reported first.
                     Err(ChannelReadError::NotConnected) => {
-                        return Err(TryOpError::Other(Errno::ENOTCONN));
+                        return Err(TryOpError::Other(
+                            proxy
+                                .get_async_error(true)
+                                .map_or(Errno::ENOTCONN, Errno::from),
+                        ));
                     }
                     Err(ChannelReadError::Socket(error)) => {
                         return Err(TryOpError::Other(error.into()));
@@ -1196,7 +1209,9 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                         Some(error) => Err(error.into()),
                         None => Ok(0),
                     },
-                    Err(ChannelReadError::NotConnected) => Err(Errno::ENOTCONN),
+                    Err(ChannelReadError::NotConnected) => Err(proxy
+                        .get_async_error(true)
+                        .map_or(Errno::ENOTCONN, Errno::from)),
                     Err(ChannelReadError::Socket(error)) => Err(error.into()),
                     Err(ChannelReadError::WouldBlock) => {
                         Err(wait_errno(timeout, socket_io_errno(error)))

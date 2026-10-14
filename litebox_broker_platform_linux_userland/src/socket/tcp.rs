@@ -286,11 +286,32 @@ fn readiness_from_epoll(socket: &SocketEntry, events: epoll::EventFlags) -> Read
     {
         readiness = readiness | ReadinessFlags::READ | ReadinessFlags::HANGUP;
     }
+    // A host hang-up closes both directions of an external connection, but on
+    // an internal endpoint it only reports that the peer closed.
+    if events.contains(epoll::EventFlags::HUP)
+        && socket
+            .tcp_state()
+            .is_ok_and(|tcp| tcp.descriptor.is_external())
+    {
+        readiness = readiness | ReadinessFlags::CLOSED;
+    }
     if events.contains(epoll::EventFlags::ERR) {
         readiness = readiness | ReadinessFlags::ERROR;
     }
     let previous = socket.snapshot.load();
-    ReadinessFlags(readiness.0 | previous.0)
+    with_tcp_closed(socket, ReadinessFlags(readiness.0 | previous.0))
+}
+
+/// Adds [`ReadinessFlags::CLOSED`] once both directions of a TCP socket are shut down.
+fn with_tcp_closed(socket: &SocketEntry, readiness: ReadinessFlags) -> ReadinessFlags {
+    if socket.kind() == SocketKind::Tcp
+        && socket.write_shutdown
+        && (socket.read_shutdown || readiness.contains(ReadinessFlags::HANGUP))
+    {
+        readiness | ReadinessFlags::CLOSED
+    } else {
+        readiness
+    }
 }
 
 fn active_epoll_events() -> epoll::EventFlags {
@@ -568,7 +589,13 @@ pub(super) fn send_socket(
                 return Err(BrokerError::WouldBlock);
             }
             Err(error) => {
-                let error = socket_operation_error_from_errno(error)?;
+                // `EPIPE` means the connection can no longer send, which is
+                // distinct from the reset that `ECONNRESET` reports.
+                let error = if error == Errno::PIPE {
+                    SocketError::NotConnected
+                } else {
+                    socket_operation_error_from_errno(error)?
+                };
                 fail_connect(socket, error);
                 let _ = consume_synchronous_error(socket);
                 return Ok(SocketOutcome::Failed(error));
@@ -995,7 +1022,7 @@ pub(super) fn shutdown_tcp_socket(
     let (kernel_shutdown, add, clear, shuts_down_read, shuts_down_write) = match mode {
         ShutdownMode::Read => (
             (!internal_endpoint).then_some(LinuxShutdown::Read),
-            ReadinessFlags::READ,
+            ReadinessFlags::READ | ReadinessFlags::HANGUP,
             ReadinessFlags::default(),
             true,
             false,
@@ -1013,7 +1040,7 @@ pub(super) fn shutdown_tcp_socket(
             } else {
                 LinuxShutdown::Both
             }),
-            ReadinessFlags::READ,
+            ReadinessFlags::READ | ReadinessFlags::HANGUP,
             ReadinessFlags::WRITE,
             true,
             true,
@@ -1047,6 +1074,17 @@ pub(super) fn shutdown_tcp_socket(
             }
         }
     }
+    // Shutting down a pending connect aborts it with a reset; record that now
+    // so the caller observes it.
+    if socket.connection_status == SocketConnectionStatus::Connecting
+        && socket.tcp_state()?.descriptor.is_external()
+        && let Err(error) = sockopt::socket_error(socket.tcp_state()?.descriptor.socket()?)
+            .map_err(broker_error_from_errno)?
+    {
+        socket.connection_status = SocketConnectionStatus::Failed(socket_error_from_errno(error));
+        let _ = update_snapshot(socket, ReadinessFlags::ERROR);
+        return Ok(SocketOutcome::Completed(()));
+    }
     let shutdown_error = if let Some(mut queued) = guest_read_shutdown_buffer {
         let capture_error = capture_guest_read_shutdown(socket, &mut queued).err();
         socket.tcp_state_mut()?.guest_read_shutdown = Some(GuestTcpReadShutdown {
@@ -1068,7 +1106,7 @@ pub(super) fn shutdown_tcp_socket(
             .take()
             .is_some();
     let current = socket.snapshot.load();
-    let readiness = ReadinessFlags((current.0 & !clear.0) | add.0);
+    let readiness = with_tcp_closed(socket, ReadinessFlags((current.0 & !clear.0) | add.0));
     // Kernel shutdown and the cached directional state are committed.
     let _ = update_snapshot(socket, readiness);
     if republish_readiness {
@@ -1751,8 +1789,11 @@ impl Reactor {
         }
         tcp.pending_errors.append(TcpPendingError::GuestReset);
         let current = socket.snapshot.load();
-        let readiness =
-            current | ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
+        let readiness = current
+            | ReadinessFlags::READ
+            | ReadinessFlags::ERROR
+            | ReadinessFlags::HANGUP
+            | ReadinessFlags::CLOSED;
         let _ = if readiness == current {
             socket.readiness.republish(readiness)
         } else {

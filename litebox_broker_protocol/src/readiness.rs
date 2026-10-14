@@ -13,8 +13,9 @@ impl ReadinessFlags {
     pub const READ: Self = Self(1 << 0);
     /// Data can be written without blocking.
     pub const WRITE: Self = Self(1 << 1);
-    /// The peer closed its write side, so reads reach end of file once
-    /// buffered data is drained, but this side may still be able to send.
+    /// No more data can be received once buffered data is drained, because
+    /// the peer closed its write side or the read side was shut down, but
+    /// this side may still be able to send.
     pub const HANGUP: Self = Self(1 << 2);
     /// The object is in an error state.
     pub const ERROR: Self = Self(1 << 3);
