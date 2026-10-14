@@ -286,7 +286,8 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
         }
     }
 
-    /// Discard what is left of a failed connection; see [`StreamSocketChannel::disconnect`].
+    /// Discard what is left of a failed connection, leaving the socket unconnected; see
+    /// [`StreamSocketChannel::disconnect`].
     pub(super) fn disconnect(&self) {
         match self {
             NetworkProxy::Stream(channel) => channel.disconnect(),
@@ -557,10 +558,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
     }
 
     /// Discard what is left of a failed connection: data not yet read or sent, and the shutdown
-    /// of either side, so that the socket can connect again.
+    /// of either side, leaving the socket unconnected so that it can connect again.
     pub(super) fn disconnect(&self) {
+        self.set_state(SocketState::Initial);
         let n = self.inner.rx_cons.lock().clear();
         self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        // Clear under the TX lock, after the state change, so that a concurrent `try_write`
+        // either queues its data before it is discarded, or finds the socket unconnected.
+        let _tx_prod = self.inner.tx_prod.lock();
         let n = self.inner.tx_cons.lock().clear();
         self.inner.tx_available.fetch_add(n, Ordering::Release);
         self.inner.read_shutdown.store(false, Ordering::Release);

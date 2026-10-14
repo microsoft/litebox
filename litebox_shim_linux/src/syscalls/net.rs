@@ -2514,7 +2514,8 @@ mod tests {
         );
         close_socket(&task, raw_pending_fd);
 
-        // A blocking call waits for the outcome of an earlier attempt.
+        // A blocking call waits for the outcome of an earlier attempt, here one that another
+        // thread aborts by shutting the socket down.
         let raw_fd = task
             .do_socket(
                 AddressFamily::INET,
@@ -2525,7 +2526,7 @@ mod tests {
             .unwrap();
         let fd = typed_socket(&task, raw_fd);
         assert_eq!(
-            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            task.do_connect(&fd, address([10, 0, 0, 3], port)),
             Err(Errno::EINPROGRESS)
         );
         task.sys_fcntl(
@@ -2533,10 +2534,19 @@ mod tests {
             litebox_common_linux::FcntlArg::SETFL(litebox::fs::OFlags::empty()),
         )
         .unwrap();
-        assert_eq!(
-            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
-            Err(Errno::ECONNREFUSED)
-        );
+        let blocked = task.spawn_clone_for_test(move |task| {
+            let fd = typed_socket(&task, raw_fd);
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT))
+        });
+        std::thread::sleep(core::time::Duration::from_millis(100));
+        assert!(!blocked.is_finished());
+        task.sys_shutdown(
+            i32::try_from(raw_fd).unwrap(),
+            litebox_common_linux::SHUT_RDWR,
+        )
+        .unwrap();
+        assert_eq!(blocked.join().unwrap(), Err(Errno::ECONNRESET));
+        assert_eq!(get_so_error(&task, &fd), 0);
         close_socket(&task, raw_fd);
 
         // A refused attempt leaves the socket unconnected, so it can connect again.

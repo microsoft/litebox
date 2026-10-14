@@ -624,19 +624,21 @@ where
                     tcp_socket.close();
                 }
 
+                // An unconnected socket has no connection to receive from or report on, even if
+                // smoltcp still holds data or the FIN of a failed one.
+                let tcp_specific = socket_handle.specific.tcp();
+                let connected = tcp_specific.connect_state != ConnectState::Unconnected;
+
                 // Drain RX buffer: from smoltcp directly to ring buffer
-                while tcp_socket.can_recv() {
+                while connected && tcp_socket.can_recv() {
                     let received = proxy
                         .push_rx_data_with(|buf| tcp_socket.recv_slice(buf).unwrap_or_default());
                     if received == 0 {
                         break;
                     }
                 }
-                let tcp_specific = socket_handle.specific.tcp();
                 // smoltcp reports `Finished` only once the peer's FIN has been received and all
-                // data before it has been moved to the channel. An unconnected socket has no
-                // connection to report on, even if smoltcp still remembers a failed one.
-                let connected = tcp_specific.connect_state != ConnectState::Unconnected;
+                // data before it has been moved to the channel.
                 let fin_received =
                     connected && matches!(tcp_socket.peek(0), Err(tcp::RecvError::Finished));
                 if fin_received {
@@ -1193,7 +1195,6 @@ where
                     // unconnected again.
                     let _ = proxy.get_async_error(true);
                     proxy.disconnect();
-                    proxy.set_state(socket_channel::SocketState::Initial);
                 }
                 Err(_) => {}
             }

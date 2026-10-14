@@ -125,9 +125,17 @@ fn pump(network: &mut Network<MockPlatform>) {
 }
 
 fn stream_socket(network: &mut Network<MockPlatform>) -> (SocketFd<MockPlatform>, TestProxy) {
+    stream_socket_with_rx_capacity(network, SOCKET_BUFFER_SIZE)
+}
+
+/// Like [`stream_socket`], with the given receive channel capacity.
+fn stream_socket_with_rx_capacity(
+    network: &mut Network<MockPlatform>,
+    rx_capacity: usize,
+) -> (SocketFd<MockPlatform>, TestProxy) {
     let fd = network.socket(Protocol::Tcp).unwrap();
     let proxy = alloc::sync::Arc::new(NetworkProxy::Stream(
-        socket_channel::StreamSocketChannel::new(),
+        socket_channel::StreamSocketChannel::new_with_capacity(rx_capacity, SOCKET_BUFFER_SIZE),
     ));
     assert!(network.set_socket_proxy(&fd, proxy.clone()));
     (fd, proxy)
@@ -149,26 +157,30 @@ fn connect_and_accept(
     (SocketFd<MockPlatform>, TestProxy),
     (SocketFd<MockPlatform>, TestProxy),
 ) {
-    connect_and_accept_with_server_rx_capacity(network, listener, SOCKET_BUFFER_SIZE)
+    connect_and_accept_with_rx_capacities(network, listener, SOCKET_BUFFER_SIZE, SOCKET_BUFFER_SIZE)
 }
 
-/// Like [`connect_and_accept`], with the given receive channel capacity for the server end.
-fn connect_and_accept_with_server_rx_capacity(
+/// Like [`connect_and_accept`], with the given receive channel capacities for the two ends.
+fn connect_and_accept_with_rx_capacities(
     network: &mut Network<MockPlatform>,
     listener: &SocketFd<MockPlatform>,
-    rx_capacity: usize,
+    client_rx_capacity: usize,
+    server_rx_capacity: usize,
 ) -> (
     (SocketFd<MockPlatform>, TestProxy),
     (SocketFd<MockPlatform>, TestProxy),
 ) {
-    let (client_fd, client) = stream_socket(network);
+    let (client_fd, client) = stream_socket_with_rx_capacity(network, client_rx_capacity);
     let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
     let err = network.connect(&client_fd, &addr, false).unwrap_err();
     assert!(matches!(err, ConnectError::InProgress));
     pump(network);
     let server_fd = network.accept(listener, None).unwrap();
     let server = alloc::sync::Arc::new(NetworkProxy::Stream(
-        socket_channel::StreamSocketChannel::new_with_capacity(rx_capacity, SOCKET_BUFFER_SIZE),
+        socket_channel::StreamSocketChannel::new_with_capacity(
+            server_rx_capacity,
+            SOCKET_BUFFER_SIZE,
+        ),
     ));
     assert!(network.set_socket_proxy(&server_fd, server.clone()));
     pump(network);
@@ -290,7 +302,7 @@ fn test_tcp_reset_reported_before_unread_data() {
     let listener = listening_socket(&mut network);
     // A small channel leaves the data that does not fit in smoltcp.
     let ((client_fd, client), (server_fd, server)) =
-        connect_and_accept_with_server_rx_capacity(&mut network, &listener, 4);
+        connect_and_accept_with_rx_capacities(&mut network, &listener, SOCKET_BUFFER_SIZE, 4);
 
     assert_eq!(write(&client, b"hello world").unwrap(), 11);
     pump(&mut network);
@@ -335,7 +347,7 @@ fn test_tcp_graceful_close_with_unread_data() {
     network.set_platform_interaction(PlatformInteraction::Manual);
     let listener = listening_socket(&mut network);
     let ((client_fd, client), (server_fd, server)) =
-        connect_and_accept_with_server_rx_capacity(&mut network, &listener, 4);
+        connect_and_accept_with_rx_capacities(&mut network, &listener, SOCKET_BUFFER_SIZE, 4);
 
     // The connection closes gracefully while smoltcp still holds data that did not fit in the
     // channel: the peer's FIN, then ours.
@@ -615,8 +627,9 @@ fn test_tcp_reconnect_after_lost_connection() {
     network.close(&server_fd, CloseBehavior::Immediate).unwrap();
 
     // Otherwise, the loss of such a connection is reported by the next call, which discards what
-    // is left of the connection.
-    let ((client_fd, client), (server_fd, server)) = connect_and_accept(&mut network, &listener);
+    // is left of the connection, including data that smoltcp holds because the channel is full.
+    let ((client_fd, client), (server_fd, server)) =
+        connect_and_accept_with_rx_capacities(&mut network, &listener, 2, SOCKET_BUFFER_SIZE);
     write(&server, b"old").unwrap();
     pump(&mut network);
     network.close(&server_fd, CloseBehavior::Immediate).unwrap();
