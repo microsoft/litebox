@@ -183,6 +183,7 @@ fn test_fork_with_windows_broker() {
     assert_eq!(numeric_field(parent, "global="), 2);
     assert_eq!(numeric_field(parent, "intact="), 1);
     assert_eq!(numeric_field(parent, "echild="), 1);
+    assert_eq!(numeric_field(parent, "alarm="), 1);
     let fork = output_line(&output, "fork ");
     let child = numeric_field(fork, "child=");
     assert_ne!(child, numeric_field(parent, "pid="));
