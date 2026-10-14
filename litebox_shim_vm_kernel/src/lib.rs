@@ -35,6 +35,7 @@ pub mod optee;
 pub mod program;
 pub mod sched;
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
@@ -163,6 +164,8 @@ struct Inner {
     /// `None` if no other process needs the CPU.
     slice_end: Cell<Option<Instant>>,
     suspended: Cell<Suspended>,
+    /// Nanoseconds, for `sched` to pick the process that used the least.
+    cpu_time: Cell<u64>,
 }
 
 /// Why a process stopped mid-run, to resume where it was.
@@ -180,7 +183,9 @@ enum Suspended {
 }
 
 pub struct Process {
-    inner: Inner,
+    /// Shared with the broker's worker while it serves the process, which
+    /// may outlast a `&mut Process` (see `sched`).
+    inner: Rc<Inner>,
     ctx: PtRegs,
     /// Saved while another process runs.
     fs_base: usize,
@@ -259,7 +264,7 @@ impl Process {
         map_read_only(&mappings, layout::STARTUP_INFO, info.as_bytes())?;
 
         Ok(Self {
-            inner: Inner {
+            inner: Rc::new(Inner {
                 platform,
                 address_space,
                 identity: config.identity,
@@ -276,8 +281,9 @@ impl Process {
                 armed_deadline: Cell::new(None),
                 notified: Cell::new(false),
                 slice_end: Cell::new(None),
+                cpu_time: Cell::new(0),
                 suspended: Cell::new(Suspended::No),
-            },
+            }),
             ctx: PtRegs::default(),
             fs_base: 0,
             user_state: UserThreadState::default(),
@@ -612,9 +618,9 @@ impl Inner {
     fn resume(&self) -> ContinueOperation {
         // Others may have published to it (e.g., fired its timers).
         self.broker.poll_events();
-        // That, or an interrupt during a halt in the kernel, may have woken a
-        // blocked process: stop, for the scheduler to see.
-        if self.broker.take_woken() {
+        // That, or an interrupt during a halt in the kernel, may have made
+        // another due to run: stop, for the scheduler to see.
+        if self.others_due() {
             self.suspended.set(Suspended::Preempted);
             return ContinueOperation::Terminate;
         }
@@ -1113,8 +1119,8 @@ impl EnterShim for Inner {
 
     /// An interrupt (e.g., the timer's, or a device's) stopped the process.
     /// First has the broker look at the devices and fire its due timers, as
-    /// a kernel call would. Past its slice end, or once a notification
-    /// reached a blocked process, then preempts it; what is due is delivered
+    /// a kernel call would. Past its slice end, or once another may be due
+    /// to run (see `sched`), then preempts it; what is due is delivered
     /// once it resumes. Otherwise delivers
     /// [`UpcallKind::Interrupt`] (quietly ignored before [`CallId::Ready`],
     /// like any upcall with no entry registered yet) if that published a
@@ -1131,8 +1137,8 @@ impl EnterShim for Inner {
             self.notified.set(true);
         }
         let now = self.platform.now();
-        // A woken process may be due to run (see `sched`).
-        if self.broker.take_woken()
+        // Another may be due to run (see `sched`).
+        if self.others_due()
             || self
                 .slice_end
                 .get()

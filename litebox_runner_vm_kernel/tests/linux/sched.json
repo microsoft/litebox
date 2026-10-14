@@ -17,7 +17,8 @@
   {
     "concurrent": [
       { "argv": ["/sched", "input", "1000"], "console_stdin": true },
-      { "argv": ["/sched", "spin", "3000", "0", "3000"] }
+      { "argv": ["/sched", "spin", "3000", "0", "150"] },
+      { "argv": ["/sched", "spin", "1000", "0", "1000", "1000"] }
     ]
   },
   {

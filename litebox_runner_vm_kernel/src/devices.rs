@@ -13,12 +13,13 @@
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
-//! The interrupt handler only ends the interrupt; the broker looks at the
-//! devices when it next runs, which, if the interrupt stopped a process, the
-//! shim has it do at once (see `litebox_platform_vm_kernel`).
+//! The interrupt handler only ends the interrupt, noting a device's; the
+//! broker looks at the devices when it next runs, which, if the interrupt
+//! stopped a process, the shim has it do at once (see
+//! `litebox_platform_vm_kernel`).
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_vm_kernel::Events;
@@ -55,6 +56,8 @@ pub struct Devices {
     /// [`armed`]), so it can skip rewriting it: under KVM each write is a VM
     /// exit, and it rearms before every resume of a process.
     armed: AtomicU64,
+    /// See [`Events::take_device_interrupt`].
+    device_interrupted: AtomicBool,
 }
 
 /// [`Devices::armed`]'s value for `deadline`: zero for none (the instant zero,
@@ -82,6 +85,7 @@ impl Devices {
             clock,
             console_interrupts: console.interrupts(),
             armed: AtomicU64::new(ARMED_UNKNOWN),
+            device_interrupted: AtomicBool::new(false),
             console: Mutex::new(console),
         }));
         litebox_platform_vm_kernel::set_interrupt_handler(Box::leak(Box::new(|vector| {
@@ -100,9 +104,22 @@ impl Devices {
             // Fired: arming the same deadline again (e.g., after an early
             // fire) must reprogram it.
             self.armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
+        } else {
+            self.device_interrupted.store(true, Ordering::Relaxed);
         }
         self.apic.end_of_interrupt();
         true
+    }
+
+    /// For drivers: waits until a device may have changed (an interrupt) or
+    /// `deadline` (to poll one that does not interrupt); then look again. On
+    /// the worker (serving broker requests), suspends it, and processes run
+    /// meanwhile; elsewhere, halts. Hold no lock the kernel may take meanwhile
+    /// (see `litebox_platform_vm_kernel::worker`).
+    pub fn block(&self, deadline: Option<Instant>) {
+        if !litebox_platform_vm_kernel::worker::suspend(deadline) {
+            self.halt(deadline);
+        }
     }
 
     /// Halts until an interrupt, or until `deadline`.
@@ -126,6 +143,10 @@ impl Events for Devices {
         }
         self.halt(deadline);
         true
+    }
+
+    fn take_device_interrupt(&self) -> bool {
+        self.device_interrupted.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -189,7 +210,7 @@ impl Console for Devices {
                 return written;
             }
             // Until the device takes more output.
-            self.halt(Some(deadline));
+            self.block(Some(deadline));
         }
     }
 }

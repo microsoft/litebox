@@ -71,6 +71,9 @@ pub trait Events: Sync {
     /// Without a deadline, false if no event could ever end the halt (and it
     /// does not halt).
     fn wait(&self, deadline: Option<Instant>) -> bool;
+
+    /// Whether a device interrupted since the last call.
+    fn take_device_interrupt(&self) -> bool;
 }
 
 /// The runner's sources for a [`Broker`].
@@ -429,6 +432,11 @@ impl Association {
         self.readiness
             .set_waiting(wait.notifications && matches!(state, WaitState::Blocked { .. }));
         state
+    }
+
+    /// See [`Events::take_device_interrupt`].
+    pub fn take_device_interrupt(&self) -> bool {
+        self.broker.events.take_device_interrupt()
     }
 
     /// For a blocked wait that the caller ends itself (e.g., stalled, or the

@@ -3,13 +3,13 @@
 
 // For the kernel's scheduler, with several programs at once. The first
 // argument picks a mode:
-// - "spin MS MIN_GAP_MS MAX_GAP_MS": busy-waits for MS milliseconds, with no
+// - "spin MS MIN_GAP_MS MAX_GAP_MS [DELAY_MS]": busy-waits for MS milliseconds, with no
 //   syscalls but clock reads (which the runner serves without the kernel),
 //   computing in floating point all along, with a GS base set by `wrgsbase`
 //   (not a syscall). Fails unless the longest gap between consecutive clock
 //   reads, while other programs ran, is in [MIN_GAP_MS, MAX_GAP_MS], and
 //   unless the computation, the rounding mode, and the GS base survived the
-//   switches.
+//   switches. With DELAY_MS, sleeps that long first.
 // - "sleep MS COUNT": sleeps COUNT times for MS milliseconds; fails if one
 //   is too short.
 // - "calls COUNT MAX_MS": makes COUNT broker calls (one-byte reads of a
@@ -120,11 +120,15 @@ static int input_mode(long long max_ms) {
     return 0;
 }
 
-static int sleep_mode(long long ms, int count) {
+static int sleep_ms(long long ms) {
     struct timespec duration = {ms / 1000, (ms % 1000) * 1000000};
+    return nanosleep(&duration, NULL);
+}
+
+static int sleep_mode(long long ms, int count) {
     for (int i = 0; i < count; i++) {
         long long start = now_us();
-        if (nanosleep(&duration, NULL) != 0 || now_us() - start < ms * 1000) {
+        if (sleep_ms(ms) != 0 || now_us() - start < ms * 1000) {
             fprintf(stderr, "sleep: %d too short\n", i);
             return 1;
         }
@@ -133,7 +137,10 @@ static int sleep_mode(long long ms, int count) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc == 5 && strcmp(argv[1], "spin") == 0) {
+    if ((argc == 5 || argc == 6) && strcmp(argv[1], "spin") == 0) {
+        if (argc == 6) {
+            sleep_ms(atoll(argv[5]));
+        }
         return spin_mode(atoll(argv[2]), atoll(argv[3]), atoll(argv[4]));
     }
     if (argc == 4 && strcmp(argv[1], "sleep") == 0) {
@@ -145,6 +152,6 @@ int main(int argc, char *argv[]) {
     if (argc == 3 && strcmp(argv[1], "input") == 0) {
         return input_mode(atoll(argv[2]));
     }
-    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS | sleep MS COUNT | calls COUNT MAX_MS | input MAX_MS\n");
+    fprintf(stderr, "usage: sched spin MS MIN_GAP_MS MAX_GAP_MS [DELAY_MS] | sleep MS COUNT | calls COUNT MAX_MS | input MAX_MS\n");
     return 2;
 }
