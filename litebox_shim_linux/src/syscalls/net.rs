@@ -2977,6 +2977,25 @@ mod tests {
             close_socket(&task, raw_fd);
         }
 
+        // Like Linux, an unconnected TCP socket is shut down even though `ENOTCONN` is reported,
+        // so receives see end-of-file once the read side is shut down.
+        for (how, expected) in [(SHUT_WR, Err(Errno::ENOTCONN)), (SHUT_RD, Ok(0))] {
+            let raw_tcp = task
+                .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+                .unwrap();
+            let tcp = typed_socket(&task, raw_tcp);
+            assert_eq!(
+                task.sys_shutdown(i32::try_from(raw_tcp).unwrap(), how),
+                Err(Errno::ENOTCONN)
+            );
+            let mut buf = [0u8; 8];
+            assert_eq!(
+                task.do_recvfrom(&tcp, &mut buf, ReceiveFlags::empty(), None),
+                expected
+            );
+            close_socket(&task, raw_tcp);
+        }
+
         // Like Linux, shutting down a connecting TCP socket reports a reset and leaves the socket
         // unconnected.
         let raw_tcp = task

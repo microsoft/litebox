@@ -1451,7 +1451,7 @@ where
     /// read side of a listening socket stops listening (pending connections are reset), and
     /// shutting down a TCP socket that is still connecting aborts the connection attempt,
     /// reports `ConnectionReset`, and leaves the socket unconnected.
-    /// An unconnected UDP socket is shut down too, even though `NotConnected` is returned.
+    /// An unconnected socket is shut down too, even though `NotConnected` is returned.
     pub fn shutdown(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1491,6 +1491,8 @@ where
                         proxy.set_state(socket_channel::SocketState::Initial);
                     }
                     tcp::State::Closed | tcp::State::Listen | tcp::State::TimeWait => {
+                        // As for UDP, shut down even an unconnected socket.
+                        proxy.shutdown(how);
                         return Err(ShutdownError::NotConnected);
                     }
                     _ => proxy.shutdown(how),
