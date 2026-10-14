@@ -8,9 +8,9 @@
 //!   new process, including both static and dynamic ELF binaries.
 //! * Loading LiteBox trampoline code for syscall handling.
 
+use crate::PAGE_SIZE;
 use alloc::vec::Vec;
 use elf::file::FileHeader;
-use litebox::PAGE_SIZE;
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _, RawPointerProvider},
     utils::{ReinterpretSignedExt as _, TruncateExt as _},

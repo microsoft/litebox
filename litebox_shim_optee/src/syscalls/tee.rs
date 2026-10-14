@@ -3,16 +3,13 @@
 
 //! Implementation of generic TEE related syscalls
 
+use litebox::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
-use litebox::{
-    PAGE_SIZE,
-    page::{NonZeroAddress, NonZeroPageSize},
-};
 use litebox_common_optee::{
-    TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeTime, TeeTimeCategory,
-    TeeUuid, UserTaPropType, UteeParams,
+    PAGE_SIZE, TeeIdentity, TeeMemoryAccessRights, TeeOrigin, TeePropSet, TeeResult, TeeTime,
+    TeeTimeCategory, TeeUuid, UserTaPropType, UteeParams,
 };
 use num_enum::TryFromPrimitive;
 use zerocopy::IntoBytes;

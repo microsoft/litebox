@@ -19,11 +19,12 @@ use crate::{NormalWorldConstPtr, NormalWorldMutPtr};
 use alloc::{boxed::Box, vec::Vec};
 use core::mem::size_of;
 use hashbrown::{HashMap, HashSet};
-use litebox::{PAGE_SIZE, vmap::PhysPageAddr};
+use litebox::vmap::PhysPageAddr;
 use litebox::{
     platform::{RawConstPointer, RawMutPointer},
     utils::TruncateExt,
 };
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgArgsHeader, OpteeMsgAttrType, OpteeMsgParamRmem,
     OpteeMsgParamTmem, OpteeMsgParamValue, OpteeRpcArgs, OpteeSecureWorldCapabilities,
@@ -849,7 +850,7 @@ impl<const ALIGN: usize> ShmInfo<ALIGN> {
     /// Write `data` to the normal-world shared memory pages referenced by `self`,
     /// starting at byte `offset` within the view.
     /// Returns `EBadAddr` if the requested range is not entirely within the view.
-    pub(crate) fn write_at<Platform: litebox::vmap::VmapManager<ALIGN>>(
+    pub(super) fn write_at<Platform: litebox::vmap::VmapManager<ALIGN>>(
         &self,
         platform: &Platform,
         offset: usize,
@@ -948,13 +949,13 @@ struct ShmRefMap<const ALIGN: usize> {
 }
 
 impl<const ALIGN: usize> ShmRefMap<ALIGN> {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             inner: spin::mutex::SpinMutex::new(HashMap::new()),
         }
     }
 
-    pub fn insert(&self, shm_ref: u64, info: ShmInfo<ALIGN>) -> Result<(), OpteeSmcReturnCode> {
+    fn insert(&self, shm_ref: u64, info: ShmInfo<ALIGN>) -> Result<(), OpteeSmcReturnCode> {
         let mut guard = self.inner.lock();
         if guard.contains_key(&shm_ref) {
             Err(OpteeSmcReturnCode::ENotAvail)
@@ -966,12 +967,12 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
         }
     }
 
-    pub fn remove(&self, shm_ref: u64) -> Option<ShmInfo<ALIGN>> {
+    fn remove(&self, shm_ref: u64) -> Option<ShmInfo<ALIGN>> {
         let mut guard = self.inner.lock();
         guard.remove(&shm_ref)
     }
 
-    pub fn get(&self, shm_ref: u64) -> Option<ShmInfo<ALIGN>> {
+    fn get(&self, shm_ref: u64) -> Option<ShmInfo<ALIGN>> {
         let guard = self.inner.lock();
         guard.get(&shm_ref).cloned()
     }
@@ -986,7 +987,7 @@ impl<const ALIGN: usize> ShmRefMap<ALIGN> {
     /// `aligned_size` indicates the page-aligned size of the shared memory region to register
     /// (i.e., `page_align_up(page_offset + size)`) and determines how many physical pages are
     /// walked from the [`ShmRefPagesData`] list.
-    pub fn register_shm<Platform: litebox::vmap::VmapManager<ALIGN>>(
+    fn register_shm<Platform: litebox::vmap::VmapManager<ALIGN>>(
         &self,
         platform: &Platform,
         shm_ref_pages_data_phys_addr: u64,

@@ -8,10 +8,7 @@
 use core::ops::Range;
 
 use alloc::vec::Vec;
-use litebox::{
-    PAGE_SIZE,
-    page::{NonZeroAddress, NonZeroPageSize, PageRange},
-};
+use litebox::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
@@ -22,6 +19,8 @@ use litebox::{
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
 };
+
+use crate::PAGE_SIZE;
 
 use crate::{
     MRemapFlags, MapFlags, ProtFlags, UserPtrMut,

@@ -8,7 +8,6 @@ use crate::{
 use alloc::vec::Vec;
 use ecdsa::hazmat::{SignPrimitive as _, bits2field};
 use hmac::{Hmac, Mac};
-use litebox::PAGE_SIZE;
 use litebox::{
     platform::{
         ComputeParams, DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _,
@@ -17,6 +16,7 @@ use litebox::{
     utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{TaFlags, TeeParamType, TeeResult, TeeUuid, UteeParams};
 use num_enum::TryFromPrimitive;
 use p384::{

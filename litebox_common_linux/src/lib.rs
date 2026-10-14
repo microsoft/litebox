@@ -27,12 +27,12 @@ pub mod vmem;
 
 extern crate alloc;
 
-use litebox::{
-    PAGE_SIZE,
-    user_pointers::{UserPtr, UserPtrMut},
-};
+use litebox::user_pointers::{UserPtr, UserPtrMut};
 
 // TODO(jayb): Should errno::Errno be publicly re-exported?
+
+/// Page size required by the supported Linux guest ABIs.
+pub const PAGE_SIZE: usize = 4096;
 
 pub const STDIN_FILENO: i32 = 0;
 pub const STDOUT_FILENO: i32 = 1;

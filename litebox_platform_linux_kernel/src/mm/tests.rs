@@ -6,12 +6,10 @@ use core::alloc::{GlobalAlloc, Layout};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use litebox::{
-    PAGE_SIZE,
-    page::{NonZeroAddress, NonZeroPageSize, PageRange},
-};
+use litebox::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::{mm::allocator::SafeZoneAllocator, platform::RawConstPointer};
 use litebox_common_linux::{
+    PAGE_SIZE,
     mm::VmemManager,
     vmem::{CreatePagesFlags, PageFaultError, VmFlags},
 };

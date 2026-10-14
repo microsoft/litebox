@@ -32,9 +32,6 @@ pub mod tls;
 pub mod user_pointers;
 pub mod vmap;
 
-/// Size of a 4 KiB page in bytes.
-pub const PAGE_SIZE: usize = 4096;
-
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.
 mod litebox;

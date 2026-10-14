@@ -55,9 +55,10 @@ use alloc::boxed::Box;
 use core::panic::Location;
 use core::sync::atomic::{AtomicU32, Ordering};
 use litebox::platform::{ComputeParams, KDFParams};
+use litebox::page::PageRange;
 use litebox::utils::TruncateExt;
-use litebox::{PAGE_SIZE, page::PageRange};
 use litebox_common_linux::vmem::VmFlags;
+use litebox_common_lvbs::PAGE_SIZE;
 use litebox_common_lvbs::PRK_LEN;
 use x86_64::{
     VirtAddr,

@@ -7,12 +7,12 @@ extern crate alloc;
 
 use alloc::{boxed::Box, sync::Arc, vec};
 use core::panic::PanicInfo;
-use litebox::PAGE_SIZE;
 use litebox::{
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::PAGE_SIZE;
 use litebox_common_lvbs::{NUM_VTLCALL_PARAMS, VsmError, VsmFunction};
 use litebox_common_optee::{
     OpteeMessageCommand, OpteeMsgArgs, OpteeMsgParamRmem, OpteeRpcArgs, OpteeRpcCommand,

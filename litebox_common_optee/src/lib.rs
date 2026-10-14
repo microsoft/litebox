@@ -18,6 +18,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 pub mod syscall_nr;
 
+/// Page size required by the OP-TEE shared-memory ABI.
+pub const PAGE_SIZE: usize = 4096;
+
 /// Maximum size for a single memref parameter in syscalls that copy data
 /// between TA and OP-TEE shim.
 ///
@@ -151,6 +154,7 @@ pub enum SyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> SyscallRequest<Platform> {
+    /// Decodes a raw OP-TEE syscall number and register context.
     pub fn try_from_raw(syscall_number: usize, ctx: &SyscallContext) -> Result<Self, TeeResult> {
         let sysnr = u32::try_from(syscall_number).map_err(|_| TeeResult::NotSupported)?;
         let dispatcher = match TeeSyscallNr::try_from(sysnr).map_err(|_| TeeResult::NotSupported)? {
@@ -305,6 +309,7 @@ macro_rules! open_enum {
         #[allow(non_upper_case_globals)]
         impl $name {
             $($pub const $variant: $name = $name($value);)*
+            /// Converts a machine-sized syscall argument into a supported enum value.
             $pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
                 Ok(match <$ty>::try_from(value).map_err(|_| TeeResult::BadParameters)? {
                     $($value => Self::$variant,)*
@@ -337,6 +342,7 @@ impl SyscallContext {
         }
     }
 
+    /// Creates a syscall context from its raw argument registers.
     pub fn new(args: &[usize; MAX_SYSCALL_ARGS]) -> Self {
         SyscallContext { args: *args }
     }
@@ -352,6 +358,10 @@ pub struct TeeObjHandle(pub u32);
 impl TeeObjHandle {
     pub const NULL: Self = TeeObjHandle(0);
 
+    /// Converts a machine-sized value into an OP-TEE object handle.
+    ///
+    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
+    /// handle representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -367,6 +377,10 @@ impl TeeObjHandle {
 pub struct TeeCrypStateHandle(pub u32);
 
 impl TeeCrypStateHandle {
+    /// Converts a machine-sized value into an OP-TEE cryptographic-state handle.
+    ///
+    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
+    /// handle representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -381,6 +395,10 @@ impl TeeCrypStateHandle {
 pub struct TaSessionId(pub u32);
 
 impl TaSessionId {
+    /// Converts a machine-sized value into a trusted-application session ID.
+    ///
+    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
+    /// session ID representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -396,6 +414,10 @@ impl TaSessionId {
 pub struct CommandId(pub u32);
 
 impl CommandId {
+    /// Converts a machine-sized value into a trusted-application command ID.
+    ///
+    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
+    /// command ID representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -514,6 +536,7 @@ impl UteeParams {
         })
     }
 
+    /// Returns the parameter type stored at `index`.
     pub fn get_type(&self, index: usize) -> Result<TeeParamType, TeeResult> {
         let type_byte = match index {
             0 => self.types.type_0(),
@@ -525,6 +548,7 @@ impl UteeParams {
         TeeParamType::try_from(type_byte).map_err(|_| TeeResult::BadParameters)
     }
 
+    /// Returns the value pair stored at `index`, or `None` for an unused parameter.
     pub fn get_values(&self, index: usize) -> Result<Option<(u64, u64)>, TeeResult> {
         if self.get_type(index)? == TeeParamType::None {
             Ok(None)
@@ -534,6 +558,7 @@ impl UteeParams {
         }
     }
 
+    /// Sets the parameter type at `index`.
     pub fn set_type(&mut self, index: usize, param_type: TeeParamType) -> Result<(), TeeResult> {
         match index {
             0 => self.types.set_type_0(param_type as u8),
@@ -545,6 +570,7 @@ impl UteeParams {
         Ok(())
     }
 
+    /// Sets the value pair stored at `index`.
     pub fn set_values(
         &mut self,
         index: usize,
@@ -560,6 +586,7 @@ impl UteeParams {
         Ok(())
     }
 
+    /// Creates an empty parameter collection.
     pub fn new() -> Self {
         Self::default()
     }
@@ -836,6 +863,7 @@ pub enum TeeTimeCategory {
 }
 
 impl TeeTimeCategory {
+    /// Converts a machine-sized syscall argument into a supported time category.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .ok()
@@ -890,6 +918,7 @@ impl Default for TeeObjectInfo {
 }
 
 impl TeeObjectInfo {
+    /// Creates object metadata for an uninitialized object of the requested type and capacity.
     pub fn new(object_type: TeeObjectType, max_object_size: u32) -> Self {
         TeeObjectInfo {
             object_type,
@@ -945,6 +974,7 @@ pub enum TeeOperationMode {
 }
 
 impl TeeOperationMode {
+    /// Converts a machine-sized syscall argument into a cryptographic operation mode.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -976,6 +1006,7 @@ pub enum TeePropSet {
 }
 
 impl TeePropSet {
+    /// Converts a machine-sized syscall argument into an OP-TEE property-set handle.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -998,6 +1029,7 @@ bitflags::bitflags! {
 }
 
 impl TeeMemoryAccessRights {
+    /// Converts a machine-sized syscall argument into memory-access rights.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -1032,6 +1064,7 @@ pub enum TeeAlgorithm {
 }
 
 impl TeeAlgorithm {
+    /// Converts a machine-sized syscall argument into a supported algorithm identifier.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -1254,6 +1287,7 @@ pub enum LdelfSyscallRequest<Platform: litebox::platform::RawPointerProvider> {
 }
 
 impl<Platform: litebox::platform::RawPointerProvider> LdelfSyscallRequest<Platform> {
+    /// Decodes a raw ldelf syscall number and register context.
     pub fn try_from_raw(syscall_number: usize, ctx: &SyscallContext) -> Result<Self, TeeResult> {
         let sysnr = u32::try_from(syscall_number).map_err(|_| TeeResult::NotSupported)?;
         let dispatcher = match LdelfSyscallNr::try_from(sysnr)
@@ -1366,6 +1400,7 @@ pub struct LdelfArg {
 }
 
 impl LdelfArg {
+    /// Creates loader arguments for the trusted application identified by `ta_uuid`.
     pub fn new(ta_uuid: TeeUuid) -> Self {
         Self {
             uuid: ta_uuid,

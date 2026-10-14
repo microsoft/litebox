@@ -127,7 +127,7 @@ impl<Platform: crate::OpteeShimPlatform> TaStack<Platform> {
     /// The trailing `UteeParams` slot is left untouched here because
     /// `set_utee_params` overwrites it in full.
     fn scrub(&mut self) -> Option<()> {
-        use litebox::PAGE_SIZE;
+        use litebox_common_optee::PAGE_SIZE;
         const ZERO_CHUNK: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
 
         for offset in (0..self.pos).step_by(ZERO_CHUNK.len()) {

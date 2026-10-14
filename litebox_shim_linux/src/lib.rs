@@ -32,12 +32,11 @@ use litebox::{
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
 use litebox::{
-    PAGE_SIZE,
     page::{NonZeroAddress, NonZeroPageSize},
     user_pointers::{UserPtr, UserPtrMut},
 };
 use litebox_common_linux::{
-    SyscallRequest,
+    PAGE_SIZE, SyscallRequest,
     errno::Errno,
     mm::VmemManager,
     vmem::{CreatePagesFlags, MappingError},

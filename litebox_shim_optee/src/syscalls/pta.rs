@@ -9,9 +9,9 @@ use crate::{Task, UserConstPtr, UserMutPtr, idk::IdksPta, syscalls::Cleanup};
 use alloc::vec;
 use alloc::vec::Vec;
 use hmac::{Hmac, Mac};
-use litebox::PAGE_SIZE;
 use litebox::platform::{DerivedKeyError, KDFParams, RawConstPointer as _, RawMutPointer as _};
 use litebox::utils::TruncateExt;
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{
     HUK_SUBKEY_MAX_LEN, HukSubkeyUsage, LdelfMapFlags, OpteeMsgArgs, OpteeSmcReturnCode, TaFlags,
     TeeOrigin, TeeParamType, TeeResult, TeeUuid, UteeParams,

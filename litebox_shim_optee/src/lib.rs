@@ -15,7 +15,6 @@ use alloc::{boxed::Box, sync::Arc, vec};
 use core::{cell::Cell, ops::Deref};
 use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
-use litebox::PAGE_SIZE;
 use litebox::{
     LiteBox,
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
@@ -23,6 +22,7 @@ use litebox::{
     utils::TruncateExt,
 };
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, mm::VmemManager};
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SHDR_BOOTSTRAP_TA, SHDR_MAGIC, SHDR_UUID_LEN, SHDR_VERSION_LEN,
     Shdr, SyscallContext, SyscallRequest, TEE_ALG_RSASSA_PKCS1_PSS_MGF1_SHA256, TaFlags,

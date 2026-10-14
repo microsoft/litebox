@@ -5,13 +5,11 @@
 
 use core::ops::Range;
 
-/// A non-empty range of page-aligned addresses
+/// A non-empty range of `ALIGN`-aligned addresses.
 #[derive(Clone, Copy)]
 pub struct PageRange<const ALIGN: usize> {
-    /// Start page of the range.
-    pub start: usize,
-    /// End page of the range.
-    pub end: usize,
+    start: usize,
+    end: usize,
 }
 
 impl<const ALIGN: usize> From<PageRange<ALIGN>> for Range<usize> {
@@ -43,19 +41,27 @@ impl<const ALIGN: usize> PageRange<ALIGN> {
         Some(Self { start, end })
     }
 
-    /// Get the size of this `ALIGN`-aligned range
+    /// Returns the inclusive start address.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Returns the exclusive end address.
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Returns the length of this `ALIGN`-aligned range in bytes.
     pub fn len(&self) -> usize {
         self.end - self.start
     }
 
-    /// Whether the range is empty or not
-    ///
-    /// Note this range is never empty.
+    /// Returns `false` because construction rejects empty ranges.
     pub fn is_empty(&self) -> bool {
         false
     }
 
-    /// Get the start address and length of this range as a tuple.
+    /// Returns the non-zero start address and length of this range.
     #[allow(
         clippy::missing_panics_doc,
         reason = "This function should not fail as the range is guaranteed to be non-empty and aligned."

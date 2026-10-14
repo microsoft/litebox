@@ -4,17 +4,14 @@
 //! ELF loader for LiteBox
 
 use alloc::{ffi::CString, vec::Vec};
-use litebox::{
-    PAGE_SIZE,
-    page::{NonZeroAddress, NonZeroPageSize},
-};
+use litebox::page::{NonZeroAddress, NonZeroPageSize};
 use litebox::{
     fs::{Mode, OFlags},
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
 };
 use litebox_common_linux::{
-    MapFlags,
+    MapFlags, PAGE_SIZE,
     errno::Errno,
     loader::ElfParsedFile,
     vmem::{CreatePagesFlags, MappingError},

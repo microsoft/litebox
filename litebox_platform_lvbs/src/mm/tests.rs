@@ -6,12 +6,13 @@ use core::alloc::{GlobalAlloc, Layout};
 use alloc::vec;
 use alloc::vec::Vec;
 use arrayvec::ArrayVec;
-use litebox::{PAGE_SIZE, page::PageRange};
+use litebox::page::PageRange;
 use litebox::{mm::allocator::SafeZoneAllocator, platform::RawConstPointer, utils::TruncateExt};
 use litebox_common_linux::{
     mm::VmemManager,
     vmem::{PageFaultError, VmFlags},
 };
+use litebox_common_lvbs::PAGE_SIZE;
 use spin::mutex::SpinMutex;
 
 use crate::{

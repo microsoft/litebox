@@ -10,6 +10,7 @@ use crate::host::per_cpu_variables::{PerCpuVariablesAsm, with_per_cpu_variables}
 use alloc::sync::Arc;
 use core::sync::atomic::AtomicU32;
 use hashbrown::HashMap;
+use litebox::page::PageRange;
 use litebox::platform::{
     ArchSpecificError, ArchSpecificProvider, ArchSpecificRegister, IPInterfaceProvider,
     ImmediatelyWokenUp, PageManagementProvider, RawMutex as _, RawMutexProvider,
@@ -19,11 +20,11 @@ use litebox::platform::{
 use litebox::vmap::{
     PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
 };
-use litebox::{PAGE_SIZE, page::PageRange};
 use litebox::{
     platform::page_mgmt::FixedAddressBehavior, shim::ContinueOperation, utils::TruncateExt,
 };
 use litebox_common_linux::errno::Errno;
+use litebox_common_lvbs::PAGE_SIZE;
 use x86_64::{
     VirtAddr,
     structures::paging::{
@@ -479,8 +480,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox::arch::x86_64::is_valid_user_fs_base::<Self, { litebox::PAGE_SIZE }>(val)
-                {
+                if litebox::arch::x86_64::is_valid_user_fs_base::<Self, PAGE_SIZE>(val) {
                     unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
@@ -1167,7 +1167,7 @@ impl<Host: HostInterface, const ALIGN: usize> PageManagementProvider<ALIGN> for 
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
         let new_range = PageRange::new(new_range.start, new_range.end)
             .ok_or(litebox::platform::page_mgmt::RemapError::Unaligned)?;
-        if old_range.start.max(new_range.start) < old_range.end.min(new_range.end) {
+        if old_range.start().max(new_range.start()) < old_range.end().min(new_range.end()) {
             return Err(litebox::platform::page_mgmt::RemapError::Overlapping);
         }
         unsafe {

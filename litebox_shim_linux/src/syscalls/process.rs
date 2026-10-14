@@ -669,9 +669,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
             #[cfg(target_arch = "x86_64")]
             {
                 // Validate the user-controlled TLS base before spawning the thread.
-                if !litebox::arch::x86_64::is_valid_user_fs_base::<Platform, { litebox::PAGE_SIZE }>(
-                    addr,
-                ) {
+                if !litebox::arch::x86_64::is_valid_user_fs_base::<
+                    Platform,
+                    { litebox_common_linux::PAGE_SIZE },
+                >(addr)
+                {
                     return Err(Errno::EPERM);
                 }
             }

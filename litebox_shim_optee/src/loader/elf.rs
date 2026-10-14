@@ -18,7 +18,6 @@
 //! we need to implement file-backed mapping, demand paging, and/or shared
 //! mapping in the future.
 use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
-use litebox::PAGE_SIZE;
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt,
@@ -29,6 +28,7 @@ use litebox_common_linux::{
     loader::{ElfParseError, ElfParsedFile},
     vmem::MappingError,
 };
+use litebox_common_optee::PAGE_SIZE;
 use litebox_common_optee::{LdelfArg, TeeUuid};
 use thiserror::Error;
 

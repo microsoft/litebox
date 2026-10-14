@@ -6,9 +6,9 @@
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
-use litebox::PAGE_SIZE;
 use litebox::fs::errors::ReadError;
 use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use litebox_common_linux::PAGE_SIZE;
 use litebox_common_linux::{
     MRemapFlags, MapFlags, ProtFlags,
     errno::Errno,

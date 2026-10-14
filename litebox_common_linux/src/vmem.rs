@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use rangemap::RangeMap;
 use thiserror::Error;
 
+use litebox::page::{NonZeroAddress, NonZeroPageSize, PageRange};
 use litebox::platform::PageManagementProvider;
 use litebox::platform::RawConstPointer;
 use litebox::platform::RawMutPointer;
@@ -24,10 +25,8 @@ use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
 };
-use litebox::{
-    PAGE_SIZE,
-    page::{NonZeroAddress, NonZeroPageSize, PageRange},
-};
+
+use crate::PAGE_SIZE;
 
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.
@@ -729,7 +728,7 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        let (start, end) = (suggested_range.start, suggested_range.end);
+        let (start, end) = (suggested_range.start(), suggested_range.end());
         if start < Platform::TASK_ADDR_MIN {
             return Err(AllocationError::BelowMinAddress);
         }
@@ -907,7 +906,7 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
-        let range = range.start..range.end;
+        let range: Range<usize> = range.into();
         if range.end > Platform::TASK_ADDR_MAX {
             return Err(VmemResizeError::InvalidRange(range));
         }
@@ -1010,9 +1009,9 @@ where
         // Check if the given range is covered by exactly one mapping
         let (cur_range, vma) = self
             .vmas
-            .get_key_value(&old_range.start)
+            .get_key_value(&old_range.start())
             .expect("VMEM: range not found");
-        assert!(cur_range.contains(&(old_range.end - 1)));
+        assert!(cur_range.contains(&(old_range.end() - 1)));
         let vma = *vma;
 
         if vma.is_file_backed() {
@@ -1085,7 +1084,7 @@ where
         // SAFETY: Hint placement never replaces existing mappings.
         let destination = unsafe {
             self.create_mapping(
-                NonZeroAddress::new(new_range.start),
+                NonZeroAddress::new(new_range.start()),
                 length,
                 temporary,
                 CreatePagesFlags::TOP_DOWN,
@@ -1118,7 +1117,7 @@ where
         let mut offset = 0;
         while offset < total {
             let chunk = (total - offset).min(COPY_CHUNK_SIZE);
-            let source = Platform::RawConstPointer::<u8>::from_usize(old_range.start + offset);
+            let source = Platform::RawConstPointer::<u8>::from_usize(old_range.start() + offset);
             let buffer = source
                 .to_owned_slice(chunk)
                 .expect("failed to read remap source");
@@ -1341,7 +1340,7 @@ where
         &self,
         page_range: PageRange<ALIGN>,
     ) -> Option<MemoryRegionPermissions> {
-        let (range_start, range_end) = (page_range.start, page_range.end);
+        let (range_start, range_end) = (page_range.start(), page_range.end());
         let range: core::ops::Range<usize> = page_range.into();
         if let Some(iter) = self.overlapping(range).next() {
             if iter.0.start > range_start || iter.0.end < range_end {
