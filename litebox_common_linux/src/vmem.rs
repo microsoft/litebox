@@ -29,6 +29,32 @@ use litebox::platform::{
 /// Page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
+/// Returns `range` minus possibly unsorted, overlapping `excluded` ranges.
+pub fn subtract_ranges(range: Range<usize>, excluded: &[Range<usize>]) -> Vec<Range<usize>> {
+    let mut blocks: Vec<Range<usize>> = excluded
+        .iter()
+        .filter(|block| block.start < range.end && range.start < block.end)
+        .cloned()
+        .collect();
+    blocks.sort_unstable_by_key(|block| (block.start, block.end));
+
+    let mut out = Vec::new();
+    let mut cursor = range.start;
+    for block in blocks {
+        if block.start > cursor {
+            out.push(cursor..block.start);
+        }
+        cursor = cursor.max(block.end);
+        if cursor >= range.end {
+            return out;
+        }
+    }
+    if cursor < range.end {
+        out.push(cursor..range.end);
+    }
+    out
+}
+
 bitflags::bitflags! {
     /// Flags to describe the properties of a memory region.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1717,6 +1743,8 @@ pub enum MappingError {
     UnAligned,
     #[error("not enough memory")]
     OutOfMemory,
+    #[error("mapping memory is inaccessible")]
+    MemoryAccess,
 
     // Errors from mapping a file
     #[error("bad file descriptor: {0}")]

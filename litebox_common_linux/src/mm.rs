@@ -791,8 +791,8 @@ where
 {
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
-    /// `placement` controls the allocation direction and whether an adjacent gap is reserved for
-    /// callers that append trampoline code. `op` initializes the mapping while it is writable;
+    /// `direction` controls the allocation direction. Callers must reserve any adjacent growth
+    /// space separately. `op` initializes the mapping while it is writable;
     /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
     /// file's contents from its start, so the platform is hinted to back it with larger pages.
     pub fn do_mmap(

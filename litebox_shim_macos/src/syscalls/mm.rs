@@ -109,6 +109,8 @@ impl MachoPatchInfo {
 pub(crate) struct MachoRuntimeTrampoline {
     rewrite_id: Arc<()>,
     range: Option<Range<usize>>,
+    /// Owned inaccessible address space available for fixed replacement.
+    runtime_trampoline_reservation: Option<Range<usize>>,
     cursor: usize,
     invalidated: bool,
 }
@@ -175,6 +177,7 @@ fn mapping_error(error: MappingError) -> Errno {
     match error {
         MappingError::BadFD(_) => Errno::EBADF,
         MappingError::NotForReading => Errno::EACCES,
+        MappingError::MemoryAccess => Errno::EFAULT,
         MappingError::OutOfMemory | MappingError::MapError(_) => Errno::ENOMEM,
         _ => Errno::EINVAL,
     }
@@ -557,14 +560,52 @@ impl<P: ShimPlatform> Task<P> {
         } else {
             Vec::new()
         };
+        let reserves_trampoline = offset == 0
+            && macho
+                .as_ref()
+                .is_some_and(|patch_info| self.macho_needs_trampoline_reservation(patch_info))
+            && self.global.platform.get_syscall_entry_point() != 0
+            && !flags.contains(MmapFlags::FIXED);
+        let reservation = if reserves_trampoline {
+            let reserved_len = length
+                .as_usize()
+                .checked_add(crate::RUNTIME_TRAMPOLINE_RESERVATION_SIZE)
+                .ok_or(Errno::ENOMEM)?;
+            let mut reservation_flags = CreatePagesFlags::empty();
+            reservation_flags.set(
+                CreatePagesFlags::TOP_DOWN,
+                direction == AllocationDirection::TopDown,
+            );
+            // SAFETY: The inaccessible mapping is exclusively owned until its prefix is replaced.
+            let pointer = unsafe {
+                self.global.mm.create_inaccessible_pages(
+                    suggested,
+                    NonZeroPageSize::new(reserved_len).ok_or(Errno::ENOMEM)?,
+                    reservation_flags,
+                    |_| Ok(0),
+                )
+            }
+            .map_err(mapping_error)?;
+            let start = pointer.as_usize();
+            Some(start..start + reserved_len)
+        } else {
+            None
+        };
+        let mapping_suggested = reservation
+            .as_ref()
+            .map_or(suggested, |range| NonZeroAddress::new(range.start));
+        let runtime_trampoline_reservation = reservation
+            .as_ref()
+            .map(|range| range.start + length.as_usize()..range.end);
         let final_permissions = permissions(protection);
         let mut create_flags = mapping_flags(flags, true, direction);
-        if macho.is_some() && !flags.contains(MmapFlags::FIXED) {
-            create_flags |= CreatePagesFlags::ENSURE_SPACE_AFTER;
+        if reservation.is_some() {
+            create_flags.insert(CreatePagesFlags::FIXED_ADDR);
+            create_flags.remove(CreatePagesFlags::NOREPLACE);
         }
         let trampoline_checkpoint = macho
             .as_ref()
-            .filter(|_| executable)
+            .filter(|_| executable || runtime_trampoline_reservation.is_some())
             .map(|patch_info| self.macho_trampoline_checkpoint(patch_info));
         let mut file_offset = offset;
         let mut buffer = [0; PAGE_SIZE];
@@ -573,7 +614,7 @@ impl<P: ShimPlatform> Task<P> {
         // runs while the new mapping is private to this syscall and still RW.
         let result = unsafe {
             self.global.mm.create_pages_with_permissions(
-                suggested,
+                mapping_suggested,
                 length,
                 create_flags,
                 final_permissions,
@@ -594,11 +635,11 @@ impl<P: ShimPlatform> Task<P> {
                         }
                         pointer
                             .copy_from_slice(copied, &buffer[..read])
-                            .ok_or(MappingError::OutOfMemory)?;
+                            .ok_or(MappingError::MemoryAccess)?;
                         copied += read;
                         file_offset = file_offset
                             .checked_add(read)
-                            .ok_or(MappingError::OutOfMemory)?;
+                            .expect("validated mapping offset and length cannot overflow");
                     }
                     if let Some(info) = macho.as_ref().filter(|_| executable) {
                         self.rewrite_macho_mapping(
@@ -607,6 +648,7 @@ impl<P: ShimPlatform> Task<P> {
                             &ranges,
                             &info.rewrite_id,
                             info.trampoline_capacity,
+                            runtime_trampoline_reservation.as_ref(),
                         )?;
                     }
                     Ok(copied)
@@ -616,6 +658,8 @@ impl<P: ShimPlatform> Task<P> {
         let pointer = match result {
             Ok(pointer) => pointer,
             Err(error) => {
+                // MapError occurs before prefix replacement; later errors occur after it.
+                let prefix_still_mapped = matches!(error, MappingError::MapError(_));
                 if let (Some(patch_info), Some(checkpoint)) =
                     (macho.as_ref(), trampoline_checkpoint)
                 {
@@ -627,12 +671,31 @@ impl<P: ShimPlatform> Task<P> {
                 if flags.contains(MmapFlags::FIXED) && replaced {
                     self.replace_macho_mappings(fixed_range.clone(), None);
                 }
+                if let Some(range) = reservation {
+                    let cleanup_start = if prefix_still_mapped {
+                        range.start
+                    } else {
+                        range.start + length.as_usize()
+                    };
+                    // SAFETY: This syscall still exclusively owns the failed reservation.
+                    let _ = unsafe {
+                        self.global.mm.remove_pages(
+                            P::RawMutPointer::from_usize(cleanup_start),
+                            range.end - cleanup_start,
+                        )
+                    };
+                }
                 return Err(
                     initialization_error.map_or_else(|| mapping_error(error), mmap_read_error)
                 );
             }
         };
         let address = pointer.as_usize();
+        if let (Some(patch_info), Some(reservation)) =
+            (macho.as_ref(), runtime_trampoline_reservation)
+        {
+            self.publish_macho_trampoline_reservation(patch_info, reservation);
+        }
         let mapping = macho.map(|patch_info| {
             let mut patched_ranges = BTreeSet::new();
             if executable {
@@ -652,6 +715,19 @@ impl<P: ShimPlatform> Task<P> {
         Ok(address)
     }
 
+    fn macho_needs_trampoline_reservation(&self, patch_info: &MachoPatchInfo) -> bool {
+        let key = Arc::as_ptr(&patch_info.rewrite_id) as usize;
+        self.global
+            .macho_trampolines
+            .lock()
+            .get(&key)
+            .is_none_or(|state| {
+                !state.invalidated
+                    && state.range.is_none()
+                    && state.runtime_trampoline_reservation.is_none()
+            })
+    }
+
     // TODO: serialize this checkpoint through rollback with other mmap-based
     // rewrites before supporting concurrent mmap of the same Mach-O. The
     // current task model does not run mmap-based rewriting concurrently.
@@ -659,24 +735,40 @@ impl<P: ShimPlatform> Task<P> {
         &self,
         patch_info: &Arc<MachoPatchInfo>,
     ) -> MachoTrampolineCheckpoint {
-        self.macho_trampoline_checkpoint_for_id(&patch_info.rewrite_id)
-    }
-
-    fn macho_trampoline_checkpoint_for_id(
-        &self,
-        rewrite_id: &Arc<()>,
-    ) -> MachoTrampolineCheckpoint {
-        let key = Arc::as_ptr(rewrite_id) as usize;
-        self.global.macho_trampolines.lock().get(&key).map_or(
+        let key = Arc::as_ptr(&patch_info.rewrite_id) as usize;
+        let trampolines = self.global.macho_trampolines.lock();
+        if let Some(state) = trampolines.get(&key) {
+            MachoTrampolineCheckpoint {
+                range: state.range.clone(),
+                cursor: state.cursor,
+            }
+        } else {
             MachoTrampolineCheckpoint {
                 range: None,
                 cursor: 0,
-            },
-            |state| MachoTrampolineCheckpoint {
-                range: state.range.clone(),
-                cursor: state.cursor,
-            },
-        )
+            }
+        }
+    }
+
+    fn publish_macho_trampoline_reservation(
+        &self,
+        patch_info: &Arc<MachoPatchInfo>,
+        reservation: Range<usize>,
+    ) {
+        let key = Arc::as_ptr(&patch_info.rewrite_id) as usize;
+        let mut trampolines = self.global.macho_trampolines.lock();
+        let state = trampolines
+            .entry(key)
+            .or_insert_with(|| MachoRuntimeTrampoline {
+                rewrite_id: Arc::clone(&patch_info.rewrite_id),
+                range: None,
+                runtime_trampoline_reservation: None,
+                cursor: 0,
+                invalidated: false,
+            });
+        debug_assert!(!state.invalidated);
+        debug_assert!(state.runtime_trampoline_reservation.is_none());
+        state.runtime_trampoline_reservation = Some(reservation);
     }
 
     fn rollback_macho_trampoline(
@@ -698,20 +790,31 @@ impl<P: ShimPlatform> Task<P> {
             return;
         };
         if state.invalidated {
+            // Invalidated ownership cannot be restored.
             return;
         }
         let current = state.range.clone();
-        state.range.clone_from(&checkpoint.range);
-        state.cursor = checkpoint.cursor;
-        if checkpoint.range.is_none() {
+        let reservation = state.runtime_trampoline_reservation.clone();
+        let MachoTrampolineCheckpoint { range, cursor } = checkpoint;
+        let previous = if range.is_some() || state.runtime_trampoline_reservation.is_some() {
+            state.range.clone_from(&range);
+            state.cursor = cursor;
+            range
+        } else {
             trampolines.remove(&key);
-        }
+            None
+        };
         drop(trampolines);
 
-        match (checkpoint.range, current) {
-            (None, Some(current)) => self.remove_trampoline(current),
+        match (previous, current) {
+            (None, Some(current)) => {
+                self.discard_unpublished_trampoline(current, reservation.as_ref());
+            }
             (Some(previous), Some(current)) if current.end > previous.end => {
-                self.remove_trampoline(previous.end..current.end);
+                self.discard_unpublished_trampoline(
+                    previous.end..current.end,
+                    reservation.as_ref(),
+                );
             }
             _ => {}
         }
@@ -724,6 +827,7 @@ impl<P: ShimPlatform> Task<P> {
         ranges: &[core::ops::Range<usize>],
         rewrite_id: &Arc<()>,
         trampoline_capacity: usize,
+        provisional_trampoline_reservation: Option<&Range<usize>>,
     ) -> Result<(), MappingError> {
         if ranges.is_empty() {
             return Ok(());
@@ -774,6 +878,7 @@ impl<P: ShimPlatform> Task<P> {
             .or_insert_with(|| MachoRuntimeTrampoline {
                 rewrite_id: Arc::clone(rewrite_id),
                 range: None,
+                runtime_trampoline_reservation: None,
                 cursor: 0,
                 invalidated: false,
             });
@@ -781,13 +886,22 @@ impl<P: ShimPlatform> Task<P> {
         if state.invalidated {
             return Err(MappingError::OutOfMemory);
         }
+        let runtime_trampoline_reservation = state
+            .runtime_trampoline_reservation
+            .as_ref()
+            .or(provisional_trampoline_reservation)
+            .cloned();
         let newly_allocated = state.range.is_none();
         if newly_allocated {
-            state.range =
-                match self.reserve_trampoline(virtual_address, length, trampoline_capacity) {
-                    Ok(range) => Some(range),
-                    Err(error) => return trap_fallback(&error),
-                };
+            state.range = match self.reserve_trampoline_in_reservation(
+                virtual_address,
+                length,
+                trampoline_capacity,
+                runtime_trampoline_reservation.as_ref(),
+            ) {
+                Ok(range) => Some(range),
+                Err(error) => return trap_fallback(&error),
+            };
             state.cursor = 0;
         }
         let mut range = state.range.clone().expect("trampoline was just allocated");
@@ -813,7 +927,10 @@ impl<P: ShimPlatform> Task<P> {
             Err(error) => {
                 if newly_allocated {
                     state.range = None;
-                    self.remove_trampoline(range);
+                    self.discard_unpublished_trampoline(
+                        range,
+                        runtime_trampoline_reservation.as_ref(),
+                    );
                 }
                 return trap_fallback(&error);
             }
@@ -824,7 +941,7 @@ impl<P: ShimPlatform> Task<P> {
         if gates.is_empty() {
             if newly_allocated {
                 state.range = None;
-                self.remove_trampoline(range);
+                self.discard_unpublished_trampoline(range, runtime_trampoline_reservation.as_ref());
             }
             return pointer
                 .copy_from_slice(0, &code)
@@ -833,10 +950,14 @@ impl<P: ShimPlatform> Task<P> {
         let new_cursor = cursor
             .checked_add(gates.len())
             .ok_or(MappingError::OutOfMemory)?;
-        if let Err(error) = self.grow_trampoline(&mut range, new_cursor) {
+        if let Err(error) = self.grow_trampoline_in_reservation(
+            &mut range,
+            new_cursor,
+            runtime_trampoline_reservation.as_ref(),
+        ) {
             if newly_allocated {
                 state.range = None;
-                self.remove_trampoline(range);
+                self.discard_unpublished_trampoline(range, runtime_trampoline_reservation.as_ref());
             }
             return trap_fallback(&error);
         }
@@ -861,7 +982,7 @@ impl<P: ShimPlatform> Task<P> {
         {
             if newly_allocated {
                 state.range = None;
-                self.remove_trampoline(range);
+                self.discard_unpublished_trampoline(range, runtime_trampoline_reservation.as_ref());
             } else {
                 // SAFETY: `range` remains the live trampoline allocation and
                 // the trampoline lock still serializes this RX restoration.
@@ -892,11 +1013,12 @@ impl<P: ShimPlatform> Task<P> {
         Ok(())
     }
 
-    fn reserve_trampoline(
+    fn reserve_trampoline_in_reservation(
         &self,
         code_address: usize,
         code_length: usize,
         capacity: usize,
+        runtime_trampoline_reservation: Option<&Range<usize>>,
     ) -> Result<Range<usize>, MappingError> {
         let code_end = code_address
             .checked_add(code_length)
@@ -907,9 +1029,13 @@ impl<P: ShimPlatform> Task<P> {
                 .max(address.abs_diff(code_end))
                 <= litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT
         };
-        let hint = self
-            .trampoline_address_after(code_address, code_length, capacity)
+        let hint = runtime_trampoline_reservation
+            .map(|range| range.start)
             .filter(|&address| reachable(address))
+            .or_else(|| {
+                self.trampoline_address_after(code_address, code_length, capacity)
+                    .filter(|&address| reachable(address))
+            })
             .or_else(|| {
                 self.trampoline_address_before(code_address, capacity)
                     .filter(|&address| reachable(address))
@@ -918,10 +1044,21 @@ impl<P: ShimPlatform> Task<P> {
                 self.trampoline_address_after(code_address, code_length, PAGE_SIZE)
                     .filter(|&address| reachable(address))
             });
-        let map = |hint, length| {
-            let address = self.allocate_trampoline(hint, length).ok()?;
+        let map = |hint: Option<usize>, length| {
+            let replace_reservation = hint.is_some_and(|address| {
+                address.checked_add(length).is_some_and(|end| {
+                    runtime_trampoline_reservation
+                        .is_some_and(|range| address >= range.start && end <= range.end)
+                })
+            });
+            let address = self
+                .allocate_trampoline_with_replacement(hint, length, replace_reservation)
+                .ok()?;
             if !reachable(address) {
-                self.remove_trampoline(address..address + length);
+                self.discard_unpublished_trampoline(
+                    address..address + length,
+                    runtime_trampoline_reservation,
+                );
                 return None;
             }
             Some(address)
@@ -935,22 +1072,24 @@ impl<P: ShimPlatform> Task<P> {
         .ok_or(MappingError::OutOfMemory)
     }
 
-    fn allocate_trampoline(
+    fn allocate_trampoline_with_replacement(
         &self,
         address: Option<usize>,
         length: usize,
+        replace_reservation: bool,
     ) -> Result<usize, MappingError> {
         let suggested = address
             .map(|address| NonZeroAddress::new(address).ok_or(MappingError::OutOfMemory))
             .transpose()?;
         let length = NonZeroPageSize::new(length).ok_or(MappingError::OutOfMemory)?;
         let mut flags = CreatePagesFlags::POPULATE_PAGES_IMMEDIATELY;
+        flags.set(CreatePagesFlags::FIXED_ADDR, suggested.is_some());
         flags.set(
-            CreatePagesFlags::FIXED_ADDR | CreatePagesFlags::NOREPLACE,
-            suggested.is_some(),
+            CreatePagesFlags::NOREPLACE,
+            suggested.is_some() && !replace_reservation,
         );
-        // SAFETY: fixed allocations use NOREPLACE; non-fixed allocations let
-        // the platform choose unused memory. No existing mappings are replaced.
+        // SAFETY: replacement is limited to a reservation owned by this trampoline; other fixed
+        // allocations use NOREPLACE, and non-fixed allocations let the platform choose unused memory.
         unsafe {
             self.global
                 .mm
@@ -959,7 +1098,12 @@ impl<P: ShimPlatform> Task<P> {
         .map(|pointer| pointer.as_usize())
     }
 
-    fn grow_trampoline(&self, range: &mut Range<usize>, used: usize) -> Result<(), MappingError> {
+    fn grow_trampoline_in_reservation(
+        &self,
+        range: &mut Range<usize>,
+        used: usize,
+        runtime_trampoline_reservation: Option<&Range<usize>>,
+    ) -> Result<(), MappingError> {
         let required = used
             .max(PAGE_SIZE)
             .checked_next_multiple_of(PAGE_SIZE)
@@ -969,7 +1113,14 @@ impl<P: ShimPlatform> Task<P> {
                 .start
                 .checked_add(required)
                 .ok_or(MappingError::OutOfMemory)?;
-            self.allocate_trampoline(Some(range.end), end - range.end)?;
+            let replace_reservation = runtime_trampoline_reservation.is_some_and(|reservation| {
+                range.end >= reservation.start && end <= reservation.end
+            });
+            self.allocate_trampoline_with_replacement(
+                Some(range.end),
+                end - range.end,
+                replace_reservation,
+            )?;
             range.end = end;
         }
         Ok(())
@@ -979,6 +1130,7 @@ impl<P: ShimPlatform> Task<P> {
     /// and optionally install the mapping that replaced it. Published runtime
     /// trampolines follow the Linux baseline and live until address-space teardown.
     fn replace_macho_mappings(&self, replaced: Range<usize>, replacement: Option<MachoMapping>) {
+        self.revoke_trampoline_reservations(&replaced);
         let invalidated: Vec<_> = {
             let mut trampolines = self.global.macho_trampolines.lock();
             trampolines
@@ -1023,6 +1175,45 @@ impl<P: ShimPlatform> Task<P> {
         for mapping in survivors.into_iter().chain(replacement) {
             mappings.insert(mapping.range.start, mapping);
         }
+        let live_images: BTreeSet<_> = mappings
+            .values()
+            .map(|mapping| Arc::as_ptr(&mapping.patch_info.rewrite_id) as usize)
+            .collect();
+        drop(mappings);
+        let mut trampolines = self.global.macho_trampolines.lock();
+        for (&key, state) in trampolines.iter_mut() {
+            if !live_images.contains(&key)
+                && let Some(reservation) = state.runtime_trampoline_reservation.take()
+            {
+                let retained: Vec<_> = state.range.clone().into_iter().collect();
+                self.release_trampoline_reservation(reservation, &retained);
+            }
+        }
+    }
+
+    fn release_trampoline_reservation(&self, reservation: Range<usize>, retained: &[Range<usize>]) {
+        for range in litebox_common_linux::vmem::subtract_ranges(reservation, retained) {
+            self.remove_trampoline(range);
+        }
+    }
+
+    fn revoke_trampoline_reservations(&self, replaced: &Range<usize>) {
+        let mut trampolines = self.global.macho_trampolines.lock();
+        for state in trampolines.values_mut() {
+            if state
+                .runtime_trampoline_reservation
+                .as_ref()
+                .is_some_and(|range| range.start < replaced.end && replaced.start < range.end)
+            {
+                let reservation = state
+                    .runtime_trampoline_reservation
+                    .take()
+                    .expect("overlapping reservation exists");
+                let mut retained = alloc::vec![replaced.clone()];
+                retained.extend(state.range.clone());
+                self.release_trampoline_reservation(reservation, &retained);
+            }
+        }
     }
 
     fn remove_trampoline(&self, range: Range<usize>) {
@@ -1034,6 +1225,32 @@ impl<P: ShimPlatform> Task<P> {
                 .remove_pages(P::RawMutPointer::from_usize(range.start), range.len())
         } {
             litebox_util_log::warn!(error:? = error; "failed to release Mach-O trampoline");
+        }
+    }
+
+    fn discard_unpublished_trampoline(
+        &self,
+        range: Range<usize>,
+        reservation: Option<&Range<usize>>,
+    ) {
+        if reservation.is_some_and(|reservation| {
+            range.start >= reservation.start && range.end <= reservation.end
+        }) {
+            // SAFETY: `range` contains only unpublished gates that replaced pages in this owned
+            // reservation, so fixed replacement restores its inaccessible state.
+            if let Err(error) = unsafe {
+                self.global.mm.create_inaccessible_pages(
+                    NonZeroAddress::new(range.start),
+                    NonZeroPageSize::new(range.len())
+                        .expect("trampoline allocation is nonempty and page-aligned"),
+                    CreatePagesFlags::FIXED_ADDR,
+                    |_| Ok(0),
+                )
+            } {
+                litebox_util_log::warn!(error:? = error; "failed to restore Mach-O trampoline reservation");
+            }
+        } else {
+            self.remove_trampoline(range);
         }
     }
 
@@ -1229,6 +1446,7 @@ impl<P: ShimPlatform> Task<P> {
                 &ranges,
                 &patch.patch_info.rewrite_id,
                 patch.patch_info.trampoline_capacity,
+                None,
             );
             let mut restore_error = None;
             for (range, previous_permissions) in previous {
@@ -1403,6 +1621,7 @@ impl<P: ShimPlatform> Task<P> {
             // be changed as soon as this syscall returns.
             let mut mappings = self.global.macho_mappings.lock();
             self.change_permissions(range.clone(), protection)?;
+            self.revoke_trampoline_reservations(&range);
             for mapping in mappings.values_mut().filter(|mapping| {
                 mapping.range.start < range.end && range.start < mapping.range.end
             }) {
@@ -1410,7 +1629,11 @@ impl<P: ShimPlatform> Task<P> {
             }
             Ok(())
         } else {
-            self.change_permissions(range, protection)
+            self.change_permissions(range.clone(), protection)?;
+            if !protection.is_empty() {
+                self.revoke_trampoline_reservations(&range);
+            }
+            Ok(())
         }
     }
 }
@@ -1614,7 +1837,9 @@ mod tests {
     #[test]
     fn trampoline_search_includes_gap_immediately_before_code() {
         let task = task_with_file(&macho_image());
-        let base = task.allocate_trampoline(None, 4 * PAGE_SIZE).unwrap();
+        let base = task
+            .allocate_trampoline_with_replacement(None, 4 * PAGE_SIZE, false)
+            .unwrap();
         task.sys_munmap(base + PAGE_SIZE, 2 * PAGE_SIZE).unwrap();
 
         assert_eq!(
@@ -1629,12 +1854,14 @@ mod tests {
     #[test]
     fn preferred_gap_fits_full_capacity() {
         let task = task_with_file(&macho_image());
-        let base = task.allocate_trampoline(None, 6 * PAGE_SIZE).unwrap();
+        let base = task
+            .allocate_trampoline_with_replacement(None, 6 * PAGE_SIZE, false)
+            .unwrap();
         task.sys_munmap(base + PAGE_SIZE, PAGE_SIZE).unwrap();
         task.sys_munmap(base + 3 * PAGE_SIZE, 2 * PAGE_SIZE)
             .unwrap();
         let range = task
-            .reserve_trampoline(base, PAGE_SIZE, 2 * PAGE_SIZE)
+            .reserve_trampoline_in_reservation(base, PAGE_SIZE, 2 * PAGE_SIZE, None)
             .unwrap();
         assert_eq!(range, base + 3 * PAGE_SIZE..base + 5 * PAGE_SIZE);
         task.remove_trampoline(range);
@@ -1683,10 +1910,11 @@ mod tests {
             patch_info
         };
         let trampolines = task.global.macho_trampolines.lock();
-        let range = trampolines[&(Arc::as_ptr(&patch_info.rewrite_id) as usize)]
-            .range
-            .as_ref()
-            .unwrap();
+        let trampoline = &trampolines[&(Arc::as_ptr(&patch_info.rewrite_id) as usize)];
+        let range = trampoline.range.as_ref().unwrap();
+        let reservation = trampoline.runtime_trampoline_reservation.as_ref().unwrap();
+        assert_eq!(range.start, reservation.start);
+        assert!(range.end <= reservation.end);
         assert!(range.contains(&target) && range.len() > PAGE_SIZE);
         drop(trampolines);
         task.sys_munmap(address, PAGE_SIZE).unwrap();
@@ -1697,7 +1925,9 @@ mod tests {
         use litebox_common_macos::user_pointers::UserPtrMut;
 
         let task = task_with_file(&macho_image());
-        let base = task.allocate_trampoline(None, 4 * PAGE_SIZE).unwrap();
+        let base = task
+            .allocate_trampoline_with_replacement(None, 4 * PAGE_SIZE, false)
+            .unwrap();
         task.sys_munmap(base, 3 * PAGE_SIZE).unwrap();
         let blocker = base + 3 * PAGE_SIZE;
         UserPtrMut::<u8>::from_usize(blocker)
@@ -1705,7 +1935,10 @@ mod tests {
             .unwrap();
         let (address, length) = choose_trampoline_reservation(
             4 * PAGE_SIZE,
-            |length| task.allocate_trampoline(Some(base), length).ok(),
+            |length| {
+                task.allocate_trampoline_with_replacement(Some(base), length, false)
+                    .ok()
+            },
             |_| None,
         )
         .unwrap();
@@ -1714,7 +1947,8 @@ mod tests {
         UserPtrMut::<u8>::from_usize(address)
             .copy_from_slice::<Platform>(0, b"gate")
             .unwrap();
-        task.grow_trampoline(&mut range, 2 * PAGE_SIZE + 1).unwrap();
+        task.grow_trampoline_in_reservation(&mut range, 2 * PAGE_SIZE + 1, None)
+            .unwrap();
         assert_eq!(range, base..base + 3 * PAGE_SIZE);
         assert_eq!(
             &*UserPtr::<u8>::from_usize(base)
@@ -1722,7 +1956,10 @@ mod tests {
                 .unwrap(),
             b"gate"
         );
-        assert!(task.grow_trampoline(&mut range, 4 * PAGE_SIZE).is_err());
+        assert!(
+            task.grow_trampoline_in_reservation(&mut range, 4 * PAGE_SIZE, None)
+                .is_err()
+        );
         assert_eq!(range, base..base + 3 * PAGE_SIZE);
         assert_eq!(
             &*UserPtr::<u8>::from_usize(blocker)
@@ -1891,10 +2128,11 @@ mod tests {
     fn failed_partial_map_fixed_preserves_macho_tracking() {
         let task = task_with_file(&macho_image());
         let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        let reservation = trampoline_reservation(&task);
         assert!(
             task.sys_mmap(
                 address,
-                2 * PAGE_SIZE,
+                reservation.end - address + PAGE_SIZE,
                 VmProtection::READ | VmProtection::WRITE,
                 MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED,
                 -1,
@@ -1933,6 +2171,178 @@ mod tests {
         );
         assert_eq!(task.global.mm.mappings(), before);
         assert!(task.global.macho_trampolines.lock().is_empty());
+    }
+
+    #[test]
+    fn failed_executable_mmap_restores_existing_trampoline_reservation() {
+        let task = task_with_file(&macho_image());
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        let reservation = task
+            .global
+            .macho_trampolines
+            .lock()
+            .values()
+            .next()
+            .unwrap()
+            .runtime_trampoline_reservation
+            .clone()
+            .unwrap();
+
+        assert!(
+            mmap_with_protection(
+                &task,
+                VmProtection::READ | VmProtection::WRITE | VmProtection::EXECUTE,
+            )
+            .is_err()
+        );
+
+        let trampolines = task.global.macho_trampolines.lock();
+        let trampoline = trampolines.values().next().unwrap();
+        assert!(trampoline.range.is_none());
+        assert_eq!(
+            trampoline.runtime_trampoline_reservation.as_ref(),
+            Some(&reservation)
+        );
+        drop(trampolines);
+        assert!(
+            task.allocate_trampoline_with_replacement(Some(reservation.start), PAGE_SIZE, false,)
+                .is_err()
+        );
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    fn trampoline_reservation(task: &Task<Platform>) -> Range<usize> {
+        task.global
+            .macho_trampolines
+            .lock()
+            .values()
+            .next()
+            .unwrap()
+            .runtime_trampoline_reservation
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn unmapping_last_image_releases_unused_trampoline_reservation() {
+        let task = task_with_file(&macho_image());
+        let before = task.global.mm.mappings();
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        assert!(!trampoline_reservation(&task).is_empty());
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    #[test]
+    fn partial_reservation_unmap_releases_unowned_survivors() {
+        let task = task_with_file(&macho_image());
+        let before = task.global.mm.mappings();
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        let reservation = trampoline_reservation(&task);
+        task.sys_munmap(reservation.start + PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        assert!(task.global.mm.mappings().iter().all(|(range, _)| {
+            range.end <= reservation.start || range.start >= reservation.end
+        }));
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    #[test]
+    fn fixed_reservation_replacement_survives_executable_transition() {
+        use litebox_common_macos::user_pointers::UserPtrMut;
+
+        let task = task_with_file(&macho_image());
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        let reservation = trampoline_reservation(&task);
+        let replacement = task
+            .sys_mmap(
+                reservation.start,
+                PAGE_SIZE,
+                VmProtection::READ | VmProtection::WRITE,
+                MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED,
+                -1,
+                0,
+            )
+            .unwrap();
+        UserPtrMut::<u8>::from_usize(replacement)
+            .copy_from_slice::<Platform>(0, b"keep")
+            .unwrap();
+        task.sys_mprotect(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ | VmProtection::EXECUTE,
+        )
+        .unwrap();
+        assert_eq!(
+            UserPtr::<u8>::from_usize(replacement)
+                .to_owned_slice::<Platform>(4)
+                .unwrap()
+                .as_ref(),
+            b"keep",
+        );
+        task.sys_munmap(replacement, PAGE_SIZE).unwrap();
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn writable_reservation_pages_survive_executable_transition() {
+        use litebox_common_macos::user_pointers::UserPtrMut;
+
+        let task = task_with_file(&macho_image());
+        let address = mmap_with_protection(&task, VmProtection::READ).unwrap();
+        let reservation = trampoline_reservation(&task);
+        task.sys_mprotect(
+            reservation.start,
+            PAGE_SIZE,
+            VmProtection::READ | VmProtection::WRITE,
+        )
+        .unwrap();
+        UserPtrMut::<u8>::from_usize(reservation.start)
+            .copy_from_slice::<Platform>(0, b"keep")
+            .unwrap();
+        task.sys_mprotect(
+            address,
+            PAGE_SIZE,
+            VmProtection::READ | VmProtection::EXECUTE,
+        )
+        .unwrap();
+        assert_eq!(
+            UserPtr::<u8>::from_usize(reservation.start)
+                .to_owned_slice::<Platform>(4)
+                .unwrap()
+                .as_ref(),
+            b"keep",
+        );
+        task.sys_munmap(reservation.start, PAGE_SIZE).unwrap();
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn releasing_reservation_preserves_published_trampoline() {
+        let task = task_with_file(&macho_image());
+        let address =
+            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        let reservation = trampoline_reservation(&task);
+        let trampoline = task
+            .global
+            .macho_trampolines
+            .lock()
+            .values()
+            .next()
+            .unwrap()
+            .range
+            .clone()
+            .unwrap();
+        task.sys_munmap(reservation.end - PAGE_SIZE, PAGE_SIZE)
+            .unwrap();
+        for (range, _) in task.global.mm.mappings() {
+            if range.start < reservation.end && reservation.start < range.end {
+                assert!(range.start >= trampoline.start && range.end <= trampoline.end);
+            }
+        }
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_munmap(trampoline.start, trampoline.len()).unwrap();
     }
 
     #[test]
@@ -2007,6 +2417,16 @@ mod tests {
         let duplicate = i32::try_from(task.sys_dup(0).unwrap()).unwrap();
         let first =
             mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        let first_reservation = task
+            .global
+            .macho_trampolines
+            .lock()
+            .values()
+            .next()
+            .unwrap()
+            .runtime_trampoline_reservation
+            .clone()
+            .unwrap();
         let second = task
             .sys_mmap(
                 0,
@@ -2032,7 +2452,12 @@ mod tests {
             .into();
         let trampolines = task.global.macho_trampolines.lock();
         assert_eq!(trampolines.len(), 1);
-        let range = trampolines.values().next().unwrap().range.as_ref().unwrap();
+        let trampoline = trampolines.values().next().unwrap();
+        assert_eq!(
+            trampoline.runtime_trampoline_reservation.as_ref(),
+            Some(&first_reservation)
+        );
+        let range = trampoline.range.as_ref().unwrap();
         assert!(targets.into_iter().all(|target| range.contains(&target)));
         drop(trampolines);
         task.sys_munmap(first, PAGE_SIZE).unwrap();

@@ -339,6 +339,7 @@ impl From<crate::vmem::MappingError> for Errno {
         match value {
             crate::vmem::MappingError::UnAligned => Errno::EINVAL,
             crate::vmem::MappingError::OutOfMemory => Errno::ENOMEM,
+            crate::vmem::MappingError::MemoryAccess => Errno::EFAULT,
             crate::vmem::MappingError::BadFD(_) => Errno::EBADF,
             crate::vmem::MappingError::NotAFile => Errno::EISDIR,
             crate::vmem::MappingError::NotForReading => Errno::EACCES,

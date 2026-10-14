@@ -12,6 +12,15 @@
 
 extern crate alloc;
 
+/// Extra inaccessible address space retained after an offset-zero Mach-O mapping.
+///
+/// Runtime rewriting may initially underestimate how many trampoline gates the image needs. The
+/// shim therefore owns this tail up front so later trampoline growth cannot collide with an
+/// unrelated bottom-up allocation. This is address-space reservation, not committed executable
+/// trampoline memory: pages become writable/executable only as the runtime trampoline consumes
+/// them.
+pub(crate) const RUNTIME_TRAMPOLINE_RESERVATION_SIZE: usize = 16 * 1024 * 1024;
+
 use alloc::{collections::BTreeMap, ffi::CString, sync::Arc, vec, vec::Vec};
 use core::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use litebox::shim::{ContinueOperation, EnterShim, ExceptionInfo};

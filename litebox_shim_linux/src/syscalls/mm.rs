@@ -14,7 +14,7 @@ use litebox_common_linux::{
     loader::{
         TRAMPOLINE_HEADER_SIZE, TrampolineHeaderError, TrampolineLayout, parse_trampoline_header,
     },
-    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError},
+    vmem::{CreatePagesFlags, MappingError, PAGE_SIZE, VmemProtectError, subtract_ranges},
 };
 
 use crate::FileFd;
@@ -22,7 +22,6 @@ use crate::ShimPlatform;
 use crate::Task;
 use crate::UserPtrMut;
 use crate::syscalls::file::AnyTypedFd;
-#[cfg(target_arch = "aarch64")]
 use alloc::vec::Vec;
 use litebox::utils::TruncateExt as _;
 #[cfg(target_arch = "aarch64")]
@@ -228,33 +227,6 @@ impl Ord for ElfPatchKey {
 /// independently of descriptor lifetime.
 pub(crate) type ElfPatchCache = BTreeMap<ElfPatchKey, ElfPatchState>;
 
-/// Returns `range` minus possibly unsorted, overlapping `excluded` ranges.
-#[cfg(target_arch = "aarch64")]
-fn subtract_ranges(range: Range<usize>, excluded: &[Range<usize>]) -> Vec<Range<usize>> {
-    let mut blocks: Vec<Range<usize>> = excluded
-        .iter()
-        .filter(|block| block.start < range.end && range.start < block.end)
-        .cloned()
-        .collect();
-    blocks.sort_unstable_by_key(|block| (block.start, block.end));
-
-    let mut out = Vec::new();
-    let mut cursor = range.start;
-    for block in blocks {
-        if block.start > cursor {
-            out.push(cursor..block.start);
-        }
-        cursor = cursor.max(block.end);
-        if cursor >= range.end {
-            return out;
-        }
-    }
-    if cursor < range.end {
-        out.push(cursor..range.end);
-    }
-    out
-}
-
 #[inline]
 fn align_down(addr: usize, align: usize) -> usize {
     debug_assert!(align.is_power_of_two());
@@ -313,6 +285,38 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(Errno::from)
     }
 
+    /// Serialize guest replacement and ownership revocation with trampoline publication.
+    fn do_mmap_guest(
+        &self,
+        suggested_addr: Option<usize>,
+        len: usize,
+        prot: ProtFlags,
+        flags: MapFlags,
+        op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
+    ) -> Result<UserPtrMut<u8>, MappingError> {
+        let Some(start) = suggested_addr.filter(|_| flags.contains(MapFlags::MAP_FIXED)) else {
+            return self.do_mmap(suggested_addr, len, prot, flags, op);
+        };
+        let Some(end) = start.checked_add(len) else {
+            return Err(MappingError::OutOfMemory);
+        };
+        let mut cache = self.global.elf_patch_cache.lock();
+        let snapshot = || {
+            self.global
+                .mm
+                .mappings()
+                .into_iter()
+                .filter(|(range, _)| range.start < end && start < range.end)
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let result = self.do_mmap(suggested_addr, len, prot, flags, op);
+        if result.is_ok() || before != snapshot() {
+            self.clear_file_mappings_for_range(cache.values_mut(), start, len, &[]);
+        }
+        result
+    }
+
     fn do_mmap_file(
         &self,
         suggested_addr: Option<usize>,
@@ -328,10 +332,20 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::ENODEV);
         };
         let syscall_entry = self.global.platform.get_syscall_entry_point();
+        let patch_key = ElfPatchKey(Arc::clone(file_fd));
 
+        // A file whose patch state already owns trampoline space does not need another tail.
         let reserves_trampoline = offset == 0
             && syscall_entry != 0
-            && !flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE);
+            && !flags.intersects(MapFlags::MAP_FIXED | MapFlags::MAP_FIXED_NOREPLACE)
+            && self
+                .global
+                .elf_patch_cache
+                .lock()
+                .get(&patch_key)
+                .is_none_or(|state| {
+                    state.runtime_trampoline_reservation.is_none() && !state.trampoline_mapped
+                });
 
         let reservation = if reserves_trampoline {
             let reserved_len = len
@@ -386,6 +400,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         MappingError::BadFD(_)
                             | MappingError::NotAFile
                             | MappingError::NotForReading
+                            | MappingError::MemoryAccess
                             | MappingError::ProtectError(_)
                     );
                     let cleanup_start = if prefix_already_unmapped {
@@ -406,11 +421,23 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Ok(result);
         }
 
-        let patch_key = ElfPatchKey(Arc::clone(file_fd));
         let trampoline_reservation = reservation.map(|range| range.start + len..range.end);
         let cleanup_len = trampoline_reservation
             .as_ref()
             .map_or(len, |range| range.end - result.as_usize());
+
+        let initialization = self.try_init_elf_patch_state(
+            &patch_key,
+            result.as_usize(),
+            offset,
+            trampoline_reservation.clone(),
+        );
+        if initialization == ElfPatchInit::Malformed
+            || (is_exec && initialization == ElfPatchInit::MissingLoadBase)
+        {
+            self.sys_munmap(result, cleanup_len)?;
+            return Err(Errno::ENOMEM);
+        }
 
         // Runtime syscall rewriting: patch PROT_EXEC segments in-place.
         if is_exec {
@@ -422,7 +449,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     &patch_key,
                     syscall_entry,
                     Some(offset),
-                    trampoline_reservation,
                     &restore_protections,
                 )
                 .is_err()
@@ -433,18 +459,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 return Err(Errno::ENOMEM);
             }
         } else {
-            // Ensure patch state is initialized for this fd (no-op if already done).
-            // A missing load base is not fatal here: a later mapping may reveal it.
-            if self.try_init_elf_patch_state(
-                &patch_key,
-                result.as_usize(),
-                offset,
-                trampoline_reservation,
-            ) == ElfPatchInit::Malformed
-            {
-                self.sys_munmap(result, cleanup_len)?;
-                return Err(Errno::ENOMEM);
-            }
             // Track non-exec file mappings so we can patch them if they later
             // gain PROT_EXEC via mprotect.
             let mut cache = self.global.elf_patch_cache.lock();
@@ -458,7 +472,39 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         }
 
+        if let Some(reservation) = trampoline_reservation {
+            self.release_unadopted_trampoline_reservation(&patch_key, reservation);
+        }
+
         Ok(result)
+    }
+
+    /// Unmap a runtime trampoline reservation unless patch state for `fd` adopted it.
+    ///
+    /// Untracked files and reservations that cannot hold the file's trampoline have no owner
+    /// that could later consume or release them.
+    fn release_unadopted_trampoline_reservation(
+        &self,
+        fd: &ElfPatchKey,
+        reservation: Range<usize>,
+    ) {
+        let cache = self.global.elf_patch_cache.lock();
+        let adopted = cache.get(fd).is_some_and(|state| {
+            state.runtime_trampoline_reservation.as_ref() == Some(&reservation)
+        });
+        if !adopted {
+            self.release_trampoline_reservation(reservation, &[]);
+        }
+    }
+
+    fn release_trampoline_reservation(&self, reservation: Range<usize>, retained: &[Range<usize>]) {
+        for range in subtract_ranges(reservation, retained) {
+            if let Err(error) =
+                self.sys_munmap_raw(UserPtrMut::from_usize(range.start), range.len())
+            {
+                litebox_util_log::warn!(error:? = error, range:? = range; "failed to release ELF trampoline reservation");
+            }
+        }
     }
 
     /// Map a file by reading its contents through the filesystem API into allocated pages.
@@ -497,15 +543,14 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 if size == 0 {
                     break;
                 }
-                // ptr is a valid pointer returned by do_mmap.
                 ptr.copy_from_slice::<Platform>(copied, &buffer[..size])
-                    .unwrap();
+                    .ok_or(MappingError::MemoryAccess)?;
                 copied += size;
                 file_offset += size;
             }
             Ok(copied)
         };
-        let ptr = self.do_mmap(suggested_addr, len, ProtFlags::PROT_READ_WRITE, flags, op)?;
+        let ptr = self.do_mmap_guest(suggested_addr, len, ProtFlags::PROT_READ_WRITE, flags, op)?;
         if prot != ProtFlags::PROT_READ_WRITE && self.sys_mprotect_raw(ptr, len, prot).is_err() {
             // TODO: Protection may be unsupported (e.g. write-only), or another thread may
             // have unmapped the range. Best-effort cleanup may unmap a replacement
@@ -567,7 +612,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
         let suggested_addr = if addr == 0 { None } else { Some(addr) };
         if flags.contains(MapFlags::MAP_ANONYMOUS) {
-            self.do_mmap_anonymous(suggested_addr, aligned_len, prot, flags)
+            self.do_mmap_guest(suggested_addr, aligned_len, prot, flags, |_| Ok(0))
+                .map_err(Errno::from)
         } else {
             self.do_mmap_file(suggested_addr, aligned_len, prot, flags, fd, offset)
         }
@@ -576,9 +622,15 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// Handle syscall `munmap`
     #[inline]
     pub(crate) fn sys_munmap(&self, addr: UserPtrMut<u8>, len: usize) -> Result<(), Errno> {
+        let mut cache = self.global.elf_patch_cache.lock();
         let result = self.sys_munmap_raw(addr, len);
         if result.is_ok() {
-            self.clear_file_mappings_for_range(addr.as_usize(), len.next_multiple_of(PAGE_SIZE));
+            self.clear_file_mappings_for_range(
+                cache.values_mut(),
+                addr.as_usize(),
+                len.next_multiple_of(PAGE_SIZE),
+                &[],
+            );
         }
         result
     }
@@ -594,10 +646,16 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// unmapped range, so that re-mapping the same file region will be
     /// re-patched instead of skipped.
     ///
-    fn clear_file_mappings_for_range(&self, unmap_start: usize, unmap_len: usize) {
+    fn clear_file_mappings_for_range<'a>(
+        &self,
+        states: impl Iterator<Item = &'a mut ElfPatchState>,
+        unmap_start: usize,
+        unmap_len: usize,
+        preserved: &[Range<usize>],
+    ) {
         let unmap_end = unmap_start.saturating_add(unmap_len);
-        let mut cache = self.global.elf_patch_cache.lock();
-        for state in cache.values_mut() {
+        for state in states {
+            self.revoke_trampoline_reservation(state, unmap_start..unmap_end, preserved);
             #[cfg(target_arch = "aarch64")]
             if state.trampoline_mapped && state.trampoline_mapped_len > 0 {
                 // Stop excluding unmapped trampoline ranges from later
@@ -616,15 +674,56 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     state.trampoline_mapped_len = 0;
                 }
             }
+            let mut survivors = Vec::new();
             state.file_mappings.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
-                seg_end <= unmap_start || vaddr >= unmap_end
+                if seg_end <= unmap_start || vaddr >= unmap_end {
+                    return true;
+                }
+                if vaddr < unmap_start {
+                    survivors.push((vaddr, unmap_start - vaddr));
+                }
+                if seg_end > unmap_end {
+                    survivors.push((unmap_end, seg_end - unmap_end));
+                }
+                false
             });
+            state.file_mappings.extend(survivors);
             state.patched_ranges.retain(|&(vaddr, seg_len)| {
                 let seg_end = vaddr.saturating_add(seg_len);
                 seg_end <= unmap_start || vaddr >= unmap_end
             });
         }
+    }
+
+    fn revoke_trampoline_reservation(
+        &self,
+        state: &mut ElfPatchState,
+        replaced: Range<usize>,
+        preserved: &[Range<usize>],
+    ) {
+        if !state
+            .runtime_trampoline_reservation
+            .as_ref()
+            .is_some_and(|range| range.start < replaced.end && replaced.start < range.end)
+        {
+            return;
+        }
+        let reservation = state
+            .runtime_trampoline_reservation
+            .take()
+            .expect("overlapping reservation exists");
+        let mut retained = alloc::vec![replaced];
+        if state.trampoline_mapped {
+            retained.push(
+                state.trampoline_addr
+                    ..state
+                        .trampoline_addr
+                        .saturating_add(state.trampoline_mapped_len),
+            );
+        }
+        retained.extend_from_slice(preserved);
+        self.release_trampoline_reservation(reservation, &retained);
     }
 
     /// Handle syscall `mprotect`
@@ -652,27 +751,36 @@ impl<Platform: ShimPlatform> Task<Platform> {
         }
         // Only AArch64 needs protection from loader reprotection of its holes;
         // x86-64 must retain whole-request behavior.
+        let mut cache = self.global.elf_patch_cache.lock();
         #[cfg(target_arch = "aarch64")]
-        let result = self.mprotect_around_trampolines(addr.as_usize(), len, prot);
+        let result = self.mprotect_around_trampolines(cache.values(), addr.as_usize(), len, prot);
         #[cfg(target_arch = "x86_64")]
         let result = self.sys_mprotect_raw(addr, len, prot);
+        if result.is_ok() && !prot.is_empty() && len != 0 {
+            for state in cache.values_mut() {
+                self.revoke_trampoline_reservation(
+                    state,
+                    addr.as_usize()..addr.as_usize() + len,
+                    &[],
+                );
+            }
+        }
         result
     }
 
     /// Applies `prot`, excluding AOT trampolines placed inside their load spans.
     /// Runtime trampolines are outside the span and are not excluded.
     #[cfg(target_arch = "aarch64")]
-    fn mprotect_around_trampolines(
+    fn mprotect_around_trampolines<'a>(
         &self,
+        states: impl Iterator<Item = &'a ElfPatchState>,
         start: usize,
         len: usize,
         prot: ProtFlags,
     ) -> Result<(), Errno> {
         let range = start..start.saturating_add(len);
         let excluded: alloc::vec::Vec<Range<usize>> = {
-            let cache = self.global.elf_patch_cache.lock();
-            cache
-                .values()
+            states
                 .filter(|state| {
                     !state.trampoline_invalidated
                         && state.trampoline_mapped
@@ -732,9 +840,35 @@ impl<Platform: ShimPlatform> Task<Platform> {
         flags: MRemapFlags,
         new_addr: usize,
     ) -> Result<UserPtrMut<u8>, Errno> {
-        self.global
+        let mut cache = self.global.elf_patch_cache.lock();
+        let result = self
+            .global
             .mm
-            .sys_mremap(old_addr, old_size, new_size, flags, new_addr)
+            .sys_mremap(old_addr, old_size, new_size, flags, new_addr)?;
+        let old_size = old_size.next_multiple_of(PAGE_SIZE);
+        let new_size = new_size.next_multiple_of(PAGE_SIZE);
+        if result.as_usize() != old_addr.as_usize() {
+            self.clear_file_mappings_for_range(
+                cache.values_mut(),
+                old_addr.as_usize(),
+                old_size,
+                &[],
+            );
+            self.clear_file_mappings_for_range(
+                cache.values_mut(),
+                result.as_usize(),
+                new_size,
+                &[],
+            );
+        } else if new_size < old_size {
+            self.clear_file_mappings_for_range(
+                cache.values_mut(),
+                old_addr.as_usize() + new_size,
+                old_size - new_size,
+                core::slice::from_ref(&(old_addr.as_usize()..old_addr.as_usize() + new_size)),
+            );
+        }
+        Ok(result)
     }
 
     /// Handle syscall `brk`
@@ -843,7 +977,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 &fd,
                 syscall_entry,
                 None,
-                None,
                 &restore_protections,
             )?;
         }
@@ -871,8 +1004,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         // Quick check: skip if already initialized.
         let mut cache = self.global.elf_patch_cache.lock();
         if let Some(state) = cache.get_mut(fd) {
-            if runtime_trampoline_reservation.is_some() {
-                state.runtime_trampoline_reservation = runtime_trampoline_reservation;
+            // Never replace an owned reservation; an unadopted one is released by the caller.
+            if state.runtime_trampoline_reservation.is_none() && !state.trampoline_mapped {
+                state.runtime_trampoline_reservation = runtime_trampoline_reservation
+                    .filter(|range| range.contains(&state.trampoline_addr));
             }
             return ElfPatchInit::Ready;
         }
@@ -1133,7 +1268,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 trampoline_cursor: 0,
                 trampoline_mapped: false,
                 trampoline_mapped_len: 0,
-                runtime_trampoline_reservation,
+                runtime_trampoline_reservation: runtime_trampoline_reservation
+                    .filter(|range| range.contains(&trampoline_addr)),
                 runtime_patches_committed: false,
                 #[cfg(target_arch = "aarch64")]
                 trampoline_invalidated: false,
@@ -1349,6 +1485,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
     ///
     /// Returns an error when a pre-patched binary's trampoline cannot be set
     /// up or the caller-selected code permissions cannot be restored.
+    /// File mappings initialize patch state before calling this method.
     fn maybe_patch_exec_segment(
         &self,
         mapped_addr: UserPtrMut<u8>,
@@ -1356,28 +1493,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
         fd: &ElfPatchKey,
         syscall_entry: usize,
         file_offset: Option<usize>,
-        runtime_trampoline_reservation: Option<Range<usize>>,
         restore_protections: &[ProtectionRange],
     ) -> Result<(), Errno> {
-        // Initialize patch state if this is the first mmap for this fd.
-        // Typically the first mapping is at offset 0 (the ELF header), but
-        // some loaders may map an executable segment at a non-zero offset first.
-        // Executing pre-patched code without its trampoline would fault on the
-        // first rewritten syscall, so both pre-patched failures are fatal here.
-        if let Some(file_offset) = file_offset
-            && matches!(
-                self.try_init_elf_patch_state(
-                    fd,
-                    mapped_addr.as_usize(),
-                    file_offset,
-                    runtime_trampoline_reservation,
-                ),
-                ElfPatchInit::MissingLoadBase | ElfPatchInit::Malformed
-            )
-        {
-            return Err(Errno::ENOMEM);
-        }
-
+        #[cfg(target_arch = "x86_64")]
+        let _ = file_offset;
         // This lock guards the elf_patch_cache and is held for the entire
         // patching operation. In practice this is fine because the dynamic
         // linker loads shared libraries sequentially.
@@ -1505,24 +1624,8 @@ impl<Platform: ShimPlatform> Task<Platform> {
             let initial_trampoline_len = PAGE_SIZE;
 
             let map_preferred = |reservation_len| {
-                let trampoline_is_reserved =
-                    tramp_addr
-                        .checked_add(reservation_len)
-                        .is_some_and(|tramp_end| {
-                            state
-                                .runtime_trampoline_reservation
-                                .as_ref()
-                                .is_some_and(|range| {
-                                    tramp_addr >= range.start && tramp_end <= range.end
-                                })
-                        });
-                let preferred_flags = MapFlags::MAP_ANONYMOUS
-                    | MapFlags::MAP_PRIVATE
-                    | if trampoline_is_reserved {
-                        MapFlags::MAP_FIXED
-                    } else {
-                        MapFlags::MAP_FIXED_NOREPLACE
-                    };
+                let preferred_flags =
+                    Self::trampoline_mapping_flags(state, tramp_addr, reservation_len);
                 match self.do_mmap_anonymous(
                     Some(tramp_addr),
                     reservation_len,
@@ -1533,7 +1636,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         if ptr.as_usize() == tramp_addr {
                             Some(ptr)
                         } else {
-                            let _ = self.sys_munmap_raw(ptr, reservation_len);
+                            self.discard_unpublished_runtime_trampoline(
+                                state,
+                                ptr,
+                                reservation_len,
+                            );
                             None
                         }
                     }
@@ -1567,7 +1674,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                                 distance:? = distance;
                                 "rejecting arbitrary trampoline reservation outside branch range"
                             );
-                            let _ = self.sys_munmap_raw(ptr, reservation_len);
+                            self.discard_unpublished_runtime_trampoline(
+                                state,
+                                ptr,
+                                reservation_len,
+                            );
                             None
                         } else {
                             Some(ptr)
@@ -1595,8 +1706,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     distance:? = distance;
                     "trampoline too far from code segment, skipping patching"
                 );
-                let _ =
-                    self.sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), reservation_len);
+                self.discard_unpublished_runtime_trampoline(
+                    state,
+                    actual_addr_ptr,
+                    reservation_len,
+                );
                 return apply_trap_fallback(mapped_addr, len, false);
             }
 
@@ -1609,8 +1723,11 @@ impl<Platform: ShimPlatform> Task<Platform> {
                     .is_none()
                 {
                     litebox_util_log::warn!("failed to write syscall entry point to trampoline");
-                    let _ = self
-                        .sys_munmap_raw(UserPtrMut::<u8>::from_usize(actual_addr), reservation_len);
+                    self.discard_unpublished_runtime_trampoline(
+                        state,
+                        actual_addr_ptr,
+                        reservation_len,
+                    );
                     return apply_trap_fallback(mapped_addr, len, false);
                 }
                 state.trampoline_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES;
@@ -1761,9 +1878,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             Some(extra_start),
                             extra_len,
                             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-                            MapFlags::MAP_ANONYMOUS
-                                | MapFlags::MAP_PRIVATE
-                                | MapFlags::MAP_FIXED_NOREPLACE,
+                            Self::trampoline_mapping_flags(state, extra_start, extra_len),
                         )
                         .is_err()
                     {
@@ -1832,21 +1947,61 @@ impl<Platform: ShimPlatform> Task<Platform> {
 
     /// Finalize the ELF patching state for `fd`.
     ///
-    /// Removes the cache entry and unmaps any trampoline that was allocated but never used.
+    /// Removes the cache entry and releases unused reservation pages and unpublished gates.
+    /// Published gates remain mapped until address-space teardown.
     pub(crate) fn finalize_elf_patch(&self, fd: Arc<FileFd>) {
-        let state = self.global.elf_patch_cache.lock().remove(&ElfPatchKey(fd));
-        if let Some(state) = state
-            && state.trampoline_mapped
-            && !state.pre_patched
-            && !state.runtime_patches_committed
-        {
-            let tramp_len = state.trampoline_mapped_len;
-            if tramp_len > 0 {
-                let _ = self.sys_munmap(
-                    UserPtrMut::<u8>::from_usize(state.trampoline_addr),
-                    tramp_len,
+        let mut cache = self.global.elf_patch_cache.lock();
+        if let Some(state) = cache.remove(&ElfPatchKey(fd)) {
+            let trampoline = state.trampoline_addr
+                ..state
+                    .trampoline_addr
+                    .saturating_add(state.trampoline_mapped_len);
+            if let Some(reservation) = state.runtime_trampoline_reservation {
+                self.release_trampoline_reservation(
+                    reservation,
+                    core::slice::from_ref(&trampoline),
                 );
             }
+            if state.trampoline_mapped
+                && !trampoline.is_empty()
+                && !state.pre_patched
+                && !state.runtime_patches_committed
+            {
+                self.release_trampoline_reservation(trampoline, &[]);
+            }
+        }
+    }
+
+    fn trampoline_mapping_flags(state: &ElfPatchState, start: usize, len: usize) -> MapFlags {
+        let reserved = start.checked_add(len).is_some_and(|end| {
+            state
+                .runtime_trampoline_reservation
+                .as_ref()
+                .is_some_and(|range| start >= range.start && end <= range.end)
+        });
+        MapFlags::MAP_ANONYMOUS
+            | MapFlags::MAP_PRIVATE
+            | if reserved {
+                MapFlags::MAP_FIXED
+            } else {
+                MapFlags::MAP_FIXED_NOREPLACE
+            }
+    }
+
+    fn discard_unpublished_runtime_trampoline(
+        &self,
+        state: &ElfPatchState,
+        pointer: UserPtrMut<u8>,
+        len: usize,
+    ) {
+        if Self::trampoline_mapping_flags(state, pointer.as_usize(), len)
+            .contains(MapFlags::MAP_FIXED)
+        {
+            // Keep ownership valid by restoring protection without releasing the address space.
+            self.sys_mprotect_raw(pointer, len, ProtFlags::PROT_NONE)
+                .expect("fatal: failed to restore owned ELF trampoline reservation");
+        } else if let Err(error) = self.sys_munmap_raw(pointer, len) {
+            litebox_util_log::warn!(error:? = error; "failed to discard unpublished ELF trampoline");
         }
     }
 }
@@ -1859,7 +2014,6 @@ mod tests {
     use litebox::platform::PageManagementProvider;
     use litebox::platform::page_mgmt::MemoryRegionPermissions;
     use litebox_broker_protocol::fs::FileMode as Mode;
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
     use litebox_common_linux::MRemapFlags;
     use litebox_common_linux::{
         MapFlags, OFlags, ProtFlags,
@@ -2034,6 +2188,482 @@ mod tests {
         }
 
         task.sys_close(fd).expect("test file should close");
+    }
+
+    /// Builds a one-page `ET_DYN` image that runtime rewriting tracks.
+    fn minimal_dyn_elf() -> alloc::vec::Vec<u8> {
+        use object::elf::{ET_DYN, PT_LOAD};
+        #[cfg(target_arch = "x86_64")]
+        let machine = object::elf::EM_X86_64;
+        #[cfg(target_arch = "aarch64")]
+        let machine = object::elf::EM_AARCH64;
+        let page = u64::try_from(PAGE_SIZE).unwrap();
+        let mut elf = alloc::vec::Vec::new();
+        elf.extend_from_slice(b"\x7fELF");
+        elf.extend_from_slice(&[2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        elf.extend_from_slice(&ET_DYN.to_le_bytes());
+        elf.extend_from_slice(&machine.to_le_bytes());
+        elf.extend_from_slice(&1u32.to_le_bytes()); // e_version
+        elf.extend_from_slice(&0u64.to_le_bytes()); // e_entry
+        elf.extend_from_slice(&64u64.to_le_bytes()); // e_phoff
+        elf.extend_from_slice(&0u64.to_le_bytes()); // e_shoff
+        elf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
+        elf.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        elf.extend_from_slice(&1u16.to_le_bytes()); // e_phnum
+        elf.extend_from_slice(&[0; 6]); // e_shentsize, e_shnum, e_shstrndx
+        elf.extend_from_slice(&PT_LOAD.to_le_bytes());
+        elf.extend_from_slice(&5u32.to_le_bytes()); // PF_R | PF_X
+        for value in [0, 0, 0, page, page, page] {
+            elf.extend_from_slice(&u64::to_le_bytes(value));
+        }
+        elf.resize(PAGE_SIZE, 0);
+        elf
+    }
+
+    fn open_test_file(task: &Task<Platform>, path: &str, content: &[u8]) -> i32 {
+        create_file(task, path, content);
+        i32::try_from(
+            task.sys_open(path, OFlags::RDONLY, Mode::empty())
+                .expect("test file should open"),
+        )
+        .expect("file descriptor should fit i32")
+    }
+
+    fn map_file_at_offset_zero(task: &Task<Platform>, fd: i32, prot: ProtFlags) -> UserPtrMut<u8> {
+        task.do_mmap_file(None, PAGE_SIZE, prot, MapFlags::MAP_PRIVATE, fd, 0)
+            .expect("file mapping should succeed")
+    }
+
+    fn trampoline_reservation(task: &Task<Platform>, fd: i32) -> Option<core::ops::Range<usize>> {
+        task.global
+            .elf_patch_cache
+            .lock()
+            .get(&elf_patch_key(task, fd))
+            .and_then(|state| state.runtime_trampoline_reservation.clone())
+    }
+
+    #[test]
+    fn untracked_file_mmap_releases_trampoline_reservation() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/untracked-reservation", b"not an ELF image");
+        let before = task.global.mm.mappings();
+
+        for prot in [ProtFlags::PROT_READ, ProtFlags::PROT_READ_EXEC] {
+            let address = map_file_at_offset_zero(&task, fd, prot);
+            assert!(trampoline_reservation(&task, fd).is_none());
+            task.sys_munmap(address, PAGE_SIZE)
+                .expect("test mapping should unmap");
+            assert_eq!(task.global.mm.mappings(), before);
+        }
+
+        task.sys_close(fd).expect("test file should close");
+    }
+
+    #[test]
+    fn repeated_offset_zero_mmap_keeps_single_trampoline_reservation() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/repeated-reservation", &minimal_dyn_elf());
+
+        let first = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation =
+            trampoline_reservation(&task, fd).expect("tracked ELF should adopt its reservation");
+        assert_eq!(reservation.start, first.as_usize() + PAGE_SIZE);
+
+        let before_second = task.global.mm.mappings();
+        let second = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        assert_eq!(trampoline_reservation(&task, fd), Some(reservation.clone()));
+        task.sys_munmap(second, PAGE_SIZE)
+            .expect("second mapping should unmap");
+        assert_eq!(task.global.mm.mappings(), before_second);
+
+        task.sys_munmap(first, PAGE_SIZE)
+            .expect("first mapping should unmap");
+        task.sys_munmap(UserPtrMut::from_usize(reservation.start), reservation.len())
+            .expect("reservation should unmap");
+        task.sys_close(fd).expect("test file should close");
+    }
+
+    #[test]
+    fn reservation_without_trampoline_address_is_released() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/unusable-reservation", &minimal_dyn_elf());
+        // Patch state derived from another mapping places the trampoline outside any new tail.
+        task.global.elf_patch_cache.lock().insert(
+            elf_patch_key(&task, fd),
+            runtime_patch_state(BTreeSet::new(), PAGE_SIZE, false),
+        );
+        let before = task.global.mm.mappings();
+
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        assert!(trampoline_reservation(&task, fd).is_none());
+        task.sys_munmap(address, PAGE_SIZE)
+            .expect("test mapping should unmap");
+        assert_eq!(task.global.mm.mappings(), before);
+
+        task.sys_close(fd).expect("test file should close");
+    }
+
+    #[test]
+    fn unmapping_reservation_revokes_trampoline_ownership() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/revoked-reservation", &minimal_dyn_elf());
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation =
+            trampoline_reservation(&task, fd).expect("tracked ELF should adopt its reservation");
+
+        task.sys_munmap(address, PAGE_SIZE + reservation.len())
+            .expect("mapping and reservation should unmap");
+        assert!(trampoline_reservation(&task, fd).is_none());
+
+        task.sys_close(fd).expect("test file should close");
+    }
+
+    #[test]
+    fn closing_elf_releases_unused_trampoline_reservation() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/closed-reservation", &minimal_dyn_elf());
+        let before = task.global.mm.mappings();
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        assert!(trampoline_reservation(&task, fd).is_some());
+
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    #[test]
+    fn partial_reservation_unmap_releases_unowned_survivors() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/partial-reservation", &minimal_dyn_elf());
+        let before = task.global.mm.mappings();
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+
+        task.sys_munmap(
+            UserPtrMut::from_usize(reservation.start + PAGE_SIZE),
+            PAGE_SIZE,
+        )
+        .unwrap();
+        assert!(trampoline_reservation(&task, fd).is_none());
+        assert!(task.global.mm.mappings().iter().all(|(range, _)| {
+            range.end <= reservation.start || range.start >= reservation.end
+        }));
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    #[test]
+    fn shrinking_reservation_preserves_remap_result() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/shrunk-reservation", &minimal_dyn_elf());
+        let before = task.global.mm.mappings();
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        let pointer = UserPtrMut::from_usize(reservation.start);
+
+        assert_eq!(
+            task.sys_mremap(
+                pointer,
+                reservation.len(),
+                PAGE_SIZE,
+                MRemapFlags::empty(),
+                0
+            )
+            .unwrap()
+            .as_usize(),
+            pointer.as_usize(),
+        );
+        assert!(trampoline_reservation(&task, fd).is_none());
+        assert_eq!(
+            mapping_permissions(&task, pointer),
+            MemoryRegionPermissions::empty()
+        );
+        task.sys_munmap(pointer, PAGE_SIZE).unwrap();
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    #[test]
+    fn fixed_reservation_replacement_survives_executable_transition() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/fixed-reservation", &minimal_dyn_elf());
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        let replacement = task
+            .sys_mmap(
+                reservation.start,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
+                -1,
+                0,
+            )
+            .unwrap();
+        replacement.copy_from_slice::<Platform>(0, b"keep").unwrap();
+        assert!(trampoline_reservation(&task, fd).is_none());
+
+        task.sys_mprotect(address, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        assert_eq!(
+            replacement.to_owned_slice::<Platform>(4).unwrap().as_ref(),
+            b"keep",
+        );
+        task.sys_munmap(replacement, PAGE_SIZE).unwrap();
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn fixed_file_replacement_revokes_reservation() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/fixed-file-reservation", &minimal_dyn_elf());
+        let other_fd = open_test_file(&task, "/fixed-file-replacement", b"keep");
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        let replacement = task
+            .sys_mmap(
+                reservation.start,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                other_fd,
+                0,
+            )
+            .unwrap();
+        assert!(trampoline_reservation(&task, fd).is_none());
+        task.sys_mprotect(address, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        assert_eq!(
+            replacement.to_owned_slice::<Platform>(4).unwrap().as_ref(),
+            b"keep",
+        );
+        task.sys_munmap(replacement, PAGE_SIZE).unwrap();
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(other_fd).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn failed_fixed_replacement_preserves_reservation() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/failed-fixed-reservation", &minimal_dyn_elf());
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        assert!(
+            task.sys_mmap(
+                reservation.start,
+                PAGE_SIZE,
+                ProtFlags::from_bits_retain(i32::MIN),
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS | MapFlags::MAP_FIXED,
+                -1,
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(trampoline_reservation(&task, fd), Some(reservation));
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn discarded_trampoline_keeps_its_reservation_inaccessible() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/discarded-reservation", &minimal_dyn_elf());
+        let before = task.global.mm.mappings();
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        let pointer = task
+            .do_mmap_anonymous(
+                Some(reservation.start),
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+            )
+            .unwrap();
+        {
+            let cache = task.global.elf_patch_cache.lock();
+            task.discard_unpublished_runtime_trampoline(
+                &cache[&elf_patch_key(&task, fd)],
+                pointer,
+                PAGE_SIZE,
+            );
+        }
+        assert_eq!(
+            mapping_permissions(&task, pointer),
+            MemoryRegionPermissions::empty()
+        );
+        assert_eq!(trampoline_reservation(&task, fd), Some(reservation.clone()));
+        assert_eq!(
+            task.sys_mmap(
+                reservation.start,
+                PAGE_SIZE,
+                ProtFlags::PROT_READ_WRITE,
+                MapFlags::MAP_ANONYMOUS | MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED_NOREPLACE,
+                -1,
+                0,
+            )
+            .unwrap_err(),
+            Errno::EEXIST,
+        );
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    #[test]
+    fn writable_reservation_pages_survive_executable_transition() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/writable-reservation", &minimal_dyn_elf());
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        let pointer = UserPtrMut::<u8>::from_usize(reservation.start);
+        task.sys_mprotect(pointer, PAGE_SIZE, ProtFlags::PROT_READ_WRITE)
+            .unwrap();
+        pointer.copy_from_slice::<Platform>(0, b"keep").unwrap();
+        assert!(trampoline_reservation(&task, fd).is_none());
+        task.sys_mprotect(address, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        assert_eq!(
+            pointer.to_owned_slice::<Platform>(4).unwrap().as_ref(),
+            b"keep",
+        );
+        task.sys_munmap(pointer, PAGE_SIZE).unwrap();
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn trampoline_grows_in_reservation_and_close_preserves_published_gates() {
+        let task = init_platform();
+        let mut elf = minimal_dyn_elf();
+        elf[128..].fill(0x90);
+        for slot in elf[128..].as_chunks_mut::<16>().0 {
+            slot[..2].copy_from_slice(&[0x0f, 0x05]);
+        }
+        let fd = open_test_file(&task, "/growing-reservation", &elf);
+        let before = task.global.mm.mappings();
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        task.sys_mprotect(address, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        let trampoline = {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = &cache[&elf_patch_key(&task, fd)];
+            assert!(state.runtime_patches_committed);
+            assert!(state.trampoline_cursor > PAGE_SIZE);
+            assert!(state.trampoline_mapped_len > PAGE_SIZE);
+            let range = state.trampoline_addr..state.trampoline_addr + state.trampoline_mapped_len;
+            assert!(range.start >= reservation.start && range.end <= reservation.end);
+            range
+        };
+        task.sys_close(fd).unwrap();
+        assert_eq!(
+            mapping_permissions(&task, UserPtrMut::from_usize(trampoline.start)),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+        );
+        for (range, _) in task.global.mm.mappings() {
+            if range.start < reservation.end && reservation.start < range.end {
+                assert!(range.start >= trampoline.start && range.end <= trampoline.end);
+            }
+        }
+        task.sys_munmap(UserPtrMut::from_usize(trampoline.start), trampoline.len())
+            .unwrap();
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn removing_file_suffix_keeps_surviving_code_patchable() {
+        let task = init_platform();
+        let mut elf = minimal_dyn_elf();
+        elf[128..].fill(0x90);
+        elf[PAGE_SIZE / 2..PAGE_SIZE / 2 + 2].copy_from_slice(&[0x0f, 0x05]);
+        let fd = open_test_file(&task, "/file-suffix", &elf);
+        for shrink in [false, true] {
+            let address = task
+                .do_mmap_file(
+                    None,
+                    2 * PAGE_SIZE,
+                    ProtFlags::PROT_READ,
+                    MapFlags::MAP_PRIVATE,
+                    fd,
+                    0,
+                )
+                .unwrap();
+            if shrink {
+                task.sys_mremap(address, 2 * PAGE_SIZE, PAGE_SIZE, MRemapFlags::empty(), 0)
+                    .unwrap();
+            } else {
+                task.sys_munmap(
+                    UserPtrMut::from_usize(address.as_usize() + PAGE_SIZE),
+                    PAGE_SIZE,
+                )
+                .unwrap();
+            }
+            task.sys_mprotect(address, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+                .unwrap();
+            let trampoline = {
+                let cache = task.global.elf_patch_cache.lock();
+                let state = &cache[&elf_patch_key(&task, fd)];
+                assert!(state.runtime_patches_committed);
+                assert!(
+                    state
+                        .file_mappings
+                        .contains(&(address.as_usize(), PAGE_SIZE))
+                );
+                state.trampoline_addr..state.trampoline_addr + state.trampoline_mapped_len
+            };
+            task.sys_munmap(UserPtrMut::from_usize(trampoline.start), trampoline.len())
+                .unwrap();
+            task.sys_munmap(address, PAGE_SIZE).unwrap();
+            task.finalize_elf_patch(elf_patch_key(&task, fd).0);
+        }
+        task.sys_close(fd).unwrap();
+    }
+
+    #[test]
+    fn partial_reservation_release_keeps_live_trampoline() {
+        let task = init_platform();
+        let fd = open_test_file(&task, "/live-partial-reservation", &minimal_dyn_elf());
+        let address = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        let reservation = trampoline_reservation(&task, fd).unwrap();
+        task.sys_mprotect(address, PAGE_SIZE, ProtFlags::PROT_READ_EXEC)
+            .unwrap();
+        let trampoline = {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = &cache[&elf_patch_key(&task, fd)];
+            assert!(state.trampoline_mapped);
+            state.trampoline_addr..state.trampoline_addr + state.trampoline_mapped_len
+        };
+        let before = UserPtrMut::<u8>::from_usize(trampoline.start)
+            .to_owned_slice::<Platform>(trampoline.len())
+            .unwrap();
+        task.sys_munmap(
+            UserPtrMut::from_usize(reservation.end - PAGE_SIZE),
+            PAGE_SIZE,
+        )
+        .unwrap();
+        assert!(trampoline_reservation(&task, fd).is_none());
+        let after = UserPtrMut::<u8>::from_usize(trampoline.start)
+            .to_owned_slice::<Platform>(trampoline.len())
+            .unwrap();
+        assert_eq!(before.as_ref(), after.as_ref());
+        assert_eq!(
+            mapping_permissions(&task, UserPtrMut::from_usize(trampoline.start)),
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+        );
+        for (range, _) in task.global.mm.mappings() {
+            if range.start < reservation.end && reservation.start < range.end {
+                assert!(range.start >= trampoline.start && range.end <= trampoline.end);
+            }
+        }
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        task.sys_close(fd).unwrap();
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2983,7 +3613,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "aarch64")]
     fn subtract_ranges_yields_every_unowned_subrange() {
         use super::subtract_ranges;
         use core::ops::Range;
