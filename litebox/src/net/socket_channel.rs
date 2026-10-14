@@ -611,8 +611,11 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable
         }
 
         match self.inner.state() {
-            SocketState::Initial | SocketState::Closed => events |= Events::HUP | Events::OUT,
-            SocketState::Error => events |= Events::ERR | Events::OUT,
+            SocketState::Initial => events |= Events::HUP | Events::OUT,
+            // A closed or failed connection can neither receive nor send.
+            SocketState::Closed | SocketState::Error => {
+                events |= Events::IN | Events::OUT | Events::HUP | Events::RDHUP;
+            }
             SocketState::Connected if self.is_writable() => events |= Events::OUT,
             _ => {}
         }

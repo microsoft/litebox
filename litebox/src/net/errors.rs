@@ -57,6 +57,9 @@ pub enum ConnectError {
     TimedOut,
     #[error("Connection reset by peer")]
     ConnectionReset,
+    /// The connection attempt failed, but another operation has already reported its error.
+    #[error("Connection aborted")]
+    ConnectionAborted,
 }
 
 /// Possible errors from [`Network::get_local_addr`]

@@ -1039,7 +1039,8 @@ where
     /// The outcome of a TCP connection attempt is reported once, by the first call to observe it.
     /// This includes the loss of a connection that no call has yet reported as established. A
     /// reported failure discards what is left of the connection and leaves the socket unconnected,
-    /// so that another attempt can be started.
+    /// so that another attempt can be started. A failure whose error another operation has already
+    /// reported is reported as [`ConnectError::ConnectionAborted`].
     pub fn connect(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1089,18 +1090,20 @@ where
                     match result {
                         Ok(()) => tcp_specific.connect_state = ConnectState::Connected,
                         Err(ConnectError::InvalidState) => {
-                            // Report the failure recorded for the attempt, if any.
+                            // Report the failure recorded for the attempt, if any. A failure that
+                            // another operation has already reported leaves only an abort.
                             let recorded = socket_handle
                                 .proxy
                                 .as_ref()
-                                .and_then(|proxy| proxy.get_async_error(false));
+                                .map(|proxy| proxy.get_async_error(false));
                             result = match recorded {
-                                Some(errors::SocketAsyncError::ConnectionReset) => {
+                                Some(Some(errors::SocketAsyncError::ConnectionReset)) => {
                                     Err(ConnectError::ConnectionReset)
                                 }
-                                Some(errors::SocketAsyncError::TimedOut) => {
+                                Some(Some(errors::SocketAsyncError::TimedOut)) => {
                                     Err(ConnectError::TimedOut)
                                 }
+                                Some(None) => Err(ConnectError::ConnectionAborted),
                                 _ => Err(ConnectError::InvalidState),
                             };
                             // Reporting the failure leaves the socket unconnected.
@@ -1186,7 +1189,8 @@ where
                 Err(
                     ConnectError::InvalidState
                     | ConnectError::TimedOut
-                    | ConnectError::ConnectionReset,
+                    | ConnectError::ConnectionReset
+                    | ConnectError::ConnectionAborted,
                 ) => {
                     // The failure is reported here, so it is no longer pending, and the socket is
                     // unconnected again.
@@ -1526,9 +1530,9 @@ where
     ///
     /// Data received before the read side is shut down can still be read; data written before
     /// the write side is shut down is still sent, followed by a FIN for TCP. Shutting down the
-    /// read side of a listening socket stops listening (pending connections are reset), and
-    /// shutting down a TCP socket that is still connecting aborts the connection attempt,
-    /// reports `ConnectionReset`, and leaves the socket unconnected.
+    /// read side of a listening socket stops listening (pending connections are reset) and leaves
+    /// the socket unconnected, and shutting down a TCP socket that is still connecting aborts the
+    /// connection attempt, reports `ConnectionReset`, and leaves the socket unconnected.
     /// An unconnected socket is shut down too, even though `NotConnected` is returned.
     pub fn shutdown(
         &mut self,
@@ -1555,7 +1559,7 @@ where
                     }
                     server_socket.backlog = None;
                     proxy.set_readable(false);
-                    proxy.set_state(socket_channel::SocketState::Closed);
+                    proxy.set_state(socket_channel::SocketState::Initial);
                 }
             }
             ProtocolSpecific::Tcp(tcp_specific) => {

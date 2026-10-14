@@ -2169,6 +2169,25 @@ mod tests {
         optval
     }
 
+    /// Helper to poll a socket for input, output, and the peer's close without blocking.
+    fn poll_events(task: &TestTask, raw_fd: u32) -> litebox::event::Events {
+        use litebox::event::Events;
+        let mut pollfd = [litebox_common_linux::Pollfd {
+            fd: i32::try_from(raw_fd).unwrap(),
+            events: i16::try_from((Events::IN | Events::OUT | Events::RDHUP).bits()).unwrap(),
+            revents: 0,
+        }];
+        task.sys_ppoll(
+            UserPtrMut::from_usize(pollfd.as_mut_ptr() as usize),
+            1,
+            litebox_common_linux::TimeParam::None,
+            None,
+            0,
+        )
+        .unwrap();
+        Events::from_bits(u32::from(pollfd[0].revents.cast_unsigned())).unwrap()
+    }
+
     fn epoll_add(task: &TestTask, epfd: i32, target_fd: u32, events: litebox::event::Events) {
         let ev = litebox_common_linux::EpollEvent {
             events: events.bits(),
@@ -2551,6 +2570,45 @@ mod tests {
         .unwrap();
         assert_eq!(blocked.join().unwrap(), Err(Errno::ECONNRESET));
         assert_eq!(get_so_error(&task, &fd), 0);
+        close_socket(&task, raw_fd);
+
+        // A failed attempt can neither receive nor send, and once `SO_ERROR` has reported its
+        // error, `connect` reports only the abort and leaves the socket unconnected.
+        let closed = {
+            use litebox::event::Events;
+            Events::IN | Events::OUT | Events::HUP | Events::RDHUP
+        };
+        let raw_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let fd = typed_socket(&task, raw_fd);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::EINPROGRESS)
+        );
+        assert_eq!(
+            poll_events(&task, raw_fd),
+            closed | litebox::event::Events::ERR
+        );
+        assert_eq!(
+            i32::try_from(get_so_error(&task, &fd)).unwrap(),
+            i32::from(Errno::ECONNREFUSED)
+        );
+        assert_eq!(poll_events(&task, raw_fd), closed);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::ECONNABORTED)
+        );
+        assert_eq!(get_so_error(&task, &fd), 0);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::EINPROGRESS)
+        );
         close_socket(&task, raw_fd);
 
         // A refused attempt leaves the socket unconnected, so it can connect again.
@@ -3128,7 +3186,8 @@ mod tests {
         );
         close_socket(&task, raw_tcp);
 
-        // Like Linux, `SHUT_WR` leaves a listener alone while `SHUT_RD` stops listening.
+        // Like Linux, `SHUT_WR` leaves a listener alone while `SHUT_RD` stops listening and leaves
+        // the socket unconnected.
         let raw_listener = task
             .do_socket(
                 AddressFamily::INET,
@@ -3147,6 +3206,14 @@ mod tests {
         assert_eq!(accept(), Err(Errno::EAGAIN));
         shutdown(&task, raw_listener, SHUT_RD);
         assert_eq!(accept(), Err(Errno::EINVAL));
+        assert_eq!(
+            poll_events(&task, raw_listener),
+            litebox::event::Events::HUP | litebox::event::Events::OUT
+        );
+        assert_eq!(
+            task.do_recvfrom(&listener, &mut buf, ReceiveFlags::empty(), None),
+            Err(Errno::ENOTCONN)
+        );
         assert_eq!(
             task.sys_shutdown(listener_fd, SHUT_RD),
             Err(Errno::ENOTCONN)
