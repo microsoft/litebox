@@ -285,6 +285,14 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> 
             NetworkProxy::Raw => unimplemented!(),
         }
     }
+
+    /// Discard what is left of a failed connection; see [`StreamSocketChannel::disconnect`].
+    pub(super) fn disconnect(&self) {
+        match self {
+            NetworkProxy::Stream(channel) => channel.disconnect(),
+            NetworkProxy::Datagram(_) | NetworkProxy::Raw => unreachable!(),
+        }
+    }
 }
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for NetworkProxy<Platform> {
     fn register_observer(&self, observer: alloc::sync::Weak<dyn Observer<Events>>, mask: Events) {
@@ -546,6 +554,18 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> StreamSocketChannel<Pla
         if !was_shutdown {
             self.inner.pollee.notify_observers(self.check_io_events());
         }
+    }
+
+    /// Discard what is left of a failed connection: data not yet read or sent, and the shutdown
+    /// of either side, so that the socket can connect again.
+    pub(super) fn disconnect(&self) {
+        let n = self.inner.rx_cons.lock().clear();
+        self.inner.rx_available.fetch_sub(n, Ordering::Release);
+        let n = self.inner.tx_cons.lock().clear();
+        self.inner.tx_available.fetch_add(n, Ordering::Release);
+        self.inner.read_shutdown.store(false, Ordering::Release);
+        self.inner.write_shutdown.store(false, Ordering::Release);
+        self.inner.peer_closed.store(false, Ordering::Release);
     }
 }
 

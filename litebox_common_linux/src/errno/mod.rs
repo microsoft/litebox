@@ -408,6 +408,7 @@ impl From<litebox::net::errors::ConnectError> for Errno {
             litebox::net::errors::ConnectError::AlreadyConnected => Errno::EISCONN,
             litebox::net::errors::ConnectError::InvalidState => Errno::ECONNREFUSED,
             litebox::net::errors::ConnectError::TimedOut => Errno::ETIMEDOUT,
+            litebox::net::errors::ConnectError::ConnectionReset => Errno::ECONNRESET,
             _ => unimplemented!(),
         }
     }

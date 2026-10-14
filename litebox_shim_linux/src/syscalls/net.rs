@@ -678,9 +678,6 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
         fd: &SocketFd<Platform>,
         sockaddr: SocketAddr,
     ) -> Result<(), Errno> {
-        if sockaddr.port() == 0 || sockaddr.ip().is_unspecified() {
-            return Err(Errno::ECONNREFUSED);
-        }
         let mut check_progress = false;
         let mut already_in_progress = false;
         cx.wait_on_events::<_, Errno>(
@@ -2511,7 +2508,36 @@ mod tests {
             task.do_connect(&pending_fd, address([10, 0, 0, 1], port)),
             Err(Errno::EALREADY)
         );
+        assert_eq!(
+            task.do_connect(&pending_fd, address([10, 0, 0, 1], 0)),
+            Err(Errno::EALREADY)
+        );
         close_socket(&task, raw_pending_fd);
+
+        // A blocking call waits for the outcome of an earlier attempt.
+        let raw_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let fd = typed_socket(&task, raw_fd);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::EINPROGRESS)
+        );
+        task.sys_fcntl(
+            i32::try_from(raw_fd).unwrap(),
+            litebox_common_linux::FcntlArg::SETFL(litebox::fs::OFlags::empty()),
+        )
+        .unwrap();
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::ECONNREFUSED)
+        );
+        close_socket(&task, raw_fd);
 
         // A refused attempt leaves the socket unconnected, so it can connect again.
         let raw_fd = task
@@ -2519,12 +2545,21 @@ mod tests {
             .unwrap();
         let fd = typed_socket(&task, raw_fd);
         assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], 0)),
+            Err(Errno::ECONNREFUSED)
+        );
+        assert_eq!(get_so_error(&task, &fd), 0);
+        assert_eq!(
             task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
             Err(Errno::ECONNREFUSED)
         );
         task.do_connect(&fd, address([10, 0, 0, 1], port)).unwrap();
         assert_eq!(
             task.do_connect(&fd, address([10, 0, 0, 1], port)),
+            Err(Errno::EISCONN)
+        );
+        assert_eq!(
+            task.do_connect(&fd, address([0, 0, 0, 0], port)),
             Err(Errno::EISCONN)
         );
         server.join().unwrap();
@@ -2981,8 +3016,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, Errno::ETIMEDOUT);
 
-        let so_err = get_so_error(&task, &sockfd);
-        assert_eq!(so_err, i32::from(Errno::ETIMEDOUT).cast_unsigned());
+        // `connect` already reported the error, so it is no longer pending.
+        assert_eq!(get_so_error(&task, &sockfd), 0);
 
         close_socket(&task, raw_sockfd);
     }

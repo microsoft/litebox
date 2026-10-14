@@ -632,25 +632,29 @@ where
                         break;
                     }
                 }
+                let tcp_specific = socket_handle.specific.tcp();
                 // smoltcp reports `Finished` only once the peer's FIN has been received and all
-                // data before it has been moved to the channel.
-                let fin_received = matches!(tcp_socket.peek(0), Err(tcp::RecvError::Finished));
+                // data before it has been moved to the channel. An unconnected socket has no
+                // connection to report on, even if smoltcp still remembers a failed one.
+                let connected = tcp_specific.connect_state != ConnectState::Unconnected;
+                let fin_received =
+                    connected && matches!(tcp_socket.peek(0), Err(tcp::RecvError::Finished));
                 if fin_received {
                     proxy.shutdown_read();
                 }
 
-                let tcp_specific = socket_handle.specific.tcp();
                 // Record the peer's FIN as soon as it is seen, so that poll reports it at once.
                 // This also tells a reset from a graceful close below, since smoltcp does not say
                 // whether a closed connection received the FIN.
                 if fin_received
-                    || matches!(
-                        tcp_socket.state(),
-                        tcp::State::CloseWait
-                            | tcp::State::LastAck
-                            | tcp::State::Closing
-                            | tcp::State::TimeWait
-                    )
+                    || connected
+                        && matches!(
+                            tcp_socket.state(),
+                            tcp::State::CloseWait
+                                | tcp::State::LastAck
+                                | tcp::State::Closing
+                                | tcp::State::TimeWait
+                        )
                 {
                     proxy.set_peer_closed();
                 }
@@ -1031,7 +1035,9 @@ where
     /// true, this function checks the progress of an ongoing connection.
     ///
     /// The outcome of a TCP connection attempt is reported once, by the first call to observe it.
-    /// A reported failure leaves the socket unconnected, so that another attempt can be started.
+    /// This includes the loss of a connection that no call has yet reported as established. A
+    /// reported failure discards what is left of the connection and leaves the socket unconnected,
+    /// so that another attempt can be started.
     pub fn connect(
         &mut self,
         fd: &SocketFd<Platform>,
@@ -1078,12 +1084,26 @@ where
                     match result {
                         Ok(()) => tcp_specific.connect_state = ConnectState::Connected,
                         Err(ConnectError::InvalidState) => {
-                            if let ConnectState::Connecting { initiated_at } =
-                                tcp_specific.connect_state
-                                && now - initiated_at >= TCP_CONNECT_TIMEOUT
-                            {
-                                result = Err(ConnectError::TimedOut);
-                            }
+                            // Report the failure recorded by the network worker. If the worker
+                            // has not seen it yet, the time taken tells a timeout from a refusal.
+                            let recorded = socket_handle
+                                .proxy
+                                .as_ref()
+                                .and_then(|proxy| proxy.get_async_error(false));
+                            result = match (recorded, tcp_specific.connect_state) {
+                                (Some(errors::SocketAsyncError::ConnectionReset), _) => {
+                                    Err(ConnectError::ConnectionReset)
+                                }
+                                (Some(errors::SocketAsyncError::TimedOut), _) => {
+                                    Err(ConnectError::TimedOut)
+                                }
+                                (None, ConnectState::Connecting { initiated_at })
+                                    if now - initiated_at >= TCP_CONNECT_TIMEOUT =>
+                                {
+                                    Err(ConnectError::TimedOut)
+                                }
+                                _ => Err(ConnectError::InvalidState),
+                            };
                             // Reporting the failure leaves the socket unconnected.
                             tcp_specific.connect_state = ConnectState::Unconnected;
                         }
@@ -1139,7 +1159,7 @@ where
                 }
             }
             Protocol::Udp => {
-                if addr.port() == 0 {
+                if addr.port() == 0 || addr.ip().is_unspecified() {
                     return Err(ConnectError::Unaddressable);
                 }
                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
@@ -1164,13 +1184,15 @@ where
                 Err(ConnectError::InProgress) => {
                     proxy.set_state(socket_channel::SocketState::Connecting);
                 }
-                Err(ConnectError::Unaddressable) => {
-                    proxy.set_async_error(errors::SocketAsyncError::ConnectionRefused);
-                }
-                Err(ConnectError::InvalidState | ConnectError::TimedOut) => {
+                Err(
+                    ConnectError::InvalidState
+                    | ConnectError::TimedOut
+                    | ConnectError::ConnectionReset,
+                ) => {
                     // The failure is reported here, so it is no longer pending, and the socket is
                     // unconnected again.
                     let _ = proxy.get_async_error(true);
+                    proxy.disconnect();
                     proxy.set_state(socket_channel::SocketState::Initial);
                 }
                 Err(_) => {}
@@ -1554,7 +1576,12 @@ where
                         proxy.shutdown(how);
                         return Err(ShutdownError::NotConnected);
                     }
-                    _ => proxy.shutdown(how),
+                    _ => {
+                        // Shutting down a connection confirms that it was established, even if
+                        // `connect` has not reported it yet.
+                        tcp_specific.connect_state = ConnectState::Connected;
+                        proxy.shutdown(how);
+                    }
                 }
             }
             ProtocolSpecific::Udp(udp_specific) => {

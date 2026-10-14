@@ -55,6 +55,8 @@ pub enum ConnectError {
     InvalidState,
     #[error("Connection timed out")]
     TimedOut,
+    #[error("Connection reset by peer")]
+    ConnectionReset,
 }
 
 /// Possible errors from [`Network::get_local_addr`]
