@@ -1931,12 +1931,6 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
         assert!(queued.len() < 8, "listener accept queue did not fill");
     }
 
-    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-
     let half_closed_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let half_closed_port = half_closed_listener.local_addr().unwrap().port();
     let half_closed_server = std::thread::spawn(move || {
@@ -1952,6 +1946,13 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
             .map(|_| open_listener.accept().unwrap().0)
             .collect::<Vec<_>>()
     });
+
+    // Freed after the other listeners are bound, so none of them can reuse it.
+    let refused_port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
 
     let mut runner = Runner::new(&target, "broker_tcp_states_rewriter");
     let control_socket_path = unique_test_socket_path("runner-broker-tcp-states-control");
@@ -1972,7 +1973,7 @@ fn test_runner_broker_tcp_connection_states_with_rewriter() {
         .arg(open_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 12);
+    assert_eq!(broker.next_close_object_count(), 16);
     broker.join();
     reset_server.join().unwrap();
     half_closed_server.join().unwrap();

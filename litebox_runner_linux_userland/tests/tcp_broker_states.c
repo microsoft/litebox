@@ -134,6 +134,25 @@ int main(int argc, char **argv) {
     expect_send_error(fd, EPIPE);
     assert(close(fd) == 0);
 
+    // An aborted connect's reset is also reported once, by whichever of
+    // receive or send comes first.
+    fd = connect_to(&unresponsive, SOCK_NONBLOCK);
+    assert(shutdown(fd, SHUT_RDWR) == 0);
+    expect_receive_error(fd, ECONNRESET);
+    expect_receive_error(fd, ENOTCONN);
+    assert(poll_events(fd) == UNCONNECTED_EVENTS);
+    expect_send_error(fd, EPIPE);
+    assert(socket_error(fd) == 0);
+    assert(close(fd) == 0);
+
+    fd = connect_to(&unresponsive, SOCK_NONBLOCK);
+    assert(shutdown(fd, SHUT_RDWR) == 0);
+    expect_send_error(fd, ECONNRESET);
+    expect_send_error(fd, EPIPE);
+    expect_receive_error(fd, ENOTCONN);
+    assert(socket_error(fd) == 0);
+    assert(close(fd) == 0);
+
     // A connect that fails in the background leaves both directions closed.
     fd = connect_to(&refused, SOCK_NONBLOCK);
     wait_for(fd, POLLOUT);
@@ -145,6 +164,24 @@ int main(int argc, char **argv) {
     assert(shutdown(fd, SHUT_RDWR) == -1);
     assert(errno == ENOTCONN);
     assert(poll_events(fd) == CLOSED_EVENTS);
+    assert(close(fd) == 0);
+
+    // Its failure is reported once, by whichever of connect or SO_ERROR comes
+    // first, which leaves a later connect only an abort to report.
+    fd = connect_to(&refused, SOCK_NONBLOCK);
+    wait_for(fd, POLLOUT);
+    assert(connect(fd, (const struct sockaddr *)&refused, sizeof(refused)) == -1);
+    assert(errno == ECONNREFUSED);
+    assert(socket_error(fd) == 0);
+    assert(poll_events(fd) == UNCONNECTED_EVENTS);
+    assert(close(fd) == 0);
+
+    fd = connect_to(&refused, SOCK_NONBLOCK);
+    wait_for(fd, POLLOUT);
+    assert(socket_error(fd) == ECONNREFUSED);
+    assert(connect(fd, (const struct sockaddr *)&refused, sizeof(refused)) == -1);
+    assert(errno == ECONNABORTED);
+    assert(poll_events(fd) == UNCONNECTED_EVENTS);
     assert(close(fd) == 0);
 
     // A connect that reports its own failure leaves the socket unconnected.
