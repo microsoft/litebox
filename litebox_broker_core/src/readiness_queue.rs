@@ -137,7 +137,9 @@ pub(crate) struct ReadinessQueueObject {
 impl ReadinessQueueObject {
     /// Returns `READ` if any entry is queued.
     pub(crate) fn readiness(&self) -> ReadinessFlags {
-        if self.queue.state.lock().ready.is_empty() {
+        let mut state = self.queue.state.lock();
+        if state.ready.is_empty() {
+            state.found_empty = true;
             ReadinessFlags::default()
         } else {
             ReadinessFlags::READ
@@ -176,6 +178,10 @@ struct QueueState {
     entry_ids: HashMap<EntryKey, u64>,
     /// Queued entry IDs and the sequence numbers they were queued with.
     ready: VecDeque<(u64, u64)>,
+    /// Whether a caller found no entry queued since the queue last woke its
+    /// watchers, so it may be waiting while a take holds entries it will
+    /// queue again.
+    found_empty: bool,
     next_id: u64,
     next_sequence: u64,
 }
@@ -369,9 +375,21 @@ impl Queue {
                 state.queue(id, readiness);
             }
         }
-        // Level-triggered entries queued again by concurrent calls woke no
-        // waiters, so wake them if this call skipped any.
-        if events.is_empty() && !self.state.lock().ready.is_empty() {
+        // Entries queued again by a take woke no waiters, so like Linux, wake
+        // them if any remain queued and a caller found none meanwhile, or this
+        // call skipped some.
+        let wake = {
+            let mut state = self.state.lock();
+            if state.ready.is_empty() {
+                state.found_empty |= events.is_empty();
+                false
+            } else {
+                let wake = state.found_empty || events.is_empty();
+                state.found_empty &= !wake;
+                wake
+            }
+        };
+        if wake {
             self.watchers.lock().publish(ReadinessFlags::READ);
         }
         Ok(events)
@@ -421,7 +439,12 @@ impl Queue {
     /// Queues entry `id` if `readiness` includes its watched readiness,
     /// waking the queue's waiters if it did.
     fn entry_changed(&self, id: u64, readiness: ReadinessFlags) {
-        let queued = self.state.lock().queue(id, readiness);
+        let queued = {
+            let mut state = self.state.lock();
+            let queued = state.queue(id, readiness);
+            state.found_empty &= !queued;
+            queued
+        };
         if queued {
             self.watchers.lock().publish(ReadinessFlags::READ);
         }

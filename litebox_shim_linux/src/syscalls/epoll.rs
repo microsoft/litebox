@@ -12,7 +12,9 @@ use litebox::{
         Events, IOPollable,
         observer::Observer,
         polling::TryOpError,
-        readiness_queue::{ReadinessInterest, ReadinessQueue, ReadinessTarget},
+        readiness_queue::{
+            ReadinessInterest, ReadinessQueue, ReadinessQueueError, ReadinessTarget,
+        },
         wait::{WaitContext, WaitError, Waker},
     },
     fd::{FdEnabledSubsystem, FdEnabledSubsystemEntry, TypedFd},
@@ -180,7 +182,11 @@ pub(crate) struct EpollFile<Platform: ShimPlatform> {
 
 impl<Platform: ShimPlatform> EpollFile<Platform> {
     pub(crate) fn new(global: &GlobalState<Platform>) -> Result<Self, Errno> {
-        let queue = ReadinessQueue::new(&global.litebox)?;
+        // Exhaustion means ENOSPC only for epoll_ctl's watch limit.
+        let queue = ReadinessQueue::new(&global.litebox).map_err(|error| match error {
+            ReadinessQueueError::ResourceExhausted => Errno::ENOMEM,
+            error => error.into(),
+        })?;
         Ok(Self {
             queue: Arc::new(queue),
         })

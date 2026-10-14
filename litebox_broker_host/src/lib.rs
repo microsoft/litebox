@@ -1708,18 +1708,18 @@ fn handle_readiness_queue_request<Memory: SharedMemory>(
             if length == 0 || length % READY_EVENT_SIZE != 0 {
                 return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
             }
-            // Validate the buffer before taking events, which a failed write
-            // would lose.
+            // Validate and allocate before taking events, which a later
+            // failure would lose.
             validate_shared_buffer(request.buffer, MAX_LENGTH)?;
+            let mut encoded = Vec::new();
+            encoded
+                .try_reserve_exact(length as usize)
+                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
             let events = readiness_queue::take_ready(
                 process,
                 request.queue,
                 (length / READY_EVENT_SIZE) as usize,
             )?;
-            let mut encoded = Vec::new();
-            encoded
-                .try_reserve_exact(events.len() * READY_EVENT_SIZE as usize)
-                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
             for event in &events {
                 encoded.extend_from_slice(&event.encode());
             }
