@@ -8,9 +8,10 @@
 //!   `rootfs.tar`).
 //! - `envp`: `KEY=VALUE` strings (default none).
 //! - `stdin`: the run's standard input, after which it ends (default: none,
-//!   as `/dev/null`). The console's own input is not read: a device cannot
-//!   tell where input ends, so a program reading to the end would never
-//!   finish, and its timing is the host's.
+//!   as `/dev/null`).
+//! - `console_stdin`: default false; if true (without `stdin`), the run's
+//!   standard input is the console's: what the host sends, when it sends it.
+//!   It never ends, as a device cannot tell where input ends.
 //! - `expect_exit_code` (default 0), or `expect_signal` for a signal death.
 //! - `expect_stdout`, `expect_stderr`: the exact output, if given; output
 //!   beyond what is recorded fails the check.
@@ -39,6 +40,8 @@ struct Run {
     envp: Vec<String>,
     #[serde(default)]
     stdin: String,
+    #[serde(default)]
+    console_stdin: bool,
     expect_exit_code: Option<u32>,
     expect_signal: Option<u32>,
     expect_stdout: Option<String>,
@@ -58,12 +61,20 @@ struct Recorded {
     truncated: bool,
 }
 
-/// The runs' [`Console`]: serves each run's standard input, then its end, and
-/// records what each output stream wrote to `device`.
+/// A run's standard input.
+enum Input {
+    /// What is left of it, then its end.
+    Given(VecDeque<u8>),
+    /// The device's.
+    Console,
+}
+
+/// The runs' [`Console`]: serves each run's standard input, and records what
+/// each output stream wrote to `device`.
 pub struct Stdio {
     device: &'static dyn Console,
-    /// What is left of the current run's standard input.
-    input: Mutex<VecDeque<u8>>,
+    /// The current run's.
+    input: Mutex<Input>,
     /// Standard output, then standard error.
     recorded: Mutex<[Recorded; 2]>,
 }
@@ -72,7 +83,7 @@ impl Stdio {
     pub fn new(device: &'static dyn Console) -> Self {
         Self {
             device,
-            input: Mutex::new(VecDeque::new()),
+            input: Mutex::new(Input::Given(VecDeque::new())),
             recorded: Mutex::new(Default::default()),
         }
     }
@@ -84,9 +95,12 @@ impl Stdio {
 }
 
 impl Console for Stdio {
-    /// The rest of the run's input; at its end, the end of input.
     fn read(&self, output: &mut [u8]) -> Option<usize> {
         let mut input = self.input.lock();
+        let input = match &mut *input {
+            Input::Given(input) => input,
+            Input::Console => return self.device.read(output),
+        };
         if input.is_empty() {
             return None;
         }
@@ -97,9 +111,12 @@ impl Console for Stdio {
         Some(len)
     }
 
-    /// Input, or its end: never a wait.
+    /// Given input, or its end, never waits.
     fn has_input(&self) -> bool {
-        true
+        match *self.input.lock() {
+            Input::Given(_) => true,
+            Input::Console => self.device.has_input(),
+        }
     }
 
     /// Records what the device took.
@@ -142,8 +159,16 @@ pub fn run(json: &[u8], service: &mut Programs, stdio: &Stdio) {
                 panic!("run {index}: `expect_exit_code` and `expect_signal` exclude each other")
             }
         };
+        assert!(
+            !run.console_stdin || run.stdin.is_empty(),
+            "run {index}: `stdin` and `console_stdin` exclude each other"
+        );
         stdio.take();
-        *stdio.input.lock() = run.stdin.into_bytes().into();
+        *stdio.input.lock() = if run.console_stdin {
+            Input::Console
+        } else {
+            Input::Given(run.stdin.into_bytes().into())
+        };
         let reply = service.call(Program {
             path: path.clone(),
             argv: strings(run.argv),

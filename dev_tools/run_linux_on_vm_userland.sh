@@ -18,7 +18,10 @@
 # misses (reflect.c).
 #
 # Runner processes' standard output and error go to a virtio console, backed
-# by a file; each run's standard input is its `stdin` in programs.json.
+# by a file; each run's standard input is its `stdin` in programs.json, or,
+# with `console_stdin`, the console's. A test's <test>.input.txt, if any, is
+# the console's input: sent once the console shows a line `ready`, so it
+# arrives while the program runs.
 #
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
@@ -87,12 +90,25 @@ for src in "$TESTS_DIR"/*.c; do
 done
 (cd "$WORK/rootfs" && tar --format=ustar --owner=0 --group=0 -cf "$WORK/rootfs.tar" -- *)
 
-# The virtio console's file for test $1.
+# The virtio console's files for test $1: its output, and the FIFO of its
+# input if it has any (see `feed_input`).
 console_args() {
-    : >"$WORK/$1.stdout"
+    local input=
+    [[ ! -f "$TESTS_DIR/$1.input.txt" ]] || input=",input-path=$WORK/$1.stdin"
     echo -device virtio-serial-pci,id=vs0,disable-legacy=on \
-        -chardev "file,id=con0,path=$WORK/$1.stdout" \
+        -chardev "file,id=con0,path=$WORK/$1.stdout$input" \
         -device virtconsole,chardev=con0,bus=vs0.0
+}
+
+# Sends test $1's input to the console FIFO open as fd $2 once the console
+# shows a line `ready`. Run in the background, this script ends it after the
+# test; it also ends if this script does without (e.g., killed).
+feed_input() {
+    until grep -sqx ready "$WORK/$1.stdout"; do
+        kill -0 $$ 2>/dev/null || return 0
+        sleep 0.1
+    done
+    cat "$TESTS_DIR/$1.input.txt" >&"$2"
 }
 
 # The kernel checks the output; this only shows it.
@@ -113,8 +129,23 @@ for t in "${tests[@]}"; do
     cp "$TESTS_DIR/$t.json" "$WORK/$t/programs.json"
     tar --format=ustar -cf "$WORK/$t.tar" -C "$WORK/$t" runner.elf rootfs.tar programs.json
     failed_before=$fail
+    : >"$WORK/$t.stdout"
+    feeder=
+    if [[ -f "$TESTS_DIR/$t.input.txt" ]]; then
+        mkfifo "$WORK/$t.stdin"
+        # Open for reading too, so that neither QEMU nor this blocks opening
+        # it, and QEMU never sees the input end.
+        exec {input_fd}<>"$WORK/$t.stdin"
+        feed_input "$t" "$input_fd" &
+        feeder=$!
+    fi
     # shellcheck disable=SC2046 # console_args prints separate arguments
     run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t")
+    if [[ -n $feeder ]]; then
+        kill "$feeder" 2>/dev/null || true
+        wait "$feeder" 2>/dev/null || true
+        exec {input_fd}>&-
+    fi
     if [[ $fail -ne $failed_before ]]; then
         echo "      console:"
         sed 's/^/      > /' "$WORK/$t.stdout" | tail -20

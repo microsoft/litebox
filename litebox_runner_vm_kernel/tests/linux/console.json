@@ -1,0 +1,7 @@
+[
+  {
+    "argv": ["/console"],
+    "console_stdin": true,
+    "expect_stdout": "ready\nhello from the host\nand a second line\n"
+  }
+]
