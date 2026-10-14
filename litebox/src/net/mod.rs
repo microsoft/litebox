@@ -1580,6 +1580,8 @@ where
                         proxy.shutdown(how);
                         return Err(ShutdownError::NotConnected);
                     }
+                    // The handshake of a simultaneous open has not completed yet.
+                    tcp::State::SynReceived => proxy.shutdown(how),
                     _ => {
                         // Shutting down a connection confirms that it was established, even if
                         // `connect` has not reported it yet.
