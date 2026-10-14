@@ -682,6 +682,7 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
             return Err(Errno::ECONNREFUSED);
         }
         let mut check_progress = false;
+        let mut already_in_progress = false;
         cx.wait_on_events::<_, Errno>(
             self.get_status(fd).contains(OFlags::NONBLOCK),
             Events::IN | Events::OUT,
@@ -696,10 +697,17 @@ impl<Platform: ShimPlatform> GlobalState<Platform> {
                     check_progress = true;
                     Err(TryOpError::TryAgain)
                 }
+                // A blocking call waits for an earlier attempt just as for its own.
+                Err(litebox::net::errors::ConnectError::AlreadyInProgress) => {
+                    check_progress = true;
+                    already_in_progress = true;
+                    Err(TryOpError::TryAgain)
+                }
                 Err(e) => Err(TryOpError::Other(e.into())),
             },
         )
         .map_err(|err| match err {
+            TryOpError::TryAgain if already_in_progress => Errno::EALREADY,
             TryOpError::TryAgain => Errno::EINPROGRESS,
             err => err.into(),
         })
@@ -2468,11 +2476,59 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, litebox_common_linux::errno::Errno::ECONNREFUSED);
 
-        let so_err = get_so_error(&task, &socket_fd2);
-        assert_eq!(so_err, i32::from(Errno::ECONNREFUSED).cast_unsigned());
-
-        // Second read should be cleared (self-clearing semantics)
+        // `connect` already reported the error, so it is no longer pending.
         assert_eq!(get_so_error(&task, &socket_fd2), 0);
+    }
+
+    #[test]
+    fn test_tun_tcp_connect_states() {
+        let task = init_platform(Some(TUN_DEVICE_NAME));
+        let address = |ip: [u8; 4], port: u16| {
+            SocketAddress::Inet(SocketAddr::V4(core::net::SocketAddrV4::new(
+                core::net::Ipv4Addr::from(ip),
+                port,
+            )))
+        };
+        let listener = std::net::TcpListener::bind("10.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || listener.accept().unwrap());
+
+        // Nothing answers 10.0.0.3, so the attempt stays in progress.
+        let raw_pending_fd = task
+            .do_socket(
+                AddressFamily::INET,
+                SockType::Stream,
+                SockFlags::NONBLOCK,
+                0,
+            )
+            .unwrap();
+        let pending_fd = typed_socket(&task, raw_pending_fd);
+        assert_eq!(
+            task.do_connect(&pending_fd, address([10, 0, 0, 3], port)),
+            Err(Errno::EINPROGRESS)
+        );
+        assert_eq!(
+            task.do_connect(&pending_fd, address([10, 0, 0, 1], port)),
+            Err(Errno::EALREADY)
+        );
+        close_socket(&task, raw_pending_fd);
+
+        // A refused attempt leaves the socket unconnected, so it can connect again.
+        let raw_fd = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        let fd = typed_socket(&task, raw_fd);
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT)),
+            Err(Errno::ECONNREFUSED)
+        );
+        task.do_connect(&fd, address([10, 0, 0, 1], port)).unwrap();
+        assert_eq!(
+            task.do_connect(&fd, address([10, 0, 0, 1], port)),
+            Err(Errno::EISCONN)
+        );
+        server.join().unwrap();
+        close_socket(&task, raw_fd);
     }
 
     #[test]

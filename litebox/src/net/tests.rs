@@ -482,3 +482,134 @@ fn test_tcp_shutdown_while_connecting() {
 
     network.close(&client_fd, CloseBehavior::Immediate).unwrap();
 }
+
+#[test]
+fn test_tcp_connect_reports_connection_state() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let (client_fd, _client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+
+    // Another call while the attempt is in progress does not start a new one.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyInProgress));
+
+    // The first call after the attempt succeeds reports the success; later calls report that the
+    // socket is already connected.
+    pump(&mut network);
+    network.connect(&client_fd, &addr, false).unwrap();
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyConnected));
+
+    // So do accepted and listening sockets.
+    let server_fd = network.accept(&listener, None).unwrap();
+    let err = network.connect(&server_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyConnected));
+    let err = network.connect(&listener, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::AlreadyConnected));
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_reconnect_after_refused_connect() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let (client_fd, client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let assert_unconnected = || {
+        assert!(client.get_async_error(false).is_none());
+        assert!(matches!(read(&client), Err(ChannelReadError::NotConnected)));
+        let events = client.check_io_events();
+        assert!(events.contains(Events::OUT | Events::HUP));
+        assert!(!events.contains(Events::ERR));
+    };
+
+    // A refusal reported while checking progress leaves the socket unconnected, with the error no
+    // longer pending.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    let local_addr = network.get_local_addr(&client_fd).unwrap();
+    pump(&mut network);
+    let err = network.connect(&client_fd, &addr, true).unwrap_err();
+    assert!(matches!(err, ConnectError::InvalidState));
+    assert_unconnected();
+
+    // So does a refusal reported by the next call, after it is pending.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    pump(&mut network);
+    assert!(client.check_io_events().contains(Events::ERR));
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InvalidState));
+    assert_unconnected();
+
+    // Another attempt then connects from the same local port.
+    let listener = listening_socket(&mut network);
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    assert_eq!(network.get_local_addr(&client_fd).unwrap(), local_addr);
+    pump(&mut network);
+    network.connect(&client_fd, &addr, true).unwrap();
+    let server_fd = network.accept(&listener, None).unwrap();
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_reconnect_after_aborted_connect() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let (client_fd, client) = stream_socket(&mut network);
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    network.shutdown(&client_fd, Shutdown::Both).unwrap();
+    assert!(client.get_async_error(false).is_some());
+
+    // The new attempt discards the error of the aborted one.
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    assert!(client.get_async_error(false).is_none());
+    pump(&mut network);
+    network.connect(&client_fd, &addr, true).unwrap();
+    let server_fd = network.accept(&listener, None).unwrap();
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
+
+#[test]
+fn test_tcp_connect_from_bound_port() {
+    let litebox = LiteBox::new(MockPlatform::new());
+    let mut network = Network::new(&litebox);
+    network.set_platform_interaction(PlatformInteraction::Manual);
+    let listener = listening_socket(&mut network);
+    let (client_fd, _client) = stream_socket(&mut network);
+    let local_addr = SocketAddr::V4(SocketAddrV4::from_str("0.0.0.0:5555").unwrap());
+    network.bind(&client_fd, &local_addr).unwrap();
+    let addr = SocketAddr::V4(SocketAddrV4::from_str("10.0.0.2:8080").unwrap());
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::InProgress));
+    pump(&mut network);
+    network.connect(&client_fd, &addr, true).unwrap();
+    let mut peer = local_addr;
+    let server_fd = network.accept(&listener, Some(&mut peer)).unwrap();
+    assert_eq!(peer.port(), 5555);
+
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    network.close(&listener, CloseBehavior::Immediate).unwrap();
+}
