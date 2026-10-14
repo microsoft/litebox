@@ -2178,19 +2178,19 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         |fd| linux_status_flags(self.global.pipes.get_status_flags(fd)?),
                         |fd| {
                             self.global
-                                .with_eventfd(fd, super::eventfd::EventFile::get_status)
+                                .with_eventfd(fd, super::eventfd::EventFile::get_status_flags)
                         },
                         |fd| {
                             self.global
-                                .with_epoll(fd, super::epoll::EpollFile::get_status)
+                                .with_epoll(fd, super::epoll::EpollFile::get_status_flags)
                         },
                         |fd| {
                             self.global
-                                .with_unix_socket(fd, super::unix::UnixSocket::get_status)
+                                .with_unix_socket(fd, super::unix::UnixSocket::get_status_flags)
                         },
                         |fd| {
                             self.global
-                                .with_timerfd(fd, super::timerfd::TimerFile::get_status)
+                                .with_timerfd(fd, super::timerfd::TimerFile::get_status_flags)
                         },
                     )?
                     .bits())

@@ -55,7 +55,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> EventFile<Platform> {
     }
 
     /// Returns the `F_GETFL` flags of the eventfd.
-    pub(crate) fn get_status(&self) -> Result<OFlags, Errno> {
+    pub(crate) fn get_status_flags(&self) -> Result<OFlags, Errno> {
         linux_status_flags(self.counter.get_status_flags()?)
     }
 

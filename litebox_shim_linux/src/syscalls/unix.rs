@@ -405,7 +405,7 @@ impl<Platform: ShimPlatform> UnixSocket<Platform> {
     }
 
     /// Returns the `F_GETFL` flags of the socket, which every descriptor sharing it sees.
-    pub(super) fn get_status(&self) -> Result<OFlags, Errno> {
+    pub(super) fn get_status_flags(&self) -> Result<OFlags, Errno> {
         linux_status_flags(self.socket.get_status_flags()?)
     }
 

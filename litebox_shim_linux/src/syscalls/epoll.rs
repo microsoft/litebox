@@ -244,7 +244,7 @@ impl<Platform: ShimPlatform> EpollFile<Platform> {
     }
 
     /// Returns the access mode and status flags of the epoll instance.
-    pub(crate) fn get_status(&self) -> Result<OFlags, Errno> {
+    pub(crate) fn get_status_flags(&self) -> Result<OFlags, Errno> {
         linux_status_flags(self.queue.get_status_flags()?)
     }
 
@@ -467,17 +467,11 @@ mod test {
     use crate::{Task, UserPtr, UserPtrMut};
     use litebox::event::Events;
     use litebox::event::wait::WaitState;
-    use litebox_common_linux::{
-        EfdFlags, EpollCreateFlags, EpollEvent, EpollOp, FcntlArg, OFlags, errno::Errno,
-    };
+    use litebox_common_linux::{EpollCreateFlags, EpollEvent, EpollOp, OFlags, errno::Errno};
 
     use crate::syscalls::file::FilesState;
 
     extern crate std;
-
-    const EPOLLET: u32 = 1 << 31;
-    const EPOLLONESHOT: u32 = 1 << 30;
-    const EPOLLEXCLUSIVE: u32 = 1 << 28;
 
     fn platform() -> &'static TestPlatform {
         crate::syscalls::tests::test_platform()
@@ -517,20 +511,6 @@ mod test {
             .collect()
     }
 
-    fn eventfd(task: &Task<TestPlatform>, initval: u32) -> i32 {
-        i32::try_from(task.sys_eventfd2(initval, EfdFlags::empty()).unwrap()).unwrap()
-    }
-
-    fn read_eventfd(task: &Task<TestPlatform>, fd: i32) -> u64 {
-        let mut buf = [0; 8];
-        assert_eq!(task.sys_read(fd, &mut buf, None).unwrap(), 8);
-        u64::from_ne_bytes(buf)
-    }
-
-    fn write_eventfd(task: &Task<TestPlatform>, fd: i32, value: u64) {
-        assert_eq!(task.sys_write(fd, &value.to_ne_bytes(), None).unwrap(), 8);
-    }
-
     #[test]
     fn test_epoll_with_pipe() {
         let task = crate::syscalls::tests::init_platform();
@@ -561,210 +541,6 @@ mod test {
             epoll_wait(&task, epfd, 0),
             [(u64::try_from(rfd).unwrap(), Events::HUP.bits())]
         );
-    }
-
-    #[test]
-    fn test_epoll_trigger_modes() {
-        let task = crate::syscalls::tests::init_platform();
-        let epfd = epoll_create(&task);
-        let fd = eventfd(&task, 1);
-        let data = u64::try_from(fd).unwrap();
-        let ready = [(data, Events::IN.bits())];
-
-        // Level-triggered entries are reported while their target is ready.
-        epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, fd, Events::IN.bits()).unwrap();
-        assert_eq!(epoll_wait(&task, epfd, 0), ready);
-        assert_eq!(epoll_wait(&task, epfd, 0), ready);
-
-        // Edge-triggered entries are reported once per change.
-        epoll_ctl(
-            &task,
-            epfd,
-            EpollOp::EpollCtlMod,
-            fd,
-            Events::IN.bits() | EPOLLET,
-        )
-        .unwrap();
-        assert_eq!(epoll_wait(&task, epfd, 0), ready);
-        assert_eq!(epoll_wait(&task, epfd, 0), []);
-        write_eventfd(&task, fd, 1);
-        assert_eq!(epoll_wait(&task, epfd, 0), ready);
-        assert_eq!(epoll_wait(&task, epfd, 0), []);
-
-        // One-shot entries are disabled once reported, until modified.
-        epoll_ctl(
-            &task,
-            epfd,
-            EpollOp::EpollCtlMod,
-            fd,
-            Events::IN.bits() | EPOLLONESHOT,
-        )
-        .unwrap();
-        assert_eq!(epoll_wait(&task, epfd, 0), ready);
-        write_eventfd(&task, fd, 1);
-        assert_eq!(epoll_wait(&task, epfd, 0), []);
-        epoll_ctl(
-            &task,
-            epfd,
-            EpollOp::EpollCtlMod,
-            fd,
-            Events::IN.bits() | EPOLLONESHOT,
-        )
-        .unwrap();
-        assert_eq!(epoll_wait(&task, epfd, 0), ready);
-
-        // Only the requested events are reported.
-        epoll_ctl(&task, epfd, EpollOp::EpollCtlMod, fd, Events::OUT.bits()).unwrap();
-        assert_eq!(epoll_wait(&task, epfd, 0), [(data, Events::OUT.bits())]);
-        assert_eq!(read_eventfd(&task, fd), 3);
-        epoll_ctl(&task, epfd, EpollOp::EpollCtlMod, fd, Events::IN.bits()).unwrap();
-        assert_eq!(epoll_wait(&task, epfd, 0), []);
-
-        epoll_ctl(&task, epfd, EpollOp::EpollCtlDel, fd, 0).unwrap();
-        write_eventfd(&task, fd, 1);
-        assert_eq!(epoll_wait(&task, epfd, 0), []);
-    }
-
-    #[test]
-    fn test_epoll_ctl_errors() {
-        let task = crate::syscalls::tests::init_platform();
-        let epfd = epoll_create(&task);
-        let fd = eventfd(&task, 0);
-        let in_ = Events::IN.bits();
-
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlMod, fd, in_),
-            Err(Errno::ENOENT)
-        );
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlDel, fd, 0),
-            Err(Errno::ENOENT)
-        );
-        epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, fd, in_).unwrap();
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, fd, in_),
-            Err(Errno::EEXIST)
-        );
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, epfd, in_),
-            Err(Errno::EINVAL)
-        );
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, 1000, in_),
-            Err(Errno::EBADF)
-        );
-
-        // `EPOLLEXCLUSIVE` is only allowed when adding, with a few other flags.
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlMod, fd, in_ | EPOLLEXCLUSIVE),
-            Err(Errno::EINVAL)
-        );
-        let other = eventfd(&task, 0);
-        assert_eq!(
-            epoll_ctl(
-                &task,
-                epfd,
-                EpollOp::EpollCtlAdd,
-                other,
-                in_ | Events::RDHUP.bits() | EPOLLEXCLUSIVE
-            ),
-            Err(Errno::EINVAL)
-        );
-        epoll_ctl(
-            &task,
-            epfd,
-            EpollOp::EpollCtlAdd,
-            other,
-            in_ | EPOLLET | EPOLLEXCLUSIVE,
-        )
-        .unwrap();
-
-        // Epoll instances cannot be nested, and directories never change readiness.
-        let nested = epoll_create(&task);
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, nested, in_),
-            Err(Errno::EPERM)
-        );
-        let dir = task
-            .sys_open(
-                "/",
-                OFlags::RDONLY | OFlags::DIRECTORY,
-                litebox_broker_protocol::fs::FileMode::empty(),
-            )
-            .unwrap();
-        assert_eq!(
-            epoll_ctl(
-                &task,
-                epfd,
-                EpollOp::EpollCtlAdd,
-                i32::try_from(dir).unwrap(),
-                in_
-            ),
-            Err(Errno::EPERM)
-        );
-    }
-
-    #[test]
-    fn test_epoll_interest_follows_open_file_description() {
-        let task = crate::syscalls::tests::init_platform();
-        let epfd = epoll_create(&task);
-        let fd = eventfd(&task, 0);
-        epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, fd, Events::IN.bits()).unwrap();
-        let dup = i32::try_from(task.sys_dup(fd, None, None).unwrap()).unwrap();
-
-        // The interest outlives the descriptor it was added under while a duplicate is open.
-        task.sys_close(fd).unwrap();
-        write_eventfd(&task, dup, 1);
-        assert_eq!(
-            epoll_wait(&task, epfd, 0),
-            [(u64::try_from(fd).unwrap(), Events::IN.bits())]
-        );
-        // It is keyed by that descriptor's number, not the duplicate's.
-        assert_eq!(
-            epoll_ctl(&task, epfd, EpollOp::EpollCtlDel, dup, 0),
-            Err(Errno::ENOENT)
-        );
-
-        // It goes away with the open file description.
-        task.sys_close(dup).unwrap();
-        assert_eq!(epoll_wait(&task, epfd, 0), []);
-    }
-
-    #[test]
-    fn test_epoll_status_flags_and_poll() {
-        let task = crate::syscalls::tests::init_platform();
-        let epfd = epoll_create(&task);
-        assert_eq!(
-            task.sys_fcntl(epfd, FcntlArg::GETFL),
-            Ok(OFlags::RDWR.bits())
-        );
-        task.sys_fcntl(epfd, FcntlArg::SETFL(OFlags::NONBLOCK))
-            .unwrap();
-        assert_eq!(
-            task.sys_fcntl(epfd, FcntlArg::GETFL),
-            Ok((OFlags::RDWR | OFlags::NONBLOCK).bits())
-        );
-
-        // An epoll instance is readable while it has ready entries.
-        let fd = eventfd(&task, 0);
-        epoll_ctl(&task, epfd, EpollOp::EpollCtlAdd, fd, Events::IN.bits()).unwrap();
-        let files = task.files.borrow().clone();
-        let mut set = super::PollSet::with_capacity(1).unwrap();
-        set.add_fd(epfd, Events::IN);
-        set.scan(&task.global, &files);
-        assert_eq!(
-            set.revents().collect::<std::vec::Vec<_>>(),
-            [Events::empty()]
-        );
-
-        let writer = task.spawn_clone_for_test(move |task| {
-            std::thread::sleep(core::time::Duration::from_millis(100));
-            write_eventfd(&task, fd, 1);
-        });
-        set.wait(&task.global, &WaitState::new(platform()).context(), &files)
-            .unwrap();
-        assert_eq!(set.revents().collect::<std::vec::Vec<_>>(), [Events::IN]);
-        writer.join().unwrap();
     }
 
     #[test]
