@@ -75,10 +75,9 @@ pub struct ProcessConfig<'a> {
 /// The kernel's one-shot hardware timer, which processes' [`CallId::SetTimer`]
 /// deadlines share, one at a time: the runner owns it (e.g., a local APIC's).
 pub trait ProcessTimer: Sync {
-    /// Arms, or with `None` disarms, a one-shot interrupt at `deadline` on
-    /// [`litebox_platform_vm_kernel::TIMER_VECTOR`], which a process running
-    /// then sees as [`UpcallKind::Interrupt`]. Arming replaces an earlier
-    /// deadline.
+    /// Arms, or with `None` disarms, a one-shot interrupt at `deadline`,
+    /// which a process running then sees as [`UpcallKind::Interrupt`].
+    /// Arming replaces an earlier deadline.
     fn arm(&self, deadline: Option<Instant>);
 }
 
@@ -869,13 +868,14 @@ fn timer_deadline(
     }
 }
 
-/// What [`Inner::interrupt`] does with a timer fire.
+/// What [`Inner::interrupt`] does, given the deadline it would deliver at.
 #[derive(Debug, PartialEq, Eq)]
-enum TimerFire {
-    /// No deadline is armed: spurious, or left over.
+enum InterruptAction {
+    /// No deadline is armed: another interrupt (e.g., a device's, with
+    /// nothing published), or a spurious or left-over timer fire.
     Ignore,
-    /// Fired before the deadline (e.g., a one-shot count capped short of
-    /// it): arm it again.
+    /// Before the deadline: another interrupt, or the timer fired early
+    /// (e.g., a one-shot count capped short of it). Arm it again.
     Rearm,
     /// Due, but the runner is still taking an earlier upcall, which a nested
     /// one would overwrite: fire again then. The deadline stays (past), so a
@@ -886,7 +886,7 @@ enum TimerFire {
     Deliver,
 }
 
-impl TimerFire {
+impl InterruptAction {
     /// Ample for the runner to leave the upcall stack, without spinning on
     /// retries.
     const UPCALL_STACK_RETRY: Duration = Duration::from_micros(100);
@@ -998,40 +998,45 @@ impl EnterShim for Inner {
         self.deliver_exception(ctx, info)
     }
 
-    /// [`TIMER_VECTOR`](litebox_platform_vm_kernel::TIMER_VECTOR) fired
-    /// while the process ran. Delivers [`UpcallKind::Interrupt`] (quietly
+    /// An interrupt (e.g., the timer's, or a device's) stopped the process.
+    /// First has the broker look at the devices and fire its due timers, as
+    /// a kernel call would. Then delivers [`UpcallKind::Interrupt`] (quietly
     /// ignored before [`CallId::Ready`], like any upcall with no entry
-    /// registered yet) once the armed deadline, or a broker timer's (fired
-    /// first, so the runner sees its readiness), has passed. Otherwise resumes:
-    /// - with no deadline armed, the fire is spurious, or left over;
-    /// - before the deadline, the timer fired early (e.g., a one-shot count
-    ///   capped short of it), so this re-arms it;
+    /// registered yet) if that published a notification, or once the armed
+    /// deadline has passed. Otherwise resumes:
+    /// - with no deadline armed, there is nothing to deliver;
+    /// - before the deadline, this re-arms it (e.g., the timer fired early,
+    ///   as a one-shot count capped short of it);
     /// - on the upcall stack, the runner is still taking an earlier upcall
     ///   (which a nested one would overwrite), so this retries shortly.
     fn interrupt(&self, ctx: &mut PtRegs) -> ContinueOperation {
         let on_upcall_stack = layout::UPCALL_STACK.contains(ctx.rsp as u64);
+        self.broker.poll_events();
+        if self.broker.take_published() {
+            self.notified.set(true);
+        }
         let now = self.platform.now();
         let deadline = timer_deadline(
             self.notified.get(),
             self.armed_deadline.get(),
             self.broker.next_timer_deadline(),
         );
-        match TimerFire::decide(deadline, now, on_upcall_stack) {
-            TimerFire::Ignore => ContinueOperation::Resume,
-            TimerFire::Rearm => {
+        match InterruptAction::decide(deadline, now, on_upcall_stack) {
+            InterruptAction::Ignore => ContinueOperation::Resume,
+            InterruptAction::Rearm => {
                 self.rearm_timer();
                 ContinueOperation::Resume
             }
-            TimerFire::Retry(at) => {
+            InterruptAction::Retry(at) => {
                 self.timer.arm(Some(at));
                 ContinueOperation::Resume
             }
             // Kept until there is an upcall entry to deliver it to.
-            TimerFire::Deliver if self.upcall_entry().is_none() => {
+            InterruptAction::Deliver if self.upcall_entry().is_none() => {
                 self.timer.arm(None);
                 ContinueOperation::Resume
             }
-            TimerFire::Deliver => {
+            InterruptAction::Deliver => {
                 if self
                     .armed_deadline
                     .get()
@@ -1039,9 +1044,7 @@ impl EnterShim for Inner {
                 {
                     self.armed_deadline.set(None);
                 }
-                self.broker.fire_timers();
                 // The upcall is for everything published so far.
-                self.broker.take_published();
                 self.notified.set(false);
                 self.upcall(ctx, UpcallKind::Interrupt, 0, 0, 0)
             }
@@ -1054,26 +1057,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn timer_fire_waits_out_early_fires_and_upcall_delivery() {
+    fn interrupts_wait_out_early_fires_and_upcall_delivery() {
         let at = Instant::from_nanos;
-        assert_eq!(TimerFire::decide(None, at(100), false), TimerFire::Ignore);
+        assert_eq!(
+            InterruptAction::decide(None, at(100), false),
+            InterruptAction::Ignore
+        );
         // Early (e.g., a capped one-shot count): keep the deadline.
         assert_eq!(
-            TimerFire::decide(Some(at(200)), at(100), false),
-            TimerFire::Rearm
+            InterruptAction::decide(Some(at(200)), at(100), false),
+            InterruptAction::Rearm
         );
         assert_eq!(
-            TimerFire::decide(Some(at(200)), at(100), true),
-            TimerFire::Rearm
+            InterruptAction::decide(Some(at(200)), at(100), true),
+            InterruptAction::Rearm
         );
         // Due while the runner takes another upcall: retry, not kill.
         assert_eq!(
-            TimerFire::decide(Some(at(100)), at(150), true),
-            TimerFire::Retry(at(150 + 100_000))
+            InterruptAction::decide(Some(at(100)), at(150), true),
+            InterruptAction::Retry(at(150 + 100_000))
         );
         assert_eq!(
-            TimerFire::decide(Some(at(100)), at(100), false),
-            TimerFire::Deliver
+            InterruptAction::decide(Some(at(100)), at(100), false),
+            InterruptAction::Deliver
         );
     }
 
@@ -1089,12 +1095,12 @@ mod tests {
         assert_eq!(timer_deadline(true, None, None), at(0));
         assert_eq!(timer_deadline(true, at(300), at(200)), at(0));
         assert!(matches!(
-            TimerFire::decide(
+            InterruptAction::decide(
                 timer_deadline(true, None, None),
                 Instant::from_nanos(100),
                 false
             ),
-            TimerFire::Deliver
+            InterruptAction::Deliver
         ));
     }
 

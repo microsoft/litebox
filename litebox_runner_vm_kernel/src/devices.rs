@@ -14,7 +14,8 @@
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
 //! The interrupt handler only ends the interrupt; the broker looks at the
-//! devices when it next runs.
+//! devices when it next runs, which, if the interrupt stopped a process, the
+//! shim has it do at once (see `litebox_platform_vm_kernel`).
 
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -33,6 +34,9 @@ use spin::Mutex;
 /// How long a console write may wait for the device to take output before
 /// the rest is dropped.
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// The local APIC's timer.
+const TIMER_VECTOR: u8 = 0x30;
 
 /// Shared by every device: the broker looks at all of them when it runs.
 const DEVICE_VECTOR: u8 = 0x31;
@@ -62,9 +66,7 @@ fn armed(deadline: Option<Instant>) -> u64 {
 impl Devices {
     /// Brings up the devices and enables their interrupts. Call once.
     pub fn init(platform: &'static VmKernel, clock: Clock) -> &'static Self {
-        // The platform's timer vector: a fire while a process runs also
-        // reaches the shim (see `ProcessTimer::arm`).
-        let apic = LocalApic::init(platform, litebox_platform_vm_kernel::TIMER_VECTOR, clock);
+        let apic = LocalApic::init(platform, TIMER_VECTOR, clock);
         let console = match ConsoleDevice::probe(platform, apic.target(DEVICE_VECTOR)) {
             Ok(Some(device)) => device,
             Ok(None) => ConsoleDevice::serial(),
@@ -91,13 +93,10 @@ impl Devices {
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
     /// per-CPU data.
     fn on_interrupt(&self, vector: u8) -> bool {
-        if !matches!(
-            vector,
-            litebox_platform_vm_kernel::TIMER_VECTOR | DEVICE_VECTOR
-        ) {
+        if !matches!(vector, TIMER_VECTOR | DEVICE_VECTOR) {
             return false;
         }
-        if vector == litebox_platform_vm_kernel::TIMER_VECTOR {
+        if vector == TIMER_VECTOR {
             // Fired: arming the same deadline again (e.g., after an early
             // fire) must reprogram it.
             self.armed.store(ARMED_UNKNOWN, Ordering::Relaxed);

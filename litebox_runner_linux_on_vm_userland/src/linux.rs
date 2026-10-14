@@ -17,11 +17,11 @@
 //!
 //! Waits halt in the kernel until their timeout, a platform timer, or a
 //! broker notification (e.g., a timer file's expiry, or standard input
-//! arriving), which the broker's notification receiver dispatches. The kernel also
-//! interrupts the running program once it publishes one, so a nonblocking
-//! check (e.g., `epoll_wait` with no timeout) sees it: a timer file's expiry
-//! as it comes due, even in a busy loop; standard input once the broker next
-//! serves a request, as the kernel publishes it only then.
+//! arriving), which the broker's notification receiver dispatches. The
+//! kernel also interrupts the running program once it publishes one, so a
+//! nonblocking check (e.g., `epoll_wait` with no timeout) sees it even in a
+//! busy loop: a timer file's expiry as it comes due, and standard input as
+//! the console's interrupt brings it.
 //!
 //! Limits, which end the runner (the kernel sees it exit with
 //! `EXIT_FAILURE`) rather than fail the program's call:

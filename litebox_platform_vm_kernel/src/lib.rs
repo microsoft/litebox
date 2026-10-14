@@ -18,10 +18,10 @@
 //! Interrupts: the kernel runs with interrupts disabled, except while it
 //! halts ([`VmKernel::halt_until_interrupt`]); user code runs with them
 //! enabled. External interrupts go to the handler the runner installs
-//! ([`set_interrupt_handler`]), which returns to the interrupted code;
-//! [`TIMER_VECTOR`], when it interrupts user code, then also enters the
-//! shim's `interrupt` (the runner's one-shot timer). There is no scheduling:
-//! user code otherwise keeps the CPU.
+//! ([`set_interrupt_handler`]); one that interrupted user code then also
+//! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, or
+//! a device's input). There is no scheduling: user code otherwise keeps the
+//! CPU.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -105,8 +105,6 @@ pub struct BootConfig<'a> {
 
 /// See [`set_interrupt_handler`].
 pub type InterruptHandler = dyn Fn(u8) -> bool + Sync;
-
-pub use arch::interrupts::TIMER_VECTOR;
 
 /// Installs the handler for external interrupts (vectors 32 and up, except
 /// [`BootConfig::ignored_vectors`]), which returns whether it handled the
@@ -1273,7 +1271,7 @@ unsafe extern "C" fn run_thread_arch(thread_ctx: &ThreadContext, ctx: *mut PtReg
         "mov rsi, cr2",   // not yet overwritten: no fault since
         "call {exception_handler}",
         "jmp done",
-        // From `isr_timer`, for a timer fire that interrupted user mode. On
+        // From `isr_external`, for an external interrupt of user mode. On
         // entry: rsp = ISR stack [vector, error_code, rip, cs,
         // rflags, rsp, ss] (vector and error code are placeholders, unused),
         // all GPRs hold the interrupted values, IF is clear, and GS is still
@@ -1404,12 +1402,11 @@ unsafe extern "C" fn exception_handler(thread_ctx: &ThreadContext, cr2: usize) {
     }
 }
 
-/// [`TIMER_VECTOR`] fired while a process ran. `ctx` is whatever it was
-/// running at the time; the shim decides whether and how to act on it (e.g.,
-/// deliver `UpcallKind::Interrupt`, defined in `litebox_common_vm_abi`, which
-/// this crate does not depend on).
-///
-/// [`TIMER_VECTOR`]: crate::TIMER_VECTOR
+/// An external interrupt, which [`set_interrupt_handler`]'s handler has
+/// handled, interrupted a process. `ctx` is whatever it was running at the
+/// time; the shim decides whether and how to act on it (e.g., deliver
+/// `UpcallKind::Interrupt`, defined in `litebox_common_vm_abi`, which this
+/// crate does not depend on).
 unsafe extern "C" fn interrupt_handler(thread_ctx: &ThreadContext) {
     // Safety: entered from user mode; see `ThreadContext`.
     let ctx = unsafe { &mut *thread_ctx.ctx };

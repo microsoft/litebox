@@ -234,9 +234,9 @@ impl RawMutexTrait for RawMutex {
 /// input arriving) for the runner, dispatching them (e.g., with
 /// `LiteBox::broker_notification_dispatcher`). They arrive while the guest
 /// runs, too, not only while it waits: the kernel interrupts the process
-/// once it publishes one, i.e., when a broker timer comes due, or as the
-/// broker serves the process's requests (where, e.g., standard input that
-/// arrived meanwhile is published).
+/// once it publishes one, i.e., when a broker timer comes due, when a
+/// device's interrupt brings input (e.g., standard input), or as the broker
+/// serves the process's requests.
 pub trait NotificationReceiver: Sync {
     /// Dispatches the published notifications, first waiting for one until
     /// `deadline` if there are none. Returns how many: zero at the deadline;

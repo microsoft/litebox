@@ -4,13 +4,17 @@
 // Reads standard input from the console, which the host sends only once this
 // prints `ready` (see console.json and console.input.txt): until then, a read
 // would block, as the console's input has not ended. Then waits for input
-// with poll(2), and copies it to standard output until a line `end`.
+// with poll(2), or with `busy`, by spinning on a nonblocking epoll_wait(2),
+// which the runner answers without a kernel call, so only an interrupt
+// brings the input to it (see console_busy.json). Then copies the input to
+// standard output until a line `end`.
 
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <unistd.h>
 
 #define CHECK(cond)                                                     \
@@ -22,9 +26,10 @@
         }                                                               \
     } while (0)
 
-int main(void) {
+int main(int argc, char **argv) {
     char buf[256];
     size_t len = 0;
+    int busy = argc > 1 && strcmp(argv[1], "busy") == 0;
 
     int flags = fcntl(0, F_GETFL);
     CHECK(flags >= 0);
@@ -32,10 +37,22 @@ int main(void) {
     CHECK(read(0, buf, sizeof(buf)) == -1 && errno == EAGAIN);
     CHECK(fcntl(0, F_SETFL, flags) == 0);
 
+    int ep = epoll_create1(0);
+    CHECK(ep >= 0);
+    struct epoll_event event = {.events = EPOLLIN, .data.fd = 0};
+    CHECK(epoll_ctl(ep, EPOLL_CTL_ADD, 0, &event) == 0);
+
     CHECK(write(1, "ready\n", 6) == 6);
 
-    struct pollfd pfd = {.fd = 0, .events = POLLIN};
-    CHECK(poll(&pfd, 1, -1) == 1 && (pfd.revents & POLLIN));
+    if (busy) {
+        int n;
+        while ((n = epoll_wait(ep, &event, 1, 0)) == 0) {
+        }
+        CHECK(n == 1 && (event.events & EPOLLIN));
+    } else {
+        struct pollfd pfd = {.fd = 0, .events = POLLIN};
+        CHECK(poll(&pfd, 1, -1) == 1 && (pfd.revents & POLLIN));
+    }
 
     for (;;) {
         char *newline = memchr(buf, '\n', len);

@@ -202,24 +202,26 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 
 impl Association {
     /// The earliest armed broker timer's deadline, on the kernel clock:
-    /// when [`Self::fire_timers`] next has something to publish.
+    /// when [`Self::poll_events`] next fires one.
     pub fn next_timer_deadline(&self) -> Option<Instant> {
         self.broker.timers.next_deadline()
     }
 
-    /// Fires the broker timers that are due, publishing their readiness, as
-    /// [`BrokerEnterOp::Wait`] would; for a process that is running instead.
-    /// A notification ring this corrupts fails the association, which its
-    /// next [`Self::enter`] reports.
-    pub fn fire_timers(&self) {
+    /// Looks at the devices and fires the broker timers that are due,
+    /// publishing readiness, as [`BrokerEnterOp::Wait`] would; for a process
+    /// that is running instead (e.g., an interrupt stopped it). A
+    /// notification ring this corrupts fails the association, which its next
+    /// [`Self::enter`] reports.
+    pub fn poll_events(&self) {
+        self.broker.stdio.poll();
         self.broker.timers.fire();
         let _ = self.flush_readiness();
     }
 
     /// Whether a notification was published since the last call (e.g., a
-    /// timer fired, or standard input arrived, as the broker served a
-    /// request): the process then has something to receive, even while it
-    /// runs.
+    /// timer fired, or standard input arrived, as the broker served a request
+    /// or [`Self::poll_events`]): the process then has something to receive,
+    /// even while it runs.
     pub fn take_published(&self) -> bool {
         self.readiness.take_published()
     }

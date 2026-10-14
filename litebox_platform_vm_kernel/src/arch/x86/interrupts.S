@@ -13,9 +13,6 @@
 .code64
 .text
 
-/* Must match `TIMER_VECTOR` in `interrupts.rs`. */
-.equ TIMER_VECTOR, 0x30
-
 /* Push order is the reverse of the `PtRegs` field order. */
 .macro push_regs
     push    rdi
@@ -154,6 +151,10 @@ isr_ignore:
  * IF=1. Entry does not depend on GS (which may still be the user's): the
  * handler must not touch per-CPU data, so no SWAPGS. The kernel runs with
  * SSE disabled, so only the caller-saved GPRs need saving.
+ *
+ * One that interrupted user mode then also reaches the shim: with an
+ * `errcode`/`vector` pair pushed, as the CPU exception stubs do for
+ * `exception_callback`, it jumps to `interrupt_callback`, its counterpart.
  */
 .balign 8
 .global isr_external_stubs
@@ -162,58 +163,6 @@ isr_external_stubs:
     .balign 8
     call    isr_external
 .endr
-
-/*
- * The timer's vector: dedicated so that, unlike other external interrupts,
- * a fire that interrupted user mode also reaches the shim (which may
- * deliver `UpcallKind::Interrupt`). A direct IDT target, not reached through
- * `isr_external_stubs`, so there is no stub return address to skip.
- *
- * Ring 0 (the kernel runs, or the CPU halts): identical to `isr_external`,
- * and for the same reason (GS may be the user's, so no SWAPGS yet).
- * Ring 3 (a process runs): also pushes an `errcode`/`vector` pair, as the
- * CPU exception stubs do for `exception_callback`, and jumps to
- * `interrupt_callback`, its counterpart.
- */
-.global isr_timer
-isr_timer:
-    cld
-    clac
-    push    rax
-    push    rcx
-    push    rdx
-    push    rsi
-    push    rdi
-    push    r8
-    push    r9
-    push    r10
-    push    r11
-    push    rbp
-    mov     rbp, rsp
-    mov     rdi, TIMER_VECTOR
-    mov     rsi, [rbp + 80]     /* interrupted RIP */
-    mov     rdx, [rbp + 88]     /* interrupted CS */
-    and     rsp, -16
-    call    external_interrupt_handler_impl
-    mov     rsp, rbp
-    pop     rbp
-    pop     r11
-    pop     r10
-    pop     r9
-    pop     r8
-    pop     rdi
-    pop     rsi
-    pop     rdx
-    pop     rcx
-    pop     rax
-    /* All GPRs hold their interrupted values; [rsp] rip, [rsp+8] CS. */
-    test    qword ptr [rsp + 8], 0x3
-    jz      .Lisr_timer_ring0
-    push    0                   /* error code, unused */
-    push    TIMER_VECTOR
-    jmp     interrupt_callback
-.Lisr_timer_ring0:
-    iretq
 
 isr_external:
     cld
@@ -251,4 +200,11 @@ isr_external:
     pop     rcx
     pop     rax
     add     rsp, 8              /* stub return address */
+    /* All GPRs hold their interrupted values; [rsp] RIP, [rsp+8] CS. */
+    test    qword ptr [rsp + 8], 0x3
+    jnz     .Lisr_external_user
     iretq
+.Lisr_external_user:
+    push    0                   /* error code, unused */
+    push    0                   /* vector, unused */
+    jmp     interrupt_callback
