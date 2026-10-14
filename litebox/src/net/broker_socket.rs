@@ -117,6 +117,11 @@ pub struct BrokerTcpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerTcpSocket<Platform> {
+    /// The broker handle this socket owns until it closes.
+    pub(super) fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
     pub(super) fn new(
         broker: Arc<dyn BrokerControl>,
         pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
@@ -740,7 +745,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerTc
         }
         let (mut events, broker_readiness_available) =
             match self.broker.check_readiness(self.handle) {
-                Ok(readiness) => (socket_readiness_events(readiness), true),
+                Ok(readiness) => (readiness_events(readiness), true),
                 Err(_) => (Events::ERR, false),
             };
         let connection = self.state.lock().connection;
@@ -810,6 +815,11 @@ pub struct BrokerUdpSocket<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> BrokerUdpSocket<Platform> {
+    /// The broker handle this socket owns until it closes.
+    pub(super) fn handle(&self) -> ObjectHandle {
+        self.handle
+    }
+
     pub(super) fn new(
         broker: Arc<dyn BrokerControl>,
         pollable_registry: Arc<BrokerPollableRegistry<Platform>>,
@@ -1218,7 +1228,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerUd
             return Events::OUT | Events::HUP;
         }
         let mut events = match self.broker.check_readiness(self.handle) {
-            Ok(readiness) => socket_readiness_events(readiness),
+            Ok(readiness) => readiness_events(readiness),
             Err(_) => Events::ERR,
         };
         if events.contains(Events::ERR) && self.state.lock().async_error == 0 {
@@ -1239,18 +1249,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for BrokerUd
         }
         events
     }
-}
-
-fn socket_readiness_events(
-    readiness: litebox_broker_protocol::readiness::ReadinessFlags,
-) -> Events {
-    let mut events = readiness_events(readiness);
-    events.set(
-        Events::RDHUP,
-        readiness.contains(litebox_broker_protocol::readiness::ReadinessFlags::HANGUP),
-    );
-    events.remove(Events::HUP);
-    events
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for BrokerTcpSocket<Platform> {

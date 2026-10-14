@@ -41,9 +41,10 @@ use litebox_broker_protocol::fs::{
 use litebox_broker_protocol::message::{
     BrokerHandshakeResponse, BrokerOperation, BrokerRequest, BrokerResponse, BrokerResult,
     EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-    ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse, SignalRequest,
-    SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest,
-    TimerResponse, UnixSocketRequest, UnixSocketResponse,
+    ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
+    ReadinessQueueRequest, ReadinessQueueResponse, SignalRequest, SignalResponse, SocketRequest,
+    SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse, UnixSocketRequest,
+    UnixSocketResponse,
 };
 use litebox_broker_protocol::pipe::{
     CreatePipeResponse, MAX_PIPE_TRANSFER_SIZE, ReadPipeResponse, WritePipeResponse,
@@ -54,6 +55,9 @@ use litebox_broker_protocol::process::{
     ProcessStartupDescriptor, StartChildProcessRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
+use litebox_broker_protocol::readiness_queue::{
+    CreateReadinessQueueResponse, MAX_READINESS_QUEUE_EVENTS, READY_EVENT_SIZE, TakeReadyResponse,
+};
 use litebox_broker_protocol::shared_buffer::{
     SHARED_BUFFER_LAYOUT, SHARED_BUFFER_SLOT_COUNT, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
     SharedBufferSlotIndex,
@@ -534,6 +538,10 @@ fn handle_request<Memory: SharedMemory>(
         }
         BrokerOperation::Signal(request) => {
             handle_signal_request(process, request, readiness_sink).map(BrokerResult::Signal)
+        }
+        BrokerOperation::ReadinessQueue(request) => {
+            handle_readiness_queue_request(process, request, shared_buffers, readiness_sink)
+                .map(BrokerResult::ReadinessQueue)
         }
         BrokerOperation::ProcessGroup(request) => {
             handle_process_group_request(process, request).map(BrokerResult::ProcessGroup)
@@ -1651,6 +1659,78 @@ fn handle_signal_request(
     response.map_err(RequestFailure::from)
 }
 
+fn handle_readiness_queue_request<Memory: SharedMemory>(
+    process: &BrokerProcess,
+    request: ReadinessQueueRequest,
+    shared_buffers: &SharedBufferPool<Memory>,
+    readiness_sink: &Arc<dyn ReadinessSink>,
+) -> RequestResult<ReadinessQueueResponse> {
+    use litebox_broker_core::readiness_queue;
+
+    match request {
+        ReadinessQueueRequest::Create => {
+            let handle = readiness_queue::create(process, readiness_sink)?;
+            Ok(ReadinessQueueResponse::Create(
+                CreateReadinessQueueResponse { handle },
+            ))
+        }
+        ReadinessQueueRequest::Add(request) => Ok(readiness_queue::add(
+            process,
+            request.queue,
+            request.target,
+            request.key,
+            request.interest,
+        )?
+        .map_or_else(ReadinessQueueResponse::Failed, |()| {
+            ReadinessQueueResponse::Add
+        })),
+        ReadinessQueueRequest::Modify(request) => Ok(readiness_queue::modify(
+            process,
+            request.queue,
+            request.target,
+            request.key,
+            request.interest,
+        )?
+        .map_or_else(ReadinessQueueResponse::Failed, |()| {
+            ReadinessQueueResponse::Modify
+        })),
+        ReadinessQueueRequest::Remove(request) => {
+            Ok(
+                readiness_queue::remove(process, request.queue, request.target, request.key)?
+                    .map_or_else(ReadinessQueueResponse::Failed, |()| {
+                        ReadinessQueueResponse::Remove
+                    }),
+            )
+        }
+        ReadinessQueueRequest::TakeReady(request) => {
+            const MAX_LENGTH: u32 = MAX_READINESS_QUEUE_EVENTS * READY_EVENT_SIZE;
+            let length = request.buffer.length();
+            if length == 0 || length % READY_EVENT_SIZE != 0 {
+                return Err(RequestFailure::Abort(ErrorCode::MalformedRequest));
+            }
+            // Validate the buffer before taking events, which a failed write
+            // would lose.
+            validate_shared_buffer(request.buffer, MAX_LENGTH)?;
+            let events = readiness_queue::take_ready(
+                process,
+                request.queue,
+                (length / READY_EVENT_SIZE) as usize,
+            )?;
+            let mut encoded = Vec::new();
+            encoded
+                .try_reserve_exact(events.len() * READY_EVENT_SIZE as usize)
+                .map_err(|_| RequestFailure::Respond(ErrorCode::OutOfMemory))?;
+            for event in &events {
+                encoded.extend_from_slice(&event.encode());
+            }
+            write_shared_buffer(shared_buffers, request.buffer, &encoded, MAX_LENGTH)?;
+            Ok(ReadinessQueueResponse::TakeReady(TakeReadyResponse {
+                count: u32::try_from(events.len()).expect("takes are bounded"),
+            }))
+        }
+    }
+}
+
 fn handle_process_group_request(
     process: &BrokerProcess,
     request: ProcessGroupRequest,
@@ -2069,6 +2149,7 @@ mod tests {
         association_shared_buffer_sequences_stage_socket_data(&broker);
         association_shared_buffer_sequences_stage_unix_socket_data(&broker);
         association_shared_buffer_sequence_stages_random_data(&broker);
+        association_shared_buffer_sequences_stage_ready_events(&broker);
         active_request_queries_file_terminal(&broker, &stdio_provider);
         active_requests_change_file_status_flags(&broker);
         association_shared_buffer_sequences_stage_file_data(&broker);
@@ -2305,6 +2386,114 @@ mod tests {
             .read(SharedBufferSlotIndex(3), &mut output)
             .unwrap();
         assert_eq!(output, [0xa5; 2]);
+    }
+
+    fn association_shared_buffer_sequences_stage_ready_events(broker: &BrokerCore) {
+        use litebox_broker_protocol::readiness::ReadinessFlags;
+        use litebox_broker_protocol::readiness_queue::{
+            AddReadinessQueueEntryRequest, ReadinessQueueError, ReadinessQueueInterest, ReadyEvent,
+            TakeReadyRequest,
+        };
+
+        let process = broker
+            .create_process(CallerCredential::Unauthenticated, None)
+            .unwrap();
+        let shared_buffers = test_shared_buffers();
+        let response = handle_test_request(
+            &process,
+            BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Create),
+        );
+        let BrokerResult::ReadinessQueue(ReadinessQueueResponse::Create(
+            CreateReadinessQueueResponse { handle: queue },
+        )) = response
+        else {
+            panic!("unexpected create response: {response:?}");
+        };
+        let response = handle_test_request(
+            &process,
+            BrokerOperation::Event(EventRequest::Create(CreateEventRequest {
+                initial_count: 1,
+                flags: FileOpenFlags::NONE,
+            })),
+        );
+        let BrokerResult::Event(EventResponse::Create(CreateEventResponse { handle: event })) =
+            response
+        else {
+            panic!("unexpected create response: {response:?}");
+        };
+        let add = BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
+            AddReadinessQueueEntryRequest {
+                queue,
+                target: event,
+                key: 0,
+                interest: ReadinessQueueInterest {
+                    readiness: ReadinessFlags::READ,
+                    token: 0x1122_3344_5566_7788,
+                    ..ReadinessQueueInterest::default()
+                },
+            },
+        ));
+        assert_eq!(
+            handle_test_request(&process, add.clone()),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Add)
+        );
+        assert_eq!(
+            handle_test_request(&process, add),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Failed(
+                ReadinessQueueError::AlreadyRegistered
+            ))
+        );
+
+        let take = |buffer| {
+            handle_request(
+                &process,
+                BrokerOperation::ReadinessQueue(ReadinessQueueRequest::TakeReady(
+                    TakeReadyRequest { queue, buffer },
+                )),
+                &shared_buffers,
+                &test_readiness_sink(),
+            )
+        };
+        shared_buffers
+            .write(
+                SharedBufferSlotIndex(3),
+                &[0xa5; 2 * READY_EVENT_SIZE as usize],
+            )
+            .unwrap();
+        assert_eq!(
+            take(single_slot_sequence(3, 2 * READY_EVENT_SIZE)),
+            Ok(BrokerResult::ReadinessQueue(
+                ReadinessQueueResponse::TakeReady(TakeReadyResponse { count: 1 })
+            ))
+        );
+        let mut output = [0u8; 2 * READY_EVENT_SIZE as usize];
+        shared_buffers
+            .read(SharedBufferSlotIndex(3), &mut output)
+            .unwrap();
+        let (first, rest) = output.split_at(READY_EVENT_SIZE as usize);
+        assert_eq!(
+            ReadyEvent::decode(first.try_into().unwrap()),
+            ReadyEvent {
+                token: 0x1122_3344_5566_7788,
+                readiness: ReadinessFlags::READ,
+            }
+        );
+        assert_eq!(rest, [0xa5; READY_EVENT_SIZE as usize]);
+
+        // Buffers holding partial events or too many are malformed.
+        for length in [
+            READY_EVENT_SIZE - 1,
+            READY_EVENT_SIZE + 1,
+            (MAX_READINESS_QUEUE_EVENTS + 1) * READY_EVENT_SIZE,
+        ] {
+            assert_eq!(
+                take(single_slot_sequence(3, length)),
+                Err(RequestFailure::Abort(ErrorCode::MalformedRequest))
+            );
+        }
+
+        process.close_object_reference(queue).unwrap();
+        process.close_object_reference(event).unwrap();
     }
 
     fn active_request_queries_file_terminal(broker: &BrokerCore, provider: &TestStdioProvider) {

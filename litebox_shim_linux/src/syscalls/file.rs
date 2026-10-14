@@ -342,6 +342,13 @@ impl<Platform: ShimPlatform> FilesState<Platform> {
                             .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
                     })?;
                 }
+                InheritedFdKind::Epoll => {
+                    self.install_inherited_fd(litebox, first_fd, raw_fd, || {
+                        global
+                            .adopt_inherited_epoll(handle)
+                            .map_err(|_| crate::loader::elf::ElfLoaderError::InvalidInheritedFds)
+                    })?;
+                }
             }
             descriptions.entry(handle).or_insert(raw_fd);
             next_fd = raw_fd + 1;
@@ -618,7 +625,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
     /// them is:
     ///
     /// - a network socket: the broker does not duplicate socket objects;
-    /// - an epoll descriptor: the object is local to this runner;
     /// - a directory with a position, set by `getdents64` or `lseek`: the position is local to this
     ///   runner; or
     /// - more than [`MAX_INHERITED_FD_GAP`] past the previous one, which a fresh runner cannot
@@ -684,7 +690,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         InheritableFd::Timer(alloc::sync::Arc::clone(file.timer())),
                     ))
                 })?,
-                AnyTypedFd::Network(_) | AnyTypedFd::Epoll(_) => return Err(Errno::EAGAIN),
+                AnyTypedFd::Epoll(epoll) => self.global.with_epoll(&epoll, |file| {
+                    Ok((
+                        InheritedFdKind::Epoll,
+                        InheritableFd::ReadinessQueue(alloc::sync::Arc::clone(file.queue())),
+                    ))
+                })?,
+                AnyTypedFd::Network(_) => return Err(Errno::EAGAIN),
             };
             next_fd = raw_fd + 1;
             let inherited_fd = ForkedFd {
@@ -2159,18 +2171,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             .unwrap_or(OFlags::empty()))
                     };
                 }
-                macro_rules! getfl_from_handle {
-                    ($fd:ident) => {{
-                        // TODO: Consider shared metadata table?
-                        let handle = self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .entry_handle($fd)
-                            .ok_or(Errno::EBADF)?;
-                        handle.with_entry(|file| Ok(file.get_status()))
-                    }};
-                }
                 Ok(fd
                     .dispatch(
                         |fd| linux_status_flags(self.global.litebox.get_file_status_flags(fd)?),
@@ -2180,7 +2180,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                             self.global
                                 .with_eventfd(fd, super::eventfd::EventFile::get_status)
                         },
-                        |fd| getfl_from_handle!(fd),
+                        |fd| {
+                            self.global
+                                .with_epoll(fd, super::epoll::EpollFile::get_status)
+                        },
                         |fd| {
                             self.global
                                 .with_unix_socket(fd, super::unix::UnixSocket::get_status)
@@ -2250,7 +2253,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         self.global
                             .with_eventfd(fd, |file| file.set_status_flags(setfl_mask, flags))
                     },
-                    |_fd| todo!("epoll"),
+                    |fd| {
+                        if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
+                            log_unsupported!("unsupported flags");
+                        }
+                        self.global
+                            .with_epoll(fd, |file| file.set_status_flags(setfl_mask, flags))
+                    },
                     |fd| {
                         if flags.intersects(OFlags::DIRECT | OFlags::NOATIME) {
                             log_unsupported!("unsupported flags");
@@ -2501,20 +2510,6 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 } else {
                     OFlags::empty()
                 };
-                macro_rules! set_nonblock_on_entry {
-                    ($fd:ident) => {{
-                        let handle = self
-                            .global
-                            .litebox
-                            .descriptor_table()
-                            .entry_handle($fd)
-                            .ok_or(Errno::EBADF)?;
-                        handle.with_entry(|file| {
-                            file.set_status(OFlags::NONBLOCK, val != 0);
-                        });
-                        Ok(())
-                    }};
-                }
                 fd.dispatch(
                     |file_fd| {
                         set_file_status_flags(
@@ -2551,7 +2546,10 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         self.global
                             .with_eventfd(fd, |file| file.set_status_flags(OFlags::NONBLOCK, flags))
                     },
-                    |fd| set_nonblock_on_entry!(fd),
+                    |fd| {
+                        self.global
+                            .with_epoll(fd, |file| file.set_status_flags(OFlags::NONBLOCK, flags))
+                    },
                     |fd| {
                         self.global.with_unix_socket(fd, |socket| {
                             socket.set_status_flags(OFlags::NONBLOCK, flags)
@@ -2611,7 +2609,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
             return Err(Errno::EINVAL);
         }
 
-        let epoll_file = super::epoll::EpollFile::new();
+        let epoll_file = super::epoll::EpollFile::new(&self.global)?;
         let mut dt = self.global.litebox.descriptor_table_mut();
         let typed = dt.insert::<super::epoll::EpollSubsystem<Platform>>(epoll_file);
         if flags.contains(EpollCreateFlags::EPOLL_CLOEXEC) {
@@ -2716,22 +2714,13 @@ impl<Platform: ShimPlatform> Task<Platform> {
             }
         };
         handle.with_entry(|epoll_file| {
-            match epoll_file.wait(
-                &self.global,
-                &self.wait_cx().with_timeout(timeout),
-                maxevents,
-            ) {
-                Ok(epoll_events) => {
-                    if !epoll_events.is_empty() {
-                        events
-                            .copy_from_slice::<Platform>(0, &epoll_events)
-                            .ok_or(Errno::EFAULT)?;
-                    }
-                    Ok(epoll_events.len())
-                }
-                Err(WaitError::TimedOut) => Ok(0),
-                Err(WaitError::Interrupted) => Err(Errno::EINTR),
+            let epoll_events = epoll_file.wait(&self.wait_cx().with_timeout(timeout), maxevents)?;
+            if !epoll_events.is_empty() {
+                events
+                    .copy_from_slice::<Platform>(0, &epoll_events)
+                    .ok_or(Errno::EFAULT)?;
             }
+            Ok(epoll_events.len())
         })
     }
 

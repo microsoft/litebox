@@ -22,7 +22,8 @@ use crate::broker::{
     BrokerControl, BrokerPollableRegistry, error::BrokerControlError, readiness_events,
 };
 use crate::event::{
-    Events, IOPollable, counter::EventCounter, observer::Observer, polling::Pollee, timer::Timer,
+    Events, IOPollable, counter::EventCounter, observer::Observer, polling::Pollee,
+    readiness_queue::ReadinessQueue, timer::Timer,
 };
 use crate::fs::FileFd;
 use crate::pipes::PipeFd;
@@ -202,6 +203,8 @@ pub enum InheritableFd<Platform: RawSyncPrimitivesProvider + TimeProvider> {
     EventCounter(Arc<EventCounter<Platform>>),
     /// A timer, adopted with [`LiteBox::adopt_inherited_timer`].
     Timer(Arc<Timer<Platform>>),
+    /// A readiness queue, adopted with [`LiteBox::adopt_inherited_readiness_queue`].
+    ReadinessQueue(Arc<ReadinessQueue<Platform>>),
 }
 
 /// A child process that has not started.
@@ -277,6 +280,7 @@ impl PendingChild {
                 }
                 InheritableFd::EventCounter(counter) => counter.handle(),
                 InheritableFd::Timer(timer) => timer.handle(),
+                InheritableFd::ReadinessQueue(queue) => queue.handle(),
             };
             fd_handles.push(handle);
         }

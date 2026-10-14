@@ -5,7 +5,10 @@ use litebox_broker_local::BrokerLocalError;
 use litebox_broker_protocol::error::ErrorCode;
 use thiserror::Error;
 
-use crate::event::{counter::EventCounterError, polling::TryOpError, timer::TimerError};
+use crate::event::{
+    counter::EventCounterError, polling::TryOpError, readiness_queue::ReadinessQueueError,
+    timer::TimerError,
+};
 
 /// Error returned by the deployment-provided broker control path.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -101,6 +104,32 @@ impl From<BrokerObjectError> for EventCounterError {
             | BrokerObjectError::InvalidObject
             | BrokerObjectError::PeerClosed
             | BrokerObjectError::UnsupportedOperation => Self::Io,
+        }
+    }
+}
+
+impl From<BrokerObjectError> for TryOpError<ReadinessQueueError> {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::WouldBlock => Self::TryAgain,
+            error => Self::Other(error.into()),
+        }
+    }
+}
+
+impl From<BrokerObjectError> for ReadinessQueueError {
+    fn from(error: BrokerObjectError) -> Self {
+        match error {
+            BrokerObjectError::WouldBlock => Self::WouldBlock,
+            BrokerObjectError::ResourceExhausted => Self::ResourceExhausted,
+            BrokerObjectError::OutOfMemory => Self::OutOfMemory,
+            BrokerObjectError::PermissionDenied => Self::PermissionDenied,
+            // A target the queue cannot watch through this reference, such
+            // as one opened without the right to observe it.
+            BrokerObjectError::InvalidObject | BrokerObjectError::UnsupportedOperation => {
+                Self::UnsupportedTarget
+            }
+            BrokerObjectError::Control | BrokerObjectError::PeerClosed => Self::Io,
         }
     }
 }

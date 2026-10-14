@@ -31,6 +31,7 @@ const PIPE_TAG: u8 = 1;
 const UNIX_SOCKET_TAG: u8 = 2;
 const EVENTFD_TAG: u8 = 3;
 const TIMERFD_TAG: u8 = 4;
+const EPOLL_TAG: u8 = 5;
 const PROGRAM_STARTUP_TAG: u8 = 0;
 const FORK_STARTUP_TAG: u8 = 1;
 
@@ -133,6 +134,8 @@ pub enum InheritedFdKind {
         /// The clock absolute expiration times are measured against.
         clock: TimerfdClock,
     },
+    /// An epoll instance.
+    Epoll,
 }
 
 /// Clock against which a timerfd measures absolute expiration times.
@@ -547,7 +550,7 @@ impl InheritedFd {
     fn encoded_len(&self) -> usize {
         INHERITED_FD_HEADER_SIZE
             + match self.kind {
-                InheritedFdKind::File => 0,
+                InheritedFdKind::File | InheritedFdKind::Epoll => 0,
                 InheritedFdKind::Pipe { .. }
                 | InheritedFdKind::UnixSocket { .. }
                 | InheritedFdKind::Eventfd { .. }
@@ -586,6 +589,7 @@ impl InheritedFd {
                     TimerfdClock::Monotonic => 1,
                 });
             }
+            InheritedFdKind::Epoll => output.push(EPOLL_TAG),
         }
     }
 
@@ -622,6 +626,7 @@ impl InheritedFd {
                     _ => return Err(LinuxProgramStartupError::Malformed),
                 },
             },
+            EPOLL_TAG => InheritedFdKind::Epoll,
             _ => return Err(LinuxProgramStartupError::Malformed),
         };
         Ok(Self { fd, handle, kind })
@@ -856,6 +861,11 @@ mod tests {
                         clock: TimerfdClock::Monotonic,
                     },
                 },
+                InheritedFd {
+                    fd: 10,
+                    handle: ObjectHandle(13),
+                    kind: InheritedFdKind::Epoll,
+                },
             ],
         };
 
@@ -1002,6 +1012,14 @@ mod tests {
                         },
                     },
                     close_on_exec: false,
+                },
+                ForkedFd {
+                    inherited: InheritedFd {
+                        fd: 7,
+                        handle: ObjectHandle(12),
+                        kind: InheritedFdKind::Epoll,
+                    },
+                    close_on_exec: true,
                 },
             ],
         }

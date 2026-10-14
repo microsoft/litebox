@@ -65,6 +65,15 @@ impl File {
         Ok(Some(registration))
     }
 
+    /// Publishes this file's later readiness changes through `registration` until every clone of
+    /// it drops, failing with `UnsupportedOperation` if its reads and writes always make progress.
+    pub(crate) fn add_watcher(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.readiness
+            .as_ref()
+            .ok_or(BrokerError::UnsupportedOperation)?
+            .watch(registration)
+    }
+
     /// Returns this file's readiness, if its reads or writes can fail with `WouldBlock`.
     pub(crate) fn readiness(&self) -> Result<ReadinessFlags> {
         self.readiness

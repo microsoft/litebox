@@ -690,6 +690,25 @@ impl From<litebox::event::timer::TimerError> for Errno {
     }
 }
 
+impl From<litebox::event::readiness_queue::ReadinessQueueError> for Errno {
+    fn from(value: litebox::event::readiness_queue::ReadinessQueueError) -> Self {
+        use litebox::event::readiness_queue::ReadinessQueueError;
+        match value {
+            ReadinessQueueError::AlreadyRegistered => Errno::EEXIST,
+            ReadinessQueueError::NotRegistered => Errno::ENOENT,
+            ReadinessQueueError::ClosedTarget => Errno::EBADF,
+            ReadinessQueueError::UnsupportedTarget | ReadinessQueueError::PermissionDenied => {
+                Errno::EPERM
+            }
+            ReadinessQueueError::WouldBlock => Errno::EAGAIN,
+            ReadinessQueueError::ResourceExhausted => Errno::ENOSPC,
+            ReadinessQueueError::OutOfMemory => Errno::ENOMEM,
+            ReadinessQueueError::Io | ReadinessQueueError::Unavailable => Errno::EIO,
+            _ => Errno::EIO,
+        }
+    }
+}
+
 impl From<litebox::fs::errors::ReadDirError> for Errno {
     fn from(value: litebox::fs::errors::ReadDirError) -> Self {
         match value {

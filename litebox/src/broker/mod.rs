@@ -24,6 +24,10 @@ use litebox_broker_protocol::process::{
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness::ReadinessFlags;
+use litebox_broker_protocol::readiness_queue::{
+    MAX_READINESS_QUEUE_EVENTS, READY_EVENT_SIZE, ReadinessQueueError, ReadinessQueueInterest,
+    ReadyEvent,
+};
 use litebox_broker_protocol::shared_buffer::SHARED_BUFFER_SLOT_SIZE;
 use litebox_broker_protocol::signal::{SignalEvent, SignalTarget};
 use litebox_broker_protocol::socket::{
@@ -283,6 +287,39 @@ pub(crate) trait BrokerControl: Send + Sync {
     ) -> core::result::Result<TimerSpec, BrokerControlError>;
 
     fn read_timer(&self, handle: ObjectHandle) -> core::result::Result<u64, BrokerControlError>;
+
+    fn create_readiness_queue(&self) -> core::result::Result<ObjectHandle, BrokerControlError>;
+
+    fn add_readiness_queue_entry(
+        &self,
+        queue: ObjectHandle,
+        target: ObjectHandle,
+        key: u64,
+        interest: ReadinessQueueInterest,
+    ) -> core::result::Result<core::result::Result<(), ReadinessQueueError>, BrokerControlError>;
+
+    fn modify_readiness_queue_entry(
+        &self,
+        queue: ObjectHandle,
+        target: ObjectHandle,
+        key: u64,
+        interest: ReadinessQueueInterest,
+    ) -> core::result::Result<core::result::Result<(), ReadinessQueueError>, BrokerControlError>;
+
+    fn remove_readiness_queue_entry(
+        &self,
+        queue: ObjectHandle,
+        target: ObjectHandle,
+        key: u64,
+    ) -> core::result::Result<core::result::Result<(), ReadinessQueueError>, BrokerControlError>;
+
+    /// Takes up to `events.len()` ready events, which must be between one and
+    /// [`MAX_READINESS_QUEUE_EVENTS`], returning how many it stored.
+    fn take_ready(
+        &self,
+        queue: ObjectHandle,
+        events: &mut [ReadyEvent],
+    ) -> core::result::Result<usize, BrokerControlError>;
 
     fn create_pipe(
         &self,
@@ -1051,6 +1088,55 @@ where
         self.request(|local| local.read_timer(handle))
     }
 
+    fn create_readiness_queue(&self) -> core::result::Result<ObjectHandle, BrokerControlError> {
+        self.request(BrokerLocal::create_readiness_queue)
+    }
+
+    fn add_readiness_queue_entry(
+        &self,
+        queue: ObjectHandle,
+        target: ObjectHandle,
+        key: u64,
+        interest: ReadinessQueueInterest,
+    ) -> core::result::Result<core::result::Result<(), ReadinessQueueError>, BrokerControlError>
+    {
+        self.request(|local| local.add_readiness_queue_entry(queue, target, key, interest))
+    }
+
+    fn modify_readiness_queue_entry(
+        &self,
+        queue: ObjectHandle,
+        target: ObjectHandle,
+        key: u64,
+        interest: ReadinessQueueInterest,
+    ) -> core::result::Result<core::result::Result<(), ReadinessQueueError>, BrokerControlError>
+    {
+        self.request(|local| local.modify_readiness_queue_entry(queue, target, key, interest))
+    }
+
+    fn remove_readiness_queue_entry(
+        &self,
+        queue: ObjectHandle,
+        target: ObjectHandle,
+        key: u64,
+    ) -> core::result::Result<core::result::Result<(), ReadinessQueueError>, BrokerControlError>
+    {
+        self.request(|local| local.remove_readiness_queue_entry(queue, target, key))
+    }
+
+    fn take_ready(
+        &self,
+        queue: ObjectHandle,
+        events: &mut [ReadyEvent],
+    ) -> core::result::Result<usize, BrokerControlError> {
+        assert!(
+            (1..=MAX_READINESS_QUEUE_EVENTS as usize).contains(&events.len()),
+            "a take must request between one and MAX_READINESS_QUEUE_EVENTS events"
+        );
+        let lease = self.acquire_shared_buffer(events.len() * READY_EVENT_SIZE as usize)?;
+        self.request(|local| local.take_ready(queue, lease.sequence(), events))
+    }
+
     fn create_pipe(
         &self,
         capacity: u64,
@@ -1400,11 +1486,15 @@ where
     }
 }
 
+/// Maps broker readiness to events: an object whose peer closed its write
+/// side reports [`Events::RDHUP`], and one that can neither receive more data
+/// nor send reports [`Events::HUP`].
 pub(crate) fn readiness_events(readiness: ReadinessFlags) -> Events {
     let mut events = Events::empty();
     events.set(Events::IN, readiness.contains(ReadinessFlags::READ));
     events.set(Events::OUT, readiness.contains(ReadinessFlags::WRITE));
-    events.set(Events::HUP, readiness.contains(ReadinessFlags::HANGUP));
+    events.set(Events::RDHUP, readiness.contains(ReadinessFlags::HANGUP));
+    events.set(Events::HUP, readiness.contains(ReadinessFlags::CLOSED));
     events.set(Events::ERR, readiness.contains(ReadinessFlags::ERROR));
     events
 }

@@ -13,7 +13,6 @@ use litebox_broker_protocol::{
     ObjectHandle,
     error::ErrorCode,
     fs::{FileMode, FileOpenFlags, FileStatusFlags, FileUser},
-    readiness::ReadinessFlags,
     socket::{ShutdownMode, SocketType},
     unix_socket::{
         UNIX_SOCKET_BUFFER_SIZE, UnixSocketAddress, UnixSocketError as ProtocolError,
@@ -27,6 +26,7 @@ use crate::{
     broker::{
         BrokerControl, BrokerPollableRegistry,
         error::{BrokerControlError, BrokerObjectError},
+        readiness_events,
     },
     event::{
         Events, IOPollable,
@@ -388,7 +388,7 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> IOPollable for UnixSock
     fn check_io_events(&self) -> Events {
         self.broker
             .check_readiness(self.handle)
-            .map_or(Events::ERR, unix_socket_events)
+            .map_or(Events::ERR, readiness_events)
     }
 }
 
@@ -397,20 +397,6 @@ impl<Platform: RawSyncPrimitivesProvider + TimeProvider> Drop for UnixSocket<Pla
         self.pollable_registry.unregister_pollable(self.handle);
         let _ = self.broker.close_object(self.handle);
     }
-}
-
-/// Maps Unix socket readiness to events: a socket that can no longer
-/// receive reports [`Events::RDHUP`], and one that can neither send nor
-/// receive, or is a stream socket that is not connected, reports
-/// [`Events::HUP`].
-fn unix_socket_events(readiness: ReadinessFlags) -> Events {
-    let mut events = Events::empty();
-    events.set(Events::IN, readiness.contains(ReadinessFlags::READ));
-    events.set(Events::OUT, readiness.contains(ReadinessFlags::WRITE));
-    events.set(Events::RDHUP, readiness.contains(ReadinessFlags::HANGUP));
-    events.set(Events::HUP, readiness.contains(ReadinessFlags::CLOSED));
-    events.set(Events::ERR, readiness.contains(ReadinessFlags::ERROR));
-    events
 }
 
 fn flatten<R>(

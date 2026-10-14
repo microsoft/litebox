@@ -6,6 +6,7 @@
 pub mod counter;
 pub mod observer;
 pub mod polling;
+pub mod readiness_queue;
 pub mod timer;
 pub mod wait;
 

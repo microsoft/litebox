@@ -64,6 +64,7 @@ const DEDICATED_C_TESTS: &[&str] = &[
     "fork_parent.c",
     "fork_threads_parent.c",
     "fork_aarch64_state.c",
+    "fork_epoll_parent.c",
     "fork_event_parent.c",
     "fork_unix_parent.c",
     "gate_signals.c",
@@ -1120,6 +1121,28 @@ fn forked_children_share_eventfds_and_timerfds() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn forked_children_share_epoll_instances() {
+    let parent = common::compile(
+        "./tests/fork_epoll_parent.c",
+        "fork_epoll_parent",
+        true,
+        false,
+    );
+    let mut runner = Runner::new(&parent, "fork_epoll_parent");
+    runner.allow_process_duplication();
+
+    let output = String::from_utf8(runner.output()).unwrap();
+    let line = output
+        .lines()
+        .find(|line| line.starts_with("epoll-fork "))
+        .unwrap_or_else(|| panic!("missing epoll-fork output in {output:?}"));
+    for field in ["shared=", "blocked=", "flags="] {
+        assert_eq!(numeric_field(line, field), 1, "{field} in {output:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn fork_requires_process_duplication() {
     let parent = common::compile(
         "./tests/fork_parent.c",
@@ -1699,8 +1722,9 @@ console.log(content);
     assert_eq!(broker_thread.next_close_object_count(), 0);
 
     eventfd_runner.broker_socket(&control_socket_path).run();
-    // eventfd.c creates thirteen eventfd objects; each should release one broker object.
-    assert_eq!(broker_thread.next_close_object_count(), 13);
+    // eventfd.c creates thirteen eventfd objects and one epoll instance; each should release one
+    // broker object.
+    assert_eq!(broker_thread.next_close_object_count(), 14);
 
     pipe_runner.broker_socket(&control_socket_path).run();
     // pipe_broker.c creates five pipes; each endpoint owns one broker object.
@@ -1842,7 +1866,8 @@ fn test_runner_broker_tcp_client_with_rewriter() {
         .arg(refused_port.to_string())
         .broker_socket(&control_socket_path)
         .run();
-    assert_eq!(broker.next_close_object_count(), 9);
+    // Nine sockets and two epoll instances.
+    assert_eq!(broker.next_close_object_count(), 11);
     broker.join();
     server.join().unwrap();
 }

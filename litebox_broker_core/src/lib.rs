@@ -28,8 +28,10 @@ pub mod pipe;
 mod policy;
 mod process;
 pub mod process_group;
+mod quota;
 pub mod random;
 pub mod readiness;
+pub mod readiness_queue;
 pub mod signal;
 pub mod socket;
 pub mod stdio;
@@ -93,6 +95,10 @@ pub struct BrokerCoreLimits {
     pub max_sockets: usize,
     /// Maximum live platform socket resources owned by one process.
     pub max_sockets_per_process: usize,
+    /// Maximum readiness queue entries across all processes.
+    pub max_readiness_queue_entries: usize,
+    /// Maximum readiness queue entries added by one process.
+    pub max_readiness_queue_entries_per_process: usize,
     /// Maximum live broker-allocated thread IDs.
     pub max_threads: usize,
     /// Maximum live broker-allocated thread IDs owned by one process.
@@ -115,6 +121,8 @@ impl BrokerCoreLimits {
         max_unix_socket_bytes_per_process: 16 * 1024 * 1024,
         max_sockets: 1024,
         max_sockets_per_process: 256,
+        max_readiness_queue_entries: 16384,
+        max_readiness_queue_entries_per_process: 4096,
         max_threads: 4096,
         max_threads_per_process: 1024,
         max_child_image_size: 1024 * 1024 * 1024,
@@ -136,6 +144,9 @@ impl BrokerCoreLimits {
             max_unix_socket_bytes_per_process: Self::DEFAULT.max_unix_socket_bytes_per_process,
             max_sockets: Self::DEFAULT.max_sockets,
             max_sockets_per_process: Self::DEFAULT.max_sockets_per_process,
+            max_readiness_queue_entries: Self::DEFAULT.max_readiness_queue_entries,
+            max_readiness_queue_entries_per_process: Self::DEFAULT
+                .max_readiness_queue_entries_per_process,
             max_threads: Self::DEFAULT.max_threads,
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
             max_child_image_size: Self::DEFAULT.max_child_image_size,
@@ -163,6 +174,9 @@ impl BrokerCoreLimits {
             max_unix_socket_bytes_per_process: Self::DEFAULT.max_unix_socket_bytes_per_process,
             max_sockets,
             max_sockets_per_process,
+            max_readiness_queue_entries: Self::DEFAULT.max_readiness_queue_entries,
+            max_readiness_queue_entries_per_process: Self::DEFAULT
+                .max_readiness_queue_entries_per_process,
             max_threads: Self::DEFAULT.max_threads,
             max_threads_per_process: Self::DEFAULT.max_threads_per_process,
             max_child_image_size: Self::DEFAULT.max_child_image_size,
@@ -201,6 +215,24 @@ impl BrokerCoreLimits {
         Self {
             max_total_unix_socket_bytes,
             max_unix_socket_bytes_per_process,
+            ..self
+        }
+    }
+
+    /// Returns these limits with explicit broker-wide and per-process quotas
+    /// for readiness queue entries.
+    ///
+    /// A per-process quota above the broker-wide limit is accepted; the
+    /// broker-wide limit still applies.
+    #[must_use]
+    pub const fn with_readiness_queue_limits(
+        self,
+        max_readiness_queue_entries: usize,
+        max_readiness_queue_entries_per_process: usize,
+    ) -> Self {
+        Self {
+            max_readiness_queue_entries,
+            max_readiness_queue_entries_per_process,
             ..self
         }
     }
@@ -286,6 +318,7 @@ pub struct BrokerCore {
     pub(crate) pending_references: Arc<AtomicUsize>,
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    pub(crate) readiness_queue_entries: Arc<AtomicUsize>,
     pub(crate) unix_sockets: Arc<unix_socket::UnixSockets>,
     /// Bytes of child memory images held by the broker.
     pub(crate) reserved_child_image_size: Arc<AtomicU64>,
@@ -351,6 +384,7 @@ impl BrokerCore {
             pending_references: Arc::new(AtomicUsize::new(0)),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             unix_sockets: Arc::new(unix_socket::UnixSockets::new(&limits)),
             reserved_child_image_size: Arc::new(AtomicU64::new(0)),
             random_provider,

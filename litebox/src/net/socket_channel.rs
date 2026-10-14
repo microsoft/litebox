@@ -4,6 +4,7 @@
 //! Socket I/O and readiness proxies.
 
 use core::net::SocketAddr;
+use litebox_broker_protocol::ObjectHandle;
 use litebox_platform::time::TimeProvider;
 
 use crate::{
@@ -74,6 +75,15 @@ pub enum NetworkProxy<Platform: RawSyncPrimitivesProvider + TimeProvider> {
 }
 
 impl<Platform: RawSyncPrimitivesProvider + TimeProvider> NetworkProxy<Platform> {
+    /// The broker handle of this socket, which stays open until the socket
+    /// closes.
+    pub(crate) fn handle(&self) -> ObjectHandle {
+        match self {
+            Self::BrokerStream(socket) => socket.handle(),
+            Self::BrokerDatagram(socket) => socket.handle(),
+        }
+    }
+
     /// Set the socket state.
     pub fn set_state(&self, state: SocketState) {
         match self {

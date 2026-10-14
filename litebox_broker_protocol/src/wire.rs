@@ -33,6 +33,7 @@ mod pipe;
 mod primitive;
 mod process;
 mod process_group;
+mod readiness_queue;
 mod signal;
 mod socket;
 mod thread;
@@ -55,6 +56,7 @@ const REQUEST_TAG_SET_STATUS_FLAGS: u8 = 12;
 const REQUEST_TAG_SIGNAL: u8 = 13;
 const REQUEST_TAG_PROCESS_GROUP: u8 = 14;
 const REQUEST_TAG_UNIX_SOCKET: u8 = 15;
+const REQUEST_TAG_READINESS_QUEUE: u8 = 16;
 
 // Paired request and successful-response tags intentionally share values.
 const RESPONSE_TAG_NEGOTIATED: u8 = 0;
@@ -73,6 +75,7 @@ const RESPONSE_TAG_STATUS_FLAGS_SET: u8 = 12;
 const RESPONSE_TAG_SIGNAL: u8 = 13;
 const RESPONSE_TAG_PROCESS_GROUP: u8 = 14;
 const RESPONSE_TAG_UNIX_SOCKET: u8 = 15;
+const RESPONSE_TAG_READINESS_QUEUE: u8 = 16;
 
 // Reserve the top of the tag space for responses without paired requests.
 const RESPONSE_TAG_ERROR: u8 = 253;
@@ -136,7 +139,8 @@ pub fn decode_handshake_request(frame: &[u8]) -> Result<BrokerHandshakeRequest, 
         | REQUEST_TAG_SET_STATUS_FLAGS
         | REQUEST_TAG_SIGNAL
         | REQUEST_TAG_PROCESS_GROUP
-        | REQUEST_TAG_UNIX_SOCKET => {
+        | REQUEST_TAG_UNIX_SOCKET
+        | REQUEST_TAG_READINESS_QUEUE => {
             return Err(WireError::WrongMessagePhase);
         }
         _ => return Err(WireError::InvalidTag),
@@ -231,6 +235,11 @@ pub fn encode_request(request: BrokerRequest) -> Vec<u8> {
             encoder.request_id(request_id);
             unix_socket::encode_unix_socket_request(&mut encoder, request);
         }
+        BrokerOperation::ReadinessQueue(request) => {
+            encoder.u8(REQUEST_TAG_READINESS_QUEUE);
+            encoder.request_id(request_id);
+            readiness_queue::encode_readiness_queue_request(&mut encoder, request);
+        }
     }
     encoder.finish()
 }
@@ -255,7 +264,8 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         | REQUEST_TAG_SET_STATUS_FLAGS
         | REQUEST_TAG_SIGNAL
         | REQUEST_TAG_PROCESS_GROUP
-        | REQUEST_TAG_UNIX_SOCKET => {}
+        | REQUEST_TAG_UNIX_SOCKET
+        | REQUEST_TAG_READINESS_QUEUE => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -283,6 +293,9 @@ pub fn decode_request(frame: &[u8]) -> Result<BrokerRequest, WireError> {
         REQUEST_TAG_UNIX_SOCKET => {
             BrokerOperation::UnixSocket(unix_socket::decode_unix_socket_request(&mut decoder)?)
         }
+        REQUEST_TAG_READINESS_QUEUE => BrokerOperation::ReadinessQueue(
+            readiness_queue::decode_readiness_queue_request(&mut decoder)?,
+        ),
         _ => unreachable!("active request tag was validated"),
     };
     decoder.finish()?;
@@ -363,7 +376,8 @@ pub fn decode_handshake_response(frame: &[u8]) -> Result<BrokerHandshakeResponse
         | RESPONSE_TAG_STATUS_FLAGS_SET
         | RESPONSE_TAG_SIGNAL
         | RESPONSE_TAG_PROCESS_GROUP
-        | RESPONSE_TAG_UNIX_SOCKET => {
+        | RESPONSE_TAG_UNIX_SOCKET
+        | RESPONSE_TAG_READINESS_QUEUE => {
             return Err(WireError::WrongMessagePhase);
         }
         RESPONSE_TAG_VERSION_MISMATCH => BrokerHandshakeResponse::VersionMismatch {
@@ -458,6 +472,11 @@ pub fn encode_response(response: BrokerResponse) -> Vec<u8> {
             encoder.request_id(request_id);
             unix_socket::encode_unix_socket_response(&mut encoder, response);
         }
+        BrokerResult::ReadinessQueue(response) => {
+            encoder.u8(RESPONSE_TAG_READINESS_QUEUE);
+            encoder.request_id(request_id);
+            readiness_queue::encode_readiness_queue_response(&mut encoder, response);
+        }
         BrokerResult::Error(error) => {
             encoder.u8(RESPONSE_TAG_ERROR);
             encoder.request_id(request_id);
@@ -490,7 +509,8 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         | RESPONSE_TAG_STATUS_FLAGS_SET
         | RESPONSE_TAG_SIGNAL
         | RESPONSE_TAG_PROCESS_GROUP
-        | RESPONSE_TAG_UNIX_SOCKET => {}
+        | RESPONSE_TAG_UNIX_SOCKET
+        | RESPONSE_TAG_READINESS_QUEUE => {}
         _ => return Err(WireError::InvalidTag),
     }
     let request_id = decoder.request_id()?;
@@ -519,6 +539,9 @@ pub fn decode_response(frame: &[u8]) -> Result<BrokerResponse, WireError> {
         RESPONSE_TAG_UNIX_SOCKET => {
             BrokerResult::UnixSocket(unix_socket::decode_unix_socket_response(&mut decoder)?)
         }
+        RESPONSE_TAG_READINESS_QUEUE => BrokerResult::ReadinessQueue(
+            readiness_queue::decode_readiness_queue_response(&mut decoder)?,
+        ),
         _ => unreachable!("active response tag was validated"),
     };
     decoder.finish()?;
@@ -611,9 +634,10 @@ mod tests {
     };
     use crate::message::{
         EventRequest, EventResponse, FileRequest, FileResponse, PipeRequest, PipeResponse,
-        ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse, SignalRequest,
-        SignalResponse, SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest,
-        TimerResponse, UnixSocketRequest, UnixSocketResponse,
+        ProcessGroupRequest, ProcessGroupResponse, ProcessRequest, ProcessResponse,
+        ReadinessQueueRequest, ReadinessQueueResponse, SignalRequest, SignalResponse,
+        SocketRequest, SocketResponse, ThreadRequest, ThreadResponse, TimerRequest, TimerResponse,
+        UnixSocketRequest, UnixSocketResponse,
     };
     use crate::pipe::{
         CreatePipeRequest, CreatePipeResponse, ReadPipeRequest, ReadPipeResponse, WritePipeRequest,
@@ -625,6 +649,12 @@ mod tests {
         WriteChildMemoryRequest,
     };
     use crate::process_group::{ProcessGroupMembership, SetProcessGroupRequest};
+    use crate::readiness_queue::{
+        AddReadinessQueueEntryRequest, CreateReadinessQueueResponse,
+        ModifyReadinessQueueEntryRequest, ReadinessQueueEntryFlags, ReadinessQueueError,
+        ReadinessQueueInterest, RemoveReadinessQueueEntryRequest, TakeReadyRequest,
+        TakeReadyResponse,
+    };
     use crate::shared_buffer::{
         MAX_SHARED_BUFFER_SEQUENCE_SLOTS, SHARED_BUFFER_SLOT_SIZE, SharedBufferSequence,
         SharedBufferSlotIndex,
@@ -705,6 +735,7 @@ mod tests {
                 RESPONSE_TAG_SIGNAL,
                 RESPONSE_TAG_PROCESS_GROUP,
                 RESPONSE_TAG_UNIX_SOCKET,
+                RESPONSE_TAG_READINESS_QUEUE,
             ],
             [
                 REQUEST_TAG_NEGOTIATE,
@@ -723,10 +754,11 @@ mod tests {
                 REQUEST_TAG_SIGNAL,
                 REQUEST_TAG_PROCESS_GROUP,
                 REQUEST_TAG_UNIX_SOCKET,
+                REQUEST_TAG_READINESS_QUEUE,
             ]
         );
         // Top-level tags are consecutive.
-        assert_eq!(REQUEST_TAG_UNIX_SOCKET, 15);
+        assert_eq!(REQUEST_TAG_READINESS_QUEUE, 16);
         assert_eq!(
             [
                 RESPONSE_TAG_ERROR,
@@ -807,6 +839,38 @@ mod tests {
             })),
             BrokerOperation::Timer(TimerRequest::Get(GetTimerRequest { handle })),
             BrokerOperation::Timer(TimerRequest::Read(ReadTimerRequest { handle })),
+            BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Create),
+            BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
+                AddReadinessQueueEntryRequest {
+                    queue: handle,
+                    target: ObjectHandle(u64::MAX),
+                    key: u64::MAX,
+                    interest: ReadinessQueueInterest {
+                        readiness: ReadinessFlags(u32::MAX),
+                        flags: ReadinessQueueEntryFlags::all(),
+                        token: u64::MAX,
+                    },
+                },
+            )),
+            BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Modify(
+                ModifyReadinessQueueEntryRequest {
+                    queue: handle,
+                    target: ObjectHandle(7),
+                    key: 0,
+                    interest: ReadinessQueueInterest::default(),
+                },
+            )),
+            BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Remove(
+                RemoveReadinessQueueEntryRequest {
+                    queue: handle,
+                    target: ObjectHandle(7),
+                    key: 3,
+                },
+            )),
+            BrokerOperation::ReadinessQueue(ReadinessQueueRequest::TakeReady(TakeReadyRequest {
+                queue: handle,
+                buffer: sequence(4, 48),
+            })),
             BrokerOperation::Signal(SignalRequest::Open),
             BrokerOperation::Signal(SignalRequest::Send(SendSignalRequest {
                 target: SignalTarget::Process(process_id(u32::MAX)),
@@ -1417,6 +1481,21 @@ mod tests {
             BrokerResult::UnixSocket(UnixSocketResponse::Failed(UnixSocketError::File(
                 FileError::NoSuchFileOrDirectory,
             ))),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Create(
+                CreateReadinessQueueResponse { handle },
+            )),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Add),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Modify),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Remove),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::TakeReady(TakeReadyResponse {
+                count: u32::MAX,
+            })),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Failed(
+                ReadinessQueueError::AlreadyRegistered,
+            )),
+            BrokerResult::ReadinessQueue(ReadinessQueueResponse::Failed(
+                ReadinessQueueError::NotRegistered,
+            )),
             BrokerResult::Signal(SignalResponse::Open(OpenSignalsResponse { handle })),
             BrokerResult::Signal(SignalResponse::Sent),
             BrokerResult::Signal(SignalResponse::Take(SignalEvent::Signal(PendingSignal {
@@ -1764,6 +1843,33 @@ mod tests {
         unknown_signal_request[9] = 0xff;
         assert_eq!(
             decode_request(&unknown_signal_request),
+            Err(WireError::InvalidTag)
+        );
+        let mut unknown_readiness_queue_request = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Create),
+        });
+        unknown_readiness_queue_request[9] = 0xff;
+        assert_eq!(
+            decode_request(&unknown_readiness_queue_request),
+            Err(WireError::InvalidTag)
+        );
+        let mut unknown_readiness_queue_flags = encode_request(BrokerRequest {
+            request_id: TEST_REQUEST_ID,
+            operation: BrokerOperation::ReadinessQueue(ReadinessQueueRequest::Add(
+                AddReadinessQueueEntryRequest {
+                    queue: ObjectHandle(1),
+                    target: ObjectHandle(2),
+                    key: 3,
+                    interest: ReadinessQueueInterest::default(),
+                },
+            )),
+        });
+        // Tag, request ID, family tag, two handles, key, and readiness
+        // precede the entry flags.
+        unknown_readiness_queue_flags[38] = 1 << 7;
+        assert_eq!(
+            decode_request(&unknown_readiness_queue_flags),
             Err(WireError::InvalidTag)
         );
         let truncated_signal_send = encode_request(BrokerRequest {
@@ -2390,6 +2496,18 @@ mod tests {
         unknown_timer_response[9] = 0xff;
         assert_eq!(
             decode_response(&unknown_timer_response),
+            Err(WireError::InvalidTag)
+        );
+
+        let mut unknown_readiness_queue_error = encode_response(BrokerResponse {
+            request_id: TEST_REQUEST_ID,
+            result: BrokerResult::ReadinessQueue(ReadinessQueueResponse::Failed(
+                ReadinessQueueError::NotRegistered,
+            )),
+        });
+        unknown_readiness_queue_error[10] = 0xff;
+        assert_eq!(
+            decode_response(&unknown_readiness_queue_error),
             Err(WireError::InvalidTag)
         );
 

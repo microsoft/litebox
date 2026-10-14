@@ -7,7 +7,6 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::fmt;
 use core::net::{Ipv4Addr, SocketAddrV4};
-use core::sync::atomic::{AtomicUsize, Ordering};
 
 use hashbrown::HashSet;
 use litebox_broker_protocol::ObjectHandle;
@@ -21,7 +20,8 @@ use litebox_broker_protocol::socket::{
 use spin::Mutex;
 
 use crate::object::{ObjectEntry, ObjectRights};
-use crate::readiness::{ReadinessRegistration, ReadinessSink};
+use crate::quota::QuotaReservation;
+use crate::readiness::{ReadinessRegistration, ReadinessSink, SharedReadinessWatchers};
 use crate::{BrokerError, BrokerProcess, ProcessId, Result};
 
 const DEFAULT_TCP_LISTEN_ADDRESS: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
@@ -655,8 +655,13 @@ pub fn create(
         .core
         .policy
         .authorize_socket_create(process.caller_credential, request)?;
-    let quota = Arc::new(SocketQuotaReservation::new(process)?);
+    let quota = Arc::new(reserve_socket(process)?);
     let reference = process.reserve_object_reference(rights)?;
+    let watchers = SharedReadinessWatchers::default();
+    let readiness_sink = Arc::new(SocketReadinessSink {
+        owner: readiness_sink,
+        watchers: watchers.clone(),
+    });
     let readiness =
         ReadinessRegistration::new_with_retirement_guard(reference.handle(), readiness_sink, quota);
     let platform_socket =
@@ -677,6 +682,7 @@ pub fn create(
     let resource = Arc::new(SocketResource {
         platform_socket,
         readiness,
+        watchers,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(None),
     });
@@ -975,8 +981,13 @@ pub fn accept(
         .core
         .policy
         .principal_object_rights(process.caller_credential)?;
-    let quota = Arc::new(SocketQuotaReservation::new(process)?);
+    let quota = Arc::new(reserve_socket(process)?);
     let reference = process.reserve_object_reference(rights)?;
+    let watchers = SharedReadinessWatchers::default();
+    let readiness_sink = Arc::new(SocketReadinessSink {
+        owner: readiness_sink,
+        watchers: watchers.clone(),
+    });
     let readiness =
         ReadinessRegistration::new_with_retirement_guard(reference.handle(), readiness_sink, quota);
     let accepted = match listener_resource.platform_socket.accept(readiness.clone()) {
@@ -1004,6 +1015,7 @@ pub fn accept(
     let resource = Arc::new(SocketResource {
         platform_socket: socket,
         readiness,
+        watchers,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(Some(guest_source_lease)),
     });
@@ -1977,11 +1989,20 @@ impl SocketObject {
     pub(crate) fn resource(&self) -> Arc<SocketResource> {
         Arc::clone(&self.resource)
     }
+
+    /// Publishes this socket's later readiness changes through
+    /// `registration` until every clone of `registration` drops.
+    pub(crate) fn watch(&self, registration: &ReadinessRegistration) -> Result<()> {
+        self.resource.watchers.watch(registration)
+    }
 }
 
 pub(crate) struct SocketResource {
     platform_socket: Arc<dyn PlatformSocket>,
     readiness: ReadinessRegistration,
+    /// Registrations other than the owner's, such as readiness queue entries,
+    /// which the provider's publications also wake.
+    watchers: SharedReadinessWatchers,
     port_binding: Mutex<Option<Arc<GuestPortBinding>>>,
     guest_source_lease: Mutex<Option<GuestSourceLease>>,
 }
@@ -2078,50 +2099,43 @@ impl Drop for SocketResource {
     }
 }
 
-struct SocketQuotaReservation {
-    global: Arc<AtomicUsize>,
-    process: Arc<AtomicUsize>,
+/// Charges one socket resource to the broker and to `process`.
+fn reserve_socket(process: &BrokerProcess) -> Result<QuotaReservation> {
+    QuotaReservation::new(
+        &process.core.reserved_sockets,
+        process.core.limits.max_sockets,
+        &process.reserved_sockets,
+        process.core.limits.max_sockets_per_process,
+    )
 }
 
-impl SocketQuotaReservation {
-    fn new(process: &BrokerProcess) -> Result<Self> {
-        reserve_socket(
-            &process.core.reserved_sockets,
-            process.core.limits.max_sockets,
-        )?;
-        if reserve_socket(
-            &process.reserved_sockets,
-            process.core.limits.max_sockets_per_process,
-        )
-        .is_err()
-        {
-            process
-                .core
-                .reserved_sockets
-                .fetch_sub(1, Ordering::Relaxed);
-            return Err(BrokerError::ResourceExhausted);
-        }
-        Ok(Self {
-            global: Arc::clone(&process.core.reserved_sockets),
-            process: Arc::clone(&process.reserved_sockets),
-        })
+/// Readiness sink of one socket resource, which forwards its provider's
+/// publications to the owning association and wakes the socket's watchers.
+struct SocketReadinessSink {
+    owner: Arc<dyn ReadinessSink>,
+    watchers: SharedReadinessWatchers,
+}
+
+impl ReadinessSink for SocketReadinessSink {
+    fn max_tracked_objects(&self) -> usize {
+        self.owner.max_tracked_objects()
     }
-}
 
-impl Drop for SocketQuotaReservation {
-    fn drop(&mut self) {
-        self.process.fetch_sub(1, Ordering::Relaxed);
-        self.global.fetch_sub(1, Ordering::Relaxed);
+    fn publish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        let result = self.owner.publish(handle, readiness);
+        self.watchers.publish(readiness);
+        result
     }
-}
 
-fn reserve_socket(counter: &AtomicUsize, limit: usize) -> Result<()> {
-    counter
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
-            reserved.checked_add(1).filter(|next| *next <= limit)
-        })
-        .map(|_| ())
-        .map_err(|_| BrokerError::ResourceExhausted)
+    fn republish(&self, handle: ObjectHandle, readiness: ReadinessFlags) -> Result<()> {
+        let result = self.owner.republish(handle, readiness);
+        self.watchers.publish(readiness);
+        result
+    }
+
+    fn retire(&self, handle: ObjectHandle) {
+        self.owner.retire(handle);
+    }
 }
 
 #[cfg(test)]

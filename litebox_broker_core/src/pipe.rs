@@ -303,7 +303,7 @@ impl PipeState {
                     readiness = readiness | ReadinessFlags::READ;
                 }
                 if !self.write_open {
-                    readiness = readiness | ReadinessFlags::HANGUP;
+                    readiness = readiness | ReadinessFlags::CLOSED;
                 }
                 readiness
             }

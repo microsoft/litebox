@@ -14,6 +14,7 @@ use crate::event::EventObject;
 use crate::fs::File;
 use crate::pipe::PipeObject;
 use crate::readiness::{ReadinessRegistration, ReadinessSink};
+use crate::readiness_queue::ReadinessQueueObject;
 use crate::signal::SignalsObject;
 use crate::socket::SocketObject;
 use crate::timer::TimerObject;
@@ -53,6 +54,7 @@ pub(crate) enum ObjectEntry {
     Socket(SocketObject),
     Signals(SignalsObject),
     Timer(TimerObject),
+    ReadinessQueue(ReadinessQueueObject),
 }
 
 // Each object kind's module defines its own accessor in an `impl ObjectEntry`
@@ -70,7 +72,8 @@ impl ObjectEntry {
             | Self::File(_)
             | Self::UnixSocket(_)
             | Self::Pipe(_)
-            | Self::Timer(_) => true,
+            | Self::Timer(_)
+            | Self::ReadinessQueue(_) => true,
             Self::Socket(_) | Self::Signals(_) => false,
         }
     }
@@ -94,7 +97,26 @@ impl ObjectEntry {
             Self::UnixSocket(socket) => watch(&|registration| socket.watch(registration)),
             Self::Pipe(pipe) => watch(&|registration| pipe.watch(registration)),
             Self::Timer(timer) => watch(&|registration| timer.watch(registration)),
+            Self::ReadinessQueue(queue) => watch(&|registration| queue.watch(registration)),
             Self::Socket(_) | Self::Signals(_) => Ok(None),
+        }
+    }
+
+    /// Publishes this object's later readiness changes through
+    /// `registration` until every clone of `registration` drops, such as for
+    /// a readiness queue entry watching it.
+    ///
+    /// Fails with `UnsupportedOperation` if the object never publishes its
+    /// readiness, or is itself a readiness queue.
+    pub(crate) fn add_watcher(&self, registration: &ReadinessRegistration) -> Result<()> {
+        match self {
+            Self::Event(event) => event.watch(registration),
+            Self::File(file) => file.add_watcher(registration),
+            Self::UnixSocket(socket) => socket.watch(registration),
+            Self::Pipe(pipe) => pipe.watch(registration),
+            Self::Socket(socket) => socket.watch(registration),
+            Self::Timer(timer) => timer.watch(registration),
+            Self::Signals(_) | Self::ReadinessQueue(_) => Err(BrokerError::UnsupportedOperation),
         }
     }
 }
@@ -166,6 +188,7 @@ pub(crate) fn readiness(object: &RwLock<ObjectEntry>) -> Result<ReadinessFlags> 
             ObjectEntry::Pipe(pipe) => return Ok(pipe.readiness()),
             ObjectEntry::Signals(signals) => return Ok(signals.readiness()),
             ObjectEntry::Timer(timer) => return Ok(timer.readiness()),
+            ObjectEntry::ReadinessQueue(queue) => return Ok(queue.readiness()),
             ObjectEntry::Socket(socket) => socket.resource(),
         }
     };
@@ -183,6 +206,7 @@ pub(crate) fn get_status_flags(
         ObjectEntry::UnixSocket(socket) => return Ok(socket.get_status_flags()),
         ObjectEntry::Pipe(pipe) => return Ok(pipe.get_status_flags()),
         ObjectEntry::Timer(timer) => return Ok(timer.get_status_flags()),
+        ObjectEntry::ReadinessQueue(queue) => return Ok(queue.get_status_flags()),
         ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),
     };
     crate::fs::get_status_flags(process, &file)
@@ -211,6 +235,10 @@ pub(crate) fn set_status_flags(
         }
         ObjectEntry::Timer(timer) => {
             timer.set_status_flags(mask, flags);
+            return Ok(());
+        }
+        ObjectEntry::ReadinessQueue(queue) => {
+            queue.set_status_flags(mask, flags);
             return Ok(());
         }
         ObjectEntry::Socket(_) | ObjectEntry::Signals(_) => return Err(BrokerError::InvalidRights),

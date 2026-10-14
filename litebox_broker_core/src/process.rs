@@ -195,6 +195,8 @@ pub struct BrokerProcess {
     pub(crate) unix_socket_bytes: Arc<AtomicUsize>,
     /// Socket quota held by pending, live, and closing in-flight resources.
     pub(crate) reserved_sockets: Arc<AtomicUsize>,
+    /// Readiness queue entries added by this process that are still live.
+    pub(crate) readiness_queue_entries: Arc<AtomicUsize>,
     /// Signals and child exits this process has not taken.
     pub(crate) signals: Arc<ProcessSignals>,
     /// Cancellation state of this process's association.
@@ -363,6 +365,7 @@ impl BrokerProcess {
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
             reserved_sockets: Arc::new(AtomicUsize::new(0)),
+            readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),
             cancellation: AssociationCancellation::default(),
         }
@@ -2194,7 +2197,7 @@ mod tests {
         assert_eq!(take_republished(&child_sink), []);
 
         assert_eq!(child.close_object_reference(child_writer), Ok(()));
-        let hangup = ReadinessFlags::READ | ReadinessFlags::HANGUP;
+        let hangup = ReadinessFlags::READ | ReadinessFlags::CLOSED;
         assert_eq!(take_republished(&parent_sink), [(reader, hangup)]);
         assert_eq!(take_republished(&child_sink), []);
         assert_eq!(*child_sink.retired.lock().unwrap(), [child_writer]);
@@ -2337,7 +2340,7 @@ mod tests {
         assert!(
             root.check_readiness(read)
                 .unwrap()
-                .contains(ReadinessFlags::HANGUP)
+                .contains(ReadinessFlags::CLOSED)
         );
         assert_eq!(broker.active_thread_count.load(Ordering::Relaxed), 0);
         assert!(broker.processes.read().contains_key(&child_id));
@@ -2618,7 +2621,7 @@ mod tests {
             !root
                 .check_readiness(read)
                 .unwrap()
-                .contains(ReadinessFlags::HANGUP)
+                .contains(ReadinessFlags::CLOSED)
         );
         assert_eq!(
             root.collect_child_exit(ChildSelector::Any),
@@ -4126,7 +4129,7 @@ mod tests {
         assert_eq!(broker.reserved_pipe_capacity.load(Ordering::Relaxed), 4);
         assert_eq!(
             process.check_readiness(reader),
-            Ok(ReadinessFlags::READ | ReadinessFlags::HANGUP)
+            Ok(ReadinessFlags::READ | ReadinessFlags::CLOSED)
         );
         assert_eq!(
             crate::pipe::read(&process, reader, 4),

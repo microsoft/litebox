@@ -914,8 +914,8 @@ fn exec_inherits_only_transferable_descriptors() {
         })
     };
 
-    // Broker files, pipes, and eventfds transfer. Close-on-exec descriptors stay behind whatever
-    // their kind, but others must be broker objects.
+    // Broker files, pipes, eventfds, and epoll instances transfer. Close-on-exec descriptors stay
+    // behind whatever their kind, but others must be broker objects.
     let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 3, 4]));
     task.sys_close(read_fd.try_into().unwrap()).unwrap();
@@ -925,14 +925,13 @@ fn exec_inherits_only_transferable_descriptors() {
     task.sys_close(eventfd.try_into().unwrap()).unwrap();
     let epoll = task
         .sys_epoll_create(EpollCreateFlags::EPOLL_CLOEXEC)
-        .unwrap()
-        .try_into()
         .unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2]));
-    task.sys_fcntl(epoll, FcntlArg::SETFD(FileDescriptorFlags::empty()))
+    let epoll_fd = epoll.try_into().unwrap();
+    task.sys_fcntl(epoll_fd, FcntlArg::SETFD(FileDescriptorFlags::empty()))
         .unwrap();
-    assert_eq!(inherited(), Err(Errno::EAGAIN));
-    task.sys_close(epoll).unwrap();
+    assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, epoll]));
+    task.sys_close(epoll_fd).unwrap();
 
     // A fresh runner installs descriptors at most a bounded distance apart.
     assert_eq!(task.sys_dup(1, Some(258), None), Ok(258));

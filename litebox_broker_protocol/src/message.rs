@@ -25,6 +25,10 @@ use crate::process::{
 };
 use crate::process_group::SetProcessGroupRequest;
 use crate::readiness::ReadinessFlags;
+use crate::readiness_queue::{
+    AddReadinessQueueEntryRequest, CreateReadinessQueueResponse, ModifyReadinessQueueEntryRequest,
+    ReadinessQueueError, RemoveReadinessQueueEntryRequest, TakeReadyRequest, TakeReadyResponse,
+};
 use crate::shared_buffer::SharedBufferSequence;
 use crate::signal::{OpenSignalsResponse, SendSignalRequest, SignalEvent, TakeSignalRequest};
 use crate::socket::{
@@ -90,6 +94,8 @@ pub enum BrokerOperation {
     Signal(SignalRequest),
     /// Unix socket request family.
     UnixSocket(UnixSocketRequest),
+    /// Readiness queue request family.
+    ReadinessQueue(ReadinessQueueRequest),
 }
 
 impl BrokerOperation {
@@ -141,7 +147,11 @@ impl BrokerOperation {
                 | UnixSocketRequest::Send(SendUnixSocketRequest { buffer, .. })
                 | UnixSocketRequest::Receive(ReceiveUnixSocketRequest { buffer, .. })
                 | UnixSocketRequest::GetName(GetUnixSocketNameRequest { buffer, .. }),
-            ) => Some(*buffer),
+            )
+            | Self::ReadinessQueue(ReadinessQueueRequest::TakeReady(TakeReadyRequest {
+                buffer,
+                ..
+            })) => Some(*buffer),
             Self::Thread(_)
             | Self::CloseObject(_)
             | Self::CheckReadiness(_)
@@ -188,6 +198,12 @@ impl BrokerOperation {
                 | UnixSocketRequest::Shutdown(_)
                 | UnixSocketRequest::SetOption(_)
                 | UnixSocketRequest::GetOption(_),
+            )
+            | Self::ReadinessQueue(
+                ReadinessQueueRequest::Create
+                | ReadinessQueueRequest::Add(_)
+                | ReadinessQueueRequest::Modify(_)
+                | ReadinessQueueRequest::Remove(_),
             ) => None,
         }
     }
@@ -258,6 +274,21 @@ pub enum TimerRequest {
     Get(GetTimerRequest),
     /// Consume a timer's pending expirations.
     Read(ReadTimerRequest),
+}
+
+/// Broker-owned readiness queue request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadinessQueueRequest {
+    /// Create an empty readiness queue.
+    Create,
+    /// Add an entry watching another object.
+    Add(AddReadinessQueueEntryRequest),
+    /// Replace an entry's interest.
+    Modify(ModifyReadinessQueueEntryRequest),
+    /// Remove an entry.
+    Remove(RemoveReadinessQueueEntryRequest),
+    /// Take ready events without waiting.
+    TakeReady(TakeReadyRequest),
 }
 
 /// Request about the caller's threads.
@@ -454,6 +485,8 @@ pub enum BrokerResult {
     Signal(SignalResponse),
     /// Unix socket response family.
     UnixSocket(UnixSocketResponse),
+    /// Readiness queue response family.
+    ReadinessQueue(ReadinessQueueResponse),
     /// Operation failed with an ABI-neutral broker error.
     Error(ErrorCode),
 }
@@ -489,6 +522,26 @@ pub enum TimerResponse {
     Get(GetTimerResponse),
     /// Read operation response.
     Read(ReadTimerResponse),
+}
+
+/// Broker-owned readiness queue response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadinessQueueResponse {
+    /// Create operation response.
+    Create(CreateReadinessQueueResponse),
+    /// Add operation completed.
+    Add,
+    /// Modify operation completed.
+    Modify,
+    /// Remove operation completed.
+    Remove,
+    /// Take-ready operation response.
+    TakeReady(TakeReadyResponse),
+    /// The operation failed in a way the guest ABI reports.
+    ///
+    /// Waiting, resource, and request-validation failures use
+    /// [`BrokerResult::Error`] instead.
+    Failed(ReadinessQueueError),
 }
 
 /// Response to a thread request.
