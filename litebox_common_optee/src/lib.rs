@@ -359,9 +359,6 @@ impl TeeObjHandle {
     pub const NULL: Self = TeeObjHandle(0);
 
     /// Converts a machine-sized value into an OP-TEE object handle.
-    ///
-    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
-    /// handle representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -378,9 +375,6 @@ pub struct TeeCrypStateHandle(pub u32);
 
 impl TeeCrypStateHandle {
     /// Converts a machine-sized value into an OP-TEE cryptographic-state handle.
-    ///
-    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
-    /// handle representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -396,9 +390,6 @@ pub struct TaSessionId(pub u32);
 
 impl TaSessionId {
     /// Converts a machine-sized value into a trusted-application session ID.
-    ///
-    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
-    /// session ID representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
@@ -415,9 +406,6 @@ pub struct CommandId(pub u32);
 
 impl CommandId {
     /// Converts a machine-sized value into a trusted-application command ID.
-    ///
-    /// Returns [`TeeResult::BadParameters`] if the value does not fit in the
-    /// command ID representation.
     pub fn try_from_usize(value: usize) -> Result<Self, TeeResult> {
         u32::try_from(value)
             .map_err(|_| TeeResult::BadParameters)
