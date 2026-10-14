@@ -643,6 +643,11 @@ fn test_tcp_reconnect_after_lost_connection() {
     assert!(matches!(err, ConnectError::ConnectionReset));
     pump(&mut network);
     assert_unconnected(&client);
+    let mut buf = [0; 3];
+    let err = network
+        .receive(&client_fd, &mut buf, ReceiveFlags::empty(), None)
+        .unwrap_err();
+    assert!(matches!(err, ReceiveError::SocketInInvalidState));
 
     // Another attempt then starts afresh.
     let err = network.connect(&client_fd, &addr, false).unwrap_err();

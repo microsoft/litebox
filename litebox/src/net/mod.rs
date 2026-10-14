@@ -1706,6 +1706,13 @@ where
         }
 
         let ret = match socket_handle.protocol() {
+            // An unconnected socket has no connection to receive from, even if smoltcp still
+            // holds data of a failed one.
+            Protocol::Tcp
+                if socket_handle.specific.tcp().connect_state == ConnectState::Unconnected =>
+            {
+                Err(ReceiveError::SocketInInvalidState)
+            }
             Protocol::Tcp => {
                 if let Some(source_addr) = source_addr {
                     // TCP is connection-oriented, so no need to provide a source address

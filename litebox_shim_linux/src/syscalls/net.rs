@@ -2534,10 +2534,14 @@ mod tests {
             litebox_common_linux::FcntlArg::SETFL(litebox::fs::OFlags::empty()),
         )
         .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let blocked = task.spawn_clone_for_test(move |task| {
             let fd = typed_socket(&task, raw_fd);
+            started_tx.send(()).unwrap();
             task.do_connect(&fd, address([10, 0, 0, 1], SERVER_PORT))
         });
+        // Give the call time to start waiting before the attempt is aborted.
+        started_rx.recv().unwrap();
         std::thread::sleep(core::time::Duration::from_millis(100));
         assert!(!blocked.is_finished());
         task.sys_shutdown(
