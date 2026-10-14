@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use litebox_bootloader::handoff::BootInfo;
 use litebox_common_linux::PtRegs;
 use litebox_common_optee::{UteeEntryFunc, UteeParamOwned};
-use litebox_platform_vm_kernel::{KERNEL_OFFSET, VmKernel};
+use litebox_platform_vm_kernel::{KERNEL_OFFSET, UserThreadState, VmKernel};
 use litebox_shim_optee::session::SessionManager;
 
 struct Payload {
@@ -111,7 +111,11 @@ fn run_ta_with_default_commands(
     let mut ctx = PtRegs::default();
     // Safety: the platform is set up, and threads run one at a time.
     unsafe {
-        litebox_platform_vm_kernel::run_thread_ref(entrypoints, &mut ctx);
+        litebox_platform_vm_kernel::run_thread_ref(
+            entrypoints,
+            &mut ctx,
+            &mut UserThreadState::default(),
+        );
     }
     assert!(
         ctx.rax == 0,
@@ -130,7 +134,11 @@ fn run_ta_with_default_commands(
     let mut ctx = PtRegs::default();
     // Safety: the platform is set up, and threads run one at a time.
     unsafe {
-        litebox_platform_vm_kernel::reenter_thread_ref(entrypoints, &mut ctx);
+        litebox_platform_vm_kernel::reenter_thread_ref(
+            entrypoints,
+            &mut ctx,
+            &mut UserThreadState::default(),
+        );
     }
     assert!(
         ctx.rax == 0,

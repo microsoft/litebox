@@ -3,7 +3,8 @@
 
 //! Test client for standalone programs: runs those of the payload's
 //! `programs.json` in order, and checks how each ends. `programs.json` is an
-//! array of runs:
+//! array of runs, or of `{ "concurrent": [...] }` groups of runs started
+//! together. A run:
 //! - `argv`: `argv[0]` is the program's absolute path (e.g., in
 //!   `rootfs.tar`).
 //! - `envp`: `KEY=VALUE` strings (default none).
@@ -18,10 +19,12 @@
 //! - `min_reflected_syscalls`: default 0; guest syscalls the runner did not
 //!   take directly, so the kernel reflected them.
 //!
+//! In a group, runs share standard input and output, so they take no
+//! `stdin`, `console_stdin`, `expect_stdout`, or `expect_stderr`.
+//!
 //! Output also goes to the console, as it would without this client.
 
-use crate::service::Service;
-use crate::service::program::Programs;
+use crate::service::program::{Programs, Reply};
 use alloc::collections::VecDeque;
 use alloc::ffi::CString;
 use alloc::string::String;
@@ -31,6 +34,19 @@ use litebox_broker_vm_kernel::stdio::Console;
 use litebox_common_vm_abi::program::{ExitStatus, Program};
 use serde::Deserialize;
 use spin::Mutex;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Entry {
+    Run(Run),
+    Concurrent(Concurrent),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Concurrent {
+    concurrent: Vec<Run>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -139,74 +155,115 @@ impl Console for Stdio {
 ///
 /// On a malformed `programs.json`, or any unexpected end of a run.
 pub fn run(json: &[u8], service: &mut Programs, stdio: &Stdio) {
-    let runs: Vec<Run> = serde_json::from_slice(json).expect("malformed programs.json");
-    assert!(!runs.is_empty(), "programs.json has no runs");
-    let strings = |strings: Vec<String>| {
+    let entries: Vec<Entry> = serde_json::from_slice(json).expect("malformed programs.json");
+    assert!(!entries.is_empty(), "programs.json has no runs");
+    let mut index = 0;
+    for entry in entries {
+        match entry {
+            Entry::Run(run) => {
+                run_group(index, alloc::vec![run], service, stdio);
+                index += 1;
+            }
+            Entry::Concurrent(Concurrent { concurrent }) => {
+                assert!(
+                    concurrent.iter().all(|run| run.stdin.is_empty()
+                        && !run.console_stdin
+                        && run.expect_stdout.is_none()
+                        && run.expect_stderr.is_none()),
+                    "runs {index}..: concurrent runs share standard streams, so they take no \
+                     `stdin`, `console_stdin`, `expect_stdout`, or `expect_stderr`"
+                );
+                let len = concurrent.len();
+                run_group(index, concurrent, service, stdio);
+                index += len;
+            }
+        }
+    }
+}
+
+/// Runs `runs`, numbered from `first`, at once, and checks each.
+fn run_group(first: usize, runs: Vec<Run>, service: &mut Programs, stdio: &Stdio) {
+    let strings = |strings: &[String]| {
         strings
-            .into_iter()
-            .map(|string| CString::new(string).expect("programs.json strings have no NUL"))
+            .iter()
+            .map(|string| CString::new(string.as_str()).expect("programs.json strings have no NUL"))
             .collect::<Vec<_>>()
     };
-    for (index, run) in runs.into_iter().enumerate() {
-        let path = run.argv.first().expect("a run has an argv").clone();
-        litebox_util_log::info!(index:% = index, path:% = path; "running");
-        let expected = match (run.expect_exit_code, run.expect_signal) {
-            (code, None) => ExitStatus::Exited {
-                code: code.unwrap_or(0),
-            },
-            (None, Some(signal)) => ExitStatus::Signaled { signal },
-            (Some(_), Some(_)) => {
-                panic!("run {index}: `expect_exit_code` and `expect_signal` exclude each other")
+    let programs: Vec<Program> = (first..)
+        .zip(&runs)
+        .map(|(index, run)| {
+            let path = run.argv.first().expect("a run has an argv").clone();
+            litebox_util_log::info!(index:% = index, path:% = path; "running");
+            Program {
+                path,
+                argv: strings(&run.argv),
+                envp: strings(&run.envp),
             }
-        };
+        })
+        .collect();
+    for (index, run) in (first..).zip(&runs) {
         assert!(
             !run.console_stdin || run.stdin.is_empty(),
             "run {index}: `stdin` and `console_stdin` exclude each other"
         );
-        stdio.take();
-        *stdio.input.lock() = if run.console_stdin {
-            Input::Console
-        } else {
-            Input::Given(run.stdin.into_bytes().into())
-        };
-        let reply = service.call(Program {
-            path: path.clone(),
-            argv: strings(run.argv),
-            envp: strings(run.envp),
-        });
-        let [stdout, stderr] = stdio.take();
-        let status = reply
-            .status
-            .unwrap_or_else(|error| panic!("run {index} ({path}) did not run: {error:?}"));
-        assert_eq!(status, expected, "run {index} ({path}): exit status");
-        for (what, expected, actual) in [
-            ("stdout", run.expect_stdout, stdout),
-            ("stderr", run.expect_stderr, stderr),
-        ] {
-            if let Some(expected) = expected {
-                assert!(
-                    !actual.truncated,
-                    "run {index} ({path}): {what} exceeded the {MAX_RECORDED} bytes recorded, \
-                     so it cannot be checked exactly"
-                );
-                assert!(
-                    expected.as_bytes() == actual.bytes,
-                    "run {index} ({path}): {what} was {:?}, expected {expected:?}",
-                    String::from_utf8_lossy(&actual.bytes)
-                );
-            }
-        }
-        assert!(
-            reply.reflected_syscalls >= run.min_reflected_syscalls,
-            "run {index} ({path}): {} reflected syscalls, expected at least {}",
-            reply.reflected_syscalls,
-            run.min_reflected_syscalls
-        );
-        litebox_util_log::info!(
-            index:% = index,
-            status:? = status,
-            reflected_syscalls:% = reply.reflected_syscalls;
-            "run passed"
-        );
     }
+    stdio.take();
+    // Only a lone run has input.
+    *stdio.input.lock() = if runs.iter().any(|run| run.console_stdin) {
+        Input::Console
+    } else {
+        Input::Given(runs.iter().flat_map(|run| run.stdin.bytes()).collect())
+    };
+    let replies = service.run_concurrently(&programs);
+    let output = stdio.take();
+    for ((index, run), reply) in (first..).zip(runs).zip(replies) {
+        check(index, run, reply, &output);
+    }
+}
+
+/// Checks how run `index` ended; `output` is what its group wrote.
+fn check(index: usize, run: Run, reply: Reply, output: &[Recorded; 2]) {
+    let path = &run.argv[0];
+    let expected = match (run.expect_exit_code, run.expect_signal) {
+        (code, None) => ExitStatus::Exited {
+            code: code.unwrap_or(0),
+        },
+        (None, Some(signal)) => ExitStatus::Signaled { signal },
+        (Some(_), Some(_)) => {
+            panic!("run {index}: `expect_exit_code` and `expect_signal` exclude each other")
+        }
+    };
+    let status = reply
+        .status
+        .unwrap_or_else(|error| panic!("run {index} ({path}) did not run: {error:?}"));
+    assert_eq!(status, expected, "run {index} ({path}): exit status");
+    for (what, expected, actual) in [
+        ("stdout", run.expect_stdout, &output[0]),
+        ("stderr", run.expect_stderr, &output[1]),
+    ] {
+        if let Some(expected) = expected {
+            assert!(
+                !actual.truncated,
+                "run {index} ({path}): {what} exceeded the {MAX_RECORDED} bytes recorded, \
+                 so it cannot be checked exactly"
+            );
+            assert!(
+                expected.as_bytes() == actual.bytes,
+                "run {index} ({path}): {what} was {:?}, expected {expected:?}",
+                String::from_utf8_lossy(&actual.bytes)
+            );
+        }
+    }
+    assert!(
+        reply.reflected_syscalls >= run.min_reflected_syscalls,
+        "run {index} ({path}): {} reflected syscalls, expected at least {}",
+        reply.reflected_syscalls,
+        run.min_reflected_syscalls
+    );
+    litebox_util_log::info!(
+        index:% = index,
+        status:? = status,
+        reflected_syscalls:% = reply.reflected_syscalls;
+        "run passed"
+    );
 }

@@ -10,8 +10,8 @@
 //! initialized platform; key provisioning remains separate and must precede
 //! execution that needs derived keys.
 //!
-//! Assumptions: a single CPU, no scheduler, and not a confidential VM (no
-//! #VE/#VC/#HV).
+//! Assumptions: a single CPU, no kernel threads (the runner may switch user
+//! threads), and not a confidential VM (no #VE/#VC/#HV).
 //!
 //! Devices: [`VmKernel`] is the drivers' [`litebox_hal::dma::Hal`].
 //!
@@ -20,8 +20,8 @@
 //! enabled. External interrupts go to the handler the runner installs
 //! ([`set_interrupt_handler`]); one that interrupted user code then also
 //! enters the shim's `interrupt` (e.g., for the runner's one-shot timer, or
-//! a device's input). There is no scheduling: user code otherwise keeps the
-//! CPU.
+//! a device's input); ending the run there lets the runner preempt the
+//! thread ([`resume_thread_ref`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -954,30 +954,62 @@ unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for VmKernel {
 }
 
 /// Run a user thread until it terminates or returns to the kernel. The shim's
-/// `init` fills `ctx`, which is sanitized before user mode.
+/// `init` fills `ctx`, which is sanitized before user mode. Resets `state`.
 ///
 /// # Safety
 ///
 /// The platform must be set up (see the crate docs), and no other
 /// `run_thread_ref`/`reenter_thread_ref` call may be in progress.
-pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs)
+pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, false);
+    run_thread_inner(shim, ctx, false, state, true);
 }
 
 /// Re-enter a thread, e.g., after `load_ta_context`. The shim's `reenter`
-/// fills `ctx`, which is sanitized before user mode.
+/// fills `ctx`, which is sanitized before user mode. Resets `state`.
 ///
 /// # Safety
 ///
 /// As for [`run_thread_ref`].
-pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut PtRegs)
+pub unsafe fn reenter_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
 where
     T: EnterShim<ExecutionContext = PtRegs>,
 {
-    run_thread_inner(shim, ctx, true);
+    run_thread_inner(shim, ctx, true, state, true);
+}
+
+/// As [`reenter_thread_ref`], but keeps `state`, for a thread suspended
+/// anywhere (e.g., preempted).
+///
+/// # Safety
+///
+/// As for [`run_thread_ref`].
+pub unsafe fn resume_thread_ref<T>(shim: &T, ctx: &mut PtRegs, state: &mut UserThreadState)
+where
+    T: EnterShim<ExecutionContext = PtRegs>,
+{
+    run_thread_inner(shim, ctx, true, state, false);
+}
+
+/// A user thread's state that the platform keeps across its runs, besides
+/// registers and the FS base (the caller's): extended state (x87, SSE), in
+/// the thread's own XSAVE area, and the GS base.
+pub struct UserThreadState {
+    area: alloc::boxed::Box<per_cpu::XsaveArea>,
+    xsaved: per_cpu::XsaveState,
+    gs_base: VirtAddr,
+}
+
+impl Default for UserThreadState {
+    fn default() -> Self {
+        Self {
+            area: alloc::boxed::Box::new(per_cpu::XsaveArea::zeroed()),
+            xsaved: per_cpu::XsaveState::default(),
+            gs_base: VirtAddr::zero(),
+        }
+    }
 }
 
 /// Kernel faults can re-enter a shim handler. Only non-nesting user-entry
@@ -991,10 +1023,21 @@ fn run_thread_inner(
     shim: &dyn EnterShim<ExecutionContext = PtRegs>,
     ctx: &mut PtRegs,
     reenter: bool,
+    state: &mut UserThreadState,
+    reset: bool,
 ) {
     // SWAPGS exposes KernelGsBase to user code.
-    crate::arch::write_kernel_gsbase_msr(VirtAddr::zero());
-    with_per_cpu_variables(|pcv| pcv.asm.reset_user_xsave());
+    if reset {
+        state.gs_base = VirtAddr::zero();
+    }
+    crate::arch::write_kernel_gsbase_msr(state.gs_base);
+    let area = core::ptr::from_mut(&mut *state.area);
+    with_per_cpu_variables(|pcv| {
+        pcv.asm.install_user_xsave(area, state.xsaved);
+        if reset {
+            pcv.asm.reset_user_xsave();
+        }
+    });
     let ctx = core::ptr::from_mut(ctx);
     let thread_ctx = ThreadContext { shim, ctx };
     // `ctx` is passed again so the assembly need not know `ThreadContext`'s layout.
@@ -1003,6 +1046,9 @@ fn run_thread_inner(
     unsafe {
         run_thread_arch(&thread_ctx, ctx, u8::from(reenter));
     }
+    // Not left installed: the thread's area may be freed before the next run.
+    state.xsaved = with_per_cpu_variables(|pcv| pcv.asm.uninstall_user_xsave());
+    state.gs_base = crate::arch::read_kernel_gsbase_msr();
 }
 
 macro_rules! SAVE_CALLEE_SAVED_REGISTERS_ASM {

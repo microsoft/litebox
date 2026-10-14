@@ -11,7 +11,7 @@ use litebox::utils::TruncateExt;
 use litebox_common_optee::{
     TeeIdentity, TeeLogin, TeeParamType, TeeUuid, UteeEntryFunc, UteeParamOwned, UteeParams,
 };
-use litebox_platform_vm_kernel::VmKernel;
+use litebox_platform_vm_kernel::{UserThreadState, VmKernel};
 use litebox_shim_optee::{LoadedProgram, UserConstPtr};
 use serde::Deserialize;
 
@@ -139,6 +139,7 @@ pub fn run_ta_with_test_commands(
                     litebox_platform_vm_kernel::run_thread_ref(
                         info.entrypoints.as_ref().unwrap(),
                         &mut ctx,
+                        &mut UserThreadState::default(),
                     );
                 }
                 assert!(
@@ -170,6 +171,7 @@ pub fn run_ta_with_test_commands(
                 litebox_platform_vm_kernel::reenter_thread_ref(
                     info.entrypoints.as_ref().unwrap(),
                     &mut ctx,
+                    &mut UserThreadState::default(),
                 );
             }
             assert!(

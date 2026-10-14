@@ -5,10 +5,10 @@
 //! [`VmKernel`].
 //!
 //! Assumptions:
-//! - Single CPU, no scheduler: a process runs only inside [`Process::start`]
-//!   or [`Process::call`], until it waits, exits, or is killed.
+//! - Single CPU: processes run only inside [`Process::start`],
+//!   [`Process::call`], or [`sched::run`].
 //! - The kernel does not use FS; user state across switches is the address
-//!   space and the FS base.
+//!   space and the FS base, plus [`UserThreadState`] if preempted.
 //!
 //! Contract: runners are untrusted. Every call is validated and scoped to its
 //! process; identity-bound results use the identity fixed at
@@ -33,6 +33,7 @@ mod memory;
 #[cfg(feature = "optee")]
 pub mod optee;
 pub mod program;
+pub mod sched;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -52,7 +53,9 @@ use litebox_common_vm_abi::{
     UnmapRequest, UpcallFrame, UpcallKind, UserRange, WallClock,
 };
 use litebox_platform::time::{Instant as _, TimeProvider as _};
-use litebox_platform_vm_kernel::{AddressSpaceId, Instant, PinnedUserPages, VmKernel};
+use litebox_platform_vm_kernel::{
+    AddressSpaceId, Instant, PinnedUserPages, UserThreadState, VmKernel,
+};
 use zerocopy::IntoBytes;
 
 use memory::{Mappings, checked_range, copy_from_user, copy_to_user};
@@ -73,11 +76,12 @@ pub struct ProcessConfig<'a> {
 }
 
 /// The kernel's one-shot hardware timer, which processes' [`CallId::SetTimer`]
-/// deadlines share, one at a time: the runner owns it (e.g., a local APIC's).
+/// deadlines and the [scheduler](sched)'s time slices share, one at a time:
+/// the runner owns it (e.g., a local APIC's).
 pub trait ProcessTimer: Sync {
     /// Arms, or with `None` disarms, a one-shot interrupt at `deadline`,
-    /// which a process running then sees as [`UpcallKind::Interrupt`].
-    /// Arming replaces an earlier deadline.
+    /// which interrupts a process running then (see
+    /// [`EnterShim::interrupt`]). Arming replaces an earlier deadline.
     fn arm(&self, deadline: Option<Instant>);
 }
 
@@ -156,6 +160,10 @@ struct Inner {
     /// The broker published notifications (e.g., as it served a request)
     /// that the process has not been interrupted for yet.
     notified: Cell<bool>,
+    /// `None` if no other process needs the CPU.
+    slice_end: Cell<Option<Instant>>,
+    /// Its slice ended, anywhere in ring 3.
+    preempted: Cell<bool>,
 }
 
 pub struct Process {
@@ -163,6 +171,8 @@ pub struct Process {
     ctx: PtRegs,
     /// Saved while another process runs.
     fs_base: usize,
+    /// Kept while preempted.
+    user_state: UserThreadState,
 }
 
 impl Process {
@@ -252,9 +262,12 @@ impl Process {
                 reflected: Cell::new(0),
                 armed_deadline: Cell::new(None),
                 notified: Cell::new(false),
+                slice_end: Cell::new(None),
+                preempted: Cell::new(false),
             },
             ctx: PtRegs::default(),
             fs_base: 0,
+            user_state: UserThreadState::default(),
         })
     }
 
@@ -310,22 +323,15 @@ impl Process {
     ///
     /// If called twice.
     pub fn start(&mut self) -> Result<(), Dead> {
-        assert_eq!(
-            *self.inner.state.borrow(),
-            State::New,
-            "process already started"
-        );
-        self.activate();
-        // Safety: single CPU, and no other thread runs; `ctx` is this
-        // process's context.
-        unsafe { litebox_platform_vm_kernel::run_thread_ref(&self.inner, &mut self.ctx) };
-        self.deactivate();
+        assert!(self.inner.is_new(), "process already started");
+        sched::run(&mut [self]);
         self.settle()?;
         Ok(())
     }
 
     /// Delivers `request` and returns the reply, both envelopes; the reply's
-    /// framing is checked.
+    /// framing is checked. Only this process runs meanwhile; see
+    /// [`sched::run`] for several.
     ///
     /// # Errors
     ///
@@ -333,9 +339,25 @@ impl Process {
     ///
     /// # Panics
     ///
-    /// If the process was not started, or `request` is longer than
-    /// [`MAX_MESSAGE_LEN`].
+    /// As for [`Self::submit`].
     pub fn call(&mut self, request: &[u8]) -> Result<Vec<u8>, Dead> {
+        self.submit(request)?;
+        sched::run(&mut [self]);
+        self.reply()
+    }
+
+    /// Gives `request` to the process, to serve when it next runs (see
+    /// [`sched::run`]); [`Self::reply`] then takes the reply.
+    ///
+    /// # Errors
+    ///
+    /// The process is dead.
+    ///
+    /// # Panics
+    ///
+    /// If the process is not waiting for a request (e.g., not started), or
+    /// `request` is longer than [`MAX_MESSAGE_LEN`].
+    pub fn submit(&mut self, request: &[u8]) -> Result<(), Dead> {
         if let Some(dead) = self.dead() {
             return Err(dead);
         }
@@ -352,10 +374,20 @@ impl Process {
         };
         self.inner.entries.set(0);
         self.inner.reflected.set(0);
-        self.activate();
-        // Safety: as in `start`.
-        unsafe { litebox_platform_vm_kernel::reenter_thread_ref(&self.inner, &mut self.ctx) };
-        self.deactivate();
+        Ok(())
+    }
+
+    /// The reply to the request from [`Self::submit`], once [`sched::run`]
+    /// has run the process.
+    ///
+    /// # Errors
+    ///
+    /// The process died serving the request.
+    ///
+    /// # Panics
+    ///
+    /// If there is no reply: no request was submitted, or it was not run.
+    pub fn reply(&mut self) -> Result<Vec<u8>, Dead> {
         let reply = self.settle()?;
         log::debug!(
             "request served with {} kernel entries ({} reflected syscalls)",
@@ -386,14 +418,16 @@ impl Process {
     }
 
     /// The waiting process's reply, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// If the process still has to run (see [`sched::run`]).
     fn settle(&self) -> Result<Option<Vec<u8>>, Dead> {
         match &mut *self.inner.state.borrow_mut() {
-            State::Waiting { reply, .. } => return Ok(reply.take()),
-            State::Dead(dead) => return Err(*dead),
-            _ => {}
+            State::Waiting { reply, .. } => Ok(reply.take()),
+            State::Dead(dead) => Err(*dead),
+            _ => panic!("the process has not run to a wait"),
         }
-        self.inner.kill("returned to the kernel without waiting");
-        Err(self.dead().expect("just killed"))
     }
 }
 
@@ -539,6 +573,16 @@ impl Inner {
     fn kill(&self, reason: &'static str) {
         log::warn!("killing runner process: {reason}");
         *self.state.borrow_mut() = State::Dead(Dead::Killed(reason));
+        self.preempted.set(false);
+    }
+
+    fn is_new(&self) -> bool {
+        *self.state.borrow() == State::New
+    }
+
+    /// Waiting for a request, or dead.
+    fn is_stopped(&self) -> bool {
+        matches!(*self.state.borrow(), State::Waiting { .. } | State::Dead(_))
     }
 
     fn kill_and_stop(&self, reason: &'static str) -> ContinueOperation {
@@ -665,17 +709,27 @@ impl Inner {
     ///
     /// Shares the timer with the broker's bounded waits (see
     /// [`ProcessTimer::arm`]), which always disarm it afterward, so nothing
-    /// is lost by calling this unconditionally.
+    /// is lost by calling this unconditionally. Also arms the end of the time
+    /// slice, if earlier.
     fn rearm_timer(&self) {
         if self.broker.take_published() {
             self.notified.set(true);
         }
-        let deadline = self.upcall_entry().and(timer_deadline(
+        self.arm_timer(self.upcall_entry().and(timer_deadline(
             self.notified.get(),
             self.armed_deadline.get(),
             self.broker.next_timer_deadline(),
-        ));
-        self.timer.arm(deadline);
+        )));
+    }
+
+    /// Arms the platform's timer for `deadline` or the end of the time slice,
+    /// whichever is first.
+    fn arm_timer(&self, deadline: Option<Instant>) {
+        let first = match (deadline, self.slice_end.get()) {
+            (Some(deadline), Some(slice_end)) => Some(deadline.min(slice_end)),
+            (deadline, slice_end) => deadline.or(slice_end),
+        };
+        self.timer.arm(first);
     }
 
     /// The registered upcall entry, once the process is serving.
@@ -942,7 +996,14 @@ impl EnterShim for Inner {
         ContinueOperation::Resume
     }
 
+    /// Resumes a preempted process where it was, or delivers its request.
     fn reenter(&self, ctx: &mut PtRegs) -> ContinueOperation {
+        if self.preempted.replace(false) {
+            // Others may have published to it (e.g., fired its timers).
+            self.broker.poll_events();
+            self.rearm_timer();
+            return ContinueOperation::Resume;
+        }
         let (waiter, request) = match &mut *self.state.borrow_mut() {
             State::Delivering { waiter, request } => (*waiter, core::mem::take(request)),
             _ => return ContinueOperation::Terminate,
@@ -1000,40 +1061,50 @@ impl EnterShim for Inner {
 
     /// An interrupt (e.g., the timer's, or a device's) stopped the process.
     /// First has the broker look at the devices and fire its due timers, as
-    /// a kernel call would. Then delivers [`UpcallKind::Interrupt`] (quietly
-    /// ignored before [`CallId::Ready`], like any upcall with no entry
-    /// registered yet) if that published a notification, or once the armed
-    /// deadline has passed. Otherwise resumes:
+    /// a kernel call would. Past its slice end, then preempts it; what is
+    /// due is delivered once it resumes. Otherwise delivers
+    /// [`UpcallKind::Interrupt`] (quietly ignored before [`CallId::Ready`],
+    /// like any upcall with no entry registered yet) if that published a
+    /// notification, or once the armed deadline has passed. Otherwise
+    /// resumes:
     /// - with no deadline armed, there is nothing to deliver;
     /// - before the deadline, this re-arms it (e.g., the timer fired early,
     ///   as a one-shot count capped short of it);
     /// - on the upcall stack, the runner is still taking an earlier upcall
     ///   (which a nested one would overwrite), so this retries shortly.
     fn interrupt(&self, ctx: &mut PtRegs) -> ContinueOperation {
-        let on_upcall_stack = layout::UPCALL_STACK.contains(ctx.rsp as u64);
         self.broker.poll_events();
         if self.broker.take_published() {
             self.notified.set(true);
         }
         let now = self.platform.now();
+        if self
+            .slice_end
+            .get()
+            .is_some_and(|slice_end| now >= slice_end)
+        {
+            self.preempted.set(true);
+            return ContinueOperation::Terminate;
+        }
+        let on_upcall_stack = layout::UPCALL_STACK.contains(ctx.rsp as u64);
         let deadline = timer_deadline(
             self.notified.get(),
             self.armed_deadline.get(),
             self.broker.next_timer_deadline(),
         );
         match InterruptAction::decide(deadline, now, on_upcall_stack) {
-            InterruptAction::Ignore => ContinueOperation::Resume,
-            InterruptAction::Rearm => {
+            // The slice end, if any, may still be armed.
+            InterruptAction::Ignore | InterruptAction::Rearm => {
                 self.rearm_timer();
                 ContinueOperation::Resume
             }
             InterruptAction::Retry(at) => {
-                self.timer.arm(Some(at));
+                self.arm_timer(Some(at));
                 ContinueOperation::Resume
             }
             // Kept until there is an upcall entry to deliver it to.
             InterruptAction::Deliver if self.upcall_entry().is_none() => {
-                self.timer.arm(None);
+                self.arm_timer(None);
                 ContinueOperation::Resume
             }
             InterruptAction::Deliver => {

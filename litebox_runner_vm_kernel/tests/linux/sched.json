@@ -1,0 +1,17 @@
+[
+  {
+    "concurrent": [
+      { "argv": ["/sched", "spin", "300", "5", "1000"] },
+      { "argv": ["/sched", "spin", "300", "5", "1000"] },
+      { "argv": ["/sched-pie", "spin", "300", "5", "1000"] }
+    ]
+  },
+  {
+    "concurrent": [
+      { "argv": ["/alarm", "default"], "expect_signal": 14 },
+      { "argv": ["/timerfd"] },
+      { "argv": ["/sched", "sleep", "200", "3"] },
+      { "argv": ["/sched", "spin", "1000", "5", "2000"] }
+    ]
+  }
+]

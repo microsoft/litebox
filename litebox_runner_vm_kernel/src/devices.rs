@@ -9,7 +9,7 @@
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
-//!   `SetTimer` deadline.
+//!   `SetTimer` deadline and time slice.
 //!
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!

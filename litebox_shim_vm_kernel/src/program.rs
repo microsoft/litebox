@@ -6,6 +6,7 @@
 //! whichever guest OS its runner provides, then replies with its exit status.
 
 use crate::{Dead, Process};
+use alloc::vec::Vec;
 use litebox_common_vm_abi::program::{self, ExitStatus, Program};
 
 /// Why a program did not run to completion.
@@ -27,10 +28,43 @@ pub enum RunError {
 ///
 /// If the process was not started.
 pub fn run(process: &mut Process, program: &Program) -> Result<ExitStatus, RunError> {
+    run_all(&mut [(process, program)]).remove(0)
+}
+
+/// Runs each program in its process, all at once (see [`crate::sched`]), and
+/// returns their exit statuses, in order. A malformed reply kills the
+/// process.
+///
+/// # Panics
+///
+/// If a process was not started.
+pub fn run_all(runs: &mut [(&mut Process, &Program)]) -> Vec<Result<ExitStatus, RunError>> {
+    let submitted: Vec<_> = runs
+        .iter_mut()
+        .map(|(process, program)| submit(process, program))
+        .collect();
+    let mut running: Vec<&mut Process> = runs
+        .iter_mut()
+        .zip(&submitted)
+        .filter(|(_, submitted)| submitted.is_ok())
+        .map(|((process, _), _)| &mut **process)
+        .collect();
+    crate::sched::run(&mut running);
+    runs.iter_mut()
+        .zip(submitted)
+        .map(|((process, _), submitted)| submitted.and_then(|()| reply(process)))
+        .collect()
+}
+
+fn submit(process: &mut Process, program: &Program) -> Result<(), RunError> {
     let request = program::encode_request(program)
         .filter(|request| request.len() as u64 <= crate::MAX_MESSAGE_LEN)
         .ok_or(RunError::BadProgram)?;
-    let reply = process.call(&request).map_err(RunError::Dead)?;
+    process.submit(&request).map_err(RunError::Dead)
+}
+
+fn reply(process: &mut Process) -> Result<ExitStatus, RunError> {
+    let reply = process.reply().map_err(RunError::Dead)?;
     program::decode_reply(&reply)
         .ok_or_else(|| RunError::Dead(process.kill("malformed program reply")))
 }
