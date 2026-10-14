@@ -663,6 +663,17 @@ fn test_tcp_reconnect_after_lost_connection() {
     network.close(&client_fd, CloseBehavior::Immediate).unwrap();
     network.close(&server_fd, CloseBehavior::Immediate).unwrap();
 
+    // The loss is reported even if the network worker has not recorded it yet.
+    let ((client_fd, client), (server_fd, _)) = connect_and_accept(&mut network, &listener);
+    network.close(&server_fd, CloseBehavior::Immediate).unwrap();
+    while tcp_state(&network, &client_fd) != tcp::State::Closed {
+        network.perform_platform_interaction();
+    }
+    assert!(!client.check_io_events().contains(Events::ERR));
+    let err = network.connect(&client_fd, &addr, false).unwrap_err();
+    assert!(matches!(err, ConnectError::ConnectionReset));
+    network.close(&client_fd, CloseBehavior::Immediate).unwrap();
+
     // The same holds after the peer's FIN, which smoltcp remembers after the reset.
     let ((client_fd, client), (server_fd, _)) = connect_and_accept(&mut network, &listener);
     network.shutdown(&server_fd, Shutdown::Write).unwrap();

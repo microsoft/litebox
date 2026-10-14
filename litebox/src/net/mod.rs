@@ -1058,6 +1058,9 @@ where
         let now = self.now();
         let ret = match socket_handle.protocol() {
             Protocol::Tcp => {
+                // Record what the latest packets did to the connection, as the next pass of the
+                // network worker would, so that the outcome reported below is up to date.
+                Self::drain_socket_channel_buffers(&mut self.socket_set, socket_handle, now);
                 let socket: &mut tcp::Socket = self.socket_set.get_mut(socket_handle.handle);
                 let tcp_specific = socket_handle.specific.tcp_mut();
                 let connecting =
