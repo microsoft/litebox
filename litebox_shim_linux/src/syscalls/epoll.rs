@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! epoll instances (`epoll_create(2)`) backed by broker readiness queues.
+//! epoll instances (`epoll_create(2)`) backed by LiteBox readiness queues.
 
 use alloc::{
     sync::{Arc, Weak},
@@ -169,8 +169,8 @@ impl<Platform: ShimPlatform> EpollDescriptor<Platform> {
     }
 }
 
-/// An epoll instance, whose interest list and status flags the broker owns, so processes that
-/// share it through `fork` share one interest list.
+/// An epoll instance, whose interest list and status flags its readiness queue owns, so
+/// processes that share it through `fork` share one interest list.
 ///
 /// Interests are keyed by their target's open file description and the descriptor number they
 /// were added under, like Linux. Unlike Linux, epoll instances cannot be nested, `EPOLLPRI` is

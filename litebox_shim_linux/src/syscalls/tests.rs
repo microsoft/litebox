@@ -914,8 +914,7 @@ fn exec_inherits_only_transferable_descriptors() {
         })
     };
 
-    // Broker files, pipes, eventfds, and epoll instances transfer. Close-on-exec descriptors stay
-    // behind whatever their kind, but others must be broker objects.
+    // Files, pipes, eventfds, and epoll instances transfer unless they are close-on-exec.
     let (read_fd, write_fd) = task.sys_pipe2(OFlags::empty()).unwrap();
     assert_eq!(inherited(), Ok(alloc::vec![0, 1, 2, 3, 4]));
     task.sys_close(read_fd.try_into().unwrap()).unwrap();
