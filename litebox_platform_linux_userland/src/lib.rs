@@ -26,7 +26,7 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::ContinueOperation;
 use litebox::utils::{ReinterpretSignedExt, ReinterpretUnsignedExt as _, TruncateExt};
-use litebox_common::vmap::VmapManager;
+use litebox::vmap::VmapManager;
 use litebox_common_linux::{MRemapFlags, MapFlags, ProtFlags};
 
 use zerocopy::{FromBytes, IntoBytes};
@@ -1753,21 +1753,21 @@ impl litebox::platform::DerivedKeyProvider for LinuxUserland {
 /// We might need to emulate these functions' behaviors using virtual addresses for development or
 /// testing, or use a kernel module to provide this functionality (if needed).
 unsafe impl<const ALIGN: usize> VmapManager<ALIGN> for LinuxUserland {
-    type MapInfo = litebox_common::vmap::NoopPhysPageMapInfo;
+    type MapInfo = litebox::vmap::NoopPhysPageMapInfo;
 
     fn validate_unowned(
         &self,
-        _pages: &litebox_common::vmap::PhysPageAddrArray<ALIGN>,
-    ) -> Result<(), litebox_common::vmap::PhysPointerError> {
-        Err(litebox_common::vmap::PhysPointerError::UnsupportedOperation)
+        _pages: &litebox::vmap::PhysPageAddrArray<ALIGN>,
+    ) -> Result<(), litebox::vmap::PhysPointerError> {
+        Err(litebox::vmap::PhysPointerError::UnsupportedOperation)
     }
 
     unsafe fn protect(
         &self,
-        _pages: &litebox_common::vmap::PhysPageAddrArray<ALIGN>,
-        _perms: litebox_common::vmap::PhysPageMapPermissions,
-    ) -> Result<(), litebox_common::vmap::PhysPointerError> {
-        Err(litebox_common::vmap::PhysPointerError::UnsupportedOperation)
+        _pages: &litebox::vmap::PhysPageAddrArray<ALIGN>,
+        _perms: litebox::vmap::PhysPageMapPermissions,
+    ) -> Result<(), litebox::vmap::PhysPointerError> {
+        Err(litebox::vmap::PhysPointerError::UnsupportedOperation)
     }
 }
 

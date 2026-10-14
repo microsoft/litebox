@@ -15,13 +15,13 @@ use alloc::{boxed::Box, sync::Arc, vec};
 use core::{cell::Cell, ops::Deref};
 use ctr::Ctr128BE;
 use hashbrown::{HashMap, HashSet};
+use litebox::PAGE_SIZE;
 use litebox::{
     LiteBox,
     platform::{Instant as _, RawConstPointer as _, RawMutPointer as _, TimeProvider},
     shim::ContinueOperation,
     utils::TruncateExt,
 };
-use litebox_common::PAGE_SIZE;
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno, mm::VmemManager};
 use litebox_common_optee::{
     LdelfArg, LdelfSyscallRequest, SHDR_BOOTSTRAP_TA, SHDR_MAGIC, SHDR_UUID_LEN, SHDR_VERSION_LEN,
@@ -72,7 +72,7 @@ pub trait OpteeShimPlatform:
     + litebox::platform::SystemInfoProvider
     + litebox::platform::ArchSpecificProvider
     + litebox::platform::DerivedKeyProvider
-    + litebox_common::vmap::VmapManager<{ PAGE_SIZE }>
+    + litebox::vmap::VmapManager<{ PAGE_SIZE }>
     + 'static
     + Sized
 {
@@ -91,7 +91,7 @@ where
         + litebox::platform::SystemInfoProvider
         + litebox::platform::ArchSpecificProvider
         + litebox::platform::DerivedKeyProvider
-        + litebox_common::vmap::VmapManager<{ PAGE_SIZE }>
+        + litebox::vmap::VmapManager<{ PAGE_SIZE }>
         + 'static,
     T::Reservations: litebox_common_linux::vmem::LinuxReservationStore<T, PAGE_SIZE>,
 {
@@ -1937,9 +1937,9 @@ impl SessionIdPool {
 }
 
 pub type NormalWorldConstPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox_common::physical_pointers::PhysConstPtr<'a, Platform, T, ALIGN>;
+    litebox::physical_pointers::PhysConstPtr<'a, Platform, T, ALIGN>;
 pub type NormalWorldMutPtr<'a, Platform, T, const ALIGN: usize> =
-    litebox_common::physical_pointers::PhysMutPtr<'a, Platform, T, ALIGN>;
+    litebox::physical_pointers::PhysMutPtr<'a, Platform, T, ALIGN>;
 
 #[cfg(test)]
 mod test_utils {

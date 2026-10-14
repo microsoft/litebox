@@ -18,11 +18,11 @@
 //! we need to implement file-backed mapping, demand paging, and/or shared
 //! mapping in the future.
 use crate::{MutPtr, Task, ThreadInitState, UserMutPtr};
+use litebox::PAGE_SIZE;
 use litebox::{
     platform::{RawConstPointer as _, RawMutPointer as _},
     utils::TruncateExt,
 };
-use litebox_common::PAGE_SIZE;
 use litebox_common_linux::{
     MapFlags, ProtFlags,
     errno::Errno,

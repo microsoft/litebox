@@ -6,7 +6,7 @@
 use litebox::platform::RawMutPointer;
 use litebox::platform::{RawConstPointer, page_mgmt::MemoryRegionPermissions};
 use litebox::utils::TruncateExt;
-use litebox_common::{
+use litebox::{
     PAGE_SIZE,
     page::{NonZeroAddress, NonZeroPageSize},
 };

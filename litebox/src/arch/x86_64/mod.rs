@@ -3,7 +3,7 @@
 
 //! Shared x86-64 CPU-state helpers.
 
-use litebox::platform::PageManagementProvider;
+use crate::platform::PageManagementProvider;
 
 pub mod xstate;
 

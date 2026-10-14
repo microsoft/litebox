@@ -10,7 +10,6 @@ description = "Common OP-TEE-related definitions shared across LiteBox shims, pl
 bitflags = "2.9.0"
 elf = { version = "0.8.0", default-features = false }
 litebox = { path = "../litebox/", version = "0.1.0" }
-litebox_common = { path = "../litebox_common/", version = "0.1.0" }
 num_enum = { version = "0.7.3", default-features = false }
 zerocopy = { version = "0.8", features = ["derive"] }
 

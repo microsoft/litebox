@@ -1525,17 +1525,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "litebox_common"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.13.1",
- "litebox",
- "spin 0.9.8",
- "thiserror",
- "zerocopy",
-]
-
-[[package]]
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
@@ -1544,7 +1533,6 @@ dependencies = [
  "elf",
  "int-enum",
  "litebox",
- "litebox_common",
  "litebox_util_log",
  "rangemap",
  "spin 0.9.8",
@@ -1559,7 +1547,6 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.13.1",
  "litebox",
- "litebox_common",
  "num_enum",
  "thiserror",
  "x86_64",
@@ -1573,7 +1560,6 @@ dependencies = [
  "bitflags 2.13.1",
  "elf",
  "litebox",
- "litebox_common",
  "num_enum",
  "zerocopy",
 ]
@@ -1604,7 +1590,6 @@ dependencies = [
  "bindgen",
  "bitflags 2.13.1",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_util_log",
  "paste",
@@ -1625,7 +1610,6 @@ dependencies = [
  "getrandom 0.3.4",
  "libc",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_common_optee",
  "seccompiler",
@@ -1645,7 +1629,6 @@ dependencies = [
  "hashbrown",
  "libc",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_common_lvbs",
  "litebox_util_log",
@@ -1670,7 +1653,6 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "windows-sys 0.60.2",
  "zerocopy",
@@ -1716,7 +1698,6 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_common_lvbs",
  "litebox_common_optee",
@@ -1755,7 +1736,6 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_platform_linux_kernel",
  "litebox_shim_linux",
@@ -1775,7 +1755,6 @@ dependencies = [
  "elf",
  "hashbrown",
  "litebox",
- "litebox_common",
  "litebox_common_lvbs",
  "log",
  "object",
@@ -1799,7 +1778,6 @@ dependencies = [
  "bitvec",
  "libc",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_platform_linux_userland",
  "litebox_platform_windows_userland",
@@ -1826,7 +1804,6 @@ dependencies = [
  "hashbrown",
  "hmac",
  "litebox",
- "litebox_common",
  "litebox_common_linux",
  "litebox_common_optee",
  "litebox_platform_linux_userland",

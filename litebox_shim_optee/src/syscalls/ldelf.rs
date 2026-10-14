@@ -3,9 +3,9 @@
 
 use crate::syscalls::Cleanup;
 use crate::{Task, UserMutPtr};
+use litebox::PAGE_SIZE;
 use litebox::platform::page_mgmt::PageManagementProvider;
 use litebox::platform::{RawConstPointer, RawMutPointer};
-use litebox_common::PAGE_SIZE;
 use litebox_common_linux::{MapFlags, ProtFlags, errno::Errno};
 use litebox_common_optee::{LdelfMapFlags, TeeResult, TeeUuid};
 

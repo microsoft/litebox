@@ -8,6 +8,7 @@ use alloc::{
     string::{String, ToString as _},
     vec,
 };
+use litebox::PAGE_SIZE;
 use litebox::{
     event::{Events, wait::WaitError},
     fd::{FdEnabledSubsystem, MetadataError, TypedFd},
@@ -15,7 +16,6 @@ use litebox::{
     platform::StdioStream,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _, TruncateExt as _},
 };
-use litebox_common::PAGE_SIZE;
 use litebox_common_linux::{
     AccessFlags, AtFlags, EfdFlags, EpollCreateFlags, FcntlArg, FileDescriptorFlags, FileStat,
     InodeType, IoReadVec, IoWriteVec, IoctlArg, Statx, StatxMask, TimeParam, errno::Errno,

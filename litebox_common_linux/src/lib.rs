@@ -27,7 +27,7 @@ pub mod vmem;
 
 extern crate alloc;
 
-use litebox_common::{
+use litebox::{
     PAGE_SIZE,
     user_pointers::{UserPtr, UserPtrMut},
 };
@@ -3049,7 +3049,7 @@ pub struct PtRegs {
 #[derive(Clone, Debug, Default)]
 pub struct PtRegs {
     /// General-purpose registers x0-x30.
-    pub regs: [usize; litebox_common::arch::aarch64::GENERAL_REGISTER_COUNT],
+    pub regs: [usize; litebox::arch::aarch64::GENERAL_REGISTER_COUNT],
     /// Stack pointer.
     pub sp: usize,
     /// Program counter.
@@ -3067,7 +3067,7 @@ pub struct PtRegs {
 
 #[cfg(target_arch = "x86_64")]
 pub mod arch {
-    use litebox_common::arch::x86_64::{
+    use litebox::arch::x86_64::{
         EFLAGS_AF, EFLAGS_CF, EFLAGS_DF, EFLAGS_FIXED, EFLAGS_ID, EFLAGS_IF, EFLAGS_OF, EFLAGS_PF,
         EFLAGS_RF, EFLAGS_SF, EFLAGS_ZF,
     };
@@ -3089,7 +3089,7 @@ pub mod arch {
 
 #[cfg(target_arch = "aarch64")]
 pub mod arch {
-    use litebox_common::arch::aarch64::{PSR_DIT_BIT, PSR_NZCV_MASK, PSR_SSBS_BIT};
+    use litebox::arch::aarch64::{PSR_DIT_BIT, PSR_NZCV_MASK, PSR_SSBS_BIT};
 
     /// PSTATE bits a guest may keep when returning to EL0.
     pub const SAFE_USER_PSTATE: u64 = PSR_NZCV_MASK | PSR_SSBS_BIT | PSR_DIT_BIT;
@@ -3122,8 +3122,8 @@ impl PtRegs {
             return false;
         }
         self.eflags = (self.eflags & arch::SAFE_USER_EFLAGS)
-            | litebox_common::arch::x86_64::EFLAGS_FIXED
-            | litebox_common::arch::x86_64::EFLAGS_IF;
+            | litebox::arch::x86_64::EFLAGS_FIXED
+            | litebox::arch::x86_64::EFLAGS_IF;
         self.cs = arch::USER_CS;
         self.ss = arch::USER_DS;
         true

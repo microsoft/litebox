@@ -111,7 +111,7 @@ impl<Platform: ShimPlatform> SignalState<Platform> {
         ctx.rsi = frame_addr.wrapping_add(offset_of!(SignalFrame, siginfo));
         ctx.rdx = frame_addr.wrapping_add(offset_of!(SignalFrame, ucontext));
         ctx.rax = 0;
-        ctx.eflags &= !litebox_common::arch::x86_64::EFLAGS_DF;
+        ctx.eflags &= !litebox::arch::x86_64::EFLAGS_DF;
         Ok(())
     }
 }

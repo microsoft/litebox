@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-use litebox::platform::page_mgmt::MemoryRegionPermissions;
+use crate::platform::page_mgmt::MemoryRegionPermissions;
 use thiserror::Error;
 
 /// A provider to map and unmap physical pages with virtually contiguous addresses.
@@ -159,7 +159,7 @@ impl PhysPageMapInfo for NoopPhysPageMapInfo {
 
 bitflags::bitflags! {
     /// Physical page map permissions which is a restricted version of
-    /// [`litebox::platform::page_mgmt::MemoryRegionPermissions`].
+    /// [`crate::platform::page_mgmt::MemoryRegionPermissions`].
     ///
     /// This module only supports READ and WRITE permissions. Both EXECUTE and SHARED
     /// permissions are explicitly prohibited.

@@ -9,6 +9,7 @@
 use core::sync::atomic::AtomicU64;
 use core::{arch::asm, sync::atomic::AtomicU32};
 
+use litebox::page::PageRange;
 use litebox::platform::RawPointerProvider;
 use litebox::platform::page_mgmt::FixedAddressBehavior;
 use litebox::platform::{
@@ -16,7 +17,6 @@ use litebox::platform::{
     ImmediatelyWokenUp, PageManagementProvider, Provider, RawMutexProvider, TimeProvider,
     UnblockedOrTimedOut,
 };
-use litebox_common::page::PageRange;
 use litebox_common_linux::errno::Errno;
 
 extern crate alloc;
@@ -79,12 +79,9 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox_common::arch::x86_64::is_valid_user_fs_base::<
-                    Self,
-                    { litebox_common::PAGE_SIZE },
-                >(val)
+                if litebox::arch::x86_64::is_valid_user_fs_base::<Self, { litebox::PAGE_SIZE }>(val)
                 {
-                    unsafe { litebox_common::arch::x86_64::wrfsbase(val) };
+                    unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
@@ -103,7 +100,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
         reg: &ArchSpecificRegister,
     ) -> Result<usize, ArchSpecificError> {
         match reg {
-            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common::arch::x86_64::rdfsbase() }),
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox::arch::x86_64::rdfsbase() }),
             ArchSpecificRegister::GsBase => {
                 // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
                 unimplemented!()

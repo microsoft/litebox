@@ -5,13 +5,13 @@
 
 use alloc::{ffi::CString, vec::Vec};
 use litebox::{
+    PAGE_SIZE,
+    page::{NonZeroAddress, NonZeroPageSize},
+};
+use litebox::{
     fs::{Mode, OFlags},
     platform::RawConstPointer,
     utils::{ReinterpretSignedExt, TruncateExt},
-};
-use litebox_common::{
-    PAGE_SIZE,
-    page::{NonZeroAddress, NonZeroPageSize},
 };
 use litebox_common_linux::{
     MapFlags,
@@ -309,7 +309,7 @@ impl<'a, Platform: ShimPlatform> ElfLoader<'a, Platform> {
         };
 
         let sp = unsafe {
-            let length = litebox_common::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
+            let length = litebox::page::NonZeroPageSize::new(super::DEFAULT_STACK_SIZE)
                 .expect("DEFAULT_STACK_SIZE is not page-aligned");
             global
                 .mm

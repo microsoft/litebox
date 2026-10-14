@@ -24,7 +24,7 @@ use litebox::platform::{
     common_providers::reservations::{NoTrackedReservations, TrackedReservations},
     page_mgmt::{DeallocationError, PageReservation, PermissionUpdateError, ReservationStore},
 };
-use litebox_common::{
+use litebox::{
     PAGE_SIZE,
     page::{NonZeroAddress, NonZeroPageSize, PageRange},
 };

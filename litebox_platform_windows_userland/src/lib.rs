@@ -19,6 +19,7 @@ use std::os::raw::c_void;
 use std::os::windows::io::AsRawHandle as _;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use litebox::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
 use litebox::platform::ImmediatelyWokenUp;
 use litebox::platform::UnblockedOrTimedOut;
 use litebox::platform::page_mgmt::{
@@ -26,7 +27,6 @@ use litebox::platform::page_mgmt::{
 };
 use litebox::shim::{ContinueOperation, Exception};
 use litebox::utils::TruncateExt as _;
-use litebox_common::arch::x86_64::xstate::{XsaveArea, XsaveChunk, XsaveLayout, XsaveLegacyArea};
 
 use windows_sys::Win32::Foundation::{self as Win32_Foundation, FILETIME};
 use windows_sys::Win32::{
@@ -93,7 +93,7 @@ impl<const ALIGN: usize> WindowsUserland<ALIGN> {
     /// Restore the current thread's FS base from saved state
     fn restore_thread_fs_base() {
         unsafe {
-            litebox_common::arch::x86_64::wrfsbase(THREAD_FS_BASE.get());
+            litebox::arch::x86_64::wrfsbase(THREAD_FS_BASE.get());
         }
     }
 
@@ -183,7 +183,7 @@ unsafe extern "system" fn vectored_exception_handler_inner(
     // missing a real interrupt that arrives while resuming the guest. Go through
     // the interrupt path to ensure that any pending interrupts are also handled.
     if exception_record.ExceptionCode == Win32_Foundation::EXCEPTION_ACCESS_VIOLATION
-        && unsafe { litebox_common::arch::x86_64::rdfsbase() } == 0
+        && unsafe { litebox::arch::x86_64::rdfsbase() } == 0
         && WindowsUserland::<PAGE_SIZE>::get_thread_fs_base() != 0
     {
         set_context_to_interrupt_callback(context);
@@ -1732,7 +1732,7 @@ impl<const ALIGN: usize> litebox::platform::ArchSpecificProvider for WindowsUser
     ) -> Result<(), litebox::platform::ArchSpecificError> {
         match reg {
             litebox::platform::ArchSpecificRegister::FsBase => {
-                if litebox_common::arch::x86_64::is_valid_user_fs_base::<Self, ALIGN>(val) {
+                if litebox::arch::x86_64::is_valid_user_fs_base::<Self, ALIGN>(val) {
                     // Use WindowsUserland's per-thread FS base management system
                     Self::set_thread_fs_base(val);
                     Ok(())

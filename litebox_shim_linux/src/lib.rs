@@ -31,7 +31,7 @@ use litebox::{
     sync::futex::FutexManager,
     utils::{ReinterpretSignedExt as _, ReinterpretUnsignedExt as _},
 };
-use litebox_common::{
+use litebox::{
     PAGE_SIZE,
     page::{NonZeroAddress, NonZeroPageSize},
     user_pointers::{UserPtr, UserPtrMut},

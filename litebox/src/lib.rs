@@ -16,16 +16,24 @@
 
 extern crate alloc;
 
+pub mod arch;
 pub mod event;
 pub mod fd;
 pub mod fs;
 pub mod mm;
 pub mod net;
+pub mod page;
+pub mod physical_pointers;
 pub mod pipes;
 pub mod platform;
 pub mod shim;
 pub mod sync;
 pub mod tls;
+pub mod user_pointers;
+pub mod vmap;
+
+/// Size of a 4 KiB page in bytes.
+pub const PAGE_SIZE: usize = 4096;
 
 // The core [`LiteBox`] object itself, re-exported here publicly, just to keep management of the
 // code cleaner.

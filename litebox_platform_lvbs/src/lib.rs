@@ -16,13 +16,13 @@ use litebox::platform::{
     RawPointerProvider, StdioProvider, TimeProvider, UnblockedOrTimedOut,
     page_mgmt::DeallocationError,
 };
+use litebox::vmap::{
+    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
+};
+use litebox::{PAGE_SIZE, page::PageRange};
 use litebox::{
     platform::page_mgmt::FixedAddressBehavior, shim::ContinueOperation, utils::TruncateExt,
 };
-use litebox_common::vmap::{
-    PhysPageAddrArray, PhysPageMapInfo, PhysPageMapPermissions, PhysPointerError, VmapManager,
-};
-use litebox_common::{PAGE_SIZE, page::PageRange};
 use litebox_common_linux::errno::Errno;
 use x86_64::{
     VirtAddr,
@@ -479,12 +479,9 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
     ) -> Result<(), ArchSpecificError> {
         match reg {
             ArchSpecificRegister::FsBase => {
-                if litebox_common::arch::x86_64::is_valid_user_fs_base::<
-                    Self,
-                    { litebox_common::PAGE_SIZE },
-                >(val)
+                if litebox::arch::x86_64::is_valid_user_fs_base::<Self, { litebox::PAGE_SIZE }>(val)
                 {
-                    unsafe { litebox_common::arch::x86_64::wrfsbase(val) };
+                    unsafe { litebox::arch::x86_64::wrfsbase(val) };
                     Ok(())
                 } else {
                     Err(ArchSpecificError::RegisterUnpermittedValue)
@@ -503,7 +500,7 @@ impl<Host: HostInterface> ArchSpecificProvider for LinuxKernel<Host> {
         reg: &ArchSpecificRegister,
     ) -> Result<usize, ArchSpecificError> {
         match reg {
-            ArchSpecificRegister::FsBase => Ok(unsafe { litebox_common::arch::x86_64::rdfsbase() }),
+            ArchSpecificRegister::FsBase => Ok(unsafe { litebox::arch::x86_64::rdfsbase() }),
             ArchSpecificRegister::GsBase => {
                 // See https://github.com/microsoft/litebox/pull/806#discussion_r3210873538
                 unimplemented!()
