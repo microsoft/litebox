@@ -6,6 +6,7 @@
 //!
 //! - [`Console`]: the VM's console device, else output to the serial port
 //!   and no input.
+//! - [`Link`]: the VM's network device, if any.
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
@@ -14,16 +15,19 @@
 //! Also the wall clock ([`wall_clock`]), for runners.
 //!
 //! The interrupt handler only ends the interrupt; the broker looks at the
-//! devices when it next runs.
+//! devices when it next runs. A device interrupt also fires the timer at
+//! once, so that the shim of a process running meanwhile runs the broker
+//! ([`Events::interrupted`]).
 
 use alloc::boxed::Box;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
 use litebox_broker_vm_kernel::Events;
+use litebox_broker_vm_kernel::Link;
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::ConsoleDevice;
+use litebox_hal::devices::{ConsoleDevice, NetworkDevice};
 use litebox_hal::interrupt::LocalApic;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
@@ -47,6 +51,10 @@ pub struct Devices {
     console: Mutex<ConsoleDevice>,
     /// Whether the console interrupts; else it is polled.
     console_interrupts: bool,
+    /// A device interrupted since the broker last looked; see
+    /// [`Events::interrupted`].
+    interrupted: AtomicBool,
+    network: Option<&'static Nic>,
     /// What [`ProcessTimer::arm`] last programmed into the timer (see
     /// [`armed`]), so it can skip rewriting it: under KVM each write is a VM
     /// exit, and it rearms before every resume of a process.
@@ -74,11 +82,31 @@ impl Devices {
             }
         };
         litebox_util_log::info!(device:% = console; "standard streams");
+        let network = match NetworkDevice::probe(platform, apic.target(DEVICE_VECTOR)) {
+            Ok(device) => device,
+            Err(error) => {
+                litebox_util_log::warn!(error:% = error; "network device unusable");
+                None
+            }
+        };
+        match &network {
+            Some(device) => litebox_util_log::info!(device:% = device; "network"),
+            None => litebox_util_log::info!("no network device: sockets stay in the guest"),
+        }
+        let network = network.map(|device| -> &'static Nic {
+            Box::leak(Box::new(Nic {
+                mac: device.mac(),
+                interrupts: device.interrupts(),
+                device: Mutex::new(device),
+            }))
+        });
         let devices: &'static Self = Box::leak(Box::new(Self {
             platform,
             apic,
             clock,
             console_interrupts: console.interrupts(),
+            interrupted: AtomicBool::new(false),
+            network,
             armed: AtomicU64::new(ARMED_UNKNOWN),
             console: Mutex::new(console),
         }));
@@ -86,6 +114,11 @@ impl Devices {
             devices.on_interrupt(vector)
         })));
         devices
+    }
+
+    /// The network device, for the broker's sockets.
+    pub fn network(&self) -> Option<&'static dyn Link> {
+        self.network.map(|nic| -> &'static dyn Link { nic })
     }
 
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
@@ -97,11 +130,16 @@ impl Devices {
         ) {
             return false;
         }
-        if vector == litebox_platform_vm_kernel::TIMER_VECTOR {
-            // Fired: arming the same deadline again (e.g., after an early
-            // fire) must reprogram it.
-            self.armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
+        if vector == DEVICE_VECTOR {
+            // For the broker, even while a process runs: firing the timer at
+            // once enters the process's shim, which runs the broker (see
+            // `Events::interrupted`). In a halt, it only ends the halt.
+            self.interrupted.store(true, Ordering::Relaxed);
+            self.apic.arm_timer(0);
         }
+        // Fired, or replaced: arming the same deadline again (e.g., after an
+        // early fire) must reprogram it.
+        self.armed.store(ARMED_UNKNOWN, Ordering::Relaxed);
         self.apic.end_of_interrupt();
         true
     }
@@ -122,11 +160,20 @@ impl Devices {
 
 impl Events for Devices {
     fn wait(&self, deadline: Option<Instant>) -> bool {
-        if deadline.is_none() && !self.console_interrupts {
+        let network_interrupts = self.network.is_some_and(|nic| nic.interrupts);
+        if deadline.is_none() && !self.console_interrupts && !network_interrupts {
             return false;
         }
         self.halt(deadline);
         true
+    }
+
+    fn interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Relaxed)
+    }
+
+    fn clear_interrupted(&self) {
+        self.interrupted.store(false, Ordering::Relaxed);
     }
 }
 
@@ -192,5 +239,34 @@ impl Console for Devices {
             // Until the device takes more output.
             self.halt(Some(deadline));
         }
+    }
+}
+
+/// The network device, shared by the broker's stack.
+pub struct Nic {
+    device: Mutex<NetworkDevice>,
+    mac: [u8; 6],
+    interrupts: bool,
+}
+
+impl Link for Nic {
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    fn receive(&self, frame: &mut [u8]) -> Option<usize> {
+        self.device.lock().receive(frame)
+    }
+
+    fn can_transmit(&self) -> bool {
+        self.device.lock().can_transmit()
+    }
+
+    fn transmit(&self, frame: &[u8]) -> bool {
+        self.device.lock().transmit(frame)
+    }
+
+    fn interrupts(&self) -> bool {
+        self.interrupts
     }
 }

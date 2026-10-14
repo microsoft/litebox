@@ -169,7 +169,7 @@ version = "0.71.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
  "itertools",
@@ -188,6 +188,12 @@ name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
+
+[[package]]
+name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bitflags"
@@ -240,6 +246,12 @@ name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+
+[[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
@@ -525,6 +537,46 @@ dependencies = [
  "darling_core",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "defmt"
+version = "0.3.100"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f0963443817029b2024136fc4dd07a5107eb8f977eaf18fcd1fdeb11306b64ad"
+dependencies = [
+ "defmt 1.1.1",
+]
+
+[[package]]
+name = "defmt"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2953bfe4f93bbd20cc71198842756f77d161884c99ebbabc41d80231ded88d1"
+dependencies = [
+ "bitflags 1.3.2",
+ "defmt-macros",
+]
+
+[[package]]
+name = "defmt-macros"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bad9c72e7ca2137e0dc3813245a0d282fd6daad32fd800af018306a9169b5fe8"
+dependencies = [
+ "defmt-parser",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "defmt-parser"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
+dependencies = [
+ "thiserror",
 ]
 
 [[package]]
@@ -988,6 +1040,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash32"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d60b12902ba28e2730cd37e95b8c9223af2808df9e902d4df49588d1470606"
+dependencies = [
+ "byteorder",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -996,6 +1057,16 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+]
+
+[[package]]
+name = "heapless"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+dependencies = [
+ "hash32",
+ "stable_deref_trait",
 ]
 
 [[package]]
@@ -1430,7 +1501,7 @@ version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1744e39d1d6a9948f4f388969627434e31128196de472883b39f148769bfe30a"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "libc",
  "plain",
  "redox_syscall",
@@ -1446,7 +1517,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 name = "litebox"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "buddy_system_allocator",
  "hashbrown",
  "litebox_broker_local",
@@ -1482,7 +1553,7 @@ dependencies = [
 name = "litebox_broker_core"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "hashbrown",
  "litebox_broker_protocol",
  "litebox_platform",
@@ -1564,8 +1635,19 @@ dependencies = [
 name = "litebox_broker_protocol"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "thiserror",
+]
+
+[[package]]
+name = "litebox_broker_smoltcp"
+version = "0.1.0"
+dependencies = [
+ "litebox_broker_core",
+ "litebox_broker_protocol",
+ "log",
+ "smoltcp",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -1628,6 +1710,7 @@ dependencies = [
  "litebox_broker_core",
  "litebox_broker_host",
  "litebox_broker_protocol",
+ "litebox_broker_smoltcp",
  "litebox_broker_transport",
  "litebox_common_vm_abi",
  "litebox_hal",
@@ -1648,7 +1731,7 @@ dependencies = [
 name = "litebox_common_linux"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "cfg-if",
  "elf",
  "int-enum",
@@ -1668,7 +1751,7 @@ dependencies = [
 name = "litebox_common_lvbs"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "litebox",
  "litebox_common_linux",
  "num_enum",
@@ -1681,7 +1764,7 @@ dependencies = [
 name = "litebox_common_macos"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "litebox",
  "litebox_broker_protocol",
  "litebox_common_linux",
@@ -1695,7 +1778,7 @@ dependencies = [
 name = "litebox_common_optee"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "elf",
  "litebox",
  "litebox_common_linux",
@@ -1776,7 +1859,7 @@ version = "0.1.0"
 dependencies = [
  "arrayvec",
  "bindgen",
- "bitflags",
+ "bitflags 2.13.1",
  "litebox",
  "litebox_common",
  "litebox_common_linux",
@@ -1816,7 +1899,7 @@ version = "0.1.0"
 dependencies = [
  "aligned-vec",
  "arrayvec",
- "bitflags",
+ "bitflags 2.13.1",
  "digest",
  "hashbrown",
  "libc",
@@ -1842,7 +1925,7 @@ dependencies = [
 name = "litebox_platform_macos_userland"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "libc",
  "litebox",
  "litebox_common_linux",
@@ -2180,7 +2263,7 @@ name = "litebox_shim_linux"
 version = "0.1.0"
 dependencies = [
  "arrayvec",
- "bitflags",
+ "bitflags 2.13.1",
  "bitvec",
  "libc",
  "litebox",
@@ -2273,7 +2356,7 @@ dependencies = [
 name = "litebox_shim_windows"
 version = "0.1.0"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "int-enum",
  "litebox",
  "litebox_broker_core",
@@ -2357,6 +2440,12 @@ dependencies = [
  "sval_ref",
  "value-bag",
 ]
+
+[[package]]
+name = "managed"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ca88d725a0a943b096803bd34e73a4437208b6077654cc4ecb2947a5f91618d"
 
 [[package]]
 name = "matchers"
@@ -2611,7 +2700,7 @@ version = "0.10.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "cfg-if",
  "foreign-types",
  "libc",
@@ -2876,7 +2965,7 @@ version = "11.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
 ]
 
 [[package]]
@@ -2905,7 +2994,7 @@ version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce70a74e890531977d37e532c34d45e9055d2409ed08ddba14529471ed0be16"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
 ]
 
 [[package]]
@@ -3028,7 +3117,7 @@ version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd15f8a2c5551a84d56efdc1cd049089e409ac19a3072d5037a17fd70719ff3e"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "errno",
  "libc",
  "linux-raw-sys",
@@ -3108,7 +3197,7 @@ version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "897b2245f0b511c87893af39b033e5ca9cce68824c4d7e7630b5a1d339658d02"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "core-foundation",
  "core-foundation-sys",
  "libc",
@@ -3267,6 +3356,21 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "smoltcp"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dad095989c1533c1c266d9b1e8d70a1329dd3723c3edac6d03bbd67e7bf6f4bb"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "cfg-if",
+ "defmt 0.3.100",
+ "heapless",
+ "log",
+ "managed",
+]
 
 [[package]]
 name = "socket2"
@@ -3483,7 +3587,7 @@ version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac9ee8b664c9f1740cd813fea422116f8ba29997bb7c878d1940424889802897"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "log",
  "num-traits",
 ]
@@ -3625,7 +3729,7 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
- "bitflags",
+ "bitflags 2.13.1",
  "bytes",
  "futures-util",
  "http",
@@ -4219,7 +4323,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f042214de98141e9c8706e8192b73f56494087cc55ebec28ce10f26c5c364ae"
 dependencies = [
  "bit_field",
- "bitflags",
+ "bitflags 2.13.1",
  "rustversion",
  "volatile",
 ]

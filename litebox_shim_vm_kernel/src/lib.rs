@@ -1001,8 +1001,9 @@ impl EnterShim for Inner {
     /// [`TIMER_VECTOR`](litebox_platform_vm_kernel::TIMER_VECTOR) fired
     /// while the process ran. Delivers [`UpcallKind::Interrupt`] (quietly
     /// ignored before [`CallId::Ready`], like any upcall with no entry
-    /// registered yet) once the armed deadline, or a broker timer's (fired
-    /// first, so the runner sees its readiness), has passed. Otherwise resumes:
+    /// registered yet) once the armed deadline, or the broker's (whose work
+    /// is done first, so the runner sees its readiness), has passed; for the
+    /// broker's alone, only if it published something. Otherwise resumes:
     /// - with no deadline armed, the fire is spurious, or left over;
     /// - before the deadline, the timer fired early (e.g., a one-shot count
     ///   capped short of it), so this re-arms it;
@@ -1032,16 +1033,22 @@ impl EnterShim for Inner {
                 ContinueOperation::Resume
             }
             TimerFire::Deliver => {
-                if self
+                let armed_due = self
                     .armed_deadline
                     .get()
-                    .is_some_and(|deadline| deadline <= now)
-                {
+                    .is_some_and(|deadline| deadline <= now);
+                if armed_due {
                     self.armed_deadline.set(None);
                 }
                 self.broker.fire_timers();
                 // The upcall is for everything published so far.
-                self.broker.take_published();
+                let published = self.broker.take_published() | self.notified.get();
+                if !armed_due && !published {
+                    // Only the broker had work (e.g., the network stack's),
+                    // which gave the process nothing to receive.
+                    self.rearm_timer();
+                    return ContinueOperation::Resume;
+                }
                 self.notified.set(false);
                 self.upcall(ctx, UpcallKind::Interrupt, 0, 0, 0)
             }

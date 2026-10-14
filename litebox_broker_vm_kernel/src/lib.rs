@@ -10,11 +10,14 @@
 //!
 //! Files are the devices under `/dev`, with standard streams on the
 //! runner's [`stdio::Console`], and those of an optional read-only root
-//! ([`Config::root`]). Timers are on the kernel clock.
-//! Readiness (e.g., of standard input, or a timer's expiry) goes to the
-//! association's notification ring. Waiting ([`BrokerEnterOp::Wait`]) halts
-//! until the runner's [`Events`] report something, e.g., an interrupt, or
-//! until a timer's deadline.
+//! ([`Config::root`]). Timers are on the kernel clock. IPv4 TCP and UDP
+//! sockets are on smoltcp (`litebox_broker_smoltcp`): between runner
+//! processes, and, with the runner's [`Link`] ([`Config::network`]), to the
+//! outside. Readiness (e.g., of standard input, a timer's expiry, or
+//! sockets) goes to the association's notification ring. Waiting
+//! ([`BrokerEnterOp::Wait`]) halts until the runner's [`Events`] report
+//! something, e.g., an interrupt, or until a timer's or the network stack's
+//! deadline.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -50,6 +53,8 @@ use litebox_common_vm_abi::{BrokerEnterOp, BrokerEnterRequest, Status, UserRange
 use litebox_platform::time::TimeProvider as _;
 use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel};
 
+pub use litebox_broker_smoltcp::Link;
+
 use memory::{PinnedControlRing, UserSharedMemory};
 use readiness::KernelReadiness;
 use stdio::ConsoleStdio;
@@ -68,6 +73,16 @@ pub trait Events: Sync {
     /// Without a deadline, false if no event could ever end the halt (and it
     /// does not halt).
     fn wait(&self, deadline: Option<Instant>) -> bool;
+
+    /// Whether a device interrupted since [`Self::clear_interrupted`]: it may
+    /// have something for the broker (e.g., received network frames), which
+    /// [`Association::next_timer_deadline`] then makes due at once.
+    fn interrupted(&self) -> bool {
+        false
+    }
+
+    /// The broker is about to look at every device.
+    fn clear_interrupted(&self) {}
 }
 
 /// The runner's sources for a [`Broker`].
@@ -79,6 +94,8 @@ pub struct Config {
     pub events: &'static dyn Events,
     /// A tar, read-only at `/`, e.g., a Linux program's files.
     pub root: Option<&'static [u8]>,
+    /// The network sockets reach beyond the guest, if any.
+    pub network: Option<&'static dyn Link>,
 }
 
 /// The kernel's broker; clones share it.
@@ -89,6 +106,7 @@ pub struct Broker {
     events: &'static dyn Events,
     stdio: Arc<ConsoleStdio>,
     timers: Arc<KernelTimers>,
+    network: litebox_broker_smoltcp::Network,
 }
 
 impl Broker {
@@ -100,12 +118,27 @@ impl Broker {
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         let timers = Arc::new(KernelTimers::new(config.platform));
+        let clock: &'static KernelClock =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(KernelClock(config.platform)));
+        let network = litebox_broker_smoltcp::Network::new(
+            clock,
+            config.network,
+            providers::seed(),
+            &providers::LIMITS,
+        );
         Self {
-            core: providers::core(config.root, stdio.clone(), timers.clone()),
+            core: providers::core(
+                config.root,
+                stdio.clone(),
+                timers.clone(),
+                network.provider(),
+                config.network.is_some(),
+            ),
             platform: config.platform,
             events: config.events,
             stdio,
             timers,
+            network,
         }
     }
 
@@ -130,6 +163,35 @@ impl Broker {
             readiness: Arc::new(KernelReadiness::default()),
             state: RefCell::new(State::New(ring)),
         }
+    }
+
+    /// Looks at what changes outside requests: standard input, timers, and
+    /// the network.
+    fn poll_sources(&self) {
+        // First: a device interrupting meanwhile is looked at next time.
+        self.events.clear_interrupted();
+        self.stdio.poll();
+        self.timers.fire();
+        self.network.poll();
+    }
+
+    /// When the network stack must next run, if ever.
+    fn next_network_poll(&self) -> Option<Instant> {
+        self.network.next_poll().map(instant)
+    }
+}
+
+/// `time` on the [`KernelClock`], as an instant.
+fn instant(time: core::time::Duration) -> Instant {
+    Instant::from_nanos(u64::try_from(time.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// The kernel clock, for the network stack.
+struct KernelClock(&'static VmKernel);
+
+impl litebox_broker_smoltcp::Clock for KernelClock {
+    fn now(&self) -> core::time::Duration {
+        core::time::Duration::from_nanos(self.0.now().as_nanos())
     }
 }
 
@@ -201,18 +263,31 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 }
 
 impl Association {
-    /// The earliest armed broker timer's deadline, on the kernel clock:
-    /// when [`Self::fire_timers`] next has something to publish.
+    /// When, on the kernel clock, [`Self::fire_timers`] must next run while
+    /// the process runs: the earliest armed broker timer's deadline, the
+    /// network stack's (e.g., to retransmit), or soon after a device
+    /// interrupt (e.g., frames received): as soon as the network stack may
+    /// run again, so a flood of interrupts cannot keep the CPU.
     pub fn next_timer_deadline(&self) -> Option<Instant> {
-        self.broker.timers.next_deadline()
+        let devices = self
+            .broker
+            .events
+            .interrupted()
+            .then(|| instant(self.broker.network.earliest_run()));
+        timers::earliest(
+            timers::earliest(self.broker.timers.next_deadline(), devices),
+            self.broker.next_network_poll(),
+        )
     }
 
-    /// Fires the broker timers that are due, publishing their readiness, as
-    /// [`BrokerEnterOp::Wait`] would; for a process that is running instead.
-    /// A notification ring this corrupts fails the association, which its
-    /// next [`Self::enter`] reports.
+    /// Does what is due outside requests (fires the broker timers, runs the
+    /// network stack, looks at standard input) and publishes the readiness
+    /// that changes, as [`BrokerEnterOp::Wait`] would; for a process that is
+    /// running instead. Whether anything was published: see
+    /// [`Self::take_published`]. A notification ring this corrupts fails the
+    /// association, which its next [`Self::enter`] reports.
     pub fn fire_timers(&self) {
-        self.broker.timers.fire();
+        self.broker.poll_sources();
         let _ = self.flush_readiness();
     }
 
@@ -289,7 +364,8 @@ impl Association {
     /// Before the handshake, any request is [`Status::Denied`].
     ///
     /// Waiting halts the kernel (single CPU, no scheduler) until the word
-    /// changes or the deadline passes. Only notifications change ring words
+    /// changes or the deadline passes, running the network stack at its
+    /// deadlines meanwhile. Only notifications change ring words
     /// asynchronously; a wait on another word without a deadline, or on the
     /// notification epoch when no event or armed timer could publish, is
     /// [`Status::Stalled`]. A corrupted notification ring fails the
@@ -333,8 +409,7 @@ impl Association {
                 Some(offset)
             }
         };
-        self.broker.stdio.poll();
-        self.broker.timers.fire();
+        self.broker.poll_sources();
         active.serve().map_err(|Failed| EnterError::Failed)?;
         self.flush_readiness()?;
         let Some(offset) = wait_offset else {
@@ -367,11 +442,11 @@ impl Association {
             } else {
                 deadline
             };
+            let wake = timers::earliest(wake, self.broker.next_network_poll());
             if !self.broker.events.wait(wake) {
                 return Err(EnterError::Status(Status::Stalled));
             }
-            self.broker.stdio.poll();
-            self.broker.timers.fire();
+            self.broker.poll_sources();
             self.flush_readiness()?;
         }
     }
