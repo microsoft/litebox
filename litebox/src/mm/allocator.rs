@@ -62,13 +62,16 @@ impl<const ORDER: usize, M: MemoryProvider> SafeZoneAllocator<'_, ORDER, M> {
     pub const fn new() -> Self {
         Self {
             buddy_allocator: LockedHeapWithRescue::new(|heap, layout| {
-                let page_aligned_size = layout.size().next_power_of_two();
+                // On failure, add nothing so the retry fails and `alloc` returns null.
+                let Some(page_aligned_size) = layout.size().checked_next_power_of_two() else {
+                    return;
+                };
                 if page_aligned_size.trailing_zeros() as usize >= ORDER {
-                    unimplemented!("requested size {page_aligned_size:#} is too large");
+                    return;
                 }
                 let Ok(layout) = Layout::from_size_align(page_aligned_size, page_aligned_size)
                 else {
-                    unreachable!();
+                    return;
                 };
                 if let Some((start, size)) = M::alloc(&layout) {
                     // the returned size might be larger than requested (i.e., layout.size())
@@ -158,6 +161,8 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
     for SafeZoneAllocator<'static, ORDER, M>
 {
     unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        // Pad to alignment so the slab size class is >= `align`. Must match `dealloc`.
+        let layout = layout.pad_to_align();
         match layout.size() {
             Self::BASE_PAGE_SIZE => {
                 // Best to use the underlying backend directly to allocate pages
@@ -180,36 +185,36 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
                 match zone_allocator.allocate(layout) {
                     Ok(ptr) => ptr.as_ptr(),
                     Err(AllocationError::OutOfMemory) => {
-                        if layout.size() <= ZoneAllocator::MAX_BASE_ALLOC_SIZE {
-                            self.alloc_page().map_or(core::ptr::null_mut(), |page| {
-                                unsafe {
-                                    zone_allocator
-                                        .refill(layout, page)
-                                        .expect("Could not refill?");
+                        // Refill and retry; report any failure as null.
+                        let refilled = if layout.size() <= ZoneAllocator::MAX_BASE_ALLOC_SIZE {
+                            self.alloc_page().is_some_and(|page| {
+                                let raw = core::ptr::from_mut(page).cast::<u8>();
+                                let ok = unsafe { zone_allocator.refill(layout, page) }.is_ok();
+                                if !ok {
+                                    unsafe { self.free_pages(raw, Self::BASE_PAGE_SIZE_ORDER) };
                                 }
-                                zone_allocator
-                                    .allocate(layout)
-                                    .expect("Should succeed after refill")
-                                    .as_ptr()
+                                ok
                             })
                         } else {
-                            self.alloc_large_page()
-                                .map_or(core::ptr::null_mut(), |large_page| {
-                                    unsafe {
-                                        zone_allocator
-                                            .refill_large(layout, large_page)
-                                            .expect("Could not refill?");
-                                    }
-                                    zone_allocator
-                                        .allocate(layout)
-                                        .expect("Should succeed after refill")
-                                        .as_ptr()
-                                })
+                            self.alloc_large_page().is_some_and(|large_page| {
+                                let raw = core::ptr::from_mut(large_page).cast::<u8>();
+                                let ok = unsafe { zone_allocator.refill_large(layout, large_page) }
+                                    .is_ok();
+                                if !ok {
+                                    unsafe { self.free_pages(raw, Self::LARGE_PAGE_SIZE_ORDER) };
+                                }
+                                ok
+                            })
+                        };
+                        if !refilled {
+                            return core::ptr::null_mut();
                         }
+                        zone_allocator
+                            .allocate(layout)
+                            .map_or(core::ptr::null_mut(), NonNull::as_ptr)
                     }
-                    Err(AllocationError::InvalidLayout) => {
-                        panic!("Invalid layout: {layout:?}");
-                    }
+                    // Unreachable: sizes are bounded by `MAX_ALLOC_SIZE`.
+                    Err(AllocationError::InvalidLayout) => core::ptr::null_mut(),
                 }
             }
             _ => unsafe { self.buddy_allocator.alloc(layout) },
@@ -217,6 +222,8 @@ unsafe impl<const ORDER: usize, M: MemoryProvider> GlobalAlloc
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+        // Must match `alloc`.
+        let layout = layout.pad_to_align();
         match layout.size() {
             Self::BASE_PAGE_SIZE | Self::LARGE_PAGE_SIZE => unsafe {
                 self.buddy_allocator.dealloc(ptr, layout);
