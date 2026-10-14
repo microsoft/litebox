@@ -22,9 +22,9 @@ const DOUBLE_FAULT_STACK_SIZE: usize = 4 * PAGE_SIZE;
 const NMI_STACK_SIZE: usize = 4 * PAGE_SIZE;
 const EXCEPTION_STACK_SIZE: usize = 4 * PAGE_SIZE;
 #[cfg(debug_assertions)]
-const KERNEL_STACK_SIZE: usize = 111 * PAGE_SIZE;
+pub(crate) const KERNEL_STACK_SIZE: usize = 111 * PAGE_SIZE;
 #[cfg(not(debug_assertions))]
-const KERNEL_STACK_SIZE: usize = 47 * PAGE_SIZE;
+pub(crate) const KERNEL_STACK_SIZE: usize = 47 * PAGE_SIZE;
 
 #[repr(C)]
 pub(crate) struct PerCpuVariables {
@@ -34,6 +34,7 @@ pub(crate) struct PerCpuVariables {
     pub(crate) tls: Cell<*mut ()>,
     /// See `with_user_faults`; null otherwise.
     pub(crate) fault_context: Cell<*const ()>,
+    pub(crate) worker: crate::worker::Worker,
     /// Keeps the task page table in CR3 alive (`None`: the base table).
     active_page_table: UnsafeCell<Option<(AddressSpaceId, Arc<crate::mm::PageTable<PAGE_SIZE>>)>>,
     stacks: PerCpuStacks,
@@ -346,6 +347,7 @@ pub(crate) fn allocate_per_cpu_variables() {
         gdt: Cell::new(None),
         tls: Cell::new(core::ptr::null_mut()),
         fault_context: Cell::new(core::ptr::null()),
+        worker: crate::worker::Worker::new(),
         active_page_table: UnsafeCell::new(None),
         stacks: PerCpuStacks::allocate(),
     }));
@@ -355,20 +357,27 @@ pub(crate) fn allocate_per_cpu_variables() {
 
 /// The arena must remain allocated after its guard pages are unmapped.
 pub(crate) fn unmap_stack_guards(page_table: &crate::mm::PageTable<PAGE_SIZE>) {
-    use litebox_common_linux::vmem::PageRange;
-
     let base = with_per_cpu_variables(|pcv| pcv.stacks.base);
     for offset in STACK_GUARD_OFFSETS {
-        let start = base + offset;
-        let range = PageRange {
-            start,
-            end: start + PAGE_SIZE,
-        };
-        // Safety: aligned, unused guards in a leaked allocation. Retain backing
-        // frames and shared page tables.
-        unsafe { page_table.unmap_pages(range, UnmapOptions::KEEP_FRAMES) }
-            .expect("failed to unmap a stack guard page");
+        // Safety: aligned, unused guards in a leaked allocation.
+        unsafe { unmap_guard(page_table, base + offset) };
     }
+}
+
+/// Unmaps the stack guard page at `start`, keeping its frame and shared page
+/// tables.
+///
+/// # Safety
+///
+/// `start` is an aligned, unused page of an allocation that is never freed.
+pub(crate) unsafe fn unmap_guard(page_table: &crate::mm::PageTable<PAGE_SIZE>, start: usize) {
+    let range = litebox_common_linux::vmem::PageRange {
+        start,
+        end: start + PAGE_SIZE,
+    };
+    // Safety: see the function's.
+    unsafe { page_table.unmap_pages(range, UnmapOptions::KEEP_FRAMES) }
+        .expect("failed to unmap a stack guard page");
 }
 
 /// Allocate the current core's kernel XSAVE area. Must run after

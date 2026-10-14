@@ -81,6 +81,7 @@ mod per_cpu;
 pub mod providers;
 
 mod syscall_entry;
+pub mod worker;
 
 /// Inputs to the single-CPU kernel handoff. The runner owns device setup and
 /// must keep the clock and allocator alive until reset.
@@ -502,12 +503,16 @@ impl VmKernel {
         // addresses as the boot mappings.
         unsafe { base_pt.load() };
 
-        alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
+        let platform = alloc::boxed::Box::leak(alloc::boxed::Box::new(Self {
             page_table_manager: PageTableManager::new(base_pt),
             clock,
             ram_frame_ranges,
             ioremap_next: spin::Mutex::new(IOREMAP.start),
-        }))
+        }));
+        if cfg!(debug_assertions) {
+            worker::self_check(platform);
+        }
+        platform
     }
 
     /// Halts until an interrupt is handled, with interrupts enabled only for
@@ -517,6 +522,23 @@ impl VmKernel {
     pub fn halt_until_interrupt(&self) {
         x86_64::instructions::interrupts::enable_and_hlt();
         x86_64::instructions::interrupts::disable();
+    }
+
+    /// A kernel stack of `size` bytes (a multiple of the page size), with an
+    /// unmapped guard page below it; its top. Never freed.
+    fn allocate_worker_stack(&self, size: usize) -> usize {
+        use alloc::alloc::{Layout, alloc_zeroed, handle_alloc_error};
+        let layout = Layout::from_size_align(size + PAGE_SIZE, PAGE_SIZE)
+            .expect("a page-aligned stack size");
+        // Safety: nonzero size. Leaked: the guard stays unmapped.
+        let base = unsafe { alloc_zeroed(layout) };
+        if base.is_null() {
+            handle_alloc_error(layout);
+        }
+        // Safety: its first page, unused. Kernel mappings are shared by every
+        // page table.
+        unsafe { per_cpu::unmap_guard(&self.page_table_manager.base_page_table, base as usize) };
+        base as usize + PAGE_SIZE + size
     }
 
     /// Only valid for addresses in the kernel's direct mapping.
