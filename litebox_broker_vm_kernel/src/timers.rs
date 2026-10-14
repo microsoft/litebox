@@ -82,9 +82,7 @@ impl KernelTimers {
             .iter()
             .filter_map(|alarm| *alarm.upgrade()?.deadline.lock())
             .min()?;
-        Some(Instant::from_nanos(
-            u64::try_from(earliest.as_nanos()).unwrap_or(u64::MAX),
-        ))
+        Some(instant(earliest))
     }
 }
 
@@ -105,6 +103,11 @@ impl TimerProvider for KernelTimers {
         self.alarms.lock().push(Arc::downgrade(&alarm));
         Ok(Box::new(AlarmHandle(alarm)))
     }
+}
+
+/// `time`, on [`KernelTimers::now`]'s clock, as an instant.
+pub(crate) fn instant(time: Duration) -> Instant {
+    Instant::from_nanos(u64::try_from(time.as_nanos()).unwrap_or(u64::MAX))
 }
 
 /// `deadline` and `other`'s earlier, either being `None` for none.

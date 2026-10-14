@@ -23,6 +23,10 @@
 # the console's input: sent once the console shows a line `ready`, so it
 # arrives while the program runs.
 #
+# Their sockets reach a virtio network device on QEMU's user network,
+# isolated from the host (restrict=on) but for an echo server (cat) at
+# 10.0.2.100:7. The guest is 10.0.2.15, and its gateway (the host) 10.0.2.1.
+#
 # Usage: dev_tools/run_linux_on_vm_userland.sh [-t <test>]... [-r] [-v]
 #   -t   test to run, e.g. hello (repeatable; default: every test)
 #   -r   build and run the release kernel and runner
@@ -111,6 +115,12 @@ feed_input() {
     cat "$TESTS_DIR/$1.input.txt" >&"$2"
 }
 
+# The network device: see the header.
+network_args() {
+    echo -netdev user,id=n0,net=10.0.2.0/24,host=10.0.2.1,restrict=on,guestfwd=tcp:10.0.2.100:7-cmd:cat \
+        -device virtio-net-pci,netdev=n0,disable-legacy=on
+}
+
 # The kernel checks the output; this only shows it.
 show_console() {
     if [[ ${verbose:-0} -ne 0 ]]; then
@@ -139,8 +149,8 @@ for t in "${tests[@]}"; do
         feed_input "$t" "$input_fd" &
         feeder=$!
     fi
-    # shellcheck disable=SC2046 # console_args prints separate arguments
-    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t")
+    # shellcheck disable=SC2046 # these print separate arguments
+    run_vm "$t" "$KERNEL" "$WORK/$t.tar" $(console_args "$t") $(network_args)
     if [[ -n $feeder ]]; then
         kill "$feeder" 2>/dev/null || true
         wait "$feeder" 2>/dev/null || true

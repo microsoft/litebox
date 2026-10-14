@@ -6,6 +6,7 @@
 //!
 //! - [`Console`]: the VM's console device, else output to the serial port
 //!   and no input.
+//! - [`Network`]: the VM's network device, if any.
 //! - [`Events`]: the devices' interrupt, and the local APIC's timer for
 //!   deadlines.
 //! - [`ProcessTimer`]: the same timer, while a process runs, for its
@@ -22,10 +23,11 @@ use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use litebox_broker_core::stdio::StdioOutputStream;
+use litebox_broker_smoltcp::Network;
 use litebox_broker_vm_kernel::Events;
 use litebox_broker_vm_kernel::stdio::Console;
 use litebox_hal::clock::Clock;
-use litebox_hal::devices::ConsoleDevice;
+use litebox_hal::devices::{ConsoleDevice, NetworkDevice};
 use litebox_hal::interrupt::LocalApic;
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_kernel::{Instant, VmKernel};
@@ -52,6 +54,9 @@ pub struct Devices {
     console: Mutex<ConsoleDevice>,
     /// Whether the console interrupts; else it is polled.
     console_interrupts: bool,
+    network: Option<Mutex<NetworkDevice>>,
+    /// Whether the network device interrupts; else it is polled.
+    network_interrupts: bool,
     /// What [`ProcessTimer::arm`] last programmed into the timer (see
     /// [`armed`]), so it can skip rewriting it: under KVM each write is a VM
     /// exit, and it rearms before every resume of a process.
@@ -79,11 +84,24 @@ impl Devices {
             }
         };
         litebox_util_log::info!(device:% = console; "standard streams");
+        let network = match NetworkDevice::probe(platform, apic.target(DEVICE_VECTOR)) {
+            Ok(device) => device,
+            Err(error) => {
+                litebox_util_log::warn!(error:% = error; "network device unusable");
+                None
+            }
+        };
+        match &network {
+            Some(device) => litebox_util_log::info!(device:% = device; "network"),
+            None => litebox_util_log::info!("no network device: sockets stay in the guest"),
+        }
         let devices: &'static Self = Box::leak(Box::new(Self {
             platform,
             apic,
             clock,
             console_interrupts: console.interrupts(),
+            network_interrupts: network.as_ref().is_some_and(NetworkDevice::interrupts),
+            network: network.map(Mutex::new),
             armed: AtomicU64::new(ARMED_UNKNOWN),
             device_interrupted: AtomicBool::new(false),
             console: Mutex::new(console),
@@ -92,6 +110,18 @@ impl Devices {
             devices.on_interrupt(vector)
         })));
         devices
+    }
+
+    /// The network device, if any, for the broker's sockets.
+    pub fn network(&'static self) -> Option<&'static dyn Network> {
+        self.network.is_some().then_some(self)
+    }
+
+    fn network_device(&self) -> spin::MutexGuard<'_, NetworkDevice> {
+        self.network
+            .as_ref()
+            .expect("the broker has a network only with a device")
+            .lock()
     }
 
     /// See `litebox_platform_vm_kernel::set_interrupt_handler`: no locks, no
@@ -138,7 +168,7 @@ impl Devices {
 
 impl Events for Devices {
     fn wait(&self, deadline: Option<Instant>) -> bool {
-        if deadline.is_none() && !self.console_interrupts {
+        if deadline.is_none() && !self.console_interrupts && !self.network_interrupts {
             return false;
         }
         self.halt(deadline);
@@ -212,5 +242,27 @@ impl Console for Devices {
             // Until the device takes more output.
             self.block(Some(deadline));
         }
+    }
+}
+
+impl Network for Devices {
+    fn mac(&self) -> [u8; 6] {
+        self.network_device().mac()
+    }
+
+    fn receive(&self, frame: &mut [u8]) -> Option<usize> {
+        self.network_device().receive(frame)
+    }
+
+    fn can_transmit(&self) -> bool {
+        self.network_device().can_transmit()
+    }
+
+    fn transmit(&self, frame: &[u8]) -> bool {
+        self.network_device().transmit(frame)
+    }
+
+    fn interrupts(&self) -> bool {
+        self.network_interrupts
     }
 }

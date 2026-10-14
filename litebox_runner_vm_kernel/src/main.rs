@@ -11,8 +11,8 @@
 //!   client ([`client::script`]).
 //!
 //! QEMU exits with 33 if all tests pass, 65 otherwise. Runner processes'
-//! standard streams are the VM's console device, if there is one
-//! ([`devices`]).
+//! standard streams are the VM's console device, if there is one, and their
+//! sockets reach the VM's network device, if there is one ([`devices`]).
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -45,6 +45,7 @@ fn kernel_main(kernel: Kernel) -> ! {
             console,
             events: devices,
             root: payload.file("rootfs.tar"),
+            network: devices.network(),
         })
     };
     if let Some(programs) = payload.file("programs.json") {

@@ -10,9 +10,12 @@
 //!
 //! Files are the devices under `/dev`, with standard streams on the
 //! runner's [`stdio::Console`], and those of an optional read-only root
-//! ([`Config::root`]). Timers are on the kernel clock.
-//! Readiness (e.g., of standard input, or a timer's expiry) goes to the
-//! association's notification ring.
+//! ([`Config::root`]). Timers are on the kernel clock. IPv4 TCP and UDP
+//! sockets are `litebox_broker_smoltcp`'s, which mediates their traffic:
+//! between runner processes directly, and, with the runner's [`Network`]
+//! device ([`Config::network`]), to the outside on smoltcp. Readiness (e.g., of
+//! standard input, a timer's expiry, or sockets) goes to the association's
+//! notification ring.
 //!
 //! As in the userland broker, requests are served apart from the runner's
 //! calls ([`Association::serve`]), and a wait blocks only its process: the
@@ -53,6 +56,8 @@ use litebox_common_vm_abi::{BrokerEnterOp, BrokerEnterRequest, Status, UserRange
 use litebox_platform::time::TimeProvider as _;
 use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel};
 
+use litebox_broker_smoltcp::{Network, SmoltcpSocketProvider};
+
 use memory::{PinnedControlRing, UserSharedMemory};
 use readiness::KernelReadiness;
 use stdio::ConsoleStdio;
@@ -85,6 +90,8 @@ pub struct Config {
     pub events: &'static dyn Events,
     /// A tar, read-only at `/`, e.g., a Linux program's files.
     pub root: Option<&'static [u8]>,
+    /// The network sockets reach beyond the guest, if any.
+    pub network: Option<&'static dyn Network>,
 }
 
 /// The kernel's broker; clones share it.
@@ -97,6 +104,7 @@ pub struct Broker {
     timers: Arc<KernelTimers>,
     /// See [`Association::take_woken`].
     woken: Arc<AtomicBool>,
+    sockets: Arc<SmoltcpSocketProvider>,
 }
 
 impl Broker {
@@ -108,13 +116,27 @@ impl Broker {
     pub fn new(config: Config) -> Self {
         let stdio = Arc::new(ConsoleStdio::new(config.console));
         let timers = Arc::new(KernelTimers::new(config.platform));
+        let sockets = Arc::new(SmoltcpSocketProvider::new(
+            providers::LIMITS.max_sockets,
+            providers::LIMITS.max_sockets_per_process,
+            timers.clone(),
+            config.network,
+            providers::seed(),
+        ));
         Self {
-            core: providers::core(config.root, stdio.clone(), timers.clone()),
+            core: providers::core(
+                config.root,
+                stdio.clone(),
+                timers.clone(),
+                sockets.clone(),
+                config.network.is_some(),
+            ),
             platform: config.platform,
             events: config.events,
             stdio,
             timers,
             woken: Arc::new(AtomicBool::new(false)),
+            sockets,
         }
     }
 
@@ -140,6 +162,19 @@ impl Broker {
             state: RefCell::new(State::New(ring)),
             submitted: Cell::new(false),
         }
+    }
+
+    /// Looks at what changes outside requests: standard input, timers, and
+    /// the network.
+    fn poll_sources(&self) {
+        self.stdio.poll();
+        self.timers.fire();
+        self.sockets.poll();
+    }
+
+    /// When the network stack must next run, if ever.
+    fn next_network_deadline(&self) -> Option<Instant> {
+        self.sockets.next_deadline().map(timers::instant)
     }
 }
 
@@ -243,20 +278,23 @@ fn frame(bytes: &[u8]) -> Result<WireFrame, Status> {
 }
 
 impl Association {
-    /// The earliest armed broker timer's deadline, on the kernel clock:
-    /// when [`Self::poll_events`] next fires one.
+    /// When, on the kernel clock, [`Self::poll_events`] next has something
+    /// to do: the earliest armed broker timer's deadline, or the network
+    /// stack's (e.g., to retransmit).
     pub fn next_timer_deadline(&self) -> Option<Instant> {
-        self.broker.timers.next_deadline()
+        timers::earliest(
+            self.broker.timers.next_deadline(),
+            self.broker.next_network_deadline(),
+        )
     }
 
-    /// Looks at the devices and fires the broker timers that are due,
-    /// publishing readiness, as [`BrokerEnterOp::Wait`] would; for a process
-    /// that is running instead (e.g., an interrupt stopped it). A
-    /// notification ring this corrupts fails the association, which its next
-    /// [`Self::enter`] reports.
+    /// Looks at the devices (standard input, the network) and fires the
+    /// broker timers that are due, publishing readiness, as
+    /// [`BrokerEnterOp::Wait`] would; for a process that is running instead
+    /// (e.g., an interrupt stopped it). A notification ring this corrupts
+    /// fails the association, which its next [`Self::enter`] reports.
     pub fn poll_events(&self) {
-        self.broker.stdio.poll();
-        self.broker.timers.fire();
+        self.broker.poll_sources();
         let _ = self.flush_readiness();
     }
 
@@ -420,12 +458,14 @@ impl Association {
                 if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
                     return Err(EnterError::Status(Status::Stalled));
                 }
-                // Only notifications see timers.
+                // Only notifications see timers; the network stack runs at
+                // its deadlines, whatever the wait.
                 let wake = if wait.notifications {
                     timers::earliest(wait.deadline, self.broker.timers.next_deadline())
                 } else {
                     wait.deadline
                 };
+                let wake = timers::earliest(wake, self.broker.next_network_deadline());
                 Ok(WaitState::Blocked { wake })
             })
             .unwrap_or_else(|error| WaitState::Ended(Err(error)));
@@ -474,10 +514,10 @@ impl Association {
         result
     }
 
-    /// Looks at the devices, fires the due timers, and publishes readiness.
+    /// Catches up with what changed outside requests (devices, timers),
+    /// publishing readiness.
     fn poll(&self) -> Result<(), EnterError> {
-        self.broker.stdio.poll();
-        self.broker.timers.fire();
+        self.broker.poll_sources();
         self.flush_readiness()
     }
 

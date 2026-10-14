@@ -10,6 +10,7 @@ litebox_platform = { path = "../litebox_platform", version = "0.1.0" }
 litebox_broker_core = { path = "../litebox_broker_core", version = "0.1.0" }
 litebox_broker_host = { path = "../litebox_broker_host", version = "0.1.0" }
 litebox_broker_protocol = { path = "../litebox_broker_protocol", version = "0.1.0" }
+litebox_broker_smoltcp = { path = "../litebox_broker_smoltcp", version = "0.1.0" }
 litebox_broker_transport = { path = "../litebox_broker_transport", version = "0.1.0" }
 litebox_common_vm_abi = { path = "../litebox_common_vm_abi", version = "0.1.0" }
 litebox_hal = { path = "../litebox_hal", version = "0.1.0" }

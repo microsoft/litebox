@@ -10,6 +10,7 @@ base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 litebox_platform = { version = "0.1.0", path = "../litebox_platform" }
 litebox_bootloader = { version = "0.1.0", path = "../litebox_bootloader" }
 litebox_broker_core = { version = "0.1.0", path = "../litebox_broker_core" }
+litebox_broker_smoltcp = { version = "0.1.0", path = "../litebox_broker_smoltcp" }
 litebox_broker_vm_kernel = { version = "0.1.0", path = "../litebox_broker_vm_kernel" }
 litebox_hal = { version = "0.1.0", path = "../litebox_hal" }
 litebox_common_optee = { version = "0.1.0", path = "../litebox_common_optee" }
