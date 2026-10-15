@@ -34,7 +34,8 @@ pub(crate) struct KernelReadiness {
     failed: AtomicBool,
     /// A notification was written since [`Self::take_published`].
     published: AtomicBool,
-    /// The process is blocked on the notification epoch.
+    /// A thread of the process blocks in a wait that a notification would
+    /// end (see `Association::set_notification_waiter`).
     waiting: AtomicBool,
     /// The broker's: set when a waiting process's ring changes.
     woken: Arc<AtomicBool>,
@@ -52,8 +53,8 @@ impl KernelReadiness {
         }
     }
 
-    /// Whether the process is blocked on the notification epoch, for a write
-    /// to its ring to set the broker's `woken`.
+    /// Whether a thread of the process blocks in a wait that a notification
+    /// would end, for a write to its ring to set the broker's `woken`.
     pub(crate) fn set_waiting(&self, waiting: bool) {
         self.waiting.store(waiting, Ordering::Relaxed);
     }
@@ -100,6 +101,15 @@ impl KernelReadiness {
                 self.failed.store(true, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Whether the process has yet to consume a notification written to its
+    /// ring. Not on a ring it corrupted, which fails the association.
+    pub(crate) fn unconsumed(&self) -> bool {
+        self.notifications
+            .lock()
+            .as_ref()
+            .is_some_and(|producer| producer.has_unconsumed().unwrap_or(false))
     }
 
     /// Whether a notification was written since the last call.

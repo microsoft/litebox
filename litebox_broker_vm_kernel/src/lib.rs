@@ -52,7 +52,7 @@ use litebox_broker_transport::control_ring::{
     MemoryAccessPolicy,
 };
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedBufferPool};
-use litebox_common_vm_abi::{BrokerEnterOp, BrokerEnterRequest, Status, UserRange, WireFrame};
+use litebox_common_vm_abi::{Status, UserRange, WireFrame};
 use litebox_platform::time::TimeProvider as _;
 use litebox_platform_vm_kernel::{Instant, PinnedUserPages, VmKernel};
 
@@ -224,7 +224,7 @@ struct Active {
     association: BrokerHostAssociation<UserSharedMemory>,
     requests: ControlRingConsumer<PinnedControlRing>,
     responses: ControlRingProducer<PinnedControlRing>,
-    /// For [`BrokerEnterOp::Wait`].
+    /// For [`RingFutex::Wait`].
     words: PinnedControlRing,
     /// A response the full ring could not take; no request is consumed while
     /// it waits.
@@ -242,7 +242,7 @@ pub struct Association {
     submitted: Cell<bool>,
 }
 
-/// A [`BrokerEnterOp::Wait`] that did not end at once.
+/// A [`RingFutex::Wait`] that did not end at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wait {
     offset: usize,
@@ -252,11 +252,33 @@ pub struct Wait {
     notifications: bool,
 }
 
-/// What [`Association::enter`] leaves to the caller.
+impl Wait {
+    /// Whether it is on the notification epoch, which a notification ends.
+    pub fn is_for_notifications(&self) -> bool {
+        self.notifications
+    }
+}
+
+/// A futex operation on a word of the control ring (see
+/// `litebox_common_vm_abi`, Broker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingFutex {
+    /// On the requests' producer epoch, has the broker serve them; on other
+    /// words, nothing.
+    Wake,
+    /// Until the word differs from `expected`, or `deadline` passes.
+    Wait {
+        expected: u32,
+        deadline: Option<Instant>,
+    },
+}
+
+/// What [`Association::futex`] leaves to the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Entered {
     Done,
-    /// [`BrokerEnterOp::Wake`]: serve before the call returns.
+    /// [`RingFutex::Wake`] on the requests' producer epoch: serve before the
+    /// call returns.
     Woke,
     /// Poll it with [`Association::poll_wait`].
     Wait(Wait),
@@ -290,9 +312,9 @@ impl Association {
 
     /// Looks at the devices (standard input, the network) and fires the
     /// broker timers that are due, publishing readiness, as
-    /// [`BrokerEnterOp::Wait`] would; for a process that is running instead
+    /// [`RingFutex::Wait`] would; for a process that is running instead
     /// (e.g., an interrupt stopped it). A notification ring this corrupts
-    /// fails the association, which its next [`Self::enter`] reports.
+    /// fails the association, which its next [`Self::futex`] reports.
     pub fn poll_events(&self) {
         self.broker.poll_sources();
         let _ = self.flush_readiness();
@@ -304,6 +326,13 @@ impl Association {
     /// even while it runs.
     pub fn take_published(&self) -> bool {
         self.readiness.take_published()
+    }
+
+    /// Whether the notification ring holds notifications the process has not
+    /// consumed (published its progress past): unlike
+    /// [`Self::take_published`], what it still has to receive.
+    pub fn has_notifications(&self) -> bool {
+        self.readiness.unconsumed()
     }
 
     /// [`BrokerHandshake`](litebox_common_vm_abi::CallId::BrokerHandshake):
@@ -365,41 +394,38 @@ impl Association {
         frame(&wire::encode_handshake_response(response))
     }
 
-    /// [`BrokerEnter`](litebox_common_vm_abi::CallId::BrokerEnter): leaves
-    /// published requests to [`Self::serve`], and a wait that does not end at
-    /// once to the caller. An invalid request has no effect. Before the
-    /// handshake, any request is [`Status::Denied`]. A corrupted notification
-    /// ring fails the association, as a corrupted request ring does.
+    /// [`Futex`](litebox_common_vm_abi::CallId::Futex) on the `u32` at
+    /// `offset` into the control ring: leaves published requests to
+    /// [`Self::serve`], and a wait that does not end at once to the caller.
+    /// An invalid request has no effect. Before the handshake, any request is
+    /// [`Status::Denied`]. A corrupted notification ring fails the
+    /// association, as a corrupted request ring does.
     ///
     /// # Errors
     ///
     /// See [`EnterError`].
-    pub fn enter(&self, request: &BrokerEnterRequest) -> Result<Entered, EnterError> {
+    pub fn futex(&self, offset: usize, op: RingFutex) -> Result<Entered, EnterError> {
         if !matches!(*self.state.borrow(), State::Active(_)) {
             return Err(EnterError::Status(Status::Denied));
         }
-        let invalid = || EnterError::Status(Status::InvalidArgument);
-        let wait = match request.op {
-            BrokerEnterOp::Wake => {
-                if (request.expected, request.offset, request.deadline) != (0, 0, 0) {
-                    return Err(invalid());
+        if !MemoryAccessPolicy::ControlRing.permits_u32(offset) {
+            return Err(EnterError::Status(Status::InvalidArgument));
+        }
+        let wait = match op {
+            RingFutex::Wake => {
+                if offset != ControlRingDirection::Requests.producer_epoch_offset() {
+                    // The broker waits on no other word.
+                    return Ok(Entered::Done);
                 }
                 None
             }
-            BrokerEnterOp::Wait => {
-                let offset = usize::try_from(request.offset).map_err(|_| invalid())?;
-                if !MemoryAccessPolicy::ControlRing.permits_u32(offset) {
-                    return Err(invalid());
-                }
-                Some(Wait {
-                    offset,
-                    expected: request.expected,
-                    deadline: (request.deadline != 0)
-                        .then(|| Instant::from_nanos(request.deadline)),
-                    notifications: offset
-                        == ControlRingDirection::Notifications.producer_epoch_offset(),
-                })
-            }
+            RingFutex::Wait { expected, deadline } => Some(Wait {
+                offset,
+                expected,
+                deadline,
+                notifications: offset
+                    == ControlRingDirection::Notifications.producer_epoch_offset(),
+            }),
         };
         self.submitted.set(true);
         let Some(wait) = wait else {
@@ -436,42 +462,38 @@ impl Association {
     /// Without a deadline, a wait on a word other than the notification epoch
     /// is [`Status::Stalled`] once [`Self::serve`] has nothing left to serve.
     pub fn poll_wait(&self, wait: &Wait) -> WaitState {
-        let state = self
-            .with_active(|active| {
-                self.poll()?;
-                match active.words.load_u32_acquire(wait.offset) {
-                    Ok(word) if word != wait.expected => {
-                        if wait.notifications {
-                            // The runner receives them next, so need not also
-                            // be interrupted for them.
-                            self.readiness.take_published();
-                        }
-                        return Ok(WaitState::Ended(Ok(())));
+        self.with_active(|active| {
+            self.poll()?;
+            match active.words.load_u32_acquire(wait.offset) {
+                Ok(word) if word != wait.expected => {
+                    if wait.notifications {
+                        // The runner receives them next, so need not also
+                        // be interrupted for them.
+                        self.readiness.take_published();
                     }
-                    Ok(_) => {}
-                    Err(_) => return Err(EnterError::Status(Status::InvalidArgument)),
+                    return Ok(WaitState::Ended(Ok(())));
                 }
-                let now = self.broker.platform.now();
-                if wait.deadline.is_some_and(|deadline| now >= deadline) {
-                    return Err(EnterError::Status(Status::TimedOut));
-                }
-                if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
-                    return Err(EnterError::Status(Status::Stalled));
-                }
-                // Only notifications see timers; the network stack runs at
-                // its deadlines, whatever the wait.
-                let wake = if wait.notifications {
-                    timers::earliest(wait.deadline, self.broker.timers.next_deadline())
-                } else {
-                    wait.deadline
-                };
-                let wake = timers::earliest(wake, self.broker.next_network_deadline());
-                Ok(WaitState::Blocked { wake })
-            })
-            .unwrap_or_else(|error| WaitState::Ended(Err(error)));
-        self.readiness
-            .set_waiting(wait.notifications && matches!(state, WaitState::Blocked { .. }));
-        state
+                Ok(_) => {}
+                Err(_) => return Err(EnterError::Status(Status::InvalidArgument)),
+            }
+            let now = self.broker.platform.now();
+            if wait.deadline.is_some_and(|deadline| now >= deadline) {
+                return Err(EnterError::Status(Status::TimedOut));
+            }
+            if wait.deadline.is_none() && !wait.notifications && !self.submitted.get() {
+                return Err(EnterError::Status(Status::Stalled));
+            }
+            // Only notifications see timers; the network stack runs at its
+            // deadlines, whatever the wait.
+            let wake = if wait.notifications {
+                timers::earliest(wait.deadline, self.broker.timers.next_deadline())
+            } else {
+                wait.deadline
+            };
+            let wake = timers::earliest(wake, self.broker.next_network_deadline());
+            Ok(WaitState::Blocked { wake })
+        })
+        .unwrap_or_else(|error| WaitState::Ended(Err(error)))
     }
 
     /// See [`Events::take_device_interrupt`].
@@ -485,8 +507,18 @@ impl Association {
         self.readiness.set_waiting(false);
     }
 
-    /// Whether a notification reached a process blocked on its notification
-    /// epoch since the last call (any process's): poll the waits again.
+    /// Whether a thread of the process blocks in a wait that a notification
+    /// would end (on the notification epoch, or another the caller ends for
+    /// them, e.g., a futex wait), for a notification to set
+    /// [`Self::take_woken`]. The caller's to keep current: before polling
+    /// waits, since polling may publish.
+    pub fn set_notification_waiter(&self, waiting: bool) {
+        self.readiness.set_waiting(waiting);
+    }
+
+    /// Whether a notification reached a process with a thread blocked in a
+    /// wait that it would end (see [`Self::set_notification_waiter`]), since
+    /// the last call (any process's): poll the waits again.
     pub fn take_woken(&self) -> bool {
         self.broker.woken.swap(false, Ordering::Relaxed)
     }
@@ -594,7 +626,7 @@ fn failure<E: core::fmt::Debug>(what: &'static str) -> impl FnOnce(E) -> Failed 
     }
 }
 
-/// Why [`Association::enter`] failed.
+/// Why [`Association::futex`] failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnterError {
     /// A status for the runner; the association is unaffected.

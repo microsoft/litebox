@@ -77,9 +77,6 @@ impl VmUserland {
         TIMED_WAIT
             .clock_khz
             .store(info.clock_khz, Ordering::Relaxed);
-        TIMED_WAIT
-            .control_ring
-            .store(info.broker_control_ring.start, Ordering::Relaxed);
         Self {
             wall_clock: info.wall_clock,
         }
@@ -159,47 +156,72 @@ impl RawMutexProvider for VmUserland {
 
 impl WaitWakerProvider for VmUserland {}
 
-/// One thread: nothing else in the runner can change a waiter's word. So a
-/// wait blocks in the kernel until its timeout, a platform timer's deadline
-/// (whose signal then interrupts it), or, with a [`NotificationReceiver`],
-/// a broker notification, which it dispatches (possibly waking the waiter).
-/// One that nothing could end panics.
+/// The kernel's futex ([`kcall::futex_wait`]). A wait also ends where the
+/// thread would take an interrupt: a broker notification, which it then
+/// dispatches (possibly waking the waiter), or a platform timer's deadline
+/// (whose signal is then pending). One that nothing could end panics.
 pub struct RawMutex {
     inner: AtomicU32,
+    /// Threads in [`Self::wait`], so wakes call the kernel only for them.
+    waiters: AtomicU32,
+}
+
+impl RawMutex {
+    /// Waits while the word is `val`, until a wake, an interrupt, a platform
+    /// timer's deadline (whose signal is then pending), or `deadline`;
+    /// whether `deadline` passed. Platform timers are by their state, not by
+    /// the kernel's interrupt for them, which may have come while the runner
+    /// ran its own code (leaving it to the guest's next entry).
+    fn wait(&self, val: u32, deadline: Option<Instant>) -> bool {
+        let timer = timer::next_deadline().filter(|&timer| deadline.is_none_or(|d| timer < d));
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let result = kcall::futex_wait(&self.inner, val, timer.or(deadline));
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        match result {
+            Ok(()) => false,
+            Err(Status::Interrupted) => {
+                drain_notifications();
+                false
+            }
+            Err(Status::TimedOut) => timer.is_none(),
+            Err(Status::Stalled) => {
+                panic!("a wait that nothing could end in the VM userland runner would deadlock")
+            }
+            Err(status) => panic!("futex wait: {status:?}"),
+        }
+    }
 }
 
 impl RawMutexTrait for RawMutex {
     const INIT: Self = Self {
         inner: AtomicU32::new(0),
+        waiters: AtomicU32::new(0),
     };
 
     fn underlying_atomic(&self) -> &AtomicU32 {
         &self.inner
     }
 
-    fn wake_many(&self, _n: usize) -> usize {
-        0
+    fn wake_many(&self, n: usize) -> usize {
+        // Orders the caller's change of the word before the check, against
+        // a waiter's increment before the kernel checks the word.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if self.waiters.load(Ordering::SeqCst) == 0 {
+            return 0;
+        }
+        let woken = kcall::futex_wake(&self.inner, n as u64)
+            .unwrap_or_else(|status| panic!("futex wake: {status:?}"));
+        usize::try_from(woken).unwrap_or(usize::MAX)
     }
 
-    /// A wait without a timeout: blocks until a broker notification or an
-    /// armed platform timer's deadline (whose signal may then be pending once
-    /// resumed); panics if nothing could end it. So a wait the timer's signal
-    /// does not end (e.g., `pause` with `SIGALRM` ignored) panics after it
-    /// expires, unless input could still arrive, where Linux would block
-    /// forever.
+    /// Without a timeout, a wait that a platform timer's signal does not
+    /// end (e.g., `pause` with `SIGALRM` ignored) panics once nothing else
+    /// could end it, where Linux would block forever.
     fn block(&self, val: u32) -> Result<(), ImmediatelyWokenUp> {
         if self.inner.load(Ordering::Relaxed) != val {
             return Err(ImmediatelyWokenUp);
         }
-        let deadline = timer::next_deadline();
-        let ended = receive(deadline).is_some()
-            || deadline
-                .map(|deadline| TIMED_WAIT.sleep_until(deadline))
-                .is_some();
-        assert!(
-            ended,
-            "a wait that nothing could end in the single-threaded VM userland runner would deadlock"
-        );
+        self.wait(val, None);
         Ok(())
     }
 
@@ -211,47 +233,35 @@ impl RawMutexTrait for RawMutex {
         if self.inner.load(Ordering::Relaxed) != val {
             return Err(ImmediatelyWokenUp);
         }
-        let Some(deadline) = now().checked_add(time) else {
-            // Too far off to represent: as a wait without a timeout.
-            return self.block(val).map(|()| UnblockedOrTimedOut::Unblocked);
-        };
-        // A platform timer due first ends the wait early, to raise its signal.
-        let timer = timer::next_deadline().filter(|&timer| timer < deadline);
-        let wake = timer.unwrap_or(deadline);
-        let received = receive(Some(wake)).unwrap_or_else(|| {
-            TIMED_WAIT.sleep_until(wake);
-            0
-        });
-        Ok(if received != 0 || timer.is_some() {
-            UnblockedOrTimedOut::Unblocked
-        } else {
+        // Too far off to represent: as a wait without a timeout.
+        let deadline = now().checked_add(time);
+        Ok(if self.wait(val, deadline) {
             UnblockedOrTimedOut::TimedOut
+        } else {
+            UnblockedOrTimedOut::Unblocked
         })
     }
 }
 
 /// Receives broker notifications (e.g., a timer file's expiry, or standard
 /// input arriving) for the runner, dispatching them (e.g., with
-/// `LiteBox::broker_notification_dispatcher`). They arrive while the guest
-/// runs, too, not only while it waits: the kernel interrupts the process
-/// once it publishes one, i.e., when a broker timer comes due, when a
-/// device's interrupt brings input (e.g., standard input), or as the broker
-/// serves the process's requests.
+/// `LiteBox::broker_notification_dispatcher`). The kernel interrupts the
+/// process once it publishes one, i.e., when a broker timer comes due, when
+/// a device's interrupt brings input (e.g., standard input), or as the
+/// broker serves the process's requests: a running thread, or a waiting one
+/// (see [`RawMutex`]), then drains them.
 pub trait NotificationReceiver: Sync {
-    /// Dispatches the published notifications, first waiting for one until
-    /// `deadline` if there are none. Returns how many: zero at the deadline;
-    /// `None`, without waiting, if nothing could publish (no deadline and
-    /// nothing to come, or receiving failed for good).
-    fn receive(&self, deadline: Option<Instant>) -> Option<usize>;
-
-    /// Dispatches the published notifications, without waiting; enters the
-    /// kernel only after reading a full ring, for it to publish the rest.
+    /// Consumes the published notifications and dispatches them, without
+    /// waiting; enters the kernel only after reading a full ring, for it to
+    /// publish the rest. While another thread dispatches, this still consumes
+    /// them, so that the kernel sees the ring consumed (and stops ending
+    /// waits for them), but leaves them to that thread to dispatch, in order.
     fn drain(&self);
 }
 
 impl VmUserland {
-    /// Lets waits end at broker notifications, and dispatches those that
-    /// interrupt the guest. At most once.
+    /// Dispatches the broker notifications that interrupt the process. At
+    /// most once.
     ///
     /// # Panics
     ///
@@ -264,13 +274,6 @@ impl VmUserland {
         });
         assert!(set, "the notification receiver is already set");
     }
-}
-
-/// [`NotificationReceiver::receive`], if there is a receiver: `None`, without
-/// waiting, if there is none or nothing could publish (waits then only
-/// sleep until their deadline).
-fn receive(deadline: Option<Instant>) -> Option<usize> {
-    TIMED_WAIT.receiver.get()?.receive(deadline)
 }
 
 /// Dispatches the notifications an interrupt may be for.
@@ -293,48 +296,13 @@ pub(crate) fn interrupts_for_shim() -> bool {
 struct TimedWait {
     /// [`StartupInfo::clock_khz`], for [`now`].
     clock_khz: AtomicU64,
-    /// [`StartupInfo::broker_control_ring`]'s start.
-    control_ring: AtomicU64,
     receiver: spin::Once<&'static dyn NotificationReceiver>,
 }
 
 static TIMED_WAIT: TimedWait = TimedWait {
     clock_khz: AtomicU64::new(0),
-    control_ring: AtomicU64::new(0),
     receiver: spin::Once::new(),
 };
-
-impl TimedWait {
-    /// Blocks until `deadline` with the kernel's deadline wait (`BrokerEnter`'s
-    /// Wait), on a control-ring word that only the kernel's serving changes:
-    /// the request ring's consumer epoch.
-    ///
-    /// # Panics
-    ///
-    /// If the kernel refuses the wait, e.g., before the broker handshake.
-    fn sleep_until(&self, deadline: Instant) {
-        use litebox_broker_transport::control_ring::ControlRingDirection;
-        let offset = ControlRingDirection::Requests.consumer_epoch_offset();
-        let word = usize::try_from(self.control_ring.load(Ordering::Relaxed))
-            .expect("x86-64 addresses fit usize")
-            + offset;
-        while now() < deadline {
-            // Safety: the control ring is mapped for the process's lifetime,
-            // and its words are aligned `u32`s.
-            let current = unsafe { (*(word as *const AtomicU32)).load(Ordering::Acquire) };
-            let request = litebox_common_vm_abi::BrokerEnterRequest::wait(
-                offset as u64,
-                current,
-                deadline.as_nanos(),
-            );
-            match kcall::call(&request) {
-                // The word changed (served requests), or the deadline passed.
-                Ok(()) | Err(Status::TimedOut) => {}
-                Err(status) => panic!("timed wait: {status:?}"),
-            }
-        }
-    }
-}
 
 /// An instant on the kernel clock (see `litebox_common_vm_abi`); `from_nanos`
 /// and `as_nanos` convert to and from ABI times.

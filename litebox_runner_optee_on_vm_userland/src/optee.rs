@@ -114,17 +114,19 @@ struct Runner {
     locked_down: bool,
 }
 
-/// Besides [`CallId::Exit`], which is always allowed. Executable memory is
-/// not, and asking for it kills the process: nothing may need it once the TA
-/// runs (no runtime `dlopen`, ldelf re-entry, or executable `mprotect`).
+/// Besides [`CallId::Exit`] and [`CallId::ExitThread`], which are always
+/// allowed. Executable memory is not, and asking for it kills the process:
+/// nothing may need it once the TA runs (no runtime `dlopen`, ldelf
+/// re-entry, or executable `mprotect`).
 const SERVING_CALLS: CallSet = CallSet::EMPTY
     .with(CallId::ReplyAndWait)
     .with(CallId::Map)
     .with(CallId::Unmap)
     .with(CallId::Protect)
-    .with(CallId::BrokerEnter)
     .with(CallId::DeriveKey)
-    .with(CallId::Log);
+    .with(CallId::Log)
+    // The broker's, and the platform's waits (e.g., a TA's `TEE_Wait`).
+    .with(CallId::Futex);
 
 /// The session manager tells instances apart by page-table ID; with one
 /// instance per process, any constant works.

@@ -31,9 +31,9 @@ impl Lockdown {
         })
     }
 
-    /// [`CallId::Exit`] is always permitted.
+    /// [`CallId::Exit`] and [`CallId::ExitThread`] are always permitted.
     pub(crate) fn permits_call(self, id: CallId) -> bool {
-        id == CallId::Exit || self.calls.contains(id)
+        matches!(id, CallId::Exit | CallId::ExitThread) || self.calls.contains(id)
     }
 
     pub(crate) fn permits_prot(self, prot: Prot) -> bool {
@@ -66,7 +66,7 @@ mod tests {
             ))
             .unwrap();
         assert!(!first.permits_call(CallId::BrokerHandshake));
-        assert!(first.permits_call(CallId::BrokerEnter));
+        assert!(first.permits_call(CallId::Futex));
         assert!(first.permits_prot(Prot::ReadWrite));
         assert!(!first.permits_prot(Prot::ReadExec));
 
@@ -80,8 +80,9 @@ mod tests {
             .narrowed(&RestrictRequest::new(CallSet::EMPTY, ProtSet::EMPTY))
             .unwrap();
         assert!(!last.permits_call(CallId::Restrict));
-        assert!(!last.permits_call(CallId::BrokerEnter));
+        assert!(!last.permits_call(CallId::Futex));
         assert!(last.permits_call(CallId::Exit), "exit is always permitted");
+        assert!(last.permits_call(CallId::ExitThread));
         assert!(!last.permits_prot(Prot::None));
     }
 

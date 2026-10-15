@@ -597,6 +597,12 @@ impl<Memory: ControlRingMemory> ControlRingProducer<Memory> {
         self.direction
     }
 
+    /// Whether the consumer has yet to publish its progress past a written
+    /// message.
+    pub fn has_unconsumed(&self) -> Result<bool, ControlRingError> {
+        Ok(self.ring.load_consumer_head(self.direction)? < self.tail)
+    }
+
     /// Returns a handle that can interrupt a wait on this producer's ring
     /// direction.
     pub fn wake_handle(&self) -> ControlRingWakeHandle<Memory> {

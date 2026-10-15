@@ -5,10 +5,11 @@
 //! instruction outside guest code: the kernel accepts calls only from
 //! [`GATE_SECTION`](litebox_common_vm_abi::GATE_SECTION).
 
+use core::sync::atomic::AtomicU32;
 use litebox_common_vm_abi::{
-    CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, KernelCall, LogLevel, LogRequest,
-    MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest, ReadyRequest,
-    RestrictRequest, SetTimerRequest, Status, UnmapRequest, UserRange,
+    CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, FutexRequest, KernelCall, LogLevel,
+    LogRequest, MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest,
+    ReadyRequest, RestrictRequest, SetTimerRequest, Status, UnmapRequest, UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
 
@@ -97,6 +98,35 @@ pub fn ready(upcall_entry: usize) -> Result<Message, Status> {
 /// See [`call`].
 pub fn reply_and_wait(reply: &Message) -> Result<Message, Status> {
     call(reply)
+}
+
+/// Blocks while `word` is `expected`, until a [`futex_wake`] on it,
+/// `deadline`, or an interrupt ([`Status::Interrupted`]).
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn futex_wait(
+    word: &AtomicU32,
+    expected: u32,
+    deadline: Option<crate::Instant>,
+) -> Result<(), Status> {
+    call(&FutexRequest::wait(
+        word.as_ptr() as u64,
+        expected,
+        // Zero means none, so the (theoretical) instant zero waits from 1 ns.
+        deadline.map_or(0, |deadline| deadline.as_nanos().max(1)),
+    ))
+    .map(|_| ())
+}
+
+/// Wakes up to `count` threads waiting on `word`; returns how many.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn futex_wake(word: &AtomicU32, count: u64) -> Result<u64, Status> {
+    call(&FutexRequest::wake(word.as_ptr() as u64, count)).map(|reply| reply.woken)
 }
 
 /// # Errors

@@ -6,11 +6,11 @@
 //! call, then requests and responses in the control ring and payloads in the
 //! shared buffers (see `litebox_common_vm_abi`, Broker).
 //!
-//! Where the userland transport uses futexes, this one uses the kernel's
-//! (`BrokerEnter`'s Wake and Wait). The kernel serves the ring apart from
-//! them, so a call takes a Wake and, unless the response is already there, a
-//! Wait. Shared memory is accessed only through
-//! `peer_memory`.
+//! Where the userland transport uses the host's futex, this one uses the
+//! kernel's (`Futex`), on the same ring words. The kernel serves the ring
+//! apart from it, so a call takes a Wake (on the requests' producer epoch)
+//! and, unless the response is already there, a Wait. Shared memory is
+//! accessed only through `peer_memory`.
 //!
 //! Notifications (readiness of broker objects, e.g., standard input) have no
 //! receiver thread: the runner receives them with [`Notifications::receive`],
@@ -23,7 +23,10 @@
 
 extern crate alloc;
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use litebox::utils::TruncateExt as _;
 use litebox_broker_local::BrokerLocal;
 use litebox_broker_protocol::message::{
@@ -41,7 +44,7 @@ use litebox_broker_transport::control_ring::{
 use litebox_broker_transport::peer_memory;
 use litebox_broker_transport::shared_memory::{ControlRingMemory, SharedMemory, SharedMemoryError};
 use litebox_common_vm_abi::{
-    BrokerEnterRequest, BrokerHandshakeFrame, StartupInfo, Status, UserRange, WireFrame,
+    BrokerHandshakeFrame, FutexRequest, StartupInfo, Status, UserRange, WireFrame,
 };
 use litebox_platform::time::{Instant as _, TimeProvider as _};
 use litebox_platform_vm_userland::{Instant, NotificationReceiver, VmUserland, kcall};
@@ -330,13 +333,13 @@ impl WaitableSharedMemory for KernelControlRing {
     }
 
     fn wait_while_equal(&self, offset: usize, expected: u32) -> Result<(), ChannelError> {
-        broker_wait(offset, expected, None).map_err(ChannelError::Kernel)
+        broker_wait(self.start, offset, expected, None).map_err(ChannelError::Kernel)
     }
 
     /// The kernel waits on no ring word: only new requests need it.
     fn wake_one(&self, offset: usize) -> Result<(), ChannelError> {
         if offset == ControlRingDirection::Requests.producer_epoch_offset() {
-            broker_wake().map_err(ChannelError::Kernel)?;
+            broker_wake(self.start).map_err(ChannelError::Kernel)?;
         }
         Ok(())
     }
@@ -404,12 +407,14 @@ impl Notifications {
         mut dispatch: impl FnMut(BrokerNotification),
     ) -> Result<usize, ChannelError> {
         loop {
-            let (received, wait_epoch) = self.read_published(&mut dispatch, broker_wake)?;
+            let start = self.words.start;
+            let (received, wait_epoch) =
+                self.read_published(&mut dispatch, || broker_wake(start))?;
             if received != 0 {
                 return Ok(received);
             }
             let epoch = ControlRingDirection::Notifications.producer_epoch_offset();
-            match broker_wait(epoch, wait_epoch, deadline) {
+            match broker_wait(self.words.start, epoch, wait_epoch, deadline) {
                 Ok(()) => {}
                 Err(Status::TimedOut) => return Ok(0),
                 Err(status) => return Err(ChannelError::Kernel(status)),
@@ -428,12 +433,19 @@ impl Notifications {
         &mut self,
         mut dispatch: impl FnMut(BrokerNotification),
     ) -> Result<usize, ChannelError> {
-        Ok(self.read_published(&mut dispatch, broker_wake)?.0)
+        let start = self.words.start;
+        Ok(self.read_published(&mut dispatch, || broker_wake(start))?.0)
     }
 
     /// As [`Self::try_receive`], also returning the producer epoch to wait on
     /// while the ring stays empty; `publish_rest` (e.g., [`broker_wake`]) has
     /// the kernel publish what did not fit in a full ring.
+    ///
+    /// Reads what is published, publishes its progress, and only then
+    /// dispatches it, until a read finds nothing: dispatching may take long
+    /// (e.g., waiting for a lock, or preempted), and meanwhile the kernel
+    /// sees the ring consumed, so it does not end other threads' waits for
+    /// what this one dispatches (see `litebox_common_vm_abi`, Threads).
     fn read_published(
         &mut self,
         dispatch: &mut impl FnMut(BrokerNotification),
@@ -441,29 +453,28 @@ impl Notifications {
     ) -> Result<(usize, u32), ChannelError> {
         let mut received = 0;
         loop {
-            let mut batch = 0;
+            let mut batch = Vec::new();
             let wait_epoch = loop {
                 match self.consumer.try_read(wire::decode_notification) {
-                    Ok(ControlRingReadStatus::Message(notification)) => {
-                        dispatch(notification);
-                        batch += 1;
-                    }
+                    Ok(ControlRingReadStatus::Message(notification)) => batch.push(notification),
                     Ok(ControlRingReadStatus::Empty { wait_epoch }) => break wait_epoch,
                     Err(error) => return Err(read_error(error)),
                 }
             };
-            received += batch;
-            if batch != 0 {
-                // The kernel sees the freed slots when it next publishes.
-                self.consumer.publish_head().map_err(ChannelError::Ring)?;
-            }
-            if (batch as u64) < CONTROL_RING_NOTIFICATION_SLOT_COUNT {
+            if batch.is_empty() {
                 return Ok((received, wait_epoch));
             }
-            // A full ring: the kernel may hold more. This publishes them, and
-            // so leaves the kernel to interrupt the process for them once
-            // more, with nothing left to receive by then.
-            publish_rest().map_err(ChannelError::Kernel)?;
+            // The kernel sees the freed slots when it next publishes.
+            self.consumer.publish_head().map_err(ChannelError::Ring)?;
+            let full = batch.len() as u64 == CONTROL_RING_NOTIFICATION_SLOT_COUNT;
+            received += batch.len();
+            batch.into_iter().for_each(&mut *dispatch);
+            if full {
+                // A full ring: the kernel may hold more. This publishes them,
+                // and so leaves the kernel to interrupt the process for them
+                // once more, with nothing left to receive by then.
+                publish_rest().map_err(ChannelError::Kernel)?;
+            }
         }
     }
 }
@@ -481,7 +492,12 @@ impl Notifications {
         Failure: Fn() + Sync,
     {
         Receiver {
-            notifications: spin::Mutex::new(Some(self)),
+            reading: spin::Mutex::new(Reading {
+                notifications: Some(self),
+                queue: VecDeque::new(),
+            }),
+            dispatching: AtomicBool::new(false),
+            requested: AtomicBool::new(false),
             dispatch,
             dispatch_failure,
         }
@@ -494,11 +510,28 @@ impl Notifications {
 /// malformed ring) fails the association's objects, once, with
 /// `dispatch_failure` (e.g., `LiteBox::broker_failure_dispatcher`), and then
 /// nothing more is received.
+///
+/// Threads may drain at once: each reads what is published, so that the
+/// kernel sees the ring consumed at once, and one at a time dispatches what
+/// was read, in order. Dispatching may take long (e.g., waiting for a lock,
+/// or preempted): meanwhile, the others' waits do not end for notifications
+/// that are only left to dispatch (see `litebox_common_vm_abi`, Threads).
 pub struct Receiver<Dispatch, Failure> {
-    /// `None` once receiving failed.
-    notifications: spin::Mutex<Option<Notifications>>,
+    /// Held only to read the ring or take from the queue.
+    reading: spin::Mutex<Reading>,
+    /// A thread dispatches the queue.
+    dispatching: AtomicBool,
+    /// A drain found `dispatching` set: its dispatcher dispatches again.
+    requested: AtomicBool,
     dispatch: Dispatch,
     dispatch_failure: Failure,
+}
+
+struct Reading {
+    /// `None` once receiving failed.
+    notifications: Option<Notifications>,
+    /// Read but not yet dispatched, in order.
+    queue: VecDeque<BrokerNotification>,
 }
 
 impl<Dispatch, Failure> Receiver<Dispatch, Failure>
@@ -506,27 +539,48 @@ where
     Dispatch: Fn(BrokerNotification) + Sync,
     Failure: Fn() + Sync,
 {
-    /// `receive` on the notifications, unless receiving failed (`None`);
-    /// fails them on an error.
-    fn with_notifications<T>(
-        &self,
-        receive: impl FnOnce(&mut Notifications, &Dispatch) -> Result<T, ChannelError>,
-    ) -> Option<Result<T, ChannelError>> {
-        let mut notifications = self
-            .notifications
-            .try_lock()
-            .expect("one thread receives at a time");
-        let result = receive(notifications.as_mut()?, &self.dispatch);
-        match &result {
-            Err(ChannelError::Kernel(Status::Stalled)) | Ok(_) => {}
-            Err(error) => {
-                log::error!("failed to receive broker notifications: {error}");
-                *notifications = None;
-                drop(notifications);
-                (self.dispatch_failure)();
-            }
+    /// Reads what is published into the queue, unless receiving failed;
+    /// fails the association's objects if this fails it.
+    fn read(&self) {
+        let mut reading = self.reading.lock();
+        if !reading.read() {
+            drop(reading);
+            (self.dispatch_failure)();
         }
-        Some(result)
+    }
+
+    /// The queue's first, reading what is published if it is empty. Only
+    /// the dispatcher takes from the queue, so that it keeps the order.
+    fn next(&self) -> Option<BrokerNotification> {
+        let mut reading = self.reading.lock();
+        if let Some(notification) = reading.queue.pop_front() {
+            return Some(notification);
+        }
+        if !reading.read() {
+            drop(reading);
+            (self.dispatch_failure)();
+            reading = self.reading.lock();
+        }
+        reading.queue.pop_front()
+    }
+}
+
+impl Reading {
+    /// Reads what is published into the queue, unless receiving failed;
+    /// false if this fails it.
+    fn read(&mut self) -> bool {
+        let Self {
+            notifications,
+            queue,
+        } = self;
+        let Some(Err(error)) = notifications.as_mut().map(|notifications| {
+            notifications.try_receive(|notification| queue.push_back(notification))
+        }) else {
+            return true;
+        };
+        log::error!("failed to receive broker notifications: {error}");
+        *notifications = None;
+        false
     }
 }
 
@@ -535,22 +589,27 @@ where
     Dispatch: Fn(BrokerNotification) + Sync,
     Failure: Fn() + Sync,
 {
-    /// After a failure, nothing could publish (`None`). The failure itself
-    /// counts as one dispatched notification, so waiters recheck (and see
-    /// their objects failed).
-    fn receive(&self, deadline: Option<Instant>) -> Option<usize> {
-        match self.with_notifications(|notifications, dispatch| {
-            notifications.receive(deadline, dispatch)
-        })? {
-            Ok(received) => Some(received),
-            // Nothing could publish: no input to come, and no timer armed.
-            Err(ChannelError::Kernel(Status::Stalled)) => None,
-            Err(_) => Some(1),
-        }
-    }
-
+    /// Reads what is published (nothing once receiving failed), then
+    /// dispatches it, unless another thread dispatches: that one then
+    /// dispatches it too, once it is done (it may have found the queue empty
+    /// just before). Dispatching may wait (e.g., for a lock), and
+    /// interrupted, drain again: nested, it so has the outer drain dispatch
+    /// what it read.
     fn drain(&self) {
-        self.with_notifications(|notifications, dispatch| notifications.try_receive(dispatch));
+        self.read();
+        self.requested.store(true, Ordering::SeqCst);
+        // Checked once no longer dispatching: a request since then, which
+        // this does not see, found dispatching free.
+        while self.requested.load(Ordering::SeqCst) {
+            if self.dispatching.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            self.requested.store(false, Ordering::SeqCst);
+            while let Some(notification) = self.next() {
+                (self.dispatch)(notification);
+            }
+            self.dispatching.store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -561,17 +620,38 @@ fn read_error(error: ControlRingReadError<WireError>) -> ChannelError {
     }
 }
 
-/// Has the kernel serve published broker requests.
-fn broker_wake() -> Result<(), Status> {
-    kcall::call(&BrokerEnterRequest::wake())
+/// The kernel's futex on the control ring at `start`, at `offset`.
+fn futex(
+    start: usize,
+    request: impl FnOnce(u64) -> FutexRequest,
+    offset: usize,
+) -> Result<(), Status> {
+    kcall::call(&request((start + offset) as u64)).map(|_| ())
 }
 
-/// Has the kernel serve published broker requests, and waits while the
-/// control-ring word at `offset` equals `expected`, until `deadline`, if any.
-fn broker_wait(offset: usize, expected: u32, deadline: Option<Instant>) -> Result<(), Status> {
+/// Has the kernel serve published broker requests: a wake on the requests'
+/// producer epoch of the control ring at `start`.
+fn broker_wake(start: usize) -> Result<(), Status> {
+    let offset = ControlRingDirection::Requests.producer_epoch_offset();
+    futex(start, |addr| FutexRequest::wake(addr, 1), offset)
+}
+
+/// Has the kernel serve published broker requests, and waits while the word
+/// at `offset` into the control ring at `start` equals `expected`, until
+/// `deadline`, if any.
+fn broker_wait(
+    start: usize,
+    offset: usize,
+    expected: u32,
+    deadline: Option<Instant>,
+) -> Result<(), Status> {
     // Zero means none, so the (theoretical) instant zero waits from 1 ns.
     let deadline = deadline.map_or(0, |deadline| deadline.as_nanos().max(1));
-    kcall::call(&BrokerEnterRequest::wait(offset as u64, expected, deadline))
+    futex(
+        start,
+        |addr| FutexRequest::wait(addr, expected, deadline),
+        offset,
+    )
 }
 
 /// Self-check (debug builds): the broker's futex operations, on the
@@ -591,10 +671,16 @@ pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
             .load_u32_acquire(offset)
             .expect("a ring word")
     };
-    broker_wake().expect("waking an idle broker");
+    let start = notifications.words.start;
+    broker_wake(start).expect("waking an idle broker");
+    // The broker waits on no other word.
+    assert_eq!(
+        futex(start, |addr| FutexRequest::wake(addr, 1), epoch),
+        Ok(())
+    );
     let notified = current(epoch);
     assert_eq!(
-        broker_wait(epoch, notified.wrapping_add(1), None),
+        broker_wait(start, epoch, notified.wrapping_add(1), None),
         Ok(()),
         "word differs"
     );
@@ -602,26 +688,25 @@ pub fn self_check(notifications: &Notifications, platform: &VmUserland) {
         .checked_add(core::time::Duration::from_millis(1))
         .expect("the clock is far from overflowing");
     assert_eq!(
-        broker_wait(served, current(served), None),
+        broker_wait(start, served, current(served), None),
         Err(Status::Stalled)
     );
     assert_eq!(
-        broker_wait(served, current(served), Some(soon)),
+        broker_wait(start, served, current(served), Some(soon)),
         Err(Status::TimedOut)
     );
     assert!(now() >= soon, "a timed wait returned early");
-    assert_eq!(broker_wait(0, 0, None), Err(Status::InvalidArgument));
-    let mut wake = BrokerEnterRequest::wake();
+    assert_eq!(broker_wait(start, 0, 0, None), Err(Status::InvalidArgument));
+    let mut wake = FutexRequest::wake((start + served) as u64, 1);
     wake.expected = 1;
     assert_eq!(kcall::call(&wake), Err(Status::InvalidArgument));
-    broker_wake().expect("the association survives");
+    broker_wake(start).expect("the association survives");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::AtomicUsize;
     use litebox_broker_protocol::ObjectHandle;
     use litebox_broker_protocol::message::ReadinessNotification;
     use litebox_broker_protocol::readiness::ReadinessFlags;
@@ -706,6 +791,60 @@ mod tests {
     }
 
     #[test]
+    fn notifications_are_consumed_before_their_dispatch() {
+        let mut memory = ring_memory();
+        let (notifications, producer) = ring(&mut memory);
+        let producer = spin::Mutex::new(producer);
+        producer.lock().try_write(&readiness(7)).expect("written");
+        let dispatched = AtomicUsize::new(0);
+        let receiver = notifications.into_receiver(
+            |_| {
+                let mut producer = producer.lock();
+                // Other threads' waits do not end for what this dispatches.
+                assert!(!producer.has_unconsumed().expect("ring"));
+                if dispatched.fetch_add(1, Ordering::Relaxed) == 0 {
+                    // Published while dispatching: received in the same drain.
+                    producer.try_write(&readiness(8)).expect("written");
+                }
+            },
+            || panic!("receiving failed"),
+        );
+        receiver.drain();
+        assert_eq!(dispatched.load(Ordering::Relaxed), 2);
+        assert!(!producer.lock().has_unconsumed().expect("ring"));
+    }
+
+    #[test]
+    fn a_drain_while_another_dispatches_leaves_it_to_that_one_in_order() {
+        let mut memory = ring_memory();
+        let (notifications, mut producer) = ring(&mut memory);
+        let dispatched = spin::Mutex::new(Vec::new());
+        let receiver = notifications.into_receiver(
+            |notification| {
+                let BrokerNotification::Readiness(readiness) = notification;
+                dispatched.lock().push(readiness.handle.0);
+            },
+            || panic!("receiving failed"),
+        );
+        // As if another thread dispatched.
+        receiver.dispatching.store(true, Ordering::SeqCst);
+        producer.try_write(&readiness(1)).expect("written");
+        producer.try_write(&readiness(2)).expect("written");
+        receiver.drain();
+        assert!(dispatched.lock().is_empty());
+        assert!(
+            !producer.has_unconsumed().expect("ring"),
+            "read, for other threads' waits"
+        );
+        producer.try_write(&readiness(3)).expect("written");
+        // That thread, done, finds the request, and dispatches all, in order.
+        receiver.dispatching.store(false, Ordering::SeqCst);
+        assert!(receiver.requested.load(Ordering::SeqCst));
+        receiver.drain();
+        assert_eq!(*dispatched.lock(), [1, 2, 3]);
+    }
+
+    #[test]
     fn a_receive_failure_fails_the_association_once_and_stops_receiving() {
         let mut memory = ring_memory();
         let (notifications, mut producer) = ring(&mut memory);
@@ -732,11 +871,6 @@ mod tests {
         receiver.drain();
         assert_eq!(failures.load(Ordering::Relaxed), 1);
         receiver.drain();
-        assert_eq!(
-            receiver.receive(Some(Instant::from_nanos(1))),
-            None,
-            "nothing could publish, so no wait"
-        );
         assert_eq!(dispatched.load(Ordering::Relaxed), 1);
         assert_eq!(failures.load(Ordering::Relaxed), 1);
     }

@@ -15,13 +15,13 @@
 //! QEMU's TCG), starting at the Unix epoch. `alarm` and `setitimer` raise
 //! `SIGALRM` from platform timers; timer files are broker timers.
 //!
-//! Waits halt in the kernel until their timeout, a platform timer, or a
-//! broker notification (e.g., a timer file's expiry, or standard input
-//! arriving), which the broker's notification receiver dispatches. The
-//! kernel also interrupts the running program once it publishes one, so a
-//! nonblocking check (e.g., `epoll_wait` with no timeout) sees it even in a
-//! busy loop: a timer file's expiry as it comes due, and standard input as
-//! the console's interrupt brings it.
+//! Waits block in the kernel (its futex) until their timeout, a platform
+//! timer, or a broker notification (e.g., a timer file's expiry, or
+//! standard input arriving), which the broker's notification receiver
+//! dispatches. The kernel also interrupts the running program once it
+//! publishes one, so a nonblocking check (e.g., `epoll_wait` with no
+//! timeout) sees it even in a busy loop: a timer file's expiry as it comes
+//! due, and standard input as the console's interrupt brings it.
 //!
 //! Limits, which end the runner (the kernel sees it exit with
 //! `EXIT_FAILURE`) rather than fail the program's call:
@@ -42,16 +42,16 @@ type Platform = VmUserland;
 const GUEST_UID: u32 = 1000;
 const GUEST_GID: u32 = 1000;
 
-/// Besides [`CallId::Exit`], which is always allowed. No key derivation: the
-/// process has no identity.
+/// Besides [`CallId::Exit`] and [`CallId::ExitThread`], which are always
+/// allowed. No key derivation: the process has no identity.
 const SERVING_CALLS: CallSet = CallSet::EMPTY
     .with(CallId::ReplyAndWait)
     .with(CallId::Map)
     .with(CallId::Unmap)
     .with(CallId::Protect)
-    .with(CallId::BrokerEnter)
     .with(CallId::SetTimer)
-    .with(CallId::Log);
+    .with(CallId::Log)
+    .with(CallId::Futex);
 
 pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));

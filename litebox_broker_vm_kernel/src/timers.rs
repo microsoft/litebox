@@ -2,9 +2,10 @@
 // Licensed under the MIT license.
 
 //! Broker timers on the kernel clock. Alarms fire when the broker runs: on
-//! each `BrokerEnter` and each poll of a blocked wait, after the kernel halts
-//! until the earliest deadline ([`KernelTimers::next_deadline`]), and when
-//! that deadline interrupts a running process. A fired alarm publishes
+//! each futex operation on the control ring and each poll of a blocked wait,
+//! after the kernel halts until the earliest deadline
+//! ([`KernelTimers::next_deadline`]), and when that deadline interrupts a
+//! running process. A fired alarm publishes
 //! its timer's readiness to its watchers (e.g., processes sharing the timer
 //! across fork), through their associations' notification rings.
 //!

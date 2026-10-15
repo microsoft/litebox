@@ -90,8 +90,18 @@ impl PerCpuStacks {
 pub(crate) struct XsaveArea([u8; PerCpuVariables::XSAVE_AREA_SIZE]);
 
 impl XsaveArea {
-    pub(crate) const fn zeroed() -> Self {
-        Self([0; PerCpuVariables::XSAVE_AREA_SIZE])
+    /// The initial state, as `PerCpuVariablesAsm::reset_user_xsave` leaves
+    /// an area: XRSTOR loads MXCSR from the area even for the initial SSE
+    /// state, and zero would unmask every SIMD exception.
+    pub(crate) const fn initial() -> Self {
+        let mut area = Self([0; PerCpuVariables::XSAVE_AREA_SIZE]);
+        let mxcsr = PerCpuVariables::MXCSR_DEFAULT.to_le_bytes();
+        let mut i = 0;
+        while i < mxcsr.len() {
+            area.0[PerCpuVariables::XSAVE_MXCSR_OFFSET + i] = mxcsr[i];
+            i += 1;
+        }
+        area
     }
 }
 

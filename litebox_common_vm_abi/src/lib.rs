@@ -47,13 +47,22 @@
 //!   return address, `r11` = flags), number in `orig_rax`, `rax` = `-ENOSYS`.
 //! - [`UpcallKind::Exception`]: an exception the kernel could not resolve;
 //!   `rip` is the faulting instruction.
-//! - [`UpcallKind::Interrupt`]: the [`CallId::SetTimer`] deadline passed
-//!   while the process ran; `vector`, `error_code`, and `fault_address` are
-//!   zero. `regs` are whatever the process was running at the time (its own
-//!   code or a further-embedded guest's), unrelated to the deadline.
+//! - [`UpcallKind::Interrupt`]: `vector`, `error_code`, and `fault_address`
+//!   are zero; `regs` are whatever the thread was running at the time (its
+//!   own code or a further-embedded guest's), unrelated to the cause. It
+//!   comes:
+//!   - once the process's [`CallId::SetTimer`] deadline passes, to every
+//!     thread, as each next runs;
+//!   - once broker notifications are published to the process, to one
+//!     thread: the running one, or the next to run;
+//!   - for [`CallId::InterruptThread`], to that thread, as it next runs.
 //!
-//! The runner resumes the guest itself. Without an upcall entry, an upcall
-//! kills the process.
+//!   A thread in a [`FutexOp::Wait`] also ends it, which for notifications
+//!   replaces the upcall (see [Threads](crate#threads)).
+//!
+//! An upcall goes to the thread it is for, on that thread's upcall stack (see
+//! [Threads](crate#threads)). The runner resumes the guest itself. Without an
+//! upcall entry, an upcall kills the process.
 //!
 //! # Messages
 //!
@@ -74,11 +83,38 @@
 //!   ([`StartupInfo`]), including the runner image; kernel-placed objects go
 //!   only here.
 //!
+//! # Threads
+//!
+//! A process starts with one thread, its main thread, which alone serves
+//! [Messages](crate#messages). While it serves a request, any thread can
+//! [`CallId::Clone`] another, as Linux's `clone` does (`copy_thread`):
+//!
+//! - [`CloneKind::Thread`]: in the same process, sharing everything but its
+//!   registers, FS and GS bases, extended state (initial), and upcall stack
+//!   (its own, given by the runner, unlike the main thread's
+//!   [`StartupInfo::upcall_stack`]). Further kinds (e.g., a process with a
+//!   copy of the address space, for `fork`) may come.
+//! - A thread runs until [`CallId::ExitThread`]; [`CallId::Exit`] ends every
+//!   thread. The main thread cannot exit alone, and replies (or waits for its
+//!   first request) only once it is the only thread: like `exec`, a request
+//!   starts with one thread.
+//! - The kernel schedules threads, preempting them as processes, and keeps
+//!   the FS and GS bases per thread.
+//! - [`CallId::Futex`] is a private futex on `u32` words of the process. A
+//!   wait also ends, with [`Status::Interrupted`], for what interrupts the
+//!   thread (see [Upcalls](crate#upcalls)), for the runner to handle it: the
+//!   process's deadline or [`CallId::InterruptThread`], whose
+//!   [`UpcallKind::Interrupt`] the thread still takes once it resumes; or
+//!   broker notifications it has not consumed (even if an interrupt already
+//!   came for them), which the runner then receives, with no upcall for
+//!   them. Besides the broker's waits, they are the runner's only way to
+//!   block.
+//!
 //! # Lockdown
 //!
 //! [`CallId::Restrict`] irrevocably narrows the allowed calls and page
-//! permissions. A violation kills the process. [`CallId::Exit`] is always
-//! allowed.
+//! permissions. A violation kills the process. [`CallId::Exit`] and
+//! [`CallId::ExitThread`] are always allowed.
 //!
 //! # Trust
 //!
@@ -89,19 +125,27 @@
 //!
 //! # Broker
 //!
-//! Active traffic uses the userland broker's shared-memory transport, served
-//! like `io_uring`:
+//! Active traffic uses the userland broker's shared-memory transport:
 //!
 //! - [`CallId::BrokerHandshake`] negotiates the association and activates the
 //!   control ring (`litebox_broker_transport::control_ring`) at the start of
 //!   [`StartupInfo::broker_control_ring`] and the shared buffers in
 //!   [`StartupInfo::broker_shared_memory`]. [`ABI_VERSION`] covers the ring
 //!   layout.
-//! - The runner publishes requests and consumes responses.
-//!   [`CallId::BrokerEnter`] stands in for the userland transport's futex:
-//!   [`BrokerEnterOp::Wake`] and [`BrokerEnterOp::Wait`] on ring words. The
-//!   kernel serves the published requests apart from the call, as the
-//!   userland broker's workers do.
+//! - The runner publishes requests and consumes responses, with
+//!   [`CallId::Futex`] on ring words, as the userland transport uses the
+//!   host's futex. The kernel's broker changes the ring words, and serves the
+//!   published requests apart from the call, as the userland broker's
+//!   workers do; so on a word of the control ring:
+//!   - [`FutexOp::Wake`] on the requests' producer epoch has the kernel serve
+//!     them (before the call returns, unless a request waits, e.g., for a
+//!     device); on other words, it wakes nothing.
+//!   - [`FutexOp::Wait`] needs no wake: it returns once the word differs from
+//!     `expected`, the kernel serving the published requests meanwhile. It
+//!     is not interrupted ([`Status::Interrupted`]); a thread interrupted
+//!     meanwhile takes the interrupt once it resumes. Without a deadline, a
+//!     word other than the notification epoch is [`Status::Stalled`] once the
+//!     kernel has served every published request.
 //! - The ring's notification direction carries readiness of broker objects
 //!   (e.g., standard input) from the kernel, published as it changes; the
 //!   runner consumes them and waits for them on the direction's producer
@@ -111,8 +155,10 @@
 //!   executing a request that names them.
 //! - If the response ring is full, the kernel holds one response and consumes
 //!   no further request.
-//! - A malformed ring or request kills the process. Before the handshake,
-//!   `BrokerEnter` is [`Status::Denied`].
+//! - A malformed ring or request kills the process. Before the handshake, a
+//!   futex operation on the control ring is [`Status::Denied`]; on the ring,
+//!   only the words that `litebox_broker_transport`'s
+//!   `MemoryAccessPolicy::ControlRing` lets a peer access as `u32` are valid.
 
 #![no_std]
 
@@ -159,6 +205,9 @@ pub const IDENTITY_LEN: usize = 32;
 /// Length of [`StartupInfo::images`].
 pub const MAX_IMAGES: usize = 4;
 
+/// The main thread's [`CloneReply::thread`].
+pub const MAIN_THREAD: u64 = 0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(u32)]
 /// Why a call failed; a successful call returns 0.
@@ -180,6 +229,8 @@ pub enum Status {
     TimedOut = 9,
     /// A wait that nothing could end.
     Stalled = 10,
+    /// A wait ended for what an [`UpcallKind::Interrupt`] would deliver.
+    Interrupted = 11,
 }
 
 impl Status {
@@ -307,8 +358,10 @@ kernel_calls! {
     /// `litebox_broker_protocol` wire frames. One attempt, successful or not;
     /// later ones are [`Status::Denied`]. See [Broker](crate#broker).
     6 => BrokerHandshake(BrokerHandshakeFrame) -> WireFrame;
-    /// Serves the broker's request ring. See [Broker](crate#broker).
-    7 => BrokerEnter(BrokerEnterRequest) -> ();
+    /// A private futex (see [`FutexOp`]), as Linux's `futex`: for
+    /// [Threads](crate#threads), and, on the control ring, the
+    /// [Broker](crate#broker)'s.
+    7 => Futex(FutexRequest) -> FutexReply;
     /// The key is bound to [`StartupInfo::identity`] and `context`.
     8 => DeriveKey(DeriveKeyRequest) -> DeriveKeyReply;
     9 => Log(LogRequest) -> ();
@@ -316,13 +369,26 @@ kernel_calls! {
     10 => Exit(ExitRequest) -> ();
     /// See [Lockdown](crate#lockdown).
     11 => Restrict(RestrictRequest) -> ();
-    /// Sets the process's one-shot timer: at `deadline` (an instant), the
-    /// kernel delivers [`UpcallKind::Interrupt`] if the process is still
-    /// running then; zero cancels. One timer per process; a later call
-    /// replaces the earlier one. The kernel may deliver
-    /// it late, e.g. while running kernel code on the process's behalf, but
-    /// not early.
+    /// Sets the process's one-shot timer: once `deadline` (an instant)
+    /// passes, every thread of the process takes [`UpcallKind::Interrupt`]
+    /// as it next runs, a thread in a [`FutexOp::Wait`] ending it first (see
+    /// [Upcalls](crate#upcalls)); zero cancels. One timer per process; a
+    /// later call replaces the earlier one. The kernel may deliver it late,
+    /// e.g. while running kernel code on the process's behalf, but not
+    /// early.
     12 => SetTimer(SetTimerRequest) -> ();
+    /// Creates a thread. Allowed only while serving a request (see
+    /// [Threads](crate#threads)); [`Status::NoMemory`] at the kernel's thread
+    /// limit.
+    13 => Clone(CloneRequest) -> CloneReply;
+    /// Ends the calling thread; does not return. [`Status::Denied`] for the
+    /// main thread.
+    14 => ExitThread(ExitThreadRequest) -> ();
+    /// Has `thread` (possibly the caller) take an [`UpcallKind::Interrupt`]
+    /// once it next runs, also if this ends its [`FutexOp::Wait`] (with
+    /// [`Status::Interrupted`]); as `tgkill` does. [`Status::InvalidArgument`]
+    /// for a thread that does not exist (e.g., exited).
+    15 => InterruptThread(InterruptThreadRequest) -> ();
 }
 
 /// One bit per [`CallId`] value.
@@ -606,52 +672,6 @@ impl WireFrame {
 #[repr(transparent)]
 pub struct BrokerHandshakeFrame(pub WireFrame);
 
-/// The futex operations of the userland transport, on control-ring words.
-/// Both have the kernel serve the published requests.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(u32)]
-pub enum BrokerEnterOp {
-    Wake = 0,
-    /// Returns once the `u32` ring word at `offset`, an epoch, differs from
-    /// `expected`. [`Status::TimedOut`] at the deadline; [`Status::Stalled`]
-    /// if nothing could change the word: without a deadline, a word other
-    /// than the notification epoch stalls once the kernel has served every
-    /// published request. Other processes run meanwhile.
-    Wait = 1,
-}
-
-/// `offset` is into the control ring and `deadline` an instant (see
-/// [Clock](crate#clock)) or zero for none. The other fields are zero for
-/// [`BrokerEnterOp::Wake`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
-#[repr(C)]
-pub struct BrokerEnterRequest {
-    pub op: BrokerEnterOp,
-    pub expected: u32,
-    pub offset: u64,
-    pub deadline: u64,
-}
-
-impl BrokerEnterRequest {
-    pub const fn wake() -> Self {
-        Self {
-            op: BrokerEnterOp::Wake,
-            expected: 0,
-            offset: 0,
-            deadline: 0,
-        }
-    }
-
-    pub const fn wait(offset: u64, expected: u32, deadline: u64) -> Self {
-        Self {
-            op: BrokerEnterOp::Wait,
-            expected,
-            offset,
-            deadline,
-        }
-    }
-}
-
 /// `context.len` ≤ [`MAX_KDF_CONTEXT_LEN`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
@@ -705,8 +725,9 @@ pub struct ExitRequest {
 pub struct ReadyRequest {
     pub abi_version: u32,
     reserved: Reserved,
-    /// Entered with `rdi` = the [`UpcallFrame`] on
-    /// [`StartupInfo::upcall_stack`]. Zero: upcalls kill the process.
+    /// Entered with `rdi` = the [`UpcallFrame`] on the thread's upcall stack
+    /// (the main thread's is [`StartupInfo::upcall_stack`]). Zero: upcalls
+    /// kill the process.
     /// Otherwise in the runner's executable segments, or
     /// [`Status::InvalidArgument`].
     pub upcall_entry: u64,
@@ -785,8 +806,142 @@ pub struct SetTimerRequest {
     pub deadline: u64,
 }
 
-/// See [Upcalls](crate#upcalls). An upcall while `rsp` is on the upcall stack
-/// kills the process.
+/// What [`CloneRequest`] creates; see [Threads](crate#threads).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(u32)]
+pub enum CloneKind {
+    /// A thread of the calling process.
+    Thread = 0,
+}
+
+/// The new thread starts at `regs` (`rip` and `rsp` in user space; `cs`,
+/// `ss`, and privileged flags are the kernel's; `rax` is replaced with its
+/// [`CloneReply::thread`], for it to know itself), with the given FS and GS
+/// bases (valid user addresses, or zero), and initial extended state. Its
+/// upcalls go on `upcall_stack`: page-aligned, nonempty, in
+/// [`RUNNER_MANAGED_MIN`]..[`USER_END`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct CloneRequest {
+    pub kind: CloneKind,
+    reserved: Reserved,
+    pub regs: Registers,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub upcall_stack: UserRange,
+}
+
+/// A [`CloneRequest`]'s thread: where it starts, and what it starts with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NewThread {
+    pub regs: Registers,
+    pub fs_base: u64,
+    pub gs_base: u64,
+    pub upcall_stack: UserRange,
+}
+
+impl CloneRequest {
+    pub const fn new(kind: CloneKind, thread: NewThread) -> Self {
+        let NewThread {
+            regs,
+            fs_base,
+            gs_base,
+            upcall_stack,
+        } = thread;
+        Self {
+            kind,
+            reserved: Reserved::Zero,
+            regs,
+            fs_base,
+            gs_base,
+            upcall_stack,
+        }
+    }
+}
+
+/// For [`CallId::InterruptThread`]. The main thread is [`MAIN_THREAD`]; a
+/// process never reuses an ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct CloneReply {
+    pub thread: u64,
+}
+
+/// `clear`: zero, or a `u32` word of the process that the kernel sets to
+/// zero, waking its futex waiters, once the thread is gone (as Linux's
+/// `CLONE_CHILD_CLEARTID`); failing to is ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct ExitThreadRequest {
+    pub clear: u64,
+}
+
+/// The operations of [`CallId::Futex`], on the `u32` at its `addr`, in the
+/// order of Linux's. On the broker's control ring, see [Broker](crate#broker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(u32)]
+pub enum FutexOp {
+    /// Blocks while the word equals `expected`, until a [`FutexOp::Wake`] on
+    /// it (success), the deadline ([`Status::TimedOut`]), or an interrupt
+    /// ([`Status::Interrupted`]). Returns at once, successfully, if the word
+    /// differs. [`Status::Stalled`] if nothing could end it. Other threads
+    /// and processes run meanwhile.
+    Wait = 0,
+    /// Wakes up to `count` threads waiting on the word.
+    Wake = 1,
+}
+
+/// `addr` is 4-byte aligned. `expected` and `deadline` (an instant, see
+/// [Clock](crate#clock), or zero for none) are [`FutexOp::Wait`]'s, and
+/// `count` is [`FutexOp::Wake`]'s; the other op's are zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct FutexRequest {
+    pub op: FutexOp,
+    pub expected: u32,
+    pub addr: u64,
+    pub deadline: u64,
+    pub count: u64,
+}
+
+impl FutexRequest {
+    pub const fn wait(addr: u64, expected: u32, deadline: u64) -> Self {
+        Self {
+            op: FutexOp::Wait,
+            expected,
+            addr,
+            deadline,
+            count: 0,
+        }
+    }
+
+    pub const fn wake(addr: u64, count: u64) -> Self {
+        Self {
+            op: FutexOp::Wake,
+            expected: 0,
+            addr,
+            deadline: 0,
+            count,
+        }
+    }
+}
+
+/// `woken`: how many threads [`FutexOp::Wake`] woke; zero for
+/// [`FutexOp::Wait`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct FutexReply {
+    pub woken: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
+#[repr(C)]
+pub struct InterruptThreadRequest {
+    pub thread: u64,
+}
+
+/// See [Upcalls](crate#upcalls). An upcall while `rsp` is on the thread's
+/// upcall stack kills the process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromBytes, IntoBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct UpcallFrame {
@@ -862,6 +1017,7 @@ pub struct StartupInfo {
     pub heap: UserRange,
     /// The entry `rsp` is its end.
     pub stack: UserRange,
+    /// The main thread's; see [Threads](crate#threads).
     pub upcall_stack: UserRange,
     /// See [Messages](crate#messages).
     pub message_window: UserRange,
@@ -969,20 +1125,44 @@ mod tests {
             RestrictRequest::new(CallSet::ALL, ProtSet::ALL).as_bytes(),
             12,
         );
+        check(
+            CallId::Clone,
+            CloneRequest::new(
+                CloneKind::Thread,
+                NewThread {
+                    upcall_stack: range,
+                    ..NewThread::default()
+                },
+            )
+            .as_bytes(),
+            4,
+        );
     }
 
     #[test]
-    fn broker_enter_ops_are_validated() {
-        let wait = BrokerEnterRequest::wait(8, 1, 42);
+    fn futex_ops_are_validated() {
+        let wait = FutexRequest::wait(0x1000, 1, 42);
         assert!(matches!(
-            Request::decode(CallId::BrokerEnter, wait.as_bytes()),
-            Ok(Request::BrokerEnter(r)) if r == wait
+            Request::decode(CallId::Futex, wait.as_bytes()),
+            Ok(Request::Futex(r)) if r == wait
         ));
-        let mut bytes = [0u8; size_of::<BrokerEnterRequest>()];
+        let mut bytes = [0u8; size_of::<FutexRequest>()];
         bytes.copy_from_slice(wait.as_bytes());
         bytes[0] = 2;
         assert_eq!(
-            Request::decode(CallId::BrokerEnter, &bytes).unwrap_err(),
+            Request::decode(CallId::Futex, &bytes).unwrap_err(),
+            Status::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn clone_kinds_are_validated() {
+        let request = CloneRequest::new(CloneKind::Thread, NewThread::default());
+        let mut bytes = [0u8; size_of::<CloneRequest>()];
+        bytes.copy_from_slice(request.as_bytes());
+        bytes[0] = 1;
+        assert_eq!(
+            Request::decode(CallId::Clone, &bytes).unwrap_err(),
             Status::InvalidArgument
         );
     }

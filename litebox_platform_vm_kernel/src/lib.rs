@@ -1054,13 +1054,29 @@ pub struct UserThreadState {
     gs_base: VirtAddr,
 }
 
+/// The initial state, as a reset leaves it (see [`run_thread_ref`]), with a
+/// zero GS base.
 impl Default for UserThreadState {
     fn default() -> Self {
         Self {
-            area: alloc::boxed::Box::new(per_cpu::XsaveArea::zeroed()),
+            area: alloc::boxed::Box::new(per_cpu::XsaveArea::initial()),
             xsaved: per_cpu::XsaveState::default(),
             gs_base: VirtAddr::zero(),
         }
+    }
+}
+
+impl UserThreadState {
+    /// A new thread's: initial extended state, and `gs_base`, for
+    /// [`resume_thread_ref`] to start it with. `None` unless `gs_base` is a
+    /// user address, or zero.
+    pub fn with_gs_base(gs_base: u64) -> Option<Self> {
+        let user = usize::try_from(gs_base)
+            .is_ok_and(|addr| addr == 0 || (USER_ADDR_MIN..USER_ADDR_MAX).contains(&addr));
+        user.then(|| Self {
+            gs_base: VirtAddr::new(gs_base),
+            ..Self::default()
+        })
     }
 }
 
