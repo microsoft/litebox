@@ -4,3 +4,7 @@ build-std = ["core", "compiler_builtins", "alloc"]
 
 [build]
 target = "x86_64_vtl1.json"
+# No jump/lookup tables: a mispredicted bounds check on an attacker-controlled
+# `match` value (e.g., a syscall number) could otherwise load a branch target
+# from out of bounds (Spectre v1). `RUSTFLAGS` overrides this; CI sets it too.
+rustflags = ["-Cjump-tables=no"]

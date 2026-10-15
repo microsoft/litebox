@@ -271,7 +271,8 @@ jobs:
           ./.github/tools/github_actions_run_cargo clippy -Z json-target-spec -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json --all-features
       - run: |
           ./.github/tools/github_actions_run_cargo build
-          ./.github/tools/github_actions_run_cargo build -Z json-target-spec -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
+          # Keep `-Cjump-tables=no` in sync with litebox_runner_lvbs/.cargo/config.toml.
+          RUSTFLAGS="$RUSTFLAGS -Cjump-tables=no" ./.github/tools/github_actions_run_cargo build -Z json-target-spec -Z build-std-features=compiler-builtins-mem -Z build-std=core,alloc --manifest-path=litebox_runner_lvbs/Cargo.toml --target litebox_runner_lvbs/x86_64_vtl1.json
       - run: ./.github/tools/github_actions_run_cargo nextest -p litebox_platform_lvbs
       - run: |
           ./.github/tools/github_actions_run_cargo test --doc
