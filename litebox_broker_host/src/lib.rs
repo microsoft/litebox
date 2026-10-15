@@ -51,8 +51,9 @@ use litebox_broker_protocol::pipe::{
 };
 use litebox_broker_protocol::process::{
     DuplicateObjectsToChildRequest, ExitChildProcessRequest, MAX_CHILD_MEMORY_WRITE_SIZE,
-    MAX_CHILD_OBJECT_DUPLICATES, MAX_PROCESS_BOOTSTRAP_SIZE, ProcessStartupData,
-    ProcessStartupDescriptor, StartChildProcessRequest, WriteChildMemoryRequest,
+    MAX_CHILD_OBJECT_DUPLICATES, MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_BOOTSTRAP_SIZE,
+    MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE, ProcessStartupData, ProcessStartupDescriptor,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, WriteChildMemoryRequest,
 };
 use litebox_broker_protocol::random::MAX_RANDOM_TRANSFER_SIZE;
 use litebox_broker_protocol::readiness_queue::{
@@ -598,7 +599,9 @@ fn handle_process_request<Memory: SharedMemory>(
                 .map(|()| ProcessResponse::DuplicateObjectsToChild);
         }
         // These need a platform launcher; see `handle_process_operation`.
-        ProcessRequest::WriteChildMemory(_) | ProcessRequest::StartChild(_) => {
+        ProcessRequest::WriteChildMemory(_)
+        | ProcessRequest::StartChild(_)
+        | ProcessRequest::StartChildWithExistingRunner(_) => {
             return Err(RequestFailure::Respond(ErrorCode::UnsupportedOperation));
         }
         ProcessRequest::ExitChild(ExitChildProcessRequest {
@@ -947,6 +950,15 @@ pub trait ProcessLauncher: Send + Sync {
         image: Option<ChildImage>,
     ) -> core::result::Result<(), BrokerError>;
 
+    /// Adopts and starts an already-created platform runner.
+    fn launch_existing(
+        self: Arc<Self>,
+        parent_process_id: ProcessId,
+        process: Arc<BrokerProcess>,
+        startup: ProcessStartupData,
+        launch_descriptor: Vec<u8>,
+    ) -> core::result::Result<(), BrokerError>;
+
     /// Creates an empty memory image for a pending child, which never grows
     /// past `capacity` bytes.
     fn create_image(
@@ -981,6 +993,36 @@ where
                     )
                 })
                 .map(|()| BrokerResult::Process(ProcessResponse::StartChild)),
+        ),
+        BrokerOperation::Process(ProcessRequest::StartChildWithExistingRunner(
+            StartChildWithExistingRunnerRequest {
+                child_process_id,
+                launch_descriptor_length,
+                data,
+            },
+        )) => Some(
+            read_shared_buffer(shared_buffers, *data, MAX_EXISTING_RUNNER_START_SIZE)
+                .and_then(|combined| {
+                    let descriptor_length = *launch_descriptor_length as usize;
+                    if descriptor_length > MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE as usize
+                        || descriptor_length > combined.len()
+                        || combined.len().saturating_sub(descriptor_length)
+                            > MAX_PROCESS_BOOTSTRAP_SIZE as usize
+                    {
+                        return Err(RequestFailure::Respond(ErrorCode::ResourceExhausted));
+                    }
+                    let (launch_descriptor, payload) = combined.split_at(descriptor_length);
+                    start_child_with_existing_runner(
+                        Arc::clone(launcher),
+                        parent,
+                        *child_process_id,
+                        ProcessStartupData {
+                            payload: payload.to_vec(),
+                        },
+                        launch_descriptor.to_vec(),
+                    )
+                })
+                .map(|()| BrokerResult::Process(ProcessResponse::StartChildWithExistingRunner)),
         ),
         BrokerOperation::Process(ProcessRequest::WriteChildMemory(WriteChildMemoryRequest {
             child_process_id,
@@ -1070,6 +1112,29 @@ fn start_child_process<Launcher: ProcessLauncher + ?Sized>(
             },
             image,
         )
+        .map_err(RequestFailure::from)
+}
+
+fn start_child_with_existing_runner<Launcher: ProcessLauncher + ?Sized>(
+    launcher: Arc<Launcher>,
+    parent: &BrokerProcess,
+    child_process_id: ProcessId,
+    startup: ProcessStartupData,
+    launch_descriptor: Vec<u8>,
+) -> RequestResult<()> {
+    if !parent.is_running() {
+        return Err(RequestFailure::Abort(ErrorCode::ProtocolState));
+    }
+    let process = parent
+        .take_child_process(child_process_id)
+        .map_err(RequestFailure::from)?;
+    if parent.is_cancellation_requested() {
+        let _ = process.fail_start(BrokerError::PeerClosed, false, true);
+        process.retire(true);
+        return Err(RequestFailure::Respond(ErrorCode::PeerClosed));
+    }
+    launcher
+        .launch_existing(parent.id(), process, startup, launch_descriptor)
         .map_err(RequestFailure::from)
 }
 

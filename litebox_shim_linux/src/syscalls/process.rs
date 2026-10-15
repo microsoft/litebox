@@ -1213,19 +1213,25 @@ impl<Platform: ShimPlatform> Task<Platform> {
             .map_err(Errno::from)?;
         let child_pid = i32::try_from(child.identity().process_id.0)
             .expect("broker process IDs must fit Linux pid_t");
-        self.write_fork_image(&child, &startup.regions)?;
+        if self.global.fork_backend.is_none() {
+            self.write_fork_image(&child, &startup.regions)?;
+        }
         let handles = child
             .inherit(&self.global.litebox, &objects)
             .map_err(Errno::from)?;
         for (forked, handle) in startup.fds.iter_mut().zip(handles) {
             forked.inherited.handle = handle;
         }
-        // The child's memory and objects are copied, so the other threads may go on.
-        drop(pause);
         let payload = startup
             .encode()
             .expect("the startup fit with placeholder handles");
-        child.start(&payload).map_err(Errno::from)?;
+        if let Some(backend) = &self.global.fork_backend {
+            backend.start(&child, &payload).map_err(Errno::from)?;
+        } else {
+            // The child's memory and objects are copied, so the other threads may go on.
+            drop(pause);
+            child.start(&payload).map_err(Errno::from)?;
+        }
         Ok(child_pid.cast_unsigned() as usize)
     }
 

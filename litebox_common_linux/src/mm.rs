@@ -12,8 +12,8 @@ use litebox::{
     platform::{
         PageManagementProvider, RawConstPointer,
         page_mgmt::{
-            AllocationDirection, CowAllocationError, DeallocationError, MemoryRegionPermissions,
-            RemapError,
+            AllocationDirection, AllocationError, CowAllocationError, DeallocationError,
+            MemoryRegionPermissions, RemapError,
         },
     },
     sync::{RawSyncPrimitivesProvider, RwLock},
@@ -55,6 +55,20 @@ where
     pub fn new(platform: &'static Platform) -> Self {
         let vmem = RwLock::new(Vmem::new(platform));
         Self { vmem }
+    }
+
+    /// Takes ownership of an existing platform mapping and records its Linux flags.
+    ///
+    /// # Safety
+    ///
+    /// `range` must identify an exact inherited mapping that has no other owner in this process.
+    pub unsafe fn adopt_existing_pages(
+        &self,
+        range: Range<usize>,
+        flags: VmFlags,
+    ) -> Result<(), AllocationError> {
+        // SAFETY: The caller supplies the ownership and mapping guarantees required by Vmem.
+        unsafe { self.vmem.write().adopt_mapping(range, flags) }
     }
 
     /// Attempt a native copy-on-write mapping backed by static data.
