@@ -77,6 +77,13 @@ pub(crate) trait BrokerControl: Send + Sync {
         payload: &[u8],
     ) -> core::result::Result<(), BrokerControlError>;
 
+    fn start_child_with_existing_runner(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        launch_descriptor: &[u8],
+        payload: &[u8],
+    ) -> core::result::Result<(), BrokerControlError>;
+
     fn write_child_memory(
         &self,
         child_process_id: litebox_broker_protocol::ProcessId,
@@ -731,6 +738,37 @@ where
         let shared_buffer_lease = self.acquire_shared_buffer(payload.len())?;
         self.request(|local| {
             local.start_child_process(child_process_id, shared_buffer_lease.sequence(), payload)
+        })
+    }
+
+    fn start_child_with_existing_runner(
+        &self,
+        child_process_id: litebox_broker_protocol::ProcessId,
+        launch_descriptor: &[u8],
+        payload: &[u8],
+    ) -> core::result::Result<(), BrokerControlError> {
+        use litebox_broker_protocol::process::{
+            MAX_EXISTING_RUNNER_START_SIZE, MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE,
+        };
+
+        if launch_descriptor.len() > MAX_PROCESS_LAUNCH_DESCRIPTOR_SIZE as usize
+            || payload.len() > MAX_PROCESS_BOOTSTRAP_SIZE as usize
+        {
+            return Err(BrokerControlError::Broker(ErrorCode::ResourceExhausted));
+        }
+        let length = launch_descriptor
+            .len()
+            .checked_add(payload.len())
+            .filter(|length| *length <= MAX_EXISTING_RUNNER_START_SIZE as usize)
+            .ok_or(BrokerControlError::Broker(ErrorCode::ResourceExhausted))?;
+        let shared_buffer_lease = self.acquire_shared_buffer(length)?;
+        self.request(|local| {
+            local.start_child_with_existing_runner(
+                child_process_id,
+                shared_buffer_lease.sequence(),
+                launch_descriptor,
+                payload,
+            )
         })
     }
 

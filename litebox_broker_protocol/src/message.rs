@@ -21,7 +21,8 @@ use crate::pipe::{
 use crate::process::{
     ChildExit, ChildSelector, DuplicateObjectsToChildRequest, ExitChildProcessRequest,
     ProcessExitStatus, ProcessIdentity, ProcessInfo, ProcessStartupDescriptor,
-    StartChildProcessRequest, ThreadInfo, WriteChildMemoryRequest,
+    StartChildProcessRequest, StartChildWithExistingRunnerRequest, ThreadInfo,
+    WriteChildMemoryRequest,
 };
 use crate::process_group::SetProcessGroupRequest;
 use crate::readiness::ReadinessFlags;
@@ -135,6 +136,10 @@ impl BrokerOperation {
                 | ProcessRequest::WriteChildMemory(WriteChildMemoryRequest { data: buffer, .. })
                 | ProcessRequest::StartChild(StartChildProcessRequest {
                     startup: ProcessStartupDescriptor { buffer },
+                    ..
+                })
+                | ProcessRequest::StartChildWithExistingRunner(StartChildWithExistingRunnerRequest {
+                    data: buffer,
                     ..
                 }),
             )
@@ -316,6 +321,8 @@ pub enum ProcessRequest {
     WriteChildMemory(WriteChildMemoryRequest),
     /// Start one pending child process.
     StartChild(StartChildProcessRequest),
+    /// Start one pending child in an already-created platform runner.
+    StartChildWithExistingRunner(StartChildWithExistingRunnerRequest),
     /// Record the exit of one pending child process that never started.
     ExitChild(ExitChildProcessRequest),
     /// Discard one pending child process that never started, as if it had
@@ -575,6 +582,8 @@ pub enum ProcessResponse {
     WriteChildMemory,
     /// The pending child established its broker association.
     StartChild,
+    /// The pending child established its broker association in an existing runner.
+    StartChildWithExistingRunner,
     /// The pending child's exit was recorded.
     ExitChild,
     /// The pending child was discarded.

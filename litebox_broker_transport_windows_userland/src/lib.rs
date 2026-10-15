@@ -9,6 +9,7 @@
 #![cfg(all(windows, target_arch = "x86_64"))]
 
 pub mod control_ring;
+pub mod existing_runner;
 mod host;
 mod local;
 pub mod named_pipe;

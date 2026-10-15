@@ -177,6 +177,19 @@ pub trait PageManagementProvider<const ALIGN: usize>: RawPointerProvider {
     /// Placement behavior supported by [`FixedAddressBehavior::Hint`].
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior = HintPlacementBehavior::Unspecified;
 
+    /// Takes ownership of an exact range already mapped in this process.
+    ///
+    /// # Safety
+    ///
+    /// `range` must be nonempty, aligned, mapped, exclusively owned by the caller, and not yet
+    /// represented by another reservation handle.
+    unsafe fn adopt_pages(
+        &self,
+        _range: Range<usize>,
+    ) -> Result<ReservationOf<Self, ALIGN>, AllocationError> {
+        Err(AllocationError::UnsupportedByPlatform)
+    }
+
     /// Reserve virtual address space and return its exclusive ownership handle.
     ///
     /// The default calls [`Self::reserve_and_commit_pages`] with empty permissions and lazy

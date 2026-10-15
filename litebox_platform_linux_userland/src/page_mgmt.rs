@@ -69,6 +69,21 @@ impl<const ALIGN: usize> litebox::platform::PageManagementProvider<ALIGN> for Li
     const HINT_PLACEMENT_BEHAVIOR: HintPlacementBehavior =
         HintPlacementBehavior::Directional(AllocationDirection::TopDown);
 
+    unsafe fn adopt_pages(
+        &self,
+        range: core::ops::Range<usize>,
+    ) -> Result<LinuxUserlandReservation<ALIGN>, litebox::platform::page_mgmt::AllocationError>
+    {
+        if range.is_empty()
+            || !range.start.is_multiple_of(ALIGN)
+            || !range.end.is_multiple_of(ALIGN)
+        {
+            return Err(litebox::platform::page_mgmt::AllocationError::AddressInUse);
+        }
+        // SAFETY: The caller guarantees this exact inherited range is mapped and exclusively owned.
+        Ok(unsafe { LinuxUserlandReservation::new(range) })
+    }
+
     unsafe fn commit_pages<'reservation, Reservations>(
         &self,
         _covering_reservations: impl FnOnce() -> Reservations,
