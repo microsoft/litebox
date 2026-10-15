@@ -613,8 +613,10 @@ impl ElfParsedFile {
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
         } else if reserve_runtime_trampoline {
+            // Reserve space for a runtime trampoline so brk starts past it.
             // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
-            // prefers the start of this region for the trampoline.
+            // will allocate the actual trampoline in this region via MAP_FIXED.
+            // Match the runtime rewriter's native-page-aligned placement.
             info.brk = runtime_trampoline_reservation(info.brk)
                 .ok_or(ElfLoadError::InvalidProgramHeader)?
                 .end;

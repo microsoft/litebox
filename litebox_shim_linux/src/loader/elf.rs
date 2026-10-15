@@ -722,10 +722,23 @@ mod tests {
             .main
             .load_mapped(task.global.platform)
             .expect("main should load");
-        let cache = task.global.elf_patch_cache.lock();
-        let state = cache.values().next().expect("main should be tracked");
-        assert!(state.runtime_patches_committed());
-        let trampoline = state.trampoline_range();
+        let trampoline = {
+            let cache = task.global.elf_patch_cache.lock();
+            let state = cache.values().next().expect("main should be tracked");
+            assert!(state.runtime_patches_committed());
+            state.trampoline_range()
+        };
+        // The trampoline is actually mapped at the recorded address.
+        assert_eq!(
+            task.global.mm.get_memory_permissions(
+                NonZeroAddress::new(trampoline.start).unwrap(),
+                NonZeroPageSize::new(trampoline.len()).unwrap(),
+            ),
+            Some(
+                litebox::platform::page_mgmt::MemoryRegionPermissions::READ
+                    | litebox::platform::page_mgmt::MemoryRegionPermissions::EXEC
+            ),
+        );
         let reservation = litebox_common_linux::loader::runtime_trampoline_reservation(
             info.base_addr + PAGE_SIZE,
         )

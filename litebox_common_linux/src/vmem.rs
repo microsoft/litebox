@@ -950,7 +950,7 @@ where
         unsafe { self.create_mapping_in_range(suggested_address, length, vma, flags, None) }
     }
 
-    /// Same as [`create_mapping`], but allows specifying an `allowed_range` for the mapping.
+    /// Same as [`Self::create_mapping`], but allows specifying an `allowed_range` for the mapping.
     ///
     /// # Safety
     ///
