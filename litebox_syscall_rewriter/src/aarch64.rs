@@ -3071,6 +3071,16 @@ fn find_patch_sites_with_code_ranges(
             }
             let insn = u32::from_le_bytes(section_data[i..i + INSN_BYTES].try_into().unwrap());
             let vaddr = checked_add_u64(section.vaddr, i as u64, "patch site")?;
+            // Without x18 virtualization, only these encodings are patch sites.
+            // Code-range and exclusive-sequence tracking only qualifies x18
+            // sites, so skip other words before doing that bookkeeping.
+            if !config.virtualize_x18
+                && (insn & SVC_OPCODE_MASK) != SVC_OPCODE_BITS
+                && (insn & MSR_TPIDR_EL0_MASK) != MSR_TPIDR_EL0_BITS
+                && (insn & MRS_TPIDR_EL0_MASK) != MRS_TPIDR_EL0_BITS
+            {
+                continue;
+            }
             while code_index < code_sections.len()
                 && code_sections[code_index]
                     .vaddr
@@ -7213,6 +7223,89 @@ mod tests {
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].vaddr, 0x1000);
         assert_eq!(sites[0].kind, PatchKind::Svc);
+    }
+
+    #[test]
+    fn non_x18_scan_preserves_mandatory_sites_across_code_ranges() {
+        let mut words = vec![NOP, 0xc85f_7c20]; // NOP; LDXR X0, [X1]
+        let mut expected = Vec::new();
+        for reg in 0..=31 {
+            for (word, kind) in [
+                (msr_tpidr_el0(reg), Some(PatchKind::MsrTpidr(reg))),
+                (
+                    Insn::MrsTpidrEl0(reg).encode().unwrap(),
+                    (reg != XZR).then_some(PatchKind::MrsTpidr(reg)),
+                ),
+            ] {
+                let offset = words.len() * INSN_BYTES;
+                words.push(word);
+                if let Some(kind) = kind {
+                    expected.push((offset, 0x1000 + offset as u64, kind));
+                }
+                words.push(NOP);
+            }
+        }
+        for imm in [0, 1, 0xffff] {
+            let offset = words.len() * INSN_BYTES;
+            words.push(SVC_0 | (imm << 5));
+            expected.push((offset, 0x1000 + offset as u64, PatchKind::Svc));
+            words.push(NOP);
+        }
+        words.push(0xc802_7c20); // STXR W2, X0, [X1]
+        let bytes = words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let executable = [TextSectionInfo {
+            vaddr: 0x1000,
+            file_offset: 0,
+            size: bytes.len() as u64,
+        }];
+        let fragmented = [
+            TextSectionInfo {
+                vaddr: 0x1000,
+                file_offset: 0,
+                size: 16,
+            },
+            TextSectionInfo {
+                vaddr: 0x1040,
+                file_offset: 64,
+                size: 16,
+            },
+        ];
+        for code in [&[][..], &executable[..], &fragmented[..]] {
+            let sites = find_patch_sites_with_code_ranges(
+                &executable,
+                code,
+                &bytes,
+                RewriteConfig::new(crate::TargetHost::Linux, false),
+            )
+            .unwrap();
+            let actual = sites
+                .iter()
+                .map(|site| (site.file_offset, site.vaddr, site.kind))
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn non_x18_scan_still_rejects_address_overflow_on_non_candidate() {
+        let bytes = [NOP.to_le_bytes(), NOP.to_le_bytes()].concat();
+        let executable = [TextSectionInfo {
+            vaddr: u64::MAX - 3,
+            file_offset: 0,
+            size: bytes.len() as u64,
+        }];
+        assert!(matches!(
+            find_patch_sites_with_code_ranges(
+                &executable,
+                &[],
+                &bytes,
+                RewriteConfig::new(crate::TargetHost::Linux, false),
+            ),
+            Err(Error::AddressOverflow(_))
+        ));
     }
 
     #[test]
