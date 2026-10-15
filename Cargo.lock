@@ -2198,6 +2198,7 @@ dependencies = [
  "litebox_util_log",
  "object",
  "once_cell",
+ "rangemap",
  "ringbuf",
  "syscalls",
  "thiserror",

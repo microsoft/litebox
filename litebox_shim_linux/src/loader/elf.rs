@@ -29,7 +29,6 @@ struct ElfFile<'a, Platform: ShimPlatform> {
     #[cfg(target_arch = "aarch64")]
     file_fd: alloc::sync::Arc<crate::FileFd>,
     load_high: bool,
-    reserve_runtime_trampoline: bool,
 }
 
 impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
@@ -48,7 +47,6 @@ impl<'a, Platform: ShimPlatform> ElfFile<'a, Platform> {
             #[cfg(target_arch = "aarch64")]
             file_fd,
             load_high: false,
-            reserve_runtime_trampoline: false,
         })
     }
 }
@@ -97,16 +95,8 @@ impl<Platform: ShimPlatform> litebox_common_linux::loader::MapMemory for ElfFile
 
     fn reserve(&mut self, len: usize, align: usize) -> Result<usize, Self::Error> {
         // Allocate a mapping which should be large enough to fit `len` bytes.
-        // For an unpatched ELF, also include the runtime trampoline.
         let mapping_len = len
             .checked_add(align.max(PAGE_SIZE) - PAGE_SIZE)
-            .and_then(|len| {
-                len.checked_add(if self.reserve_runtime_trampoline {
-                    crate::RUNTIME_TRAMPOLINE_RESERVATION_SIZE
-                } else {
-                    0
-                })
-            })
             .ok_or(Errno::ENOMEM)?;
         let aligned_len = mapping_len
             .checked_next_multiple_of(PAGE_SIZE)
@@ -260,17 +250,7 @@ impl<'a, Platform: ShimPlatform> FileAndParsed<'a, Platform> {
         &mut self,
         platform: &(impl litebox::platform::RawPointerProvider + litebox::platform::SystemInfoProvider),
     ) -> Result<litebox_common_linux::loader::MappingInfo, ElfLoaderError> {
-        let syscall_entry_point = self.file.task.global.platform.get_syscall_entry_point();
-        // When the platform requires syscall rewriting but the binary has no
-        // embedded trampoline, reserve space so that brk starts past the
-        // runtime trampoline region.
-        let reserve = if syscall_entry_point != 0 && !self.parsed.has_trampoline() {
-            Some(crate::RUNTIME_TRAMPOLINE_RESERVATION_SIZE)
-        } else {
-            None
-        };
-        self.file.reserve_runtime_trampoline = reserve.is_some();
-        let result = self.parsed.load(&mut self.file, &mut &*platform, reserve)?;
+        let result = self.parsed.load(&mut self.file, &mut &*platform)?;
         #[cfg(target_arch = "aarch64")]
         if self.parsed.has_trampoline() {
             let patch_key =
@@ -645,7 +625,7 @@ mod tests {
         task.sys_munmap(occupied, PAGE_SIZE)
             .expect("failed to release occupied hint");
 
-        // Runtime-trampoline space participates in the gap search.
+        // Runtime trampolines no longer enlarge the ELF's placement request.
         let trampoline_blocker = task
             .sys_mmap(
                 hint + PAGE_SIZE,
@@ -656,14 +636,13 @@ mod tests {
                 0,
             )
             .expect("failed to block the runtime-trampoline region");
-        pie.reserve_runtime_trampoline = true;
         let reserved =
             litebox_common_linux::loader::MapMemory::reserve(&mut pie, PAGE_SIZE, PAGE_SIZE)
-                .expect("PIE reservation should include runtime-trampoline space");
+                .expect("PIE reservation should only cover the requested image");
         assert!(reserved < high);
-        assert_ne!(
+        assert_eq!(
             reserved, hint,
-            "trampoline space must force rejection of the hint"
+            "the adjacent blocker is outside the ELF image"
         );
         task.sys_munmap(UserPtrMut::from_usize(reserved), PAGE_SIZE)
             .expect("failed to release trampoline-aware reservation");

@@ -750,9 +750,7 @@ mod tests {
             image: &image,
             pages: TestPages::new(),
         };
-        let info = elf
-            .load(&mut mapper, &mut MacosUserland::new(), None)
-            .unwrap();
+        let info = elf.load(&mut mapper, &mut MacosUserland::new()).unwrap();
         assert_eq!(info.entry_point, info.base_addr + 2 * PAGE_SIZE);
         assert_eq!(info.phdrs_addr, info.base_addr + 64);
         assert_eq!(info.num_phdrs, 2);

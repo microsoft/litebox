@@ -946,6 +946,26 @@ where
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
     {
+        // SAFETY: The caller supplies the same replacement guarantees as this method.
+        unsafe { self.create_mapping_in_range(suggested_address, length, vma, flags, None) }
+    }
+
+    /// Same as [`create_mapping`], but allows specifying an `allowed_range` for the mapping.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure fixed replacements do not overwrite memory in use.
+    pub(super) unsafe fn create_mapping_in_range(
+        &mut self,
+        suggested_address: Option<NonZeroAddress<ALIGN>>,
+        length: NonZeroPageSize<ALIGN>,
+        vma: VmArea,
+        flags: CreatePagesFlags,
+        allowed_range: Option<Range<usize>>,
+    ) -> Result<Platform::RawMutPointer<u8>, AllocationError>
+    where
+        Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
+    {
         let behavior = FixedAddressBehavior::from(flags);
         let direction = match behavior {
             FixedAddressBehavior::Hint(direction) => Some(direction),
@@ -956,13 +976,19 @@ where
         let platform_behavior = match behavior {
             FixedAddressBehavior::Hint(direction)
                 if Platform::PLACEMENT_ADDR_MAX < Platform::TASK_ADDR_MAX
+                    || allowed_range.is_some()
                     || !Platform::HINT_PLACEMENT_BEHAVIOR.supports(direction) =>
             {
                 FixedAddressBehavior::NoReplace
             }
             _ => behavior,
         };
-        let mut request = Self::build_unmapped_area_request(suggested_address, length, behavior);
+        let mut request = Self::build_unmapped_area_request(
+            suggested_address,
+            length,
+            behavior,
+            allowed_range.clone(),
+        );
         loop {
             let new_addr = self
                 .find_area(&request)?
@@ -988,7 +1014,12 @@ where
                         .suggested_address
                         .is_some_and(|address| address.as_usize() == new_addr);
                     if rejected_hint {
-                        request = Self::build_unmapped_area_request(None, length, behavior);
+                        request = Self::build_unmapped_area_request(
+                            None,
+                            length,
+                            behavior,
+                            allowed_range.clone(),
+                        );
                     } else if direction == Some(AllocationDirection::TopDown) {
                         request.suggested_address = None;
                         request.address_range.end = new_addr;
@@ -1162,6 +1193,7 @@ where
             suggested_new_address,
             new_size,
             FixedAddressBehavior::Hint(AllocationDirection::TopDown),
+            None,
         );
         let new_addr = loop {
             let new_addr = self
@@ -1456,6 +1488,7 @@ where
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         perms: MemoryRegionPermissions,
+        allowed_range: Option<Range<usize>>,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         Platform::Reservations: LinuxReservationStore<Platform, ALIGN>,
@@ -1463,7 +1496,7 @@ where
         let shared = flags.contains(CreatePagesFlags::SHARED);
         let file_backed = flags.contains(CreatePagesFlags::MAP_FILE);
         unsafe {
-            self.create_mapping(
+            self.create_mapping_in_range(
                 suggested_new_address,
                 length,
                 VmArea::new(
@@ -1477,6 +1510,7 @@ where
                     flags.contains(CreatePagesFlags::MAP_FILE),
                 ),
                 flags,
+                allowed_range,
             )
         }
         .map_err(MappingError::MapError)
@@ -1511,6 +1545,7 @@ where
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         behavior: FixedAddressBehavior,
+        allowed_range: Option<Range<usize>>,
     ) -> FindAreaRequest<ALIGN> {
         // Only fixed-address requests may go above the placement limit; addresses chosen here,
         // including fallbacks for unusable hints, stay below it.
@@ -1528,12 +1563,17 @@ where
                 (Platform::TASK_ADDR_MAX, ALIGN)
             }
         };
+        let address_range = if let Some(range) = allowed_range {
+            Platform::TASK_ADDR_MIN.max(range.start)..address_range_end.min(range.end)
+        } else {
+            Platform::TASK_ADDR_MIN..address_range_end
+        };
         FindAreaRequest {
             suggested_address,
             length,
             behavior,
             alignment,
-            address_range: Platform::TASK_ADDR_MIN..address_range_end,
+            address_range,
         }
     }
 
@@ -1993,6 +2033,147 @@ mod tests {
             permission_updates: Mutex::new(Vec::new()),
             store: core::marker::PhantomData,
         }))
+    }
+
+    #[test]
+    fn constrained_allocation_retries_without_escaping_range() {
+        let low = DummyVmemBackend::<true>::TASK_ADDR_MIN + 8 * PAGE_SIZE;
+        for top_down in [false, true] {
+            let allowed = low..low + 4 * PAGE_SIZE;
+            let rejected = if top_down {
+                allowed.end - PAGE_SIZE
+            } else {
+                allowed.start
+            };
+            let flags = if top_down {
+                CreatePagesFlags::TOP_DOWN
+            } else {
+                CreatePagesFlags::empty()
+            };
+            for suggested_address in [None, NonZeroAddress::new(rejected)] {
+                let backend = dummy_backend::<true>(Some(rejected));
+                let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+                // SAFETY: The dummy backend owns no live memory and this cannot replace mappings.
+                let pointer = unsafe {
+                    vmem.create_mapping_in_range(
+                        suggested_address,
+                        NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                        VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                        flags,
+                        Some(allowed.clone()),
+                    )
+                }
+                .unwrap();
+                assert_eq!(
+                    pointer.as_usize(),
+                    if top_down {
+                        rejected - PAGE_SIZE
+                    } else {
+                        rejected + PAGE_SIZE
+                    }
+                );
+                let calls = backend.calls.lock();
+                if suggested_address.is_none() {
+                    assert_eq!(calls.len(), 2);
+                }
+                assert!(calls.iter().all(|(range, behavior)| {
+                    range.start >= allowed.start
+                        && range.end <= allowed.end
+                        && *behavior == FixedAddressBehavior::NoReplace
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn constrained_allocation_intersects_platform_placement_limits() {
+        type Backend = DummyVmemBackend<true, UntrackedDummyReservations, true>;
+        let backend = new_dummy_backend::<true, UntrackedDummyReservations, true>(None, None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        // SAFETY: The dummy backend owns no live memory and this cannot replace mappings.
+        let pointer = unsafe {
+            vmem.create_mapping_in_range(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::TOP_DOWN,
+                Some(0..usize::MAX),
+            )
+        }
+        .unwrap();
+        assert_eq!(pointer.as_usize(), Backend::PLACEMENT_ADDR_MAX - PAGE_SIZE);
+        // SAFETY: The interval is outside placement limits and cannot replace mappings.
+        let result = unsafe {
+            vmem.create_mapping_in_range(
+                None,
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                CreatePagesFlags::TOP_DOWN,
+                Some(Backend::PLACEMENT_ADDR_MAX..Backend::TASK_ADDR_MAX),
+            )
+        };
+        assert!(matches!(result, Err(AllocationError::OutOfMemory)));
+        assert_eq!(backend.calls.lock().len(), 1);
+    }
+
+    #[test]
+    fn constrained_allocation_enforces_whole_range_in_both_directions() {
+        for top_down in [false, true] {
+            let backend = dummy_backend::<true>(None);
+            let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+            let low = DummyVmemBackend::<true>::TASK_ADDR_MIN + 8 * PAGE_SIZE;
+            let allowed = low + 1..low + 4 * PAGE_SIZE - 1;
+            let flags = if top_down {
+                CreatePagesFlags::TOP_DOWN
+            } else {
+                CreatePagesFlags::empty()
+            };
+            // SAFETY: The dummy backend owns no live memory and no mappings are replaced.
+            let pointer = unsafe {
+                vmem.create_mapping_in_range(
+                    None,
+                    NonZeroPageSize::new(2 * PAGE_SIZE).unwrap(),
+                    VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                    flags,
+                    Some(allowed.clone()),
+                )
+            }
+            .unwrap();
+            assert_eq!(pointer.as_usize(), low + PAGE_SIZE);
+            // SAFETY: This request cannot replace mappings; the constrained range is too small.
+            let result = unsafe {
+                vmem.create_mapping_in_range(
+                    None,
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                    flags,
+                    Some(allowed),
+                )
+            };
+            assert!(matches!(result, Err(AllocationError::OutOfMemory)));
+            assert_eq!(backend.calls.lock().len(), 1);
+        }
+    }
+
+    #[test]
+    fn constrained_allocation_rejects_empty_reversed_and_too_small_ranges() {
+        let low = DummyVmemBackend::<true>::TASK_ADDR_MIN;
+        let backend = dummy_backend::<true>(None);
+        let mut vmem = Vmem::<_, PAGE_SIZE>::new(backend);
+        for allowed in [low..low, low + PAGE_SIZE..low, low..low + PAGE_SIZE - 1] {
+            // SAFETY: These non-replacing requests cannot allocate inside an invalid range.
+            let result = unsafe {
+                vmem.create_mapping_in_range(
+                    None,
+                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+                    VmArea::new(VmFlags::VM_READ | VmFlags::VM_MAYREAD, false),
+                    CreatePagesFlags::TOP_DOWN,
+                    Some(allowed),
+                )
+            };
+            assert!(matches!(result, Err(AllocationError::OutOfMemory)));
+        }
+        assert!(backend.calls.lock().is_empty());
     }
 
     #[test]
@@ -2613,6 +2794,7 @@ mod tests {
                 NonZeroPageSize::new(3 * PAGE_SIZE).unwrap(),
                 CreatePagesFlags::FIXED_ADDR,
                 MemoryRegionPermissions::empty(),
+                None,
             )
         }
         .unwrap();

@@ -159,6 +159,48 @@ fn whole_image_rewriting_emits_host_aware_tpidrro_gates() {
 }
 
 #[test]
+fn mapped_load_span_includes_gaps_and_zero_fill_but_not_pagezero() {
+    let mut input = image(&[SVC, NOP]);
+    add_segment(&mut input, BASE + 0x8000, 0x4000);
+    let pagezero = add_command(&mut input, macho::LC_SEGMENT_64, 72);
+    input[pagezero + 8..pagezero + 18].copy_from_slice(b"__PAGEZERO");
+    put64(&mut input, pagezero + 32, BASE);
+    let metadata = CodeMetadata::parse(&input).unwrap();
+    let address = 0x2000_0000;
+    for (offset, len, mapped_address, expected) in [
+        (0, 0x4000, address, Some(address..address + 0xc000)),
+        (
+            TEXT as u64 + 4,
+            4,
+            address + TEXT + 4,
+            Some(address..address + 0xc000),
+        ),
+        (0x3000, 8, address + 0x3000, None),
+        (0, 4, address, None),
+    ] {
+        assert_eq!(
+            metadata
+                .load_span_for_mapping(offset, len, mapped_address)
+                .unwrap(),
+            expected,
+        );
+    }
+    for (offset, len, address) in [
+        (u64::MAX, 4, address),
+        (0, 0x4000, usize::MAX),
+        (TEXT as u64, 4, 0),
+    ] {
+        assert!(
+            metadata
+                .load_span_for_mapping(offset, len, address)
+                .is_err()
+        );
+    }
+    put32(&mut input, pagezero + 60, 1);
+    assert!(CodeMetadata::parse(&input).is_err());
+}
+
+#[test]
 fn load_time_rewriting_uses_mapping_addresses_and_finalizes_gates() {
     let rewriter = Rewriter::new(TargetHost::MacOs).unwrap();
     let mut input = image(&[SVC, MRS, SVC, NOP]);

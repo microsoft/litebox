@@ -83,6 +83,16 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 
+/// Conservative address bounds reachable from the entire nonempty code span.
+///
+/// A runtime trampoline's complete allocation must fit inside the returned
+/// interval. Returns `None` if the span has no common reachable interval.
+pub fn trampoline_allocation_range(code: Range<usize>) -> Option<Range<usize>> {
+    let start = code.end.saturating_sub(MAX_TRAMPOLINE_DISPLACEMENT);
+    let end = code.start.saturating_add(MAX_TRAMPOLINE_DISPLACEMENT);
+    (code.start < code.end && start < end).then_some(start..end)
+}
+
 use litebox_common_windows::{NtSysno, Win32Sysno};
 use object::LittleEndian as LE;
 use object::pe::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE};

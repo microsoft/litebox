@@ -29,6 +29,15 @@ use crate::{
     },
 };
 
+/// Placement options for [`VmemManager::do_mmap`].
+#[derive(Clone, Debug)]
+pub struct MmapPlacement {
+    /// Search direction when choosing an allocation address.
+    pub direction: AllocationDirection,
+    /// Optional bounds for the entire mapping.
+    pub allowed_range: Option<Range<usize>>,
+}
+
 /// A page manager to support `mmap`, `munmap`, and etc.
 pub struct VmemManager<Platform, const ALIGN: usize>
 where
@@ -79,16 +88,18 @@ where
 
     /// Create a mapping with the given flags.
     ///
-    /// `suggested_new_address` is the hint address for where to create the pages if it is not `None`.
+    /// `suggested_address` is the hint address for where to create the pages if it is not `None`.
     /// Otherwise, let the kernel choose an available memory region.
     ///
     /// `length` is the size of the pages to be created.
     ///
     /// Set `flags` to control options such as fixed address, stack, and populate pages.
     ///
-    /// `op` is a callback for caller to initialize the created pages.
+    /// `permissions` contains the permissions to set before and after the call to `op`.
     ///
-    /// `before_perms` and `after_perms` are the permissions to set before and after the call to `op`.
+    /// `allowed_range` optionally restricts placement of the entire mapping.
+    ///
+    /// `op` is a callback for caller to initialize the created pages.
     ///
     /// # Safety
     ///
@@ -102,16 +113,26 @@ where
         suggested_address: Option<NonZeroAddress<ALIGN>>,
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
-        before_perms: MemoryRegionPermissions,
-        after_perms: MemoryRegionPermissions,
+        permissions: (MemoryRegionPermissions, MemoryRegionPermissions),
+        allowed_range: Option<Range<usize>>,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
+        let (before_perms, after_perms) = permissions;
         let addr = {
             let mut vmem = self.vmem.write();
-            unsafe { vmem.create_pages(suggested_address, length, flags, before_perms) }?
+            // SAFETY: The caller authorizes any replacements.
+            unsafe {
+                vmem.create_pages(
+                    suggested_address,
+                    length,
+                    flags,
+                    before_perms,
+                    allowed_range,
+                )
+            }?
         };
         let range = PageRange::new(addr.as_usize(), addr.as_usize() + length.as_usize())
             .expect("successful mapping must return an aligned, non-empty range");
@@ -138,6 +159,7 @@ where
     ///
     /// The pages are temporarily readable and writable while `op` initializes
     /// them, then changed to `permissions` before this function returns.
+    /// `allowed_range` optionally restricts placement of the entire mapping.
     ///
     /// # Safety
     ///
@@ -150,6 +172,7 @@ where
         length: NonZeroPageSize<ALIGN>,
         flags: CreatePagesFlags,
         permissions: MemoryRegionPermissions,
+        allowed_range: Option<Range<usize>>,
         op: F,
     ) -> Result<Platform::RawMutPointer<u8>, MappingError>
     where
@@ -160,8 +183,11 @@ where
                 suggested_address,
                 length,
                 flags,
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                permissions,
+                (
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                    permissions,
+                ),
+                allowed_range,
                 op,
             )
         }
@@ -197,10 +223,13 @@ where
                 suggested_address,
                 length,
                 flags,
-                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                // keep READ, turn off WRITE and turn on EXEC
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                (
+                    // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the code)
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                    // keep READ, turn off WRITE and turn on EXEC
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::EXEC,
+                ),
+                None,
                 op,
             )
         }
@@ -232,7 +261,7 @@ where
         F: FnOnce(Platform::RawMutPointer<u8>) -> Result<usize, MappingError>,
     {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
-        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, op) }
+        unsafe { self.create_pages(suggested_address, length, flags, (perms, perms), None, op) }
     }
 
     /// Create read-only pages.
@@ -265,10 +294,13 @@ where
                 suggested_address,
                 length,
                 flags,
-                // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
-                MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
-                // keep READ, turn off WRITE
-                MemoryRegionPermissions::READ,
+                (
+                    // create READ | WRITE pages (as `op` may need to write to them, e.g., fill in the data)
+                    MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE,
+                    // keep READ, turn off WRITE
+                    MemoryRegionPermissions::READ,
+                ),
+                None,
                 op,
             )
         }
@@ -304,8 +336,11 @@ where
                 suggested_address,
                 length,
                 flags,
-                MemoryRegionPermissions::empty(),
-                MemoryRegionPermissions::empty(),
+                (
+                    MemoryRegionPermissions::empty(),
+                    MemoryRegionPermissions::empty(),
+                ),
+                None,
                 op,
             )
         }
@@ -332,7 +367,16 @@ where
     ) -> Result<Platform::RawMutPointer<u8>, MappingError> {
         let perms = MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE;
         let flags = CreatePagesFlags::IS_STACK | flags;
-        unsafe { self.create_pages(suggested_address, length, flags, perms, perms, |_| Ok(0)) }
+        unsafe {
+            self.create_pages(
+                suggested_address,
+                length,
+                flags,
+                (perms, perms),
+                None,
+                |_| Ok(0),
+            )
+        }
     }
 
     /// Release every memory mapping and reservation.
@@ -791,7 +835,8 @@ where
 {
     /// Creates an anonymous or file-backed mapping with Linux `mmap` semantics.
     ///
-    /// `direction` controls the allocation direction. `op` initializes the mapping while it is writable;
+    /// `placement` controls the allocation direction and optional address bounds.
+    /// `op` initializes the mapping while it is writable;
     /// its error removes the new mapping. A file-backed mapping is expected to be filled with the
     /// file's contents from its start, so the platform is hinted to back it with larger pages.
     pub fn do_mmap(
@@ -800,13 +845,13 @@ where
         len: usize,
         prot: ProtFlags,
         flags: MapFlags,
-        direction: AllocationDirection,
+        placement: MmapPlacement,
         op: impl FnOnce(UserPtrMut<u8>) -> Result<usize, MappingError>,
     ) -> Result<UserPtrMut<u8>, MappingError> {
         let mut flags = CreatePagesFlags::from(flags);
         flags.set(
             CreatePagesFlags::TOP_DOWN,
-            direction == AllocationDirection::TopDown,
+            placement.direction == AllocationDirection::TopDown,
         );
         let suggested_addr = match suggested_addr {
             Some(addr) => Some(NonZeroAddress::new(addr).ok_or(MappingError::UnAligned)?),
@@ -828,14 +873,23 @@ where
             }
             op(UserPtrMut::from_platform_ptr::<Platform>(p))
         };
-        if file_backed || !permissions.is_empty() {
-            unsafe {
-                self.create_pages_with_permissions(suggested_addr, length, flags, permissions, op)
-            }
+        let before = if file_backed || !permissions.is_empty() {
+            MemoryRegionPermissions::READ | MemoryRegionPermissions::WRITE
         } else {
             // Anonymous PROT_NONE mappings are reservations and need no writable
             // initialization window.
-            unsafe { self.create_inaccessible_pages(suggested_addr, length, flags, op) }
+            permissions
+        };
+        // SAFETY: The caller authorizes replacements through mmap flags; vmem tracks the mapping.
+        unsafe {
+            self.create_pages(
+                suggested_addr,
+                length,
+                flags,
+                (before, permissions),
+                placement.allowed_range,
+                op,
+            )
         }
         .map(UserPtrMut::from_platform_ptr::<Platform>)
     }

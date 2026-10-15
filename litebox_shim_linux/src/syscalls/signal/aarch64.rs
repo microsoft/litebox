@@ -156,11 +156,12 @@ pub(super) fn sigreturn_trampoline<Platform: ShimPlatform>(
     const { assert!(RT_SIGRETURN_TRAMPOLINE_BYTES <= PAGE_SIZE) };
 
     let page = task
-        .do_mmap_anonymous(
+        .do_mmap(
             None,
             PAGE_SIZE,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
             MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+            |_| Ok(0),
         )
         .map_err(|_| DeliverFault)?;
 

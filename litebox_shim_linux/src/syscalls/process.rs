@@ -1312,6 +1312,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         length,
                         flags,
                         region.flags.into(),
+                        None,
                         |pages| {
                             // SAFETY: The pages were just mapped readable and writable, and
                             // nothing else uses them until this function returns.

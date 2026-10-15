@@ -28,6 +28,7 @@ const LOAD_COMMAND_ALIGNMENT: u32 = 8;
 pub struct CodeMetadata {
     code: Vec<TextSectionInfo>,
     segments: Vec<LoadSegment>,
+    load_span: Range<u64>,
 }
 
 impl CodeMetadata {
@@ -46,6 +47,41 @@ impl CodeMetadata {
         let mut ranges = aarch64::project_file_ranges(&self.code, file_offset, mapping_len)?;
         ranges.sort_unstable_by_key(|range| range.start);
         Ok(ranges)
+    }
+
+    /// Complete relocated image span, including gaps and zero-filled segments,
+    /// but excluding `__PAGEZERO`.
+    ///
+    /// `file_offset` is slice-relative. A mapping must overlap a code section
+    /// to establish the slide; otherwise this returns `None`.
+    pub fn load_span_for_mapping(
+        &self,
+        file_offset: u64,
+        mapping_len: usize,
+        mapping_address: usize,
+    ) -> Result<Option<Range<usize>>> {
+        let overflow = || Error::AddressOverflow("Mach-O load span".into());
+        let mapping_end = checked_add_u64(file_offset, mapping_len as u64, "Mach-O mapping")?;
+        let Some(section) = self.code.iter().find(|section| {
+            section.file_offset < mapping_end && file_offset < section.file_offset + section.size
+        }) else {
+            return Ok(None);
+        };
+        let overlap = file_offset.max(section.file_offset);
+        let address = mapping_address
+            .checked_add(usize::try_from(overlap - file_offset).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        let vaddr = section.vaddr + (overlap - section.file_offset);
+        let start = address
+            .checked_sub(usize::try_from(vaddr - self.load_span.start).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        let end = start
+            .checked_add(
+                usize::try_from(self.load_span.end - self.load_span.start)
+                    .map_err(|_| overflow())?,
+            )
+            .ok_or_else(overflow)?;
+        Ok(Some(start..end))
     }
 
     /// Upper bound for rewriting this image with `options`.
@@ -296,8 +332,7 @@ fn parse_image(input: &[u8]) -> Result<Option<CodeMetadata>> {
             "unsupported Mach-O image".into(),
         ));
     }
-    let (code, segments) = code_metadata(bytes)?;
-    Ok(Some(CodeMetadata { code, segments }))
+    code_metadata(bytes).map(Some)
 }
 
 fn parse_error(error: object::Error) -> Error {
@@ -315,7 +350,7 @@ fn checked_range(offset: u64, size: u64, len: usize) -> Result<Range<usize>> {
     )
 }
 
-fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>)> {
+fn code_metadata(bytes: &[u8]) -> Result<CodeMetadata> {
     let header = macho::MachHeader64::<LE>::parse(bytes, 0).map_err(parse_error)?;
     let mut commands = header.load_commands(LE, bytes, 0).map_err(parse_error)?;
     let mut command_bytes = 0u64;
@@ -323,6 +358,7 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
         size_of::<macho::MachHeader64<LE>>() as u64 + u64::from(header.sizeofcmds(LE));
     let mut sections = Vec::new();
     let mut segments: Vec<LoadSegment> = Vec::new();
+    let mut load_span: Option<Range<u64>> = None;
     let mut data_ranges = Vec::new();
     let mut file_ranges: Vec<Range<usize>> = Vec::new();
     while let Some(command) = commands.next().map_err(parse_error)? {
@@ -389,6 +425,10 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
         let memsz = segment.vmsize(LE);
         let offset = segment.fileoff(LE);
         let filesz = segment.filesize(LE);
+        let pagezero = segment.segname == *b"__PAGEZERO\0\0\0\0\0\0";
+        if pagezero && (filesz != 0 || segment.initprot.get(LE) != 0) {
+            return Err(Error::ParseError("invalid Mach-O PAGEZERO segment".into()));
+        }
         let end = checked_add_u64(vaddr, memsz, "Mach-O segment")?;
         let file_range = checked_range(offset, filesz, bytes.len())?;
         if filesz > memsz {
@@ -397,6 +437,12 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
             ));
         }
         if memsz != 0 {
+            if !pagezero {
+                load_span = Some(match load_span {
+                    Some(span) => span.start.min(vaddr)..span.end.max(end),
+                    None => vaddr..end,
+                });
+            }
             for previous in &segments {
                 if vaddr < previous.vaddr + previous.memsz && previous.vaddr < end {
                     return Err(Error::ParseError("overlapping Mach-O VM segments".into()));
@@ -509,7 +555,11 @@ fn code_metadata(bytes: &[u8]) -> Result<(Vec<TextSectionInfo>, Vec<LoadSegment>
             });
         }
     }
-    Ok((code, segments))
+    Ok(CodeMetadata {
+        code,
+        segments,
+        load_span: load_span.unwrap_or(0..0),
+    })
 }
 
 fn rewrite_at(

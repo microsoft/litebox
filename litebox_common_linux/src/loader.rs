@@ -476,7 +476,6 @@ impl ElfParsedFile {
         &self,
         mapper: &mut M,
         mem: &mut impl AccessMemory,
-        reserve_trampoline: Option<usize>,
     ) -> Result<MappingInfo, ElfLoadError<M::Error>> {
         let base_addr = if self.header.e_type == elf::abi::ET_DYN {
             // Find an aligned load address that will fit all PT_LOAD segments.
@@ -599,16 +598,6 @@ impl ElfParsedFile {
 
         if self.trampoline.is_some() {
             self.load_trampoline(mapper, mem, &mut info)?;
-        } else if let Some(size) = reserve_trampoline {
-            // Reserve space for a runtime trampoline so brk starts past it.
-            // The runtime patching path (do_mmap_file → maybe_patch_exec_segment)
-            // will allocate the actual trampoline in this region via MAP_FIXED.
-            // Match the runtime rewriter's native-page-aligned placement.
-            info.brk = info
-                .brk
-                .checked_next_multiple_of(HOST_PAGE_SIZE)
-                .and_then(|start| page_align_up(size).and_then(|size| start.checked_add(size)))
-                .ok_or(ElfLoadError::InvalidProgramHeader)?;
         }
 
         // The initial writable brk heap must not share native backing with an
