@@ -2277,7 +2277,28 @@ mod tests {
             "/partial-initial-mapping",
             &dyn_elf_with_load_size(load_size),
         );
-        let first = map_file_at_offset_zero(&task, fd, ProtFlags::PROT_READ);
+        // Like a loader, reserve the whole image before mapping segments into it,
+        // so that the later fixed mapping cannot collide with unrelated memory.
+        let image = task
+            .do_mmap(
+                None,
+                load_size,
+                ProtFlags::PROT_NONE,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
+                |_| Ok(0),
+            )
+            .unwrap();
+        let first = task
+            .do_mmap_file(
+                Some(image.as_usize()),
+                PAGE_SIZE,
+                ProtFlags::PROT_READ,
+                MapFlags::MAP_PRIVATE | MapFlags::MAP_FIXED,
+                fd,
+                0,
+            )
+            .unwrap();
+        assert_eq!(first.as_usize(), image.as_usize());
         {
             let cache = task.global.elf_patch_cache.lock();
             let state = &cache[&elf_patch_key(&task, fd)];
@@ -2315,8 +2336,7 @@ mod tests {
         assert_eq!(later_segment.as_usize(), first.as_usize() + PAGE_SIZE);
         assert!(trampoline_mapping(&task, fd).is_none());
 
-        task.sys_munmap(later_segment, PAGE_SIZE).unwrap();
-        task.sys_munmap(first, PAGE_SIZE).unwrap();
+        task.sys_munmap(image, load_size).unwrap();
         task.sys_close(fd).unwrap();
         assert_eq!(task.global.mm.mappings(), before);
     }

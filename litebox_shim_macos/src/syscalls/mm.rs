@@ -1606,54 +1606,69 @@ mod tests {
         task.sys_munmap(address, PAGE_SIZE).unwrap();
     }
 
+    /// Maps code whose trampoline cannot be allocated within reach and expects traps.
+    fn assert_unavailable_trampoline_uses_traps(span: usize, capacity: usize) {
+        let mut image = macho_image();
+        put64(&mut image, 64, span as u64);
+        let task = task_with_file(&image);
+        let file = task.files.typed_fd(0).unwrap();
+        task.cache_macho_patch_info(
+            &file,
+            Some(Arc::new(MachoPatchInfo {
+                metadata: CodeMetadata::parse(&image).unwrap(),
+                slice_range: 0..image.len(),
+                trampoline_capacity: capacity,
+                rewrite_id: Arc::new(()),
+            })),
+        );
+        let before = task.global.mm.mappings();
+        let address =
+            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        assert_eq!(
+            UserPtr::<u8>::from_usize(address + TEXT)
+                .to_owned_slice::<Platform>(4)
+                .unwrap()
+                .as_ref(),
+            &0xd436_2160u32.to_le_bytes(), // BRK #0xB10B
+        );
+        assert!(
+            task.global
+                .macho_trampolines
+                .lock()
+                .values()
+                .all(|state| state.range.is_none() && state.cursor == 0)
+        );
+        assert_eq!(
+            task.global.mm.get_memory_permissions(
+                NonZeroAddress::new(address).unwrap(),
+                NonZeroPageSize::new(PAGE_SIZE).unwrap(),
+            ),
+            Some(Permissions::READ | Permissions::EXEC),
+        );
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+        assert_eq!(task.global.mm.mappings(), before);
+    }
+
+    // Each case needs its own process: a process may construct only one broker core.
     #[test]
-    fn unavailable_trampoline_capacity_or_reach_uses_traps() {
-        let distance = litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT;
-        for (span, capacity) in [
-            (PAGE_SIZE, 0),
-            (2 * distance, PAGE_SIZE),
-            (PAGE_SIZE, 2 * distance),
-        ] {
-            let mut image = macho_image();
-            put64(&mut image, 64, span as u64);
-            let task = task_with_file(&image);
-            let file = task.files.typed_fd(0).unwrap();
-            task.cache_macho_patch_info(
-                &file,
-                Some(Arc::new(MachoPatchInfo {
-                    metadata: CodeMetadata::parse(&image).unwrap(),
-                    slice_range: 0..image.len(),
-                    trampoline_capacity: capacity,
-                    rewrite_id: Arc::new(()),
-                })),
-            );
-            let before = task.global.mm.mappings();
-            let address =
-                mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
-            assert_eq!(
-                UserPtr::<u8>::from_usize(address + TEXT)
-                    .to_owned_slice::<Platform>(4)
-                    .unwrap()
-                    .as_ref(),
-                &0xd436_2160u32.to_le_bytes(), // BRK #0xB10B
-            );
-            assert!(
-                task.global
-                    .macho_trampolines
-                    .lock()
-                    .values()
-                    .all(|state| state.range.is_none() && state.cursor == 0)
-            );
-            assert_eq!(
-                task.global.mm.get_memory_permissions(
-                    NonZeroAddress::new(address).unwrap(),
-                    NonZeroPageSize::new(PAGE_SIZE).unwrap(),
-                ),
-                Some(Permissions::READ | Permissions::EXEC),
-            );
-            task.sys_munmap(address, PAGE_SIZE).unwrap();
-            assert_eq!(task.global.mm.mappings(), before);
-        }
+    fn zero_trampoline_capacity_uses_traps() {
+        assert_unavailable_trampoline_uses_traps(PAGE_SIZE, 0);
+    }
+
+    #[test]
+    fn image_span_beyond_trampoline_reach_uses_traps() {
+        assert_unavailable_trampoline_uses_traps(
+            2 * litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT,
+            PAGE_SIZE,
+        );
+    }
+
+    #[test]
+    fn trampoline_capacity_beyond_reach_uses_traps() {
+        assert_unavailable_trampoline_uses_traps(
+            PAGE_SIZE,
+            2 * litebox_syscall_rewriter::MAX_TRAMPOLINE_DISPLACEMENT,
+        );
     }
 
     #[test]
@@ -1842,42 +1857,50 @@ mod tests {
         task.sys_munmap(address, PAGE_SIZE).unwrap();
     }
 
-    #[test]
-    fn failed_executable_mmap_rolls_back_new_gates() {
-        for existing in [false, true] {
-            let task = task_with_file(&macho_image());
-            let address = existing.then(|| {
-                mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap()
-            });
-            let before = task.global.mm.mappings();
-            let previous = task
-                .global
+    /// Fails an executable mapping and checks that new gates and pages are rolled back.
+    fn assert_failed_executable_mmap_rolls_back_new_gates(existing: bool) {
+        let task = task_with_file(&macho_image());
+        let address = existing.then(|| {
+            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap()
+        });
+        let before = task.global.mm.mappings();
+        let previous = task
+            .global
+            .macho_trampolines
+            .lock()
+            .values()
+            .next()
+            .map(|state| (state.range.clone(), state.cursor));
+        assert!(
+            mmap_with_protection(
+                &task,
+                VmProtection::READ | VmProtection::WRITE | VmProtection::EXECUTE,
+            )
+            .is_err()
+        );
+        assert_eq!(task.global.mm.mappings(), before);
+        assert_eq!(
+            task.global
                 .macho_trampolines
                 .lock()
                 .values()
                 .next()
-                .map(|state| (state.range.clone(), state.cursor));
-            assert!(
-                mmap_with_protection(
-                    &task,
-                    VmProtection::READ | VmProtection::WRITE | VmProtection::EXECUTE,
-                )
-                .is_err()
-            );
-            assert_eq!(task.global.mm.mappings(), before);
-            assert_eq!(
-                task.global
-                    .macho_trampolines
-                    .lock()
-                    .values()
-                    .next()
-                    .map(|state| (state.range.clone(), state.cursor)),
-                previous,
-            );
-            if let Some(address) = address {
-                task.sys_munmap(address, PAGE_SIZE).unwrap();
-            }
+                .map(|state| (state.range.clone(), state.cursor)),
+            previous,
+        );
+        if let Some(address) = address {
+            task.sys_munmap(address, PAGE_SIZE).unwrap();
         }
+    }
+
+    #[test]
+    fn failed_executable_mmap_releases_new_trampoline() {
+        assert_failed_executable_mmap_rolls_back_new_gates(false);
+    }
+
+    #[test]
+    fn failed_executable_mmap_rolls_back_gates_in_existing_trampoline() {
+        assert_failed_executable_mmap_rolls_back_new_gates(true);
     }
 
     #[test]
@@ -2090,56 +2113,64 @@ mod tests {
         task.sys_munmap(address, PAGE_SIZE).unwrap();
     }
 
-    #[test]
-    fn unmapping_trampoline_invalidates_surviving_code() {
+    /// Unmaps part or all of a trampoline and checks that its surviving code is invalidated.
+    fn assert_unmapping_trampoline_invalidates_surviving_code(remove_all: bool) {
         let mut image = macho_image();
         put64(&mut image, 32 + 72 + 40, (PAGE_SIZE - TEXT) as u64);
         for offset in (TEXT..PAGE_SIZE).step_by(4) {
             put32(&mut image, offset, SVC);
         }
-        for remove_all in [false, true] {
-            let task = task_with_file(&image);
-            let address =
-                mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
-            let trampoline = task
-                .global
+        let task = task_with_file(&image);
+        let address =
+            mmap_with_protection(&task, VmProtection::READ | VmProtection::EXECUTE).unwrap();
+        let trampoline = task
+            .global
+            .macho_trampolines
+            .lock()
+            .values()
+            .next()
+            .unwrap()
+            .range
+            .clone()
+            .unwrap();
+        assert!(trampoline.len() > PAGE_SIZE);
+        task.sys_munmap(
+            trampoline.start,
+            if remove_all {
+                trampoline.len()
+            } else {
+                PAGE_SIZE
+            },
+        )
+        .unwrap();
+        assert!(
+            task.global
                 .macho_trampolines
                 .lock()
                 .values()
                 .next()
                 .unwrap()
-                .range
-                .clone()
-                .unwrap();
-            assert!(trampoline.len() > PAGE_SIZE);
-            task.sys_munmap(
-                trampoline.start,
-                if remove_all {
-                    trampoline.len()
-                } else {
-                    PAGE_SIZE
-                },
-            )
-            .unwrap();
-            assert!(
-                task.global
-                    .macho_trampolines
-                    .lock()
-                    .values()
-                    .next()
-                    .unwrap()
-                    .invalidated
-            );
-            assert_eq!(
-                task.sys_mprotect(
-                    address,
-                    PAGE_SIZE,
-                    VmProtection::READ | VmProtection::EXECUTE
-                ),
-                Err(Errno::ENOMEM),
-            );
-            task.sys_munmap(address, PAGE_SIZE).unwrap();
-        }
+                .invalidated
+        );
+        assert_eq!(
+            task.sys_mprotect(
+                address,
+                PAGE_SIZE,
+                VmProtection::READ | VmProtection::EXECUTE
+            ),
+            Err(Errno::ENOMEM),
+        );
+        task.sys_munmap(address, PAGE_SIZE).unwrap();
+    }
+
+    #[test]
+    fn partially_unmapping_trampoline_invalidates_surviving_code() {
+        assert_unmapping_trampoline_invalidates_surviving_code(false);
+    }
+
+    #[test]
+    fn fully_unmapping_trampoline_invalidates_surviving_code() {
+        assert_unmapping_trampoline_invalidates_surviving_code(true);
     }
 
     #[test]
