@@ -15,9 +15,12 @@
 //! QEMU's TCG), starting at the Unix epoch. `alarm` and `setitimer` raise
 //! `SIGALRM` from platform timers; timer files are broker timers.
 //!
-//! Waits block in the kernel (its futex) until their timeout, a platform
-//! timer, or a broker notification (e.g., a timer file's expiry, or
-//! standard input arriving), which the broker's notification receiver
+//! Threads: each of the program's threads is a runner thread (see
+//! `litebox_platform_vm_userland::thread`), which the kernel schedules.
+//!
+//! Waits block in the kernel (its futex) until a wake, their timeout, a
+//! platform timer, or a broker notification (e.g., a timer file's expiry,
+//! or standard input arriving), which the broker's notification receiver
 //! dispatches. The kernel also interrupts the running program once it
 //! publishes one, so a nonblocking check (e.g., `epoll_wait` with no
 //! timeout) sees it even in a busy loop: a timer file's expiry as it comes
@@ -25,8 +28,9 @@
 //!
 //! Limits, which end the runner (the kernel sees it exit with
 //! `EXIT_FAILURE`) rather than fail the program's call:
-//! - One thread: a wait that nothing could end (no timeout, no armed timer,
-//!   and no input that could arrive).
+//! - A wait that nothing could end (no other thread to end it, no timeout,
+//!   no armed timer, and no input that could arrive), where Linux would
+//!   block forever.
 
 use alloc::boxed::Box;
 use litebox::utils::TruncateExt as _;
@@ -51,7 +55,9 @@ const SERVING_CALLS: CallSet = CallSet::EMPTY
     .with(CallId::Protect)
     .with(CallId::SetTimer)
     .with(CallId::Log)
-    .with(CallId::Futex);
+    .with(CallId::Clone)
+    .with(CallId::Futex)
+    .with(CallId::InterruptThread);
 
 pub fn serve(info: &StartupInfo) -> ! {
     let platform: &'static Platform = Box::leak(Box::new(VmUserland::new(info)));
@@ -128,18 +134,21 @@ fn run(
     } = shim
         .load_program(task, initial_thread, &path, argv, envp)
         .unwrap_or_else(|error| panic!("loading {path}: {error}"));
-    // Safety: no other guest thread runs.
+    // Safety: the guest's other threads are on other runner threads.
     unsafe {
         litebox_platform_vm_userland::thread::run_thread_ref(
             &entrypoints,
             &mut litebox_common_linux::PtRegs::default(),
         );
     }
-    // Detaches the thread, which ends the process.
+    // Detaches the thread, which ends the process once the others exit.
     drop(entrypoints);
-    match process.wait_for_exit_status() {
+    let status = match process.wait_for_exit_status() {
         ProcessExitStatus::Exited { code } => ExitStatus::Exited { code },
         ProcessExitStatus::Signaled { signal } => ExitStatus::Signaled { signal },
         _ => ExitStatus::Unknown,
-    }
+    };
+    // The main thread replies alone.
+    litebox_platform_vm_userland::thread::join_all();
+    status
 }

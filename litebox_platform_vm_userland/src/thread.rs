@@ -1,25 +1,36 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! Guest execution on the runner's thread (e.g. a TA and `ldelf`). Switching is a
-//! jump: both run in ring 3.
+//! Guest execution on the runner's threads (e.g. a TA and `ldelf`, or a Linux
+//! program's threads). Switching is a jump: both run in ring 3.
 //!
 //! Entries from the guest, all producing the same `PtRegs`:
 //! - `vmu_syscall_callback`: rewritten syscalls; return address in `rcx`.
 //! - `upcall_entry`: from the kernel, for unmodified syscalls and unresolved
 //!   exceptions.
 //!
-//! Assumes a single thread: the switch state is global.
+//! Each thread has its own switch state, at its GS base: the runner's thread
+//! pointer, which the kernel keeps per thread, and which the guest is assumed
+//! to leave alone (see the crate docs).
+//! The main thread's is static, set by `VmUserland::new` and again after
+//! each wait for a request, which resets the GS base; other threads' come
+//! from [`ThreadProvider::spawn_thread`](litebox::platform::ThreadProvider::spawn_thread),
+//! which the kernel starts with theirs.
 
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo};
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use litebox::shim::{ContinueOperation, EnterShim, Exception, ExceptionInfo, InitThread};
 use litebox_common_linux::PtRegs;
-use litebox_common_vm_abi::{Registers, UpcallFrame, UpcallKind};
+use litebox_common_vm_abi::{NewThread, Registers, Status, UpcallFrame, UpcallKind, UserRange};
 use zerocopy::TryFromBytes as _;
 
-/// Accessed from assembly by field offset.
+use crate::kcall;
+
+/// A thread's, at its GS base; accessed from assembly by field offset.
 #[repr(C)]
-struct SwitchState {
+pub(crate) struct SwitchState {
     /// Valid while `run_thread_arch` is active.
     host_sp: AtomicUsize,
     /// Valid while `run_thread_arch` is active.
@@ -34,16 +45,93 @@ struct SwitchState {
     /// An interrupt upcall arrived while the runner ran; the next guest
     /// entry handles it instead (it may be due to the guest).
     pending_interrupt: AtomicBool,
+    /// The kernel's ID of the thread.
+    thread: AtomicU64,
+    /// In an interruptible wait (see [`crate::RawMutex`]).
+    interruptible: AtomicBool,
+    /// The expired platform timer deadline (nanoseconds) the thread's waits
+    /// already ended for, if any (see [`crate::RawMutex`]).
+    noticed_timer: AtomicU64,
 }
 
-static STATE: SwitchState = SwitchState {
-    host_sp: AtomicUsize::new(0),
-    host_bp: AtomicUsize::new(0),
-    guest_context_top: AtomicUsize::new(0),
-    resume_rip: AtomicUsize::new(0),
-    in_guest: AtomicBool::new(false),
-    pending_interrupt: AtomicBool::new(false),
+impl SwitchState {
+    const fn new() -> Self {
+        Self {
+            host_sp: AtomicUsize::new(0),
+            host_bp: AtomicUsize::new(0),
+            guest_context_top: AtomicUsize::new(0),
+            resume_rip: AtomicUsize::new(0),
+            in_guest: AtomicBool::new(false),
+            pending_interrupt: AtomicBool::new(false),
+            thread: AtomicU64::new(litebox_common_vm_abi::MAIN_THREAD),
+            interruptible: AtomicBool::new(false),
+            noticed_timer: AtomicU64::new(0),
+        }
+    }
+}
+
+/// The main thread, which joins the others (see [`join_all`]).
+struct MainThread {
+    state: SwitchState,
+    /// Every thread from `spawn` that may not have been reaped. Futex-based
+    /// (unlike the timers' lock, which waits take): a thread may be preempted
+    /// holding it.
+    others: litebox_platform::sync::Mutex<crate::VmUserland, Vec<Arc<ThreadRecord>>>,
+}
+
+static MAIN: MainThread = MainThread {
+    state: SwitchState::new(),
+    others: litebox_platform::sync::Mutex::new(Vec::new()),
 };
+
+/// The calling thread's switch state. A GS base of zero is the main
+/// thread's, before it starts and after each wait for a request (see
+/// `kcall::ready`), which reset it; this sets it.
+pub(crate) fn current() -> &'static SwitchState {
+    // Safety: the kernel enables FSGSBASE; the runner owns GS.
+    match unsafe { litebox_common_linux::rdgsbase() } {
+        0 => {
+            // Safety: as above.
+            unsafe { litebox_common_linux::wrgsbase(&raw const MAIN.state as usize) };
+            &MAIN.state
+        }
+        // Safety: set above, or by the kernel to the thread's own (see
+        // `spawn`), which lives as long as the thread.
+        base => unsafe { &*(base as *const SwitchState) },
+    }
+}
+
+/// The kernel's ID of the calling thread.
+pub(crate) fn current_id() -> u64 {
+    current().thread.load(Ordering::Relaxed)
+}
+
+/// Whether the calling thread is in an interruptible wait (see
+/// `WaitWakerProvider::update_waker`).
+pub(crate) fn interruptible() -> bool {
+    current().interruptible.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_interruptible(interruptible: bool) {
+    current()
+        .interruptible
+        .store(interruptible, Ordering::Relaxed);
+}
+
+/// The expired platform timer deadline the calling thread's waits already
+/// ended for, if any.
+pub(crate) fn noticed_timer() -> Option<crate::Instant> {
+    match current().noticed_timer.load(Ordering::Relaxed) {
+        0 => None,
+        nanos => Some(crate::Instant::from_nanos(nanos)),
+    }
+}
+
+pub(crate) fn notice_timer(deadline: crate::Instant) {
+    current()
+        .noticed_timer
+        .store(deadline.as_nanos(), Ordering::Relaxed);
+}
 
 type DynShim<'a> = &'a dyn EnterShim<ExecutionContext = PtRegs>;
 
@@ -68,7 +156,8 @@ impl ThreadContext<'_> {
 ///
 /// # Safety
 ///
-/// No other `run_thread_ref`/`reenter_thread_ref` may be active.
+/// No other `run_thread_ref`/`reenter_thread_ref` may be active on the
+/// calling thread.
 pub unsafe fn run_thread_ref<T>(shim: &T, ctx: &mut PtRegs)
 where
     T: EnterShim<ExecutionContext = PtRegs>,
@@ -89,6 +178,8 @@ where
 }
 
 fn run_thread_inner(shim: DynShim<'_>, ctx: &mut PtRegs, reenter: bool) {
+    // The assembly finds it at the GS base.
+    current();
     let ctx = core::ptr::from_mut(ctx);
     let mut thread_ctx = ThreadContext { shim, ctx };
     // Safety: `ctx` is valid for the call, which returns exactly once.
@@ -150,10 +241,10 @@ unsafe extern "C" fn run_thread_arch(
         "push r14",
         "push r15",
         "push rdi", // `thread_ctx`; also aligns the stack
-        "mov [rip + {state} + {host_sp}], rsp",
-        "mov [rip + {state} + {host_bp}], rbp",
+        "mov gs:[{host_sp}], rsp",
+        "mov gs:[{host_bp}], rbp",
         "lea r8, [rsi + {CTX_SIZE}]",
-        "mov [rip + {state} + {guest_context_top}], r8",
+        "mov gs:[{guest_context_top}], r8",
         "test dl, dl",
         "jnz 2f",
         "call {init_handler}",
@@ -166,9 +257,9 @@ unsafe extern "C" fn run_thread_arch(
         // a real `syscall`. Clearing `in_guest` must come first.
         ".globl vmu_syscall_callback",
         "vmu_syscall_callback:",
-        "mov byte ptr [rip + {state} + {in_guest}], 0",
+        "mov byte ptr gs:[{in_guest}], 0",
         "mov r11, rsp",
-        "mov rsp, [rip + {state} + {guest_context_top}]",
+        "mov rsp, gs:[{guest_context_top}]",
         "push 0x2b",       // ss
         "push r11",        // rsp
         "pushfq",          // rflags
@@ -190,8 +281,8 @@ unsafe extern "C" fn run_thread_arch(
         "push r13",
         "push r14",
         "push r15",
-        "mov rsp, [rip + {state} + {host_sp}]",
-        "mov rbp, [rip + {state} + {host_bp}]",
+        "mov rsp, gs:[{host_sp}]",
+        "mov rbp, gs:[{host_bp}]",
         "mov rdi, [rsp]",
         "cld", // the guest may have left DF set
         "call {syscall_handler}",
@@ -200,8 +291,8 @@ unsafe extern "C" fn run_thread_arch(
         // From `upcall_dispatch`, guest state already in the guest context.
         ".globl vmu_guest_syscall_upcall",
         "vmu_guest_syscall_upcall:",
-        "mov rsp, [rip + {state} + {host_sp}]",
-        "mov rbp, [rip + {state} + {host_bp}]",
+        "mov rsp, gs:[{host_sp}]",
+        "mov rbp, gs:[{host_bp}]",
         "mov rdi, [rsp]",
         "call {syscall_handler}",
         "jmp vmu_thread_done",
@@ -209,8 +300,8 @@ unsafe extern "C" fn run_thread_arch(
         // From `upcall_dispatch`, guest state already in the guest context.
         ".globl vmu_guest_interrupt_upcall",
         "vmu_guest_interrupt_upcall:",
-        "mov rsp, [rip + {state} + {host_sp}]",
-        "mov rbp, [rip + {state} + {host_bp}]",
+        "mov rsp, gs:[{host_sp}]",
+        "mov rbp, gs:[{host_bp}]",
         "mov rdi, [rsp]",
         "call {guest_interrupt_handler}",
         "jmp vmu_thread_done",
@@ -221,8 +312,8 @@ unsafe extern "C" fn run_thread_arch(
         "mov rcx, rdx",
         "mov rdx, rsi",
         "mov rsi, rdi",
-        "mov rsp, [rip + {state} + {host_sp}]",
-        "mov rbp, [rip + {state} + {host_bp}]",
+        "mov rsp, gs:[{host_sp}]",
+        "mov rbp, gs:[{host_bp}]",
         "mov rdi, [rsp]",
         "call {guest_exception_handler}",
 
@@ -235,7 +326,6 @@ unsafe extern "C" fn run_thread_arch(
         "pop rbx",
         "pop rbp",
         "ret",
-        state = sym STATE,
         host_sp = const core::mem::offset_of!(SwitchState, host_sp),
         host_bp = const core::mem::offset_of!(SwitchState, host_bp),
         guest_context_top = const core::mem::offset_of!(SwitchState, guest_context_top),
@@ -316,11 +406,11 @@ unsafe extern "C" fn restore_context(regs: *const Registers) -> ! {
         "jmp 4f",
         ".globl vmu_enter_guest",
         "vmu_enter_guest:",
-        "mov byte ptr [rip + {state} + {in_guest}], 1",
-        "cmp byte ptr [rip + {state} + {pending}], 0",
+        "mov byte ptr gs:[{in_guest}], 1",
+        "cmp byte ptr gs:[{pending}], 0",
         "je 4f",
-        "mov byte ptr [rip + {state} + {in_guest}], 0",
-        "mov byte ptr [rip + {state} + {pending}], 0",
+        "mov byte ptr gs:[{in_guest}], 0",
+        "mov byte ptr gs:[{pending}], 0",
         "jmp vmu_guest_interrupt_upcall",
         "4:",
         "mov rsp, rdi",
@@ -340,24 +430,24 @@ unsafe extern "C" fn restore_context(regs: *const Registers) -> ! {
         "pop rsi",
         "pop rdi",
         "add rsp, 8", // orig_rax
-        "pop qword ptr [rip + {state} + {resume_rip}]",
+        "pop qword ptr gs:[{resume_rip}]",
         "add rsp, 8", // cs
         "popfq",
         "pop rsp",
         ".globl vmu_restore_jmp",
         "vmu_restore_jmp:",
-        "jmp qword ptr [rip + {state} + {resume_rip}]",
+        "jmp qword ptr gs:[{resume_rip}]",
         ".globl vmu_restore_end",
         "vmu_restore_end:",
-        state = sym STATE,
         resume_rip = const core::mem::offset_of!(SwitchState, resume_rip),
         in_guest = const core::mem::offset_of!(SwitchState, in_guest),
         pending = const core::mem::offset_of!(SwitchState, pending_interrupt),
     );
 }
 
-/// `rdi`: the [`UpcallFrame`] at the top of the upcall stack. An upcall for
-/// the runner itself is fatal, except for an exception-table fixup.
+/// `rdi`: the [`UpcallFrame`] at the top of the thread's upcall stack. An
+/// upcall for the runner itself is fatal, except for an exception-table
+/// fixup.
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn upcall_entry() -> ! {
     core::arch::naked_asm!(
@@ -374,14 +464,15 @@ extern "C" fn upcall_dispatch(frame: *const UpcallFrame) -> ! {
     let bytes =
         unsafe { core::slice::from_raw_parts(frame.cast::<u8>(), size_of::<UpcallFrame>()) };
     let frame = UpcallFrame::try_read_from_bytes(bytes).expect("malformed upcall frame");
+    let state = current();
     let rip = usize::try_from(frame.regs.rip).unwrap_or(usize::MAX);
     let entering = (vmu_enter_guest as *const () as usize..vmu_restore_end as *const () as usize)
         .contains(&rip);
-    if STATE.in_guest.load(Ordering::Relaxed) && entering && frame.kind == UpcallKind::Interrupt {
+    if state.in_guest.load(Ordering::Relaxed) && entering && frame.kind == UpcallKind::Interrupt {
         // Interrupted on the way into the guest: the guest context is intact,
         // unlike the registers, which are partly the runner's.
-        STATE.in_guest.store(false, Ordering::Relaxed);
-        STATE.pending_interrupt.store(false, Ordering::Relaxed);
+        state.in_guest.store(false, Ordering::Relaxed);
+        state.pending_interrupt.store(false, Ordering::Relaxed);
         // Safety: `run_thread_arch` is active (the guest was being entered).
         unsafe { vmu_guest_interrupt_upcall() }
     }
@@ -390,10 +481,10 @@ extern "C" fn upcall_dispatch(frame: *const UpcallFrame) -> ! {
         // guest made its (rewritten) syscall, and must not see the callback's
         // address as its own. As for the runner's code below: after the
         // syscall, at the next guest entry.
-        STATE.in_guest.store(false, Ordering::Relaxed);
+        state.in_guest.store(false, Ordering::Relaxed);
     }
-    if STATE.in_guest.swap(false, Ordering::Relaxed) {
-        let top = STATE.guest_context_top.load(Ordering::Relaxed);
+    if state.in_guest.swap(false, Ordering::Relaxed) {
+        let top = state.guest_context_top.load(Ordering::Relaxed);
         let ctx = (top - size_of::<PtRegs>()) as *mut Registers;
         // Safety: `run_thread_arch` is active (the guest was running), so
         // `ctx` is its guest context.
@@ -412,11 +503,11 @@ extern "C" fn upcall_dispatch(frame: *const UpcallFrame) -> ! {
     if frame.kind == UpcallKind::Interrupt {
         // The runner's own code ran, not the guest: leave the interrupt to
         // the next guest entry, and resume exactly where it was.
-        STATE.pending_interrupt.store(true, Ordering::Relaxed);
+        state.pending_interrupt.store(true, Ordering::Relaxed);
         let mut regs = frame.regs;
         if rip == vmu_restore_jmp as *const () as usize {
             // Its target is only in the scratch, which resuming overwrites.
-            regs.rip = STATE.resume_rip.load(Ordering::Relaxed) as u64;
+            regs.rip = state.resume_rip.load(Ordering::Relaxed) as u64;
         }
         // Safety: the runner's own state at the interrupt.
         unsafe { restore_context(&raw const regs) }
@@ -434,4 +525,189 @@ extern "C" fn upcall_dispatch(frame: *const UpcallFrame) -> ! {
         "unhandled {:?} upcall from the runner (vector {}, error {:#x}) at {:#x}, address {:#x}",
         frame.kind, frame.vector, frame.error_code, frame.regs.rip, frame.fault_address
     );
+}
+
+/// A runner thread's stack: 1 MiB, as the main thread's.
+const STACK_SIZE: usize = 1 << 20;
+/// A runner thread's upcall stack, as the main thread's.
+const UPCALL_STACK_SIZE: usize = 64 << 10;
+
+/// Page-aligned heap memory, which the kernel may use (as an upcall stack).
+struct Pages {
+    start: *mut u8,
+    layout: core::alloc::Layout,
+}
+
+impl Pages {
+    fn new(len: usize) -> Option<Self> {
+        let layout = core::alloc::Layout::from_size_align(len, 4096).ok()?;
+        // Safety: nonzero size.
+        let start = unsafe { alloc::alloc::alloc(layout) };
+        // Not `then_some`, which would build (and drop, so free) one for a
+        // failed allocation.
+        (!start.is_null()).then(|| Self { start, layout })
+    }
+
+    fn end(&self) -> usize {
+        self.start as usize + self.layout.size()
+    }
+
+    /// For the kernel, which the runner never reads it through: it may be
+    /// uninitialized.
+    fn range(&self) -> UserRange {
+        UserRange {
+            start: self.start as u64,
+            len: self.layout.size() as u64,
+        }
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        // Safety: allocated with this layout.
+        unsafe { alloc::alloc::dealloc(self.start, self.layout) };
+    }
+}
+
+/// A thread from [`spawn`]: what it runs on, kept until it exits.
+struct ThreadRecord {
+    /// At its GS base.
+    state: SwitchState,
+    /// One until the kernel clears it, once the thread exited.
+    alive: AtomicU32,
+    stack: Pages,
+    upcall_stack: Pages,
+}
+
+// Safety: the stacks are the thread's alone, then the reaper's, once the
+// kernel says it exited.
+unsafe impl Send for ThreadRecord {}
+// Safety: as above; `state` is the thread's alone.
+unsafe impl Sync for ThreadRecord {}
+
+/// What a new thread starts with, at its entry.
+struct ThreadStart {
+    init: Box<dyn InitThread<ExecutionContext = PtRegs>>,
+    ctx: PtRegs,
+    record: *const ThreadRecord,
+}
+
+/// Starts a runner thread that runs the guest at `ctx` with the shim from
+/// `init` (see [`litebox::platform::ThreadProvider::spawn_thread`]), and
+/// exits once the shim terminates it. It has the caller's FS base, which the
+/// guest owns.
+///
+/// # Errors
+///
+/// [`Status::NoMemory`] if the stacks cannot be allocated; otherwise the
+/// kernel's.
+pub(crate) fn spawn(
+    ctx: &PtRegs,
+    init: Box<dyn InitThread<ExecutionContext = PtRegs>>,
+) -> Result<(), Status> {
+    reap();
+    let stack = Pages::new(STACK_SIZE).ok_or(Status::NoMemory)?;
+    let upcall_stack = Pages::new(UPCALL_STACK_SIZE).ok_or(Status::NoMemory)?;
+    let record = Arc::new(ThreadRecord {
+        state: SwitchState::new(),
+        alive: AtomicU32::new(1),
+        stack,
+        upcall_stack,
+    });
+    let start = Box::into_raw(Box::new(ThreadStart {
+        init,
+        ctx: ctx.clone(),
+        record: Arc::as_ptr(&record),
+    }));
+    let regs = Registers {
+        rip: thread_entry as *const () as u64,
+        rsp: record.stack.end() as u64,
+        rdi: start as u64,
+        ..Registers::default()
+    };
+    let thread = NewThread {
+        regs,
+        // The guest's, as Linux's `clone` keeps it (but for `CLONE_SETTLS`,
+        // which the shim applies).
+        // Safety: the kernel enables FSGSBASE; no memory access.
+        fs_base: unsafe { litebox_common_linux::rdfsbase() } as u64,
+        gs_base: core::ptr::from_ref(&record.state) as u64,
+        upcall_stack: record.upcall_stack.range(),
+    };
+    match kcall::clone_thread(thread) {
+        Ok(_) => {
+            MAIN.others.lock().push(record);
+            Ok(())
+        }
+        Err(status) => {
+            // Safety: from `Box::into_raw` above; the thread never started.
+            drop(unsafe { Box::from_raw(start) });
+            Err(status)
+        }
+    }
+}
+
+/// The kernel starts a thread here: `rdi` is its [`ThreadStart`], `rax` its
+/// ID, and the GS base its switch state.
+#[unsafe(naked)]
+unsafe extern "C" fn thread_entry() -> ! {
+    core::arch::naked_asm!(
+        "mov rsi, rax",
+        "and rsp, -16",
+        "xor ebp, ebp",
+        "call {main}",
+        "ud2",
+        main = sym thread_main,
+    );
+}
+
+extern "C" fn thread_main(start: *mut ThreadStart, id: u64) -> ! {
+    // Safety: `spawn` leaves it to the thread.
+    let ThreadStart {
+        init,
+        mut ctx,
+        record,
+    } = *unsafe { Box::from_raw(start) };
+    // Safety: `MAIN.others` keeps it until the kernel clears `alive`, after
+    // this thread is gone.
+    let record = unsafe { &*record };
+    record.state.thread.store(id, Ordering::Relaxed);
+    let shim = init.init();
+    run_thread_inner(&*shim, &mut ctx, false);
+    drop(shim);
+    kcall::exit_thread(&record.alive)
+}
+
+/// Frees what exited threads ran on.
+fn reap() {
+    MAIN.others
+        .lock()
+        .retain(|record| record.alive.load(Ordering::Acquire) != 0);
+}
+
+/// Waits until every thread the guest created has exited, as the main thread
+/// must before it replies (see `litebox_common_vm_abi`, Threads); frees what
+/// they ran on.
+///
+/// # Panics
+///
+/// If the kernel rejects the wait.
+pub fn join_all() {
+    loop {
+        let Some(record) = MAIN
+            .others
+            .lock()
+            .iter()
+            .find(|record| record.alive.load(Ordering::Acquire) != 0)
+            .cloned()
+        else {
+            break;
+        };
+        match kcall::futex_wait(&record.alive, 1, None) {
+            Ok(()) => {}
+            Err(Status::Interrupted) => crate::drain_notifications(),
+            Err(status) => panic!("joining threads: {status:?}"),
+        }
+    }
+    reap();
 }

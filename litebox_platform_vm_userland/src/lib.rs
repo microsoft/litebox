@@ -4,16 +4,19 @@
 //! LiteBox platform for a ring-3 runner on the LiteBox VM kernel.
 //!
 //! Assumptions:
-//! - The runner, its shim, and the guest share one address space and one
-//!   thread; the guest can tamper with all of it. The kernel does not trust
-//!   the runner.
+//! - The runner, its shim, and the guest share one address space and its
+//!   threads (the guest's are the runner's, see [`thread`]); the guest can
+//!   tamper with all of it. The kernel does not trust the runner.
 //! - The kernel reaches this platform only through [`kcall`] and upcalls
 //!   ([`VmUserland::upcall_entry_address`]); it does demand paging itself.
 //! - The shim's VMAs decide the layout of the runner-managed area; the kernel
 //!   keeps the authoritative record (see `litebox_common_vm_abi`, Memory).
-//! - The guest owns the FS and GS bases; transitions between the guest and
-//!   the runner leave them alone. So runner code uses no thread-local storage
-//!   (no FS- or GS-relative accesses) until the VM kernel provides it.
+//! - The guest owns the FS base, and the runner the GS base, its thread
+//!   pointer (see [`thread`]); transitions between the guest and the runner
+//!   leave them alone. The runner assumes that the guest never changes the
+//!   GS base: nothing stops it (FSGSBASE is enabled, and `wrgsbase` is not
+//!   rewritten), but doing so breaks only the runner, which is not trusted.
+//!   Runner code uses no other thread-local storage.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -69,6 +72,8 @@ pub struct VmUserland {
 }
 
 impl VmUserland {
+    /// Before the runner runs a guest. At most once.
+    ///
     /// # Panics
     ///
     /// Panics if the clock frequency is zero.
@@ -77,6 +82,8 @@ impl VmUserland {
         TIMED_WAIT
             .clock_khz
             .store(info.clock_khz, Ordering::Relaxed);
+        // The main thread's thread pointer.
+        thread::current();
         Self {
             wall_clock: info.wall_clock,
         }
@@ -154,12 +161,22 @@ impl RawMutexProvider for VmUserland {
     type RawMutex = RawMutex;
 }
 
-impl WaitWakerProvider for VmUserland {}
+/// Tracks the interruptible waits (e.g., a guest's `pause`), which a platform
+/// timer's deadline ends (see [`RawMutex`]); the waker is not needed, as the
+/// kernel's futex wakes the waiter.
+impl WaitWakerProvider for VmUserland {
+    fn update_waker(&self, waker: Option<core::task::Waker>) {
+        thread::set_interruptible(waker.is_some());
+    }
+}
 
 /// The kernel's futex ([`kcall::futex_wait`]). A wait also ends where the
 /// thread would take an interrupt: a broker notification, which it then
-/// dispatches (possibly waking the waiter), or a platform timer's deadline
-/// (whose signal is then pending). One that nothing could end panics.
+/// dispatches (possibly waking the waiter), a platform timer's deadline
+/// (whose signal is then pending), or [`ThreadProvider::interrupt_thread`].
+/// One that nothing could end panics.
+///
+/// [`ThreadProvider::interrupt_thread`]: litebox::platform::ThreadProvider::interrupt_thread
 pub struct RawMutex {
     inner: AtomicU32,
     /// Threads in [`Self::wait`], so wakes call the kernel only for them.
@@ -167,13 +184,24 @@ pub struct RawMutex {
 }
 
 impl RawMutex {
-    /// Waits while the word is `val`, until a wake, an interrupt, a platform
-    /// timer's deadline (whose signal is then pending), or `deadline`;
-    /// whether `deadline` passed. Platform timers are by their state, not by
-    /// the kernel's interrupt for them, which may have come while the runner
-    /// ran its own code (leaving it to the guest's next entry).
+    /// Waits while the word is `val`, until a wake, an interrupt, or
+    /// `deadline`; whether `deadline` passed.
+    ///
+    /// In an interruptible wait (the shim's, e.g., for a guest's `pause`),
+    /// the calling thread's waits also end at a platform timer's deadline
+    /// (whose signal is then pending), by the timer's state, not by the
+    /// kernel's interrupt for it, which may have come while the runner ran
+    /// its own code (leaving it to the guest's next entry); but once for
+    /// each expiry. So one on the runner's locks, taken while the shim
+    /// checks the wait's condition, does not spin on an expiry until a
+    /// thread takes it: the shim takes it once that wait is over. Other waits
+    /// (e.g., for the runner's own locks) do not take signals.
     fn wait(&self, val: u32, deadline: Option<Instant>) -> bool {
-        let timer = timer::next_deadline().filter(|&timer| deadline.is_none_or(|d| timer < d));
+        let timer = thread::interruptible()
+            .then(timer::next_deadline)
+            .flatten()
+            .filter(|&timer| deadline.is_none_or(|d| timer < d))
+            .filter(|&timer| timer > now() || thread::noticed_timer() != Some(timer));
         self.waiters.fetch_add(1, Ordering::SeqCst);
         let result = kcall::futex_wait(&self.inner, val, timer.or(deadline));
         self.waiters.fetch_sub(1, Ordering::SeqCst);
@@ -183,7 +211,13 @@ impl RawMutex {
                 drain_notifications();
                 false
             }
-            Err(Status::TimedOut) => timer.is_none(),
+            Err(Status::TimedOut) => match timer {
+                Some(timer) => {
+                    thread::notice_timer(timer);
+                    false
+                }
+                None => true,
+            },
             Err(Status::Stalled) => {
                 panic!("a wait that nothing could end in the VM userland runner would deadlock")
             }
@@ -587,32 +621,52 @@ impl litebox::platform::SystemInfoProvider for VmUserland {
     }
 }
 
-/// One guest thread: the runner's. New threads are unsupported, and nothing
-/// interrupts the only one.
+/// Guest threads are runner threads (see [`thread`]), which the kernel
+/// schedules.
 impl litebox::platform::ThreadProvider for VmUserland {
     type ExecutionContext = litebox_common_linux::PtRegs;
     type ThreadSpawnError = litebox_common_linux::errno::Errno;
-    type ThreadHandle = ();
+    type ThreadHandle = ThreadHandle;
 
     unsafe fn spawn_thread(
         &self,
-        _ctx: &Self::ExecutionContext,
-        _init_thread: alloc::boxed::Box<
+        ctx: &Self::ExecutionContext,
+        init_thread: alloc::boxed::Box<
             dyn litebox::shim::InitThread<ExecutionContext = Self::ExecutionContext>,
         >,
     ) -> Result<(), Self::ThreadSpawnError> {
-        Err(litebox_common_linux::errno::Errno::ENOSYS)
+        use litebox_common_linux::errno::Errno;
+        thread::spawn(ctx, init_thread).map_err(|status| match status {
+            Status::NoMemory => Errno::ENOMEM,
+            Status::Denied => Errno::EPERM,
+            _ => Errno::EAGAIN,
+        })
     }
 
-    fn current_thread(&self) -> Self::ThreadHandle {}
+    fn current_thread(&self) -> Self::ThreadHandle {
+        ThreadHandle(thread::current_id())
+    }
 
-    fn interrupt_thread(&self, _thread: &Self::ThreadHandle) {}
+    /// Delivers an interrupt to the thread, which enters the shim's
+    /// `interrupt` at its next guest entry, or ends its wait (see
+    /// [`RawMutex`]). Nothing for a thread that exited.
+    fn interrupt_thread(&self, thread: &Self::ThreadHandle) {
+        match kcall::interrupt_thread(thread.0) {
+            Ok(()) | Err(Status::InvalidArgument) => {}
+            Err(status) => panic!("interrupting a thread: {status:?}"),
+        }
+    }
 }
 
+/// A runner thread, by its kernel ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ThreadHandle(u64);
+
 /// The guest's vector state stays in the registers: the runner never touches
-/// them (soft-float), and the kernel preserves them across its calls. No
-/// snapshot or replacement is needed while the runner has neither `fork` nor
-/// asynchronous signals, so, as on SNP, a snapshot is the initial state and a
+/// them (soft-float), and the kernel preserves them across its calls, and
+/// keeps them per thread. The shim snapshots and replaces them only for
+/// `fork` and `vfork`, which the runner does not have, so, as on SNP, a
+/// snapshot is the initial state (as a new thread starts with) and a
 /// replacement does nothing.
 impl litebox::platform::GuestVectorStateProvider for VmUserland {
     type GuestVectorState = litebox_common_linux::GuestVectorState;

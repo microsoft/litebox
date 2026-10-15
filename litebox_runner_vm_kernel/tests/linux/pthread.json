@@ -1,0 +1,15 @@
+[
+  { "argv": ["/pthread", "basic"], "expect_stdout": "basic: ok\n", "expect_stderr": "" },
+  { "argv": ["/pthread-pie", "basic"], "expect_stdout": "basic: ok\n", "expect_stderr": "" },
+  { "argv": ["/pthread", "exit"], "expect_exit_code": 7, "expect_stderr": "" },
+  { "argv": ["/pthread", "detach"], "expect_stdout": "detached: done\n" },
+  { "argv": ["/pthread", "alarm"], "expect_stdout": "alarm: ok\n", "expect_stderr": "" },
+  { "argv": ["/pthread", "input"], "console_stdin": true },
+  {
+    "concurrent": [
+      { "argv": ["/pthread", "basic"] },
+      { "argv": ["/pthread-pie", "basic"] },
+      { "argv": ["/sched", "spin", "300", "0", "1000"] }
+    ]
+  }
+]

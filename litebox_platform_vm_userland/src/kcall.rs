@@ -7,8 +7,9 @@
 
 use core::sync::atomic::AtomicU32;
 use litebox_common_vm_abi::{
-    CallSet, DeriveKeyReply, DeriveKeyRequest, ExitRequest, FutexRequest, KernelCall, LogLevel,
-    LogRequest, MapRequest, Message, Placement, Populate, Prot, ProtSet, ProtectRequest,
+    CallSet, CloneKind, CloneRequest, DeriveKeyReply, DeriveKeyRequest, ExitRequest,
+    ExitThreadRequest, FutexRequest, InterruptThreadRequest, KernelCall, LogLevel, LogRequest,
+    MapRequest, Message, NewThread, Placement, Populate, Prot, ProtSet, ProtectRequest,
     ReadyRequest, RestrictRequest, SetTimerRequest, Status, UnmapRequest, UserRange,
 };
 use zerocopy::{FromZeros as _, IntoBytes as _};
@@ -86,18 +87,46 @@ pub fn log(level: LogLevel, message: &str) {
     let _ = call(&LogRequest::new(level, user_bytes(message.as_bytes())));
 }
 
+/// Restores the main thread's thread pointer (see [`crate::thread`]), which
+/// the kernel resets.
+///
 /// # Errors
 ///
 /// See [`call`].
 pub fn ready(upcall_entry: usize) -> Result<Message, Status> {
-    call(&ReadyRequest::new(upcall_entry as u64))
+    let result = call(&ReadyRequest::new(upcall_entry as u64));
+    crate::thread::current();
+    result
 }
 
+/// Restores the main thread's thread pointer, as [`ready`].
+///
 /// # Errors
 ///
 /// See [`call`].
 pub fn reply_and_wait(reply: &Message) -> Result<Message, Status> {
-    call(reply)
+    let result = call(reply);
+    crate::thread::current();
+    result
+}
+
+/// A thread of this process, at `thread.regs` with `rax` its ID, which the
+/// reply also gives.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn clone_thread(thread: NewThread) -> Result<u64, Status> {
+    call(&CloneRequest::new(CloneKind::Thread, thread)).map(|reply| reply.thread)
+}
+
+/// Ends the calling thread; then the kernel clears `clear`, waking its
+/// waiters.
+pub fn exit_thread(clear: &AtomicU32) -> ! {
+    let _ = call(&ExitThreadRequest {
+        clear: clear.as_ptr() as u64,
+    });
+    unreachable!("the kernel resumed an exited thread")
 }
 
 /// Blocks while `word` is `expected`, until a [`futex_wake`] on it,
@@ -127,6 +156,15 @@ pub fn futex_wait(
 /// See [`call`].
 pub fn futex_wake(word: &AtomicU32, count: u64) -> Result<u64, Status> {
     call(&FutexRequest::wake(word.as_ptr() as u64, count)).map(|reply| reply.woken)
+}
+
+/// Has `thread` take an interrupt.
+///
+/// # Errors
+///
+/// See [`call`].
+pub fn interrupt_thread(thread: u64) -> Result<(), Status> {
+    call(&InterruptThreadRequest { thread })
 }
 
 /// # Errors

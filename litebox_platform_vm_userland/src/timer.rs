@@ -9,7 +9,10 @@
 //! interrupt itself), and reports whichever timers have since expired.
 //!
 //! One hardware deadline backs every live timer: creating or (re)arming one
-//! re-arms the kernel to the earliest across all of them.
+//! re-arms the kernel to the earliest across all of them. Threads may arm and
+//! take timers at once: a timer is disarmed only from the deadline found due,
+//! and the kernel is re-armed under the timers' lock, from the deadlines
+//! then.
 
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -87,8 +90,14 @@ impl litebox::platform::SignalProvider for VmUserland {
                 return false;
             };
             let deadline = timer.deadline.load(Ordering::Relaxed);
-            if deadline != DISARMED && deadline <= now {
-                timer.deadline.store(DISARMED, Ordering::Relaxed);
+            // Not if another thread has just set it anew.
+            if deadline != DISARMED
+                && deadline <= now
+                && timer
+                    .deadline
+                    .compare_exchange(deadline, DISARMED, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
                 due.push(timer.signal);
                 rearm_needed = true;
             }
@@ -109,8 +118,12 @@ pub(crate) fn any() -> bool {
 
 /// The earliest live timer's deadline, if any.
 pub(crate) fn next_deadline() -> Option<Instant> {
-    TIMERS
-        .lock()
+    earliest(&TIMERS.lock())
+}
+
+/// The earliest deadline of `timers`, if any.
+fn earliest(timers: &[Weak<TimerState>]) -> Option<Instant> {
+    timers
         .iter()
         .filter_map(
             |timer| match timer.upgrade()?.deadline.load(Ordering::Relaxed) {
@@ -123,7 +136,9 @@ pub(crate) fn next_deadline() -> Option<Instant> {
 }
 
 /// Sets the process's kernel timer to the earliest live timer, or cancels it
-/// if none is armed.
+/// if none is armed. Under the timers' lock, so that one thread's re-arming
+/// cannot overwrite another's with an earlier view of the deadlines.
 fn rearm() {
-    kcall::set_timer(next_deadline()).unwrap_or_else(|status| panic!("set_timer: {status:?}"));
+    let timers = TIMERS.lock();
+    kcall::set_timer(earliest(&timers)).unwrap_or_else(|status| panic!("set_timer: {status:?}"));
 }

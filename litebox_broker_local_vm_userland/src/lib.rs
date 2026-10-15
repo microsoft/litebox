@@ -16,6 +16,8 @@
 //! receiver thread: the runner receives them with [`Notifications::receive`],
 //! which also waits for them, or, as the platform's waits and interrupts
 //! need, with a [`Receiver`] (in place of the userland receiver thread).
+//!
+//! Calls from several threads take turns: one call is in flight at a time.
 
 #![cfg(target_arch = "x86_64")]
 #![no_std]
@@ -59,8 +61,6 @@ pub enum ChannelError {
     NoRequest,
     /// A response for another request.
     UnexpectedResponse,
-    /// A reentrant call.
-    Busy,
     /// An earlier call failed the association.
     Failed,
 }
@@ -75,7 +75,6 @@ impl core::fmt::Display for ChannelError {
             Self::Oversized => f.write_str("broker frame too large"),
             Self::NoRequest => f.write_str("no handshake request was sent"),
             Self::UnexpectedResponse => f.write_str("broker response for another request"),
-            Self::Busy => f.write_str("reentrant broker call"),
             Self::Failed => f.write_str("the broker association failed"),
         }
     }
@@ -154,15 +153,16 @@ impl Rings {
 }
 
 pub struct KernelBrokerChannel {
-    /// `None` once a call has failed the association.
-    rings: spin::Mutex<Option<Rings>>,
+    /// `None` once a call has failed the association. A thread may be
+    /// preempted, or wait in the kernel, holding it.
+    rings: litebox_platform::sync::Mutex<VmUserland, Option<Rings>>,
 }
 
 impl LocalCallChannel for KernelBrokerChannel {
     type Error = ChannelError;
 
     fn call(&self, request: BrokerRequest) -> Result<BrokerResponse, ChannelError> {
-        let mut rings = self.rings.try_lock().ok_or(ChannelError::Busy)?;
+        let mut rings = self.rings.lock();
         let result = rings.as_mut().ok_or(ChannelError::Failed)?.call(request);
         if result.is_err() {
             *rings = None;
@@ -378,7 +378,7 @@ pub fn connect(
                 words: ring()?,
             };
             let channel = KernelBrokerChannel {
-                rings: spin::Mutex::new(Some(Rings {
+                rings: litebox_platform::sync::Mutex::new(Some(Rings {
                     requests: request_producer,
                     responses: response_consumer,
                 })),
