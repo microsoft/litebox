@@ -969,7 +969,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
                         &self.wait_cx(),
                         &mut buf,
                         litebox_common_linux::ReceiveFlags::empty(),
-                        super::inet::ReceiveContext::new(None, false),
+                        false,
                         None,
                     )?;
                     Ok(received.min(buf.len()))
