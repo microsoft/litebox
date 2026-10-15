@@ -1079,10 +1079,12 @@ impl<Platform: ShimPlatform> Task<Platform> {
                 let (executable_bytes, identified_bytes) = metadata.coverage_bytes();
                 let initial_cursor = litebox_syscall_rewriter::TRAMPOLINE_ENTRY_POINT_BYTES
                     .checked_next_multiple_of(litebox_syscall_rewriter::TRAMPOLINE_CURSOR_ALIGN);
+                // Round up to at least one page; a zero estimate would otherwise
+                // read as "no runtime trampoline" and force trap fallback.
                 let capacity = upper_bound
                     .zip(initial_cursor)
                     .and_then(|(bound, cursor)| bound.checked_add(cursor))
-                    .and_then(|bound| bound.checked_next_multiple_of(PAGE_SIZE))
+                    .and_then(|bound| bound.max(PAGE_SIZE).checked_next_multiple_of(PAGE_SIZE))
                     .unwrap_or(PAGE_SIZE);
                 if upper_bound.is_none() {
                     litebox_util_log::warn!(
