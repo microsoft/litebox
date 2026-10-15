@@ -93,7 +93,8 @@ pub struct BrokerCoreLimits {
     pub max_unix_socket_bytes_per_process: usize,
     /// Maximum live platform socket resources across all processes.
     pub max_sockets: usize,
-    /// Maximum live platform socket resources owned by one process.
+    /// Maximum live platform socket resources charged to one process: those it
+    /// creates and those accepted through its listeners.
     pub max_sockets_per_process: usize,
     /// Maximum readiness queue entries across all processes.
     pub max_readiness_queue_entries: usize,

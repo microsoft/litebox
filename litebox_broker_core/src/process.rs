@@ -194,8 +194,6 @@ pub struct BrokerProcess {
     pub(crate) reserved_pipe_capacity: Arc<AtomicUsize>,
     /// Bytes queued in Unix sockets created by this process.
     pub(crate) unix_socket_bytes: Arc<AtomicUsize>,
-    /// Socket quota held by pending, live, and closing in-flight resources.
-    pub(crate) reserved_sockets: Arc<AtomicUsize>,
     /// The provider socket state charged to this process, until it releases
     /// its references.
     socket_account: Mutex<Option<Arc<SocketAccount>>>,
@@ -369,7 +367,6 @@ impl BrokerProcess {
             threads: Mutex::new(HashSet::new()),
             reserved_pipe_capacity: Arc::new(AtomicUsize::new(0)),
             unix_socket_bytes: Arc::new(AtomicUsize::new(0)),
-            reserved_sockets: Arc::new(AtomicUsize::new(0)),
             socket_account: Mutex::new(Some(socket_account)),
             readiness_queue_entries: Arc::new(AtomicUsize::new(0)),
             signals: Arc::new(ProcessSignals::new()),

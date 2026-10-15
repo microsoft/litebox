@@ -224,7 +224,9 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     })
             },
         );
-        Ok(result.map_err(|error| wait_errno(timeout, error))?.into())
+        Ok(result
+            .map_err(|error| wait_errno(timeout, socket_io_errno(error)))?
+            .into())
     }
 
     pub(super) fn connect(
@@ -254,9 +256,14 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                 Err(error) => Err(TryOpError::Other(error.into())),
             },
         );
+        // Like Linux, a connect whose wait times out reports that it is still in progress.
         result.map_err(|error| match error {
-            TryOpError::TryAgain if already_in_progress => Errno::EALREADY,
-            TryOpError::TryAgain => Errno::EINPROGRESS,
+            TryOpError::TryAgain | TryOpError::WaitError(WaitError::TimedOut)
+                if already_in_progress =>
+            {
+                Errno::EALREADY
+            }
+            TryOpError::TryAgain | TryOpError::WaitError(WaitError::TimedOut) => Errno::EINPROGRESS,
             error => wait_errno(timeout, error),
         })
     }

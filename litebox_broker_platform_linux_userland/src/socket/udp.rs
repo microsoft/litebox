@@ -845,25 +845,10 @@ impl Reactor {
             receiver_process.udp_queued_bytes += payload.len();
         }
 
-        if was_empty && self.publish_udp_readiness(destination_socket_id).is_err() {
-            let datagram = self
-                .sockets
-                .get_mut(&destination_socket_id)
-                .expect("queued UDP destination disappeared")
-                .udp_state_mut()
-                .expect("queued UDP destination changed kind")
-                .internal_receive_queue
-                .pop_back()
-                .expect("new UDP datagram disappeared before rollback");
-            self.release_udp_datagram_accounting(destination_socket_id, &datagram);
-            let readiness = self
-                .udp_readiness(destination_socket_id)
-                .expect("UDP destination disappeared during readiness rollback");
-            self.sockets
-                .get(&destination_socket_id)
-                .expect("UDP destination disappeared during readiness rollback")
-                .snapshot
-                .store(readiness);
+        if was_empty {
+            // The datagram is already queued; ignore a failure to recompute
+            // readiness.
+            let _ = self.publish_udp_readiness(destination_socket_id);
         }
         Ok(SocketOutcome::Completed(payload.len()))
     }

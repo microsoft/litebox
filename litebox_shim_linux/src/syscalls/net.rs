@@ -1623,7 +1623,7 @@ impl<Platform: ShimPlatform> Task<Platform> {
 #[cfg(target_os = "linux")]
 #[cfg(test)]
 mod tests {
-    use core::net::SocketAddr;
+    use core::{net::SocketAddr, time::Duration};
 
     type TestTask = crate::Task<crate::syscalls::tests::TestPlatform>;
 
@@ -1681,6 +1681,34 @@ mod tests {
             Err(Errno::EMFILE)
         );
         close_socket(&task, fd);
+    }
+
+    #[test]
+    fn inet_accept_timeout_returns_eagain() {
+        let task = init_platform();
+        let raw_server = task
+            .do_socket(AddressFamily::INET, SockType::Stream, SockFlags::empty(), 0)
+            .unwrap();
+        let server = typed_socket(&task, raw_server);
+        task.do_bind(&server, loopback_addr(0)).unwrap();
+        task.do_listen(&server, 1).unwrap();
+        let timeout = Duration::from_millis(200);
+        let tv = litebox_common_linux::TimeVal::from(timeout);
+        task.do_setsockopt(
+            &server,
+            SocketOptionName::Socket(SocketOption::RCVTIMEO),
+            UserPtr::from_usize((&raw const tv).cast::<u8>() as usize),
+            core::mem::size_of::<litebox_common_linux::TimeVal>(),
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        // Linux returns EAGAIN (not ETIMEDOUT) when SO_RCVTIMEO expires on a blocking accept.
+        assert_eq!(
+            task.do_accept(&server, None, SockFlags::empty()),
+            Err(Errno::EAGAIN)
+        );
+        assert!(start.elapsed() + Duration::from_millis(5) >= timeout);
+        close_socket(&task, raw_server);
     }
 
     fn typed_socket(

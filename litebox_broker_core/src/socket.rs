@@ -7,6 +7,7 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::fmt;
 use core::net::{Ipv4Addr, SocketAddrV4};
+use core::sync::atomic::AtomicUsize;
 use core::time::Duration;
 
 use hashbrown::HashSet;
@@ -681,7 +682,7 @@ pub fn create(
         .policy
         .authorize_socket_create(process.caller_credential, request)?;
     let account = process.socket_account()?;
-    let quota = Arc::new(reserve_socket(process)?);
+    let quota = Arc::new(reserve_socket(&process.core, &account)?);
     let reference = process.reserve_object_reference(rights)?;
     let (registration, socket_sink, readiness) =
         socket_readiness(&reference, readiness_sink, quota)?;
@@ -1219,7 +1220,8 @@ pub fn accept(
         .core
         .policy
         .principal_object_rights(process.caller_credential)?;
-    let quota = Arc::new(reserve_socket(process)?);
+    // The provider charges an accepted socket to its listener's process.
+    let quota = Arc::new(reserve_socket(&process.core, &listener_resource.account)?);
     let reference = process.reserve_object_reference(rights)?;
     let (registration, socket_sink, readiness) =
         socket_readiness(&reference, readiness_sink, quota)?;
@@ -1251,7 +1253,6 @@ pub fn accept(
         readiness_sink: socket_sink,
         port_binding: Mutex::new(None),
         guest_source_lease: Mutex::new(Some(guest_source_lease)),
-        // The provider charges an accepted socket to its listener's process.
         account: Arc::clone(&listener_resource.account),
     });
     let accepted_socket = SocketObject::new_connected(
@@ -3127,13 +3128,13 @@ impl Drop for SocketResource {
     }
 }
 
-/// Charges one socket resource to the broker and to `process`.
-fn reserve_socket(process: &BrokerProcess) -> Result<QuotaReservation> {
+/// Charges one socket resource to the broker and to the process of `account`.
+fn reserve_socket(core: &BrokerCore, account: &SocketAccount) -> Result<QuotaReservation> {
     QuotaReservation::new(
-        &process.core.reserved_sockets,
-        process.core.limits.max_sockets,
-        &process.reserved_sockets,
-        process.core.limits.max_sockets_per_process,
+        &core.reserved_sockets,
+        core.limits.max_sockets,
+        &account.reserved_sockets,
+        core.limits.max_sockets_per_process,
     )
 }
 
@@ -3162,9 +3163,9 @@ fn socket_readiness(
     Ok((registration, socket_sink, readiness))
 }
 
-/// The provider socket state charged to one process, which
-/// [`SocketProvider::close_process`] releases once the process has released
-/// its references and every socket charged to it has retired.
+/// The provider socket state and socket quota charged to one process, whose
+/// provider state [`SocketProvider::close_process`] releases once the process
+/// has released its references and every socket charged to it has retired.
 ///
 /// Each socket charged to the process holds this, and so does the process
 /// until it releases its references. It keeps the process's ID allocated, so
@@ -3172,6 +3173,9 @@ fn socket_readiness(
 /// state to it.
 pub(crate) struct SocketAccount {
     process_id: ProcessId,
+    /// Socket quota held by the pending, live, and closing in-flight
+    /// resources charged to the process.
+    reserved_sockets: Arc<AtomicUsize>,
     socket_provider: Arc<dyn SocketProvider>,
     ids: Arc<Mutex<IdAllocator>>,
 }
@@ -3182,6 +3186,7 @@ impl SocketAccount {
         core.ids.lock().retain(process_id.0);
         Self {
             process_id,
+            reserved_sockets: Arc::new(AtomicUsize::new(0)),
             socket_provider: Arc::clone(&core.socket_provider),
             ids: Arc::clone(&core.ids),
         }

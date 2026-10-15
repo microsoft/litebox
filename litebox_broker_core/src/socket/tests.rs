@@ -1400,6 +1400,15 @@ fn check_queued_guest_source_lease_release(stop_listener: bool) {
         .unwrap();
 }
 
+/// Returns the socket quota held by the resources charged to `process`.
+fn process_reserved_sockets(process: &BrokerProcess) -> usize {
+    process
+        .socket_account()
+        .unwrap()
+        .reserved_sockets
+        .load(Ordering::Relaxed)
+}
+
 fn test_broker(socket_provider: Arc<dyn SocketProvider>) -> BrokerCore {
     test_broker_with_policy(socket_provider, &crate::SocketPolicy::guest_network())
 }
@@ -1531,7 +1540,7 @@ fn check_failed_create_rolls_back(broker: &BrokerCore, provider: &TestSocketProv
     assert_eq!(readiness.retired.lock().unwrap().len(), 1);
     assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
-    assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(process_reserved_sockets(&process), 0);
 }
 
 #[test]
@@ -1557,7 +1566,7 @@ fn failed_accept_rolls_back_readiness_and_quota() {
         Ok(SocketOutcome::Completed(local_address))
     );
     let reserved_sockets = broker.reserved_sockets.load(Ordering::Relaxed);
-    let session_sockets = process.reserved_sockets.load(Ordering::Relaxed);
+    let session_sockets = process_reserved_sockets(&process);
 
     for failure in [TestAcceptFailure::Socket, TestAcceptFailure::Broker] {
         let readiness = Arc::new(TestReadinessSink::default());
@@ -1587,10 +1596,7 @@ fn failed_accept_rolls_back_readiness_and_quota() {
             broker.reserved_sockets.load(Ordering::Relaxed),
             reserved_sockets
         );
-        assert_eq!(
-            process.reserved_sockets.load(Ordering::Relaxed),
-            session_sockets
-        );
+        assert_eq!(process_reserved_sockets(&process), session_sockets);
     }
 
     process.close_object_reference(listener).unwrap();
@@ -1767,6 +1773,8 @@ fn socket_accepted_through_a_duplicate_is_charged_to_the_listener() {
     .unwrap() else {
         panic!("accept through the duplicate failed");
     };
+    assert_eq!(process_reserved_sockets(&owner), 2);
+    assert_eq!(process_reserved_sockets(&sharer), 0);
     let closed = |process: &BrokerProcess| {
         provider
             .state
@@ -2008,11 +2016,8 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
         assert_eq!(readiness.retired.lock().unwrap().len(), 1);
         assert_eq!(broker.pending_references.load(Ordering::Relaxed), 0);
         assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
-        assert_eq!(listener_session.reserved_sockets.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            connector_session.reserved_sockets.load(Ordering::Relaxed),
-            0
-        );
+        assert_eq!(process_reserved_sockets(&listener_session), 1);
+        assert_eq!(process_reserved_sockets(&connector_session), 0);
         provider
             .state
             .retained_platform_sockets
@@ -2342,7 +2347,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
         Some(&(process.id(), create_request()))
     );
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
-    assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(process_reserved_sockets(&process), 1);
     assert_eq!(status(&other, handle), Err(BrokerError::UnknownObject));
     assert_eq!(
         connect(
@@ -2521,7 +2526,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     drop(in_flight);
     assert_eq!(provider.state.dropped_sockets.load(Ordering::Relaxed), 1);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
-    assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(process_reserved_sockets(&process), 0);
     assert_eq!(
         provider.state.sent.lock().unwrap().as_slice(),
         [1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3]
@@ -3696,13 +3701,13 @@ fn check_quota_waits_for_deferred_retirement(broker: &BrokerCore, provider: &Tes
     process.close_object_reference(handle).unwrap();
     assert_eq!(readiness.retired.load(Ordering::Relaxed), 0);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 1);
-    assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 1);
+    assert_eq!(process_reserved_sockets(&process), 1);
 
     release_tx.send(()).unwrap();
     publisher.join().unwrap();
     assert_eq!(readiness.retired.load(Ordering::Relaxed), 1);
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
-    assert_eq!(process.reserved_sockets.load(Ordering::Relaxed), 0);
+    assert_eq!(process_reserved_sockets(&process), 0);
     *provider.state.live_readiness.lock().unwrap() = None;
 }
 
