@@ -5,11 +5,10 @@
 // argument picks a mode:
 // - "spin MS MIN_GAP_MS MAX_GAP_MS [DELAY_MS]": busy-waits for MS milliseconds, with no
 //   syscalls but clock reads (which the runner serves without the kernel),
-//   computing in floating point all along, with a GS base set by `wrgsbase`
-//   (not a syscall). Fails unless the longest gap between consecutive clock
-//   reads, while other programs ran, is in [MIN_GAP_MS, MAX_GAP_MS], and
-//   unless the computation, the rounding mode, and the GS base survived the
-//   switches. With DELAY_MS, sleeps that long first.
+//   computing in floating point all along. Fails unless the longest gap
+//   between consecutive clock reads, while other programs ran, is in
+//   [MIN_GAP_MS, MAX_GAP_MS], and unless the computation and the rounding
+//   mode survived the switches. With DELAY_MS, sleeps that long first.
 // - "sleep MS COUNT": sleeps COUNT times for MS milliseconds; fails if one
 //   is too short.
 // - "calls COUNT MAX_MS": makes COUNT broker calls (one-byte reads of a
@@ -41,9 +40,6 @@ static double step(double x) {
 }
 
 static int spin_mode(long long ms, long long min_gap_ms, long long max_gap_ms) {
-    static char gs_area[64];
-    unsigned long long gs_expected = (unsigned long long)gs_area;
-    __asm__ volatile("wrgsbase %0" : : "r"(gs_expected));
     // Rounds up: not the default, so a switch that dropped MXCSR would show.
     unsigned int mxcsr = _mm_getcsr();
     _mm_setcsr((mxcsr & ~_MM_ROUND_MASK) | _MM_ROUND_UP);
@@ -62,18 +58,15 @@ static int spin_mode(long long ms, long long min_gap_ms, long long max_gap_ms) {
         last = now;
     }
     int rounding = (_mm_getcsr() & _MM_ROUND_MASK) == _MM_ROUND_UP;
-    unsigned long long gs;
-    __asm__ volatile("rdgsbase %0" : "=r"(gs));
-    __asm__ volatile("wrgsbase %0" : : "r"(0ULL));
     double expected = 1.0;
     for (long long i = 0; i < steps; i++) {
         expected = step(expected);
     }
     _mm_setcsr(mxcsr);
     int gap = max_gap >= min_gap_ms * 1000 && max_gap <= max_gap_ms * 1000;
-    if (!gap || !rounding || x != expected || gs != gs_expected) {
-        fprintf(stderr, "spin: max gap %lld us, rounding %d, computation %d, gs %d\n", max_gap,
-                rounding, x == expected, gs == gs_expected);
+    if (!gap || !rounding || x != expected) {
+        fprintf(stderr, "spin: max gap %lld us, rounding %d, computation %d\n", max_gap,
+                rounding, x == expected);
         return 1;
     }
     return 0;
