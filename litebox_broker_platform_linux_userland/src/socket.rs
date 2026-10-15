@@ -35,7 +35,7 @@ use rustix::net::{getsockname, sockopt};
 
 use litebox_broker_core::readiness::ReadinessRegistration;
 #[cfg(test)]
-use litebox_broker_protocol::socket::{MAX_SOCKET_TRANSFER_SIZE, SocketStatusResponse};
+use litebox_broker_protocol::socket::MAX_SOCKET_TRANSFER_SIZE;
 
 mod tcp;
 mod udp;

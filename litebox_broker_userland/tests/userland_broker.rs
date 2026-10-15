@@ -172,7 +172,7 @@ fn run_fake_runner(args: &[OsString]) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while status == SocketConnectionStatus::Connecting && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
-            status = local.socket_status(handle).unwrap().status;
+            status = local.check_connect_socket(handle).unwrap().unwrap();
         }
         assert_eq!(status, SocketConnectionStatus::Connected);
         local.close_object(handle).unwrap();

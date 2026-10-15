@@ -1332,9 +1332,39 @@ fn handle_socket_request<Memory: SharedMemory>(
                 })
                 .map_err(RequestFailure::from)
         }
-        SocketRequest::Status(request) => {
-            litebox_broker_core::socket::status(process, request.handle)
-                .map(SocketResponse::Status)
+        SocketRequest::CheckConnect(request) => {
+            match litebox_broker_core::socket::check_connect(process, request.handle)
+                .map_err(RequestFailure::from)?
+            {
+                SocketOutcome::Completed(status) => {
+                    Ok(SocketResponse::CheckConnect(ConnectSocketResponse {
+                        status,
+                    }))
+                }
+                SocketOutcome::Failed(error) => Ok(SocketResponse::Failed(error)),
+            }
+        }
+        SocketRequest::GetName(request) => {
+            litebox_broker_core::socket::get_name(process, request.handle, request.peer)
+                .map(|address| {
+                    SocketResponse::GetName(
+                        litebox_broker_protocol::socket::GetSocketNameResponse { address },
+                    )
+                })
+                .map_err(RequestFailure::from)
+        }
+        SocketRequest::TakeError(request) => {
+            litebox_broker_core::socket::take_error(process, request.handle)
+                .map(|error| {
+                    SocketResponse::TakeError(
+                        litebox_broker_protocol::socket::TakeSocketErrorResponse { error },
+                    )
+                })
+                .map_err(RequestFailure::from)
+        }
+        SocketRequest::SetError(request) => {
+            litebox_broker_core::socket::set_error(process, request.handle, request.error)
+                .map(|()| SocketResponse::SetError)
                 .map_err(RequestFailure::from)
         }
     }
@@ -1796,12 +1826,12 @@ mod tests {
         SharedBufferSlotIndex,
     };
     use litebox_broker_protocol::socket::{
-        AddressFamily, ConnectSocketRequest, CreateSocketRequest, IpProtocol, ReceiveFlags,
-        ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
-        ReceiveSocketRequest, SendFlags, SendSocketRequest, SendToSocketRequest,
-        SendToSocketResponse, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
-        SocketError, SocketOptionName, SocketOptionValue, SocketStatusRequest,
-        SocketStatusResponse, SocketType,
+        AddressFamily, CheckConnectSocketRequest, ConnectSocketRequest, CreateSocketRequest,
+        GetSocketNameRequest, GetSocketNameResponse, IpProtocol, ReceiveFlags, ReceiveFromFlags,
+        ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest, SendFlags,
+        SendSocketRequest, SendToSocketRequest, SendToSocketResponse, ShutdownMode,
+        ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketOptionName,
+        SocketOptionValue, SocketType,
     };
     use litebox_broker_protocol::timer::{
         CreateTimerRequest, GetTimerRequest, ReadTimerRequest, SetTimerRequest, TimerSpec,
@@ -3281,15 +3311,26 @@ mod tests {
         assert_eq!(
             handle_test_request_with_buffers(
                 &process,
-                BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest {
+                BrokerOperation::Socket(SocketRequest::CheckConnect(CheckConnectSocketRequest {
                     handle: response.handle,
                 })),
                 &shared_buffers,
             ),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
                 status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
-                pending_error: None,
+            }))
+        );
+        assert_eq!(
+            handle_test_request_with_buffers(
+                &process,
+                BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+                    handle: response.handle,
+                    peer: false,
+                })),
+                &shared_buffers,
+            ),
+            BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+                address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
             }))
         );
 

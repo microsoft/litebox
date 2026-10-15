@@ -11,13 +11,13 @@ use litebox_broker_protocol::message::{
 use litebox_broker_protocol::shared_buffer::SharedBufferSequence;
 use litebox_broker_protocol::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
-    ConnectSocketRequest, CreateSocketRequest, GetSocketOptionRequest, IpProtocol,
-    ListenSocketRequest, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags,
-    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
-    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendToSocketRequest,
-    SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest, SocketConnectionStatus,
-    SocketError, SocketOptionName, SocketOptionValue, SocketStatusRequest, SocketStatusResponse,
-    SocketType,
+    CheckConnectSocketRequest, ConnectSocketRequest, CreateSocketRequest, GetSocketNameRequest,
+    GetSocketOptionRequest, IpProtocol, ListenSocketRequest, MAX_SOCKET_TRANSFER_SIZE,
+    MAX_UDP_DATAGRAM_SIZE, ReceiveFromFlags, ReceiveFromSocketRequest, ReceiveFromSocketResponse,
+    ReceiveSocketRequest, ReceiveSocketResponse, SendFlags, SendSocketRequest, SendToSocketRequest,
+    SetSocketErrorRequest, SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest,
+    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketType,
+    TakeSocketErrorRequest,
 };
 use litebox_broker_transport::channel::LocalCallChannel;
 
@@ -373,21 +373,82 @@ impl<Channel: LocalCallChannel> BrokerLocal<Channel> {
         }
     }
 
-    /// Reads a broker socket's authoritative connection state.
+    /// Reports the progress of a broker-owned socket's connection attempt.
     ///
     /// # Panics
     ///
     /// Panics if the broker returns a response for a different operation.
-    pub fn socket_status(
+    pub fn check_connect_socket(
         &self,
         handle: ObjectHandle,
-    ) -> Result<SocketStatusResponse, Channel::Error> {
-        let response =
-            self.request_socket(SocketRequest::Status(SocketStatusRequest { handle }))?;
-        let SocketResponse::Status(response) = response else {
-            panic!("broker returned unexpected socket status response: {response:?}");
+    ) -> Result<core::result::Result<SocketConnectionStatus, SocketError>, Channel::Error> {
+        match self.request_socket(SocketRequest::CheckConnect(CheckConnectSocketRequest {
+            handle,
+        }))? {
+            SocketResponse::CheckConnect(response) => Ok(Ok(response.status)),
+            SocketResponse::Failed(error) => Ok(Err(error)),
+            response => {
+                panic!("broker returned unexpected socket check-connect response: {response:?}")
+            }
+        }
+    }
+
+    /// Returns a broker-owned socket's local address, or if `peer` is set,
+    /// its connected peer's address.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn get_socket_name(
+        &self,
+        handle: ObjectHandle,
+        peer: bool,
+    ) -> Result<Option<SocketAddrV4>, Channel::Error> {
+        let response = self.request_socket(SocketRequest::GetName(GetSocketNameRequest {
+            handle,
+            peer,
+        }))?;
+        let SocketResponse::GetName(response) = response else {
+            panic!("broker returned unexpected socket name response: {response:?}");
         };
-        Ok(response)
+        Ok(response.address)
+    }
+
+    /// Takes a broker-owned socket's oldest pending error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn take_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> Result<Option<SocketError>, Channel::Error> {
+        let response =
+            self.request_socket(SocketRequest::TakeError(TakeSocketErrorRequest { handle }))?;
+        let SocketResponse::TakeError(response) = response else {
+            panic!("broker returned unexpected socket take-error response: {response:?}");
+        };
+        Ok(response.error)
+    }
+
+    /// Makes `error` a broker-owned socket's oldest pending error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the broker returns a response for a different operation.
+    pub fn set_socket_error(
+        &self,
+        handle: ObjectHandle,
+        error: SocketError,
+    ) -> Result<(), Channel::Error> {
+        let response = self.request_socket(SocketRequest::SetError(SetSocketErrorRequest {
+            handle,
+            error,
+        }))?;
+        let SocketResponse::SetError = response else {
+            panic!("broker returned unexpected socket set-error response: {response:?}");
+        };
+        Ok(())
     }
 
     /// Sets one option of a broker-owned socket.

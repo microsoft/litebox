@@ -541,12 +541,13 @@ fn udp_status_publication_failure_still_rearms_native_endpoint() {
         send_datagram(&process, socket, b"first", SendFlags::NONE, None),
         Ok(SocketOutcome::Completed(5))
     );
-    wait_until_ready(&process, &publications, socket, ReadinessFlags::ERROR);
+    // Checking readiness would queue the error, so wait for its publication.
+    wait_for_readiness_publication(&publications, socket, ReadinessFlags::ERROR);
 
     readiness.fail_next_publish_matching(socket, ReadinessFlags::default(), ReadinessFlags::ERROR);
     assert_eq!(
         litebox_broker_core::socket::status(&process, socket),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Connected,
             local_address,
             pending_error: Some(SocketError::ConnectionRefused),
@@ -861,13 +862,13 @@ fn reactor_preserves_udp_datagram_semantics() {
         shutdown_handle,
         ReadinessFlags::WRITE,
     );
+    // Like Linux, an unconnected socket records a shutdown that fails.
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, shutdown_handle, ShutdownMode::Both,),
-        Ok(SocketOutcome::Completed(()))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     let shutdown_readiness = process.check_readiness(shutdown_handle).unwrap();
-    assert!(shutdown_readiness.contains(ReadinessFlags::READ));
-    assert!(!shutdown_readiness.contains(ReadinessFlags::WRITE));
+    assert!(shutdown_readiness.contains(ReadinessFlags::READ | ReadinessFlags::WRITE));
     assert_eq!(
         send_datagram(
             &process,
@@ -876,7 +877,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             SendFlags::NONE,
             Some(server_address),
         ),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     let mut shutdown_data = [0; 1];
     assert_eq!(
@@ -886,7 +887,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             &mut shutdown_data,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     process.close_object_reference(shutdown_handle).unwrap();
     assert_eq!(
@@ -909,7 +910,7 @@ fn reactor_preserves_udp_datagram_semantics() {
     assert_eq!(&before_shutdown, b"before shutdown");
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, read_shutdown_handle, ShutdownMode::Read,),
-        Ok(SocketOutcome::Completed(()))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     assert_eq!(
         send_datagram(
@@ -933,7 +934,7 @@ fn reactor_preserves_udp_datagram_semantics() {
             &mut shutdown_data,
             ReceiveFromFlags::NONE,
         ),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     process
         .close_object_reference(read_shutdown_handle)
@@ -1097,7 +1098,8 @@ fn reactor_preserves_udp_datagram_semantics() {
         send_datagram(&process, handle, b"refused", SendFlags::NONE, None,),
         Ok(SocketOutcome::Completed(7))
     );
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
+    // Leave the error with the transport so that the failed send queues it.
+    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
     assert_eq!(
         send_datagram(
             &process,
@@ -1108,10 +1110,9 @@ fn reactor_preserves_udp_datagram_semantics() {
         ),
         Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
-    let send_error_status = litebox_broker_core::socket::status(&process, handle).unwrap();
     assert_eq!(
-        send_error_status.pending_error,
-        Some(SocketError::ConnectionRefused)
+        litebox_broker_core::socket::take_error(&process, handle),
+        Ok(Some(SocketError::ConnectionRefused))
     );
     assert!(
         !process
@@ -1132,10 +1133,9 @@ fn reactor_preserves_udp_datagram_semantics() {
         ),
         Ok(SocketOutcome::Failed(SocketError::InvalidArgument))
     );
-    let refused_status = litebox_broker_core::socket::status(&process, handle).unwrap();
     assert_eq!(
-        refused_status.pending_error,
-        Some(SocketError::ConnectionRefused)
+        litebox_broker_core::socket::take_error(&process, handle),
+        Ok(Some(SocketError::ConnectionRefused))
     );
     assert!(
         !process
@@ -1156,15 +1156,16 @@ fn reactor_preserves_udp_datagram_semantics() {
         litebox_broker_core::socket::connect(&process, handle, server_address),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
+    // Like Linux, a socket shut down for writing is writable.
     assert!(
-        !process
+        process
             .check_readiness(handle)
             .unwrap()
             .contains(ReadinessFlags::WRITE)
     );
     assert_eq!(
         send_datagram(&process, handle, b"after shutdown", SendFlags::NONE, None,),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
 
     process.close_object_reference(handle).unwrap();

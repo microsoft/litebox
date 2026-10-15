@@ -33,12 +33,13 @@ use crate::shared_buffer::SharedBufferSequence;
 use crate::signal::{OpenSignalsResponse, SendSignalRequest, SignalEvent, TakeSignalRequest};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, BindSocketRequest, BindSocketResponse,
-    ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest, CreateSocketResponse,
-    GetSocketOptionRequest, GetSocketOptionResponse, ListenSocketRequest, ListenSocketResponse,
-    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
-    ReceiveSocketResponse, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
-    SendToSocketResponse, SetSocketOptionRequest, ShutdownSocketRequest, SocketError,
-    SocketStatusRequest, SocketStatusResponse,
+    CheckConnectSocketRequest, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
+    CreateSocketResponse, GetSocketNameRequest, GetSocketNameResponse, GetSocketOptionRequest,
+    GetSocketOptionResponse, ListenSocketRequest, ListenSocketResponse, ReceiveFromSocketRequest,
+    ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendSocketRequest,
+    SendSocketResponse, SendToSocketRequest, SendToSocketResponse, SetSocketErrorRequest,
+    SetSocketOptionRequest, ShutdownSocketRequest, SocketError, TakeSocketErrorRequest,
+    TakeSocketErrorResponse,
 };
 use crate::timer::{
     CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse, ReadTimerRequest,
@@ -182,7 +183,10 @@ impl BrokerOperation {
                 | SocketRequest::Shutdown(_)
                 | SocketRequest::SetOption(_)
                 | SocketRequest::GetOption(_)
-                | SocketRequest::Status(_),
+                | SocketRequest::CheckConnect(_)
+                | SocketRequest::GetName(_)
+                | SocketRequest::TakeError(_)
+                | SocketRequest::SetError(_),
             )
             | Self::File(
                 FileRequest::Seek(_)
@@ -448,8 +452,14 @@ pub enum SocketRequest {
     SetOption(SetSocketOptionRequest),
     /// Read a socket option.
     GetOption(GetSocketOptionRequest),
-    /// Read a socket's connection state.
-    Status(SocketStatusRequest),
+    /// Check the progress of a connection attempt.
+    CheckConnect(CheckConnectSocketRequest),
+    /// Read the local or peer address.
+    GetName(GetSocketNameRequest),
+    /// Take the oldest pending error.
+    TakeError(TakeSocketErrorRequest),
+    /// Report an error before any already pending one.
+    SetError(SetSocketErrorRequest),
 }
 
 /// Result returned for an active broker operation.
@@ -641,16 +651,18 @@ pub enum SocketResponse {
     SetOption,
     /// Socket option response.
     GetOption(GetSocketOptionResponse),
-    /// Status operation response.
-    Status(SocketStatusResponse),
-    /// A host network operation failed.
+    /// Check-connect operation response.
+    CheckConnect(ConnectSocketResponse),
+    /// Address operation response.
+    GetName(GetSocketNameResponse),
+    /// Take-error operation response.
+    TakeError(TakeSocketErrorResponse),
+    /// Socket error was reported.
+    SetError,
+    /// A socket operation failed with an ordinary socket error.
     ///
-    /// Stream connect and status responses carry terminal connection failures
-    /// in [`SocketConnectionStatus`]. Datagram connect failures and other
-    /// ordinary socket failures use this variant. Broker and request-validation
-    /// failures use [`BrokerResult::Error`] instead.
-    ///
-    /// [`SocketConnectionStatus`]: crate::socket::SocketConnectionStatus
+    /// Broker and request-validation failures use [`BrokerResult::Error`]
+    /// instead.
     Failed(SocketError),
 }
 

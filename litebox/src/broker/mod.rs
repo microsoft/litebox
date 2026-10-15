@@ -34,8 +34,8 @@ use litebox_broker_protocol::socket::{
     AcceptSocketResponse, MAX_SOCKET_TRANSFER_SIZE, MAX_UDP_DATAGRAM_SIZE,
     ReceiveFlags as BrokerReceiveFlags, ReceiveFromFlags as BrokerReceiveFromFlags,
     ReceiveFromSocketResponse, ReceiveSocketResponse, SendFlags as BrokerSendFlags, ShutdownMode,
-    SocketConnectionStatus, SocketOptionName, SocketOptionValue, SocketOutcome,
-    SocketStatusResponse, SocketType,
+    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketOutcome,
+    SocketType,
 };
 use litebox_broker_protocol::timer::TimerSpec;
 use litebox_broker_protocol::unix_socket::{
@@ -187,10 +187,27 @@ pub(crate) trait BrokerControl: Send + Sync {
         flags: FileOpenFlags,
     ) -> core::result::Result<SocketOutcome<AcceptSocketResponse>, BrokerControlError>;
 
-    fn socket_status(
+    fn check_connect_socket(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<SocketStatusResponse, BrokerControlError>;
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError>;
+
+    fn get_socket_name(
+        &self,
+        handle: ObjectHandle,
+        peer: bool,
+    ) -> core::result::Result<Option<SocketAddrV4>, BrokerControlError>;
+
+    fn take_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<Option<SocketError>, BrokerControlError>;
+
+    fn set_socket_error(
+        &self,
+        handle: ObjectHandle,
+        error: SocketError,
+    ) -> core::result::Result<(), BrokerControlError>;
 
     fn send_socket(
         &self,
@@ -908,11 +925,38 @@ where
             })
     }
 
-    fn socket_status(
+    fn check_connect_socket(
         &self,
         handle: ObjectHandle,
-    ) -> core::result::Result<SocketStatusResponse, BrokerControlError> {
-        self.request(|local| local.socket_status(handle))
+    ) -> core::result::Result<SocketOutcome<SocketConnectionStatus>, BrokerControlError> {
+        self.request(|local| local.check_connect_socket(handle))
+            .map(|result| match result {
+                Ok(status) => SocketOutcome::Completed(status),
+                Err(error) => SocketOutcome::Failed(error),
+            })
+    }
+
+    fn get_socket_name(
+        &self,
+        handle: ObjectHandle,
+        peer: bool,
+    ) -> core::result::Result<Option<SocketAddrV4>, BrokerControlError> {
+        self.request(|local| local.get_socket_name(handle, peer))
+    }
+
+    fn take_socket_error(
+        &self,
+        handle: ObjectHandle,
+    ) -> core::result::Result<Option<SocketError>, BrokerControlError> {
+        self.request(|local| local.take_socket_error(handle))
+    }
+
+    fn set_socket_error(
+        &self,
+        handle: ObjectHandle,
+        error: SocketError,
+    ) -> core::result::Result<(), BrokerControlError> {
+        self.request(|local| local.set_socket_error(handle, error))
     }
 
     fn send_socket(

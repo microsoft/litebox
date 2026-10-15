@@ -665,14 +665,15 @@ mod tests {
     };
     use crate::socket::{
         AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
-        BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-        CreateSocketResponse, GetSocketOptionRequest, GetSocketOptionResponse, IpProtocol,
-        ListenSocketRequest, ListenSocketResponse, ReceiveFlags, ReceiveFromFlags,
-        ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
-        ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse,
-        SendToSocketRequest, SendToSocketResponse, SetSocketOptionRequest, ShutdownMode,
-        ShutdownSocketRequest, SocketConnectionStatus, SocketError, SocketOptionName,
-        SocketOptionValue, SocketStatusRequest, SocketStatusResponse, SocketType,
+        BindSocketResponse, CheckConnectSocketRequest, ConnectSocketRequest, ConnectSocketResponse,
+        CreateSocketRequest, CreateSocketResponse, GetSocketNameRequest, GetSocketNameResponse,
+        GetSocketOptionRequest, GetSocketOptionResponse, IpProtocol, ListenSocketRequest,
+        ListenSocketResponse, ReceiveFlags, ReceiveFromFlags, ReceiveFromSocketRequest,
+        ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
+        SendSocketRequest, SendSocketResponse, SendToSocketRequest, SendToSocketResponse,
+        SetSocketErrorRequest, SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest,
+        SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketType,
+        TakeSocketErrorRequest, TakeSocketErrorResponse,
     };
     use crate::timer::{
         CreateTimerRequest, CreateTimerResponse, GetTimerRequest, GetTimerResponse,
@@ -705,14 +706,6 @@ mod tests {
 
     fn sequence(slot_index: u32, length: u32) -> SharedBufferSequence {
         SharedBufferSequence::new(&[SharedBufferSlotIndex(slot_index)], length).unwrap()
-    }
-
-    const fn socket_status(status: SocketConnectionStatus) -> SocketStatusResponse {
-        SocketStatusResponse {
-            status,
-            local_address: None,
-            pending_error: None,
-        }
     }
 
     #[test]
@@ -1087,7 +1080,22 @@ mod tests {
                 handle,
                 name: SocketOptionName::SendTimeout,
             })),
-            BrokerOperation::Socket(SocketRequest::Status(SocketStatusRequest { handle })),
+            BrokerOperation::Socket(SocketRequest::CheckConnect(CheckConnectSocketRequest {
+                handle,
+            })),
+            BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+                handle,
+                peer: false,
+            })),
+            BrokerOperation::Socket(SocketRequest::GetName(GetSocketNameRequest {
+                handle,
+                peer: true,
+            })),
+            BrokerOperation::Socket(SocketRequest::TakeError(TakeSocketErrorRequest { handle })),
+            BrokerOperation::Socket(SocketRequest::SetError(SetSocketErrorRequest {
+                handle,
+                error: SocketError::ConnectionReset,
+            })),
             BrokerOperation::Thread(ThreadRequest::Create),
             BrokerOperation::Thread(ThreadRequest::Exit(thread_id(u32::MAX))),
             BrokerOperation::Process(ProcessRequest::AllocateChild),
@@ -1301,13 +1309,20 @@ mod tests {
             SocketError::Other,
             SocketError::NotConnected,
             SocketError::InvalidArgument,
+            SocketError::AlreadyConnected,
+            SocketError::AlreadyInProgress,
+            SocketError::Shutdown,
+            SocketError::DestinationAddressRequired,
+            SocketError::Listening,
+            SocketError::ResourceExhausted,
+            SocketError::UnsupportedOperation,
         ] {
             for socket_response in [
                 SocketResponse::Failed(error),
                 SocketResponse::Connect(ConnectSocketResponse {
                     status: SocketConnectionStatus::Failed(error),
                 }),
-                SocketResponse::Status(socket_status(SocketConnectionStatus::Failed(error))),
+                SocketResponse::TakeError(TakeSocketErrorResponse { error: Some(error) }),
             ] {
                 let response = BrokerResponse {
                     request_id: TEST_REQUEST_ID,
@@ -1540,9 +1555,9 @@ mod tests {
                 local_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152),
                 remote_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49153),
             })),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Unconnected,
-            ))),
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Unconnected,
+            })),
             BrokerResult::Socket(SocketResponse::Connect(ConnectSocketResponse {
                 status: SocketConnectionStatus::Connecting,
             })),
@@ -1575,20 +1590,25 @@ mod tests {
             BrokerResult::Socket(SocketResponse::GetOption(GetSocketOptionResponse {
                 value: SocketOptionValue::SendTimeout(Some(core::time::Duration::new(5, 6))),
             })),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Connecting,
-            ))),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Connected,
-            ))),
-            BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                status: SocketConnectionStatus::Connected,
-                local_address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
-                pending_error: Some(SocketError::ConnectionReset),
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Connecting,
             })),
-            BrokerResult::Socket(SocketResponse::Status(socket_status(
-                SocketConnectionStatus::Failed(SocketError::TimedOut),
-            ))),
+            BrokerResult::Socket(SocketResponse::CheckConnect(ConnectSocketResponse {
+                status: SocketConnectionStatus::Connected,
+            })),
+            BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+                address: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 49152)),
+            })),
+            BrokerResult::Socket(SocketResponse::GetName(GetSocketNameResponse {
+                address: None,
+            })),
+            BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+                error: Some(SocketError::ConnectionReset),
+            })),
+            BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+                error: None,
+            })),
+            BrokerResult::Socket(SocketResponse::SetError),
             BrokerResult::Socket(SocketResponse::Failed(SocketError::ConnectionReset)),
             BrokerResult::RandomFilled,
             BrokerResult::File(FileResponse::Open(OpenFileResponse { handle })),
@@ -2278,16 +2298,17 @@ mod tests {
             Err(WireError::InvalidTag)
         );
 
-        let mut unknown_status = encode_response(BrokerResponse {
+        let mut unknown_optional_error = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
-            result: BrokerResult::Socket(SocketResponse::Status(SocketStatusResponse {
-                status: SocketConnectionStatus::Connected,
-                local_address: None,
-                pending_error: None,
+            result: BrokerResult::Socket(SocketResponse::TakeError(TakeSocketErrorResponse {
+                error: None,
             })),
         });
-        *unknown_status.last_mut().unwrap() = 0xff;
-        assert_eq!(decode_response(&unknown_status), Err(WireError::InvalidTag));
+        *unknown_optional_error.last_mut().unwrap() = 0xff;
+        assert_eq!(
+            decode_response(&unknown_optional_error),
+            Err(WireError::InvalidTag)
+        );
 
         let get_option = encode_response(BrokerResponse {
             request_id: TEST_REQUEST_ID,
@@ -2306,7 +2327,7 @@ mod tests {
             request_id: TEST_REQUEST_ID,
             result: BrokerResult::Socket(SocketResponse::Failed(SocketError::TimedOut)),
         });
-        for raw in [0, 13, u8::MAX] {
+        for raw in [0, 20, u8::MAX] {
             let mut unknown_socket_error = socket_error.clone();
             *unknown_socket_error.last_mut().unwrap() = raw;
             assert_eq!(

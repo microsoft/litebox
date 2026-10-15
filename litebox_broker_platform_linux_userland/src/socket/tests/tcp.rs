@@ -85,13 +85,13 @@ fn abort_and_close_accepted_peer(pair: &GuestTcpPair) {
 }
 
 fn wait_for_guest_reset(
-    process: &BrokerProcess,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
     handle: ObjectHandle,
 ) {
+    // Checking readiness would queue the reset, so wait for its publication
+    // to leave it for the next operation to report.
     let readiness = ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP;
     wait_for_readiness_publication(publications, handle, readiness);
-    assert!(process.check_readiness(handle).unwrap().contains(readiness));
 }
 
 #[test]
@@ -222,12 +222,13 @@ fn reactor_drives_a_loopback_tcp_socket() {
     );
     assert_eq!(
         send_bytes(&process, handle, b"after shutdown", SendFlags::NONE),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::Shutdown))
     );
     allow_response.send(()).unwrap();
     wait_until_ready(&process, &publications, handle, ReadinessFlags::READ);
     let current_readiness = process.check_readiness(handle).unwrap();
-    assert!(!current_readiness.contains(ReadinessFlags::WRITE));
+    // Like Linux, a socket shut down for writing is writable.
+    assert!(current_readiness.contains(ReadinessFlags::WRITE));
     assert!(!current_readiness.contains(ReadinessFlags::ERROR));
 
     let mut first = [0_u8; 1];
@@ -539,9 +540,7 @@ fn external_tcp_gateway_uses_host_loopback_and_keeps_guest_identity() {
     let direct = create_socket(&process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::connect(&process, direct, host_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
     process.close_object_reference(direct).unwrap();
@@ -770,7 +769,7 @@ fn tcp_status_publication_failure_preserves_consumed_error() {
     wait_until_connected(&process, handle, &publications);
 
     abort_connection.send(()).unwrap();
-    wait_until_ready(&process, &publications, handle, ReadinessFlags::ERROR);
+    wait_for_readiness_publication(&publications, handle, ReadinessFlags::ERROR);
     readiness.fail_next_publish_matching(handle, ReadinessFlags::default(), ReadinessFlags::ERROR);
     let status = litebox_broker_core::socket::status(&process, handle).unwrap();
     assert_eq!(status.status, SocketConnectionStatus::Connected);
@@ -1172,7 +1171,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
 
     connector_process.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    wait_for_guest_reset(&listener_process, &publications, accepted);
+    wait_for_guest_reset(&publications, accepted);
     let mut byte = [0_u8; 1];
     assert_eq!(
         receive_into(
@@ -1209,7 +1208,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
     );
     connector_process.close_object_reference(aborting).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), aborting);
-    wait_for_guest_reset(&listener_process, &publications, abort_peer.handle);
+    wait_for_guest_reset(&publications, abort_peer.handle);
     assert_eq!(
         receive_into(
             &listener_process,
@@ -1227,7 +1226,7 @@ fn accepted_guest_tcp_close_with_unread_data_preserves_reset() {
 fn guest_tcp_direct_receive_reports_reset_once_then_eof() {
     let pair = connected_guest_tcp_pair(8101);
     abort_and_close_accepted_peer(&pair);
-    wait_for_guest_reset(&pair.connector_process, &pair.publications, pair.connector);
+    wait_for_guest_reset(&pair.publications, pair.connector);
 
     let mut byte = [0_u8; 1];
     assert_eq!(
@@ -1285,6 +1284,76 @@ fn guest_tcp_direct_receive_reports_reset_once_then_eof() {
     ));
 }
 
+/// Checking readiness queues a reset, which is then reported once after the
+/// buffered data in place of the end of stream that a receive reports.
+#[test]
+fn guest_tcp_polled_reset_is_queued_behind_buffered_data() {
+    let pair = connected_guest_tcp_pair(8109);
+    assert_eq!(
+        send_bytes(
+            &pair.listener_process,
+            pair.accepted,
+            b"buffered",
+            SendFlags::NONE,
+        ),
+        Ok(SocketOutcome::Completed(8))
+    );
+    wait_until_ready(
+        &pair.connector_process,
+        &pair.publications,
+        pair.connector,
+        ReadinessFlags::READ,
+    );
+    abort_and_close_accepted_peer(&pair);
+    wait_for_guest_reset(&pair.publications, pair.connector);
+
+    assert!(
+        pair.connector_process
+            .check_readiness(pair.connector)
+            .unwrap()
+            .contains(ReadinessFlags::READ | ReadinessFlags::ERROR | ReadinessFlags::HANGUP)
+    );
+    let mut buffered = [0_u8; 8];
+    assert_eq!(
+        receive_into(
+            &pair.connector_process,
+            pair.connector,
+            &mut buffered,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::Received(8)))
+    );
+    assert_eq!(&buffered, b"buffered");
+    assert_eq!(
+        receive_into(
+            &pair.connector_process,
+            pair.connector,
+            &mut buffered,
+            ReceiveFlags::NONE,
+            0,
+            0,
+        ),
+        Ok(SocketOutcome::Completed(ReceiveSocketResponse::EndOfStream))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&pair.connector_process, pair.connector),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::take_error(&pair.connector_process, pair.connector),
+        Ok(None)
+    );
+    assert!(
+        !pair
+            .connector_process
+            .check_readiness(pair.connector)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
+}
+
 #[test]
 fn guest_tcp_status_consumes_reset_before_buffered_data() {
     let pair = connected_guest_tcp_pair(8102);
@@ -1304,7 +1373,7 @@ fn guest_tcp_status_consumes_reset_before_buffered_data() {
         ReadinessFlags::READ,
     );
     abort_and_close_accepted_peer(&pair);
-    wait_for_guest_reset(&pair.connector_process, &pair.publications, pair.connector);
+    wait_for_guest_reset(&pair.publications, pair.connector);
 
     let status =
         litebox_broker_core::socket::status(&pair.connector_process, pair.connector).unwrap();
@@ -1432,7 +1501,7 @@ fn guest_read_shutdown_buffer_precedes_reset_and_eof() {
         Ok(SocketOutcome::Completed(()))
     );
     abort_and_close_accepted_peer(&pair);
-    wait_for_guest_reset(&pair.connector_process, &pair.publications, pair.connector);
+    wait_for_guest_reset(&pair.publications, pair.connector);
 
     let mut data = [0_u8; 6];
     assert_eq!(
@@ -1504,9 +1573,7 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
     let early_client = create_socket(&client_process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::connect(&client_process, early_client, claimed_port_miss,),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     assert_eq!(
         shadowed_host_listener.accept().unwrap_err().kind(),
@@ -1529,9 +1596,7 @@ fn guest_tcp_namespace_routes_across_processs_and_hides_private_backend() {
             unbound_private_client,
             SocketAddrV4::new(GUEST_IPV4_ADDRESS, unbound_private_port),
         ),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     client_process
         .close_object_reference(unbound_private_client)
@@ -1868,7 +1933,7 @@ fn connector_and_process_teardown_clean_bounded_pending_state() {
     listener_process.close_object_reference(listener).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), listener);
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
-    wait_for_guest_reset(&final_connector_process, &publications, final_connector);
+    wait_for_guest_reset(&publications, final_connector);
     let mut byte = [0_u8; 1];
     assert_eq!(
         receive_into(
@@ -1976,7 +2041,7 @@ fn graceful_connector_close_preserves_late_accept_and_eof() {
 }
 
 #[test]
-fn guest_tcp_zero_backlog_accepts_one_unspecified_destination() {
+fn guest_tcp_zero_backlog_wildcard_listener_accepts_one_connection() {
     let port = 8104;
     let policy = SocketPolicy::guest_network()
         .with_tcp_destination_rules(&[DestinationRule::new(
@@ -2022,8 +2087,14 @@ fn guest_tcp_zero_backlog_accepts_one_unspecified_destination() {
     .unwrap() else {
         panic!("wildcard connector bind failed");
     };
+    // Like a connection Linux refuses, an unspecified destination leaves the
+    // socket free to connect again.
     assert_eq!(
-        litebox_broker_core::socket::connect(&connector_process, connector, wildcard_listener,),
+        litebox_broker_core::socket::connect(&connector_process, connector, wildcard_listener),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        litebox_broker_core::socket::connect(&connector_process, connector, concrete_listener),
         Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
     );
     let concrete_connector = SocketAddrV4::new(Ipv4Addr::LOCALHOST, connector_binding.port());
@@ -2036,10 +2107,8 @@ fn guest_tcp_zero_backlog_accepts_one_unspecified_destination() {
 
     let full = create_socket(&connector_process, readiness.clone());
     assert_eq!(
-        litebox_broker_core::socket::connect(&connector_process, full, wildcard_listener),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        litebox_broker_core::socket::connect(&connector_process, full, concrete_listener),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     let SocketOutcome::Completed(accepted) = litebox_broker_core::socket::accept(
         &listener_process,
@@ -2122,9 +2191,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
     let full = create_socket(&connector_process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::connect(&connector_process, full, address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     assert_eq!(
         litebox_broker_core::socket::listen(&listener_process, listener, 1),
@@ -2159,9 +2226,7 @@ fn guest_tcp_backlog_relisten_and_fifo_are_bounded() {
     let still_full = create_socket(&connector_process, readiness.clone());
     assert_eq!(
         litebox_broker_core::socket::connect(&connector_process, still_full, address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     assert_eq!(
         litebox_broker_core::socket::listen(&listener_process, listener, 3),
@@ -2489,7 +2554,7 @@ fn guest_tcp_read_shutdown_is_logical_and_unread_close_resets_peer() {
         pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         pair.connector
     );
-    wait_for_guest_reset(&pair.listener_process, &pair.publications, pair.accepted);
+    wait_for_guest_reset(&pair.publications, pair.accepted);
     assert_eq!(
         receive_into(
             &pair.listener_process,
@@ -2593,7 +2658,7 @@ fn guest_tcp_both_shutdown_keeps_peer_send_open_and_closes_write_half() {
         pair.retirements.recv_timeout(TEST_TIMEOUT).unwrap(),
         pair.connector
     );
-    wait_for_guest_reset(&pair.listener_process, &pair.publications, pair.accepted);
+    wait_for_guest_reset(&pair.publications, pair.accepted);
     assert_eq!(
         receive_into(
             &pair.listener_process,
@@ -2779,7 +2844,7 @@ fn guest_tcp_accept_publication_failure_purges_registered_endpoint() {
             .unwrap()
             .contains(ReadinessFlags::READ)
     );
-    wait_for_guest_reset(&connector_process, &publications, connector);
+    wait_for_guest_reset(&publications, connector);
     let mut byte = [0_u8; 1];
     assert_eq!(
         receive_into(
@@ -2984,7 +3049,7 @@ fn abortive_connector_close_releases_descriptor_capacity() {
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
     connector_process.close_object_reference(connector).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
-    wait_for_guest_reset(&listener_process, &publications, accepted);
+    wait_for_guest_reset(&publications, accepted);
     let mut byte = [0_u8; 1];
     assert_eq!(
         receive_into(
@@ -3062,7 +3127,7 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), connector);
     assert_eq!(provider.reactor.queued_guest_connection_count(), 1);
 
-    readiness.fail_next_publish_matching(listener, ReadinessFlags::HANGUP, ReadinessFlags::READ);
+    readiness.fail_next_publish_matching(listener, ReadinessFlags::CLOSED, ReadinessFlags::READ);
     assert_eq!(
         litebox_broker_core::socket::shutdown(
             &listener_process,
@@ -3073,9 +3138,10 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     );
     readiness.assert_no_pending_publish_failure();
     let listener_readiness = listener_process.check_readiness(listener).unwrap();
-    assert!(listener_readiness.contains(ReadinessFlags::WRITE));
-    assert!(listener_readiness.contains(ReadinessFlags::HANGUP));
+    // Like Linux, a stopped listener is closed but not shut down for reading.
+    assert!(listener_readiness.contains(ReadinessFlags::WRITE | ReadinessFlags::CLOSED));
     assert!(!listener_readiness.contains(ReadinessFlags::READ));
+    assert!(!listener_readiness.contains(ReadinessFlags::HANGUP));
     assert_eq!(provider.reactor.queued_guest_connection_count(), 0);
     assert_eq!(
         litebox_broker_core::socket::listen(&listener_process, listener, 1),
@@ -3085,9 +3151,7 @@ fn stop_listening_cleanup_survives_readiness_failure() {
     let refused = create_socket(&connector_process, readiness);
     assert_eq!(
         litebox_broker_core::socket::connect(&connector_process, refused, guest_address),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::ConnectionRefused,
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
     );
     connector_process.close_object_reference(refused).unwrap();
     assert_eq!(retirements.recv_timeout(TEST_TIMEOUT).unwrap(), refused);
@@ -3123,7 +3187,7 @@ fn reactor_drives_a_loopback_tcp_listener() {
     assert_ne!(local_address.port(), 0);
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, listener, ShutdownMode::Write),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(SocketError::Listening))
     );
     assert!(matches!(
         litebox_broker_core::socket::accept(
@@ -3273,12 +3337,12 @@ fn reactor_drives_a_loopback_tcp_listener() {
         litebox_broker_core::socket::shutdown(&process, listener, ShutdownMode::StopListening,),
         Ok(SocketOutcome::Completed(()))
     );
-    wait_until_ready(&process, &publications, listener, ReadinessFlags::HANGUP);
+    wait_until_ready(&process, &publications, listener, ReadinessFlags::CLOSED);
     assert!(
         process
             .check_readiness(listener)
             .unwrap()
-            .contains(ReadinessFlags::HANGUP)
+            .contains(ReadinessFlags::CLOSED)
     );
     assert!(matches!(
         litebox_broker_core::socket::accept(

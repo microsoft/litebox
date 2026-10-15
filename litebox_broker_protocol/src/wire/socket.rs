@@ -7,14 +7,15 @@ use core::time::Duration;
 use crate::message::{SocketRequest, SocketResponse};
 use crate::socket::{
     AcceptSocketRequest, AcceptSocketResponse, AddressFamily, BindSocketRequest,
-    BindSocketResponse, ConnectSocketRequest, ConnectSocketResponse, CreateSocketRequest,
-    CreateSocketResponse, GetSocketOptionRequest, GetSocketOptionResponse, IpProtocol,
-    ListenSocketRequest, ListenSocketResponse, ReceiveFlags, ReceiveFromFlags,
-    ReceiveFromSocketRequest, ReceiveFromSocketResponse, ReceiveSocketRequest,
-    ReceiveSocketResponse, SendFlags, SendSocketRequest, SendSocketResponse, SendToSocketRequest,
-    SendToSocketResponse, SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest,
-    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketStatusRequest,
-    SocketStatusResponse, SocketType,
+    BindSocketResponse, CheckConnectSocketRequest, ConnectSocketRequest, ConnectSocketResponse,
+    CreateSocketRequest, CreateSocketResponse, GetSocketNameRequest, GetSocketNameResponse,
+    GetSocketOptionRequest, GetSocketOptionResponse, IpProtocol, ListenSocketRequest,
+    ListenSocketResponse, ReceiveFlags, ReceiveFromFlags, ReceiveFromSocketRequest,
+    ReceiveFromSocketResponse, ReceiveSocketRequest, ReceiveSocketResponse, SendFlags,
+    SendSocketRequest, SendSocketResponse, SendToSocketRequest, SendToSocketResponse,
+    SetSocketErrorRequest, SetSocketOptionRequest, ShutdownMode, ShutdownSocketRequest,
+    SocketConnectionStatus, SocketError, SocketOptionName, SocketOptionValue, SocketType,
+    TakeSocketErrorRequest, TakeSocketErrorResponse,
 };
 
 use super::WireError;
@@ -26,7 +27,6 @@ const SOCKET_TAG_CONNECT: u8 = 1;
 const SOCKET_TAG_SEND: u8 = 2;
 const SOCKET_TAG_RECEIVE: u8 = 3;
 const SOCKET_TAG_SHUTDOWN: u8 = 4;
-const SOCKET_TAG_STATUS: u8 = 5;
 const SOCKET_TAG_FAILED: u8 = 6;
 const SOCKET_TAG_BIND: u8 = 7;
 const SOCKET_TAG_LISTEN: u8 = 8;
@@ -35,6 +35,10 @@ const SOCKET_TAG_SEND_TO: u8 = 10;
 const SOCKET_TAG_RECEIVE_FROM: u8 = 11;
 const SOCKET_TAG_SET_OPTION: u8 = 12;
 const SOCKET_TAG_GET_OPTION: u8 = 13;
+const SOCKET_TAG_CHECK_CONNECT: u8 = 14;
+const SOCKET_TAG_GET_NAME: u8 = 15;
+const SOCKET_TAG_TAKE_ERROR: u8 = 16;
+const SOCKET_TAG_SET_ERROR: u8 = 17;
 
 const ADDRESS_FAMILY_TAG_IPV4: u8 = 0;
 
@@ -142,9 +146,23 @@ pub(super) fn encode_socket_request(encoder: &mut Encoder, request: SocketReques
             encoder.handle(request.handle);
             encode_option_name(encoder, request.name);
         }
-        SocketRequest::Status(request) => {
-            encoder.u8(SOCKET_TAG_STATUS);
+        SocketRequest::CheckConnect(request) => {
+            encoder.u8(SOCKET_TAG_CHECK_CONNECT);
             encoder.handle(request.handle);
+        }
+        SocketRequest::GetName(request) => {
+            encoder.u8(SOCKET_TAG_GET_NAME);
+            encoder.handle(request.handle);
+            encode_bool(encoder, request.peer);
+        }
+        SocketRequest::TakeError(request) => {
+            encoder.u8(SOCKET_TAG_TAKE_ERROR);
+            encoder.handle(request.handle);
+        }
+        SocketRequest::SetError(request) => {
+            encoder.u8(SOCKET_TAG_SET_ERROR);
+            encoder.handle(request.handle);
+            encode_socket_error(encoder, request.error);
         }
     }
 }
@@ -215,8 +233,19 @@ pub(super) fn decode_socket_request(decoder: &mut Decoder<'_>) -> Result<SocketR
             handle: decoder.handle()?,
             name: decode_option_name(decoder)?,
         })),
-        SOCKET_TAG_STATUS => Ok(SocketRequest::Status(SocketStatusRequest {
+        SOCKET_TAG_CHECK_CONNECT => Ok(SocketRequest::CheckConnect(CheckConnectSocketRequest {
             handle: decoder.handle()?,
+        })),
+        SOCKET_TAG_GET_NAME => Ok(SocketRequest::GetName(GetSocketNameRequest {
+            handle: decoder.handle()?,
+            peer: decode_bool(decoder)?,
+        })),
+        SOCKET_TAG_TAKE_ERROR => Ok(SocketRequest::TakeError(TakeSocketErrorRequest {
+            handle: decoder.handle()?,
+        })),
+        SOCKET_TAG_SET_ERROR => Ok(SocketRequest::SetError(SetSocketErrorRequest {
+            handle: decoder.handle()?,
+            error: decode_socket_error(decoder)?,
         })),
         _ => Err(WireError::InvalidTag),
     }
@@ -278,12 +307,19 @@ pub(super) fn encode_socket_response(encoder: &mut Encoder, response: SocketResp
             encoder.u8(SOCKET_TAG_GET_OPTION);
             encode_option_value(encoder, response.value);
         }
-        SocketResponse::Status(response) => {
-            encoder.u8(SOCKET_TAG_STATUS);
+        SocketResponse::CheckConnect(response) => {
+            encoder.u8(SOCKET_TAG_CHECK_CONNECT);
             encode_connection_status(encoder, response.status);
-            encode_optional_address(encoder, response.local_address);
-            encode_optional_socket_error(encoder, response.pending_error);
         }
+        SocketResponse::GetName(response) => {
+            encoder.u8(SOCKET_TAG_GET_NAME);
+            encode_optional_address(encoder, response.address);
+        }
+        SocketResponse::TakeError(response) => {
+            encoder.u8(SOCKET_TAG_TAKE_ERROR);
+            encode_optional_socket_error(encoder, response.error);
+        }
+        SocketResponse::SetError => encoder.u8(SOCKET_TAG_SET_ERROR),
         SocketResponse::Failed(error) => {
             encoder.u8(SOCKET_TAG_FAILED);
             encode_socket_error(encoder, error);
@@ -333,11 +369,16 @@ pub(super) fn decode_socket_response(
         SOCKET_TAG_GET_OPTION => Ok(SocketResponse::GetOption(GetSocketOptionResponse {
             value: decode_option_value(decoder)?,
         })),
-        SOCKET_TAG_STATUS => Ok(SocketResponse::Status(SocketStatusResponse {
+        SOCKET_TAG_CHECK_CONNECT => Ok(SocketResponse::CheckConnect(ConnectSocketResponse {
             status: decode_connection_status(decoder)?,
-            local_address: decode_optional_address(decoder)?,
-            pending_error: decode_optional_socket_error(decoder)?,
         })),
+        SOCKET_TAG_GET_NAME => Ok(SocketResponse::GetName(GetSocketNameResponse {
+            address: decode_optional_address(decoder)?,
+        })),
+        SOCKET_TAG_TAKE_ERROR => Ok(SocketResponse::TakeError(TakeSocketErrorResponse {
+            error: decode_optional_socket_error(decoder)?,
+        })),
+        SOCKET_TAG_SET_ERROR => Ok(SocketResponse::SetError),
         SOCKET_TAG_FAILED => Ok(SocketResponse::Failed(decode_socket_error(decoder)?)),
         _ => Err(WireError::InvalidTag),
     }
@@ -508,6 +549,13 @@ fn encode_socket_error(encoder: &mut Encoder, error: SocketError) {
         SocketError::Other => 10,
         SocketError::NotConnected => 11,
         SocketError::InvalidArgument => 12,
+        SocketError::AlreadyConnected => 13,
+        SocketError::AlreadyInProgress => 14,
+        SocketError::Shutdown => 15,
+        SocketError::DestinationAddressRequired => 16,
+        SocketError::Listening => 17,
+        SocketError::ResourceExhausted => 18,
+        SocketError::UnsupportedOperation => 19,
     });
 }
 
@@ -525,6 +573,13 @@ fn decode_socket_error(decoder: &mut Decoder<'_>) -> Result<SocketError, WireErr
         10 => Ok(SocketError::Other),
         11 => Ok(SocketError::NotConnected),
         12 => Ok(SocketError::InvalidArgument),
+        13 => Ok(SocketError::AlreadyConnected),
+        14 => Ok(SocketError::AlreadyInProgress),
+        15 => Ok(SocketError::Shutdown),
+        16 => Ok(SocketError::DestinationAddressRequired),
+        17 => Ok(SocketError::Listening),
+        18 => Ok(SocketError::ResourceExhausted),
+        19 => Ok(SocketError::UnsupportedOperation),
         _ => Err(WireError::InvalidTag),
     }
 }

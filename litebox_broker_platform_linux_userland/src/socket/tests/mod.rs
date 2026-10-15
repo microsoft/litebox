@@ -400,26 +400,29 @@ fn directional_shutdown_survives_readiness_publication_failure() {
         ))
     ));
     wait_until_connected(&process, tcp, &publications);
-    readiness.fail_next_publish_matching(tcp, ReadinessFlags::READ, ReadinessFlags::WRITE);
+    // Like Linux, a socket shut down in both directions is readable, writable,
+    // and closed.
+    let shut_down = ReadinessFlags::READ
+        | ReadinessFlags::WRITE
+        | ReadinessFlags::HANGUP
+        | ReadinessFlags::CLOSED;
+    readiness.fail_next_publish_matching(tcp, ReadinessFlags::READ, ReadinessFlags::default());
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, tcp, ShutdownMode::Both),
         Ok(SocketOutcome::Completed(()))
     );
     readiness.assert_no_pending_publish_failure();
-    let tcp_readiness = process.check_readiness(tcp).unwrap();
-    assert!(tcp_readiness.contains(ReadinessFlags::READ));
-    assert!(!tcp_readiness.contains(ReadinessFlags::WRITE));
+    assert!(process.check_readiness(tcp).unwrap().contains(shut_down));
 
+    // Like Linux, an unconnected datagram socket records a shutdown that fails.
     let udp = create_udp_socket(&process, readiness.clone());
-    readiness.fail_next_publish_matching(udp, ReadinessFlags::READ, ReadinessFlags::WRITE);
+    readiness.fail_next_publish_matching(udp, ReadinessFlags::READ, ReadinessFlags::default());
     assert_eq!(
         litebox_broker_core::socket::shutdown(&process, udp, ShutdownMode::Both),
-        Ok(SocketOutcome::Completed(()))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     readiness.assert_no_pending_publish_failure();
-    let udp_readiness = process.check_readiness(udp).unwrap();
-    assert!(udp_readiness.contains(ReadinessFlags::READ));
-    assert!(!udp_readiness.contains(ReadinessFlags::WRITE));
+    assert!(process.check_readiness(udp).unwrap().contains(shut_down));
 
     release_server.send(()).unwrap();
     server.join().unwrap();
@@ -506,18 +509,14 @@ fn wait_until_failed(
     handle: ObjectHandle,
     publications: &Receiver<(ObjectHandle, ReadinessFlags)>,
 ) -> SocketError {
-    let deadline = Instant::now() + TEST_TIMEOUT;
-    loop {
-        match litebox_broker_core::socket::status(process, handle)
-            .unwrap()
-            .status
-        {
-            SocketConnectionStatus::Connecting => {
-                wait_for_readiness_until(publications, handle, ReadinessFlags::ERROR, deadline);
-            }
-            SocketConnectionStatus::Failed(error) => return error,
-            status => panic!("unexpected connect status: {status:?}"),
-        }
+    // Like a guest, observe the failure through readiness, which queues it.
+    wait_until_ready(process, publications, handle, ReadinessFlags::ERROR);
+    match litebox_broker_core::socket::status(process, handle)
+        .unwrap()
+        .status
+    {
+        SocketConnectionStatus::Failed(error) => error,
+        status => panic!("unexpected connect status: {status:?}"),
     }
 }
 

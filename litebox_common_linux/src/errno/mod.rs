@@ -453,7 +453,6 @@ impl From<litebox::inet_socket::errors::BindError> for Errno {
         match value {
             litebox::inet_socket::errors::BindError::UnsupportedAddress(_) => Errno::EAFNOSUPPORT,
             litebox::inet_socket::errors::BindError::PortAlreadyInUse(_) => Errno::EADDRINUSE,
-            litebox::inet_socket::errors::BindError::AlreadyBound => Errno::EINVAL,
             litebox::inet_socket::errors::BindError::UnsupportedOperation => Errno::EOPNOTSUPP,
             litebox::inet_socket::errors::BindError::OperationFailed(error) => error.into(),
             _ => unimplemented!(),
@@ -467,7 +466,6 @@ impl From<litebox::inet_socket::errors::ConnectError> for Errno {
             litebox::inet_socket::errors::ConnectError::UnsupportedAddress(_) => {
                 Errno::EAFNOSUPPORT
             }
-            litebox::inet_socket::errors::ConnectError::Unaddressable => Errno::ECONNREFUSED,
             litebox::inet_socket::errors::ConnectError::InProgress => Errno::EINPROGRESS,
             litebox::inet_socket::errors::ConnectError::AlreadyInProgress => Errno::EALREADY,
             litebox::inet_socket::errors::ConnectError::AlreadyConnected => Errno::EISCONN,

@@ -330,7 +330,7 @@ fn rejected_external_route_preserves_an_exact_loopback_socket() {
     assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 0);
     assert_eq!(
         status(&process, socket),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Unconnected,
             local_address: Some(local),
             pending_error: None,
@@ -390,7 +390,7 @@ fn rejected_udp_external_routes_preserve_an_exact_loopback_socket() {
     assert_eq!(provider.state.connect_calls.load(Ordering::Relaxed), 0);
     assert_eq!(
         status(&process, socket),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Unconnected,
             local_address: Some(local),
             pending_error: None,
@@ -540,6 +540,64 @@ pub(crate) struct TestSocketProvider {
     state: Arc<TestSocketState>,
 }
 
+#[test]
+fn socket_error_queue_keeps_the_two_newest_prepended_errors() {
+    let mut errors = SocketErrorQueue::default();
+    errors.prepend(SocketError::NetworkUnreachable);
+    errors.prepend(SocketError::ConnectionRefused);
+    errors.prepend(SocketError::TimedOut);
+    assert_eq!(errors.take(), Some(SocketError::TimedOut));
+    assert_eq!(errors.take(), Some(SocketError::ConnectionRefused));
+    assert_eq!(errors.take(), None);
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn socket_error_queue_appends_behind_a_queued_error() {
+    let mut errors = SocketErrorQueue::default();
+    errors.append(QueuedSocketError::Other(SocketError::NetworkUnreachable));
+    errors.append(QueuedSocketError::Other(SocketError::ConnectionRefused));
+    errors.append(QueuedSocketError::Other(SocketError::TimedOut));
+    assert_eq!(errors.take(), Some(SocketError::NetworkUnreachable));
+    assert_eq!(errors.take(), Some(SocketError::ConnectionRefused));
+    assert_eq!(errors.take(), None);
+}
+
+#[test]
+fn socket_error_queue_restored_error_precedes_a_queued_one() {
+    let mut errors = SocketErrorQueue::default();
+    errors.append(QueuedSocketError::Other(SocketError::NetworkUnreachable));
+    errors.prepend(SocketError::ConnectionRefused);
+    assert_eq!(errors.take(), Some(SocketError::ConnectionRefused));
+    assert_eq!(errors.take(), Some(SocketError::NetworkUnreachable));
+    assert_eq!(errors.take(), None);
+}
+
+#[test]
+fn socket_error_queue_takes_only_a_connection_failure() {
+    let mut errors = SocketErrorQueue::default();
+    errors.append(QueuedSocketError::Other(SocketError::ConnectionRefused));
+    errors.append(QueuedSocketError::ConnectionFailure(
+        SocketError::ConnectionRefused,
+    ));
+    assert_eq!(
+        errors.take_connection_failure(),
+        Some(SocketError::ConnectionRefused)
+    );
+    assert_eq!(errors.take_connection_failure(), None);
+    assert_eq!(errors.take(), Some(SocketError::ConnectionRefused));
+    assert_eq!(errors.take(), None);
+
+    errors.append(QueuedSocketError::ConnectionFailure(SocketError::TimedOut));
+    errors.append(QueuedSocketError::Other(SocketError::NetworkUnreachable));
+    assert_eq!(
+        errors.take_connection_failure(),
+        Some(SocketError::TimedOut)
+    );
+    assert_eq!(errors.take(), Some(SocketError::NetworkUnreachable));
+    assert_eq!(errors.take(), None);
+}
+
 #[derive(Default)]
 struct TestSocketState {
     creates: StdMutex<std::vec::Vec<(ProcessId, CreateSocketRequest)>>,
@@ -562,6 +620,7 @@ struct TestSocketState {
     binds: StdMutex<std::vec::Vec<SocketAddrV4>>,
     listens: StdMutex<std::vec::Vec<u32>>,
     listen_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    connect_block: StdMutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
     accept_failure: StdMutex<Option<TestAcceptFailure>>,
     failed_accept_readiness: StdMutex<Option<ReadinessRegistration>>,
     shutdown_calls: AtomicUsize,
@@ -695,6 +754,22 @@ impl TestSocketProvider {
 
     fn fail_next_status(&self) {
         self.state.fail_status.store(true, Ordering::Relaxed);
+    }
+
+    fn return_next_status(
+        &self,
+        status: SocketConnectionStatus,
+        pending_error: Option<SocketError>,
+    ) {
+        self.state
+            .status_responses
+            .lock()
+            .unwrap()
+            .push_back(PlatformSocketStatus {
+                status,
+                local_address: None,
+                pending_error,
+            });
     }
 }
 
@@ -873,6 +948,11 @@ impl PlatformSocket for TestPlatformSocket {
         guest_source_lease: Option<GuestSourceLease>,
     ) -> core::result::Result<SocketConnectionStatus, PlatformConnectError> {
         self.state.connect_calls.fetch_add(1, Ordering::Relaxed);
+        let connect_block = self.state.connect_block.lock().unwrap().take();
+        if let Some((started, release)) = connect_block {
+            started.send(()).unwrap();
+            release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         self.state
             .connect_destinations
             .lock()
@@ -1364,7 +1444,7 @@ fn test_broker_with_policy(
 pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketProvider) {
     check_failed_create_rolls_back(broker, provider);
     check_socket_operations_and_policy(broker, provider);
-    check_in_flight_connect_preserves_local_address(broker);
+    check_in_flight_connect_preserves_local_address(broker, provider);
     check_private_tcp_connect_uses_private_source_for_wildcard_binding(broker, provider);
     check_tcp_option_state_is_per_socket(broker);
     check_udp_socket_operations(broker, provider);
@@ -1383,6 +1463,7 @@ pub(crate) fn check_socket_lifecycle(broker: &BrokerCore, provider: &TestSocketP
     check_invalid_bind_response_retires_socket(broker, provider);
     check_automatic_bind_retains_reservation_during_retirement(broker, provider);
     check_duplicate_port_binding_retires_socket(broker, provider);
+    check_pending_errors_and_readiness(broker, provider);
 }
 
 fn check_platform_socket_retires_before_last_arc_drop(
@@ -1529,7 +1610,8 @@ fn socket_readiness_reaches_readiness_queues() {
         .allocate_process(CallerCredential::Unauthenticated, None)
         .unwrap();
     let socket_sink = Arc::new(TestReadinessSink::default());
-    let socket = create(&process, create_request(), socket_sink.clone()).unwrap();
+    let socket = create(&process, create_udp_request(), socket_sink.clone()).unwrap();
+    socket_sink.published.lock().unwrap().clear();
     let queue_sink = Arc::new(TestReadinessSink::default());
     let queue =
         crate::readiness_queue::create(&process, &(queue_sink.clone() as Arc<dyn ReadinessSink>))
@@ -1597,7 +1679,7 @@ fn takes_wake_callers_that_found_the_queue_empty_meanwhile() {
         .unwrap();
     let socket = create(
         &process,
-        create_request(),
+        create_udp_request(),
         Arc::new(TestReadinessSink::default()),
     )
     .unwrap();
@@ -1753,25 +1835,29 @@ fn invalid_accepted_metadata_retires_socket_readiness_and_quota() {
     }
 }
 
-fn check_in_flight_connect_preserves_local_address(broker: &BrokerCore) {
+fn check_in_flight_connect_preserves_local_address(
+    broker: &BrokerCore,
+    provider: &TestSocketProvider,
+) {
     let process = Arc::new(
         broker
             .allocate_process(CallerCredential::Unauthenticated, None)
             .unwrap(),
     );
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let readiness = Arc::new(BlockingReadinessSink {
-        started: StdMutex::new(Some(started_tx)),
-        release: StdMutex::new(release_rx),
-        retired: AtomicUsize::new(0),
-    });
-    let handle = create(&process, create_request(), readiness).unwrap();
+    let handle = create(
+        &process,
+        create_request(),
+        Arc::new(TestReadinessSink::default()),
+    )
+    .unwrap();
     let local_address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 41998);
     assert_eq!(
         bind(&process, handle, local_address),
         Ok(SocketOutcome::Completed(local_address))
     );
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    *provider.state.connect_block.lock().unwrap() = Some((started_tx, release_rx));
 
     let connect_session = Arc::clone(&process);
     let connecting =
@@ -1779,7 +1865,7 @@ fn check_in_flight_connect_preserves_local_address(broker: &BrokerCore) {
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Connecting,
             local_address: Some(local_address),
             pending_error: None,
@@ -1816,7 +1902,7 @@ fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &Te
     );
     assert_eq!(
         status(&first_session, invalid),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: None,
             pending_error: None,
@@ -1906,7 +1992,7 @@ fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &Te
     );
     assert_eq!(
         status(&first_session, invalid_connect),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: None,
             pending_error: None,
@@ -1914,9 +2000,7 @@ fn check_invalid_bind_response_retires_socket(broker: &BrokerCore, provider: &Te
     );
     assert_eq!(
         connect(&first_session, invalid_connect, loopback_address()),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::Other
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionAborted))
     );
     first_session
         .close_object_reference(invalid_connect)
@@ -2032,7 +2116,7 @@ fn check_duplicate_port_binding_retires_socket(broker: &BrokerCore, provider: &T
     );
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(original_address),
             pending_error: None,
@@ -2082,7 +2166,7 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
     );
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Unconnected,
             local_address: None,
             pending_error: None,
@@ -2111,13 +2195,22 @@ fn check_socket_operations_and_policy(broker: &BrokerCore, provider: &TestSocket
             local_address.port(),
         )))
     );
+    // Creation publishes an unconnected stream's `WRITE | CLOSED`. The
+    // provider's publication during the connect still sees the unconnected
+    // view, and the connect's final synchronization reveals the transport's
+    // `WRITE`.
+    let unconnected = ReadinessFlags::WRITE | ReadinessFlags::CLOSED;
     assert_eq!(
         readiness.published.lock().unwrap().as_slice(),
-        [(handle, ReadinessFlags::WRITE)]
+        [
+            (handle, unconnected),
+            (handle, unconnected),
+            (handle, ReadinessFlags::WRITE)
+        ]
     );
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Connected,
             local_address: Some(local_address),
             pending_error: None,
@@ -2485,7 +2578,9 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     );
     assert_eq!(
         send_to(&process, handle, b"x".to_vec(), SendFlags::NONE, None),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(
+            SocketError::DestinationAddressRequired
+        ))
     );
     assert_eq!(
         send_to(
@@ -2658,7 +2753,7 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     );
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 49152)),
             pending_error: None,
@@ -2666,7 +2761,9 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     );
     assert_eq!(
         send_to(&process, handle, b"peer".to_vec(), SendFlags::NONE, None),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(
+            SocketError::DestinationAddressRequired
+        ))
     );
     assert_eq!(
         send_to(
@@ -2693,13 +2790,13 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     );
     assert_eq!(
         connect(&process, handle, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 54),),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::Other
-        )))
+        Ok(SocketOutcome::Failed(SocketError::Other))
     );
     assert_eq!(
         send_to(&process, handle, b"peer".to_vec(), SendFlags::NONE, None),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(
+            SocketError::DestinationAddressRequired
+        ))
     );
     process.close_object_reference(handle).unwrap();
 
@@ -2728,7 +2825,7 @@ fn check_udp_socket_operations(broker: &BrokerCore, provider: &TestSocketProvide
     );
     assert_eq!(
         shutdown(&process, handle, ShutdownMode::Both),
-        Ok(SocketOutcome::Completed(()))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     process.close_object_reference(handle).unwrap();
     assert_eq!(
@@ -2804,7 +2901,7 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
         let status_calls = provider.state.status_calls.load(Ordering::Relaxed);
         assert_eq!(
             status(&process, invalid),
-            Ok(SocketStatusResponse {
+            Ok(PlatformSocketStatus {
                 status: SocketConnectionStatus::Failed(SocketError::Other),
                 local_address: None,
                 pending_error: None,
@@ -2863,7 +2960,7 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
     let status_calls = provider.state.status_calls.load(Ordering::Relaxed);
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(reserved_address),
             pending_error: None,
@@ -2876,9 +2973,7 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
     let connect_calls = provider.state.connect_calls.load(Ordering::Relaxed);
     assert_eq!(
         connect(&process, handle, loopback_address()),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::Other
-        )))
+        Ok(SocketOutcome::Failed(SocketError::Other))
     );
     assert_eq!(
         provider.state.connect_calls.load(Ordering::Relaxed),
@@ -2910,7 +3005,7 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
     assert_eq!(
         status(&process, exact),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Unconnected,
             local_address: Some(exact_address),
             pending_error: None,
@@ -2989,7 +3084,7 @@ fn check_udp_status_validates_local_address(broker: &BrokerCore, provider: &Test
         let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
         assert_eq!(
             status(&process, wildcard),
-            Ok(SocketStatusResponse {
+            Ok(PlatformSocketStatus {
                 status: SocketConnectionStatus::Unconnected,
                 local_address: Some(observed_address),
                 pending_error: None,
@@ -3027,7 +3122,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
     assert_ne!(local_address.port(), 0);
     assert_eq!(
         status(&process, listener),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Unconnected,
             local_address: Some(local_address),
             pending_error: None,
@@ -3043,11 +3138,11 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
     );
     assert_eq!(
         connect(&process, listener, loopback_address()),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::AlreadyConnected))
     );
     assert_eq!(
         shutdown(&process, listener, ShutdownMode::Write),
-        Ok(SocketOutcome::Failed(SocketError::NotConnected))
+        Ok(SocketOutcome::Failed(SocketError::Listening))
     );
     assert!(matches!(
         accept(&process, listener, FileOpenFlags::NONE, readiness.clone()),
@@ -3061,7 +3156,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
     );
     assert_eq!(
         status(&process, listener),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::NotConnected),
             local_address: Some(local_address),
             pending_error: None,
@@ -3073,9 +3168,7 @@ fn check_server_socket_operations(broker: &BrokerCore, provider: &TestSocketProv
     ));
     assert_eq!(
         connect(&process, listener, loopback_address()),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::NotConnected
-        )))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
 
     let competing_session = broker
@@ -3228,7 +3321,7 @@ fn check_concurrent_udp_status_does_not_regress_connection(
     release_tx.send(()).unwrap();
     assert_eq!(
         in_flight.join().unwrap(),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(next_local_address),
             pending_error: None,
@@ -3260,7 +3353,7 @@ fn check_failed_listener_shutdown_preserves_state(
     );
     assert_eq!(
         connect(&process, handle, loopback_address()),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::AlreadyConnected))
     );
     process.close_object_reference(handle).unwrap();
 }
@@ -3290,7 +3383,7 @@ fn check_listener_shutdown_does_not_race_listen(
     let shutdown_calls = provider.state.shutdown_calls.load(Ordering::Relaxed);
     assert_eq!(
         shutdown(&process, handle, ShutdownMode::StopListening),
-        Ok(SocketOutcome::Failed(SocketError::Other))
+        Ok(SocketOutcome::Failed(SocketError::NotConnected))
     );
     assert_eq!(
         provider.state.shutdown_calls.load(Ordering::Relaxed),
@@ -3352,6 +3445,8 @@ fn check_socket_quotas(broker: &BrokerCore) {
     assert_eq!(broker.reserved_sockets.load(Ordering::Relaxed), 0);
 }
 
+/// Blocks the first publication after `started` is set, reporting it on
+/// `started` and waiting for `release`.
 struct BlockingReadinessSink {
     started: StdMutex<Option<mpsc::Sender<()>>>,
     release: StdMutex<mpsc::Receiver<()>>,
@@ -3364,9 +3459,10 @@ impl ReadinessSink for BlockingReadinessSink {
     }
 
     fn publish(&self, _handle: ObjectHandle, _readiness: ReadinessFlags) -> Result<()> {
-        if let Some(started) = self.started.lock().unwrap().take() {
-            started.send(()).map_err(|_| BrokerError::Internal)?;
-        }
+        let Some(started) = self.started.lock().unwrap().take() else {
+            return Ok(());
+        };
+        started.send(()).map_err(|_| BrokerError::Internal)?;
         self.release
             .lock()
             .unwrap()
@@ -3390,11 +3486,12 @@ fn check_quota_waits_for_deferred_retirement(broker: &BrokerCore, provider: &Tes
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let readiness = Arc::new(BlockingReadinessSink {
-        started: StdMutex::new(Some(started_tx)),
+        started: StdMutex::new(None),
         release: StdMutex::new(release_rx),
         retired: AtomicUsize::new(0),
     });
     let handle = create(&process, create_request(), readiness.clone()).unwrap();
+    *readiness.started.lock().unwrap() = Some(started_tx);
     let registration = provider
         .state
         .live_readiness
@@ -3470,13 +3567,11 @@ fn check_connect_errors_classify_peer_state(broker: &BrokerCore, provider: &Test
         .expect("automatic TCP bind was not recorded");
     assert_eq!(
         connect(&process, poisoned, loopback_address()),
-        Ok(SocketOutcome::Completed(SocketConnectionStatus::Failed(
-            SocketError::Other
-        )))
+        Ok(SocketOutcome::Failed(SocketError::ConnectionAborted))
     );
     assert_eq!(
         status(&process, poisoned),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(poisoned_local_address),
             pending_error: None,
@@ -3635,7 +3730,7 @@ fn check_concurrent_status_preserves_terminal_state(
 
     assert_eq!(
         status(&process, handle).unwrap(),
-        SocketStatusResponse {
+        PlatformSocketStatus {
             status: SocketConnectionStatus::Connected,
             local_address: Some(platform_local_address),
             pending_error: Some(SocketError::ConnectionReset),
@@ -3644,7 +3739,7 @@ fn check_concurrent_status_preserves_terminal_state(
     release_tx.send(()).unwrap();
     assert_eq!(
         first.join().unwrap(),
-        SocketStatusResponse {
+        PlatformSocketStatus {
             status: SocketConnectionStatus::Connected,
             local_address: Some(platform_local_address),
             pending_error: None,
@@ -3690,7 +3785,7 @@ fn check_concurrent_status_preserves_terminal_state(
     started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Connected,
             local_address: Some(platform_local_address),
             pending_error: None,
@@ -3705,7 +3800,7 @@ fn check_concurrent_status_preserves_terminal_state(
     );
     assert_eq!(
         status(&process, handle),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(platform_local_address),
             pending_error: None,
@@ -3759,7 +3854,7 @@ fn check_concurrent_status_preserves_terminal_state(
     release_tx.send(()).unwrap();
     assert_eq!(
         in_flight.join().unwrap(),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(platform_local_address),
             pending_error: None,
@@ -3801,7 +3896,7 @@ fn check_stream_status_validates_local_address(broker: &BrokerCore, provider: &T
     let retired_before = provider.state.retired_sockets.load(Ordering::Relaxed);
     assert_eq!(
         status(&process, valid),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Connected,
             local_address: Some(wildcard_address),
             pending_error: None,
@@ -3823,7 +3918,7 @@ fn check_stream_status_validates_local_address(broker: &BrokerCore, provider: &T
         });
     assert_eq!(
         status(&process, valid),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Connected,
             local_address: Some(observed_address),
             pending_error: None,
@@ -3927,7 +4022,7 @@ fn check_stream_status_validates_local_address(broker: &BrokerCore, provider: &T
     );
     assert_eq!(
         status(&process, invalid_status),
-        Ok(SocketStatusResponse {
+        Ok(PlatformSocketStatus {
             status: SocketConnectionStatus::Failed(SocketError::Other),
             local_address: Some(observed_address),
             pending_error: None,
@@ -4000,7 +4095,7 @@ fn check_stream_status_validates_local_address(broker: &BrokerCore, provider: &T
         let status_calls = provider.state.status_calls.load(Ordering::Relaxed);
         assert_eq!(
             status(&process, handle),
-            Ok(SocketStatusResponse {
+            Ok(PlatformSocketStatus {
                 status: SocketConnectionStatus::Failed(SocketError::Other),
                 local_address: Some(wildcard_address),
                 pending_error: None,
@@ -4059,13 +4154,164 @@ fn check_terminal_stream_status_preserves_refined_address(
             pending_error: None,
         });
 
-    let expected = SocketStatusResponse {
+    let expected = PlatformSocketStatus {
         status: SocketConnectionStatus::Failed(SocketError::TimedOut),
         local_address: Some(observed_address),
         pending_error: None,
     };
     assert_eq!(status(&process, handle), Ok(expected));
     assert_eq!(status(&process, handle), Ok(expected));
+}
+
+fn check_pending_errors_and_readiness(broker: &BrokerCore, provider: &TestSocketProvider) {
+    let process = broker
+        .allocate_process(CallerCredential::Unauthenticated, None)
+        .unwrap();
+    let new_socket =
+        |request| create(&process, request, Arc::new(TestReadinessSink::default())).unwrap();
+    let unconnected = ReadinessFlags::WRITE | ReadinessFlags::CLOSED;
+
+    // Set errors are reported newest first, and readiness reports them.
+    let stream = new_socket(create_request());
+    assert_eq!(process.check_readiness(stream), Ok(unconnected));
+    for error in [
+        SocketError::ConnectionRefused,
+        SocketError::TimedOut,
+        SocketError::NetworkUnreachable,
+    ] {
+        set_error(&process, stream, error).unwrap();
+    }
+    assert_eq!(
+        process.check_readiness(stream),
+        Ok(unconnected | ReadinessFlags::ERROR)
+    );
+    assert_eq!(
+        take_error(&process, stream),
+        Ok(Some(SocketError::NetworkUnreachable))
+    );
+    assert_eq!(
+        take_error(&process, stream),
+        Ok(Some(SocketError::TimedOut))
+    );
+    assert_eq!(take_error(&process, stream), Ok(None));
+    assert_eq!(process.check_readiness(stream), Ok(unconnected));
+
+    // A readiness check queues a connection's error, which follows the data
+    // received before it.
+    assert_eq!(
+        connect(&process, stream, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider.return_next_status(
+        SocketConnectionStatus::Connected,
+        Some(SocketError::ConnectionReset),
+    );
+    assert!(
+        process
+            .check_readiness(stream)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
+    assert_eq!(
+        receive(&process, stream, 2, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(PlatformStreamReceive::Received(
+            vec![7, 9]
+        )))
+    );
+    provider.return_next_stream_receive(PlatformStreamReceive::EndOfStream);
+    assert_eq!(
+        receive(&process, stream, 2, ReceiveFlags::NONE, 0, 0),
+        Ok(SocketOutcome::Completed(PlatformStreamReceive::EndOfStream))
+    );
+    assert_eq!(
+        take_error(&process, stream),
+        Ok(Some(SocketError::ConnectionReset))
+    );
+    assert_eq!(take_error(&process, stream), Ok(None));
+    assert!(
+        !process
+            .check_readiness(stream)
+            .unwrap()
+            .contains(ReadinessFlags::ERROR)
+    );
+    process.close_object_reference(stream).unwrap();
+
+    // `check_connect` claims a queued connection failure.
+    let failed = new_socket(create_request());
+    assert_eq!(
+        connect(&process, failed, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider.return_next_status(
+        SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
+        None,
+    );
+    assert_eq!(
+        process.check_readiness(failed),
+        Ok(ReadinessFlags::READ
+            | ReadinessFlags::WRITE
+            | ReadinessFlags::HANGUP
+            | ReadinessFlags::CLOSED
+            | ReadinessFlags::ERROR)
+    );
+    assert_eq!(
+        check_connect(&process, failed),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(take_error(&process, failed), Ok(None));
+    assert_eq!(process.check_readiness(failed), Ok(unconnected));
+    process.close_object_reference(failed).unwrap();
+
+    // Once another operation reports the failure, `check_connect` reports
+    // that the connection was aborted, as Linux does.
+    let reported = new_socket(create_request());
+    assert_eq!(
+        connect(&process, reported, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connecting))
+    );
+    provider.return_next_status(
+        SocketConnectionStatus::Failed(SocketError::ConnectionRefused),
+        None,
+    );
+    assert_eq!(
+        take_error(&process, reported),
+        Ok(Some(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        check_connect(&process, reported),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionAborted))
+    );
+    process.close_object_reference(reported).unwrap();
+
+    // A datagram transfer reports a set error before a queued one.
+    let datagram = new_socket(create_udp_request());
+    assert_eq!(
+        connect(&process, datagram, loopback_address()),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    provider.return_next_status(
+        SocketConnectionStatus::Connected,
+        Some(SocketError::NetworkUnreachable),
+    );
+    assert_eq!(
+        check_connect(&process, datagram),
+        Ok(SocketOutcome::Completed(SocketConnectionStatus::Connected))
+    );
+    set_error(&process, datagram, SocketError::ConnectionRefused).unwrap();
+    assert_eq!(
+        send_to(&process, datagram, vec![1], SendFlags::NONE, None),
+        Ok(SocketOutcome::Failed(SocketError::ConnectionRefused))
+    );
+    assert_eq!(
+        receive_from(&process, datagram, 2, ReceiveFromFlags::NONE),
+        Ok(SocketOutcome::Failed(SocketError::NetworkUnreachable))
+    );
+    assert_eq!(
+        send_to(&process, datagram, vec![1], SendFlags::NONE, None),
+        Ok(SocketOutcome::Completed(1))
+    );
+    process.close_object_reference(datagram).unwrap();
+    assert!(provider.state.status_responses.lock().unwrap().is_empty());
 }
 
 const fn create_request() -> CreateSocketRequest {

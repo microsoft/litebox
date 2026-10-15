@@ -1670,6 +1670,7 @@ impl BrokerProcess {
     /// Returns the current readiness of a broker-owned object.
     pub fn check_readiness(&self, handle: ObjectHandle) -> Result<ReadinessFlags> {
         let object = self.authorized_object(handle, ObjectRights::WAIT)?;
+        crate::socket::refresh_readiness(&object);
         object::readiness(&object)
     }
 

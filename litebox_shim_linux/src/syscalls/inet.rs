@@ -300,7 +300,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                 Err(error) => Err(TryOpError::Other(match Errno::from(error) {
                     Errno::EPIPE => self
                         .socket
-                        .get_async_error(true)
+                        .take_async_error()
                         .map_or(Errno::EPIPE, Errno::from),
                     errno => errno,
                 })),
@@ -413,7 +413,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                         if received != 0 || context.has_prior_progress {
                             return Ok(received);
                         }
-                        return match self.socket.get_async_error(true) {
+                        return match self.socket.take_async_error() {
                             Some(err) => Err(TryOpError::Other(err.into())),
                             None => Ok(0),
                         };
@@ -434,7 +434,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     Err(SocketReadError::NotConnected) => {
                         return Err(TryOpError::Other(
                             self.socket
-                                .get_async_error(true)
+                                .take_async_error()
                                 .map_or(Errno::ENOTCONN, Errno::from),
                         ));
                     }
@@ -458,14 +458,14 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                     Ok(received) => Ok(received),
                     Err(SocketReadError::ReadShutdown) => Ok(0),
                     Err(SocketReadError::ConnectionClosed) => {
-                        match self.socket.get_async_error(true) {
+                        match self.socket.take_async_error() {
                             Some(error) => Err(error.into()),
                             None => Ok(0),
                         }
                     }
                     Err(SocketReadError::NotConnected) => Err(self
                         .socket
-                        .get_async_error(true)
+                        .take_async_error()
                         .map_or(Errno::ENOTCONN, Errno::from)),
                     Err(SocketReadError::Socket(error)) => Err(error.into()),
                     Err(SocketReadError::WouldBlock | SocketReadError::NonBlocking) => {
@@ -616,7 +616,7 @@ impl<Platform: ShimPlatform> InetSocket<Platform> {
                 // SO_ERROR is self-clearing: atomically read and reset to 0.
                 SocketOption::ERROR => self
                     .socket
-                    .get_async_error(true)
+                    .take_async_error()
                     .map_or(0, |error| i32::from(Errno::from(error)).cast_unsigned()),
                 SocketOption::TYPE => {
                     if self.is_stream() {

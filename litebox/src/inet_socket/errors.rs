@@ -47,8 +47,6 @@ pub enum ShutdownError {
 pub enum ConnectError {
     #[error("Unsupported address {0}")]
     UnsupportedAddress(SocketAddr),
-    #[error("Invalid address")]
-    Unaddressable,
     #[error("Connection is still in progress")]
     InProgress,
     #[error("An earlier connection attempt is still in progress")]
@@ -79,8 +77,6 @@ pub enum BindError {
     UnsupportedAddress(SocketAddr),
     #[error("Port {0} already in use")]
     PortAlreadyInUse(u16),
-    #[error("Already bound to an address")]
-    AlreadyBound,
     #[error("Binding is unsupported for this socket")]
     UnsupportedOperation,
     #[error("Socket operation failed: {0:?}")]
